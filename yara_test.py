@@ -1,14 +1,31 @@
 import os
 import yara
+import math
 
 
 
 # Yara Rules Directory
 YARA_RULES_DIR = "rules"
 
-virus = 1096
+virus = "pls.txt"
 
-
+def get_entropy(input_file):
+    """ Gets the entropy of file from Ero Carrerra's Blog
+    http://blog.dkbza.org/2007/05/scanning-data-for-entropy-anomalies.html
+    """
+    try:
+        with open(input_file, "rb") as open_file:
+            data = open_file.read()
+            if not data: 
+                return 0 
+            entropy = 0 
+            for x in range(256): 
+                p_x = float(data.count(chr(x)))/len(data) 
+                if p_x > 0: 
+                    entropy += - p_x*math.log(p_x, 2) 
+        return entropy
+    except:
+        return "Error"
 
 class YaraClass:
     """Walks rule dir, compiling and testing rules, and scans files.
@@ -55,7 +72,7 @@ class YaraClass:
         """
         try:
             matched_rules = []
-            matches = self.rules.match(pid=scan_file)
+            matches = self.rules.match(scan_file)
             for i in matches:
                 matched_rules.append(i)
             print(matched_rules)
@@ -68,6 +85,9 @@ class YaraClass:
 
 
 def main():
+  
+    print(get_entropy(virus))
+
     test = YaraClass()
     rules = test.compile()
     test.test_rule(rules)
