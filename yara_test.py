@@ -1,37 +1,16 @@
 import os
 import yara
-import math
-
-
 
 # Yara Rules Directory
 YARA_RULES_DIR = "rules"
 
 virus = "pls.txt"
 
-def get_entropy(input_file):
-    """ Gets the entropy of file from Ero Carrerra's Blog
-    http://blog.dkbza.org/2007/05/scanning-data-for-entropy-anomalies.html
-    """
-    try:
-        with open(input_file, "rb") as open_file:
-            data = open_file.read()
-            if not data: 
-                return 0 
-            entropy = 0 
-            for x in range(256): 
-                p_x = float(data.count(chr(x)))/len(data) 
-                if p_x > 0: 
-                    entropy += - p_x*math.log(p_x, 2) 
-        return entropy
-    except:
-        return "Error"
-
 class YaraClass:
-    """Walks rule dir, compiling and testing rules, and scans files.
+    """Caminha pelo diretório, compilando e testando regras, e escaneando arquivos
     """
     def __init__(self):
-        """YaraClast initialization that sets verbose, scan and yara directory
+        """Inicialização do YaraClass que configurao verbose, scan and diretório YARA
         """
         try:
             self.yara_dir = YARA_RULES_DIR
@@ -41,7 +20,7 @@ class YaraClass:
             print ("Init Compile Exception: {}".format(e))
 
     def compile(self):
-        """Walks rule dir, tests rules, and compiles them for scanning.
+        """Caminha pelo diretório, testa regras, e compila elas para escanear
         """
         try:
             all_rules = {}
@@ -55,8 +34,10 @@ class YaraClass:
         except Exception as e:
             print ("Compile Exception: {}".format(e))
 
+        print(all_rules)
+
     def test_rule(self, test_case):
-        """Tests rules to make sure they are valid before using them.  If verbose is set will print the invalid rules.
+        """Testa regras para ter certeza que elas são válidas para serem usadas.  Se a verbose estiver setada, irá printar as regras inválidas.
         """
         try:
             yara.compile(filepath=test_case)
@@ -68,7 +49,7 @@ class YaraClass:
 
 
     def scan(self, scan_file):
-        """Scan method that uses compiled rules to scan a file
+        """Método de scan baseado nas regras compiladas
         """
         try:
             matched_rules = []
@@ -85,13 +66,19 @@ class YaraClass:
 
 
 def main():
-  
-    print(get_entropy(virus))
 
-    test = YaraClass()
-    rules = test.compile()
-    test.test_rule(rules)
-    test.scan(virus)
+    # Inicialização da YaraClass
+    yara = YaraClass()
+
+    # Chamando as funções
+    # Compilando regras
+    regras = yara.compile()
+
+    # Testa as regras
+    yara.test_rule(regras)
+
+    # Escanea o ransomware
+    yara.scan(virus)
 
 if __name__ == "__main__":
     main()
