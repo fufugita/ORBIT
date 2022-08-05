@@ -4,7 +4,7 @@ import yara
 # Yara Rules Directory
 YARA_RULES_DIR = "rules"
 
-virus = "pls.txt"
+virus = "inserir arquivo aqui"
 
 class YaraClass:
     """Caminha pelo diretório, compilando e testando regras, e escaneando arquivos
