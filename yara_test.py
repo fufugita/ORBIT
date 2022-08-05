@@ -34,8 +34,6 @@ class YaraClass:
         except Exception as e:
             print ("Compile Exception: {}".format(e))
 
-        print(all_rules)
-
     def test_rule(self, test_case):
         """Testa regras para ter certeza que elas são válidas para serem usadas.  Se a verbose estiver setada, irá printar as regras inválidas.
         """
