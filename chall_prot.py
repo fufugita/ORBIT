@@ -64,10 +64,9 @@ class YaraClass:
         except Exception as e:
             print ("Scan Exception: {}".format(e))
             return 'ERROR'
+            
 
-
-def main():
-
+def main():# Run an infinite loop to constantly monitor the system
     # Inicialização da YaraClass
     yara = YaraClass()
 
@@ -77,11 +76,6 @@ def main():
 
     # Testa as regras
     yara.test_rule(regras)
-
-    # Escanea o ransomware
-    #yara.scan(virus)
-
-def main():# Run an infinite loop to constantly monitor the system
     while True:
 
         # Clear the screen using a bash command
