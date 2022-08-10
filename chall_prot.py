@@ -51,12 +51,12 @@ class YaraClass:
             return False
 
 
-    def scan(self, scan_file):
+    def scan(self, p_id):
         """Método de scan baseado nas regras compiladas
         """
         try:
             matched_rules = []
-            matches = self.rules.match(scan_file)
+            matches = self.rules.match(pid = p_id)
             for i in matches:
                 matched_rules.append(i)
             print(matched_rules)
@@ -66,7 +66,8 @@ class YaraClass:
             return 'ERROR'
             
 
-def main():# Run an infinite loop to constantly monitor the system
+def main():
+
     # Inicialização da YaraClass
     yara = YaraClass()
 
@@ -76,23 +77,18 @@ def main():# Run an infinite loop to constantly monitor the system
 
     # Testa as regras
     yara.test_rule(regras)
-    while True:
 
-        # Clear the screen using a bash command
-        call('clear')
+    # Roda um loop infinito que monitora os processos do sistema
+    while True:
 
         print("==============================Process Monitor\
         ======================================")
 
-        # Fetch the battery information
-        #battery = psutil.sensors_battery().percent
-        #print("----Battery Available: %d " % (battery,) + "%")
+        # PrettyTable para imprimir tabela no console
+        ''' t = PrettyTable(<list of headings>)
+         t.add_row(<list of cells in row>) '''
 
-        # We have used PrettyTable to print the data on console.
-        # t = PrettyTable(<list of headings>)
-        # t.add_row(<list of cells in row>)
-
-        # Fetch the Network information
+        # Pega informações da Rede
         print("----Networks----")
         table = PrettyTable(['Network', 'Status', 'Speed'])
         for key in psutil.net_if_stats().keys():
@@ -102,7 +98,7 @@ def main():# Run an infinite loop to constantly monitor the system
                 table.add_row([name, up, speed])
         print(table)
 
-        # Fetch the memory information
+        # Pega informações da memória
         print("----Memory----")
         memory_table = PrettyTable(["Total(GB)", "Used(GB)",
                                                                 "Available(GB)", "Percentage"])
@@ -115,28 +111,29 @@ def main():# Run an infinite loop to constantly monitor the system
         ])
         print(memory_table)
 
-        # Fetch the 10 processes from available processes that has the highest cpu usage
+        # Pega os 10 processos que mais estão utilizando a CPU
         print("----Processes----")
         process_table = PrettyTable(['PID', 'PNAME', 'STATUS',
                                                                 'CPU', 'NUM THREADS', 'MEMORY(MB)'])
 
         proc = []
-        # get the pids from last which mostly are user processes
+        # Pega os últimos PIDS (maioria processos de usuário)
         for pid in psutil.pids()[-200:]:
                 try:
                         p = psutil.Process(pid)
-                        # trigger cpu_percent() the first time which leads to return of 0.0
+                        yara.scan(pid)
+                        # Ativa cpu_percent() pela primeira vez o que leva a retornar 0.0
                         p.cpu_percent()
                         proc.append(p)
 
                 except Exception as e:
                         pass
 
-        # sort by cpu_percent
+        # Organiza por cpu_percent()
         top = {}
         time.sleep(0.1)
         for p in proc:
-                # trigger cpu_percent() the second time for masurement
+                # Ativa cpu_percent() pela segunda vez para medidas
                 top[p] = p.cpu_percent() / psutil.cpu_count()
 
         top_list = sorted(top.items(), key=lambda x: x[1])
@@ -145,10 +142,10 @@ def main():# Run an infinite loop to constantly monitor the system
 
         for p, cpu_percent in top10:
 
-                # While fetching the processes, some of the subprocesses may exit
-                # Hence we need to put this code in try-except block
+                # Enquanto pega processos, alguns dos subprocesses podem sair
+                # Motivo para utilizar try except
                 try:
-                        # oneshot to improve info retrieve efficiency
+                        # Oneshot para melhorar a eficiência da recuperação de info 
                         with p.oneshot():
                                 process_table.add_row([
                                         str(p.pid),
@@ -163,7 +160,7 @@ def main():# Run an infinite loop to constantly monitor the system
                         pass
         print(process_table)
 
-        # Create a 1 second delay
+        # Cria delay de 1 segundo
         time.sleep(1)
 
 if __name__ == "__main__":
