@@ -59,7 +59,6 @@ class YaraClass:
             matches = self.rules.match(pid = p_id)
             for i in matches:
                 matched_rules.append(i)
-            print(matched_rules)
             return matched_rules
         except Exception as e:
             print ("Scan Exception: {}".format(e))
@@ -80,7 +79,7 @@ def main():
 
     # Roda um loop infinito que monitora os processos do sistema
     while True:
-
+        
         print("==============================Process Monitor\
         ======================================")
 
@@ -113,15 +112,15 @@ def main():
 
         # Pega os 10 processos que mais estão utilizando a CPU
         print("----Processes----")
-        process_table = PrettyTable(['PID', 'PNAME', 'STATUS',
-                                                                'CPU', 'NUM THREADS', 'MEMORY(MB)'])
+        process_table = PrettyTable(['PID', 'NOME', 'STATUS',
+                                                                'CPU', 'NUM THREADS', 'MEMÓRIA(MB)'])
 
         proc = []
         # Pega os últimos PIDS (maioria processos de usuário)
         for pid in psutil.pids()[-200:]:
+                yara.scan(pid)
                 try:
                         p = psutil.Process(pid)
-                        yara.scan(pid)
                         # Ativa cpu_percent() pela primeira vez o que leva a retornar 0.0
                         p.cpu_percent()
                         proc.append(p)
