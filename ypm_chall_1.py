@@ -64,8 +64,8 @@ class YaraClass:
                 print(matched_rules)
             return matched_rules
         except Exception as e:
-            print ("Scan Exception: {}".format(e))
-            return 'ERROR'
+            print ("'ERROR' - Scan Exception: {}".format(e))
+            return 0
             
 
 def main():
@@ -123,16 +123,19 @@ def main():
         # Pega os últimos PIDS (maioria processos de usuário)
         for pid in psutil.pids()[-200:]:
                 try:
-                        p = psutil.Process(pid)
-                        scan = yara.scan(pid)
-                        print("Regras Conflitadas:", scan)
-                        ps = str(pid)
-                        print(ps)
-                        if len(scan) > 1:
-                        	p.kill()
-                        # Ativa cpu_percent() pela primeira vez o que leva a retornar 0.0
-                        p.cpu_percent()
-                        proc.append(p)
+                    p = psutil.Process(pid)
+                    print(p)
+                    scan = yara.scan(pid)
+                    print("Regras Conflitadas:", scan)
+                    ps = str(pid)
+                    print("Processo:", ps)
+                    print("\n")  
+                    # Ativa cpu_percent() pela primeira vez o que leva a retornar 0.0
+                    p.cpu_percent()
+                    proc.append(p)
+                    if len(scan) > 0 :
+                        p.kill()
+                        quit()
 
                 except Exception as e:
                         pass
