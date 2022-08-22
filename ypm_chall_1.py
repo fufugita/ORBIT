@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# Import the required libraries
+# Importa bibliotecas necessárias
 import os
 import yara
 import psutil
@@ -8,7 +8,7 @@ import time
 from subprocess import call
 from prettytable import PrettyTable
 
-# Yara Rules Directory
+# Diretório de Regras YARA
 YARA_RULES_DIR = "rules"
 
 virus = "inserir arquivo aqui"
