@@ -116,7 +116,7 @@ def main():
 
         c = wmi.WMI()
         process_watcher = c.Win32_Process.watch_for("creation")
-        print("Analisando agora.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
+        print("\nAnalisando agora evite de abrir outros programas.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
         while True:
             recent_proc = []
             new_process = process_watcher()
