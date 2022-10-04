@@ -96,6 +96,28 @@ def bait(dir):  # Cria arquivos 'bait' para o ransomware na pasta 'Downloads'
 
 # --------------------------------------------------------------------------------------------------------
 
+class Handler(FileSystemEventHandler):
+
+    @staticmethod
+    def on_any_event(event):
+        # Inicialização da YaraClass
+        yara = YaraClass()
+        regras = yara.compile()
+        yara.test_rule(regras)
+
+        if event.is_directory:
+            return None
+
+        if event.event_type == 'created':
+            #print ("Received created event - %s." % event.src_path)
+            return 1
+
+        elif event.event_type == 'modified':
+            #print ("Received modified event - %s." % event.src_path)
+            return 1
+
+# --------------------------------------------------------------------------------------------------------
+
 def main():
 
     # Inicialização da YaraClass
@@ -109,14 +131,18 @@ def main():
     opt = int(input("Deseja fazer o que?\n1 - Escanear a pasta de 'Downloads'?\n2 - Verificar atividade maliciosa de algum executável?\n"))
 
     if opt == 1:
-        print("Analisando agora.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
+        print("Analisando agora evite de abrir outros programas.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
         yara.download(useros)
 
     elif opt == 2:
-
+        
         c = wmi.WMI()
         process_watcher = c.Win32_Process.watch_for("creation")
-        print("\nAnalisando agora evite de abrir outros programas.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
+        print("Analisando agora evite de abrir outros programas.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
+        observer = Observer()
+        event_handler = Handler()
+        observer.schedule(event_handler, dir, recursive=True)
+        observer.start()
         while True:
             recent_proc = []
             new_process = process_watcher()
@@ -127,7 +153,8 @@ def main():
                     recent_proc.remove(new_process.ProcessId)
             for pid in reversed(recent_proc):
                 if pid != os.getpid():
-                    subprocess.run(f"taskkill /PID {pid} /F /T", shell=True)
+                    if event_handler != None:
+                        subprocess.run(f"taskkill /PID {pid} /F /T", shell=True)
                     yara.download(useros)
             recent_proc.clear()
     
