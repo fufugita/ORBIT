@@ -109,6 +109,7 @@ def main():
     opt = int(input("Deseja fazer o que?\n1 - Escanear a pasta de 'Downloads'?\n2 - Verificar atividade maliciosa de algum executável?\n"))
 
     if opt == 1:
+        print("Analisando agora.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
         yara.download(useros)
 
     elif opt == 2:
