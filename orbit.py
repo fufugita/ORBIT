@@ -14,10 +14,9 @@ import wmi
 YARA_RULES_DIR = "rules"
 
 class YaraClass:
-    """Caminha pelo diretório, compilando e testando regras, e escaneando arquivos
-    """
+   
     def __init__(self):
-        """Inicialização do YaraClass que configurao verbose, scan and diretório YARA
+        """Inicialização do YaraClass que configura o verbose, scan e diretório YARA
         """
         try:
             self.yara_dir = YARA_RULES_DIR
@@ -68,6 +67,8 @@ class YaraClass:
             return 0
 
     def download(self, dir):
+        """Caminha pelo diretório 'Downloads' do usuário e comparando as regras com arquivos
+        """
         for filename in os.listdir(dir):
             f = os.path.join(dir, filename)
             if os.path.isfile(f):
@@ -80,6 +81,8 @@ class YaraClass:
 # --------------------------------------------------------------------------------------------------------
 
 def getUserPATH():
+    """Pega o nome de login do Usuário
+    """
     global dir
     name = os.getlogin()
     dir = "C:\\Users\\{0}\Downloads".format(name)
@@ -88,7 +91,9 @@ def getUserPATH():
 
 # --------------------------------------------------------------------------------------------------------
 
-def bait(dir):  # Cria arquivos 'bait' para o ransomware na pasta 'Downloads'
+def bait(dir):  
+    """ Cria arquivos 'bait' para o ransomware na pasta 'Downloads'
+    """
     for n in range(1, 100):
         with open(os.path.join(dir, f"bait {n}.txt"), "w") as arq:
             toArq = "this is bait ignore"
@@ -97,7 +102,8 @@ def bait(dir):  # Cria arquivos 'bait' para o ransomware na pasta 'Downloads'
 # --------------------------------------------------------------------------------------------------------
 
 class Handler(FileSystemEventHandler):
-
+    """Classe que detecta por eventos no diretório
+    """
     @staticmethod
     def on_any_event(event):
         # Inicialização da YaraClass
@@ -131,7 +137,7 @@ def main():
     opt = int(input("Deseja fazer o que?\n1 - Escanear a pasta de 'Downloads'?\n2 - Verificar atividade maliciosa de algum executável?\n"))
 
     if opt == 1:
-        print("Analisando agora evite de abrir outros programas.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
+        print("\nAnalisando agora evite de abrir outros programas.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
         yara.download(useros)
 
     elif opt == 2:
