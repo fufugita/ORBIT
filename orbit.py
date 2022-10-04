@@ -106,7 +106,7 @@ def main():
     useros = getUserPATH() 
     bait(useros)
 
-    opt = int(input("Deseja fazer o que?\n 1 - Escanear a pasta de 'Downloads'?\n2 - 'Verificar atividade maliciosa de algum executável?\n"))
+    opt = int(input("Deseja fazer o que?\n1 - Escanear a pasta de 'Downloads'?\n2 - Verificar atividade maliciosa de algum executável?\n"))
 
     if opt == 1:
         yara.download(useros)
@@ -115,7 +115,7 @@ def main():
 
         c = wmi.WMI()
         process_watcher = c.Win32_Process.watch_for("creation")
-
+        print("Analisando agora.\nCaso nenhuma mensagem de ameaça aparecer ou alertar que a ameaça foi removida, pode fechar tranquilamente o programa!\n")
         while True:
             recent_proc = []
             new_process = process_watcher()
@@ -127,6 +127,7 @@ def main():
             for pid in reversed(recent_proc):
                 if pid != os.getpid():
                     subprocess.run(f"taskkill /PID {pid} /F /T", shell=True)
+                    yara.download(useros)
             recent_proc.clear()
     
     else:
