@@ -1,0 +1,12 @@
+{
+  "schema": "orbit.evidence/release-candidate/v1",
+  "version": "v0.1.0-rc.1",
+  "archive": "orbit-v0.1.0-rc.1.tar.gz",
+  "archive_sha256": "683496e7057a72b089ccca87e347e0a8726908903c21ebf5e7ba84d129ec939e",
+  "binary_sha256": "d248dfcd9a8430b6ec82791eabe83683e8d0829fedd66bad6ed5467e542148dc",
+  "signature": "Ed25519, orbit.sig (key outside repo)",
+  "sbom_packages": 204,
+  "reproducible": "identical",
+  "clean_machine_chain": "PASS",
+  "generated_at": "2026-08-13T23:22:12Z"
+}

@@ -28,3 +28,7 @@ coverage/
 profraw/
 *.profraw
 *.profdata
+
+# Release candidate build outputs (reproducible from the tag)
+/dist/
+/orbit-v0.1.0-rc.1.tar.gz

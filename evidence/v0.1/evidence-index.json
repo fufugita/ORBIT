@@ -1,6 +1,6 @@
 {
   "schema": "orbit.evidence/index/v1",
-  "generated_at": "2026-08-13T23:18:00Z",
+  "generated_at": "2026-08-13T23:25:00Z",
   "items": [
     {
       "path": "artifact-signatures/orbit.sha256",
@@ -61,6 +61,11 @@
       "path": "provenance.intoto.jsonl",
       "sha256": "b6c1451ec1dcbd9a219a4a648a925bd5c7e5c05ab3d8f4869297931dedede5d0",
       "bytes": 313
+    },
+    {
+      "path": "release-candidate.json",
+      "sha256": "6baac1dffdcb473883a335e1be8106d4912e61210a365f0d28b0a22a9e6d062b",
+      "bytes": 484
     },
     {
       "path": "reproducibility.json",
