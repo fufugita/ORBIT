@@ -1,0 +1,22 @@
+# ORBIT orbit-adapter — provider-neutral adapter abstraction (DR-09 §3).
+# PURPOSE: ProviderAdapter trait, request/result/stream types, SecretBytes
+# credential wrapper, fixed-point sampling, redaction catalog, two v0.1
+# adapters (DeterministicTestV1, MockHttpV1), and the conformance trait
+# assertions every adapter must pass.
+# Contract: DR-09 (GW-01..GW-25). Synchronous v0.1 form.
+
+[package]
+name = "orbit-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Provider-neutral adapter abstraction, SecretBytes, sampling, redaction, conformance"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true

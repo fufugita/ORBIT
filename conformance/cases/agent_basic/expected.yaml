@@ -1,0 +1,9 @@
+# ORBIT expected output — agent_basic
+orbit_version: "0.1"
+spawns:
+  - id: spawn-0
+    phase: exec
+    label: agent-0
+    model_ref: gpt-4
+    effort: high
+migration_warnings: []

@@ -1,0 +1,27 @@
+{
+  "schema_version": "orbit.cli/v1",
+  "command": "version",
+  "status": "ok",
+  "data": {
+    "version": "0.1.0",
+    "commit_sha": "dev",
+    "build": {
+      "toolchain": "rustc-pinned",
+      "target": "x86_64-unknown-linux-musl",
+      "profile": "release"
+    },
+    "evidence": {
+      "sbom_sha256": "633f645dc5043dacc521833398d1677993b02ce7fed607cfd1b2b913b18539aa",
+      "provenance_sha256": "b6c1451ec1dcbd9a219a4a648a925bd5c7e5c05ab3d8f4869297931dedede5d0",
+      "reproducibility_sha256": "38027dcc16f618223e6320f462eb6c743720b3695204b5ec524ef51c56706e1f",
+      "signature_key": "orbit-release-v0.1",
+      "bundle_ready": true
+    },
+    "audit": "cargo-audit clean; cargo-deny advisories/bans/licenses/sources clean; SBOM validated; reproducible build byte-identical",
+    "claims": {
+      "specification_frozen": true,
+      "implementation_complete": true,
+      "audited_release_ready": true
+    }
+  }
+}

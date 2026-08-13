@@ -1,0 +1,11 @@
+# Claude Workflow source — agent_basic fixture
+# Expected: a single spawn mapped to ORBIT YAML with a flat ModelRef.
+orbit_version_min: 0.1.0
+orbit_version_max: 0.1.x
+ir_schema_version: orbit:ir@0.1.0
+
+spawns:
+  - id: agent-0
+    model: gpt-4
+    effort: high
+    phase: exec

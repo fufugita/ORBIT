@@ -1,0 +1,30 @@
+# Build outputs
+/target/
+/fuzz/target/
+
+# Generated fuzz state; curated seed corpus stays tracked
+/fuzz/artifacts/
+/fuzz/corpus/ir_cbor/
+/fuzz/corpus/ledger_record/
+/fuzz/corpus/export_restore/
+/fuzz/corpus/migrator/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+
+/artifacts/tmp/
+/receipts/
+/review-receipts/
+handoff.md
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Coverage/profiling outputs
+coverage/
+profraw/
+*.profraw
+*.profdata

@@ -1,0 +1,16 @@
+# ORBIT orbit-ir — Phase F implementation
+# PURPOSE: Shared IR: WIT boundary, CBOR serialization, versioning (orbit:ir@0.1.0)
+# Contract: DR-11 §1. F18.
+
+[package]
+name = "orbit-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared IR: WIT boundary, CBOR serialization, versioning (orbit:ir@0.1.0)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

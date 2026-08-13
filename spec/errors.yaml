@@ -1,0 +1,1294 @@
+status: accepted_for_spec_freeze
+generated_at: 2026-08-11
+errors:
+- id: E0101
+  name: model_required
+  meaning: SubagentSpawnRequest missing model field, or Phase duplicate opened with divergent digest.
+  raised_in:
+  - DR-01
+  - DR-04
+  hint: 'Add model: <id>|''$inherit'' to the subagent call; never use default.'
+- id: E0102
+  name: root_inherit_forbidden
+  meaning: Root orchestrator used ModelRef::Inherit.
+  raised_in:
+  - DR-01
+  - DR-04
+  hint: Root must declare a concrete model; reserve Inherit for non-root.
+- id: E0103
+  name: spawn_depth_exceeded
+  meaning: spawn_depth exceeded the founder-set cap (default 64) or Inherit chain safety guard (16).
+  raised_in:
+  - DR-01
+  - DR-04
+  hint: Reduce spawn depth or split the workflow; abort on exceedance.
+- id: E0104
+  name: attested_not_available_v0_1
+  meaning: Card or route requested trust_level=Attested; reserved in v0.1.
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-08
+  hint: Use Standard or Local; Attested is v0.2.
+- id: E0105
+  name: restart_id_phase_mismatch
+  meaning: Reissued Restart with same id but different phase.
+  raised_in:
+  - DR-04
+  hint: Use a fresh restart_replay_id or align to the recorded phase.
+- id: E0203
+  name: capability_denied
+  meaning: Capability check failed (PLAN or EXECUTE).
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-07
+  hint: 'card <card_id>; dimension <dim>; recovery: re-plan or trust-root rotate.'
+- id: E0204
+  name: capability_check_plan_refused
+  meaning: PLAN-time capability check refused.
+  raised_in:
+  - DR-04
+  hint: plan_digest <X>; fix capability cards and re-plan.
+- id: E0205
+  name: cross_session_grant_reuse_forbidden
+  meaning: Capability grants reused across sessions; not allowed.
+  raised_in:
+  - DR-05
+  hint: Re-declare capability cards per spawn.
+- id: E0206
+  name: narrowing_widens_parent
+  meaning: Child grant is not a subset of parent's grants.
+  raised_in:
+  - DR-05
+  hint: Fix child to narrow, never widen.
+- id: E0207
+  name: namespace_unresolved
+  meaning: Ambiguous or unauthorized card namespace.
+  raised_in:
+  - DR-05
+  hint: Resolve namespace via trust-root allowlist.
+- id: E0301
+  name: egress_intent_append_failed
+  meaning: EgressIntent could not be appended to the Ledger.
+  raised_in:
+  - DR-06
+  - DR-09
+  hint: Inspect Ledger writer and disk; block dispatch.
+- id: E0302
+  name: egress_intent_durability_ambiguous
+  meaning: EgressIntent append/fsync durability is failed or ambiguous.
+  raised_in:
+  - DR-06
+  - DR-09
+  hint: Do not dispatch; recover or repair the Ledger first.
+- id: E0307
+  name: egress_denied
+  meaning: Egress intent disallowed by capability card or trust-root policy.
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-09
+  hint: provider_host <host>; add or relax capability egress allowlist.
+- id: E0310
+  name: egress_tls_mismatch
+  meaning: TLS identity or SPKI pin did not match.
+  raised_in:
+  - DR-01
+  - DR-09
+  hint: provider_host <host>; expected_spki <X>; got_spki <Y>.
+- id: E0401
+  name: provider_configuration_invalid
+  meaning: Provider adapter route/profile invalid.
+  raised_in:
+  - DR-09
+  hint: Validate route profile.
+- id: E0402
+  name: credential_missing
+  meaning: No credential for the admitted route.
+  raised_in:
+  - DR-09
+  hint: Provide credential via env/file/keyring/stdin.
+- id: E0403
+  name: credential_rejected
+  meaning: Provider rejected the credential.
+  raised_in:
+  - DR-09
+  hint: Rotate and re-plan.
+- id: E0404
+  name: provider_permission_denied
+  meaning: Provider returned 403/permission denied.
+  raised_in:
+  - DR-09
+  hint: Check account permissions.
+- id: E0405
+  name: model_or_deployment_not_found
+  meaning: Provider returned 404 for model or deployment.
+  raised_in:
+  - DR-09
+  hint: Update alias/deployment; re-plan.
+- id: E0406
+  name: request_invalid_or_too_large
+  meaning: Provider rejected request as invalid or too large.
+  raised_in:
+  - DR-09
+  hint: Reduce context/length; split work.
+- id: E0407
+  name: rate_limited_exhausted
+  meaning: Retry policy for rate-limit exhausted.
+  raised_in:
+  - DR-09
+  hint: Back off; re-plan later.
+- id: E0408
+  name: capacity_unavailable_exhausted
+  meaning: Capacity unavailable after retry policy.
+  raised_in:
+  - DR-09
+  hint: Re-plan with another provider/deployment.
+- id: E0409
+  name: provider_timeout
+  meaning: Provider timeout.
+  raised_in:
+  - DR-09
+  hint: Retry with longer budget or split.
+- id: E0410
+  name: provider_transport_failure
+  meaning: Generic provider transport failure.
+  raised_in:
+  - DR-09
+  hint: Inspect transport; re-plan.
+- id: E0411
+  name: provider_protocol_or_stream_violation
+  meaning: Provider protocol/stream violated the contract.
+  raised_in:
+  - DR-09
+  hint: Report bug with provider trace id.
+- id: E0412
+  name: dispatch_ambiguous
+  meaning: Dispatch outcome ambiguous and no safe auto-retry.
+  raised_in:
+  - DR-09
+  hint: Operator must accept possible duplicate work; re-plan with fresh decision_id.
+- id: E0413
+  name: provider_binding_drift
+  meaning: Provider reported model/deployment/region differing from pin.
+  raised_in:
+  - DR-09
+  hint: Surface drift; rotate model or provider.
+- id: E0414
+  name: adapter_capability_mismatch
+  meaning: Adapter profile lacks claimed capability.
+  raised_in:
+  - DR-09
+  hint: Update profile or use a different model.
+- id: E0415
+  name: local_provider_sandbox_or_process_failure
+  meaning: Local provider sandbox/process failed.
+  raised_in:
+  - DR-09
+  hint: Inspect sandbox profile; re-plan.
+- id: E0416
+  name: provider_usage_invalid
+  meaning: Provider reported invalid/decreasing usage.
+  raised_in:
+  - DR-09
+  hint: Report bug with provider trace id.
+- id: E0417
+  name: stream_consumer_stalled
+  meaning: Consumer stalled; upstream cancelled.
+  raised_in:
+  - DR-09
+  hint: Inspect consumer; tune backpressure.
+- id: E0418
+  name: credential_source_acl_invalid
+  meaning: Credential source failed owner/mode check.
+  raised_in:
+  - DR-09
+  hint: Fix ownership/mode on credential file or directory.
+- id: E0419
+  name: cost_arithmetic_overflow
+  meaning: Cost arithmetic overflow.
+  raised_in:
+  - DR-09
+  hint: Export and re-baseline accounting.
+- id: E0420
+  name: mixed_currency_scalar_rollup_forbidden
+  meaning: Mixed-currency scalar rollup attempted.
+  raised_in:
+  - DR-09
+  hint: Aggregate per currency.
+- id: E0421
+  name: route_lifecycle_denied
+  meaning: Route lifecycle is sunset/retired; denied for new calls.
+  raised_in:
+  - DR-09
+  hint: Use a non-deprecated model.
+- id: E0422
+  name: adapter_profile_digest_mismatch
+  meaning: Adapter profile digest does not match the trust-root allowlist.
+  raised_in:
+  - DR-09
+  hint: Update profile; refresh trust root.
+- id: E0423
+  name: live_discovery_not_authorized
+  meaning: Live discovery cannot authorize anything.
+  raised_in:
+  - DR-09
+  hint: Trust root is authoritative.
+- id: E0501
+  name: eviction_hash_mismatch
+  meaning: Eviction target segment hash mismatch.
+  raised_in:
+  - DR-08
+  hint: Stop; investigate corruption.
+- id: E0502
+  name: context_segment_leak
+  meaning: Cross-segment read violated grant/revocation.
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-08
+  hint: Grant or re-authorize.
+- id: E0503
+  name: invalid_memory_metadata
+  meaning: Memory file missing modified/digest metadata.
+  raised_in:
+  - DR-08
+  hint: Repair metadata.
+- id: E0504
+  name: memory_conflict_unresolved
+  meaning: Persistent-memory conflict could not be auto-resolved.
+  raised_in:
+  - DR-08
+  hint: Operator must resolve.
+- id: E0505
+  name: invalid_fsm_transition
+  meaning: Invalid session FSM transition attempted.
+  raised_in:
+  - DR-08
+  hint: Re-start session.
+- id: E0506
+  name: window_above_model_cap
+  meaning: Working-memory window exceeds model hard cap.
+  raised_in:
+  - DR-04
+  - DR-08
+  hint: Lower window or split work.
+- id: E0507
+  name: restore_target_not_in_pib_allowlist
+  meaning: Restore target PIB not in sender allowlist.
+  raised_in:
+  - DR-08
+  hint: Add destination PIB to allowlist.
+- id: E0508
+  name: restore_signature_verification_failed
+  meaning: Restore signature verification failed.
+  raised_in:
+  - DR-08
+  hint: Source export corrupted or unsigned.
+- id: E0509
+  name: restore_into_existing_session
+  meaning: Restore attempted into an existing session.
+  raised_in:
+  - DR-08
+  hint: Use a fresh immutable session id.
+- id: E0510
+  name: memory_digest_mismatch
+  meaning: Memory file digest mismatch.
+  raised_in:
+  - DR-08
+  hint: Repair; skip eager-load.
+- id: E0511
+  name: recompose_source_mismatch
+  meaning: Compaction recompose sources do not match.
+  raised_in:
+  - DR-08
+  hint: Discard summary; reload sources.
+- id: E0512
+  name: eager_load_size_exceeded
+  meaning: Eager-load size exceeds 25KB/200 lines.
+  raised_in:
+  - DR-08
+  hint: Trim MEMORY.md; split into topic files.
+- id: E0513
+  name: restricted_session_invalid_init
+  meaning: Restricted session init violated ACL.
+  raised_in:
+  - DR-08
+  hint: Fix UID/owner/mode.
+- id: E0601
+  name: divergence_from_replay
+  meaning: Replay surfaced policy/binding divergence (annotation).
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  hint: Inspect ReplayManifest.divergences; reconcile policy.
+- id: E0602
+  name: verify_failed
+  meaning: VERIFY produced a failed assertion.
+  raised_in:
+  - DR-04
+  hint: verifier_id <X>; assertion <Y>; inspect.
+- id: E0701
+  name: decision_id_already_consumed
+  meaning: Decision_id consumed twice or restarted after reservation.
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-06
+  hint: Use a fresh decision_id.
+- id: E0702
+  name: ledger_rollup_overflow
+  meaning: u64 cost rollup overflow.
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-06
+  - DR-08
+  hint: Export and re-baseline accounting.
+- id: E0703
+  name: session_restricted_marker_immutable
+  meaning: Mutation attempt on session.restricted.
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-06
+  - DR-08
+  hint: Marker pinned at INIT; restart session.
+- id: E0704
+  name: card_issuer_not_in_allowlist
+  meaning: Card issuer key not in trust-root allowlist.
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-06
+  hint: Install/authorize the issuer in the signed manifest or via explicit plugin-install receipt; adding a root alone does
+    not authorize a card issuer.
+- id: E0705
+  name: restricted_acl_invalid
+  meaning: Restricted-session ACL violated (UID/owner/mode).
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-06
+  - DR-08
+  hint: Run as non-root UID; ledger dir 0700, files 0600.
+- id: E0706
+  name: trust_root_invalid
+  meaning: Trust-root manifest signature verification failed.
+  raised_in:
+  - DR-02
+  - DR-04
+  - DR-05
+  - DR-06
+  hint: Re-add root or repair manifest; refuse to start (exit 2).
+- id: E0708
+  name: aux_ref_not_committed
+  meaning: Auxiliary event linked to an uncommitted primary.
+  raised_in:
+  - DR-04
+  - DR-06
+  hint: Retry after primary is in HEAD.
+- id: E0709
+  name: ledger_recovery_truncated
+  meaning: Ledger chain broken or recovery truncated.
+  raised_in:
+  - DR-04
+  - DR-06
+  hint: Inspect recovery; refuse to start or replay.
+- id: E0710
+  name: restore_signature_chain_mismatch
+  meaning: Restore signature mismatch.
+  raised_in:
+  - DR-06
+  hint: Archive corrupted or signed by unknown PIB.
+- id: E0711
+  name: registry_bootstrap_incomplete
+  meaning: Trust-root registry failed bootstrap.
+  raised_in:
+  - DR-05
+  hint: Re-add root; inspect manifest.
+- id: E0712
+  name: registry_periodic_refresh_failed
+  meaning: Periodic trust-root refresh task failed.
+  raised_in:
+  - DR-05
+  hint: Fail closed for new admissions; inspect and restore the registry refresh task.
+- id: E0713
+  name: manifest_schema_invalid
+  meaning: Manifest schema invalid.
+  raised_in:
+  - DR-05
+  hint: Validate against DR-05 schema.
+- id: E0714
+  name: manifest_version_unsupported
+  meaning: Manifest apiVersion unsupported.
+  raised_in:
+  - DR-05
+  hint: Upgrade ORBIT or downgrade manifest.
+- id: E0715
+  name: root_algorithm_unsupported
+  meaning: Root algorithm not Ed25519.
+  raised_in:
+  - DR-05
+  hint: Use Ed25519 root keys only.
+- id: E0716
+  name: trust_level_invalid
+  meaning: Route trust_level outside {Standard, Attested, Local} enum.
+  raised_in:
+  - DR-05
+  hint: Fix enum.
+- id: E0717
+  name: issuer_key_unknown
+  meaning: Issuer references key not in roots.
+  raised_in:
+  - DR-05
+  hint: Add the issuer key to the trust root.
+- id: E0718
+  name: namespace_owner_invalid
+  meaning: Namespace owner not on allowlist.
+  raised_in:
+  - DR-05
+  hint: Authorize the owner via trust root.
+- id: E0719
+  name: ledger_unavailable_at_boot
+  meaning: Ledger unavailable during trust-root bootstrap.
+  raised_in:
+  - DR-05
+  hint: Fix filesystem permissions; retry boot.
+- id: E0721
+  name: session_restart_acl_invalid
+  meaning: Restart attempt violated ACL (e.g. not the same UID).
+  raised_in:
+  - DR-08
+  hint: Run as the owning UID.
+- id: E0722
+  name: pib_cross_machine_denied
+  meaning: Cross-machine restore denied.
+  raised_in:
+  - DR-08
+  hint: Add destination PIB to allowlist.
+- id: E0723
+  name: export_restore_policy_mismatch
+  meaning: Export/restore policy mismatch.
+  raised_in:
+  - DR-08
+  hint: Re-export or update policy.
+- id: E0801
+  name: plugin_wasi_violation
+  meaning: Plugin attempted a denied WASI import.
+  raised_in:
+  - DR-01
+  - DR-04
+  - DR-05
+  - DR-07
+  hint: export <name>; exit_code <X>; profile_id <X>; audit host-import allowlist.
+- id: E0802
+  name: sandbox_required
+  meaning: SubagentSpawnRequest missing SandboxRef.
+  raised_in:
+  - DR-04
+  - DR-07
+  hint: Provide a SandboxRef.
+- id: E0803
+  name: landlock_abi_unavailable
+  meaning: Landlock ABI unavailable or ruleset transition failed.
+  raised_in:
+  - DR-07
+  hint: Use a kernel with Landlock ABI v4.
+- id: E0804
+  name: sandbox_override_widens_profile
+  meaning: Sandbox overrides widened the profile defaults.
+  raised_in:
+  - DR-07
+  hint: Tighten overrides.
+- id: E0805
+  name: env_reserved_name
+  meaning: Setting a reserved env name ($PATH, $HOME, $LD_*, $PYTHON*, $NODE_*, $BASH_ENV).
+  raised_in:
+  - DR-07
+  hint: Remove the env var.
+- id: E0806
+  name: plugin_issuer_not_in_allowlist
+  meaning: Plugin issuer not in local trust-root allowlist.
+  raised_in:
+  - DR-07
+  hint: Run 'orbit plugin install' to add issuer.
+- id: E0807
+  name: instance_pool_exhausted
+  meaning: WASI instance pool exhausted.
+  raised_in:
+  - DR-07
+  hint: Wait for slots to drain or raise WASI_INSTANCE_POOL_MAX.
+- id: E0808
+  name: plugin_import_outside_allowlist
+  meaning: Plugin import not in the host allowlist at link time.
+  raised_in:
+  - DR-07
+  hint: Reduce imports or update profile.
+- id: E0809
+  name: broker_dns_or_tls_failed
+  meaning: Egress broker DNS or TLS failed.
+  raised_in:
+  - DR-07
+  hint: Inspect DNS/TLS; fix network or trust root.
+- id: E0810
+  name: reclaim_budget_exceeded
+  meaning: Host-abandonment reclaim over budget.
+  raised_in:
+  - DR-07
+  hint: Tune reclaim budget or reduce host abandonment pressure.
+- id: E0811
+  name: broker_ledger_write_failed
+  meaning: Broker ledger write or fsync failed.
+  raised_in:
+  - DR-07
+  hint: Inspect Ledger; block dispatch.
+- id: E0812
+  name: seccomp_filter_rejected
+  meaning: Seccomp filter rejected by kernel.
+  raised_in:
+  - DR-07
+  hint: Simplify seccomp profile; check kernel version.
+- id: E0813
+  name: plugin_self_grant_denied
+  meaning: Plugin attempted to self-grant a card.
+  raised_in:
+  - DR-04
+  - DR-05
+  hint: Plugin cannot issue cards; reject the package.
+- id: E0901
+  name: internal_phase_router_drift_reserved
+  meaning: Phase router has no subagent authority; reserved code unused for subagents.
+  raised_in:
+  - DR-01
+  - DR-04
+  hint: Internal only; no operator action.
+- id: E1001
+  name: budget_enforcement_deferred_v0_2
+  meaning: Reserved for v0.2 budget enforcement.
+  raised_in: []
+  hint: v0.2 only.
+- id: E0700
+  name: ledger_required_for_mutation
+  meaning: Mutating operation attempted without a Ledger-writable path; Ledger must be open and writable for any state-changing
+    command.
+  raised_in:
+  - DR-06
+  - DR-10
+  hint: Initialize or open the Ledger before running mutating commands (run, migrate apply, replay apply, restore, export-rotation,
+    plugin install, trust add-root).
+- id: E1100
+  name: cli_internal
+  meaning: Internal CLI error with no operator-actionable cause.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1101
+  name: cli_usage
+  meaning: Argument or grammar failure; invalid flag, unknown subcommand, or missing required argument.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1102
+  name: cli_data
+  meaning: User-provided data invalid; schema validation failed or incompatible format.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1103
+  name: cli_no_input
+  meaning: Required input missing, unreadable, or over budget; stdin/pipe/file not available.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1104
+  name: cli_unavailable
+  meaning: Optional resource unavailable; non-fatal hint surfaced to operator.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1105
+  name: cli_io
+  meaning: Filesystem I/O error; read/write/stat failed.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1106
+  name: cli_config_invalid
+  meaning: Config schema, type, or reserved-key violation; configuration file malformed.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1107
+  name: cli_resource
+  meaning: Memory, queue, or instance pool exhausted during read-only operation.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1108
+  name: cli_replay_lock
+  meaning: Replay divergence detected or missing replay lock flags (e.g., --allow-retired-pinned).
+  raised_in:
+  - DR-10
+  - DR-09
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1109
+  name: cli_policy
+  meaning: Cost or policy gate refused; --confirm-cost missing or budget exceeded.
+  raised_in:
+  - DR-10
+  - DR-03
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E110A
+  name: cli_cancel_ok
+  meaning: Clean cancellation propagated successfully; no error state.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E110B
+  name: cli_telemetry_denied
+  meaning: Config or environment attempted to enable outbound telemetry; blocked by v0.1 no-outbound-telelemetry lock.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E110C
+  name: cli_v0_2_only
+  meaning: Invoked a subcommand or flag reserved for v0.2; not available in v0.1.
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E110D
+  name: cli_killed
+  meaning: Process killed by OS (OOM, signal from parent, or resource limit).
+  raised_in:
+  - DR-10
+  hint: CLI-level error. See operator hint in documentation for resolution.
+- id: E1201
+  name: peb_submission_duplicate
+  meaning: Same input_ref submitted twice in one session
+  raised_in:
+  - DR-12
+  hint: E12 family error. See DR-12 §peb for resolution.
+- id: E1202
+  name: peb_input_ref_invalid
+  meaning: InputRef format or hash invalid
+  raised_in:
+  - DR-12
+  hint: E12 family error. See DR-12 §peb for resolution.
+- id: E1203
+  name: peb_dispatch_not_authorized
+  meaning: PEB dispatch attempted without capability grant
+  raised_in:
+  - DR-12
+  hint: E12 family error. See DR-12 §peb for resolution.
+- id: E1204
+  name: peb_cancel_after_dispatch
+  meaning: Cancellation requested after dispatch has begun
+  raised_in:
+  - DR-12
+  hint: E12 family error. See DR-12 §peb for resolution.
+- id: E1205
+  name: peb_replay_digest_mismatch
+  meaning: PEB replay from digest differs from original receipt
+  raised_in:
+  - DR-12
+  hint: E12 family error. See DR-12 §peb for resolution.
+- id: E1301
+  name: tte_task_not_found
+  meaning: Task ID does not exist in the session
+  raised_in:
+  - DR-12
+  hint: E13 family error. See DR-12 §tte for resolution.
+- id: E1302
+  name: tte_tool_not_allowed
+  meaning: Tool call denied by capability registry
+  raised_in:
+  - DR-12
+  hint: E13 family error. See DR-12 §tte for resolution.
+- id: E1303
+  name: tte_concurrent_execution_exceeded
+  meaning: Too many concurrent tasks running
+  raised_in:
+  - DR-12
+  hint: E13 family error. See DR-12 §tte for resolution.
+- id: E1304
+  name: tte_cancel_incompatible
+  meaning: Cancel request incompatible with task state
+  raised_in:
+  - DR-12
+  hint: E13 family error. See DR-12 §tte for resolution.
+- id: E1305
+  name: tte_result_digest_mismatch
+  meaning: Task result digest does not match receipt
+  raised_in:
+  - DR-12
+  hint: E13 family error. See DR-12 §tte for resolution.
+- id: E1401
+  name: ml_write_denied
+  meaning: Memory write denied by context grants
+  raised_in:
+  - DR-12
+  hint: E14 family error. See DR-12 §ml for resolution.
+- id: E1402
+  name: ml_read_denied
+  meaning: Memory read denied by context grants
+  raised_in:
+  - DR-12
+  hint: E14 family error. See DR-12 §ml for resolution.
+- id: E1403
+  name: ml_delete_denied
+  meaning: Memory delete denied (immutable memory)
+  raised_in:
+  - DR-12
+  hint: E14 family error. See DR-12 §ml for resolution.
+- id: E1404
+  name: ml_export_denied
+  meaning: Memory export denied by export policy
+  raised_in:
+  - DR-12
+  hint: E14 family error. See DR-12 §ml for resolution.
+- id: E1405
+  name: ml_digest_mismatch
+  meaning: Memory content digest does not match metadata
+  raised_in:
+  - DR-12
+  hint: E14 family error. See DR-12 §ml for resolution.
+- id: E1501
+  name: rta_assessment_failed
+  meaning: Trust assessment could not complete
+  raised_in:
+  - DR-12
+  hint: E15 family error. See DR-12 §rta for resolution.
+- id: E1502
+  name: rta_level_insufficient
+  meaning: Required trust level not met
+  raised_in:
+  - DR-12
+  hint: E15 family error. See DR-12 §rta for resolution.
+- id: E1503
+  name: rta_attestation_unavailable
+  meaning: Attestation service unreachable (reserved v0.1)
+  raised_in:
+  - DR-12
+  hint: E15 family error. See DR-12 §rta for resolution.
+- id: E1504
+  name: rta_assessment_stale
+  meaning: Trust assessment older than max-age
+  raised_in:
+  - DR-12
+  hint: E15 family error. See DR-12 §rta for resolution.
+- id: E1601
+  name: epb_bundle_incomplete
+  meaning: Evidence bundle missing required components
+  raised_in:
+  - DR-12
+  hint: E16 family error. See DR-12 §epb for resolution.
+- id: E1602
+  name: epb_verification_failed
+  meaning: Evidence bundle signature verification failed
+  raised_in:
+  - DR-12
+  hint: E16 family error. See DR-12 §epb for resolution.
+- id: E1603
+  name: epb_export_denied
+  meaning: Evidence export denied by policy
+  raised_in:
+  - DR-12
+  hint: E16 family error. See DR-12 §epb for resolution.
+- id: E1604
+  name: epb_digest_mismatch
+  meaning: Evidence content digest does not match bundle metadata
+  raised_in:
+  - DR-12
+  hint: E16 family error. See DR-12 §epb for resolution.
+- id: E1701
+  name: sde_envelope_not_found
+  meaning: Session decision envelope does not exist
+  raised_in:
+  - DR-12
+  hint: E17 family error. See DR-12 §sde for resolution.
+- id: E1702
+  name: sde_envelope_invalid
+  meaning: Envelope signature or structure invalid
+  raised_in:
+  - DR-12
+  hint: E17 family error. See DR-12 §sde for resolution.
+- id: E1703
+  name: sde_envelope_expired
+  meaning: Envelope older than session TTL
+  raised_in:
+  - DR-12
+  hint: E17 family error. See DR-12 §sde for resolution.
+- id: E1704
+  name: sde_replay_context_mismatch
+  meaning: Replay context does not match original envelope
+  raised_in:
+  - DR-12
+  hint: E17 family error. See DR-12 §sde for resolution.
+- id: E1801
+  name: sdk_empty_model_ref
+  meaning: ModelRef.id is empty or whitespace.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1802
+  name: sdk_unresolvable_model_ref
+  meaning: ModelRef failed to resolve against provider registry at spawn time.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1803
+  name: sdk_implicit_capability
+  meaning: Capability detected as implicitly granted (not enumerated).
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1804
+  name: sdk_capability_not_in_allowlist
+  meaning: Declared capability not in v0.1 allowlist.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1805
+  name: sdk_budget_exhausted
+  meaning: Token/time budget exhausted at construction; refusal to spawn.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1806
+  name: sdk_ledger_perm_rejected
+  meaning: UID mismatch or Ledger dir not 0700/files not 0600.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1807
+  name: sdk_plugin_self_grant
+  meaning: Plugin attempted to install another plugin at runtime.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1808
+  name: sdk_phase_router_misuse
+  meaning: Phase router invoked from non-orchestrator context.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1809
+  name: sdk_runtime_fallback
+  meaning: Provider failed and SDK attempted runtime fallback.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1810
+  name: sdk_prompt_bytes_leak
+  meaning: Prompt bytes detected in Ledger entry or export.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1821
+  name: wf_parse_syntax
+  meaning: YAML/JSON syntax error in workflow document.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1822
+  name: wf_parse_schema
+  meaning: Document does not match Workflow v0.1 schema.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1823
+  name: wf_parse_cycle
+  meaning: DAG contains a cycle.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1824
+  name: wf_parse_missing_step
+  meaning: Reference to non-existent step ID.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1825
+  name: wf_parse_unsafe_deref
+  meaning: Reference resolves outside trust root.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1826
+  name: wf_parse_wasi_reject
+  meaning: Script cannot be loaded into v0.1 WASI sandbox.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1827
+  name: wf_parse_semantic_divergence
+  meaning: Semantic divergence from declared semantics detected.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1828
+  name: wf_parse_egress_order
+  meaning: EgressIntent not present or appended after network call.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1829
+  name: wf_parse_budget_misuse
+  meaning: Per-step budget exceeds total workflow budget.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1830
+  name: wf_parse_prompt_leakage
+  meaning: Workflow body embeds raw prompt bytes.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1841
+  name: mig_unmappable_construct
+  meaning: Claude Workflow construct has no safe ORBIT equivalent.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1842
+  name: mig_security_gap
+  meaning: Migration would weaken a DR-01..09 invariant.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1843
+  name: mig_ordering_divergence
+  meaning: Source ordering/dataflow semantics differ materially.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1844
+  name: mig_implicit_fallback
+  meaning: Source relies on runtime model fallback (forbidden in ORBIT).
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1845
+  name: mig_insecure_hook
+  meaning: Claude hook cannot be re-expressed as sandboxed plugin.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1846
+  name: mig_prompt_bytes_present
+  meaning: Source contains raw prompt bytes.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1847
+  name: mig_egress_ordering_loss
+  meaning: Source pre-network setup ordering would be lost.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1848
+  name: mig_plugin_self_grant
+  meaning: Source relies on implicit plugin install/self-grant.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1849
+  name: mig_partial_output_blocked
+  meaning: Some subgraphs mapped safely but one failed.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1850
+  name: mig_version_unsupported
+  meaning: Source workflow version outside supported matrix.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1861
+  name: conf_test_setup_failed
+  meaning: Conformance corpus failed to load.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1862
+  name: conf_invariant_violation
+  meaning: DR-01..09 invariant violated during conformance run.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1863
+  name: conf_prompt_leak_detected
+  meaning: Fixture emitted prompt bytes into Ledger entry.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1864
+  name: conf_runtime_fallback_detected
+  meaning: Provider fallback observed (forbidden).
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1865
+  name: conf_phase_router_leak
+  meaning: Phase router invoked outside orchestrator.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1866
+  name: conf_egress_order_violation
+  meaning: Network observed before EgressIntent fsync.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1867
+  name: conf_acl_regression
+  meaning: Ledger perms or UID drifted from 0700/0600.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1868
+  name: conf_corpus_out_of_date
+  meaning: Conformance corpus predates SDK version under test.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1869
+  name: conf_coverage_gap
+  meaning: Required security dimension not covered by any test.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1870
+  name: conf_crashdump_leak
+  meaning: Crash dump contains prompt bytes.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1851
+  name: mig_runtime_fallback_removed
+  meaning: Source declared a runtime model fallback; ORBIT forbids it, the fallback list is dropped and the workflow fails
+    hard on provider outage.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1852
+  name: mig_budget_attribution_only_v0_1
+  meaning: Source relied on a runtime budget ceiling; ORBIT v0.1 only attributes cost to the Ledger, the gate becomes a no-op.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1853
+  name: mig_streaming_partial_unsupported_v0_1
+  meaning: Source streams partial results to callers; ORBIT v0.1 returns AgentResult only at TerminalState.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1854
+  name: mig_unsupported_construct
+  meaning: A Claude Workflow construct (e.g., isolation:remote, human-in-the-loop) has no v0.1 mapping; the migrator refuses
+    the subgraph.
+  raised_in:
+  - DR-11
+  hint: DR-11 SDK/Migration error. See documentation for resolution.
+- id: E1901
+  name: directive_in_non_authoritative_text
+  meaning: Directive-shaped string found in non-user content (tool/provider/file/quoted). Surfaced as data; never executed
+    as authority.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1902
+  name: directive_target_unsupported
+  meaning: AuthorityTarget is not a known capability axis.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1903
+  name: directive_references_internal_id
+  meaning: 'Intent references an internal identifier, credential, or hash. Kernel: refused even with explicit confirmation.'
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1904
+  name: directive_conflicting_classes
+  meaning: Conflicting directive classes (Grant+Deny) on the same axis in one turn.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1905
+  name: directive_no_user_typed_source
+  meaning: Authority pipeline reached without any UserTypedTurn input; subagent/tool/provider cannot grant.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1906
+  name: uai_widening_unconfirmed
+  meaning: Widening requested but AuthorityConfirmation is Pending.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1907
+  name: uai_widening_denied
+  meaning: User denied the widening confirmation.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1908
+  name: uai_widening_expired
+  meaning: Widening confirmation expired before use.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1909
+  name: uai_provenance_untrusted
+  meaning: UAI provenance is not a user-side source.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1910
+  name: uai_kernel_override_attempt
+  meaning: Attempt to widen the proof/privacy kernel; structurally denied, never confirmable.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1911
+  name: confirm_required_but_non_interactive
+  meaning: Risk >= Medium and no --confirm-cost token provided.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1912
+  name: confirm_token_expired
+  meaning: Confirmation token TTL exceeded.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1913
+  name: confirm_token_diff_mismatch
+  meaning: Policy diff changed since the confirmation token was issued.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1914
+  name: confirm_denied
+  meaning: Operator denied the confirmation prompt.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1920
+  name: grant_signature_invalid
+  meaning: UserAuthorityGrant Ed25519 signature verification failed.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1921
+  name: grant_write_not_fsynced
+  meaning: Grant record Ledger write returned without fsync ACK.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1922
+  name: grant_diff_drift
+  meaning: Policy snapshots changed between grant diff computation and write.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1923
+  name: grant_replay_detected
+  meaning: Same grant_id already recorded; replay refused.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1930
+  name: grant_not_covering_capability
+  meaning: TaskSpec requires a capability the grant does not authorize.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1931
+  name: grant_expired
+  meaning: Grant TTL exceeded before task start.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1932
+  name: grant_revoked
+  meaning: Grant revoked before or during task execution; task aborted.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1940
+  name: revoke_target_not_found
+  meaning: grant_id not in the recorded grant set.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1941
+  name: revoke_requires_user_confirmation
+  meaning: Panic-revoke attempted from a non-operator route.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1942
+  name: revoke_already_terminal
+  meaning: Grant already in Terminated or EmergencyRevoked state.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 for resolution.
+- id: E1943
+  name: programmatic_policy_signature_invalid
+  meaning: ProgrammaticUserPolicy envelope Ed25519 signature verification failed.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 §1.3.
+- id: E1944
+  name: programmatic_policy_replay_detected
+  meaning: ProgrammaticUserPolicy nonce already consumed; replay refused.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 §1.3.
+- id: E1945
+  name: programmatic_policy_revoked
+  meaning: ProgrammaticUserPolicy revoked, expired, or outside its time window.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error. See DR-14 §1.3.
+- id: E1946
+  name: policy_store_path_uncanonical
+  meaning: Runtime policy store path cannot prove canonical-root lineage.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error.
+- id: E1947
+  name: policy_snapshot_drift
+  meaning: Live EffectivePolicy digest differs from the policy snapshot digest.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error.
+- id: E1948
+  name: confirm_token_weak
+  meaning: --confirm-cost token below the ORBIT-CONFIRM/v1 entropy/format floor.
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error.
+- id: E1949
+  name: nonce_hold_lost
+  meaning: Pending-nonce hold lost (crash between signature verify and Ledger record).
+  raised_in:
+  - DR-14
+  hint: DR-14 User Authority error.
+totals:
+  codes: 205
+  families: E01..E19 + E10xx reserved

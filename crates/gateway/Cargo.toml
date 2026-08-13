@@ -1,0 +1,22 @@
+# ORBIT orbit-gateway — Phase B implementation
+# PURPOSE: Provider adapter, four-gate admission, credentials, streaming, retry, cost, phase router
+# Contract: DR-09 (GW-01..GW-25). B7.
+
+[package]
+name = "orbit-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Provider adapter, four-gate admission, credentials, streaming, retry, cost, phase router"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+orbit-adapter = { path = "../adapter" }
+orbit-ledger = { path = "../ledger" }
+orbit-egress = { path = "../egress" }

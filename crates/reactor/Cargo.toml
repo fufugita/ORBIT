@@ -1,0 +1,17 @@
+# ORBIT orbit-reactor — Phase B implementation
+# PURPOSE: Five-phase FSM (Init→Plan→Execute→Verify→Checkpoint), cancellation,
+#          recovery, PLAN/EXECUTE recheck, phase-router scope. Contract: DR-04. B9.
+
+[package]
+name = "orbit-reactor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Five-phase FSM (Init→Plan→Execute→Verify→Checkpoint), cancellation, recovery, PLAN/EXECUTE recheck"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true

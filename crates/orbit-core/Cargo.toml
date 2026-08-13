@@ -1,0 +1,23 @@
+# ORBIT orbit-core — Phase D implementation
+# PURPOSE: Six primitives + authority: PEB/TTE/ML/RTA/EPB/SDE, UserAuthorityIntent,
+#          ProgrammaticUserPolicy. Contracts: DR-14 (authority + kernel), DR-12 (primitives).
+
+[package]
+name = "orbit-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Six primitives + authority: PEB/TTE/ML/RTA/EPB/SDE, UserAuthorityIntent, ProgrammaticUserPolicy"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

@@ -1,0 +1,9 @@
+{
+  "schema": "orbit.evidence/reproducibility/v1",
+  "binary": "orbit",
+  "build_1_sha256": "d248dfcd9a8430b6ec82791eabe83683e8d0829fedd66bad6ed5467e542148dc",
+  "build_2_sha256": "d248dfcd9a8430b6ec82791eabe83683e8d0829fedd66bad6ed5467e542148dc",
+  "result": "identical",
+  "note": "SOURCE_DATE_EPOCH pinned in CI for byte-identical rebuilds",
+  "generated_at": "2026-08-13T23:12:35Z"
+}

@@ -1,0 +1,14 @@
+# ORBIT orbit-capability — scaffolded stub
+# PURPOSE: Capability Registry: card schema, Allow/Deny/Narrow algebra, PLAN/EXECUTE recheck, revocation
+# STATUS: STUB — no product semantics. Implement only after the
+#         specification-frozen gate (DR-03 §4) is satisfied.
+
+[package]
+name = "orbit-capability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Capability Registry: card schema, Allow/Deny/Narrow algebra, PLAN/EXECUTE recheck, revocation"
+
+[dependencies]

@@ -1,0 +1,12 @@
+{
+  "case": "mock-http-v1-sequence-skipped",
+  "error": "E0411",
+  "kind": "mock_http_v1",
+  "orbit_version_max": "0.1.x",
+  "orbit_version_min": "0.1.0",
+  "schema": "orbit.adapter-conformance/v1",
+  "sequences": [
+    0,
+    2
+  ]
+}

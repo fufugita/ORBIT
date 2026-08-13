@@ -1,0 +1,2414 @@
+schema: orbit.traceability.v1
+generated_at: 2026-08-12
+source_of_truth: vaults/ORBIT/decisions/
+features:
+- id: ORBIT-F-MODEL-001
+  claim: Every SubagentSpawn carries a non-Option ModelRef declared by the orchestrator.
+  contract: 01-subagent-model-selection.md#2 (I1, I2)
+  modules:
+  - gateway/src/model.rs
+  - reactor/src/subagent.rs
+  invariants:
+  - I1
+  - I2
+  errors:
+  - E0101
+  tests:
+    unit:
+    - plan_rejects_missing_model
+    - model_ref_id_owned_arc_no_static_leak_per_call
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-MODEL-002
+  claim: Inherit resolves to the caller's effective resolved model, one hop, denied at root.
+  contract: 01-subagent-model-selection.md#2 (I4)
+  modules:
+  - gateway/src/route.rs
+  invariants:
+  - I4
+  errors:
+  - E0102
+  tests:
+    unit:
+    - inherit_resolves_to_caller_effective_model_one_hop
+    - root_inherit_denied
+    - yaml_inherit_literal_rejected_at_root_accepted_at_depth_ge_1
+    property: []
+    concurrency:
+    - inherits_one_hop_under_concurrency
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-MODEL-003
+  claim: Depth is capped; Inherit chain guard 16, spawn_depth cap 64; exceedance aborts (never fallback).
+  contract: 01-subagent-model-selection.md#17 (decision 1)
+  modules:
+  - reactor/src/subagent.rs
+  invariants:
+  - I4
+  errors:
+  - E0103
+  tests:
+    unit:
+    - subagent_dispatch_respects_depth_cap
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-MODEL-004
+  claim: Provider drift is a non-terminal attribute on Completed; never replaces the outcome.
+  contract: 01-subagent-model-selection.md#2 (I20),
+  modules:
+  - gateway/src/drift.rs
+  - ledger/src/subagent_call.rs
+  invariants:
+  - I3
+  - I20
+  errors:
+  - E0413
+  tests:
+    unit:
+    - provider_drift_completed_does_not_become_outcome_variant
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - provider_drift_warning_at_verify
+  status: specified
+- id: ORBIT-F-MODEL-005
+  claim: Every terminal outcome carries OutcomeTail with usage, cost, latency, partial-stream digest.
+  contract: 01-subagent-model-selection.md#2 (I12),
+  modules:
+  - ledger/src/subagent_call.rs
+  - gateway/src/stream.rs
+  invariants:
+  - I12
+  errors: []
+  tests:
+    unit:
+    - outcome_tail_mandatory
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-MODEL-006
+  claim: decision_id is session-scoped ULID, 5-min TTL, atomic CAS; retry = fresh reservation.
+  contract: 01-subagent-model-selection.md#9, 06-ledger-contract.md#7
+  modules:
+  - ledger/src/decision_id.rs
+  - gateway/src/idempotency.rs
+  invariants:
+  - I15
+  errors:
+  - E0701
+  tests:
+    unit:
+    - decision_id_ttl_consumable_once_then_expired
+    property:
+    - decision_id_ttl_bounds_retry
+    concurrency:
+    - decision_id_concurrent_retries_serialize_correctly
+    - decision_id_ttl_race_no_double_consume
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-MODEL-007
+  claim: Phase router has no subagent authority; excluded from policy_snapshot_id.
+  contract: 01-subagent-model-selection.md#5, 04-reactor-contract.md#8
+  modules:
+  - gateway/src/phase_router.rs
+  invariants:
+  - I13
+  errors:
+  - E0901
+  tests:
+    unit: []
+    property:
+    - policy_snapshot_excludes_phase_router
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-MODEL-008
+  claim: policy_snapshot_id canonicalizes registry+cards+trust-root (sorted keys, NFC, LF, no comments).
+  contract: 01-subagent-model-selection.md#2 (I14), 06-ledger-contract.md#2
+  modules:
+  - ledger/src/canonical.rs
+  invariants:
+  - I13
+  - I14
+  errors: []
+  tests:
+    unit:
+    - policy_snapshot_id_stable_under_canonicalization
+    property:
+    - policy_snapshot_id_changes_under_semantic_edit
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-REACTOR-001
+  claim: Top-level phases are strictly sequential; concurrency exists only inside Execute.
+  contract: 04-reactor-contract.md#5,
+  modules:
+  - reactor/src/transitions.rs
+  - reactor/src/execute.rs
+  invariants:
+  - R-1
+  - R-2
+  errors:
+  - E0505
+  tests:
+    unit: []
+    property:
+    - phase_acyclic
+    concurrency:
+    - concurrent_subagents_execute_only
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-REACTOR-002
+  claim: CHECKPOINT is mandatory after every terminal non-success (Failed/Cancelled/Diverged).
+  contract: 04-reactor-contract.md#13
+  modules:
+  - reactor/src/checkpoint.rs
+  invariants:
+  - R-20
+  errors:
+  - E0702
+  tests:
+    unit:
+    - checkpoint_always_after_terminal_non_success
+    property:
+    - terminal_state_one_of_four
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - e2e_init_plan_exec_verify_fail_checkpoint_failed
+  status: specified
+- id: ORBIT-F-REACTOR-003
+  claim: Capability check runs at PLAN and EXECUTE; EXECUTE wins; card bytes snapshotted atomically.
+  contract: 04-reactor-contract.md#9, 05-capability-trust-contracts.md#8
+  modules:
+  - capability/src/check.rs
+  - gateway/src/admission.rs
+  invariants:
+  - R-6
+  - I11
+  errors:
+  - E0203
+  - E0204
+  tests:
+    unit:
+    - card_edit_between_check_and_dispatch_is_denied
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-REACTOR-004
+  claim: Cancellation is host abandonment; first signal wins; partial evidence preserved.
+  contract: 04-reactor-contract.md#10, 07-sandbox-wasi-contract.md#13
+  modules:
+  - reactor/src/cancellation.rs
+  - plugin/src/reclaim.rs
+  invariants:
+  - R-11
+  errors: []
+  tests:
+    unit: []
+    property: []
+    concurrency:
+    - concurrent_cancellations_one_winner
+    fault:
+    - kill_in_flight_wasi_instance
+    security: []
+    compatibility: []
+    e2e:
+    - e2e_init_plan_exec_cancel_checkpoint_cancelled
+  status: specified
+- id: ORBIT-F-REACTOR-005
+  claim: Restart is permitted at every phase boundary; state is rebuilt from the Ledger hash chain.
+  contract: 04-reactor-contract.md#11
+  modules:
+  - reactor/src/recovery.rs
+  invariants:
+  - R-12
+  errors:
+  - E0709
+  - E0105
+  tests:
+    unit: []
+    property:
+    - idempotent_restart_same_phase_no_op
+    concurrency: []
+    fault:
+    - restart_at_every_phase_boundary
+    - crash_during_subagent_dispatch
+    security: []
+    compatibility: []
+    e2e:
+    - e2e_restart_during_execute_resumes
+  status: specified
+- id: ORBIT-F-REACTOR-006
+  claim: Restricted marker pinned at INIT and immutable; ACL enforced (non-root UID, 0700/0600).
+  contract: 04-reactor-contract.md#14.5
+  modules:
+  - session/src/model.rs
+  - ledger/src/acl.rs
+  invariants:
+  - R-13
+  errors:
+  - E0703
+  - E0705
+  tests:
+    unit:
+    - restricted_marker_immutable
+    - restricted_acl_enforced
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CAP-001
+  claim: Deny-by-default; empty allow list denies everything (models, tools, fs, egress, context, host_imports).
+  contract: 05-capability-trust-contracts.md#2 (C1),
+  modules:
+  - capability/src/model.rs
+  - capability/src/registry.rs
+  invariants:
+  - I5
+  errors:
+  - E0203
+  tests:
+    unit:
+    - deny_by_default_empty_allow_denies_all
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CAP-002
+  claim: Child subagent narrows parent grants; widening rejected at spawn.
+  contract: 05-capability-trust-contracts.md#2 (C3)
+  modules:
+  - capability/src/registry.rs
+  invariants:
+  - I10
+  errors:
+  - E0206
+  tests:
+    unit:
+    - capability_plan_execute_recheck_snapshots_card
+    property:
+    - plan_execute_recheck_deterministic
+    concurrency:
+    - plan_execute_recheck_under_revocation
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CAP-003
+  claim: Card issuer must be in trust-root allowlist (I17); self-issuance prohibited.
+  contract: 05-capability-trust-contracts.md#2 (C2),
+  modules:
+  - capability/src/registry.rs
+  - trust/src/root.rs
+  invariants:
+  - I17
+  errors:
+  - E0704
+  - E0813
+  tests:
+    unit:
+    - plugin_self_issued_card_rejected_at_registry
+    - issuer_allowlist_enforced_at_capability_card_resolution
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CAP-004
+  claim: root-verified namespaces (orbit / vendor-models / community/* / personal/*).
+  contract: 02-foundation-decisions.md#2, 05-capability-trust-contracts.md#5 (M11)
+  modules:
+  - capability/src/registry.rs
+  invariants:
+  - I17
+  errors:
+  - E0207
+  - E0718
+  - E0205
+  tests:
+    unit:
+    - cross_session_grant_reuse_refused_e0205
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - cross_session_grant_reuse_attempt_denied
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-TRUST-001
+  claim: Trust-root manifest signature verified against baked-in + locally-added roots; failure refuses start (exit 2).
+  contract: 02-foundation-decisions.md#1, 05-capability-trust-contracts.md#11 (M1)
+  modules:
+  - trust/src/root.rs
+  invariants: []
+  errors:
+  - E0706
+  - E0713
+  - E0714
+  - E0715
+  - E0716
+  - E0717
+  tests:
+    unit:
+    - init_refuses_invalid_trust_root
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-TRUST-002
+  claim: Revocation worst-case 10s for new spawns; in-flight completes.
+  contract: 02-foundation-decisions.md#3, 05-capability-trust-contracts.md#7
+  modules:
+  - capability/src/registry.rs
+  - trust/src/root.rs
+  invariants: []
+  errors:
+  - E0421
+  - E0711
+  - E0712
+  tests:
+    unit:
+    - lifecycle_retired_denies_subsequent_completes_inflight
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-TRUST-003
+  claim: Attested trust level is reserved in v0.1; Standard+Local usable; cards requiring Attested rejected at parse.
+  contract: 01-subagent-model-selection.md#17 (decision 2/3), 05-capability-trust-contracts.md#2 (C7)
+  modules:
+  - capability/src/model.rs
+  - trust/src/root.rs
+  invariants: []
+  errors:
+  - E0104
+  tests:
+    unit:
+    - plan_rejects_attested_card
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-LEDGER-001
+  claim: The Ledger has exactly one writer; sequence allocation, head hash, append, fsync are owned by it.
+  contract: 06-ledger-contract.md#3
+  modules:
+  - ledger/src/writer.rs
+  invariants:
+  - I15
+  - L1
+  errors:
+  - E0700
+  - E0719
+  tests:
+    unit: []
+    property: []
+    concurrency:
+    - concurrent_appenders_ledger_seq_monotonic
+    - concurrent_dispatch_no_split_chain
+    fault:
+    - crash_during_ledger_writer_append
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-LEDGER-002
+  claim: EgressIntent is fsync-committed before DNS/reachability/TLS/credential/net-discovery.
+  contract: 06-ledger-contract.md#6.4, 09-gateway-provider-adapter.md#6.5
+  modules:
+  - ledger/src/events/egress.rs
+  - gateway/src/admission.rs
+  - sandbox/src/egr_broker.rs
+  invariants:
+  - I6
+  - GW-04
+  errors:
+  - E0301
+  - E0302
+  tests:
+    unit:
+    - fsync_failed_blocks_provider_dial
+    property: []
+    concurrency:
+    - dispatch_cannot_race_ahead_of_ledger_fsync_ack
+    fault:
+    - crash_at_every_egress_intent_append_and_fsync_boundary
+    security:
+    - no_dns_before_egress_intent_fsync_ack
+    - no_reachability_probe_before_egress_intent_fsync_ack
+    - no_tls_before_egress_intent_fsync_ack
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-LEDGER-003
+  claim: prompt_hash is the only prompt-derived field; prompt bytes never enter the Ledger or export.
+  contract: 06-ledger-contract.md#6.5, 08-context-session-memory.md#3
+  modules:
+  - ledger/src/events/subagent.rs
+  invariants:
+  - I8
+  - L5
+  errors: []
+  tests:
+    unit:
+    - prompt_bytes_never_in_ledger
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - prompt_output_and_credentials_absent_from_ledger_logs_exports_and_crash_reports
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-LEDGER-004
+  claim: Replay modes (strict/pinned/dry) replay decision binding, never claim bit-exact output; dry writes a separate scope.
+  contract: 06-ledger-contract.md#8
+  modules:
+  - ledger/src/replay.rs
+  invariants:
+  - L10
+  - L11
+  errors:
+  - E0601
+  - E0602
+  tests:
+    unit:
+    - replay_strict_refuses_on_policy_drift
+    - replay_pinned_uses_resolved_model_name
+    - dry_run_ledger_writes_no_main_chain_entry
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - e2e_replay_dry_above_cost_ceiling
+  status: specified
+- id: ORBIT-F-LEDGER-005
+  claim: Encrypted local export (age) + immutable restore into a fresh session namespace.
+  contract: 06-ledger-contract.md#9, 08-context-session-memory.md#14
+  modules:
+  - ledger/src/export.rs
+  - ledger/src/restore.rs
+  invariants:
+  - L12
+  errors:
+  - E0509
+  - E0710
+  - E0711
+  - E0723
+  tests:
+    unit:
+    - export_includes_ledger_and_memory
+    - export_excludes_prompt_bytes
+    property: []
+    concurrency: []
+    fault:
+    - restore_corrupt_bundle_refused
+    security: []
+    compatibility: []
+    e2e:
+    - export_restore_verify_roundtrip
+  status: specified
+- id: ORBIT-F-LEDGER-006
+  claim: Full event taxonomy (Session/Phase/EgressIntent/SubagentCall/Refused/CapabilityLifecycle/TrustRootLifecycle/PluginInstall/ContextLifecycle/MemoryConflict/Mistake/Redaction/Tombstone/ReplayManifest/Checkpoint/CostRollup/Export/Restore).
+  contract: 06-ledger-contract.md#5,
+  modules:
+  - ledger/src/events/
+  invariants:
+  - L9
+  errors:
+  - E0708
+  tests:
+    unit: []
+    property:
+    - auxiliary_class_inherits_next_periodic_fsync
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SAND-001
+  claim: Two distinct sandbox domains (Plugin, LocalModel); never crossing.
+  contract: 07-sandbox-wasi-contract.md#2 (S2),
+  modules:
+  - sandbox/src/profile.rs
+  - plugin/src/host.rs
+  invariants:
+  - S2
+  errors:
+  - E0802
+  tests:
+    unit:
+    - plugin_localmodel_domain_isolation
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - plugin_domain_cannot_cross_to_localmodel
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SAND-002
+  claim: seccomp filters syscall classes and address families only; the egress broker enforces destination tuples.
+  contract: 07-sandbox-wasi-contract.md#2 (S4),
+  modules:
+  - sandbox/src/seccomp.rs
+  - sandbox/src/egr_broker.rs
+  invariants:
+  - S4
+  - S6
+  errors:
+  - E0812
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - adapter_cannot_contact_unadmitted_destination
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SAND-003
+  claim: Fail-closed on every kernel-feature probe (no degraded sandbox mode).
+  contract: 07-sandbox-wasi-contract.md#2 (S5)
+  modules:
+  - sandbox/src/landlock.rs
+  - sandbox/src/seccomp.rs
+  invariants:
+  - S5
+  errors:
+  - E0803
+  - E0812
+  tests:
+    unit:
+    - landlock_unavailable_produces_e0803_no_process_spawn
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SAND-004
+  claim: Plugins run only after explicit operator install that records issuer fingerprint in local allowlist (Ledger::PluginInstall).
+  contract: 02-foundation-decisions.md#4, 07-sandbox-wasi-contract.md#11
+  modules:
+  - plugin/src/install_receipt.rs
+  - trust/src/allowlist.rs
+  invariants:
+  - S9
+  errors:
+  - E0806
+  - E0813
+  - E0804
+  tests:
+    unit:
+    - plugin_install_requires_ledger_event
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SAND-005
+  claim: WASI 0.2 host-import allowlist enforced at link time; raw network/audit/replay/credentials denied.
+  contract: 07-sandbox-wasi-contract.md#10
+  modules:
+  - plugin/src/import_allowlist.rs
+  invariants:
+  - S8
+  - S12
+  errors:
+  - E0808
+  - E0801
+  - E0809
+  tests:
+    unit:
+    - wasi_plugin_cannot_bypass_four_gate_via_raw_import
+    - wasi_plugin_cannot_invoke_audit_or_replay_verbs
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SAND-006
+  claim: Host abandonment is bounded (WASI_INSTANCE_POOL_MAX=64; reclaim budget 250ms; leak asserts zero).
+  contract: 07-sandbox-wasi-contract.md#2 (S11),
+  modules:
+  - plugin/src/reclaim.rs
+  invariants:
+  - S11
+  errors:
+  - E0807
+  - E0810
+  - E0811
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault:
+    - kill_in_flight_wasi_instance
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SAND-007
+  claim: Local models bind Landlock + seccomp network-deny before first inference; loopback only via broker with explicit
+    capability.
+  contract: 01-subagent-model-selection.md#2 (I19), 07-sandbox-wasi-contract.md#8.5
+  modules:
+  - sandbox/src/profile.rs
+  - sandbox/src/egr_broker.rs
+  invariants:
+  - I19
+  - S2
+  errors:
+  - E0803
+  - E0307
+  - E0310
+  - E0805
+  tests:
+    unit:
+    - local_trust_blocks_network_syscalls
+    - local_model_binds_sandbox_before_first_inference
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - local_direct_process_has_no_network_syscalls
+    - loopback_local_requires_explicit_card_and_egress_intent
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CTX-001
+  claim: Working memory is a policy-configured 200,000-token window (model override); oldest-unreferenced eviction; compaction
+    summary+source hashes.
+  contract: 02-foundation-decisions.md#6, 08-context-session-memory.md#6
+  modules:
+  - context/src/segment.rs
+  - context/src/lifecycle.rs
+  invariants:
+  - CTX-I2
+  errors:
+  - E0501
+  - E0511
+  - E0506
+  - E0502
+  - E0503
+  - E0510
+  - E0512
+  - E0513
+  tests:
+    unit:
+    - window_above_model_cap_rejected
+    - eviction_tombstone_hash_mismatch_blocks
+    property:
+    - eviction_monotonic_no_segment_revived
+    concurrency: []
+    fault: []
+    security:
+    - cross_segment_read_default_denied
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CTX-002
+  claim: Layered persistent memory (global < project < path-local); more-specific wins; same-scope latest modified wins; prior
+    digest retained in ConflictEvent.
+  contract: 02-foundation-decisions.md#6, 08-context-session-memory.md#7
+  modules:
+  - memory/src/files.rs
+  - memory/src/conflict.rs
+  invariants:
+  - CTX-I7
+  - CTX-I8
+  errors:
+  - E0504
+  - E0503
+  - E0510
+  tests:
+    unit:
+    - eager_load_size_exceeded
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CTX-003
+  claim: Session FSM (Start/Run/Checkpoint/Resume/End/CrashRecovered); restart rebuilds from Ledger; restricted ACL re-validated.
+  contract: 08-context-session-memory.md#5,
+  modules:
+  - session/src/fsm.rs
+  - session/src/model.rs
+  invariants:
+  - CTX-I1
+  - CTX-I5
+  errors:
+  - E0505
+  - E0703
+  - E0705
+  - E0721
+  tests:
+    unit:
+    - restricted_marker_immutable
+    - restricted_acl_enforced
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CTX-004
+  claim: PIB is the only cross-machine identity; exports signed by source PIB; restore requires destination in allowlist.
+  contract: 08-context-session-memory.md#13
+  modules:
+  - pib/src/identity.rs
+  invariants:
+  - CTX-I11
+  errors:
+  - E0722
+  - E0507
+  - E0508
+  tests:
+    unit:
+    - pib_export_to_unlisted_refused
+    - restore_to_unlisted_pib_refused
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - pib_private_key_never_serialized
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CTX-005
+  claim: Cost rollup is integer u64 with checked_add; overflow refuses (E0702); mixed currencies never scalar-converted.
+  contract: 08-context-session-memory.md#9, 09-gateway-provider-adapter.md#13
+  modules:
+  - session/src/rollup.rs
+  - pricing/src/calculate.rs
+  invariants:
+  - CTX-I12
+  errors:
+  - E0702
+  - E0420
+  - E0419
+  tests:
+    unit:
+    - checkpoint_rollup_overflow_refused
+    property:
+    - cost_no_float
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - mixed_currency_map
+  status: specified
+- id: ORBIT-F-GW-001
+  claim: No DNS/reachability/socket/proxy/TLS/credential-resolution/live-discovery before EgressIntent fsync ACK.
+  contract: 09-gateway-provider-adapter.md#6.5
+  modules:
+  - gateway/src/admission.rs
+  - egress/src/intent.rs
+  invariants:
+  - GW-04
+  errors:
+  - E0301
+  - E0302
+  - E0401
+  - E0406
+  - E0409
+  - E0416
+  tests:
+    unit: []
+    property: []
+    concurrency:
+    - dispatch_cannot_race_ahead_of_ledger_fsync_ack
+    fault: []
+    security:
+    - no_dns_before_egress_intent_fsync_ack
+    - network_credential_source_blocked_before_dispatch
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-GW-002
+  claim: No subagent fallback; retry same-route only; at most one automatic retry; ambiguous non-idempotent never auto-reissued.
+  contract: 09-gateway-provider-adapter.md#8
+  modules:
+  - gateway/src/retry.rs
+  - gateway/src/idempotency.rs
+  invariants:
+  - GW-06
+  - GW-08
+  - GW-09
+  errors:
+  - E0412
+  - E0404
+  - E0407
+  - E0410
+  - E1001
+  tests:
+    unit: []
+    property:
+    - random_retry_sequences_never_change_route_or_exceed_two_attempts
+    concurrency:
+    - concurrent_retry_reservation_permits_one_second_attempt
+    fault:
+    - ambiguous_non_idempotent_restart_not_reissued
+    - verified_idempotent_same_route_recovery_once
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-GW-003
+  claim: Credentials never enter workflows, plugins, Ledger, trace, export, logs, crash reports, or CLI JSON.
+  contract: 09-gateway-provider-adapter.md#10
+  modules:
+  - credentials/src/lease.rs
+  - credentials/src/redaction.rs
+  invariants:
+  - GW-16
+  - GW-21
+  - GW-22
+  errors:
+  - E0402
+  - E0403
+  - E0418
+  - E0405
+  - E0411
+  - E0415
+  - E0417
+  tests:
+    unit:
+    - secret_bytes_has_no_display_and_zeroizes_on_drop
+    - credential_file_acl_validation
+    property: []
+    concurrency:
+    - credential_rotation_vs_dispatch_uses_one_immutable_version
+    fault: []
+    security:
+    - wasi_plugin_cannot_obtain_credential_lease
+    compatibility: []
+    e2e:
+    - credential_rotation_old_leases_finish_new_call_gets_new_version
+  status: specified
+- id: ORBIT-F-GW-004
+  claim: Provider/deployment/region/adapter profile/endpoint/pricing pinned per call; immutable.
+  contract: 09-gateway-provider-adapter.md#4,
+  modules:
+  - gateway/src/dispatch.rs
+  invariants:
+  - GW-05
+  - GW-23
+  errors:
+  - E0413
+  - E0422
+  tests:
+    unit:
+    - route_binding_contains_provider_deployment_region_profile_endpoint_and_price_pins
+    property:
+    - route_pin_fields_remain_immutable_under_all_state_transitions
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-GW-005
+  claim: Pinned replay never substitutes any binding component; retired/unavailable refuses and offers dry.
+  contract: 09-gateway-provider-adapter.md#12.4
+  modules:
+  - ledger/src/replay.rs
+  invariants:
+  - GW-25
+  errors:
+  - E0421
+  - E0307
+  - E0310
+  - E0408
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - retired_pinned_replay_requires_explicit_allow_and_never_substitutes
+  status: specified
+- id: ORBIT-F-GW-006
+  claim: Provider-neutral adapters; no proprietary SDK in core; supported providers = signed profile + conformance evidence.
+  contract: 09-gateway-provider-adapter.md#3,
+  modules:
+  - provider-adapter/src/trait.rs
+  - gateway-conformance/
+  invariants:
+  - GW-01
+  - GW-30
+  errors:
+  - E0414
+  - E0423
+  - E0401
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility:
+    - adapter_conformance_suite_per_profile
+    e2e: []
+  status: specified
+- id: ORBIT-F-FOUND-001
+  claim: Denial envelope exposes reason_class + hint; oracle-proof uniform denial is v0.2.
+  contract: 01-subagent-model-selection.md#17 (decision 5),
+  modules:
+  - cli/src/errors.rs
+  invariants: []
+  errors: []
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - probing_oracle_accepted_v0_1_tradeoff
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CLI-001
+  claim: Single binary, single command tree; 15 commands matching DR-03 §3.2.
+  contract: 10-cli-hud-brand-onboarding.md#3
+  modules:
+  - cli/src/main.rs
+  - cli/src/commands/
+  invariants:
+  - CLI-01
+  - CLI-02
+  errors:
+  - E1100
+  - E1101
+  tests:
+    unit:
+    - cli_help_shows_all_commands
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - cli_run_example_session
+  status: specified
+- id: ORBIT-F-CLI-002
+  claim: 'Config layers: flags > env > workspace > user > system > defaults; restricted-session override lock.'
+  contract: 10-cli-hud-brand-onboarding.md#4
+  modules:
+  - cli/src/config.rs
+  invariants:
+  - CLI-13
+  - CLI-19
+  errors:
+  - E1106
+  tests:
+    unit:
+    - config_precedence_order
+    - restricted_config_override_lock
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CLI-003
+  claim: Exit codes map ORBIT-E to BSD supercodes; E1100-E110D allocated for CLI/HUD.
+  contract: 10-cli-hud-brand-onboarding.md#5
+  modules:
+  - cli/src/errors.rs
+  invariants:
+  - CLI-02
+  errors:
+  - E1100
+  - E1101
+  - E1102
+  - E1103
+  - E1104
+  - E1105
+  - E1106
+  - E1107
+  - E1108
+  - E1109
+  - E110A
+  - E110B
+  - E110C
+  - E110D
+  tests:
+    unit:
+    - exit_code_supercodes
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - cli_exit_code_on_error
+  status: specified
+- id: ORBIT-F-CLI-004
+  claim: Structured JSON output with mandatory envelope (schema_version, tool, status, errors[], data).
+  contract: 10-cli-hud-brand-onboarding.md#7
+  modules:
+  - cli/src/output.rs
+  invariants:
+  - CLI-03
+  - CLI-04
+  - CLI-05
+  errors:
+  - E1102
+  tests:
+    unit:
+    - json_envelope_mandatory_fields
+    property:
+    - json_output_schema_versioned
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - json_output_golden
+  status: specified
+- id: ORBIT-F-CLI-005
+  claim: No outbound telemetry default; E110B raised on violation; local logs defined as non-telemetry.
+  contract: 10-cli-hud-brand-onboarding.md#8.5
+  modules:
+  - cli/src/safety.rs
+  invariants:
+  - CLI-07
+  errors:
+  - E110B
+  tests:
+    unit:
+    - telemetry_default_off
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - sockstat_no_outbound_fd
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CLI-006
+  claim: Redaction categories (prompt, credential, provider internals, etc.) enforced before serialization.
+  contract: 10-cli-hud-brand-onboarding.md#8.1
+  modules:
+  - cli/src/safety.rs
+  - cli/src/redact/
+  invariants:
+  - CLI-08
+  errors: []
+  tests:
+    unit:
+    - redaction_categories_comprehensive
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - security_filter_prompt_injection
+    - security_filter_no_secret_emission
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CLI-007
+  claim: Restricted-session owner check at startup and before every mutating command.
+  contract: 10-cli-hud-brand-onboarding.md#8.3
+  modules:
+  - cli/src/safety.rs
+  - session/src/acl.rs
+  invariants:
+  - CLI-09
+  - CLI-19
+  errors:
+  - E0703
+  - E0705
+  - E0721
+  tests:
+    unit:
+    - restricted_marker_immutable
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - uds_forged_credentials_rejected
+    - stolen_owner_token_rejected
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CLI-008
+  claim: 'Replay/Sunset double-lock: --pinned requires both --allow-retired-pinned and --confirm-cost.'
+  contract: 10-cli-hud-brand-onboarding.md#8.4
+  modules:
+  - cli/src/commands/replay.rs
+  invariants:
+  - CLI-10
+  errors:
+  - E1108
+  - E0421
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - retired_pinned_replay_requires_explicit_allow
+  status: specified
+- id: ORBIT-F-HUD-001
+  claim: HUD is display-only; consumes HudEvents from Reactor; never mutates any subsystem.
+  contract: 10-cli-hud-brand-onboarding.md#§3
+  modules:
+  - hud/src/lib.rs
+  - hud/src/event.rs
+  invariants:
+  - H-1
+  - H-2
+  - H-23
+  errors: []
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - hud_never_writes_to_ledger
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-HUD-002
+  claim: DisplaySafeString gate scrubs ANSI/NUL/control/prompt/secret/card/plan/egress-URL before rendering.
+  contract: 10-cli-hud-brand-onboarding.md#§3.2
+  modules:
+  - hud/src/safety.rs
+  invariants:
+  - H-3
+  errors: []
+  tests:
+    unit:
+    - display_safe_string_scrub
+    property:
+    - display_safety_no_prompt_bytes
+    - display_safety_no_card_bytes
+    concurrency: []
+    fault: []
+    security:
+    - security_filter_ansi_injection
+    - security_filter_fuzz_hudevent
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-HUD-003
+  claim: 'Brand: white+magenta, ASCII ORBIT, three-tier fallback (Anim/Static/Text/Off), default-off, 4fps logo, 0fps body.'
+  contract: 10-cli-hud-brand-onboarding.md#§4
+  modules:
+  - hud/src/brand/
+  invariants:
+  - H-4
+  - H-5
+  - H-6
+  - H-15
+  errors: []
+  tests:
+    unit: []
+    property:
+    - brand_tier_no_runtime_promote
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - golden_orbit_letterform_4frames
+  status: specified
+- id: ORBIT-F-HUD-004
+  claim: 'Hard downgrade conditions: NO_COLOR > CI > screen-reader > TERM=dumb > non-UTF-8 > COLORTERM.'
+  contract: 10-cli-hud-brand-onboarding.md#§15.1
+  modules:
+  - hud/src/env.rs
+  invariants:
+  - H-7
+  - H-8
+  errors: []
+  tests:
+    unit:
+    - env_negotiate_precedence_ladder
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - a11y_no_color_env_forces_plain
+    - a11y_ci_env_forces_json
+  status: specified
+- id: ORBIT-F-HUD-005
+  claim: 'JSON envelope: {v, type, ts, phase?, payload}; additive-minor / breaking-major bump policy.'
+  contract: 10-cli-hud-brand-onboarding.md#§16.6
+  modules:
+  - hud/src/event.rs
+  invariants:
+  - H-9
+  errors: []
+  tests:
+    unit:
+    - json_envelope_keys_pinned
+    property:
+    - json_envelope_keys_stable
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - snapshot_json_session_completed
+  status: specified
+- id: ORBIT-F-HUD-006
+  claim: Stdout writes serialized across brand ticker, body ticker, and diff task via per-stream write mutex (H-24).
+  contract: 10-cli-hud-brand-onboarding.md#§17 H-24
+  modules:
+  - hud/src/stream.rs
+  invariants:
+  - H-24
+  - H-9
+  - H-10
+  errors: []
+  tests:
+    unit: []
+    property: []
+    concurrency:
+    - concurrent_brand_ticker_body_ticker_no_state_share
+    - stream_split_per_frame_lock
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-HUD-007
+  claim: 'Phase-strip, ledger ticker, subagent queue, capability foot, cost bar: event-derived, display-only, digest-only.'
+  contract: 10-cli-hud-brand-onboarding.md#§6-§11
+  modules:
+  - hud/src/region/
+  invariants:
+  - H-17
+  - H-18
+  - H-19
+  - H-20
+  - H-21
+  - H-22
+  errors: []
+  tests:
+    unit: []
+    property:
+    - cost_no_float
+    concurrency: []
+    fault: []
+    security:
+    - security_filter_no_provider_field_emission
+    compatibility: []
+    e2e:
+    - capability_foot_counts_only
+    - subagent_queue_shows_declared_only
+  status: specified
+- id: ORBIT-F-HUD-008
+  claim: Coalescing 250ms bound, one-way backpressure, 50ms resize debounce, demote-only layout.
+  contract: 10-cli-hud-brand-onboarding.md#§12-§13
+  modules:
+  - hud/src/refresh.rs
+  - hud/src/resize.rs
+  invariants:
+  - H-10
+  - H-11
+  - H-12
+  errors: []
+  tests:
+    unit: []
+    property:
+    - coalescing_window_closes_under_250ms
+    - output_mode_no_runtime_promote
+    concurrency:
+    - concurrent_backpressure_demotion
+    - concurrent_coalescer_watchdog
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - backpressure_demotion
+  status: specified
+- id: ORBIT-F-HUD-009
+  claim: 17 v0.1 scope locks (brand default-off, downgrade-only, white+magenta, etc.) cannot be relaxed by patches.
+  contract: 10-cli-hud-brand-onboarding.md#§20
+  modules:
+  - hud/src/
+  invariants:
+  - H-4
+  - H-5
+  - H-7
+  - H-8
+  - H-23
+  - H-24
+  errors: []
+  tests:
+    unit: []
+    property:
+    - brand_tier_no_runtime_promote
+    - output_mode_no_runtime_promote
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-PEB-001
+  claim: 'PEB typed ingress: submission → receipt; data minimization; no raw prompt bytes in Ledger.'
+  contract: 12-six-primitives.md#§4
+  modules:
+  - orbit-core/src/peb/
+  invariants:
+  - PEB-I1
+  - PEB-I2
+  - PEB-I3
+  - PEB-I4
+  - PEB-I5
+  - PEB-I6
+  - PEB-I7
+  - PEB-I8
+  - PEB-I9
+  - PEB-I10
+  - PEB-I11
+  errors:
+  - E1201
+  - E1202
+  - E1203
+  - E1204
+  - E1205
+  tests:
+    unit:
+    - peb_submission_unique_per_session
+    - peb_cancel_idempotent
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - peb_never_grants_from_text
+    compatibility: []
+    e2e:
+    - peb_ingress_to_tte
+  status: specified
+- id: ORBIT-F-TTE-001
+  claim: 'TTE capability-gated execution: task → receipt/status; declared ModelRef only; no model selection.'
+  contract: 12-six-primitives.md#§5
+  modules:
+  - orbit-core/src/tte/
+  invariants:
+  - TTE-I1
+  - TTE-I2
+  - TTE-I3
+  - TTE-I4
+  - TTE-I5
+  - TTE-I6
+  - TTE-I7
+  - TTE-I8
+  - TTE-I9
+  - TTE-I10
+  - TTE-I11
+  - TTE-I12
+  - TTE-I13
+  errors:
+  - E1301
+  - E1302
+  - E1303
+  - E1304
+  - E1305
+  tests:
+    unit:
+    - tte_never_selects_model
+    - tte_task_ids_unique
+    property:
+    - tte_dependency_graph_acyclic
+    concurrency:
+    - tte_concurrent_bounded_by_spawn_depth
+    fault: []
+    security:
+    - tte_tool_call_capability_gated
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-ML-001
+  claim: 'ML governed by context grants: create/read/export/delete; digest-verified; PIB-scoped.'
+  contract: 12-six-primitives.md#§6
+  modules:
+  - orbit-core/src/ml/
+  invariants:
+  - ML-I1
+  - ML-I2
+  - ML-I3
+  - ML-I4
+  - ML-I5
+  - ML-I6
+  - ML-I7
+  - ML-I8
+  - ML-I9
+  - ML-I10
+  - ML-I11
+  errors:
+  - E1401
+  - E1402
+  - E1403
+  - E1404
+  - E1405
+  tests:
+    unit:
+    - ml_write_gated_by_grant
+    - ml_delete_soft_tombstone
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - ml_digest_mismatch_refused
+    compatibility: []
+    e2e:
+    - ml_write_export_restore
+  status: specified
+- id: ORBIT-F-RTA-001
+  claim: RTA records trust state; Attested reserved v0.1; assessments immutable; monotonic transitions.
+  contract: 12-six-primitives.md#§7
+  modules:
+  - orbit-core/src/rta/
+  invariants:
+  - RTA-I1
+  - RTA-I2
+  - RTA-I3
+  - RTA-I4
+  - RTA-I5
+  - RTA-I6
+  - RTA-I7
+  - RTA-I8
+  - RTA-I9
+  errors:
+  - E1501
+  - E1502
+  - E1503
+  - E1504
+  tests:
+    unit:
+    - rta_assessment_immutable_once_committed
+    - rta_attested_reserved_v0_1
+    property:
+    - rta_transitions_monotonic
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-EPB-001
+  claim: EPB bundles verifiable evidence; no prompt bytes; digest + chain of custody.
+  contract: 12-six-primitives.md#§8
+  modules:
+  - orbit-core/src/epb/
+  invariants:
+  - EPB-I1
+  - EPB-I2
+  - EPB-I3
+  - EPB-I4
+  - EPB-I5
+  - EPB-I6
+  - EPB-I7
+  - EPB-I8
+  - EPB-I9
+  errors:
+  - E1601
+  - E1602
+  - E1603
+  - E1604
+  tests:
+    unit:
+    - epb_bundle_digest_chain_of_custody
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - epb_no_prompt_bytes_in_bundle
+    compatibility: []
+    e2e:
+    - epb_build_verify
+  status: specified
+- id: ORBIT-F-SDE-001
+  claim: SDE immutable session/decision envelope; replay anchors; TTL enforced.
+  contract: 12-six-primitives.md#§9
+  modules:
+  - orbit-core/src/sde/
+  invariants:
+  - SDE-I1
+  - SDE-I2
+  - SDE-I3
+  - SDE-I4
+  - SDE-I5
+  - SDE-I6
+  - SDE-I7
+  - SDE-I8
+  - SDE-I9
+  errors:
+  - E1701
+  - E1702
+  - E1703
+  - E1704
+  tests:
+    unit:
+    - sde_envelope_immutable_after_close
+    - sde_ttl_enforced
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - sde_derive_narrower_than_parent
+  status: specified
+- id: ORBIT-F-PEB-002
+  claim: 'PEB composition guardrails: no provider selection, no boundary bypass, acyclic.'
+  contract: 12-six-primitives.md#§5
+  modules:
+  - orbit-core/src/peb/
+  invariants:
+  - PEB-I1
+  - PEB-I5
+  errors: []
+  tests:
+    unit:
+    - peb_composition_guardrail_no_provider_selection
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - peb_boundary_no_bypass
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SDK-001
+  claim: SDK refuses to spawn on DR-01..09 invariant violation; typed E1801-E1810 errors.
+  contract: 11-sdk-claude-workflow-migration.md#7
+  modules:
+  - orbit-sdk
+  - orbit-ledger
+  invariants: []
+  errors:
+  - E1801
+  - E1802
+  - E1803
+  - E1804
+  - E1805
+  - E1806
+  - E1807
+  - E1808
+  - E1809
+  - E1810
+  - E1821
+  - E1822
+  - E1824
+  - E1825
+  tests:
+    unit:
+    - sdk_refuses_invariant_violation_at_construction
+    property:
+    - sdk_construction_typed_errors
+    concurrency: []
+    fault: []
+    security:
+    - sdk_no_implicit_grant
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SDK-002
+  claim: No raw prompt bytes in Ledger or export; only BLAKE3 digests.
+  contract: 11-sdk-claude-workflow-migration.md#8
+  modules:
+  - orbit-sdk
+  - orbit-ledger
+  invariants: []
+  errors:
+  - E1810
+  - E1823
+  - E1830
+  - E1846
+  tests:
+    unit:
+    - sdk_prompt_bytes_never_in_ledger
+    property:
+    - sdk_redaction_no_prompt_bytes
+    concurrency: []
+    fault: []
+    security:
+    - sdk_ledger_prompt_leak_fuzz
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SDK-003
+  claim: 'Restricted ACL: non-root UID, ledger dir 0700, files 0600.'
+  contract: 11-sdk-claude-workflow-migration.md#8
+  modules:
+  - orbit-sdk
+  - orbit-ledger
+  invariants: []
+  errors:
+  - E1806
+  tests:
+    unit:
+    - sdk_restricted_acl_nonroot_uid
+    - sdk_ledger_dir_0700_files_0600
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SDK-004
+  claim: ModelRef validated at spawn time; empty/unresolvable → E1801/E1802.
+  contract: 11-sdk-claude-workflow-migration.md#8
+  modules:
+  - orbit-sdk
+  invariants: []
+  errors:
+  - E1801
+  - E1802
+  - E1826
+  tests:
+    unit:
+    - sdk_modelref_empty_refused
+    - sdk_modelref_unresolvable_refused
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SDK-005
+  claim: EgressIntent append + fsync BEFORE DNS/TLS/credentials/network.
+  contract: 11-sdk-claude-workflow-migration.md#8
+  modules:
+  - orbit-egress
+  invariants: []
+  errors:
+  - E1828
+  - E1827
+  tests:
+    unit:
+    - sdk_egress_intent_before_network
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - sdk_no_dns_before_fsync_ack
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-SDK-006
+  claim: Phase router invokable only from orchestrator role.
+  contract: 11-sdk-claude-workflow-migration.md#8
+  modules:
+  - orbit-router
+  invariants: []
+  errors:
+  - E1808
+  - E1829
+  tests:
+    unit:
+    - sdk_phase_router_orchestrator_only
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - sdk_subagent_phase_router_denied
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-MIG-001
+  claim: Migration emits YAML for safe mappings only; unsafe → typed errors + TODO.yaml.
+  contract: 11-sdk-claude-workflow-migration.md#6
+  modules:
+  - orbit-migrate
+  invariants: []
+  errors:
+  - E1841
+  - E1842
+  - E1843
+  - E1844
+  - E1845
+  - E1846
+  - E1847
+  - E1848
+  - E1849
+  - E1850
+  - E1851
+  - E1852
+  - E1853
+  - E1854
+  - E1864
+  - E1865
+  - E1866
+  - E1867
+  tests:
+    unit:
+    - mig_safe_mapping_emits_yaml
+    - mig_unsafe_mapping_refused
+    - mig_runtime_fallback_removed
+    property:
+    - mig_deterministic_same_source_same_yaml
+    concurrency: []
+    fault: []
+    security: []
+    compatibility:
+    - mig_corpus_semantic_equivalence
+    e2e:
+    - mig_bundle_valid_only_when_all_safe
+  status: specified
+- id: ORBIT-F-MIG-002
+  claim: Migration bundle valid iff all subgraphs safe and no E184x errors.
+  contract: 11-sdk-claude-workflow-migration.md#6
+  modules:
+  - orbit-migrate
+  - orbit-conformance
+  invariants: []
+  errors:
+  - E1849
+  tests:
+    unit:
+    - mig_bundle_verdict_safe_unsafe_partial
+    - mig_no_silent_drop
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility:
+    - mig_no_silent_drop_fixture
+    e2e: []
+  status: specified
+- id: ORBIT-F-CONF-001
+  claim: Conformance harness refuses certification when security axis uncovered.
+  contract: 11-sdk-claude-workflow-migration.md#9
+  modules:
+  - orbit-conformance
+  invariants: []
+  errors:
+  - E1861
+  - E1862
+  - E1868
+  - E1869
+  - E1864
+  - E1865
+  - E1866
+  - E1867
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility:
+    - typescript_python_same_fixture_byte_identical
+    - fixture_version_fence
+    e2e: []
+  status: specified
+- id: ORBIT-F-DIST-001
+  claim: Linux-only v0.1; kernel floor 5.13 (Landlock); no silent degradation.
+  contract: 13-distribution-release.md#1
+  modules:
+  - orbit-platform
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_kernel_floor_5_13
+    - dist_landlock_probe_fail_refuses
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-DIST-002
+  claim: Static musl binary; WASI runtime vendored; zero external deps.
+  contract: 13-distribution-release.md#2
+  modules:
+  - orbit-build
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_static_musl_binary
+    - dist_wasi_runtime_vendored
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-DIST-003
+  claim: Semver-compat drop-in upgrades; major carries migration plan; rollback = export-restore.
+  contract: 13-distribution-release.md#3
+  modules:
+  - orbit-upgrade
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_semver_compat_drop_in
+    - dist_major_migration_plan
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility:
+    - dist_ledger_format_forward_backward
+    e2e: []
+  status: specified
+- id: ORBIT-F-DIST-004
+  claim: Apache-2.0 core + MIT/Apache-2.0 shims; NOTICE generation automated.
+  contract: 13-distribution-release.md#4
+  modules:
+  - orbit-license
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_license_apache2_core
+    - dist_shim_dual_mit_apache2
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-DIST-005
+  claim: Permissive-only deps; cargo-audit + cargo-deny enforced.
+  contract: 13-distribution-release.md#5
+  modules:
+  - orbit-deps
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_dependency_license_allowlist
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - dist_cargo_deny_blocks_copyleft
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-DIST-006
+  claim: Zero outbound telemetry in v0.1; local logs only; future telemetry requires separate DR.
+  contract: 13-distribution-release.md#6
+  modules:
+  - orbit-telemetry
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_no_outbound_telemetry
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - dist_network_monitor_no_egress
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-DIST-007
+  claim: 9-item release gate CI; any failure blocks release.
+  contract: 13-distribution-release.md#7
+  modules:
+  - orbit-ci
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_release_gate_9_item_ci
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e:
+    - dist_clean_machine_install_verify
+  status: specified
+- id: ORBIT-F-DIST-008
+  claim: SPDX 2.3 SBOM + SLSA provenance + GPG/Sigstore signing.
+  contract: 13-distribution-release.md#8
+  modules:
+  - orbit-release
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_sbom_spdx_generated
+    - dist_artifact_signed
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - dist_signature_verification
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-DIST-009
+  claim: Reproducible builds verified via twin-build comparison.
+  contract: 13-distribution-release.md#8
+  modules:
+  - orbit-build
+  invariants: []
+  errors: []
+  tests:
+    unit:
+    - dist_reproducible_twin_build_byte_identical
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-UAI-001
+  claim: UserAuthorityIntent is the only authority ingress; typed, confirmed, digest-only.
+  contract: 14-user-authority-information-flow.md#1
+  modules:
+  - orbit-core/src/authority/
+  invariants:
+  - UAI-I1
+  - UAI-I2
+  - UAI-I3
+  - UAI-I4
+  - UAI-I6
+  - UAI-I7
+  - UAI-I8
+  - UAI-I5
+  - UAI-I9
+  - UAI-I10
+  errors:
+  - E1902
+  - E1906
+  - E1907
+  - E1908
+  - E1909
+  - E1946
+  - E1947
+  - E1948
+  - E1949
+  tests:
+    unit:
+    - uai_typed_ingress_only
+    - directive_target_unknown_axis_refused
+    - auto_fallback_user_chain_wins
+    - auto_fallback_steps_to_capability_equivalent_only
+    - auto_fallback_recursion_per_mode
+    - auto_fallback_no_qualifying_model_fails
+    - efficiency_always_ledger_visible
+    - efficiency_never_trades_kernel
+    - auto_mode_no_per_action_prompts
+    - auto_destructive_flagged_not_blocked
+    - auto_mode_never_widens
+    - auto_mode_kernel_absolute
+    - guided_mode_widening_confirms
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - subagent_cannot_grant
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-UAI-002
+  claim: 'Provenance separation: only UserTypedTurn/Prior/ProgrammaticUserPolicy create authority; NonAuthoritative content
+    never does.'
+  contract: 14-user-authority-information-flow.md#2
+  modules:
+  - orbit-core/src/authority/provenance.rs
+  invariants:
+  - KERN-3
+  - UAI-I4
+  errors:
+  - E1901
+  - E1904
+  - E1905
+  - E1943
+  - E1944
+  - E1945
+  tests:
+    unit:
+    - provenance_segregation
+    - quoted_directive_treated_as_data
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - subagent_cannot_grant
+    - tool_output_injection_refused
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-UAI-003
+  claim: 'Interpret-then-confirm: any widening requires human-readable confirmation; non-interactive requires --confirm-cost
+    token bound to the diff.'
+  contract: 14-user-authority-information-flow.md#2
+  modules:
+  - cli/src/confirm.rs
+  invariants:
+  - UAI-I2
+  errors:
+  - E1911
+  - E1912
+  - E1913
+  - E1914
+  tests:
+    unit:
+    - confirm_token_diff_mismatch
+    - confirm_token_replay_blocked
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-UAI-004
+  claim: Signed, Ledger-recorded UserAuthorityGrant; digest-only event; fsync before effective; revocation propagates to in-flight
+    TTE.
+  contract: 14-user-authority-information-flow.md#2
+  modules:
+  - ledger/src/events/authority.rs
+  - orbit-core/src/authority/grant.rs
+  invariants:
+  - KERN-1
+  - KERN-2
+  - IF-3
+  errors:
+  - E1920
+  - E1921
+  - E1922
+  - E1923
+  - E1930
+  - E1931
+  - E1932
+  - E1940
+  - E1941
+  - E1942
+  tests:
+    unit:
+    - grant_signature_required
+    - grant_write_fsync_required
+    - grant_ledger_replay
+    property: []
+    concurrency: []
+    fault:
+    - revoke_propagates_to_inflight
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-KERN-001
+  claim: Truthful append-only Ledger; no instruction can falsify/delete history.
+  contract: 14-user-authority-information-flow.md#3
+  modules:
+  - ledger/src/
+  invariants:
+  - KERN-1
+  errors: []
+  tests:
+    unit: []
+    property:
+    - ledger_hash_chain_self_describing
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-KERN-002
+  claim: No hidden actions; every primitive call emits a Ledger event (Refused is an event).
+  contract: 14-user-authority-information-flow.md#3
+  modules:
+  - ledger/src/events/
+  invariants:
+  - KERN-2
+  errors: []
+  tests:
+    unit:
+    - refused_is_an_event
+    property: []
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-KERN-003
+  claim: Credentials/keys/hashes/internal IDs never sent to external providers, even with explicit confirmation.
+  contract: 14-user-authority-information-flow.md#3
+  modules:
+  - gateway/src/admission.rs
+  - egress/src/intent.rs
+  - credentials/src/lease.rs
+  invariants:
+  - IF-2
+  - IF-3
+  - IF-5
+  - KERN-4
+  errors:
+  - E1903
+  - E0418
+  tests:
+    unit: []
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - kernel_blocks_credential_disclosure
+    - kernel_blocks_internal_id_disclosure
+    - kernel_blocks_untrusted_region
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-KERN-004
+  claim: Prompt bytes never enter Ledger/export/logs/HUD; only digests.
+  contract: 14-user-authority-information-flow.md#3
+  modules:
+  - ledger/src/
+  - hud/src/safety.rs
+  invariants:
+  - IF-1
+  - IF-4
+  - IF-7
+  - IF-12
+  errors:
+  - E1810
+  - E1830
+  - E1863
+  - E1870
+  tests:
+    unit: []
+    property:
+    - display_safety_no_prompt_bytes
+    - display_safety_no_card_bytes
+    concurrency: []
+    fault: []
+    security:
+    - security_filter_prompt_injection
+    - security_filter_no_secret_emission
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-KERN-005
+  claim: Universe of authority remains bounded by the trust-root manifest; providers/regions selected by flat name only.
+  contract: 14-user-authority-information-flow.md#4
+  modules:
+  - gateway/src/dispatch.rs
+  invariants:
+  - IF-3
+  - IF-11
+  errors:
+  - E0413
+  - E0422
+  tests:
+    unit: []
+    property:
+    - route_pin_fields_remain_immutable_under_all_state_transitions
+    concurrency: []
+    fault: []
+    security: []
+    compatibility: []
+    e2e: []
+  status: specified
+- id: ORBIT-F-CLIA-001
+  claim: Natural-language and typed authority flags produce the same UAI; widening requires a diff-bound confirmation token.
+  contract: 10-cli-hud-brand-onboarding.md#4
+  modules:
+  - cli/src/authority.rs
+  - cli/src/confirm.rs
+  invariants:
+  - CLI-A1
+  - CLI-A2
+  - CLI-A3
+  - CLI-A4
+  errors:
+  - E1109
+  - E1903
+  - E1910
+  - E1911
+  - E1912
+  - E1913
+  - E1923
+  tests:
+    unit:
+    - flag_nl_byte_equivalence
+    - confirm_token_replay_blocked
+    - confirm_token_diff_mismatch
+    property: []
+    concurrency: []
+    fault: []
+    security:
+    - stdin_does_not_become_user_typed_turn
+    compatibility: []
+    e2e: []
+  status: specified
+deferred_register:
+- item: live Attested token verification
+  target: v0.2
+  why: DR-01 §17.3; attestation plumbing unbuilt.
+- item: provider/deployment/region selection exposed to orchestrators
+  target: v0.2
+  why: DR-01 §17.4; breaks flat-string invariant I2.
+- item: runtime model fallback / auto-escalation for subagents
+  target: v0.2
+  why: DR-01 §7; no fallback in v0.1.
+- item: cross-org/federated trust roots + public marketplace
+  target: v0.2
+  why: DR-02 §1/§2.
+- item: OCSP/CRL revocation infrastructure
+  target: v0.2
+  why: DR-02 §3; 10s cache+refresh is the v0.1 bound.
+- item: Ledger entries signed by built-in HSM/TPM/operator-GPG key
+  target: v0.2
+  why: DR-01 §10; signatures optional/out-of-tree in v0.1.
+- item: provider-side idempotent re-call guarantee
+  target: v0.2
+  why: DR-09 §7; verified idempotency only when profile+conformance prove it.
+- item: WASI 0.3 async preemption
+  target: v0.3
+  why: DR-07; host abandonment is the v0.1 cancel mechanism.
+- item: cloud/account-level memory synthesis (cross-chat fade)
+  target: v0.2
+  why: DR-02 §6; no cloud in v0.1.
+- item: ORBIT-hosted cloud backup service
+  target: never / v0.2 at earliest
+  why: DR-02 §8; export is operator-owned and local.
+- item: auto-routing subagents from prompt contents
+  target: v0.2
+  why: DR-01 §16; orchestrator declares model.
+- item: speculative/ensemble execution
+  target: v0.2
+  why: DR-01 §16.
+- item: provider health/status-page routing
+  target: v0.2
+  why: DR-09 §2.2.
+- item: multi-region data-residency selection UI
+  target: v0.2
+  why: DR-01 §17.4; region pinned and auditable but not selected.
+- item: Gateway hard budget reservations + mid-stream cost abort
+  target: v0.2 (E10xx reserved)
+  why: DR-01 §7; cost is attributed, not enforced, in v0.1.
+- item: semantic cross-provider output normalization
+  target: v0.2
+  why: DR-09 §2.2; output is hashed without normalization in v0.1.
+- item: lifecycle auto-migration policy
+  target: v0.2
+  why: DR-09 §12; replacement is informational in v0.1.
+- item: universal provider cancellation guarantee
+  target: v0.2
+  why: DR-09 §2.2.
+- item: Silent/automatic runtime fallback remains forbidden; user-granted FallbackPlan is a DR-14 v0.1 override, not an auto-fallback.
+  target: DR-14 explicit grant path in v0.1; E1851 for ungranted source fallback
+  rationale: Reconciles DR-11 §5.2 with DR-14 §4.
+- item: Unallocated E19xx slots (E1915-E1919, E1924-E1929, E1933-E1939, E1950-E1999).
+  target: reserved for additive authority errors at implementation freeze/v0.2
+  rationale: Intentional gaps; E1946-E1949 allocated at pass 3 for policy store/nonce/token hardening.
+- item: adapter_conformance_suite_per_profile (ORBIT-F-GW-006)
+  target: implementation-phase M2
+  why: Requires a real provider adapter + signed profile + conformance evidence (GW-24); no adapter implemented yet.
+- item: credential_rotation_old_leases_finish_new_call_gets_new_version (ORBIT-F-GW-003)
+  target: implementation-phase M2
+  why: Requires real credential rotation with dispatch timing (GW-17); the immutable-lease invariant is unit-covered.
+- item: dispatch_cannot_race_ahead_of_ledger_fsync_ack (ORBIT-F-GW-001)
+  target: implementation-phase M2
+  why: Requires a threaded broker + Ledger fsync-ACK timing test (GW-04); ordering is structurally enforced in the egress
+    broker.
+- item: dist_semver_compat_drop_in (ORBIT-F-DIST-003)
+  target: release-gate
+  why: Requires a real installed binary version pair; covered by the clean-machine E2E at build time.
+- item: kill_in_flight_wasi_instance (ORBIT-F-SAND-006)
+  target: implementation-phase M2 (WASI runtime binding)
+  why: Requires the wasmtime host + instance pool reclaim timing (S11); pool bound is enforced in the plugin registry.
+- item: retired_pinned_replay_requires_explicit_allow_and_never_substitutes (ORBIT-F-GW-005)
+  target: implementation-phase M3 (replay engine)
+  why: Requires the full replay engine; the double-lock + never-substitute semantics are in DR-06 §8.2 and the CLI double-lock
+    path.
+open_contracts: []
+founder_decisions_pending: []

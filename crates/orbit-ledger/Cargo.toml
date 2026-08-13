@@ -1,0 +1,16 @@
+# ORBIT orbit-ledger-events — Phase G implementation
+# PURPOSE: Primitive-specific Ledger event shapes (peb/tte/ml/rta/epb/sde)
+# Contract: DR-12 (primitive Ledger events), DR-06 (digest-only rule). G.
+
+[package]
+name = "orbit-ledger-events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Primitive-specific Ledger event shapes (peb/tte/ml/rta/epb/sde)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

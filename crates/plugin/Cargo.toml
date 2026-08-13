@@ -1,0 +1,22 @@
+# ORBIT orbit-plugin — Phase B implementation
+# PURPOSE: WASI 0.2 plugin runtime: host imports, guest exports, install, instance pool
+# Contract: DR-07 (S8-S17). B8. (WASI runtime binding deferred; trust/install/allowlist/pool now.)
+
+[package]
+name = "orbit-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WASI 0.2 plugin runtime: host imports, guest exports, install, instance pool"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

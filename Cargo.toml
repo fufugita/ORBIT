@@ -1,0 +1,64 @@
+# ORBIT v0.1 — Cargo workspace (scaffolded; crates are stubs until spec-frozen)
+# Member crate list mirrors the accepted module map (DR-04..DR-14).
+# Do NOT implement product semantics before the DR-03 specification-frozen gate.
+
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+  "crates/reactor",
+  "crates/capability",
+  "crates/sandbox",
+  "crates/context",
+  "crates/gateway",
+  "crates/ledger",
+  "crates/trust",
+  "crates/session",
+  "crates/pib",
+  "crates/memory",
+  "crates/export",
+  "crates/plugin",
+  "crates/egress",
+  "crates/hud",
+  "crates/cli",
+  "crates/orbit-core",
+  "crates/orbit-api",
+  "crates/orbit-ledger",
+  "crates/orbit-ir",
+  "crates/release",
+  "crates/adapter",
+  "migrator",
+  "conformance",
+  "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"          # pinned toolchain at release; see DR-13 §4.3
+license = "Apache-2.0"         # core; shims dual (MIT OR Apache-2.0) per DR-13 §4
+repository = "https://github.com/orbit-hq/orbit"
+description = "ORBIT — the harness that orbits around you. User-authority orchestration with a strict proof/privacy kernel."
+
+[workspace.dependencies]
+# Phase-A baseline — permissive-only (DR-13 §5): MIT/Apache-2.0/BSD-3/ISC.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+ulid = { version = "1", features = ["serde"] }
+thiserror = "2"
+hex = "0.4"
+rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+zeroize = "1"
+age = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Reproducible builds (DR-13 §4.3): SOURCE_DATE_EPOCH set in CI; do not add
+# nondeterministic build metadata here.

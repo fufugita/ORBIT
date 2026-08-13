@@ -1,0 +1,53 @@
+# ORBIT cargo-deny policy (DR-13 §5 — permissive-only).
+# Whitelist encodes the accepted v0.1 dependency policy:
+#   Allowed: MIT, Apache-2.0, BSD-2/3, ISC, 0BSD, Unlicense, CC0-1.0 (data)
+# Anything not allowlisted (incl. all copyleft) fails the check (default deny).
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Any advisory (incl. yanked) fails the check.
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    # Unicode-3.0: permissive Unicode data license used by unicode-ident /
+    # tinystr (ICU ecosystem). Not copyleft / source-available — within
+    # DR-13 §5 permissive-only policy.
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+# Explicit copyleft / source-available ban (DR-13 §5).
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "AGPL-3.0",
+    "LGPL-2.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+    "MPL-2.0",
+    "BUSL-1.1",
+    "Elastic-2.0",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,33 @@
+# ORBIT orbit-cli — Phase E implementation
+# PURPOSE: CLI: command tree, config precedence, exit codes, structured output,
+#          authority flags, confirmation. Contract: DR-10 Part A + DR-14. E17.
+
+[package]
+name = "orbit-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI: command tree, config precedence, exit codes, structured output, authority flags, confirmation"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+age.workspace = true
+zeroize.workspace = true
+
+orbit-trust = { path = "../trust" }
+orbit-ledger = { path = "../ledger" }
+orbit-pib = { path = "../pib" }
+orbit-export = { path = "../export" }
+orbit-reactor = { path = "../reactor" }
+orbit-release = { path = "../release" }
+
+[[bin]]
+name = "orbit"
+path = "src/main.rs"

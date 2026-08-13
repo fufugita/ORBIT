@@ -1,0 +1,18 @@
+# ORBIT orbit-memory — Phase C implementation
+# PURPOSE: Layered persistent memory: global<project<path-local, digest verification
+# Contract: DR-08 (CTX-I7..I9, I16). C11.
+
+[package]
+name = "orbit-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Layered persistent memory: global<project<path-local, digest verification"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true

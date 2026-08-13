@@ -1,0 +1,9 @@
+{
+  "schema": "orbit.evidence/benchmarks/v1",
+  "target": "x86_64-unknown-linux-musl release",
+  "ledger_append_per_op_ns": 532108,
+  "ledger_append_ops_per_sec": 1879,
+  "ops": 1000,
+  "note": "measured from a real release-mode run; includes segment fsync on close",
+  "generated_at": "2026-08-13T20:50:41Z"
+}

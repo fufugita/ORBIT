@@ -1,0 +1,16 @@
+# ORBIT orbit-session — Phase C implementation
+# PURPOSE: Session lifecycle/FSM, restricted ACL, memory binding, cost rollup, export/restore
+# Contract: DR-08 (CTX-I5, I6, I12, I13, I14). C12.
+
+[package]
+name = "orbit-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Session lifecycle/FSM, restricted ACL, memory binding, cost rollup, export/restore"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

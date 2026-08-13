@@ -1,0 +1,12 @@
+{
+  "schema": "orbit.e2e-summary/v1",
+  "dr03_gate_row": "§5 row 9",
+  "status": "PASS",
+  "steps": [
+    "install", "initialize_trust", "run_example", "cancel", "verify_ledger",
+    "replay_dry", "export_encrypted", "restore_fresh_namespace", "verify_restored"
+  ],
+  "dispatches_during_replay": 0,
+  "immutable_restore": true,
+  "evidence": "evidence/v0.1/demo-transcript.md"
+}

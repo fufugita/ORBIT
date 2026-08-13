@@ -1,0 +1,38 @@
+# ORBIT v0.1 — specification manifest
+# Generated 2026-08-12. Machine-readable summary of the frozen spec.
+# STATUS: specification-frozen YES (2026-08-12, founder sign-off). Implementation not started.
+
+orbit_version: 0.1.0
+schema: orbit.spec-manifest.v1
+
+gate:
+  specification_frozen: YES           # 2026-08-12, founder sign-off; DR-03 §4 all rows satisfied
+  implementation_complete: NO
+  audited_release_ready: NO
+
+contracts:
+  accepted: [DR-00, DR-01, DR-02, DR-03, DR-04, DR-05, DR-06, DR-07, DR-08, DR-09, DR-10, DR-11, DR-12, DR-13, DR-14]
+  draft: []
+
+registries:
+  error_codes: 205                    # E01..E19 + E10xx reserved; 0 collisions
+  traceability_features: 98
+  deferred_register_entries: 20
+  open_contracts: 0
+  founder_decisions_pending: 0
+
+kernel:
+  non_overridable:
+    - IF-1..IF-12                      # information-flow invariants (DR-14 §3)
+    - KERN-1..KERN-5                    # proof/privacy kernel (DR-14 §3)
+  core_promise: "credentials, keys, hashes, and internal identifiers never leave the user's machine to external providers."
+
+pillars:
+  - authority: "the user is the locus of authority; NL/flags -> typed, confirmed, signed grants"
+  - efficiency: "optimize token usage and cost without losing quality; always Ledger-visible"
+
+sources:
+  decisions: "vaults/ORBIT/decisions/"
+  raw_drafts: "ORBIT/artifacts/tmp/freeze-contracts/"
+  traceability: "ORBIT/spec/traceability.yaml"
+  errors: "ORBIT/spec/errors.yaml"

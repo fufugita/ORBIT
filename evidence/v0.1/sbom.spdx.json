@@ -1,0 +1,1435 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "documentNamespace": "https://releases.orbit/orbit/0.1.0/sbom",
+  "packages": [
+    {
+      "name": "aead",
+      "version": "0.5.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "73bc6f08e19ddcebaf41d07a8c16991f6afcc56075e8f4be10bf7e4a0b39ccf0",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "aes",
+      "version": "0.8.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "3b33d4224d4b2b8a6ad28946d003c7b767fbc50ad5c3d89e197c232a2081bab9",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "aes-gcm",
+      "version": "0.10.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5d7a366ee61d5f863b920e8ae66fca4b12b1057006e4ac30603ffe3f76c5dd19",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "age",
+      "version": "0.12.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "aa67b160275060944ec94db2539b2a3ee9114dc26fd96d842e0e59f99f6e9cfe",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "age-core",
+      "version": "0.12.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "638455a90adf6327891cd39ceee91153d49abeb4b765688c205ba1c7b5636a83",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "android_system_properties",
+      "version": "0.1.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "c6b7986c91cd4e8a0a3ba1b2d624fd88e7e79b8a6ecd2669cb8b2a12892bae0b",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "arc-swap",
+      "version": "1.9.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8ea08dccb25e0e94a68be76fd39ea40dbce1495be4f71a3336c19471324652bf",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "arrayref",
+      "version": "0.3.9",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "371d61042b0013627c16fd37b8fd429a03af8cb63f6880082491d2fb0527c7cb",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "arrayvec",
+      "version": "0.7.8",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1c9d79956a3a901c78188ce88bf48309a8cd6bf448a0f673f112001b02027336",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "autocfg",
+      "version": "1.5.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "a8f325257dbe2e1545379813df6d4594ff4a2d89ba63b57b297d3af03992f87d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "base16ct",
+      "version": "0.2.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "e73568f7d960044f72f2771849a9057438a583a70e0dc80f8b8ff6af593a23e6",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "base64",
+      "version": "0.22.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "91cc039d012d51d1905482539f42eb5bae07d486306ec3983eb98cf7b46e862f",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "base64ct",
+      "version": "1.8.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "251315a577be18ad0e8aff0573703982b7db156d801aa4763b7a0793533922b5",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "basic-toml",
+      "version": "0.1.10",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1c3b48d54ca83ea89e128eebac902e9bf1863e98cb8219b5abea5233d586b1b9",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "bech32",
+      "version": "0.11.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "79f4a3f8c05873b612b8c2b97e94d0048c1477256413369a288c608c67ddea28",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "bitflags",
+      "version": "2.13.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "e983de045d70b2ead30a1159c97bb8fa28ec646bd3ed7aa7c5a070ab0e1f8354",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "blake3",
+      "version": "1.8.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "33c76e0313c3ff9ff97dbfba0596737544b5bbc88f6472f630fc3090b3cd5cb9",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "block-buffer",
+      "version": "0.10.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "a2f03828ea583f25bc08833869031240d5e9cd952e2e194e69495e6eb576cd97",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "bumpalo",
+      "version": "3.20.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "58aa24c2c33b9083a00139304ea2fc115f8f50b5a72170f06dd54c0801d9edb7",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "cc",
+      "version": "1.4.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "352cb9970b7433f4b60d21d78c004728e743c4f0bac695ed13dc615529e518a5",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "cfg-if",
+      "version": "1.0.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "06849f4c59d3089bdd6c7a6d4a5191bb38118c190de593744d82e36860809730",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "chacha20",
+      "version": "0.9.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "358a8aa5b522a1c8f68792ca2e3017930365bead99e80d252a60ea34e0a81fdc",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "chacha20poly1305",
+      "version": "0.10.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "084cd481a1959e4310aded51fa6d8ae10ca38af63f5fc0295428301df037d678",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "chrono",
+      "version": "0.4.45",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d9199e1af7d08f452ecdd6b14975b013634c3e39f85945d9cbc9ae6b09eb9860",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "cipher",
+      "version": "0.4.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "a7899943f637abe0aa306ab071a949bae7710066e481434ab5dd3bf006a59f94",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "const-oid",
+      "version": "0.9.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "73228c0d15ebc9b45aa4fc113026ff3d2b45838cda201af3dd10f3a338d7028d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "constant_time_eq",
+      "version": "0.4.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "16684ed780a8bd1cb5f15b39b94bd71b87d7f358e8073fb565d57381fe3a389d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "cookie-factory",
+      "version": "0.3.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "46fe8c3c0c85a7bea233d2f6080e1d02526542814ffa7d2f143659f5d49c277e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "core-foundation-sys",
+      "version": "0.8.7",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "3fd55b00533af2104d6f40a6a3b5716592d1466de70a897fbc554e69ec1eebce",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "cpufeatures",
+      "version": "0.2.17",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "06e1c021ffa7e66b5c4bb17024612f4a8ee3f00b4b1ffbebc2ce549a8ccfe46a",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "crypto-bigint",
+      "version": "0.5.5",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b5fa0017ac6f5a9171da725cf74a1c5a0c87f5385a8ed17c5e720676e74ab914",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "crypto-common",
+      "version": "0.1.7",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1f66e24b12d19c88366ed9bef2246f5f1d3298f53b52c6bb8e73b63762f40617",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "ctr",
+      "version": "0.9.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "547c7c5753dd96ff2e2602865200f16b987f807dc0f4be2620546a343a892ce1",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "curve25519-dalek",
+      "version": "4.1.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "84076132a9304e858081ddd715139bcfb50095d730790bb1a13d94cd7738d6bb",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "curve25519-dalek-derive",
+      "version": "0.1.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "4d2467fdd5341ab2b834621c78e39a69d8546d00111d95dceb4c76608fe4d7a6",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "der",
+      "version": "0.7.10",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "c684fda218d396fe5ebd3b75e472382d0ecc713235971eb8a85745ea17f27fdf",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "digest",
+      "version": "0.10.7",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6187a5b95c62cfaf340919994e390105e7d89779bc9cc1b22c0bc8e40b116ea8",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "displaydoc",
+      "version": "0.2.7",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "e5d5f81278c13fb8fa5d2fa25f02695e209479c5ee7238601ab17f6cfb426042",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "ed25519",
+      "version": "2.2.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "09b7641a11559dccf58f3854e3077e97c0ad78cb520bee5c540688da515cd287",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "ed25519-dalek",
+      "version": "2.2.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b12a80915503894300c6643e26fa0a98973973d1b1520a85cf91fb7c3e5a4b27",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "elliptic-curve",
+      "version": "0.13.8",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8e66f584cd622e222ef8c929b4427332e6b7ef4628e6c1204bca7812b41e5405",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "ff",
+      "version": "0.13.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d71c272de7de2ea76d30e144689ca4e5a3e8d9e33fb562dcf9de630e21bd4e54",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "fiat-crypto",
+      "version": "0.2.9",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "239171c5da9e4d3405e541f08fa3337b046ae4f13ee1bb6d9f65e99e56e8c212",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "find-crate",
+      "version": "0.6.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "147a7d75a19d48458d4e262d10385f65bf733bba43725513b11af44efab4f48f",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "find-msvc-tools",
+      "version": "0.1.10",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5eabd9df7d1fc841cb49b7ceac6b19c4d06ba4f93f9e5e2611589da411684f0f",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "fluent",
+      "version": "0.17.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b51ced6b310bd4a02bbddc4702f553baa7d9dd4bba3948fa45e53dd0f4e34a7e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "fluent-bundle",
+      "version": "0.16.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d745765eb9aedae1f36c4af1a546faddd7c0299b3dfaa3738ac992958513df46",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "fluent-langneg",
+      "version": "0.13.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "4f8ee383de6df4b4efc416f3ff1fefa48dd5dbf25956383612d11cdc7e0587cb",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "fluent-syntax",
+      "version": "0.12.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "32b89cbe728238cad56bcb018f844b13f8757f132ceba03139dd39f9e04d63b5",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "25933f247d3cfa028995808431e7d288b86663e340c19d8868285b6affbbccf8",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures-channel",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "c58caef83214151841988acc43c155d500ae66ad13fad4d9c361ee7170954d00",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures-core",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8772c4c8fa519ad03889eb22b02293e822c877edbe1b21219877f4e57ccdd11f",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures-executor",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5e94a3041d42aa43512e97ae35a3f90a5e5dd1d57a864460bc092cfbeb263f2e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures-io",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "07fece938281c74065e4b7a4bcb67a710967919500b40aac951e9d7cb7ff5670",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures-macro",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1401623cb416bc0fef8878d7e828bbf9c166a90afe90ec43b56947a9778f771d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures-sink",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "24a9418fc17e34b7dc25d7c826d8cb6f01f9350e17967c2582ae4e1eec2e43e4",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures-task",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5ce24bde6e800d37b5c95b493e4eb8d243a381c5e08f46721f15a3928fc23bea",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "futures-util",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "96d6434e7d53b37b3650bd6f0fdcd8f83665a422487095a2ac8ce6ebfa738c2e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "generic-array",
+      "version": "0.14.7",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "319a089ce6e0e7bc46ad06005cffdf607afaf5a749428dc8201dc5604ab8f143",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "getrandom",
+      "version": "0.2.17",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "a3ffef96890bc2451d4f44f2cb512731d3913b6a9b1351169aed322369752afd",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "ghash",
+      "version": "0.5.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "f47bdf3851ae2528bba640e21e4908329e4509227d1894c6a1bd93eb7f8811a0",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "group",
+      "version": "0.13.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "19a6d917cd750bf690d12c8dc4dfad7334e2b8f2735b258410bd1482980c56ea",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "hex",
+      "version": "0.4.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b848d3496f55b8be0f14b1358f3a1ccdb42a92205c09bd3e54f5c33faadd5d62",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "hkdf",
+      "version": "0.12.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "cdf9dc62187b7a0c2751193af8f1321abd2a00e9d49c1fd8727e1f785b9b5249",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "hmac",
+      "version": "0.12.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "c5317e1ad1815ff08d8e085a95d0acdfec054b2f348f5cc3938fdfcd81a00090",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "hpke",
+      "version": "0.12.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6ee44216872c1006fe87d9b66335d79208010f4d94a172288f7b06e866eaebde",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "hybrid-array",
+      "version": "0.2.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "f0d17d50aeda730dacaab27bb7fbc9234b1fe5903e2ac63ffc26017c2c9fffa3",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "i18n-config",
+      "version": "0.4.8",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "2c4b8df20ce21c15f3d171dc1f7e5de122224af26a2de2113d9f884de3e3157c",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "i18n-embed",
+      "version": "0.16.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "9c0f15d4c99bc8f705abf5e90c6ed2ff9c997d1c1b627a8650b3cf90c51c5af0",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "i18n-embed-fl",
+      "version": "0.10.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "45d089572e5aaca299d06c67d81fe6dabcb735ae48fd056a0b4eac01111db309",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "i18n-embed-impl",
+      "version": "0.8.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ddab6b492e6b84b824e4883442e9a660caed8b814ea508878deae38f9576d5f2",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "iana-time-zone",
+      "version": "0.1.65",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6bff01fa6a3e4b5f60b2c82383e1f01a5543c547c074d52b2d73344a5f845093",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "iana-time-zone-haiku",
+      "version": "0.1.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8cc1180f264344113e838b75ba8ef19687b9a306a3d4c3e0aae24cca13b3370b",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "inout",
+      "version": "0.1.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b5e5a8d972af1585f4a56d3fbb81c47db7de0c653984b6f8b23e1d6261b3c733",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "intl-memoizer",
+      "version": "0.5.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "abe1bb745c86dc9772c9ab265de4e704190148f6c639ea81a1b21f4a7e5c6e51",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "intl_pluralrules",
+      "version": "7.0.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "bb23821e011496a7ed24d9c3bdd1ceb7513f1ff37ad48a578525979c959dac17",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "io_tee",
+      "version": "0.1.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "62ca07590b69cbc47a1503ab4db58e5f231eed8359082cb23bea588635b60a28",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "itoa",
+      "version": "1.0.18",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b2d1e708d90af9ddfb58f7f882ea86f68821bdfbff0b4a57cf3bbb2a5b012ea8",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "js-sys",
+      "version": "0.3.104",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "47b56781b48c28e4a19790678e86cb27f2b9c3891ae6ae1c85af9dbcee3632d2",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "keccak",
+      "version": "0.1.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "52af9453e07006db0074c82b10e885858dadff19e8ec49f026e853937d56ebb9",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "kem",
+      "version": "0.3.0-pre.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5fe6cea057e4d410e5873f53750c7a62f3eac674db760c549dc8a68884c9966e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "lazy_static",
+      "version": "1.5.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "27036387a21268c0d9ab96aefbfa0b2b465256a7f4ccd71e6aaa28cb889a66c3",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "libc",
+      "version": "0.2.189",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "2f8b541525aa91b12b0d805df999d275a1b858f7a8b4cb17aa366bb673b46344",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "lock_api",
+      "version": "0.4.14",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "e78c9d1da859751e412adb9ef6df76acff9d7385d0d14b5e673c0f5f01a23477",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "log",
+      "version": "0.4.33",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "74138d90cc3d6967e965670ad141416b8fb06d97495e19c68bb3376fe0e4ada8",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "memchr",
+      "version": "2.8.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "7318d08618e71f2a9e4e4756bcf37f79a24f5d2b52b4ccad6599fdd1b0081a29",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "mime",
+      "version": "0.3.17",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "c6423a3cceb7a7458328fb46d5deb0b41b97c8a5ba21ab4dd3ec2acc300b5fa5",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "mime_guess",
+      "version": "2.0.5",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "4b31c6c58298cf2d0629e459a34f6da457b8b3483542a072cf66a9a3db3ccfc4",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "ml-kem",
+      "version": "0.2.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ebce7b0ec3a6118b453fa3054aa0574fced1bab8732c2b73a8f98e01b75553ce",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "nom",
+      "version": "8.0.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "84269f478f7293be12d551825bdd010f8b747f7a7902f6be21e4756fc46dcfd1",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "num-traits",
+      "version": "0.2.19",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6fedb46cccaa874a3f8007f017792804c0e92b6db6a1a9a6b8fc2951ad362fb7",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "once_cell",
+      "version": "1.21.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "04f69305591b9229cdf3f4f40c7ab8893ea20611bb2ee7cdd7ec8befcc77e092",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "opaque-debug",
+      "version": "0.3.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d631faade5317fd8505d38e2e04ec2a2360466fb4b3f32689a14be05cf22668e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-adapter",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "7db6c48a6d6885a0ee10d9093ffe3e12d0dfa03d364eb9ad54bbeac680831470",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-api",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "0873159dfdd852f470b43063919281aa7adaadae4d89746407ab135ec48cf7c6",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-capability",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1bd003eaa0145d4fa32df85e90bdab0e8e7b3bd78d2e0c257aac03176d5549fc",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-cli",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "23a678a3126b7e37ad943c17d766e9a6e9c2807972e6ed0b2c5d21f9e5be4a78",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-conformance",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5eb97e27e964a13da0f52823ee98bc78d0f4640b2ebacf3c2506d97992867e08",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-context",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1e761086b0dd203ba51bc5cc72226207588cd167a002b828cb6089f43da4be68",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-core",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "45caab6ec45246ec30e87397d76b6d0353bb224b43e53b24f8c46b28d73ab099",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-egress",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "7820844e84f80ad02fcbc61694d66d4fb9c7b8bc8842f93ef90d6a27e1b29d1b",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-export",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "f71b538d5d663a536cdf99b8804e62295d50d37b740cfe812307297ae6fce965",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-gateway",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "a347645099efb248dea92fa2781779a88b86c81c8c988b0403d2429f09f4e800",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-hud",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "4e3f8a69141e1fe156777c1cea577c1a0d8121a29aa1109ff78311fbf30ff2ce",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-ir",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "9b7a8584b14c29ac6cae4df43f3caaa5bb0c93baba902415b56c6c8706183c10",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-ledger",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "0517020df5ae9cbe9d81f9125dabe04beb2421449eb37bf5290869849cefbedb",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-ledger-events",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b490d559c9506b32230ded40244941c4f8abf2d14a827a947ce5bd014c93fe6e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-memory",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "735d4ca49fe6508569fb38f0860a297dd046aa32126ec1260412df596f4aa10b",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-migrator",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "711e1169476c7e28b67034b037046d57a62bdbbcc534a0cb9519a91cfa04ab22",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-pib",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d34af807ea174fa016b51c467ef31f1e95b5f09a9ab0fda8e2a8333a4533d6ec",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-plugin",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ea4dc59c949d065dd6a192c04df0e176f932c90cc8115b3ad143704575822a88",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-reactor",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d48fa87781c41806c47340240c02eeaca5989e945cfe2b9739a63620f1383f0e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-release",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "f178a3d2c578499adf3875a7af0d182fd5089bb7036c98c4f8c9c72f15c0a23e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-sandbox",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "0b84fc7983bfba50446cf7d9d3fb15e6f7a160b81599fc6b48eac70662947cde",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-session",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "13c088c7f219a2750ae4fe74cb5166ed0d891c0dd0ae3d6069df977b0668a251",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-tests",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "047eb4469b2560fbb9e0080a8b171e6d6fe5afc9ca5a4fe2c23e8263ae49c71b",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "orbit-trust",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d90784cde33b793c4d20fa497900abd689c89786d3b131f2458774f7dc2b1941",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "p256",
+      "version": "0.13.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "66953f3425823973091cca3180f69aa12993d8c236376b6b76dec7bdd51d8037",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "parking_lot",
+      "version": "0.12.5",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d13434b834151204a2246f0520efeb56d4a37bace082b649afed3b7484315898",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "parking_lot_core",
+      "version": "0.9.12",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "39af08c8d7ea81e129f3964655c0733e80bf03e98d531749e36a01508ca1ebf0",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "pbkdf2",
+      "version": "0.12.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1d9ea02b242a14e04bfbefe05c616b22673993feff3bc428ded01148d1c3e4df",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "pin-project",
+      "version": "1.1.13",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "3ae304e6fe660e5f7afdf883a8d8ca27d2ddce14e9bf20ea4227145d89fc9124",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "pin-project-internal",
+      "version": "1.1.13",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6b91fe85991c07b1ac6a36ed901d2b8edd6b1dd99589cc0d8f95e1082b3bd9d5",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "pin-project-lite",
+      "version": "0.2.17",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8ab5aa291be99ab8ce458cc465916044365d0ecda2a91215494397a8a81a526b",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "pkcs8",
+      "version": "0.10.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "499bed63a6c2f5543c3bcc86b0dfef8be38709e94379a22c351dced371e65dd3",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "poly1305",
+      "version": "0.8.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8eec343d4be529c4f89af859b72382d2c4ae2a2f3fa2483a35981a3b1e239fb5",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "polyval",
+      "version": "0.6.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "7549416e378e7467c3fd04d96965c50b1df5e50e6f1a48f0c4d0ce4c86d7f1c5",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "ppv-lite86",
+      "version": "0.2.21",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "0210803132fc951db36f016d7e38157199aba35bac72dafeccf5e658e3af646d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "primeorder",
+      "version": "0.13.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "f7563d8d2048a8c2d5d31f5f824eb88d5020d0243c51da53ab856f035f8f613d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "proc-macro-error-attr3",
+      "version": "3.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "9d809822f4b79ecff5b263d04787b9dc38480c90c7cd3cf0dff2be4b75f54e6c",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "proc-macro-error3",
+      "version": "3.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "f0f4be2332a2509ab31c0ad02326af93209abbfc7cf1ea72f22967289d5b26c2",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "proc-macro2",
+      "version": "1.0.107",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "2d006486029c17ac14093b4b705b5766fda2548286a0d8d6e94e115ae3aa027e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "quote",
+      "version": "1.0.47",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d50574c855cb0e65842276d7c44cd59f42f0092e987e07f6f34052dcd101eae9",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "r-efi",
+      "version": "5.3.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "be609173cdb39800bd8358b22221606f27956960150812ff21f1911562c6e265",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rand",
+      "version": "0.8.7",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8ba2b1c6a4eea4675893ac74c12423102337948c24e4cb05c219db04b0a95d43",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rand_chacha",
+      "version": "0.3.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "3e2807dfb04518904135924bb071b690c9c0c9c3e340387a489f58cd765fcfbb",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rand_core",
+      "version": "0.6.4",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "57b08e099fdfe5bc391eac9b1ade0be3c0de55730ab8511b0a88c27e5cf645ca",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "redox_syscall",
+      "version": "0.5.18",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "369e7f2badbe4a1020ffbdecbabe5f61412e7c42386444899d9c809862432268",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rust-embed",
+      "version": "8.12.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1faa2a937bf3c84657177dacf480bcc3b605b3f09503ced1e1d27b05ab973114",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rust-embed-impl",
+      "version": "8.12.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "912761edeb12b96a0f795da85a699fb1dcde5fc6463761be53c40d5ddcf3051c",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rust-embed-utils",
+      "version": "8.12.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "dabcf3bc049229c909103af8b3400ff5ea9e6864fdb8eec72e03cc2e843aa97d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rustc-hash",
+      "version": "2.1.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ca2ee8215aa91ba5b02725fc0536453be83d2d1eac8eef7b066df30f4512e5ab",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rustc_version",
+      "version": "0.4.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "599497add8281b6413f10f1863a5ad8a5f2430b49d3a149e5a70c791201d1df3",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "rustversion",
+      "version": "1.0.23",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "3e0f96c7a9cdaaeeccfacf0d5d8dd66b74d44e8c1758f6a16d2b0ac1d139bb42",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "salsa20",
+      "version": "0.10.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "882e5bde8d950acf6e6c39a029cf769eca116d115173342f39a3d2877a607458",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "same-file",
+      "version": "1.0.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5d0378dd0eb244f5728ab6e0eb7216a93a4e8c3f1969eb540a21d843b05ae36f",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "scopeguard",
+      "version": "1.2.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "2781c420fa3e2551f813167cf840765288746c02447194397e867b253f986f65",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "scrypt",
+      "version": "0.11.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "dd75b903296a974475ecf3cb12879024175c10245a298f1689f3f12657155f7e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "sec1",
+      "version": "0.7.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "df822667bbad95513af34bb323350ec2ea67efd3f9bfbddf56f34ac896eaa74f",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "secrecy",
+      "version": "0.10.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "52960945674f85d27ca59ff5ef90f0da1add065c8e1b93f4ea55975857480ffb",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "self_cell",
+      "version": "1.3.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "45dfe84c3ca545f21a070240d0ede870fb8411bd860e2422a9574a7aae008447",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "semver",
+      "version": "1.0.28",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "103feee231eebea284ec4294e7bfb772ccb65e8847615a88d34464adb3b79386",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "serde",
+      "version": "1.0.229",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d11d11b1d493a45c6f5c997b0c12be32901dc4ed0ec1a1d89b8f63b62024f52a",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "serde_core",
+      "version": "1.0.229",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "0f54d2cfbc66115f4435af56a756c30174ab7c6c2906311f9f05e92627878928",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "serde_derive",
+      "version": "1.0.229",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "54b46a19636b261ae8499d113d8a548df45d8ce4fe00b0d15c2764fe5b92330a",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "serde_json",
+      "version": "1.0.151",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b007773cbd0096942775d2713b2273be041d9d9c062b16df9346d8a3fe564357",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "sha2",
+      "version": "0.10.9",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ade3de04182593fbb2dd88ecd365f09dbc9bb7c06e6ddb74bd5bbb81ebf5add3",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "sha3",
+      "version": "0.10.9",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "83547d02309365ba0ac6e3f341b62609f55d8f0f22918856d5f8e74ca08457da",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "shlex",
+      "version": "2.0.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5dc06fcc96d56a614941c2dadb38a579d2ca0363168b8eadc57cc17f95fc4a5f",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "signature",
+      "version": "2.2.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ac5324c4f241bdff30a126c71262b815ddce207cbd5ca6577218a2e214038e60",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "slab",
+      "version": "0.4.12",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "cca5a98df7ca6cfe177833e0755b0a22778ea8dcd350c490c15e53fcd30adbd2",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "smallvec",
+      "version": "1.15.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "7ecc863f0b45e63547221ae8714afe96aba6bffffc3c197e3f58e908a01cb5d7",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "spki",
+      "version": "0.7.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "0bc8ecfb2d7e7472e665f581f09dc8afe571f7eda14fa8da2aceb0d3a6c52bbf",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "strsim",
+      "version": "0.11.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "cf887173e82bab154b1560803f4c832d0b7a4db31f339f04415db6d4118b5c8d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "subtle",
+      "version": "2.6.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ead67d49b15f768e4e14f0a349c045eefccccf00b13cc177a34f497a6bcf238d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "syn",
+      "version": "2.0.119",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5c8b80b625e716b90ee8be6e83768b693142f8561f2436c2631e2c6c486c4192",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "thiserror",
+      "version": "1.0.69",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "f1b532cce00cd656e4bb9d7db68a1b266a1c4338dae359776b0cd3938b282ff0",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "thiserror-impl",
+      "version": "1.0.69",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "13616f2297248b18ea23e3a264a0f209b4e6916e7fa8ddf0f912f8e98cc37a05",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "tinystr",
+      "version": "0.8.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "5dbcc9fba4642a081791fa58ad6289038529a304fe81a2200595490e7632f4e1",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "toml",
+      "version": "0.5.11",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "38e05f8af13d2935dc6753c5d959f267a58cf33a1e0be96c15e3d7bfe7b70bcb",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "type-map",
+      "version": "0.5.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "88316fcc96f093f4eeda2b0c252dbbd17644454059694ff22283049ab0300d6c",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "typenum",
+      "version": "1.20.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "fbadd46655f9097c516e507c7050a9cf10af9a2182a3300ae99517e03c6617ac",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "ulid",
+      "version": "1.2.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "2bd325b48525d3f69d8a556be64cb50dd0a6e6bfe36e8ac9f014d92ccd575117",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "unic-langid",
+      "version": "0.9.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "26d72b6e85231957a9ba78ee602fa4499d59181e529beda224608935b0afa42c",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "unic-langid-impl",
+      "version": "0.9.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8de52b933db992e8c9e2e13129a6d0bccb6b32aed94d2eb8fc133de42bc2fbae",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "unicase",
+      "version": "2.9.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6c7245af578a74fbf31a2403d2aa4409a287492c7ead8157223760eddbdd77ba",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "unicode-ident",
+      "version": "1.0.24",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "312e8439d1f2f3b6ee086bbe481cee6dc649f0d1612831ecd3c7b5b58bc0c80b",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "universal-hash",
+      "version": "0.5.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "996cf6a2d329fa264d114316d80968156a402fa765463c2ab6ade09556925880",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "version_check",
+      "version": "0.9.5",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "f9ca581300806a8a1730ac1881f39a9c540dd0a7527c4bfdb61f52f4d4278e1e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "walkdir",
+      "version": "2.5.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "abc5528b43000a146b0c70aa145bbbf54764111b698d695d996519e7e18e36d0",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "wasi",
+      "version": "0.11.1+wasi-snapshot-preview1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6d9383bcdbe32a0479f302efcd6b38b4b9b702c49d5e030c53fa60bf708bd3be",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "wasip2",
+      "version": "1.0.4+wasi-0.2.12",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "1639a5c9d180d9987e534f28eb6a17d0f70b07cb1ba7ed8715041d57bac78fbf",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "wasm-bindgen",
+      "version": "0.2.127",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "e7450d5c17f0f26d681cfe86da91e5257f68e1a83efd426d2e09fbf85ff39fac",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "wasm-bindgen-macro",
+      "version": "0.2.127",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "2a659a37edaa0c5dffb2478450b0ddc098f0066b3d38a03598b76375617fd963",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "wasm-bindgen-macro-support",
+      "version": "0.2.127",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ac0d79e2f8cf854c51d5d96c589619a04679b30b28487f031ace5b8c9e1c1d5a",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "wasm-bindgen-shared",
+      "version": "0.2.127",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "c2c6a5e25c5f62371a365dd7d8c001982efdb1c34c3a2619110c7a91dbe00fe8",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "web-time",
+      "version": "1.1.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "9478a8136f3102e21e0c5e9911d09c55632f2cb1d8d999f4a6e2cf0cf4529452",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "winapi-util",
+      "version": "0.1.11",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "70aaab72ca3091e10b9e481f158cbbfef1c9ec065af133ee957b12056baaf7a4",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "windows-core",
+      "version": "0.62.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "66fdd71423b2b0ebbe766f8776448a9bc2685edede6a5b4b29964145fe153166",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "windows-implement",
+      "version": "0.60.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "ec57f4eda21f864ff7c9acb822e008375b59982a1240668847d089cd543a957c",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "windows-interface",
+      "version": "0.59.3",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "4e351a74ee983051eefb6b0c7d2e60277e9695a5e6c7ca3d8c0ee6ea34f2d019",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "windows-link",
+      "version": "0.2.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "8c02325d9c479e71347bd6b5eb27b5597b45dbeb647f735bf3517acb253da4ef",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "windows-result",
+      "version": "0.4.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "0795a685f0415c4185b930478f5e8db5c4eeecb6df932a3f994ff81fa0fa4bc4",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "windows-strings",
+      "version": "0.5.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6b8ffdc25a5c587cf6a662936b0f362200b2144a16c7d97fa3224dec73a0002d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "windows-sys",
+      "version": "0.61.2",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "27c68f22007adecbda45d2d7ef62a69fac373b2a24c795ce4c31576cd456a5af",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "wit-bindgen",
+      "version": "0.57.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "6da8f46e4acb49718104ebf9a59d0101b743bdf3d910e8ba41f09794e951dd94",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "x25519-dalek",
+      "version": "2.0.1",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "71acf5f8eb8cad262da038bb2af2cf6d0475f10c375e5411bd836a09bcf928ea",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "zerocopy",
+      "version": "0.8.56",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "be786eb1cef5193478ccab14cd98366a73136b78bf4387ebb9f466ce784631b4",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "zerocopy-derive",
+      "version": "0.8.56",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "58ebdbf97af436375b231c3fa2322810cdf6489db23066ce2da7fe66632e2b84",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "zerofrom",
+      "version": "0.1.8",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "b0c51aeb34cc27ffe2e23c2cb27f86b62228138ccf0d4b86171c98092592ec66",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "zeroize",
+      "version": "1.9.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "67ce57e0531df43ce4aeccfa374360b9178b9d98aae3468269e232cee4408df8",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "zeroize_derive",
+      "version": "1.5.0",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "0c5429eb26b022e43b56ae4f7c9a69cc8518c4665f2ad33ed8636bdd988d2b7e",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "zerovec",
+      "version": "0.11.6",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "7140873ba9221223d38d9d494993d36802ed4c85d6d8f02c9c652dbeb79e968d",
+      "supplier": "crates.io"
+    },
+    {
+      "name": "zmij",
+      "version": "1.0.23",
+      "license": "MIT OR Apache-2.0",
+      "sha256": "d4928e44402a0691ba953cb5bb71e9a3846485bf3d4d166454759b4e42b03bd0",
+      "supplier": "crates.io"
+    }
+  ]
+}

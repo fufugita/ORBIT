@@ -1,0 +1,1 @@
+{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"https://slsa.dev/provenance/v0.2","subject":[{"name":"orbit","digest":{"sha256":"633f645dc5043dacc521833398d1677993b02ce7fed607cfd1b2b913b18539aa"}}],"predicate":{"builder":{"id":"orbit-local-build"},"buildType":"https://orbithq.dev/orbit-build/v1"}}

@@ -1,0 +1,18 @@
+# ORBIT orbit-sandbox — Phase B implementation
+# PURPOSE: Landlock + seccomp + egress broker profiles; WASI 0.2 host-import allowlist
+# Contract: DR-07 (S1-S17), three locked profiles (§3.3). B5.
+# Real Landlock/seccomp enforcement on Linux; profile model + fail-closed probes.
+
+[package]
+name = "orbit-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Landlock + seccomp + egress broker profiles; WASI 0.2 host-import allowlist"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+libc = "0.2"

@@ -1,0 +1,11 @@
+{
+  "v": "ledger/record/v1",
+  "event": {
+    "variant": "session_end",
+    "session_id": "session-compat",
+    "terminal": "Completed",
+    "reason": "fixture"
+  },
+  "ledger_hash_prev": "0000000000000000000000000000000000000000000000000000000000000000",
+  "ledger_hash_self": "1111111111111111111111111111111111111111111111111111111111111111"
+}

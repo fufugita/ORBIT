@@ -1,0 +1,9 @@
+{
+  "case": "mock-http-v1-mixed-currency",
+  "error": "E0420",
+  "kind": "mock_http_v1",
+  "orbit_version_max": "0.1.x",
+  "orbit_version_min": "0.1.0",
+  "reason": "scalar rollup forbidden",
+  "schema": "orbit.adapter-conformance/v1"
+}

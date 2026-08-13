@@ -1,0 +1,43 @@
+# ORBIT integration tests — DR-03 §5b named-test closeout
+# Implements the high-value traceability seeds (concurrency/fault/security/
+# migration/e2e) under their EXACT seeded names against the real crates,
+# so DR-03 §8 traceability cells are literally evidenced.
+
+[package]
+name = "orbit-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Integration tests implementing the DR-03 §5b named-test inventory"
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+orbit-trust = { path = "../crates/trust" }
+orbit-ledger = { path = "../crates/ledger" }
+orbit-pib = { path = "../crates/pib" }
+orbit-export = { path = "../crates/export" }
+orbit-sandbox = { path = "../crates/sandbox" }
+orbit-egress = { path = "../crates/egress" }
+orbit-gateway = { path = "../crates/gateway" }
+orbit-adapter = { path = "../crates/adapter" }
+orbit-plugin = { path = "../crates/plugin" }
+orbit-reactor = { path = "../crates/reactor" }
+orbit-context = { path = "../crates/context" }
+orbit-memory = { path = "../crates/memory" }
+orbit-session = { path = "../crates/session" }
+orbit-core = { path = "../crates/orbit-core" }
+orbit-api = { path = "../crates/orbit-api" }
+orbit-hud = { path = "../crates/hud" }
+orbit-cli = { path = "../crates/cli" }
+orbit-ir = { path = "../crates/orbit-ir" }
+orbit-ledger-events = { path = "../crates/orbit-ledger" }
+orbit-release = { path = "../crates/release" }
+orbit-migrator = { path = "../migrator" }
+orbit-conformance = { path = "../conformance" }

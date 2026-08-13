@@ -1,0 +1,16 @@
+{
+  "case": "mock-http-v1-usage-decrease",
+  "error": "E0416",
+  "kind": "mock_http_v1",
+  "orbit_version_max": "0.1.x",
+  "orbit_version_min": "0.1.0",
+  "schema": "orbit.adapter-conformance/v1",
+  "usage": [
+    {
+      "output_tokens": 5
+    },
+    {
+      "output_tokens": 4
+    }
+  ]
+}

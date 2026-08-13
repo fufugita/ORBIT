@@ -1,0 +1,9 @@
+{
+  "case": "mock-http-v1-timeout",
+  "error": "E0409",
+  "kind": "mock_http_v1",
+  "orbit_version_max": "0.1.x",
+  "orbit_version_min": "0.1.0",
+  "retry_class": "retryable_transport",
+  "schema": "orbit.adapter-conformance/v1"
+}

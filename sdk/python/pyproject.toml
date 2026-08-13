@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orbit-sdk"
+version = "0.1.0"
+description = "ORBIT Python SDK — the harness that orbits around you. Scaffolded stub; no runtime code until spec-frozen."
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orbit_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,25 @@
+# ORBIT orbit-pib — Phase A implementation
+# PURPOSE: PIB cross-machine identity: PibId, allowlist, identity record (DR-08 §13, CTX-I11)
+# A9: PIB identity + allowlist
+
+[package]
+name = "orbit-pib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PIB cross-machine identity: PibId, allowlist, identity record"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

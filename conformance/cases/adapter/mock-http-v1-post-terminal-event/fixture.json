@@ -1,0 +1,13 @@
+{
+  "case": "mock-http-v1-post-terminal-event",
+  "error": "E0411",
+  "events": [
+    "started",
+    "finished",
+    "text_delta"
+  ],
+  "kind": "mock_http_v1",
+  "orbit_version_max": "0.1.x",
+  "orbit_version_min": "0.1.0",
+  "schema": "orbit.adapter-conformance/v1"
+}

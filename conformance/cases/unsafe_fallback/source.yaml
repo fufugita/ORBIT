@@ -1,0 +1,10 @@
+# Claude Workflow source — unsafe_fallback fixture
+# Expected: FAIL-CLOSED (E1851) — a declared fallback list the user did not grant.
+orbit_version_min: 0.1.0
+orbit_version_max: 0.1.x
+ir_schema_version: orbit:ir@0.1.0
+
+spawns:
+  - id: agent-0
+    model: gpt-4
+    fallback_models: [gpt-3.5-turbo, claude-sonnet]

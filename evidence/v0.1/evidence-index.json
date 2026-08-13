@@ -1,0 +1,106 @@
+{
+  "schema": "orbit.evidence/index/v1",
+  "generated_at": "2026-08-13T23:18:00Z",
+  "items": [
+    {
+      "path": "artifact-signatures/orbit.sha256",
+      "sha256": "81c6e2b608ec26a9d76d5acf7ff30db71f9c8817a70a6a0b16b951bd529ced8c",
+      "bytes": 72
+    },
+    {
+      "path": "benchmarks.json",
+      "sha256": "fb92b89737dfea12ffb0114ea825a8ff33b98a92fda01e7b9533a8df270f356f",
+      "bytes": 311
+    },
+    {
+      "path": "clippy-summary.json",
+      "sha256": "7f7df379c038978d13d93c81e878faf5309d81407403377b4216413a857afa68",
+      "bytes": 135
+    },
+    {
+      "path": "concurrency-summary.json",
+      "sha256": "ec08a4651d0c7a4d119e4099e6ab100861262e8f861ac6dcd3eeeb1af27110d1",
+      "bytes": 156
+    },
+    {
+      "path": "demo-transcript.md",
+      "sha256": "6f2799e5abcfb8619668da178e4c9dc48b749c7c170594e9275aaf4f970ce733",
+      "bytes": 3717
+    },
+    {
+      "path": "dependency-audit.json",
+      "sha256": "50ccc50be0247f51a2955ef538f43d5168d6dcb7a6c19fdf2c50ff30ee322a9a",
+      "bytes": 401
+    },
+    {
+      "path": "e2e-summary.json",
+      "sha256": "d221dee6675870fb3023611cb9b5ba0e879692780b02944cf2d0f0994bf76599",
+      "bytes": 381
+    },
+    {
+      "path": "fault-summary.json",
+      "sha256": "2583141e63715b6f4348fc746d91e932ab98dd15fcd256e13db1f92438c9158c",
+      "bytes": 150
+    },
+    {
+      "path": "fuzz-summary.json",
+      "sha256": "220ee9c91e2eaeb654a81856112d50aa77ae4c9d6d6e70a05e0a53a335ec7e70",
+      "bytes": 149
+    },
+    {
+      "path": "known-issues.md",
+      "sha256": "5ae066f3f623911afc308859b2c84ae575997c8e95460d4b463da390dc3e145a",
+      "bytes": 122
+    },
+    {
+      "path": "migration-summary.json",
+      "sha256": "d330c0fdf0afe36cdca407e68ff623cb30fd401d63e42dc24482df46ed245087",
+      "bytes": 154
+    },
+    {
+      "path": "provenance.intoto.jsonl",
+      "sha256": "b6c1451ec1dcbd9a219a4a648a925bd5c7e5c05ab3d8f4869297931dedede5d0",
+      "bytes": 313
+    },
+    {
+      "path": "reproducibility.json",
+      "sha256": "38027dcc16f618223e6320f462eb6c743720b3695204b5ec524ef51c56706e1f",
+      "bytes": 388
+    },
+    {
+      "path": "sbom.spdx.json",
+      "sha256": "633f645dc5043dacc521833398d1677993b02ce7fed607cfd1b2b913b18539aa",
+      "bytes": 44957
+    },
+    {
+      "path": "secret-scan.json",
+      "sha256": "e06b100450e6283bba8ae5e196c2bdbc690fad8063a8ff0c3b4efe2932511e76",
+      "bytes": 267
+    },
+    {
+      "path": "security-review.md",
+      "sha256": "0c65d05631fe3a5d97bf2303d695f658b3c5ad5ff1286c7faef926ddbeadd320",
+      "bytes": 351
+    },
+    {
+      "path": "spec-manifest.json",
+      "sha256": "3b32c60fbadd2a6afd0bbccabd99ff6e1a48ad550ae6b88084cf142d6f39dac5",
+      "bytes": 251
+    },
+    {
+      "path": "test-summary.json",
+      "sha256": "bc0626ea142cf62f0f69151234c32402cd600a624784e3992a34eaf831279aec",
+      "bytes": 135
+    },
+    {
+      "path": "traceability.json",
+      "sha256": "da886d4cf41ce9be75f9c161646664301d74eaef5244f5a5095ff811c3f1ccf9",
+      "bytes": 56882
+    },
+    {
+      "path": "unsafe-audit.md",
+      "sha256": "dc92f0dd62a0ab676c46af2a8e760e7bcc6faeb10e8527cf35e3a09170b24474",
+      "bytes": 2780
+    }
+  ]
+}

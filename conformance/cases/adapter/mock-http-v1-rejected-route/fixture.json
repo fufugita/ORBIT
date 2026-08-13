@@ -1,0 +1,9 @@
+{
+  "case": "mock-http-v1-rejected-route",
+  "error": "E0414",
+  "kind": "mock_http_v1",
+  "orbit_version_max": "0.1.x",
+  "orbit_version_min": "0.1.0",
+  "route_kind": "deterministic_test_v1",
+  "schema": "orbit.adapter-conformance/v1"
+}

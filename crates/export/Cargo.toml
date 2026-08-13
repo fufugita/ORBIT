@@ -1,0 +1,20 @@
+# ORBIT orbit-export — Phase A implementation
+# PURPOSE: Encrypted local export / immutable restore bundle (DR-02 §8, DR-06 §6.19/§9)
+# A10: encrypted export + immutable restore
+
+[package]
+name = "orbit-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Encrypted local export / immutable restore bundle"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+age.workspace = true
+chrono.workspace = true

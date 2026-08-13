@@ -1,0 +1,16 @@
+# ORBIT orbit-hud — Phase E implementation
+# PURPOSE: HUD: display-only, event-sourced, brand (white+magenta), accessibility, JSON/non-TTY
+# Contract: DR-10 Part B (H-1..H-24). E16.
+
+[package]
+name = "orbit-hud"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HUD: display-only, event-sourced, brand (white+magenta), accessibility, JSON/non-TTY"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

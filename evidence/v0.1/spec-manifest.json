@@ -1,0 +1,6 @@
+{
+  "schema": "orbit.evidence/spec-manifest/v1",
+  "traceability_yaml_sha256": "da886d4cf41ce9be75f9c161646664301d74eaef5244f5a5095ff811c3f1ccf9",
+  "decisions_dir_sha256": "external-decisions-not-supplied",
+  "generated_at": "2026-08-13T23:12:10Z"
+}

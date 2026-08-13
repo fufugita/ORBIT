@@ -1,0 +1,26 @@
+# ORBIT orbit-trust — Phase A implementation
+# PURPOSE: Trust root manifest, namespaces, revocation, policy_snapshot_id, restricted ACL
+# Contract: DR-05, DR-02 §1-2, DR-06 §1.2 (ACL)
+
+[package]
+name = "orbit-trust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Trust root manifest, namespaces, revocation, policy_snapshot_id, restricted ACL"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+zeroize.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

@@ -1,0 +1,26 @@
+# ORBIT orbit-ledger — Phase A implementation
+# PURPOSE: Append-only hash-chained Ledger: single writer, event taxonomy,
+#          replay/export, AuthorityGrant. Contract: DR-06.
+# A5 single-writer + fsync-before-ACK · A6 hash chain + recovery · A7 event
+# taxonomy + canonical serialization · A8 EgressIntent + AuthorityGrant/Revoke.
+
+[package]
+name = "orbit-ledger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Append-only hash-chained Ledger: single writer, event taxonomy, replay/export, AuthorityGrant"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

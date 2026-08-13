@@ -1,0 +1,125 @@
+// ORBIT shared IR — WIT boundary (DR-11 Part 1, scaffolded)
+// package orbit:ir@0.1.0  — serialization: CBOR (RFC 8949), deterministic.
+// STATUS: scaffolded sketch of the crossing types. Finalize ONLY after the
+//         specification-frozen gate. Types are illustrative of the DR-01/08/11
+//         surface; the frozen contract is decisions/11-sdk-claude-workflow-migration.md.
+
+package orbit:ir@0.1.0;
+
+interface types {
+    // ---------- Identifiers ----------
+    type pib-id = string;                  // ULID, 26 chars (DR-08 CTX-I11)
+    type segment-id = string;              // ULID
+    type agent-id = string;
+    type ulid = string;
+
+    // ---------- Model reference (DR-01) ----------
+    variant model-ref {
+        id(string),                        // flat provider model id
+        inherit,                           // one-hop: caller fills it
+    }
+
+    // ---------- Outcome tail (DR-01) ----------
+    variant outcome-tail {
+        completed(completed-tail),
+        failed(failed-tail),
+        cancelled(cancelled-tail),
+    }
+
+    record completed-tail {
+        provider-drift: option<provider-drift>,
+        divergence-flagged: bool,          // annotation-only
+    }
+
+    record failed-tail {
+        code: string,                      // ORBIT-E code
+        message: string,
+        retryable: bool,
+    }
+
+    record cancelled-tail {
+        reason: string,
+        initiator: cancel-initiator,
+    }
+
+    variant cancel-initiator { user, runtime, parent }
+
+    record provider-drift {
+        expected: string,
+        observed: string,
+        severity: u8,
+    }
+
+    // ---------- Context (DR-08) ----------
+    record context-segment {
+        id: segment-id,
+        content: segment-content,
+        grant: grant,
+    }
+
+    variant segment-content {
+        text(string),
+        blob(list<u8>),
+        reference(reference),
+    }
+
+    record reference { uri: string, content-hash: string, content-type: string }
+
+    // ---------- Memory (DR-08) ----------
+    variant memory-scope-kind { global, project, path-local }
+
+    record memory-record {
+        id: ulid,
+        scope: memory-scope-kind,
+        path-pattern: option<string>,
+        key: string,
+        value: memory-value,
+        created-at: ulid,
+        ttl: option<u32>,
+    }
+
+    variant memory-value {
+        text(string),
+        json(string),
+        binary(list<u8>),
+    }
+
+    // ---------- HUD events (DR-04/10) ----------
+    variant hud-event {
+        state-change(state-transition),
+        message(string),
+        tool-call(tool-call-info),
+        token-usage(token-usage),
+        model-select(model-selection),
+        error(error-info),
+    }
+
+    record state-transition { from: string, to: string, at: ulid }
+    record tool-call-info { name: string, args: string, result: option<string> }
+    record token-usage { model: string, prompt: u32, completion: u32 }
+    record model-selection { requested: model-ref, resolved: model-ref }
+    record error-info { code: string, message: string, retryable: bool }
+
+    // ---------- Workflow (DR-11) ----------
+    record workflow-descriptor {
+        id: ulid,
+        name: string,
+        version: string,
+        steps: list<workflow-step>,
+        edges: list<workflow-edge>,
+    }
+
+    variant workflow-step {
+        run-agent(agent-step),
+        parallel(parallel-group),
+        pipeline(pipeline-group),
+    }
+
+    record agent-step { identity: string, model: model-ref, prompt: string }
+    record parallel-group { id: ulid, steps: list<workflow-step> }
+    record pipeline-group { id: ulid, steps: list<workflow-step> }
+    record workflow-edge { from: ulid, to: ulid, condition: option<string> }
+}
+
+// DR-14 authority types are canonical in orbit-core; the WIT boundary
+// exposes only digest references (UAI-I6: no bytes cross).

@@ -1,0 +1,18 @@
+# ORBIT orbit-context — Phase C implementation
+# PURPOSE: Segmented context: segments, grants, token budget, compaction, leak prevention
+# Contract: DR-08 (CTX-I1..I4, I10). C10.
+
+[package]
+name = "orbit-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Segmented context: segments, grants, token budget, compaction, leak prevention"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true

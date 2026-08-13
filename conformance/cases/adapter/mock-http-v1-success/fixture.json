@@ -1,0 +1,9 @@
+{
+  "case": "mock-http-v1-success",
+  "expected_assertions": "all",
+  "kind": "mock_http_v1",
+  "orbit_version_max": "0.1.x",
+  "orbit_version_min": "0.1.0",
+  "outcome": "completed",
+  "schema": "orbit.adapter-conformance/v1"
+}

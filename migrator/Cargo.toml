@@ -1,0 +1,16 @@
+# ORBIT orbit-migrator — Phase F implementation
+# PURPOSE: Claude Workflow → ORBIT migration: fail-closed mapping, E184x errors, conformance corpus
+# Contract: DR-11 §5-6. F19.
+
+[package]
+name = "orbit-migrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Claude Workflow → ORBIT migration: fail-closed mapping, E184x errors, conformance corpus"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

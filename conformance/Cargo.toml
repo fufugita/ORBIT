@@ -1,0 +1,25 @@
+# ORBIT conformance — Phase F implementation
+# PURPOSE: Cross-language IR conformance corpus runner (DR-11 §9)
+# F21: version-pinned fixtures, byte-identical cross-language gate.
+
+[package]
+name = "orbit-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cross-language IR conformance corpus runner"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dependencies.orbit-ir]
+path = "../crates/orbit-ir"
+
+[dependencies.orbit-adapter]
+path = "../crates/adapter"
+
+[dependencies.orbit-migrator]
+path = "../migrator"

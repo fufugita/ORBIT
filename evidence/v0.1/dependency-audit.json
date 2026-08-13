@@ -1,0 +1,17 @@
+{
+  "schema": "orbit.evidence/dependency-audit/v1",
+  "cargo_audit": {
+    "version": "0.22.2",
+    "exit_code": 0,
+    "dependencies_scanned": 218,
+    "vulnerabilities": 0,
+    "result": "clean"
+  },
+  "cargo_deny": {
+    "version": "0.20.2",
+    "exit_code": 0,
+    "summary": "advisories ok, bans ok, licenses ok, sources ok",
+    "result": "clean"
+  },
+  "generated_at": "2026-08-13T23:12:10Z"
+}
