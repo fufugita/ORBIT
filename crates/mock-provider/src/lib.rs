@@ -11,9 +11,10 @@ pub mod server;
 pub use server::{router, spawn, ServerConfig, ServerState};
 
 /// Scriptable behavior for a mock endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum MockBehavior {
     /// A clean SSE success stream ending in `[DONE]`.
+    #[default]
     Success,
     /// A partial stream that stops without `[DONE]`.
     Partial,
@@ -27,10 +28,4 @@ pub enum MockBehavior {
     SlowFirstByte { delay_ms: u64 },
     /// A stream with tool-call deltas.
     ToolCalls,
-}
-
-impl Default for MockBehavior {
-    fn default() -> Self {
-        Self::Success
-    }
 }

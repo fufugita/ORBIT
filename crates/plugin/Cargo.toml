@@ -17,6 +17,10 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 ed25519-dalek.workspace = true
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime-wasi = "47"
+tokio.workspace = true
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
+wat = "1"

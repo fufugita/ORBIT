@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod canonical;
+pub mod runtime;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -276,6 +277,8 @@ impl PluginRegistry {
         Ok(())
     }
 }
+
+pub use runtime::PluginRuntime;
 
 #[cfg(test)]
 mod tests {

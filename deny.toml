@@ -14,11 +14,15 @@ feature-depth = 1
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Any advisory (incl. yanked) fails the check.
 yanked = "deny"
-
 [licenses]
 allow = [
     "MIT",
     "Apache-2.0",
+    # Apache-2.0 WITH LLVM-exception — permissive, standard for the Rust
+    # toolchain/compiler-ecosystem crates (wasmtime/cranelift). Within DR-13 §5.
+    "Apache-2.0 WITH LLVM-exception",
+    # Zlib — permissive OSI license (foldhash, a wasmtime transitive dep).
+    "Zlib",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",

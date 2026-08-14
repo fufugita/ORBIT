@@ -37,7 +37,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"          # pinned toolchain at release; see DR-13 §4.3
+rust-version = "1.94"          # pinned toolchain at release; see DR-13 §4.3
 license = "Apache-2.0"         # core; shims dual (MIT OR Apache-2.0) per DR-13 §4
 repository = "https://github.com/orbit-hq/orbit"
 description = "ORBIT — the harness that orbits around you. User-authority orchestration with a strict proof/privacy kernel."

@@ -1,0 +1,4 @@
+# v0.2 pinned toolchain (wasmtime 47 requires rust 1.94).
+# The v0.1 release tag remains pinned at 1.88 (rust-version in its Cargo.toml).
+[toolchain]
+channel = "1.94.0"
