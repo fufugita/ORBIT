@@ -302,6 +302,17 @@ fn hash_of(path: std::path::PathBuf) -> String {
         .unwrap_or_default()
 }
 
+/// A monotonic-ish timestamp string for session metadata (std-only, no chrono
+/// dep): seconds since the Unix epoch. Good enough for ordering/sorting.
+pub fn timestamp_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    secs.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

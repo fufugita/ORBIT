@@ -19,6 +19,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+mod config;
+mod sessions;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -72,6 +75,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "export" => cmd_export(&home, args),
         "restore" => cmd_restore(&home, args),
         "ask" => cmd_ask(&home, args),
+        "models" | "list-models" => cmd_models(&home, args),
         "version" => Ok(
             serde_json::to_value(orbit_cli::version_evidence("0.1.0", "dev")).unwrap_or_default(),
         ),
@@ -84,6 +88,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "(bare)        start the interactive harness",
                 "chat          start the interactive harness (explicit alias)",
                 "init          initialize trust root + PIB + Ledger",
+                "models        list models from all configured providers",
                 "ask PROMPT    send one prompt through a configured gateway",
                 "run           run the example phase chain",
                 "cancel        cancel the session (terminal: cancelled)",
@@ -360,8 +365,10 @@ struct TurnOutcome {
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
     home: &Path,
+    provider_id: &str,
     gate: &str,
     model: &str,
+    credential_env: Option<&str>,
     prompt: &str,
     messages: Option<Vec<orbit_adapter::types::ChatMessage>>,
     observer: orbit_provider_http::stream::StreamObserver<'_>,
@@ -389,8 +396,8 @@ fn run_turn(
         orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(prompt.as_bytes())));
     let adapter_identity = orbit_provider_http::openai::openai_identity();
     let route = orbit_adapter::types::ProviderRouteBinding {
-        provider_id: orbit_adapter::types::ProviderId("configured-gateway".into()),
-        deployment_id: orbit_adapter::types::DeploymentId("configured-gateway".into()),
+        provider_id: orbit_adapter::types::ProviderId(provider_id.into()),
+        deployment_id: orbit_adapter::types::DeploymentId(provider_id.into()),
         region_id: orbit_adapter::types::RegionId("local".into()),
         adapter_kind: orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1,
         adapter_implementation_digest: adapter_identity.implementation_digest.clone(),
@@ -432,7 +439,7 @@ fn run_turn(
         host: route.endpoint_host.clone(),
         port,
         path_prefix: "/v1".into(),
-        provider_id: "configured-gateway".into(),
+        provider_id: provider_id.into(),
         region_id: "local".into(),
     };
     let engine = orbit_gateway::DispatchEngine::new(
@@ -469,12 +476,15 @@ fn run_turn(
         total_timeout_ms: 120_000,
     };
 
-    // Gate authentication (never printed/persisted). A gateway may require a
-    // Bearer token for /v1 chat calls; read it from ORBIT_GATE_TOKEN. No other
-    // env vars are consulted — e.g. ANTHROPIC_AUTH_TOKEN is Claude Code's
-    // UPSTREAM auth, not the gate's key, so it is deliberately NOT a fallback.
-    let credential = std::env::var("ORBIT_GATE_TOKEN")
-        .ok()
+    // Gate authentication (never printed/persisted). A provider may require a
+    // Bearer token for /v1 chat calls; read it from the provider's declared
+    // env var (config `env = "..."`) or, for the legacy single-gate path,
+    // `ORBIT_GATE_TOKEN`. No other env vars are consulted — e.g.
+    // ANTHROPIC_AUTH_TOKEN is an upstream agent's auth, not this gate's key,
+    // so it is deliberately NOT a fallback.
+    let credential = credential_env
+        .or(Some("ORBIT_GATE_TOKEN"))
+        .and_then(|var| std::env::var(var).ok())
         .filter(|t| !t.is_empty())
         .map(|t| orbit_adapter::credential::SecretBytes::new(t.into_bytes()));
 
@@ -561,8 +571,24 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     let model = value_after(args, "--model")
         .or_else(|| std::env::var("ORBIT_MODEL").ok())
         .ok_or(("ORBIT-E1101", "ask requires --model or ORBIT_MODEL".into()))?;
+    let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+    let provider = value_after(args, "--provider")
+        .and_then(|name| cfg.provider.iter().find(|p| p.name == name))
+        .or_else(|| cfg.provider_for_model(&model));
+    let provider_id = provider.map(|p| p.name.as_str()).unwrap_or("configured-gateway");
+    let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
+    let credential_env = provider.and_then(|p| p.env.as_deref());
 
-    let outcome = run_turn(home, &gate, &model, prompt, None, None)?;
+    let outcome = run_turn(
+        home,
+        provider_id,
+        resolved_gate,
+        &model,
+        credential_env,
+        prompt,
+        None,
+        None,
+    )?;
     Ok(serde_json::json!({
         "schema": "orbit.cli/v1",
         "command": "ask",
@@ -603,16 +629,52 @@ fn cmd_chat(args: &[String]) -> i32 {
         .or_else(|| std::env::var("ORBIT_MODEL").ok())
         .unwrap_or_else(|| "glm-5.2".into());
 
-    let session = orbit_gateway::new_session_id();
-    // Conversation transcript: role + content per turn (multi-turn wire payload).
-    let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
-    let mut total_input: u64 = 0;
-    let mut total_output: u64 = 0;
-    let mut turns: u64 = 0;
+    let cfg = config::ProvidersConfig::load(&home)
+        .map_err(|e| eprintln!("warning: providers.toml: {e}"))
+        .unwrap_or_default();
 
-    eprintln!("orbit — interactive harness");
-    eprintln!("model: {model}   gate: {gate}   session: {session}");
-    eprintln!("type `/help` for commands, `exit` to quit");
+    // Session identity + persistence. `--resume <id>` loads a prior session's
+    // transcript so the conversation continues across invocations.
+    let resume = value_after(args, "--resume");
+    let resumed_file = resume
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .and_then(|id| match sessions::load_session(&home, id) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("warning: cannot resume {id}: {e}; starting fresh");
+                None
+            }
+        });
+    if let Some(s) = &resumed_file {
+        eprintln!("resumed session {} ({} prior turns)", s.session_id, s.turns);
+    }
+    let mut session = resumed_file
+        .as_ref()
+        .map(|s| s.session_id.clone())
+        .unwrap_or_else(orbit_gateway::new_session_id);
+    // Conversation transcript: role + content per turn (multi-turn wire payload).
+    let mut transcript: Vec<orbit_adapter::types::ChatMessage> = resumed_file
+        .as_ref()
+        .map(|s| s.to_transcript())
+        .unwrap_or_default();
+    let mut total_input = resumed_file.as_ref().map(|s| s.input_tokens).unwrap_or(0);
+    let mut total_output = resumed_file.as_ref().map(|s| s.output_tokens).unwrap_or(0);
+    let mut turns = resumed_file.as_ref().map(|s| s.turns).unwrap_or(0);
+
+    // HUD (DR-10 Part B): display-only, display-safe (H-3), brand + output
+    // mode negotiated from the environment (NO_COLOR/CI/TERM).
+    let hud = orbit_hud::Hud::new(&orbit_hud::Env {
+        no_color: std::env::var_os("NO_COLOR").is_some(),
+        ci: std::env::var_os("CI").is_some(),
+        term_dumb: std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false),
+    });
+    render_hud(&hud, &orbit_hud::HudEvent::Message {
+        text: format!("interactive harness — model {model}, session {session}"),
+    });
+    render_hud(&hud, &orbit_hud::HudEvent::Message {
+        text: "type /help for commands, exit to quit".into(),
+    });
 
     let stdin = std::io::stdin();
     use std::io::BufRead;
@@ -633,7 +695,23 @@ fn cmd_chat(args: &[String]) -> i32 {
             break;
         }
         if trimmed.starts_with('/') {
-            let handled = handle_chat_command(&trimmed, &mut model, &mut transcript);
+            // `/resume <id>` needs the mutable session id, so it is handled
+            // here (in the loop) rather than in handle_chat_command.
+            if let Some(id) = trimmed.strip_prefix("/resume ") {
+                match sessions::load_session(&home, id.trim()) {
+                    Ok(s) => {
+                        session = s.session_id.clone();
+                        transcript = s.to_transcript();
+                        turns = s.turns;
+                        total_input = s.input_tokens;
+                        total_output = s.output_tokens;
+                        eprintln!("resumed {id} ({} prior turns)", s.turns);
+                    }
+                    Err(e) => eprintln!("cannot resume {id}: {e}"),
+                }
+                continue;
+            }
+            let handled = handle_chat_command(&trimmed, &home, &mut model, &mut transcript);
             if !handled {
                 eprintln!("unknown command: {trimmed}; try /help");
             }
@@ -659,7 +737,31 @@ fn cmd_chat(args: &[String]) -> i32 {
             }
         };
 
-        let outcome = run_turn(&home, &gate, &model, &trimmed, Some(turn_messages), Some(&mut observer));
+        // Resolve the provider for the current model (config overrides the
+        // default gate). `credential_env` names the env var holding the token.
+        let provider = value_after(args, "--provider")
+            .and_then(|name| cfg.provider.iter().find(|p| p.name == name))
+            .or_else(|| cfg.provider_for_model(&model));
+        let provider_id = provider.map(|p| p.name.as_str()).unwrap_or("configured-gateway");
+        let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
+        let credential_env = provider.and_then(|p| p.env.as_deref());
+
+        render_hud(
+            &hud,
+            &orbit_hud::HudEvent::PhaseChanged {
+                phase: format!("turn {}({model})", turns + 1),
+            },
+        );
+        let outcome = run_turn(
+            &home,
+            provider_id,
+            resolved_gate,
+            &model,
+            credential_env,
+            &trimmed,
+            Some(turn_messages),
+            Some(&mut observer),
+        );
         println!();
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -669,6 +771,14 @@ fn cmd_chat(args: &[String]) -> i32 {
                 turns += 1;
                 total_input += o.input_tokens;
                 total_output += o.output_tokens;
+                // Cost bar (H-17: integer µ¢ — token counts here; a future
+                // pricing model maps tokens -> µ¢).
+                render_hud(
+                    &hud,
+                    &orbit_hud::HudEvent::CostBar {
+                        cost_microcents: o.input_tokens + o.output_tokens,
+                    },
+                );
                 // Record the model's reply into the transcript for continuity.
                 transcript.push(orbit_adapter::types::ChatMessage {
                     role: orbit_adapter::types::ChatRole::User,
@@ -678,6 +788,20 @@ fn cmd_chat(args: &[String]) -> i32 {
                     role: orbit_adapter::types::ChatRole::Assistant,
                     content: o.output.clone(),
                 });
+                // Persist the session after each successful turn.
+                let sf = sessions::SessionFile::from_chat(
+                    &session,
+                    &model,
+                    resolved_gate,
+                    provider_id,
+                    &transcript,
+                    turns,
+                    total_input,
+                    total_output,
+                );
+                if let Err(e) = sessions::save_session(&home, &sf) {
+                    eprintln!("warning: session not saved: {e}");
+                }
             }
             Err((code, msg)) => {
                 eprintln!("{code}: {msg}");
@@ -703,15 +827,35 @@ fn cmd_chat(args: &[String]) -> i32 {
     0
 }
 
+/// `orbit models` — list every declared model across all configured providers.
+/// Reads `$ORBIT_HOME/providers.toml` (missing = empty config).
+fn cmd_models(
+    home: &Path,
+    args: &[String],
+) -> Result<serde_json::Value, (&'static str, String)> {
+    let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+    let entries: Vec<(String, String)> = cfg.all_models();
+    Ok(serde_json::json!({
+        "schema": "orbit.cli/v1",
+        "command": "models",
+        "status": "ok",
+        "providers": cfg.provider,
+        "models": entries,
+        "count": entries.len(),
+        "json": args.iter().any(|a| a == "--json"),
+    }))
+}
+
 /// Handle REPL slash commands. Returns true if recognized.
 fn handle_chat_command(
     cmd: &str,
+    home: &Path,
     model: &mut String,
     transcript: &mut Vec<orbit_adapter::types::ChatMessage>,
 ) -> bool {
     match cmd {
         "/help" => {
-            println!("commands: exit, /help, /model <M>, /clear, /usage");
+            println!("commands: exit, /help, /model <M>, /clear, /usage, /models");
             true
         }
         "/clear" => {
@@ -721,6 +865,38 @@ fn handle_chat_command(
         }
         "/usage" => {
             println!("usage tracked per turn (see exit summary)");
+            true
+        }
+        "/models" => {
+            let cfg = config::ProvidersConfig::load(home);
+            match cfg {
+                Ok(cfg) => {
+                    let entries = cfg.all_models();
+                    if entries.is_empty() {
+                        println!("(no providers configured)");
+                    } else {
+                        for (prov, m) in &entries {
+                            println!("{prov} \t{m}");
+                        }
+                    }
+                }
+                Err(e) => println!("error reading providers.toml: {e}"),
+            }
+            true
+        }
+        "/sessions" => {
+            match sessions::list_sessions(home) {
+                Ok(list) if list.is_empty() => println!("(no saved sessions)"),
+                Ok(list) => {
+                    for s in &list {
+                        println!(
+                            "{} \tmodel={} \tturns={} \tupdated={}",
+                            s.session_id, s.model, s.turns, s.updated_at
+                        );
+                    }
+                }
+                Err(e) => println!("error listing sessions: {e}"),
+            }
             true
         }
         "/model" => {
@@ -733,6 +909,32 @@ fn handle_chat_command(
             true
         }
         _ => false,
+    }
+}
+
+/// Render a HUD event to the terminal, honoring the display-safety gate (H-3)
+/// and the stdout/stderr split (H-9). A payload rejected by the gate renders a
+/// safe placeholder to stderr — never a crash, never leaked bytes.
+fn render_hud(hud: &orbit_hud::Hud, event: &orbit_hud::HudEvent) {
+    // Apply the display-safety gate (H-3) to text-bearing events first.
+    let event = match event {
+        orbit_hud::HudEvent::Message { text } => {
+            match orbit_hud::display_safe(text) {
+                Ok(clean) => orbit_hud::HudEvent::Message { text: clean },
+                Err(_) => {
+                    eprintln!("[HUD] message rejected by display gate (H-3)");
+                    return;
+                }
+            }
+        }
+        other => other.clone(),
+    };
+    let (out, err) = hud.render(&event);
+    if let Some(line) = out {
+        println!("{line}");
+    }
+    if let Some(line) = err {
+        eprintln!("{line}");
     }
 }
 
