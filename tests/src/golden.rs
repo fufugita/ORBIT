@@ -68,7 +68,8 @@ fn cli_exit_codes_golden() {
 
 #[test]
 fn cli_command_tree_golden() {
-    // The full command tree is pinned (DR-03 §3.2, all 15).
+    // The full command tree is pinned (DR-03 §3.2, all 15) + the interactive
+    // `chat` harness (promoted from v0.2-reserved in v0.2).
     let expected = [
         "run",
         "plan",
@@ -85,10 +86,11 @@ fn cli_command_tree_golden() {
         "export",
         "restore",
         "version",
+        "chat",
     ];
     assert_eq!(orbit_cli::COMMANDS, expected.as_slice());
-    // v0.2 commands are gated (CLI-26).
-    for cmd in ["import", "serve", "attach", "admin", "chat"] {
+    // Remaining v0.2 commands are gated (CLI-26).
+    for cmd in ["import", "serve", "attach", "admin"] {
         let args: Vec<String> = vec![cmd.into()];
         assert_eq!(parse_args(&args).unwrap_err().code(), "E110C");
     }

@@ -84,14 +84,31 @@ impl OpenAiCompatibleHttpV1 {
         let url = format!("{base}/chat/completions");
 
         // Build the wire body — sampling as provider floats ONLY here.
+        // Multi-turn transcript wins when present; otherwise the single
+        // user turn (input bytes are always the newest user prompt).
+        let messages: serde_json::Value = match &request.messages {
+            Some(transcript) => transcript
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "role": m.role.as_str(),
+                        "content": m.content,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            None => serde_json::json!([
+                {"role": "user", "content": String::from_utf8_lossy(
+                    request.input.expose()
+                ).into_owned()}
+            ]),
+        };
         let body = serde_json::json!({
             "model": request.route.expected_model,
             "stream": true,
             "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
             "max_tokens": request.sampling.max_output_tokens,
-            "messages": [{"role": "user", "content": String::from_utf8_lossy(
-                request.input.expose()
-            ).into_owned()}],
+            "messages": messages,
         });
 
         let mut req = self

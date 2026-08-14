@@ -17,6 +17,7 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+ulid.workspace = true
 orbit-adapter = { path = "../adapter" }
 orbit-provider-http = { path = "../provider-http" }
 orbit-mock-provider = { path = "../mock-provider" }

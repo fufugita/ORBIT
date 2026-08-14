@@ -230,8 +230,10 @@ fn security_filter_no_provider_field_emission() {
 
 #[test]
 fn cli_help_shows_all_commands() {
-    assert_eq!(orbit_cli::COMMANDS.len(), 15);
+    // 15 DR-03 commands + the v0.2-promoted interactive `chat` harness.
+    assert_eq!(orbit_cli::COMMANDS.len(), 16);
     assert!(orbit_cli::COMMANDS.contains(&"verify-ledger"));
+    assert!(orbit_cli::COMMANDS.contains(&"chat"));
 }
 
 #[test]

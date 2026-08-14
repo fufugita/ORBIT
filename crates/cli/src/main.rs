@@ -21,6 +21,26 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Bare `orbit` (no args, or only flags) summons the interactive CLI — the
+    // "harness". `orbit chat` is the explicit alias. Both stream live to
+    // stdout, so they run outside the JSON-envelope dispatch path.
+    // `--help`/`-h`/`--version` stay on the JSON dispatch (first-class verbs).
+    let first_is_command = args
+        .first()
+        .map(|a| !a.starts_with('-'))
+        .unwrap_or(false);
+    let wants_chat = args.is_empty()
+        || args[0] == "chat"
+        || (!first_is_command
+            && args[0] != "--help"
+            && args[0] != "-h"
+            && args[0] != "--version");
+    if wants_chat {
+        let code = cmd_chat(&args);
+        std::process::exit(code);
+    }
+
     let result = dispatch(&args);
     match result {
         Ok(v) => println!(
@@ -59,10 +79,12 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
             "schema": "orbit.cli/v1",
             "command": "help",
             "status": "ok",
-            "usage": "orbit <command> [--home <dir>]",
+            "usage": "orbit [chat] [--model <M>] [--gate <URL>] | orbit <command>",
             "commands": [
+                "(bare)        start the interactive harness",
+                "chat          start the interactive harness (explicit alias)",
                 "init          initialize trust root + PIB + Ledger",
-                "ask PROMPT     send a prompt through a configured gateway",
+                "ask PROMPT    send one prompt through a configured gateway",
                 "run           run the example phase chain",
                 "cancel        cancel the session (terminal: cancelled)",
                 "verify-ledger verify the Ledger hash chain",
@@ -319,27 +341,33 @@ fn cmd_restore(_home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
     }))
 }
 
-/// `orbit ask "<prompt>" [--model <M>] [--gate <url>]` — send a prompt through
-/// a local OpenAI-compatible gateway via the four-gate async dispatch pipeline.
-///
-/// Configuration (no internal defaults committed):
-/// - `--gate` / `ORBIT_GATE_URL` — default `http://127.0.0.1:4001`
-/// - `--model` / `ORBIT_MODEL` — REQUIRED; no default model is invented
-/// - `ORBIT_GATE_TOKEN` — optional bearer token (never printed/persisted)
-fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
-    ensure_initialized(home)?;
-    let prompt = args
-        .get(1)
-        .ok_or(("ORBIT-E1101", "ask requires a prompt".into()))?;
-    let gate = value_after(args, "--gate")
-        .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:4001".into());
-    let model = value_after(args, "--model")
-        .or_else(|| std::env::var("ORBIT_MODEL").ok())
-        .ok_or(("ORBIT-E1101", "ask requires --model or ORBIT_MODEL".into()))?;
+/// Outcome of one `run_turn` call: the assembled text + token usage.
+struct TurnOutcome {
+    output: String,
+    input_tokens: u64,
+    output_tokens: u64,
+}
 
+/// Run one prompt through the configured gateway via the four-gate async
+/// dispatch pipeline. Shared by `orbit ask` (single-turn) and the interactive
+/// REPL (multi-turn with a transcript + live observer).
+///
+/// - `gate` / `model`: resolved by the caller (flags → env → defaults).
+/// - `messages`: `Some(transcript)` for multi-turn chat, `None` for the
+///   single-turn `ask` contract.
+/// - `observer`: called per streamed event (live TextDelta rendering);
+///   `None` = buffered output only.
+#[allow(clippy::too_many_arguments)]
+fn run_turn(
+    home: &Path,
+    gate: &str,
+    model: &str,
+    prompt: &str,
+    messages: Option<Vec<orbit_adapter::types::ChatMessage>>,
+    observer: orbit_provider_http::stream::StreamObserver<'_>,
+) -> Result<TurnOutcome, (&'static str, String)> {
     // Parse the gate URL; only http loopback or https is acceptable.
-    let url = url::Url::parse(&gate).map_err(|e| ("ORBIT-E0401", format!("bad gate url: {e}")))?;
+    let url = url::Url::parse(gate).map_err(|e| ("ORBIT-E0401", format!("bad gate url: {e}")))?;
     let scheme = match url.scheme() {
         "https" => orbit_adapter::types::EndpointScheme::Https,
         "http" => orbit_adapter::types::EndpointScheme::HttpLoopback,
@@ -370,7 +398,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         endpoint_digest: orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(
             format!("{gate}:{model}").as_bytes(),
         ))),
-        expected_model: model.clone(),
+        expected_model: model.to_string(),
         pricing_digest: orbit_adapter::types::Sha256Digest("0".repeat(64)),
         endpoint_host: host,
         endpoint_port: port,
@@ -388,7 +416,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         },
     )
     .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
-    registry.register_model(orbit_gateway::ModelRef(model.clone()), route.clone());
+    registry.register_model(orbit_gateway::ModelRef(model.to_string()), route.clone());
     registry.register_async_adapter(
         orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1,
         std::sync::Arc::new(adapter),
@@ -423,6 +451,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         attempt_id: orbit_adapter::types::AttemptId(format!("ask-{}", std::process::id())),
         route: route.clone(),
         input,
+        messages,
         sampling: orbit_adapter::types::SamplingParameters {
             temperature_milliunits: 700,
             top_p_millionths: 950_000,
@@ -468,19 +497,20 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
                     })?;
             engine
                 .dispatch_async(
-                    &model,
+                    model,
                     &session,
                     &decision.0,
                     &request,
                     credential.as_ref(),
                     &mut writer,
                     &cancel,
+                    observer,
                 )
                 .await
         })
         .map_err(|e| (e.code, e.message))?;
 
-    let (outcome, reservation) = result;
+    let (outcome, _reservation) = result;
     match outcome {
         orbit_gateway::DispatchOutcome::Completed(r) => {
             let output: String = r
@@ -494,19 +524,11 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
                 })
                 .collect();
             let usage = r.accounting.usage;
-            Ok(serde_json::json!({
-                "schema": "orbit.cli/v1",
-                "command": "ask",
-                "status": "ok",
-                "model": model,
-                "output": output,
-                "ledger_recorded": true,
-                "ledger_head": reservation.destination_digest,
-                "usage": {
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                }
-            }))
+            Ok(TurnOutcome {
+                output,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            })
         }
         orbit_gateway::DispatchOutcome::AdapterRefused { code: "E0404", .. }
             if credential.is_none() =>
@@ -518,6 +540,199 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         }
         orbit_gateway::DispatchOutcome::AdapterRefused { code, message } => Err((code, message)),
         other => Err(("ORBIT-E0406", format!("ask failed: {other:?}"))),
+    }
+}
+
+/// `orbit ask "<prompt>" [--model <M>] [--gate <url>]` — send a prompt through
+/// a local OpenAI-compatible gateway via the four-gate async dispatch pipeline.
+///
+/// Configuration (no internal defaults committed):
+/// - `--gate` / `ORBIT_GATE_URL` — default `http://127.0.0.1:4001`
+/// - `--model` / `ORBIT_MODEL` — REQUIRED; no default model is invented
+/// - `ORBIT_GATE_TOKEN` — optional bearer token (never printed/persisted)
+fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    ensure_initialized(home)?;
+    let prompt = args
+        .get(1)
+        .ok_or(("ORBIT-E1101", "ask requires a prompt".into()))?;
+    let gate = value_after(args, "--gate")
+        .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:4001".into());
+    let model = value_after(args, "--model")
+        .or_else(|| std::env::var("ORBIT_MODEL").ok())
+        .ok_or(("ORBIT-E1101", "ask requires --model or ORBIT_MODEL".into()))?;
+
+    let outcome = run_turn(home, &gate, &model, prompt, None, None)?;
+    Ok(serde_json::json!({
+        "schema": "orbit.cli/v1",
+        "command": "ask",
+        "status": "ok",
+        "model": model,
+        "output": outcome.output,
+        "ledger_recorded": true,
+        "usage": {
+            "input_tokens": outcome.input_tokens,
+            "output_tokens": outcome.output_tokens,
+        }
+    }))
+}
+
+/// The interactive REPL — the "harness" (bare `orbit` or `orbit chat`).
+///
+/// Each prompt runs the full four-gate async dispatch pipeline (same as
+/// `orbit ask`) with a growing conversation transcript. Output streams live
+/// (TextDeltas printed as they arrive). Model/gate resolved from flags →
+/// `ORBIT_MODEL`/`ORBIT_GATE_URL` → defaults. Exits cleanly on `exit`/EOF.
+///
+/// Slash commands: `/help`, `/model <M>`, `/clear`, `/usage`.
+fn cmd_chat(args: &[String]) -> i32 {
+    let home = orbit_home(args).unwrap_or_else(|| {
+        std::env::var("ORBIT_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".orbit"))
+    });
+    if let Err((code, msg)) = ensure_initialized(&home) {
+        eprintln!("{code}: {msg}");
+        return 2;
+    }
+
+    let gate = value_after(args, "--gate")
+        .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:4001".into());
+    let mut model = value_after(args, "--model")
+        .or_else(|| std::env::var("ORBIT_MODEL").ok())
+        .unwrap_or_else(|| "glm-5.2".into());
+
+    let session = orbit_gateway::new_session_id();
+    // Conversation transcript: role + content per turn (multi-turn wire payload).
+    let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
+    let mut turns: u64 = 0;
+
+    eprintln!("orbit — interactive harness");
+    eprintln!("model: {model}   gate: {gate}   session: {session}");
+    eprintln!("type `/help` for commands, `exit` to quit");
+
+    let stdin = std::io::stdin();
+    use std::io::BufRead;
+    let lines = stdin.lock().lines();
+
+    for line in lines {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Slash commands / control.
+        if trimmed == "exit" || trimmed == "quit" {
+            break;
+        }
+        if trimmed.starts_with('/') {
+            let handled = handle_chat_command(&trimmed, &mut model, &mut transcript);
+            if !handled {
+                eprintln!("unknown command: {trimmed}; try /help");
+            }
+            continue;
+        }
+
+        // Build the transcript for THIS turn: prior turns + the new user prompt.
+        let mut turn_messages = transcript.clone();
+        turn_messages.push(orbit_adapter::types::ChatMessage {
+            role: orbit_adapter::types::ChatRole::User,
+            content: trimmed.clone(),
+        });
+
+        // Live observer: print TextDeltas as they stream in.
+        let mut live_output: String = String::new();
+        let mut observer = |ev: &orbit_adapter::types::ProviderStreamEvent| {
+            if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &ev.event {
+                let s = String::from_utf8_lossy(bytes).into_owned();
+                print!("{s}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                live_output.push_str(&s);
+            }
+        };
+
+        let outcome = run_turn(&home, &gate, &model, &trimmed, Some(turn_messages), Some(&mut observer));
+        println!();
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        match outcome {
+            Ok(o) => {
+                turns += 1;
+                total_input += o.input_tokens;
+                total_output += o.output_tokens;
+                // Record the model's reply into the transcript for continuity.
+                transcript.push(orbit_adapter::types::ChatMessage {
+                    role: orbit_adapter::types::ChatRole::User,
+                    content: trimmed.clone(),
+                });
+                transcript.push(orbit_adapter::types::ChatMessage {
+                    role: orbit_adapter::types::ChatRole::Assistant,
+                    content: o.output.clone(),
+                });
+            }
+            Err((code, msg)) => {
+                eprintln!("{code}: {msg}");
+            }
+        }
+    }
+
+    // Exit summary (JSON envelope, consistent with other commands).
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "orbit.cli/v1",
+            "command": "chat",
+            "status": "exit",
+            "session": session,
+            "turns": turns,
+            "usage": {
+                "input_tokens": total_input,
+                "output_tokens": total_output,
+            }
+        })
+    );
+    0
+}
+
+/// Handle REPL slash commands. Returns true if recognized.
+fn handle_chat_command(
+    cmd: &str,
+    model: &mut String,
+    transcript: &mut Vec<orbit_adapter::types::ChatMessage>,
+) -> bool {
+    match cmd {
+        "/help" => {
+            println!("commands: exit, /help, /model <M>, /clear, /usage");
+            true
+        }
+        "/clear" => {
+            transcript.clear();
+            println!("conversation cleared");
+            true
+        }
+        "/usage" => {
+            println!("usage tracked per turn (see exit summary)");
+            true
+        }
+        "/model" => {
+            println!("usage: /model <model-id>");
+            true
+        }
+        c if c.starts_with("/model ") => {
+            *model = c["/model ".len()..].trim().to_string();
+            println!("model -> {model}");
+            true
+        }
+        _ => false,
     }
 }
 

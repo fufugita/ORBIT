@@ -51,7 +51,8 @@ impl CliError {
     }
 }
 
-/// The v0.1 command tree (DR-03 §3.2 — all 15 commands).
+/// The v0.1 command tree (DR-03 §3.2 — all 15 commands), plus the interactive
+/// `chat` harness (v0.2-promoted: bare `orbit` and `orbit chat`).
 pub const COMMANDS: &[&str] = &[
     "run",
     "plan",
@@ -68,10 +69,11 @@ pub const COMMANDS: &[&str] = &[
     "export",
     "restore",
     "version",
+    "chat",
 ];
 
 /// v0.2-reserved subcommands (CLI-26: must not be silently added in v0.1).
-pub const V02_COMMANDS: &[&str] = &["import", "serve", "attach", "admin", "chat"];
+pub const V02_COMMANDS: &[&str] = &["import", "serve", "attach", "admin"];
 
 /// The execution mode (DR-14 §2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -12,7 +12,8 @@ use futures::StreamExt;
 use orbit_adapter::conformance::canonical_request;
 use orbit_adapter::credential::SecretBytes;
 use orbit_adapter::types::{
-    AdapterKind, ProviderEventKind, ProviderRequest, ProviderRouteBinding, Sha256Digest,
+    AdapterKind, ProviderEventKind, ProviderRequest, ProviderRouteBinding, ProviderStreamEvent,
+    Sha256Digest,
 };
 use orbit_mock_provider::{server::spawn, ServerState};
 use orbit_provider_http::{
@@ -199,5 +200,102 @@ async fn openai_adapter_cancel_mid_stream_terminates() {
     assert_eq!(
         finished, 1,
         "a cancelled stream still produces one terminal (GW-10)"
+    );
+}
+
+#[tokio::test]
+async fn openai_adapter_sends_multi_turn_transcript() {
+    let (addr, state, _h) = start_mock().await;
+    let adapter = OpenAiCompatibleHttpV1::new(
+        openai_identity(),
+        openai_capabilities(),
+        orbit_adapter::types::TlsPinPolicy {
+            webpki: false,
+            spki_sha256: None,
+        },
+    )
+    .unwrap();
+    let mut req = request(
+        "127.0.0.1",
+        addr.port(),
+        AdapterKind::OpenAiCompatibleHttpV1,
+    );
+    // A 3-turn transcript: system + user + assistant + the new user turn.
+    req.messages = Some(vec![
+        orbit_adapter::types::ChatMessage {
+            role: orbit_adapter::types::ChatRole::System,
+            content: "you are a helpful harness".into(),
+        },
+        orbit_adapter::types::ChatMessage {
+            role: orbit_adapter::types::ChatRole::User,
+            content: "what is 2+2?".into(),
+        },
+        orbit_adapter::types::ChatMessage {
+            role: orbit_adapter::types::ChatRole::Assistant,
+            content: "4".into(),
+        },
+        orbit_adapter::types::ChatMessage {
+            role: orbit_adapter::types::ChatRole::User,
+            content: "and 3+3?".into(),
+        },
+    ]);
+    let cancel = CancelToken::new();
+    let mut stream = adapter.invoke(&req, None, &cancel).await.unwrap();
+    while let Some(item) = stream.next().await {
+        item.unwrap();
+    }
+    let captured = state.last_body.lock().unwrap().clone().expect("body");
+    let msgs = captured.pointer("/messages").and_then(|v| v.as_array());
+    let msgs = msgs.expect("messages array");
+    assert_eq!(msgs.len(), 4, "the full transcript reaches the wire");
+    assert_eq!(
+        msgs[0].pointer("/role").and_then(|v| v.as_str()),
+        Some("system")
+    );
+    assert_eq!(
+        msgs[3].pointer("/content").and_then(|v| v.as_str()),
+        Some("and 3+3?")
+    );
+}
+
+#[tokio::test]
+async fn collect_stream_observer_emits_live_deltas() {
+    let (addr, _state, _h) = start_mock().await;
+    let adapter = OpenAiCompatibleHttpV1::new(
+        openai_identity(),
+        openai_capabilities(),
+        orbit_adapter::types::TlsPinPolicy {
+            webpki: false,
+            spki_sha256: None,
+        },
+    )
+    .unwrap();
+    let req = request(
+        "127.0.0.1",
+        addr.port(),
+        AdapterKind::OpenAiCompatibleHttpV1,
+    );
+    let cancel = CancelToken::new();
+    let stream = adapter.invoke(&req, None, &cancel).await.unwrap();
+
+    // Observer captures TextDeltas as they stream; collect_stream must call it.
+    let mut observed: Vec<String> = Vec::new();
+    let mut cb = |ev: &ProviderStreamEvent| {
+        if let ProviderEventKind::TextDelta { bytes } = &ev.event {
+            observed.push(String::from_utf8_lossy(bytes).into_owned());
+        }
+    };
+    let (events, _evidence) =
+        orbit_provider_http::stream::collect_stream(stream, Some(&mut cb))
+            .await
+            .unwrap();
+    assert!(!observed.is_empty(), "observer saw live deltas");
+    let joined: String = observed.concat();
+    assert_eq!(joined, "hello world", "deltas assemble the full reply");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.event, ProviderEventKind::Finished { .. })),
+        "collected stream still has a terminal"
     );
 }

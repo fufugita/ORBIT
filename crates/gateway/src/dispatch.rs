@@ -265,8 +265,12 @@ impl DispatchEngine {
     /// then invokes the ASYNC adapter and collects the event stream. Returns
     /// the collected events + evidence (the stream is validated for sequence/
     /// usage contiguity — GW-11/GW-13).
-    #[allow(clippy::too_many_arguments)] // engine API: model/session/decision/request/cred/writer/cancel
-    pub async fn dispatch_async(
+    ///
+    /// `observer` is optional and called per event as the stream drains (for
+    /// live streaming in the interactive CLI); `None` is byte-identical to
+    /// the previous buffered behavior.
+    #[allow(clippy::too_many_arguments)] // engine API: model/session/decision/request/cred/writer/cancel/observer
+    pub async fn dispatch_async<'o>(
         &self,
         model: &str,
         session_id: &str,
@@ -275,6 +279,7 @@ impl DispatchEngine {
         credential: Option<&SecretBytes>,
         writer: &mut LedgerWriter,
         cancel: &orbit_provider_http::CancelToken,
+        observer: orbit_provider_http::stream::StreamObserver<'o>,
     ) -> Result<(DispatchOutcome, EgressReservation), DispatchError> {
         // P0-3 replay guard (same as sync).
         match self.recovery_state(session_id, decision_id) {
@@ -378,7 +383,7 @@ impl DispatchEngine {
                 ))
             }
         };
-        match orbit_provider_http::stream::collect_stream(stream).await {
+        match orbit_provider_http::stream::collect_stream(stream, observer).await {
             Ok((events, evidence)) => {
                 let result = orbit_adapter::types::ProviderResult {
                     status: orbit_adapter::types::ProviderTerminalStatus::Completed,
@@ -543,19 +548,22 @@ impl DispatchError {
     }
 }
 
-/// Convenience for tests: construct a fresh session id.
+/// A fresh session id. ULID-suffixed so multiple sessions in one process
+/// (e.g. the interactive REPL) never collide.
 pub fn new_session_id() -> SessionId {
-    format!("session-{}", std::process::id())
+    format!("session-{}", ulid::Ulid::new())
 }
 
-/// Convenience for tests: a fresh decision id (ULID-ish).
+/// A fresh decision id (ULID-suffixed). Unique per dispatch — the replay
+/// guard (P0-3) rejects a decision_id already seen in the ledger, so IDs
+/// must be unique within a process, not just across processes.
 pub fn new_decision_id() -> DecisionId {
-    DecisionId(format!("decision-{}", std::process::id()))
+    DecisionId(format!("decision-{}", ulid::Ulid::new()))
 }
 
-/// Convenience: a fresh request id.
+/// A fresh request id.
 pub fn new_request_id() -> RequestId {
-    RequestId(format!("req-{}", std::process::id()))
+    RequestId(format!("req-{}", ulid::Ulid::new()))
 }
 
 /// Build a dispatch-friendly temp dir helper (used by gateway tests).

@@ -15,10 +15,17 @@ use std::pin::Pin;
 pub type AsyncProviderEventStream =
     Pin<Box<dyn Stream<Item = Result<ProviderStreamEvent, AdapterError>> + Send>>;
 
+/// A per-event observer for live streaming. When provided, called for every
+/// event as the stream drains (before it lands in the collected Vec), so a
+/// caller can render TextDeltas live. `collect_stream` is byte-identical to
+/// the previous behavior when `None` is passed.
+pub type StreamObserver<'a> = Option<&'a mut dyn FnMut(&ProviderStreamEvent)>;
+
 /// Collect a stream to its terminal result, validating sequence/usage on the
 /// way (GW-11/GW-13). Returns the events + the two-hash output evidence.
 pub async fn collect_stream(
     mut stream: AsyncProviderEventStream,
+    mut observer: StreamObserver<'_>,
 ) -> Result<
     (
         Vec<ProviderStreamEvent>,
@@ -30,7 +37,12 @@ pub async fn collect_stream(
     let mut events = Vec::new();
     while let Some(item) = stream.next().await {
         match item {
-            Ok(ev) => events.push(ev),
+            Ok(ev) => {
+                if let Some(cb) = observer.as_deref_mut() {
+                    cb(&ev);
+                }
+                events.push(ev)
+            }
             Err(e) => return Err(e),
         }
     }

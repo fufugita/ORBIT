@@ -360,6 +360,7 @@ async fn gateway_async_dispatch_streams_from_mock_provider() {
             None,
             &mut writer,
             &cancel,
+            None,
         )
         .await
         .unwrap();

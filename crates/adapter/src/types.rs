@@ -177,6 +177,32 @@ pub struct RequestMetadata {
     pub tools_count: u32,
 }
 
+/// One turn of a multi-turn conversation transcript (DR-09 §3 extension).
+/// Roles mirror the OpenAI-compatible wire set: `system` | `user` | `assistant`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl ChatRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
 /// A provider request (DR-09 §3). `input` is SecretBytes (zeroize-on-drop);
 /// the adapter borrows it for the call duration only.
 /// Not Clone / Serialize — the prompt bytes must never be duplicated into a
@@ -191,6 +217,11 @@ pub struct ProviderRequest {
     /// The actual prompt bytes, zeroized on drop. The adapter borrows these
     /// at the final wire boundary — never the metadata hash.
     pub input: crate::credential::SecretBytes,
+    /// Multi-turn transcript. `None` (default) keeps the single-turn contract:
+    /// the adapter sends `[{role:"user", content: input}]`. `Some(transcript)`
+    /// sends the full conversation (the final user turn's bytes are still
+    /// `input` for hashing/zeroization; the transcript is the wire payload).
+    pub messages: Option<Vec<ChatMessage>>,
     pub sampling: SamplingParameters,
     pub output: OutputRequirements,
     pub tools: Vec<ToolDefinition>,
