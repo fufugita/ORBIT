@@ -54,6 +54,22 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "version" => Ok(
             serde_json::to_value(orbit_cli::version_evidence("0.1.0", "dev")).unwrap_or_default(),
         ),
+        "--help" | "-h" | "help" => Ok(serde_json::json!({
+            "schema": "orbit.cli/v1",
+            "command": "help",
+            "status": "ok",
+            "usage": "orbit <command> [--home <dir>]",
+            "commands": [
+                "init          initialize trust root + PIB + Ledger",
+                "run           run the example phase chain",
+                "cancel        cancel the session (terminal: cancelled)",
+                "verify-ledger verify the Ledger hash chain",
+                "replay --dry  verify + emit a no-dispatch replay plan",
+                "export --to   encrypt an age bundle",
+                "restore       restore into a fresh namespace",
+                "version       release evidence (claims + hashes)"
+            ]
+        })),
         other => Err(("ORBIT-E1101", format!("unsupported command {other}"))),
     }
 }

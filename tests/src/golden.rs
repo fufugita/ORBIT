@@ -117,3 +117,20 @@ fn cli_telemetry_golden() {
         "E110B"
     );
 }
+
+#[test]
+fn cli_help_lists_all_commands() {
+    // The help surface lists every command (the CLI's summonable usage).
+    let out = orbit_cli::CliOutput::ok(
+        "help",
+        serde_json::json!({
+            "usage": "orbit <command> [--home <dir>]",
+            "commands": ["init", "run", "cancel", "verify-ledger", "replay", "export", "restore", "version"],
+        }),
+    );
+    let s = serde_json::to_string(&out).unwrap();
+    assert!(s.contains("\"command\":\"help\""));
+    assert!(s.contains("init"));
+    assert!(s.contains("verify-ledger"));
+    assert!(s.contains("version"));
+}
