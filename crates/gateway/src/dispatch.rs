@@ -261,6 +261,145 @@ impl DispatchEngine {
         }
     }
 
+    /// v0.2 async dispatch: runs the same four-gate admission + egress fsync,
+    /// then invokes the ASYNC adapter and collects the event stream. Returns
+    /// the collected events + evidence (the stream is validated for sequence/
+    /// usage contiguity — GW-11/GW-13).
+    #[allow(clippy::too_many_arguments)] // engine API: model/session/decision/request/cred/writer/cancel
+    pub async fn dispatch_async(
+        &self,
+        model: &str,
+        session_id: &str,
+        decision_id: &str,
+        request: &ProviderRequest,
+        credential: Option<&SecretBytes>,
+        writer: &mut LedgerWriter,
+        cancel: &orbit_provider_http::CancelToken,
+    ) -> Result<(DispatchOutcome, EgressReservation), DispatchError> {
+        // P0-3 replay guard (same as sync).
+        match self.recovery_state(session_id, decision_id) {
+            Ok(DispatchState::Reserved) => {}
+            Ok(_) => {
+                return Err(DispatchError {
+                    code: "E0701",
+                    phase: "dispatch",
+                    message: format!("decision_id {decision_id} already dispatched (E0701)"),
+                    session_id: session_id.into(),
+                    decision_id: decision_id.into(),
+                })
+            }
+            Err(e) => {
+                return Err(DispatchError {
+                    code: "E0602",
+                    phase: "recovery",
+                    message: format!("recovery read failed: {e}"),
+                    session_id: session_id.into(),
+                    decision_id: decision_id.into(),
+                })
+            }
+        }
+
+        // Gates 1-2: trust + capability (allowlist + route).
+        if !self.registry.is_model_allowed(model) {
+            return Err(DispatchError::admission("trust", model, "E0404"));
+        }
+        let binding = self
+            .registry
+            .route_for_model(model)
+            .ok_or_else(|| DispatchError::admission("capability", model, "E0405"))?;
+        // Gate 3: egress — endpoint pinned.
+        if binding.endpoint_digest.as_str().is_empty() {
+            return Err(DispatchError::admission("egress", model, "E0405"));
+        }
+        // Gate 4: resolve the ASYNC adapter (v0.2).
+        let adapter = self
+            .registry
+            .resolve_async_adapter(binding.adapter_kind)
+            .ok_or_else(|| DispatchError::admission("dispatch", model, "E0401"))?;
+        adapter
+            .validate_route(&binding)
+            .map_err(|e| DispatchError {
+                code: e.code(),
+                phase: "dispatch",
+                message: e.to_string(),
+                session_id: session_id.into(),
+                decision_id: decision_id.into(),
+            })?;
+
+        // Egress broker check against the EXTERNAL allowlist (P0-1) + SPKI.
+        let tuple = egress_tuple_from_binding(&binding).map_err(|e| DispatchError {
+            code: "E0401",
+            phase: "egress",
+            message: e,
+            session_id: session_id.into(),
+            decision_id: decision_id.into(),
+        })?;
+        let broker = EgressBroker::new(
+            self.egress_allowlist.clone(),
+            "pol".into(),
+            self.trusted_routes.clone(),
+            self.spki_pins.clone(),
+        );
+        let verdict = broker.evaluate(&tuple, decision_id);
+        if !verdict.allowed {
+            return Err(DispatchError::admission("egress", model, "E0307"));
+        }
+
+        // GW-04: fsync the EgressIntent before any adapter invocation.
+        let reservation =
+            match self.fsync_egress_intent(writer, session_id, decision_id, &tuple, &verdict) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok((
+                        DispatchOutcome::EgressNotDurable {
+                            reason: e.to_string(),
+                        },
+                        EgressReservation {
+                            decision_id: decision_id.into(),
+                            session_id: session_id.into(),
+                            destination_digest: tuple.digest(),
+                            egress_category: "model_inference".into(),
+                            policy_snapshot_id: "pol".into(),
+                        },
+                    ))
+                }
+            };
+
+        // Invoke the async adapter, collect the stream, validate evidence.
+        let stream = match adapter.invoke(request, credential, cancel).await {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok((
+                    DispatchOutcome::AdapterRefused {
+                        code: e.code(),
+                        message: e.to_string(),
+                    },
+                    reservation,
+                ))
+            }
+        };
+        match orbit_provider_http::stream::collect_stream(stream).await {
+            Ok((events, evidence)) => {
+                let result = orbit_adapter::types::ProviderResult {
+                    status: orbit_adapter::types::ProviderTerminalStatus::Completed,
+                    binding: Default::default(),
+                    output: evidence,
+                    accounting: Default::default(),
+                    transport: Default::default(),
+                    events,
+                };
+                Ok((DispatchOutcome::Completed(Box::new(result)), reservation))
+            }
+            Err(e) => Ok((
+                DispatchOutcome::AdapterRefused {
+                    code: e.code(),
+                    message: e.to_string(),
+                },
+                reservation,
+            )),
+        }
+    }
+
     /// Append + fsync the EgressIntent to the ledger. This is the point where
     /// a fault (disk full, fsync failure) must BLOCK dispatch (GW-04).
     /// P0-5 fix: uses the injected long-lived writer — no competing flock.
@@ -354,8 +493,17 @@ fn egress_tuple_from_binding(binding: &ProviderRouteBinding) -> Result<EgressTup
             binding.provider_id.0
         ));
     }
+    // Scheme mirrors the adapter: loopback hosts use http, else https.
+    let scheme = if binding.endpoint_host == "127.0.0.1"
+        || binding.endpoint_host == "localhost"
+        || binding.endpoint_host == "::1"
+    {
+        "http"
+    } else {
+        "https"
+    };
     Ok(EgressTuple {
-        scheme: "https".into(),
+        scheme: scheme.into(),
         host: binding.endpoint_host.clone(),
         port: binding.endpoint_port,
         path_prefix: "/v1".into(),

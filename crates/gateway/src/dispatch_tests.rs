@@ -300,3 +300,87 @@ fn gateway_replayed_decision_id_refused_e0701() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn gateway_async_dispatch_streams_from_mock_provider() {
+    use orbit_mock_provider::server::spawn;
+    use orbit_provider_http::openai::{openai_capabilities, openai_identity};
+    use orbit_provider_http::{CancelToken, OpenAiCompatibleHttpV1};
+
+    // Start the mock provider (same as the homelab binary).
+    let (addr, _h) = spawn().await.expect("mock spawn");
+    let dir = crate::tmpdir("async-dispatch");
+
+    // Build the engine with the async adapter registered + egress allowlist.
+    let mut registry = ProviderRegistry::new();
+    let adapter = OpenAiCompatibleHttpV1::new(
+        openai_identity(),
+        openai_capabilities(),
+        orbit_adapter::types::TlsPinPolicy {
+            webpki: false,
+            spki_sha256: None,
+        },
+    )
+    .unwrap();
+    let mut binding = test_binding();
+    binding.adapter_kind = AdapterKind::OpenAiCompatibleHttpV1;
+    binding.endpoint_host = "127.0.0.1".into();
+    binding.endpoint_port = addr.port();
+    registry.register_model(crate::ModelRef("test-model".into()), binding.clone());
+    registry.register_async_adapter(
+        AdapterKind::OpenAiCompatibleHttpV1,
+        std::sync::Arc::new(adapter),
+    );
+    // The egress tuple derived from the binding uses the binding's provider_id
+    // ("test-provider") + the loopback host/port — the allowlist must match.
+    let mock_tuple = orbit_egress::EgressTuple {
+        scheme: "http".into(),
+        host: "127.0.0.1".into(),
+        port: addr.port(),
+        path_prefix: "/v1".into(),
+        provider_id: "test-provider".into(),
+        region_id: "test-region".into(),
+    };
+    let allowlist = EgressAllowlist::new(vec![mock_tuple.clone()]);
+    let engine = DispatchEngine::new(registry, dir.clone(), allowlist, vec![mock_tuple], vec![]);
+    let mut writer = LedgerWriter::open(&dir, "test-writer".into(), "0.1.0").unwrap();
+
+    let session = new_session_id();
+    let decision = new_decision_id();
+    let request = canonical_request(&binding, b"hello");
+    let cancel = CancelToken::new();
+    let (outcome, reservation) = engine
+        .dispatch_async(
+            "test-model",
+            &session,
+            &decision.0,
+            &request,
+            None,
+            &mut writer,
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reservation.decision_id, decision.0);
+    match outcome {
+        DispatchOutcome::Completed(r) => {
+            // The stream produced the mock's "hello world" text.
+            let text: String = r
+                .events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    orbit_adapter::types::ProviderEventKind::TextDelta { bytes } => {
+                        Some(String::from_utf8_lossy(bytes).into_owned())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                text, "hello world",
+                "async dispatch streamed the provider text"
+            );
+        }
+        other => panic!("async dispatch expected Completed, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

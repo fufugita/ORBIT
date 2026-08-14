@@ -1659,10 +1659,13 @@ dependencies = [
  "orbit-adapter",
  "orbit-egress",
  "orbit-ledger",
+ "orbit-mock-provider",
+ "orbit-provider-http",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
+ "tokio",
  "zeroize",
 ]
 

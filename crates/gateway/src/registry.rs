@@ -16,6 +16,8 @@ pub struct ProviderRegistry {
     allowlisted_models: HashSet<ModelRef>,
     model_to_route: HashMap<String, ProviderRouteBinding>,
     adapters: HashMap<AdapterKind, Arc<dyn ProviderAdapter>>,
+    /// v0.2 async adapters (AsyncProviderAdapter), keyed by kind.
+    async_adapters: HashMap<AdapterKind, Arc<dyn orbit_provider_http::AsyncProviderAdapter>>,
 }
 
 impl ProviderRegistry {
@@ -42,6 +44,24 @@ impl ProviderRegistry {
 
     pub fn resolve_adapter(&self, kind: AdapterKind) -> Option<Arc<dyn ProviderAdapter>> {
         self.adapters.get(&kind).cloned()
+    }
+
+    /// Register a v0.2 async adapter for a route kind.
+    pub fn register_async_adapter(
+        &mut self,
+        kind: AdapterKind,
+        adapter: Arc<dyn orbit_provider_http::AsyncProviderAdapter>,
+    ) {
+        self.async_adapters.insert(kind, adapter);
+    }
+
+    /// Resolve a v0.2 async adapter for a route kind (v0.1 routes resolve the
+    /// sync adapter; v0.2 async routes resolve this).
+    pub fn resolve_async_adapter(
+        &self,
+        kind: AdapterKind,
+    ) -> Option<Arc<dyn orbit_provider_http::AsyncProviderAdapter>> {
+        self.async_adapters.get(&kind).cloned()
     }
 
     pub fn adapter_kinds(&self) -> Vec<AdapterKind> {
