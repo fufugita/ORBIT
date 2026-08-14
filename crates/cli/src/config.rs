@@ -118,6 +118,74 @@ impl ProvidersConfig {
             .find_map(|p| p.models.iter().find(|m| m.id == model))
             .map(|m| m.pricing)
     }
+
+    /// Append a provider, refusing a duplicate name. Returns an error string
+    /// on collision so callers can surface it without partial writes.
+    pub fn add_provider(&mut self, p: ProviderConfig) -> Result<(), String> {
+        if self.provider.iter().any(|x| x.name == p.name) {
+            return Err(format!("provider '{}' already configured", p.name));
+        }
+        self.provider.push(p);
+        Ok(())
+    }
+
+    /// Atomic save: serialize, write to a temp file in the same directory,
+    /// validate by reloading, then rename into place. On Unix the file is
+    /// created 0600 — the config may reference env-var names but never holds
+    /// credential values; 0600 is defense-in-depth for the provider list.
+    pub fn save_atomic(&self, home: &Path) -> Result<(), String> {
+        let dir = home;
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
+        let path = dir.join("providers.toml");
+        let serialized =
+            toml::to_string(self).map_err(|e| format!("serialize providers: {e}"))?;
+        let tmp = dir.join(".providers.toml.tmp");
+        std::fs::write(&tmp, &serialized).map_err(|e| format!("write {tmp:?}: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        // Roundtrip validate before rename.
+        let back: ProvidersConfig = toml::from_str(&serialized)
+            .map_err(|e| format!("validate roundtrip: {e}"))?;
+        if back.provider.len() != self.provider.len() {
+            return Err("roundtrip provider count mismatch".into());
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| format!("rename -> {path:?}: {e}"))?;
+        Ok(())
+    }
+
+    /// The config path for a home dir.
+    #[allow(dead_code)] // exposed for tooling and tests
+    pub fn config_path(home: &Path) -> std::path::PathBuf {
+        home.join("providers.toml")
+    }
+}
+
+/// Parsed OpenAI-compatible `/v1/models` response: `{data:[{id:"..."}]}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ModelListResponse {
+    pub data: Vec<ModelListItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ModelListItem {
+    pub id: String,
+}
+
+impl ModelListResponse {
+    /// Parse a raw `/v1/models` body; missing/empty data is an error so
+    /// callers can fall back to manual model entry.
+    pub fn parse(raw: &str) -> Result<Vec<String>, String> {
+        let parsed: ModelListResponse = serde_json::from_str(raw)
+            .map_err(|e| format!("parse models response: {e}"))?;
+        let ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
+        if ids.is_empty() {
+            return Err("models response contained no data".into());
+        }
+        Ok(ids)
+    }
 }
 
 #[cfg(test)]
@@ -227,5 +295,67 @@ output_per_million_microcents = 600000
             ..Default::default()
         };
         assert_eq!(rates.cost_microcents(&usage), Some(800));
+    }
+
+    #[test]
+    fn add_provider_refuses_duplicate() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.add_provider(ProviderConfig {
+            name: "a".into(),
+            kind: "openai-compatible".into(),
+            url: "http://127.0.0.1:4001".into(),
+            env: None,
+            models: vec![],
+        })
+        .unwrap();
+        let dup = cfg.add_provider(ProviderConfig {
+            name: "a".into(),
+            kind: "openai-compatible".into(),
+            url: "http://other".into(),
+            env: None,
+            models: vec![],
+        });
+        assert!(dup.is_err());
+    }
+
+    #[test]
+    fn save_atomic_roundtrips_and_preserves() {
+        let home = std::env::temp_dir().join("orbit-config-save");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cfg = ProvidersConfig::default();
+        cfg.add_provider(ProviderConfig {
+            name: "local".into(),
+            kind: "openai-compatible".into(),
+            url: "http://127.0.0.1:4001".into(),
+            env: Some("ORBIT_GATE_TOKEN".into()),
+            models: vec![ModelEntry {
+                id: "glm-5.2".into(),
+                label: None,
+                pricing: Pricing {
+                    input_per_million_microcents: 200_000,
+                    output_per_million_microcents: 600_000,
+                    ..Default::default()
+                },
+            }],
+        })
+        .unwrap();
+        cfg.save_atomic(&home).unwrap();
+        let loaded = ProvidersConfig::load(&home).unwrap();
+        assert_eq!(loaded.provider.len(), 1);
+        assert_eq!(loaded.provider[0].name, "local");
+        assert_eq!(loaded.provider[0].models[0].pricing.output_per_million_microcents, 600_000);
+        // Token VALUE never stored; only the env-var NAME is present.
+        let raw = std::fs::read_to_string(ProvidersConfig::config_path(&home)).unwrap();
+        assert!(raw.contains("ORBIT_GATE_TOKEN"));
+        assert!(!raw.to_lowercase().contains("sk-"));
+    }
+
+    #[test]
+    fn parses_models_response() {
+        let raw = r#"{"data":[{"id":"glm-5.2"},{"id":"kimi-k2.7"}]}"#;
+        let ids = ModelListResponse::parse(raw).unwrap();
+        assert_eq!(ids, vec!["glm-5.2".to_string(), "kimi-k2.7".to_string()]);
+        assert!(ModelListResponse::parse(r#"{"data":[]}"#).is_err());
     }
 }

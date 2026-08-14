@@ -67,7 +67,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
             .unwrap_or_else(|_| PathBuf::from(".orbit"))
     });
     match args[0].as_str() {
-        "init" => cmd_init(&home),
+        "init" => cmd_init(&home, args),
         "run" => cmd_run(&home, args),
         "cancel" => cmd_cancel(&home),
         "verify-ledger" => cmd_verify(&home),
@@ -111,7 +111,7 @@ fn orbit_home(args: &[String]) -> Option<PathBuf> {
 
 /// `orbit init`: generate a local Ed25519 trust root, sign the manifest, verify it,
 /// initialize PIB identity + Ledger (DR-03 E2E: initialize trust).
-fn cmd_init(home: &Path) -> Result<serde_json::Value, (&'static str, String)> {
+fn cmd_init(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     std::fs::create_dir_all(home).map_err(ioe)?;
     let trust_dir = home.join("trust");
     std::fs::create_dir_all(&trust_dir).map_err(ioe)?;
@@ -189,11 +189,248 @@ fn cmd_init(home: &Path) -> Result<serde_json::Value, (&'static str, String)> {
     .map_err(|e| ("ORBIT-E0700", e.to_string()))?;
     w.close().map_err(|e| ("ORBIT-E0700", e.to_string()))?;
 
+    // Optional provider/model setup. Non-interactive init never waits for
+    // stdin; scripted flags or a real terminal opt into configuration.
+    let providers = if args.iter().any(|a| a == "--no-provider") {
+        Vec::new()
+    } else if let Some(name) = value_after(args, "--provider") {
+        let gate = value_after(args, "--gate")
+            .ok_or(("ORBIT-E1101", "--provider requires --gate".into()))?;
+        let models = value_after(args, "--model")
+            .ok_or(("ORBIT-E1101", "--provider requires --model M[,M...]".into()))?;
+        let credential_env = value_after(args, "--credential-env");
+        let model_ids: Vec<String> = models
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        add_configured_provider(home, &name, &gate, credential_env, model_ids, None)?;
+        vec![name]
+    } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        interactive_provider_setup(home)?
+    } else {
+        Vec::new()
+    };
+
     Ok(serde_json::json!({
         "schema": "orbit.cli/v1", "command": "init", "status": "ok",
         "trust_root_verified": true, "pib_id": pib_id,
-        "ledger": ledger_dir.to_string_lossy()
+        "ledger": ledger_dir.to_string_lossy(),
+        "providers_configured": providers,
     }))
+}
+
+/// `orbit run example`: phase chain Init→Plan→Execute (example runs locally).
+/// Add one provider to providers.toml (scripted init path). Pricing defaults to
+/// zero unless supplied by the interactive setup. Token values are never
+/// accepted here — only the credential env-var name.
+fn add_configured_provider(
+    home: &Path,
+    name: &str,
+    gate: &str,
+    credential_env: Option<String>,
+    model_ids: Vec<String>,
+    pricing: Option<Vec<config::Pricing>>,
+) -> Result<(), (&'static str, String)> {
+    validate_provider_url(gate)?;
+    if model_ids.is_empty() {
+        return Err(("ORBIT-E1101", "at least one model is required".into()));
+    }
+    let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+    let models = model_ids
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| config::ModelEntry {
+            id,
+            label: None,
+            pricing: pricing
+                .as_ref()
+                .and_then(|p| p.get(i).copied())
+                .unwrap_or_default(),
+        })
+        .collect();
+    cfg.add_provider(config::ProviderConfig {
+        name: name.into(),
+        kind: "openai-compatible".into(),
+        url: gate.trim_end_matches('/').into(),
+        env: credential_env.filter(|s| !s.trim().is_empty()),
+        models,
+    })
+    .map_err(|e| ("ORBIT-E1106", e))?;
+    cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))
+}
+
+/// URL safety for configured providers: HTTPS anywhere; cleartext HTTP only
+/// for loopback or RFC1918 private-LAN hosts. Reject public cleartext egress.
+fn validate_provider_url(gate: &str) -> Result<(), (&'static str, String)> {
+    let url = url::Url::parse(gate)
+        .map_err(|e| ("ORBIT-E0401", format!("bad provider URL: {e}")))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = url.host_str().unwrap_or("");
+            let private = host == "localhost"
+                || host == "127.0.0.1"
+                || host == "::1"
+                || host.starts_with("10.")
+                || host.starts_with("192.168.")
+                || host
+                    .strip_prefix("172.")
+                    .and_then(|rest| rest.split('.').next())
+                    .and_then(|n| n.parse::<u8>().ok())
+                    .map(|n| (16..=31).contains(&n))
+                    .unwrap_or(false);
+            if private {
+                Ok(())
+            } else {
+                Err((
+                    "ORBIT-E0301",
+                    "cleartext HTTP provider must be loopback/private LAN".into(),
+                ))
+            }
+        }
+        other => Err(("ORBIT-E0301", format!("unsupported scheme {other}"))),
+    }
+}
+
+/// GET `<base>/v1/models`, using a bearer token read from the declared env var
+/// (borrowed for the request only; never printed or persisted). Runs on a
+/// short-lived tokio runtime so the interactive flow stays synchronous.
+fn discover_models(gate: &str, credential_env: Option<&str>) -> Result<Vec<String>, String> {
+    let url = format!("{}/v1/models", gate.trim_end_matches('/'));
+    // reqwest uses rustls in this workspace; install the ring process-default
+    // provider before constructing a standalone discovery client.
+    let _ = orbit_provider_http::tls::client_config(&orbit_adapter::types::TlsPinPolicy {
+        webpki: true,
+        spki_sha256: None,
+    })
+    .map_err(|e| format!("tls init: {e}"))?;
+    tokio::runtime::Runtime::new()
+        .map_err(|e| format!("runtime: {e}"))?
+        .block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("http client: {e}"))?;
+            let mut req = client.get(&url);
+            if let Some(var) = credential_env.filter(|s| !s.trim().is_empty()) {
+                if let Ok(token) = std::env::var(var) {
+                    req = req.bearer_auth(token);
+                }
+            }
+            let resp = req.send().await.map_err(|e| format!("model discovery: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("model discovery returned {}", resp.status()));
+            }
+            let raw = resp
+                .text()
+                .await
+                .map_err(|e| format!("read models: {e}"))?;
+            config::ModelListResponse::parse(&raw)
+        })
+}
+
+/// Guided provider setup for `orbit init` in a real terminal.
+fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str, String)> {
+    use std::io::Write;
+    let mut configured = Vec::new();
+    if !prompt_yes_no("Configure a model provider now?", true)? {
+        return Ok(configured);
+    }
+    loop {
+        let name = prompt_line("Provider name", Some("local"))?;
+        let gate = prompt_line("Base URL", Some("http://127.0.0.1:4001"))?;
+        validate_provider_url(&gate)?;
+        let credential_env = prompt_line("Credential env-var name (blank = none)", Some("ORBIT_GATE_TOKEN"))?;
+        let credential_env = if credential_env.trim().is_empty() {
+            None
+        } else {
+            Some(credential_env)
+        };
+
+        let discovered = match discover_models(&gate, credential_env.as_deref()) {
+            Ok(ids) => {
+                println!("Discovered models:");
+                for (i, id) in ids.iter().enumerate() {
+                    println!("  {}. {id}", i + 1);
+                }
+                ids
+            }
+            Err(e) => {
+                eprintln!("Could not discover models: {e}");
+                Vec::new()
+            }
+        };
+        let model_ids = if discovered.is_empty() {
+            prompt_line("Enter model ids (comma-separated)", None)?
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        } else {
+            let sel = prompt_line("Select models (all or comma-separated numbers)", Some("all"))?;
+            if sel.trim().eq_ignore_ascii_case("all") {
+                discovered
+            } else {
+                sel.split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .filter_map(|n| discovered.get(n.saturating_sub(1)).cloned())
+                    .collect()
+            }
+        };
+        if model_ids.is_empty() {
+            return Err(("ORBIT-E1101", "no models selected".into()));
+        }
+
+        let mut pricing = Vec::new();
+        for id in &model_ids {
+            println!("Pricing for {id} (microcents per million tokens; blank = 0):");
+            let input = prompt_line("  input", Some("0"))?.parse::<u64>().unwrap_or(0);
+            let output = prompt_line("  output", Some("0"))?.parse::<u64>().unwrap_or(0);
+            pricing.push(config::Pricing {
+                input_per_million_microcents: input,
+                output_per_million_microcents: output,
+                ..Default::default()
+            });
+        }
+        add_configured_provider(home, &name, &gate, credential_env, model_ids, Some(pricing))?;
+        configured.push(name);
+        let _ = std::io::stdout().flush();
+        if !prompt_yes_no("Add another provider?", false)? {
+            break;
+        }
+    }
+    // Roundtrip validate the final config.
+    config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+    Ok(configured)
+}
+
+fn prompt_line(label: &str, default: Option<&str>) -> Result<String, (&'static str, String)> {
+    use std::io::Write;
+    match default {
+        Some(d) => print!("{label} [{d}]: "),
+        None => print!("{label}: "),
+    }
+    std::io::stdout().flush().map_err(ioe)?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(ioe)?;
+    let value = line.trim().to_string();
+    if value.is_empty() {
+        Ok(default.unwrap_or("").to_string())
+    } else {
+        Ok(value)
+    }
+}
+
+fn prompt_yes_no(label: &str, default_yes: bool) -> Result<bool, (&'static str, String)> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    let answer = prompt_line(&format!("{label} {suffix}"), None)?;
+    if answer.trim().is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 /// `orbit run example`: phase chain Init→Plan→Execute (example runs locally).

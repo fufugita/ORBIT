@@ -34,6 +34,7 @@ orbit-gateway = { path = "../gateway" }
 orbit-egress = { path = "../egress" }
 orbit-hud = { path = "../hud" }
 tokio.workspace = true
+reqwest.workspace = true
 url = "2"
 
 [[bin]]
