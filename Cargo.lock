@@ -2046,9 +2046,13 @@ dependencies = [
  "age",
  "ed25519-dalek",
  "hex",
+ "orbit-adapter",
+ "orbit-egress",
  "orbit-export",
+ "orbit-gateway",
  "orbit-ledger",
  "orbit-pib",
+ "orbit-provider-http",
  "orbit-reactor",
  "orbit-release",
  "orbit-trust",
@@ -2057,6 +2061,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
+ "tokio",
+ "url",
  "zeroize",
 ]
 

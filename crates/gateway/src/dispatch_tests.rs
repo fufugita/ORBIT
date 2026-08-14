@@ -309,7 +309,7 @@ async fn gateway_async_dispatch_streams_from_mock_provider() {
     use orbit_provider_http::{CancelToken, OpenAiCompatibleHttpV1};
 
     // Start the mock provider (same as the homelab binary).
-    let (addr, _h) = spawn().await.expect("mock spawn");
+    let (addr, _state, _h) = spawn().await.expect("mock spawn");
     let dir = crate::tmpdir("async-dispatch");
 
     // Build the engine with the async adapter registered + egress allowlist.

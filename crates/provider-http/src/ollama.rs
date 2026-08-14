@@ -73,7 +73,7 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
         let body = serde_json::json!({
             "model": request.route.expected_model,
             "stream": true,
-            "messages": [{"role":"user","content":"orbit-request"}],
+            "messages": [{"role":"user","content": String::from_utf8_lossy(request.input.expose()).into_owned()}],
             "options": {
                 "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
                 "top_p": request.sampling.top_p_millionths as f64 / 1_000_000.0,

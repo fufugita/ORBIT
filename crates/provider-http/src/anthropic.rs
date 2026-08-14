@@ -70,7 +70,7 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
             "stream": true,
             "max_tokens": request.sampling.max_output_tokens,
             "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
-            "messages": [{"role":"user","content":"orbit-request"}],
+            "messages": [{"role":"user","content": String::from_utf8_lossy(request.input.expose()).into_owned()}],
         });
         let mut req = self
             .client

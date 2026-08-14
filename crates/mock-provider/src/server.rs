@@ -31,6 +31,8 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ServerState {
     pub requests: Arc<std::sync::atomic::AtomicU64>,
+    /// The last request JSON captured (for prompt-delivery assertions).
+    pub last_body: Arc<std::sync::Mutex<Option<Value>>>,
 }
 
 pub fn router(state: ServerState) -> Router {
@@ -51,11 +53,12 @@ fn behavior(headers: &HeaderMap) -> &str {
 async fn openai(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
     state
         .requests
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *state.last_body.lock().unwrap() = Some(body);
     match behavior(&headers) {
         "rate-limit" => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -176,12 +179,14 @@ fn ollama_success() -> String {
 }
 
 /// Spawn on `127.0.0.1:0` and return the assigned address + shutdown handle.
-pub async fn spawn() -> Result<(SocketAddr, tokio::task::JoinHandle<()>), std::io::Error> {
+pub async fn spawn(
+) -> Result<(SocketAddr, ServerState, tokio::task::JoinHandle<()>), std::io::Error> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let app = router(ServerState::default());
+    let state = ServerState::default();
+    let app = router(state.clone());
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    Ok((addr, handle))
+    Ok((addr, state, handle))
 }

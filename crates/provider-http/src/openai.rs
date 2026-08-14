@@ -90,7 +90,7 @@ impl OpenAiCompatibleHttpV1 {
             "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
             "max_tokens": request.sampling.max_output_tokens,
             "messages": [{"role": "user", "content": String::from_utf8_lossy(
-                request.metadata.input_sha256.as_str().as_bytes()
+                request.input.expose()
             ).into_owned()}],
         });
 

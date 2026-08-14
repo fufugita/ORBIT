@@ -27,6 +27,12 @@ orbit-pib = { path = "../pib" }
 orbit-export = { path = "../export" }
 orbit-reactor = { path = "../reactor" }
 orbit-release = { path = "../release" }
+orbit-adapter = { path = "../adapter" }
+orbit-provider-http = { path = "../provider-http" }
+orbit-gateway = { path = "../gateway" }
+orbit-egress = { path = "../egress" }
+tokio.workspace = true
+url = "2"
 
 [[bin]]
 name = "orbit"

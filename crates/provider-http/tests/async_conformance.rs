@@ -48,14 +48,13 @@ async fn start_mock() -> (
     ServerState,
     tokio::task::JoinHandle<()>,
 ) {
-    let (addr, handle) = spawn().await.expect("mock spawn");
-    let _ = ServerState::default();
-    (addr, ServerState::default(), handle)
+    let (addr, state, handle) = spawn().await.expect("mock spawn");
+    (addr, state, handle)
 }
 
 #[tokio::test]
 async fn openai_adapter_streams_success_with_valid_evidence() {
-    let (addr, _state, _h) = start_mock().await;
+    let (addr, state, _h) = start_mock().await;
     let adapter = OpenAiCompatibleHttpV1::new(
         openai_identity(),
         openai_capabilities(),
@@ -78,6 +77,30 @@ async fn openai_adapter_streams_success_with_valid_evidence() {
     while let Some(item) = stream.next().await {
         events.push(item.unwrap());
     }
+    // The actual raw prompt reached the gate (not its SHA-256 digest).
+    let captured = state
+        .last_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("captured body");
+    assert_eq!(
+        captured
+            .pointer("/messages/0/content")
+            .and_then(|v| v.as_str()),
+        Some("hello")
+    );
+    assert!(!captured.to_string().contains(
+        request(
+            "127.0.0.1",
+            addr.port(),
+            AdapterKind::OpenAiCompatibleHttpV1
+        )
+        .metadata
+        .input_sha256
+        .as_str()
+    ));
+
     // Sequence contiguity + single terminal (GW-11).
     let evidence = orbit_adapter::stream::output_evidence(&events).unwrap();
     let finished = events

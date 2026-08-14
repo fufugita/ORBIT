@@ -108,6 +108,7 @@ pub fn canonical_request(route: &ProviderRouteBinding, input: &[u8]) -> Provider
         decision_id: crate::types::DecisionId("decision-1".into()),
         attempt_id: crate::types::AttemptId("attempt-1".into()),
         route: route.clone(),
+        input: crate::credential::SecretBytes::new(input.to_vec()),
         sampling: SamplingParameters {
             temperature_milliunits: 700,
             top_p_millionths: 950_000,

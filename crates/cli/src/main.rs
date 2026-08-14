@@ -51,6 +51,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "replay" => cmd_replay(&home, args),
         "export" => cmd_export(&home, args),
         "restore" => cmd_restore(&home, args),
+        "ask" => cmd_ask(&home, args),
         "version" => Ok(
             serde_json::to_value(orbit_cli::version_evidence("0.1.0", "dev")).unwrap_or_default(),
         ),
@@ -61,6 +62,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
             "usage": "orbit <command> [--home <dir>]",
             "commands": [
                 "init          initialize trust root + PIB + Ledger",
+                "ask PROMPT     send a prompt through a configured gateway",
                 "run           run the example phase chain",
                 "cancel        cancel the session (terminal: cancelled)",
                 "verify-ledger verify the Ledger hash chain",
@@ -315,6 +317,208 @@ fn cmd_restore(_home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
         "schema":"orbit.cli/v1","command":"restore","status":"ok","into":into,
         "source_session":manifest.source_session_id,"restored_session":"session-restored"
     }))
+}
+
+/// `orbit ask "<prompt>" [--model <M>] [--gate <url>]` — send a prompt through
+/// a local OpenAI-compatible gateway via the four-gate async dispatch pipeline.
+///
+/// Configuration (no internal defaults committed):
+/// - `--gate` / `ORBIT_GATE_URL` — default `http://127.0.0.1:4001`
+/// - `--model` / `ORBIT_MODEL` — REQUIRED; no default model is invented
+/// - `ORBIT_GATE_TOKEN` — optional bearer token (never printed/persisted)
+fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    ensure_initialized(home)?;
+    let prompt = args
+        .get(1)
+        .ok_or(("ORBIT-E1101", "ask requires a prompt".into()))?;
+    let gate = value_after(args, "--gate")
+        .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:4001".into());
+    let model = value_after(args, "--model")
+        .or_else(|| std::env::var("ORBIT_MODEL").ok())
+        .ok_or(("ORBIT-E1101", "ask requires --model or ORBIT_MODEL".into()))?;
+
+    // Parse the gate URL; only http loopback or https is acceptable.
+    let url = url::Url::parse(&gate).map_err(|e| ("ORBIT-E0401", format!("bad gate url: {e}")))?;
+    let scheme = match url.scheme() {
+        "https" => orbit_adapter::types::EndpointScheme::Https,
+        "http" => orbit_adapter::types::EndpointScheme::HttpLoopback,
+        other => {
+            return Err(("ORBIT-E0301", format!("unsupported scheme {other}")));
+        }
+    };
+    let host = url.host_str().unwrap_or("").to_string();
+    if host.is_empty() {
+        return Err(("ORBIT-E0401", "gate url missing host".into()));
+    }
+    let port = url
+        .port()
+        .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+
+    // Build the route binding (generic runtime config — no internal models).
+    let input = orbit_adapter::credential::SecretBytes::new(prompt.as_bytes().to_vec());
+    let input_digest =
+        orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(prompt.as_bytes())));
+    let adapter_identity = orbit_provider_http::openai::openai_identity();
+    let route = orbit_adapter::types::ProviderRouteBinding {
+        provider_id: orbit_adapter::types::ProviderId("configured-gateway".into()),
+        deployment_id: orbit_adapter::types::DeploymentId("configured-gateway".into()),
+        region_id: orbit_adapter::types::RegionId("local".into()),
+        adapter_kind: orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1,
+        adapter_implementation_digest: adapter_identity.implementation_digest.clone(),
+        adapter_profile_digest: adapter_identity.profile_digest.clone(),
+        endpoint_digest: orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(
+            format!("{gate}:{model}").as_bytes(),
+        ))),
+        expected_model: model.clone(),
+        pricing_digest: orbit_adapter::types::Sha256Digest("0".repeat(64)),
+        endpoint_host: host,
+        endpoint_port: port,
+        endpoint_scheme: scheme,
+    };
+
+    // Register the model + async adapter in a fresh registry.
+    let mut registry = orbit_gateway::ProviderRegistry::new();
+    let adapter = orbit_provider_http::OpenAiCompatibleHttpV1::new(
+        adapter_identity,
+        orbit_provider_http::openai::openai_capabilities(),
+        orbit_adapter::types::TlsPinPolicy {
+            webpki: true,
+            spki_sha256: None,
+        },
+    )
+    .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
+    registry.register_model(orbit_gateway::ModelRef(model.clone()), route.clone());
+    registry.register_async_adapter(
+        orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1,
+        std::sync::Arc::new(adapter),
+    );
+
+    // Egress allowlist: exactly this one gate tuple.
+    let tuple = orbit_egress::EgressTuple {
+        scheme: if url.scheme() == "https" {
+            "https".into()
+        } else {
+            "http".into()
+        },
+        host: route.endpoint_host.clone(),
+        port,
+        path_prefix: "/v1".into(),
+        provider_id: "configured-gateway".into(),
+        region_id: "local".into(),
+    };
+    let engine = orbit_gateway::DispatchEngine::new(
+        registry,
+        home.join("ledger"),
+        orbit_egress::EgressAllowlist::new(vec![tuple.clone()]),
+        vec![tuple],
+        vec![],
+    );
+
+    // Build the provider request carrying the REAL prompt bytes.
+    let request = orbit_adapter::types::ProviderRequest {
+        schema_version: 1,
+        request_id: orbit_adapter::types::RequestId(format!("ask-{}", std::process::id())),
+        decision_id: orbit_adapter::types::DecisionId(format!("ask-{}", std::process::id())),
+        attempt_id: orbit_adapter::types::AttemptId(format!("ask-{}", std::process::id())),
+        route: route.clone(),
+        input,
+        sampling: orbit_adapter::types::SamplingParameters {
+            temperature_milliunits: 700,
+            top_p_millionths: 950_000,
+            max_output_tokens: 2048,
+        },
+        output: orbit_adapter::types::OutputRequirements::Text,
+        tools: Vec::new(),
+        metadata: orbit_adapter::types::RequestMetadata {
+            input_sha256: input_digest,
+            input_bytes: prompt.len() as u64,
+            tools_count: 0,
+        },
+        connect_timeout_ms: 10_000,
+        first_byte_timeout_ms: 30_000,
+        total_timeout_ms: 120_000,
+    };
+
+    // Gate authentication (never printed/persisted). A gateway may require a
+    // Bearer token for /v1 chat calls; read it from ORBIT_GATE_TOKEN. No other
+    // env vars are consulted — e.g. ANTHROPIC_AUTH_TOKEN is Claude Code's
+    // UPSTREAM auth, not the gate's key, so it is deliberately NOT a fallback.
+    let credential = std::env::var("ORBIT_GATE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|t| orbit_adapter::credential::SecretBytes::new(t.into_bytes()));
+
+    let session = orbit_gateway::new_session_id();
+    let decision = orbit_gateway::new_decision_id();
+    let cancel = orbit_provider_http::CancelToken::new();
+
+    // Run the full pipeline via tokio.
+    let result = tokio::runtime::Runtime::new()
+        .map_err(|e| ("ORBIT-E0410", e.to_string()))?
+        .block_on(async {
+            let mut writer =
+                orbit_ledger::LedgerWriter::open(&home.join("ledger"), "orbit-ask".into(), "0.1.0")
+                    .map_err(|e| orbit_gateway::DispatchError {
+                        code: "E0719",
+                        phase: "ledger",
+                        message: e.to_string(),
+                        session_id: session.clone(),
+                        decision_id: decision.0.clone(),
+                    })?;
+            engine
+                .dispatch_async(
+                    &model,
+                    &session,
+                    &decision.0,
+                    &request,
+                    credential.as_ref(),
+                    &mut writer,
+                    &cancel,
+                )
+                .await
+        })
+        .map_err(|e| (e.code, e.message))?;
+
+    let (outcome, reservation) = result;
+    match outcome {
+        orbit_gateway::DispatchOutcome::Completed(r) => {
+            let output: String = r
+                .events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    orbit_adapter::types::ProviderEventKind::TextDelta { bytes } => {
+                        Some(String::from_utf8_lossy(bytes).into_owned())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let usage = r.accounting.usage;
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "ask",
+                "status": "ok",
+                "model": model,
+                "output": output,
+                "ledger_recorded": true,
+                "ledger_head": reservation.destination_digest,
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                }
+            }))
+        }
+        orbit_gateway::DispatchOutcome::AdapterRefused { code: "E0404", .. }
+            if credential.is_none() =>
+        {
+            Err((
+                "ORBIT-E0402",
+                format!("gateway at {gate} requires authentication; set ORBIT_GATE_TOKEN"),
+            ))
+        }
+        orbit_gateway::DispatchOutcome::AdapterRefused { code, message } => Err((code, message)),
+        other => Err(("ORBIT-E0406", format!("ask failed: {other:?}"))),
+    }
 }
 
 fn ensure_initialized(home: &Path) -> Result<(), (&'static str, String)> {

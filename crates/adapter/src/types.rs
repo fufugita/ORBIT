@@ -179,13 +179,18 @@ pub struct RequestMetadata {
 
 /// A provider request (DR-09 §3). `input` is SecretBytes (zeroize-on-drop);
 /// the adapter borrows it for the call duration only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Not Clone / Serialize — the prompt bytes must never be duplicated into a
+/// second sink (GW-25).
+#[derive(Debug)]
 pub struct ProviderRequest {
     pub schema_version: u16,
     pub request_id: RequestId,
     pub decision_id: DecisionId,
     pub attempt_id: AttemptId,
     pub route: ProviderRouteBinding,
+    /// The actual prompt bytes, zeroized on drop. The adapter borrows these
+    /// at the final wire boundary — never the metadata hash.
+    pub input: crate::credential::SecretBytes,
     pub sampling: SamplingParameters,
     pub output: OutputRequirements,
     pub tools: Vec<ToolDefinition>,
