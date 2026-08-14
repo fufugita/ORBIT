@@ -6,7 +6,7 @@
 //! transcript back into the conversation so a session continues across
 //! invocations.
 
-use orbit_adapter::types::{ChatMessage, ChatRole};
+use orbit_adapter::types::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -18,7 +18,7 @@ pub struct SessionFile {
     pub model: String,
     pub gate: String,
     pub provider: String,
-    pub transcript: Vec<StoredMessage>,
+    pub transcript: Vec<orbit_adapter::types::ChatMessage>,
     pub turns: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -27,30 +27,9 @@ pub struct SessionFile {
     pub updated_at: String,
 }
 
-/// Wire-compatible message shape (role + content; serialized JSON).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredMessage {
-    pub role: String,
-    pub content: String,
-}
-
 impl SessionFile {
     pub fn to_transcript(&self) -> Vec<ChatMessage> {
-        self.transcript
-            .iter()
-            .filter_map(|m| {
-                let role = match m.role.as_str() {
-                    "system" => ChatRole::System,
-                    "user" => ChatRole::User,
-                    "assistant" => ChatRole::Assistant,
-                    _ => return None,
-                };
-                Some(ChatMessage {
-                    role,
-                    content: m.content.clone(),
-                })
-            })
-            .collect()
+        self.transcript.clone()
     }
 
     /// Build a session file from live REPL state.
@@ -72,13 +51,7 @@ impl SessionFile {
             model: model.into(),
             gate: gate.into(),
             provider: provider.into(),
-            transcript: transcript
-                .iter()
-                .map(|m| StoredMessage {
-                    role: m.role.as_str().into(),
-                    content: m.content.clone(),
-                })
-                .collect(),
+            transcript: transcript.to_vec(),
             turns,
             input_tokens,
             output_tokens,
@@ -137,6 +110,7 @@ pub fn list_sessions(home: &Path) -> Result<Vec<SessionFile>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orbit_adapter::types::ChatRole;
 
     fn test_home(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("orbit-sessions-{name}"));
@@ -155,10 +129,16 @@ mod tests {
                 ChatMessage {
                     role: ChatRole::User,
                     content: "hello".into(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    tool_result: None,
                 },
                 ChatMessage {
                     role: ChatRole::Assistant,
                     content: "world".into(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    tool_result: None,
                 },
             ],
             1,
@@ -192,12 +172,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_roles_are_not_restored() {
-        let mut s = sample("session-roles");
-        s.transcript.push(StoredMessage {
-            role: "tool".into(),
-            content: "not supported yet".into(),
+    fn tool_message_roundtrips() {
+        let mut s = sample("session-tool");
+        s.transcript.push(ChatMessage {
+            role: ChatRole::Tool,
+            content: "{\"ok\":true}".into(),
+            tool_calls: None,
+            tool_call_id: Some("call-1".into()),
+            tool_result: Some("{\"ok\":true}".into()),
         });
-        assert_eq!(s.to_transcript().len(), 2);
+        let restored = s.to_transcript();
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[2].role, ChatRole::Tool);
+        assert_eq!(restored[2].tool_call_id.as_deref(), Some("call-1"));
     }
 }

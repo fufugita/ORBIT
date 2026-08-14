@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 mod config;
 mod sessions;
+mod tool_runtime;
+mod tools;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -583,9 +585,20 @@ fn cmd_restore(_home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
     }))
 }
 
-/// Outcome of one `run_turn` call: the assembled text + token usage + cost.
+/// One assembled tool call from the provider stream.
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    index: u32,
+    id: String,
+    name: String,
+    arguments: Vec<u8>,
+}
+
+/// Outcome of one provider round: assembled text + tool calls + usage + cost.
 struct TurnOutcome {
     output: String,
+    tool_calls: Vec<PendingToolCall>,
+    finish_reason: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
     cost_microcents: u64,
@@ -704,11 +717,11 @@ fn run_turn(
             max_output_tokens: 2048,
         },
         output: orbit_adapter::types::OutputRequirements::Text,
-        tools: Vec::new(),
+        tools: tools::tool_definitions(),
         metadata: orbit_adapter::types::RequestMetadata {
             input_sha256: input_digest,
             input_bytes: prompt.len() as u64,
-            tools_count: 0,
+            tools_count: tools::tool_definitions().len() as u32,
         },
         connect_timeout_ms: 10_000,
         first_byte_timeout_ms: 30_000,
@@ -772,6 +785,40 @@ fn run_turn(
                     _ => None,
                 })
                 .collect();
+            // Assemble tool calls from the streamed events.
+            let mut tool_calls: std::collections::BTreeMap<u32, PendingToolCall> =
+                std::collections::BTreeMap::new();
+            for e in &r.events {
+                match &e.event {
+                    orbit_adapter::types::ProviderEventKind::ToolCallStarted {
+                        call_index,
+                        provider_call_id,
+                        name,
+                    } => {
+                        tool_calls.entry(*call_index).or_insert_with(|| PendingToolCall {
+                            index: *call_index,
+                            id: provider_call_id.clone().unwrap_or_else(|| format!("call-{call_index}")),
+                            name: name.clone(),
+                            arguments: Vec::new(),
+                        });
+                    }
+                    orbit_adapter::types::ProviderEventKind::ToolCallArgumentsDelta {
+                        call_index,
+                        bytes,
+                    } => {
+                        if let Some(tc) = tool_calls.get_mut(call_index) {
+                            tc.arguments.extend_from_slice(bytes);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let finish_reason = r.events.iter().rev().find_map(|e| match &e.event {
+                orbit_adapter::types::ProviderEventKind::Finished {
+                    finish_reason, ..
+                } => finish_reason.clone(),
+                _ => None,
+            });
             let usage = r.accounting.usage;
             // Cost in microcents from the pricing config (zero if unpriced).
             let cost_microcents = pricing
@@ -779,6 +826,8 @@ fn run_turn(
                 .unwrap_or(0);
             Ok(TurnOutcome {
                 output,
+                tool_calls: tool_calls.into_values().collect(),
+                finish_reason,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_microcents,
@@ -972,24 +1021,15 @@ fn cmd_chat(args: &[String]) -> i32 {
             continue;
         }
 
-        // Build the transcript for THIS turn: prior turns + the new user prompt.
-        let mut turn_messages = transcript.clone();
-        turn_messages.push(orbit_adapter::types::ChatMessage {
+        // Build the transcript for THIS user turn. A user turn may contain
+        // multiple provider rounds when the model calls tools.
+        transcript.push(orbit_adapter::types::ChatMessage {
             role: orbit_adapter::types::ChatRole::User,
             content: trimmed.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
         });
-
-        // Live observer: print TextDeltas as they stream in.
-        let mut live_output: String = String::new();
-        let mut observer = |ev: &orbit_adapter::types::ProviderStreamEvent| {
-            if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &ev.event {
-                let s = String::from_utf8_lossy(bytes).into_owned();
-                print!("{s}");
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                live_output.push_str(&s);
-            }
-        };
 
         // Resolve the provider for the current model (config overrides the
         // default gate). `credential_env` names the env var holding the token.
@@ -1000,6 +1040,8 @@ fn cmd_chat(args: &[String]) -> i32 {
         let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
         let credential_env = provider.and_then(|p| p.env.as_deref());
         let pricing = cfg.pricing_for_model(&model);
+        let auto_tools = args.iter().any(|a| a == "--auto-tools");
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
         render_hud(
             &hud,
@@ -1007,61 +1049,139 @@ fn cmd_chat(args: &[String]) -> i32 {
                 phase: format!("turn {}({model})", turns + 1),
             },
         );
-        let outcome = run_turn(
-            &home,
-            provider_id,
-            resolved_gate,
-            &model,
-            credential_env,
-            pricing,
-            &trimmed,
-            Some(turn_messages),
-            Some(&mut observer),
-        );
-        println!();
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
 
-        match outcome {
-            Ok(o) => {
-                turns += 1;
-                total_input += o.input_tokens;
-                total_output += o.output_tokens;
-                total_cost += o.cost_microcents;
-                // Cost bar (H-17: integer µ¢, real pricing when declared).
-                render_hud(
-                    &hud,
-                    &orbit_hud::HudEvent::CostBar {
-                        cost_microcents: o.cost_microcents,
-                    },
-                );
-                // Record the model's reply into the transcript for continuity.
-                transcript.push(orbit_adapter::types::ChatMessage {
-                    role: orbit_adapter::types::ChatRole::User,
-                    content: trimmed.clone(),
-                });
+        let mut turn_ok = false;
+        for round in 0..8u32 {
+            // Live observer: print TextDeltas as they stream in.
+            let mut observer = |ev: &orbit_adapter::types::ProviderStreamEvent| {
+                if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &ev.event {
+                    let s = String::from_utf8_lossy(bytes).into_owned();
+                    print!("{s}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+            };
+            let outcome = run_turn(
+                &home,
+                provider_id,
+                resolved_gate,
+                &model,
+                credential_env,
+                pricing,
+                &trimmed,
+                Some(transcript.clone()),
+                Some(&mut observer),
+            );
+            println!();
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+
+            let o = match outcome {
+                Ok(o) => o,
+                Err((code, msg)) => {
+                    eprintln!("{code}: {msg}");
+                    break;
+                }
+            };
+            total_input += o.input_tokens;
+            total_output += o.output_tokens;
+            total_cost += o.cost_microcents;
+            render_hud(
+                &hud,
+                &orbit_hud::HudEvent::CostBar {
+                    cost_microcents: o.cost_microcents,
+                },
+            );
+
+            if o.tool_calls.is_empty() {
+                // Normal text terminal — append assistant reply and finish the
+                // user turn. `finish_reason` is retained in TurnOutcome for
+                // evidence/debugging but not exposed to the transcript.
+                let _finish_reason = &o.finish_reason;
                 transcript.push(orbit_adapter::types::ChatMessage {
                     role: orbit_adapter::types::ChatRole::Assistant,
-                    content: o.output.clone(),
+                    content: o.output,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    tool_result: None,
                 });
-                // Persist the session after each successful turn.
-                let sf = sessions::SessionFile::from_chat(
-                    &session,
-                    &model,
-                    resolved_gate,
-                    provider_id,
-                    &transcript,
-                    turns,
-                    total_input,
-                    total_output,
-                    total_cost,
-                );
-                if let Err(e) = sessions::save_session(&home, &sf) {
-                    eprintln!("warning: session not saved: {e}");
-                }
+                turn_ok = true;
+                break;
             }
-            Err((code, msg)) => {
-                eprintln!("{code}: {msg}");
+
+            if o.tool_calls.len() > 16 {
+                eprintln!("ORBIT-E0200: provider requested more than 16 tools in one round");
+                break;
+            }
+
+            // Append the assistant tool-call message, then each tool result.
+            let assistant_calls: Vec<orbit_adapter::types::ToolCallMessage> = o
+                .tool_calls
+                .iter()
+                .map(|tc| orbit_adapter::types::ToolCallMessage {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: String::from_utf8_lossy(&tc.arguments).into_owned(),
+                })
+                .collect();
+            transcript.push(orbit_adapter::types::ChatMessage {
+                role: orbit_adapter::types::ChatRole::Assistant,
+                content: o.output,
+                tool_calls: Some(assistant_calls),
+                tool_call_id: None,
+                tool_result: None,
+            });
+
+            for call in &o.tool_calls {
+                // Update the read-only current_session snapshot before execution.
+                tools::SESSION_SNAPSHOT.with(|s| {
+                    *s.borrow_mut() = tools::SessionSnapshot {
+                        session_id: session.clone(),
+                        model: model.clone(),
+                        provider: provider_id.to_string(),
+                        turns,
+                        input_tokens: total_input,
+                        output_tokens: total_output,
+                    };
+                });
+                let decision_id = format!("tool-round-{round}-{}", call.index);
+                let result = tool_runtime::execute_call(
+                    &home,
+                    &session,
+                    &decision_id,
+                    call,
+                    auto_tools,
+                    interactive,
+                )
+                .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+                transcript.push(orbit_adapter::types::ChatMessage {
+                    role: orbit_adapter::types::ChatRole::Tool,
+                    content: result.clone(),
+                    tool_calls: None,
+                    tool_call_id: Some(call.id.clone()),
+                    tool_result: Some(result),
+                });
+            }
+            // The next provider round receives the assistant call + tool results.
+        }
+
+        if !turn_ok {
+            eprintln!("ORBIT-E0406: tool loop ended without a final assistant response");
+        } else {
+            turns += 1;
+            let sf = sessions::SessionFile::from_chat(
+                &session,
+                &model,
+                resolved_gate,
+                provider_id,
+                &transcript,
+                turns,
+                total_input,
+                total_output,
+                total_cost,
+            );
+            if let Err(e) = sessions::save_session(&home, &sf) {
+                eprintln!("warning: session not saved: {e}");
             }
         }
     }

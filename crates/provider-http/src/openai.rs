@@ -90,10 +90,32 @@ impl OpenAiCompatibleHttpV1 {
             Some(transcript) => transcript
                 .iter()
                 .map(|m| {
-                    serde_json::json!({
-                        "role": m.role.as_str(),
-                        "content": m.content,
-                    })
+                    if let Some(tool_calls) = m
+                        .tool_calls
+                        .as_ref()
+                        .filter(|_| m.role == orbit_adapter::types::ChatRole::Assistant)
+                    {
+                        serde_json::json!({
+                            "role": "assistant",
+                            "content": if m.content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(m.content.clone()) },
+                            "tool_calls": tool_calls.iter().map(|tc| serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": { "name": tc.name, "arguments": tc.arguments },
+                            })).collect::<Vec<_>>(),
+                        })
+                    } else if m.role == orbit_adapter::types::ChatRole::Tool {
+                        serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": m.tool_call_id,
+                            "content": m.tool_result.as_deref().unwrap_or(&m.content),
+                        })
+                    } else {
+                        serde_json::json!({
+                            "role": m.role.as_str(),
+                            "content": m.content,
+                        })
+                    }
                 })
                 .collect::<Vec<_>>()
                 .into(),
@@ -103,13 +125,32 @@ impl OpenAiCompatibleHttpV1 {
                 ).into_owned()}
             ]),
         };
-        let body = serde_json::json!({
+        let tools: Vec<serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                })
+            })
+            .collect();
+        let mut body = serde_json::json!({
             "model": request.route.expected_model,
             "stream": true,
+            "stream_options": { "include_usage": true },
             "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
             "max_tokens": request.sampling.max_output_tokens,
             "messages": messages,
         });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools);
+            body["tool_choice"] = serde_json::Value::String("auto".into());
+        }
 
         let mut req = self
             .client
@@ -159,6 +200,8 @@ fn openai_stream(
         let mut seq: u64 = 0;
         let mut usage = ProviderUsage::default();
         let mut saw_done = false;
+        let mut finish_reason: Option<String> = None;
+        let mut open_tool_calls: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
 
         // Emit the response-started event.
         yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ResponseStarted { upstream_request_id: None } });
@@ -198,6 +241,60 @@ fn openai_stream(
                     });
                     seq += 1;
                 }
+                // Streaming tool calls. OpenAI may fragment name/id/arguments
+                // across arbitrary SSE chunks. We emit Started on first sight,
+                // ArgumentsDelta for every fragment, then Finished when the
+                // choice finish_reason becomes `tool_calls` (or at terminal).
+                if let Some(calls) = json.pointer("/choices/0/delta/tool_calls")
+                    .and_then(|v| v.as_array())
+                {
+                    for call in calls {
+                        let index = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        if !open_tool_calls.contains(&index) {
+                            let id = call.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                            let name = call.pointer("/function/name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            open_tool_calls.insert(index);
+                            yield Ok(ProviderStreamEvent {
+                                sequence: seq,
+                                event: ProviderEventKind::ToolCallStarted {
+                                    call_index: index,
+                                    provider_call_id: id,
+                                    name,
+                                },
+                            });
+                            seq += 1;
+                        }
+                        if let Some(args) = call.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                            if !args.is_empty() {
+                                yield Ok(ProviderStreamEvent {
+                                    sequence: seq,
+                                    event: ProviderEventKind::ToolCallArgumentsDelta {
+                                        call_index: index,
+                                        bytes: args.as_bytes().to_vec(),
+                                    },
+                                });
+                                seq += 1;
+                            }
+                        }
+                    }
+                }
+                if let Some(reason) = json.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) {
+                    finish_reason = Some(reason.to_string());
+                    if reason == "tool_calls" {
+                        let to_finish: Vec<u32> = open_tool_calls.iter().copied().collect();
+                        for index in to_finish {
+                            yield Ok(ProviderStreamEvent {
+                                sequence: seq,
+                                event: ProviderEventKind::ToolCallFinished { call_index: index },
+                            });
+                            seq += 1;
+                            open_tool_calls.remove(&index);
+                        }
+                    }
+                }
                 // Usage update — full five-field extraction (DR-09 §8).
                 // OpenAI nests cache/reasoning under prompt/completion details.
                 if let Some(u) = json.get("usage") {
@@ -229,11 +326,20 @@ fn openai_stream(
             if saw_done { break; }
         }
 
-        // Terminalizer (GW-10): exactly one Finished.
+        // Terminalizer (GW-10): exactly one Finished. Finish any tool calls the
+        // stream left open (belt-and-suspenders — a well-formed stream closes
+        // them at finish_reason=tool_calls).
+        for index in open_tool_calls.iter().copied().collect::<Vec<_>>() {
+            yield Ok(ProviderStreamEvent {
+                sequence: seq,
+                event: ProviderEventKind::ToolCallFinished { call_index: index },
+            });
+            seq += 1;
+        }
         yield Ok(ProviderStreamEvent {
             sequence: seq,
             event: ProviderEventKind::Finished {
-                finish_reason: Some("stop".into()),
+                finish_reason,
                 final_usage: Some(usage),
             },
         });

@@ -58,8 +58,24 @@ async fn openai(
     state
         .requests
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    *state.last_body.lock().unwrap() = Some(body);
-    match behavior(&headers) {
+    *state.last_body.lock().unwrap() = Some(body.clone());
+    // If the request advertises tools, exercise a real fragmented calculator
+    // call on the first round. If a tool result is already in messages, return
+    // the final text response. Explicit x-orbit-behavior still wins.
+    let implicit_tool_behavior = if headers.get("x-orbit-behavior").is_none()
+        && body.get("tools").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+    {
+        let has_result = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|msgs| msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")))
+            .unwrap_or(false);
+        Some(if has_result { "success" } else { "tool-calls" })
+    } else {
+        None
+    };
+    let selected = implicit_tool_behavior.unwrap_or_else(|| behavior(&headers));
+    match selected {
         "rate-limit" => (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", "1")],
@@ -159,7 +175,14 @@ fn openai_partial() -> String {
     r#"data: {"id":"r1","choices":[{"delta":{"content":"partial"}}]}\n\n"#.replace("\\n", "\n")
 }
 fn openai_tool_calls() -> String {
-    openai_success()
+    [
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"calculator","arguments":"{\"expression\":"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"2*(3+4)\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n")
 }
 fn anthropic_success() -> String {
     [

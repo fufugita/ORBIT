@@ -181,6 +181,43 @@ pub struct SegmentHeader {
     pub ledger_hash_prev: String,
 }
 
+/// ToolIntent — recorded + fsynced BEFORE a tool executes (DR-19). Carries
+/// only the arguments SHA-256 and byte size, never raw arguments (they may be
+/// secret-bearing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolIntent {
+    pub session_id: SessionId,
+    pub decision_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments_sha256: String,
+    pub arguments_bytes: u64,
+}
+
+/// ToolVerdict — the approval outcome (DR-19). `allowed` false records a deny.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolVerdict {
+    pub session_id: SessionId,
+    pub decision_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub allowed: bool,
+    pub reason: String,
+}
+
+/// ToolResult — recorded after execution. Carries output digest + size only,
+/// never raw output bytes (output is returned to the model, not the ledger).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub session_id: SessionId,
+    pub decision_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub status: String, // ok | error
+    pub output_sha256: String,
+    pub output_bytes: u64,
+}
+
 /// The full event taxonomy (DR-06 §5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "variant", rename_all = "snake_case")]
@@ -194,6 +231,9 @@ pub enum LedgerEvent {
     Refused(Refused),
     AuthorityGrant(AuthorityGrant),
     AuthorityRevoke(AuthorityRevoke),
+    ToolIntent(ToolIntent),
+    ToolVerdict(ToolVerdict),
+    ToolResult(ToolResult),
 }
 
 /// The hash-chained on-disk record (DR-06 §2.2).

@@ -163,9 +163,16 @@ pub enum OutputRequirements {
     JsonSchema { digest: Sha256Digest },
 }
 
+/// A tool definition sent to the provider (tool-calling phase). `schema_digest`
+/// is preserved from the pre-tool spec; `description` + `parameters` carry the
+/// OpenAI-compatible JSON schema that the model uses to emit calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
+    pub description: String,
+    /// JSON Schema (serde Value) for the arguments object.
+    pub parameters: serde_json::Value,
+    /// SHA-256 of the serialized canonical definition (backwards-compatible).
     pub schema_digest: Sha256Digest,
 }
 
@@ -183,6 +190,27 @@ pub struct RequestMetadata {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Tool-call metadata for assistant messages (tool-calling phase).
+    /// `None` for plain user/system/assistant text messages (backwards-compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallMessage>>,
+    /// Tool-result metadata for a `tool` role message.
+    /// `None` for plain messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Raw arguments JSON string for a `tool` role message (already validated
+    /// and recorded; the model may receive the sanitized result only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<String>,
+}
+
+/// A tool call inside an assistant message (OpenAI-compatible wire shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallMessage {
+    pub id: String,
+    pub name: String,
+    /// JSON-encoded arguments (validated JSON, possibly redacted before sending).
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +219,7 @@ pub enum ChatRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 impl ChatRole {
@@ -199,6 +228,7 @@ impl ChatRole {
             Self::System => "system",
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Tool => "tool",
         }
     }
 }

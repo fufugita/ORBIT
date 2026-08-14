@@ -235,18 +235,30 @@ async fn openai_adapter_sends_multi_turn_transcript() {
         orbit_adapter::types::ChatMessage {
             role: orbit_adapter::types::ChatRole::System,
             content: "you are a helpful harness".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
         },
         orbit_adapter::types::ChatMessage {
             role: orbit_adapter::types::ChatRole::User,
             content: "what is 2+2?".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
         },
         orbit_adapter::types::ChatMessage {
             role: orbit_adapter::types::ChatRole::Assistant,
             content: "4".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
         },
         orbit_adapter::types::ChatMessage {
             role: orbit_adapter::types::ChatRole::User,
             content: "and 3+3?".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
         },
     ]);
     let cancel = CancelToken::new();
@@ -308,4 +320,79 @@ async fn collect_stream_observer_emits_live_deltas() {
             .any(|e| matches!(e.event, ProviderEventKind::Finished { .. })),
         "collected stream still has a terminal"
     );
+}
+
+#[tokio::test]
+async fn openai_adapter_serializes_tools_and_parses_fragmented_call() {
+    let (addr, state, _h) = start_mock().await;
+    let adapter = OpenAiCompatibleHttpV1::new(
+        openai_identity(),
+        openai_capabilities(),
+        orbit_adapter::types::TlsPinPolicy {
+            webpki: false,
+            spki_sha256: None,
+        },
+    )
+    .unwrap();
+    let mut req = request(
+        "127.0.0.1",
+        addr.port(),
+        AdapterKind::OpenAiCompatibleHttpV1,
+    );
+    req.tools = vec![orbit_adapter::types::ToolDefinition {
+        name: "calculator".into(),
+        description: "pure arithmetic".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "expression": { "type": "string" } },
+            "required": ["expression"]
+        }),
+        schema_digest: Sha256Digest("0".repeat(64)),
+    }];
+    req.metadata.tools_count = 1;
+    let cancel = CancelToken::new();
+    let mut stream = adapter.invoke(&req, None, &cancel).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(item) = stream.next().await {
+        events.push(item.unwrap());
+    }
+    let captured = state.last_body.lock().unwrap().clone().expect("body");
+    assert_eq!(
+        captured.pointer("/tools/0/function/name").and_then(|v| v.as_str()),
+        Some("calculator")
+    );
+    assert_eq!(
+        captured.pointer("/tool_choice").and_then(|v| v.as_str()),
+        Some("auto")
+    );
+    let started = events.iter().find_map(|e| match &e.event {
+        ProviderEventKind::ToolCallStarted {
+            call_index,
+            provider_call_id,
+            name,
+        } => Some((*call_index, provider_call_id.clone(), name.clone())),
+        _ => None,
+    });
+    assert_eq!(started, Some((0, Some("call-1".into()), "calculator".into())));
+    let args: String = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            ProviderEventKind::ToolCallArgumentsDelta { bytes, .. } => {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(args, r#"{"expression":"2*(3+4)"}"#);
+    assert!(events.iter().any(|e| matches!(
+        e.event,
+        ProviderEventKind::ToolCallFinished { call_index: 0 }
+    )));
+    assert!(events.iter().any(|e| matches!(
+        &e.event,
+        ProviderEventKind::Finished {
+            finish_reason: Some(reason),
+            ..
+        } if reason == "tool_calls"
+    )));
 }
