@@ -33,6 +33,7 @@ fn route_for(host: &str, port: u16, kind: AdapterKind) -> ProviderRouteBinding {
         pricing_digest: Sha256Digest("r".repeat(64)),
         endpoint_host: host.into(),
         endpoint_port: port,
+        endpoint_scheme: orbit_adapter::types::EndpointScheme::HttpLoopback,
     }
 }
 

@@ -35,6 +35,7 @@ fn test_binding() -> ProviderRouteBinding {
         pricing_digest: Sha256Digest("r".repeat(64)),
         endpoint_host: String::from("test-provider"),
         endpoint_port: 443,
+        endpoint_scheme: orbit_adapter::types::EndpointScheme::Https,
     }
 }
 
@@ -326,6 +327,7 @@ async fn gateway_async_dispatch_streams_from_mock_provider() {
     binding.adapter_kind = AdapterKind::OpenAiCompatibleHttpV1;
     binding.endpoint_host = "127.0.0.1".into();
     binding.endpoint_port = addr.port();
+    binding.endpoint_scheme = orbit_adapter::types::EndpointScheme::HttpLoopback;
     registry.register_model(crate::ModelRef("test-model".into()), binding.clone());
     registry.register_async_adapter(
         AdapterKind::OpenAiCompatibleHttpV1,

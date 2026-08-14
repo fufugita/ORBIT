@@ -75,8 +75,9 @@ pub struct EndpointPin {
     pub proxy: Option<ProxyPin>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum EndpointScheme {
+    #[default]
     Https,
     HttpLoopback,
     LocalProcess,
@@ -124,6 +125,11 @@ pub struct ProviderRouteBinding {
     pub endpoint_host: String,
     #[serde(default = "default_https_port")]
     pub endpoint_port: u16,
+    /// Endpoint scheme (v0.2): HttpLoopback → http, else https. The adapter
+    /// and gateway egress tuple derive the wire scheme from this, so a
+    /// homelab mock (HTTP on a LAN IP) is addressable without host sniffing.
+    #[serde(default)]
+    pub endpoint_scheme: EndpointScheme,
 }
 
 fn default_https_port() -> u16 {

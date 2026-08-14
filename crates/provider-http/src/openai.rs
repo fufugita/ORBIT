@@ -73,13 +73,12 @@ impl OpenAiCompatibleHttpV1 {
         // Validate the route offline (DR-09 §3 — no I/O).
         self.validate_route(&request.route)?;
 
-        // Scheme: loopback hosts use plain HTTP (HttpLoopback); everything
-        // else is HTTPS with SPKI pinning (EndpointScheme::Https).
+        // Scheme from the route binding: HttpLoopback → http, else https
+        // with SPKI pinning. A homelab mock on a LAN IP uses HttpLoopback.
         let host = &request.route.endpoint_host;
-        let scheme = if host == "127.0.0.1" || host == "localhost" || host == "::1" {
-            "http"
-        } else {
-            "https"
+        let scheme = match request.route.endpoint_scheme {
+            orbit_adapter::types::EndpointScheme::HttpLoopback => "http",
+            _ => "https",
         };
         let base = format!("{scheme}://{host}:{}{}", request.route.endpoint_port, "/v1");
         let url = format!("{base}/chat/completions");

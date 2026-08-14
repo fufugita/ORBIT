@@ -236,6 +236,7 @@ mod tests {
             pricing_digest: Sha256Digest("r".repeat(64)),
             endpoint_host: String::from("api.test-provider.example"),
             endpoint_port: 443,
+            endpoint_scheme: orbit_adapter::types::EndpointScheme::Https,
         }
     }
 

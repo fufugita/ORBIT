@@ -25,6 +25,7 @@ fn test_route(kind: AdapterKind) -> ProviderRouteBinding {
         pricing_digest: Sha256Digest("r".repeat(64)),
         endpoint_host: String::from("api.test-provider.example"),
         endpoint_port: 443,
+        endpoint_scheme: crate::types::EndpointScheme::Https,
     }
 }
 

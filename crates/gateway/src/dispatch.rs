@@ -493,14 +493,10 @@ fn egress_tuple_from_binding(binding: &ProviderRouteBinding) -> Result<EgressTup
             binding.provider_id.0
         ));
     }
-    // Scheme mirrors the adapter: loopback hosts use http, else https.
-    let scheme = if binding.endpoint_host == "127.0.0.1"
-        || binding.endpoint_host == "localhost"
-        || binding.endpoint_host == "::1"
-    {
-        "http"
-    } else {
-        "https"
+    // Scheme from the route binding: HttpLoopback → http, else https.
+    let scheme = match binding.endpoint_scheme {
+        orbit_adapter::types::EndpointScheme::HttpLoopback => "http",
+        _ => "https",
     };
     Ok(EgressTuple {
         scheme: scheme.into(),

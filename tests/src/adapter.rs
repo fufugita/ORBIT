@@ -46,6 +46,7 @@ fn test_binding() -> ProviderRouteBinding {
         pricing_digest: Sha256Digest("r".repeat(64)),
         endpoint_host: String::from("test-provider"),
         endpoint_port: 443,
+        endpoint_scheme: orbit_adapter::types::EndpointScheme::Https,
     }
 }
 
