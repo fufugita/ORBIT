@@ -27,6 +27,8 @@ members = [
   "crates/orbit-ir",
   "crates/release",
   "crates/adapter",
+  "crates/provider-http",
+  "crates/mock-provider",
   "migrator",
   "conformance",
   "tests",
@@ -54,6 +56,18 @@ rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zeroize = "1"
 age = "0.12"
+
+# v0.2 async provider stack — permissive-only (DR-13 §5, re-checked via cargo-deny).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls-manual-roots-no-provider"] }
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "0.26"
+rustls-native-certs = "0.8"
+async-trait = "0.1"
+futures = "0.3"
+axum = "0.7"
+tokio-rustls = "0.26"
+rcgen = "0.13"
 
 [profile.release]
 lto = "thin"

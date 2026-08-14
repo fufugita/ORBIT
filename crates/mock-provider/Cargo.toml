@@ -1,0 +1,22 @@
+# ORBIT orbit-mock-provider — v0.2 mock provider server.
+# PURPOSE: Standalone HTTP server speaking the OpenAI-compatible / Anthropic /
+# Ollama wire formats over real HTTP/TLS. Deployable to the homelab; used by
+# the async conformance harness as the deterministic test target.
+
+[package]
+name = "orbit-mock-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Mock provider HTTP server for async adapter conformance"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+hex.workspace = true

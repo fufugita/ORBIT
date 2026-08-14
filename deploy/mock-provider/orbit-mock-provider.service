@@ -1,0 +1,19 @@
+[Unit]
+Description=ORBIT mock provider (v0.2 conformance target)
+After=network-online.target
+
+[Service]
+Type=simple
+User=orbit
+Group=orbit
+Environment=ORBIT_MOCK_BIND=0.0.0.0:8088
+ExecStart=/usr/local/bin/orbit-mock-provider
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

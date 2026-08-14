@@ -1,0 +1,33 @@
+# ORBIT orbit-provider-http — v0.2 async provider HTTP adapters (DR-09 §3, §4, §7).
+# PURPOSE: AsyncProviderAdapter trait, AsyncProviderEventStream, CancelToken, SSE
+# parser, rustls TLS with SPKI pin enforcement, and the OpenAI-compatible /
+# Anthropic / Ollama HTTP adapters.
+# Contract: DR-09 (GW-04, GW-07, GW-11, GW-12, GW-13, GW-16, GW-23, GW-25).
+
+[package]
+name = "orbit-provider-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Async provider HTTP adapters, streaming, TLS/SPKI pinning"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+async-stream = "0.3"
+bytes = "1"
+x509-parser = "0.16"
+orbit-adapter = { path = "../adapter" }
+
+[dev-dependencies]
+orbit-mock-provider = { path = "../mock-provider" }
