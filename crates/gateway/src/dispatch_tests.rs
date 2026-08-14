@@ -382,6 +382,10 @@ async fn gateway_async_dispatch_streams_from_mock_provider() {
                 text, "hello world",
                 "async dispatch streamed the provider text"
             );
+            // The final usage is surfaced into ProviderResult.accounting so
+            // the CLI can compute real cost from its pricing config.
+            assert_eq!(r.accounting.usage.input_tokens, 3);
+            assert_eq!(r.accounting.usage.output_tokens, 2);
         }
         other => panic!("async dispatch expected Completed, got {other:?}"),
     }

@@ -346,11 +346,12 @@ fn cmd_restore(_home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
     }))
 }
 
-/// Outcome of one `run_turn` call: the assembled text + token usage.
+/// Outcome of one `run_turn` call: the assembled text + token usage + cost.
 struct TurnOutcome {
     output: String,
     input_tokens: u64,
     output_tokens: u64,
+    cost_microcents: u64,
 }
 
 /// Run one prompt through the configured gateway via the four-gate async
@@ -369,6 +370,7 @@ fn run_turn(
     gate: &str,
     model: &str,
     credential_env: Option<&str>,
+    pricing: Option<config::Pricing>,
     prompt: &str,
     messages: Option<Vec<orbit_adapter::types::ChatMessage>>,
     observer: orbit_provider_http::stream::StreamObserver<'_>,
@@ -534,10 +536,15 @@ fn run_turn(
                 })
                 .collect();
             let usage = r.accounting.usage;
+            // Cost in microcents from the pricing config (zero if unpriced).
+            let cost_microcents = pricing
+                .and_then(|p| orbit_adapter::types::CostRates::from(p).cost_microcents(&usage))
+                .unwrap_or(0);
             Ok(TurnOutcome {
                 output,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
+                cost_microcents,
             })
         }
         orbit_gateway::DispatchOutcome::AdapterRefused { code: "E0404", .. }
@@ -578,6 +585,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     let provider_id = provider.map(|p| p.name.as_str()).unwrap_or("configured-gateway");
     let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
     let credential_env = provider.and_then(|p| p.env.as_deref());
+    let pricing = cfg.pricing_for_model(&model);
 
     let outcome = run_turn(
         home,
@@ -585,6 +593,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         resolved_gate,
         &model,
         credential_env,
+        pricing,
         prompt,
         None,
         None,
@@ -599,6 +608,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         "usage": {
             "input_tokens": outcome.input_tokens,
             "output_tokens": outcome.output_tokens,
+            "cost_microcents": outcome.cost_microcents,
         }
     }))
 }
@@ -660,6 +670,7 @@ fn cmd_chat(args: &[String]) -> i32 {
         .unwrap_or_default();
     let mut total_input = resumed_file.as_ref().map(|s| s.input_tokens).unwrap_or(0);
     let mut total_output = resumed_file.as_ref().map(|s| s.output_tokens).unwrap_or(0);
+    let mut total_cost = resumed_file.as_ref().map(|s| s.cost_microcents).unwrap_or(0);
     let mut turns = resumed_file.as_ref().map(|s| s.turns).unwrap_or(0);
 
     // HUD (DR-10 Part B): display-only, display-safe (H-3), brand + output
@@ -711,7 +722,13 @@ fn cmd_chat(args: &[String]) -> i32 {
                 }
                 continue;
             }
-            let handled = handle_chat_command(&trimmed, &home, &mut model, &mut transcript);
+            let handled = handle_chat_command(
+                &trimmed,
+                &home,
+                &mut model,
+                &mut transcript,
+                (&turns, &total_input, &total_output, &total_cost),
+            );
             if !handled {
                 eprintln!("unknown command: {trimmed}; try /help");
             }
@@ -745,6 +762,7 @@ fn cmd_chat(args: &[String]) -> i32 {
         let provider_id = provider.map(|p| p.name.as_str()).unwrap_or("configured-gateway");
         let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
         let credential_env = provider.and_then(|p| p.env.as_deref());
+        let pricing = cfg.pricing_for_model(&model);
 
         render_hud(
             &hud,
@@ -758,6 +776,7 @@ fn cmd_chat(args: &[String]) -> i32 {
             resolved_gate,
             &model,
             credential_env,
+            pricing,
             &trimmed,
             Some(turn_messages),
             Some(&mut observer),
@@ -771,12 +790,12 @@ fn cmd_chat(args: &[String]) -> i32 {
                 turns += 1;
                 total_input += o.input_tokens;
                 total_output += o.output_tokens;
-                // Cost bar (H-17: integer µ¢ — token counts here; a future
-                // pricing model maps tokens -> µ¢).
+                total_cost += o.cost_microcents;
+                // Cost bar (H-17: integer µ¢, real pricing when declared).
                 render_hud(
                     &hud,
                     &orbit_hud::HudEvent::CostBar {
-                        cost_microcents: o.input_tokens + o.output_tokens,
+                        cost_microcents: o.cost_microcents,
                     },
                 );
                 // Record the model's reply into the transcript for continuity.
@@ -798,6 +817,7 @@ fn cmd_chat(args: &[String]) -> i32 {
                     turns,
                     total_input,
                     total_output,
+                    total_cost,
                 );
                 if let Err(e) = sessions::save_session(&home, &sf) {
                     eprintln!("warning: session not saved: {e}");
@@ -821,7 +841,8 @@ fn cmd_chat(args: &[String]) -> i32 {
             "usage": {
                 "input_tokens": total_input,
                 "output_tokens": total_output,
-            }
+            },
+            "cost_microcents": total_cost,
         })
     );
     0
@@ -852,6 +873,7 @@ fn handle_chat_command(
     home: &Path,
     model: &mut String,
     transcript: &mut Vec<orbit_adapter::types::ChatMessage>,
+    usage: (&u64, &u64, &u64, &u64), // (turns, input, output, cost µ¢)
 ) -> bool {
     match cmd {
         "/help" => {
@@ -864,7 +886,15 @@ fn handle_chat_command(
             true
         }
         "/usage" => {
-            println!("usage tracked per turn (see exit summary)");
+            let (turns, input, output, cost) = usage;
+            println!(
+                "turns {} · in {} · out {} · ${}.{:06}",
+                turns,
+                input,
+                output,
+                cost / 1_000_000,
+                cost % 1_000_000
+            );
             true
         }
         "/models" => {

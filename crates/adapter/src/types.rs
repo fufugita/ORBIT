@@ -295,10 +295,13 @@ impl CostRates {
                 self.reasoning_per_million_microcents,
             ),
         ] {
-            let r = rate?; // missing rate for a non-zero category → None (honest incomplete cost)
+            // A missing rate only makes cost incomplete when that category has
+            // non-zero tokens. Zero-token optional categories must not poison
+            // otherwise complete input/output pricing.
             if tokens == 0 {
                 continue;
             }
+            let r = rate?; // missing rate for a non-zero category → None (honest incomplete cost)
             // ceil(tokens × rate / 1_000_000)
             let prod = (tokens as u128).checked_mul(r as u128)?;
             let q = prod / 1_000_000;

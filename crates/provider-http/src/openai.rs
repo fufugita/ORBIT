@@ -198,12 +198,26 @@ fn openai_stream(
                     });
                     seq += 1;
                 }
-                // Usage update.
+                // Usage update — full five-field extraction (DR-09 §8).
+                // OpenAI nests cache/reasoning under prompt/completion details.
                 if let Some(u) = json.get("usage") {
+                    let prompt_details = u.get("prompt_tokens_details");
+                    let completion_details = u.get("completion_tokens_details");
                     usage = ProviderUsage {
                         input_tokens: u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                        output_tokens: u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                        ..Default::default()
+                        output_tokens: u
+                            .get("completion_tokens")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
+                        cache_read_tokens: prompt_details
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
+                        cache_write_tokens: 0,
+                        reasoning_tokens: completion_details
+                            .and_then(|d| d.get("reasoning_tokens"))
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
                     };
                     yield Ok(ProviderStreamEvent {
                         sequence: seq,

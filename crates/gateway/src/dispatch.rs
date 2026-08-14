@@ -385,14 +385,26 @@ impl DispatchEngine {
         };
         match orbit_provider_http::stream::collect_stream(stream, observer).await {
             Ok((events, evidence)) => {
-                let result = orbit_adapter::types::ProviderResult {
-                    status: orbit_adapter::types::ProviderTerminalStatus::Completed,
-                    binding: Default::default(),
-                    output: evidence,
-                    accounting: Default::default(),
-                    transport: Default::default(),
+                // Surface the final provider usage into ProviderResult.accounting.
+                // Prefer Finished.final_usage; fall back to the last UsageUpdate.
+                let usage = events
+                    .iter()
+                    .rev()
+                    .find_map(|e| match &e.event {
+                        orbit_adapter::types::ProviderEventKind::Finished {
+                            final_usage: Some(u),
+                            ..
+                        } => Some(*u),
+                        orbit_adapter::types::ProviderEventKind::UsageUpdate(u) => Some(*u),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let result = orbit_adapter::types::ProviderResult::completed(
                     events,
-                };
+                    usage,
+                    0, // cost computed by the caller from its pricing config
+                    evidence,
+                );
                 Ok((DispatchOutcome::Completed(Box::new(result)), reservation))
             }
             Err(e) => Ok((

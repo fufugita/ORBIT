@@ -10,12 +10,45 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// A model declared for a provider (id + optional display label).
+/// Per-million-token pricing in microcents (DR-09 §8). All optional; a model
+/// with no pricing block is billed at 0 µ¢ until the user declares rates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Pricing {
+    #[serde(default)]
+    pub input_per_million_microcents: u64,
+    #[serde(default)]
+    pub output_per_million_microcents: u64,
+    #[serde(default)]
+    pub cache_read_per_million_microcents: Option<u64>,
+    #[serde(default)]
+    pub cache_write_per_million_microcents: Option<u64>,
+    #[serde(default)]
+    pub reasoning_per_million_microcents: Option<u64>,
+    #[serde(default)]
+    pub request_flat_microcents: u64,
+}
+
+impl From<Pricing> for orbit_adapter::types::CostRates {
+    fn from(p: Pricing) -> Self {
+        orbit_adapter::types::CostRates {
+            input_per_million_microcents: p.input_per_million_microcents,
+            output_per_million_microcents: p.output_per_million_microcents,
+            cache_read_per_million_microcents: p.cache_read_per_million_microcents,
+            cache_write_per_million_microcents: p.cache_write_per_million_microcents,
+            reasoning_per_million_microcents: p.reasoning_per_million_microcents,
+            request_flat_microcents: p.request_flat_microcents,
+        }
+    }
+}
+
+/// A model declared for a provider (id + optional display label + pricing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub pricing: Pricing,
 }
 
 /// One declared provider.
@@ -76,6 +109,14 @@ impl ProvidersConfig {
         self.provider
             .iter()
             .find(|p| p.models.iter().any(|m| m.id == model))
+    }
+
+    /// The pricing block declared for a model id, if any.
+    pub fn pricing_for_model(&self, model: &str) -> Option<Pricing> {
+        self.provider
+            .iter()
+            .find_map(|p| p.models.iter().find(|m| m.id == model))
+            .map(|m| m.pricing)
     }
 }
 
@@ -145,5 +186,46 @@ id = "model-c"
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("providers.toml"), "not = [valid toml").unwrap();
         assert!(ProvidersConfig::load(&dir).is_err());
+    }
+
+    #[test]
+    fn parses_pricing_block() {
+        let cfg: ProvidersConfig = toml::from_str(
+            r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:4001"
+[[provider.models]]
+id = "m"
+[provider.models.pricing]
+input_per_million_microcents = 200000
+output_per_million_microcents = 600000
+"#,
+        )
+        .unwrap();
+        let pricing = cfg.pricing_for_model("m").expect("pricing found");
+        assert_eq!(pricing.input_per_million_microcents, 200_000);
+        assert_eq!(pricing.output_per_million_microcents, 600_000);
+        assert_eq!(pricing.cache_read_per_million_microcents, None);
+    }
+
+    #[test]
+    fn cost_microcents_math() {
+        use orbit_adapter::types::{CostRates, ProviderUsage};
+        // $0.20/M input + $0.60/M output: 1000 in + 1000 out → 200 + 600 = 800 µ¢
+        let rates = CostRates {
+            input_per_million_microcents: 200_000,
+            output_per_million_microcents: 600_000,
+            cache_read_per_million_microcents: None,
+            cache_write_per_million_microcents: None,
+            reasoning_per_million_microcents: None,
+            request_flat_microcents: 0,
+        };
+        let usage = ProviderUsage {
+            input_tokens: 1000,
+            output_tokens: 1000,
+            ..Default::default()
+        };
+        assert_eq!(rates.cost_microcents(&usage), Some(800));
     }
 }

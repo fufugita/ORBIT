@@ -22,6 +22,8 @@ pub struct SessionFile {
     pub turns: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cost_microcents: u64,
     pub updated_at: String,
 }
 
@@ -62,6 +64,7 @@ impl SessionFile {
         turns: u64,
         input_tokens: u64,
         output_tokens: u64,
+        cost_microcents: u64,
     ) -> Self {
         Self {
             schema: "orbit.session/v1".into(),
@@ -79,6 +82,7 @@ impl SessionFile {
             turns,
             input_tokens,
             output_tokens,
+            cost_microcents,
             updated_at: orbit_cli::timestamp_now(),
         }
     }
@@ -160,6 +164,7 @@ mod tests {
             1,
             2,
             3,
+            42,
         )
     }
 

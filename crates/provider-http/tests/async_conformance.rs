@@ -121,6 +121,16 @@ async fn openai_adapter_streams_success_with_valid_evidence() {
         })
         .collect();
     assert_eq!(text, "hello world");
+    // Final OpenAI usage is surfaced into the stream (real accounting path).
+    let usage = events.iter().find_map(|e| match e.event {
+        ProviderEventKind::UsageUpdate(u) => Some(u),
+        _ => None,
+    });
+    let usage = usage.expect("usage update");
+    assert_eq!(usage.input_tokens, 3);
+    assert_eq!(usage.output_tokens, 2);
+    assert_eq!(usage.cache_read_tokens, 0);
+    assert_eq!(usage.reasoning_tokens, 0);
 }
 
 #[tokio::test]
