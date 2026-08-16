@@ -184,7 +184,11 @@ fn parse_power(chars: &mut std::iter::Peekable<std::str::Chars>, pos: &mut usize
 }
 
 fn parse_unary(chars: &mut std::iter::Peekable<std::str::Chars>, pos: &mut usize) -> Option<f64> {
-    while chars.peek().map(|c| c.is_ascii_whitespace()).unwrap_or(false) {
+    while chars
+        .peek()
+        .map(|c| c.is_ascii_whitespace())
+        .unwrap_or(false)
+    {
         *pos += 1;
         chars.next();
     }
@@ -214,7 +218,11 @@ fn parse_unary(chars: &mut std::iter::Peekable<std::str::Chars>, pos: &mut usize
 }
 
 fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars>, pos: &mut usize) -> Option<f64> {
-    while chars.peek().map(|c| c.is_ascii_whitespace()).unwrap_or(false) {
+    while chars
+        .peek()
+        .map(|c| c.is_ascii_whitespace())
+        .unwrap_or(false)
+    {
         *pos += 1;
         chars.next();
     }
@@ -316,7 +324,6 @@ pub fn is_known_tool(name: &str) -> bool {
     builtin_tools().iter().any(|t| t.name == name)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,7 +336,11 @@ mod tests {
 
     #[test]
     fn calculator_rejects_code_characters_and_div_zero() {
-        assert!(execute("calculator", &serde_json::json!({"expression":"system(\"id\")"})).is_err());
+        assert!(execute(
+            "calculator",
+            &serde_json::json!({"expression":"system(\"id\")"})
+        )
+        .is_err());
         assert!(execute("calculator", &serde_json::json!({"expression":"1/0"})).is_err());
     }
 

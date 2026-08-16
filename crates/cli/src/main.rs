@@ -23,6 +23,7 @@ mod config;
 mod sessions;
 mod tool_runtime;
 mod tools;
+mod tui_worker;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -31,16 +32,10 @@ fn main() {
     // "harness". `orbit chat` is the explicit alias. Both stream live to
     // stdout, so they run outside the JSON-envelope dispatch path.
     // `--help`/`-h`/`--version` stay on the JSON dispatch (first-class verbs).
-    let first_is_command = args
-        .first()
-        .map(|a| !a.starts_with('-'))
-        .unwrap_or(false);
+    let first_is_command = args.first().map(|a| !a.starts_with('-')).unwrap_or(false);
     let wants_chat = args.is_empty()
         || args[0] == "chat"
-        || (!first_is_command
-            && args[0] != "--help"
-            && args[0] != "-h"
-            && args[0] != "--version");
+        || (!first_is_command && args[0] != "--help" && args[0] != "-h" && args[0] != "--version");
     if wants_chat {
         let code = cmd_chat(&args);
         std::process::exit(code);
@@ -266,8 +261,8 @@ fn add_configured_provider(
 /// URL safety for configured providers: HTTPS anywhere; cleartext HTTP only
 /// for loopback or RFC1918 private-LAN hosts. Reject public cleartext egress.
 fn validate_provider_url(gate: &str) -> Result<(), (&'static str, String)> {
-    let url = url::Url::parse(gate)
-        .map_err(|e| ("ORBIT-E0401", format!("bad provider URL: {e}")))?;
+    let url =
+        url::Url::parse(gate).map_err(|e| ("ORBIT-E0401", format!("bad provider URL: {e}")))?;
     match url.scheme() {
         "https" => Ok(()),
         "http" => {
@@ -321,14 +316,14 @@ fn discover_models(gate: &str, credential_env: Option<&str>) -> Result<Vec<Strin
                     req = req.bearer_auth(token);
                 }
             }
-            let resp = req.send().await.map_err(|e| format!("model discovery: {e}"))?;
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("model discovery: {e}"))?;
             if !resp.status().is_success() {
                 return Err(format!("model discovery returned {}", resp.status()));
             }
-            let raw = resp
-                .text()
-                .await
-                .map_err(|e| format!("read models: {e}"))?;
+            let raw = resp.text().await.map_err(|e| format!("read models: {e}"))?;
             config::ModelListResponse::parse(&raw)
         })
 }
@@ -344,7 +339,10 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
         let name = prompt_line("Provider name", Some("local"))?;
         let gate = prompt_line("Base URL", Some("http://127.0.0.1:4001"))?;
         validate_provider_url(&gate)?;
-        let credential_env = prompt_line("Credential env-var name (blank = none)", Some("ORBIT_GATE_TOKEN"))?;
+        let credential_env = prompt_line(
+            "Credential env-var name (blank = none)",
+            Some("ORBIT_GATE_TOKEN"),
+        )?;
         let credential_env = if credential_env.trim().is_empty() {
             None
         } else {
@@ -372,7 +370,10 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         } else {
-            let sel = prompt_line("Select models (all or comma-separated numbers)", Some("all"))?;
+            let sel = prompt_line(
+                "Select models (all or comma-separated numbers)",
+                Some("all"),
+            )?;
             if sel.trim().eq_ignore_ascii_case("all") {
                 discovered
             } else {
@@ -389,8 +390,12 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
         let mut pricing = Vec::new();
         for id in &model_ids {
             println!("Pricing for {id} (microcents per million tokens; blank = 0):");
-            let input = prompt_line("  input", Some("0"))?.parse::<u64>().unwrap_or(0);
-            let output = prompt_line("  output", Some("0"))?.parse::<u64>().unwrap_or(0);
+            let input = prompt_line("  input", Some("0"))?
+                .parse::<u64>()
+                .unwrap_or(0);
+            let output = prompt_line("  output", Some("0"))?
+                .parse::<u64>()
+                .unwrap_or(0);
             pricing.push(config::Pricing {
                 input_per_million_microcents: input,
                 output_per_million_microcents: output,
@@ -795,12 +800,16 @@ fn run_turn(
                         provider_call_id,
                         name,
                     } => {
-                        tool_calls.entry(*call_index).or_insert_with(|| PendingToolCall {
-                            index: *call_index,
-                            id: provider_call_id.clone().unwrap_or_else(|| format!("call-{call_index}")),
-                            name: name.clone(),
-                            arguments: Vec::new(),
-                        });
+                        tool_calls
+                            .entry(*call_index)
+                            .or_insert_with(|| PendingToolCall {
+                                index: *call_index,
+                                id: provider_call_id
+                                    .clone()
+                                    .unwrap_or_else(|| format!("call-{call_index}")),
+                                name: name.clone(),
+                                arguments: Vec::new(),
+                            });
                     }
                     orbit_adapter::types::ProviderEventKind::ToolCallArgumentsDelta {
                         call_index,
@@ -814,9 +823,9 @@ fn run_turn(
                 }
             }
             let finish_reason = r.events.iter().rev().find_map(|e| match &e.event {
-                orbit_adapter::types::ProviderEventKind::Finished {
-                    finish_reason, ..
-                } => finish_reason.clone(),
+                orbit_adapter::types::ProviderEventKind::Finished { finish_reason, .. } => {
+                    finish_reason.clone()
+                }
                 _ => None,
             });
             let usage = r.accounting.usage;
@@ -868,7 +877,9 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     let provider = value_after(args, "--provider")
         .and_then(|name| cfg.provider.iter().find(|p| p.name == name))
         .or_else(|| cfg.provider_for_model(&model));
-    let provider_id = provider.map(|p| p.name.as_str()).unwrap_or("configured-gateway");
+    let provider_id = provider
+        .map(|p| p.name.as_str())
+        .unwrap_or("configured-gateway");
     let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
     let credential_env = provider.and_then(|p| p.env.as_deref());
     let pricing = cfg.pricing_for_model(&model);
@@ -942,6 +953,36 @@ fn cmd_chat(args: &[String]) -> i32 {
                 None
             }
         });
+
+    // TUI front-end (DR-20): if TTY + --tui (default), forward to the ratatui
+    // TUI. --no-tui, non-TTY stdin/stdout, or the `tui` feature off → fall
+    // through to the existing REPL unchanged.
+    #[cfg(feature = "tui")]
+    {
+        let want_tui = !args.iter().any(|a| a == "--no-tui")
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout());
+        if want_tui {
+            let session_id = resumed_file
+                .as_ref()
+                .map(|s| s.session_id.clone())
+                .unwrap_or_else(orbit_gateway::new_session_id);
+            let provider = cfg.provider_for_model(&model);
+            let provider_id = provider
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "configured-gateway".into());
+            let tui_config = tui_worker::TuiTurnConfig {
+                home: home.clone(),
+                session_id,
+                gate: gate.clone(),
+                model: model.clone(),
+                provider_id,
+                auto_tools: args.iter().any(|a| a == "--auto-tools"),
+            };
+            return orbit_hud_tui::run(args, tui_worker::make_spawner(tui_config));
+        }
+    }
+
     if let Some(s) = &resumed_file {
         eprintln!("resumed session {} ({} prior turns)", s.session_id, s.turns);
     }
@@ -956,7 +997,10 @@ fn cmd_chat(args: &[String]) -> i32 {
         .unwrap_or_default();
     let mut total_input = resumed_file.as_ref().map(|s| s.input_tokens).unwrap_or(0);
     let mut total_output = resumed_file.as_ref().map(|s| s.output_tokens).unwrap_or(0);
-    let mut total_cost = resumed_file.as_ref().map(|s| s.cost_microcents).unwrap_or(0);
+    let mut total_cost = resumed_file
+        .as_ref()
+        .map(|s| s.cost_microcents)
+        .unwrap_or(0);
     let mut turns = resumed_file.as_ref().map(|s| s.turns).unwrap_or(0);
 
     // HUD (DR-10 Part B): display-only, display-safe (H-3), brand + output
@@ -966,12 +1010,18 @@ fn cmd_chat(args: &[String]) -> i32 {
         ci: std::env::var_os("CI").is_some(),
         term_dumb: std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false),
     });
-    render_hud(&hud, &orbit_hud::HudEvent::Message {
-        text: format!("interactive harness — model {model}, session {session}"),
-    });
-    render_hud(&hud, &orbit_hud::HudEvent::Message {
-        text: "type /help for commands, exit to quit".into(),
-    });
+    render_hud(
+        &hud,
+        &orbit_hud::HudEvent::Message {
+            text: format!("interactive harness — model {model}, session {session}"),
+        },
+    );
+    render_hud(
+        &hud,
+        &orbit_hud::HudEvent::Message {
+            text: "type /help for commands, exit to quit".into(),
+        },
+    );
 
     let stdin = std::io::stdin();
     use std::io::BufRead;
@@ -1036,12 +1086,20 @@ fn cmd_chat(args: &[String]) -> i32 {
         let provider = value_after(args, "--provider")
             .and_then(|name| cfg.provider.iter().find(|p| p.name == name))
             .or_else(|| cfg.provider_for_model(&model));
-        let provider_id = provider.map(|p| p.name.as_str()).unwrap_or("configured-gateway");
+        let provider_id = provider
+            .map(|p| p.name.as_str())
+            .unwrap_or("configured-gateway");
         let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
         let credential_env = provider.and_then(|p| p.env.as_deref());
         let pricing = cfg.pricing_for_model(&model);
         let auto_tools = args.iter().any(|a| a == "--auto-tools");
         let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+
+        // Approval channel + session-scoped R-grants (DR-20 §2.6/§2.7).
+        // The REPL uses StdApprovalChannel (blocking stdin); the TUI injects
+        // its own TuiApprovalChannel that posts to the event bus.
+        let mut approval_channel = tool_runtime::StdApprovalChannel::new(interactive);
+        let mut auto_grants = tool_runtime::AutoGrants::new();
 
         render_hud(
             &hud,
@@ -1152,6 +1210,8 @@ fn cmd_chat(args: &[String]) -> i32 {
                     call,
                     auto_tools,
                     interactive,
+                    &mut approval_channel,
+                    &mut auto_grants,
                 )
                 .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
                 transcript.push(orbit_adapter::types::ChatMessage {
@@ -1207,10 +1267,7 @@ fn cmd_chat(args: &[String]) -> i32 {
 
 /// `orbit models` — list every declared model across all configured providers.
 /// Reads `$ORBIT_HOME/providers.toml` (missing = empty config).
-fn cmd_models(
-    home: &Path,
-    args: &[String],
-) -> Result<serde_json::Value, (&'static str, String)> {
+fn cmd_models(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
     let entries: Vec<(String, String)> = cfg.all_models();
     Ok(serde_json::json!({
@@ -1305,15 +1362,13 @@ fn handle_chat_command(
 fn render_hud(hud: &orbit_hud::Hud, event: &orbit_hud::HudEvent) {
     // Apply the display-safety gate (H-3) to text-bearing events first.
     let event = match event {
-        orbit_hud::HudEvent::Message { text } => {
-            match orbit_hud::display_safe(text) {
-                Ok(clean) => orbit_hud::HudEvent::Message { text: clean },
-                Err(_) => {
-                    eprintln!("[HUD] message rejected by display gate (H-3)");
-                    return;
-                }
+        orbit_hud::HudEvent::Message { text } => match orbit_hud::display_safe(text) {
+            Ok(clean) => orbit_hud::HudEvent::Message { text: clean },
+            Err(_) => {
+                eprintln!("[HUD] message rejected by display gate (H-3)");
+                return;
             }
-        }
+        },
         other => other.clone(),
     };
     let (out, err) = hud.render(&event);

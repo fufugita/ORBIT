@@ -33,9 +33,14 @@ orbit-provider-http = { path = "../provider-http" }
 orbit-gateway = { path = "../gateway" }
 orbit-egress = { path = "../egress" }
 orbit-hud = { path = "../hud" }
+orbit-hud-tui = { path = "../hud-tui", optional = true }
 tokio.workspace = true
 reqwest.workspace = true
 url = "2"
+
+[features]
+tui = ["orbit-hud-tui"]
+default = ["tui"]
 
 [[bin]]
 name = "orbit"

@@ -332,7 +332,7 @@ impl CostRates {
                 continue;
             }
             let r = rate?; // missing rate for a non-zero category → None (honest incomplete cost)
-            // ceil(tokens × rate / 1_000_000)
+                           // ceil(tokens × rate / 1_000_000)
             let prod = (tokens as u128).checked_mul(r as u128)?;
             let q = prod / 1_000_000;
             let rem = prod % 1_000_000;

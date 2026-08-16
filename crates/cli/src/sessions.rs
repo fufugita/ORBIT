@@ -95,7 +95,12 @@ pub fn list_sessions(home: &Path) -> Result<Vec<SessionFile>, String> {
     }
     for entry in std::fs::read_dir(&dir).map_err(|e| format!("read {dir:?}: {e}"))? {
         let entry = entry.map_err(|e| format!("entry: {e}"))?;
-        if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
+        if entry
+            .path()
+            .extension()
+            .map(|e| e == "json")
+            .unwrap_or(false)
+        {
             let name = entry.file_name().to_string_lossy().into_owned();
             let id = name.trim_end_matches(".json");
             if let Ok(s) = load_session(home, id) {

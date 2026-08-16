@@ -96,11 +96,7 @@ impl ProvidersConfig {
     pub fn all_models(&self) -> Vec<(String, String)> {
         self.provider
             .iter()
-            .flat_map(|p| {
-                p.models
-                    .iter()
-                    .map(move |m| (p.name.clone(), m.id.clone()))
-            })
+            .flat_map(|p| p.models.iter().map(move |m| (p.name.clone(), m.id.clone())))
             .collect()
     }
 
@@ -137,8 +133,7 @@ impl ProvidersConfig {
         let dir = home;
         std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
         let path = dir.join("providers.toml");
-        let serialized =
-            toml::to_string(self).map_err(|e| format!("serialize providers: {e}"))?;
+        let serialized = toml::to_string(self).map_err(|e| format!("serialize providers: {e}"))?;
         let tmp = dir.join(".providers.toml.tmp");
         std::fs::write(&tmp, &serialized).map_err(|e| format!("write {tmp:?}: {e}"))?;
         #[cfg(unix)]
@@ -147,8 +142,8 @@ impl ProvidersConfig {
             let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
         }
         // Roundtrip validate before rename.
-        let back: ProvidersConfig = toml::from_str(&serialized)
-            .map_err(|e| format!("validate roundtrip: {e}"))?;
+        let back: ProvidersConfig =
+            toml::from_str(&serialized).map_err(|e| format!("validate roundtrip: {e}"))?;
         if back.provider.len() != self.provider.len() {
             return Err("roundtrip provider count mismatch".into());
         }
@@ -178,8 +173,8 @@ impl ModelListResponse {
     /// Parse a raw `/v1/models` body; missing/empty data is an error so
     /// callers can fall back to manual model entry.
     pub fn parse(raw: &str) -> Result<Vec<String>, String> {
-        let parsed: ModelListResponse = serde_json::from_str(raw)
-            .map_err(|e| format!("parse models response: {e}"))?;
+        let parsed: ModelListResponse =
+            serde_json::from_str(raw).map_err(|e| format!("parse models response: {e}"))?;
         let ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
         if ids.is_empty() {
             return Err("models response contained no data".into());
@@ -344,7 +339,12 @@ output_per_million_microcents = 600000
         let loaded = ProvidersConfig::load(&home).unwrap();
         assert_eq!(loaded.provider.len(), 1);
         assert_eq!(loaded.provider[0].name, "local");
-        assert_eq!(loaded.provider[0].models[0].pricing.output_per_million_microcents, 600_000);
+        assert_eq!(
+            loaded.provider[0].models[0]
+                .pricing
+                .output_per_million_microcents,
+            600_000
+        );
         // Token VALUE never stored; only the env-var NAME is present.
         let raw = std::fs::read_to_string(ProvidersConfig::config_path(&home)).unwrap();
         assert!(raw.contains("ORBIT_GATE_TOKEN"));

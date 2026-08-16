@@ -63,12 +63,19 @@ async fn openai(
     // call on the first round. If a tool result is already in messages, return
     // the final text response. Explicit x-orbit-behavior still wins.
     let implicit_tool_behavior = if headers.get("x-orbit-behavior").is_none()
-        && body.get("tools").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+        && body
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
     {
         let has_result = body
             .get("messages")
             .and_then(|v| v.as_array())
-            .map(|msgs| msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")))
+            .map(|msgs| {
+                msgs.iter()
+                    .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            })
             .unwrap_or(false);
         Some(if has_result { "success" } else { "tool-calls" })
     } else {

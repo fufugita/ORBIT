@@ -307,10 +307,9 @@ async fn collect_stream_observer_emits_live_deltas() {
             observed.push(String::from_utf8_lossy(bytes).into_owned());
         }
     };
-    let (events, _evidence) =
-        orbit_provider_http::stream::collect_stream(stream, Some(&mut cb))
-            .await
-            .unwrap();
+    let (events, _evidence) = orbit_provider_http::stream::collect_stream(stream, Some(&mut cb))
+        .await
+        .unwrap();
     assert!(!observed.is_empty(), "observer saw live deltas");
     let joined: String = observed.concat();
     assert_eq!(joined, "hello world", "deltas assemble the full reply");
@@ -358,7 +357,9 @@ async fn openai_adapter_serializes_tools_and_parses_fragmented_call() {
     }
     let captured = state.last_body.lock().unwrap().clone().expect("body");
     assert_eq!(
-        captured.pointer("/tools/0/function/name").and_then(|v| v.as_str()),
+        captured
+            .pointer("/tools/0/function/name")
+            .and_then(|v| v.as_str()),
         Some("calculator")
     );
     assert_eq!(
@@ -373,7 +374,10 @@ async fn openai_adapter_serializes_tools_and_parses_fragmented_call() {
         } => Some((*call_index, provider_call_id.clone(), name.clone())),
         _ => None,
     });
-    assert_eq!(started, Some((0, Some("call-1".into()), "calculator".into())));
+    assert_eq!(
+        started,
+        Some((0, Some("call-1".into()), "calculator".into()))
+    );
     let args: String = events
         .iter()
         .filter_map(|e| match &e.event {

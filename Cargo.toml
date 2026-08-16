@@ -20,6 +20,7 @@ members = [
   "crates/plugin",
   "crates/egress",
   "crates/hud",
+  "crates/hud-tui",
   "crates/cli",
   "crates/orbit-core",
   "crates/orbit-api",
@@ -69,6 +70,14 @@ futures = "0.3"
 axum = "0.7"
 tokio-rustls = "0.26"
 rcgen = "0.13"
+
+# TUI stack (DR-20): ratatui + crossterm + signal handling.
+ratatui = "0.30"
+crossterm = "0.29"
+tui-markdown = "0.3"
+tui-textarea = "0.7"
+tui-widget-list = "0.13"
+signal-hook = "0.3"
 
 [profile.release]
 lto = "thin"

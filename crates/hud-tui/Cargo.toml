@@ -1,0 +1,26 @@
+# ORBIT orbit-hud-tui — TUI front-end (ratatui + crossterm)
+# PURPOSE: Terminal user interface for ORBIT — three-pane layout, event-sourced,
+#          display-safe, brand-aware. Contract: DR-20.
+# Depends on orbit-hud (display gate, OutputMode, BrandTier, HudEvent).
+
+[package]
+name = "orbit-hud-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TUI front-end for ORBIT (ratatui + crossterm)"
+
+[dependencies]
+orbit-hud = { path = "../hud" }
+ratatui.workspace = true
+crossterm.workspace = true
+tui-markdown.workspace = true
+tui-textarea.workspace = true
+tui-widget-list.workspace = true
+toml.workspace = true
+serde.workspace = true
+signal-hook.workspace = true
+
+[lib]
+name = "orbit_hud_tui"

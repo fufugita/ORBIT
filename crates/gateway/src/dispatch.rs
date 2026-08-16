@@ -400,9 +400,7 @@ impl DispatchEngine {
                     })
                     .unwrap_or_default();
                 let result = orbit_adapter::types::ProviderResult::completed(
-                    events,
-                    usage,
-                    0, // cost computed by the caller from its pricing config
+                    events, usage, 0, // cost computed by the caller from its pricing config
                     evidence,
                 );
                 Ok((DispatchOutcome::Completed(Box::new(result)), reservation))
