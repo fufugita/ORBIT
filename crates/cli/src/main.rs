@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod config;
+mod go_bridge;
 mod sessions;
 mod tool_runtime;
 mod tools;
@@ -629,6 +630,7 @@ fn run_turn(
     prompt: &str,
     messages: Option<Vec<orbit_adapter::types::ChatMessage>>,
     observer: orbit_provider_http::stream::StreamObserver<'_>,
+    cancel: orbit_provider_http::CancelToken,
 ) -> Result<TurnOutcome, (&'static str, String)> {
     // Parse the gate URL; only http loopback or https is acceptable.
     let url = url::Url::parse(gate).map_err(|e| ("ORBIT-E0401", format!("bad gate url: {e}")))?;
@@ -747,7 +749,9 @@ fn run_turn(
 
     let session = orbit_gateway::new_session_id();
     let decision = orbit_gateway::new_decision_id();
-    let cancel = orbit_provider_http::CancelToken::new();
+    // `cancel` is provided by the caller (the TUI installs a fresh token per
+    // turn so Ctrl+C can abort the in-flight stream; the REPL passes a new
+    // token for each call).
 
     // Run the full pipeline via tokio.
     let result = tokio::runtime::Runtime::new()
@@ -894,6 +898,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         prompt,
         None,
         None,
+        orbit_provider_http::CancelToken::new(),
     )?;
     Ok(serde_json::json!({
         "schema": "orbit.cli/v1",
@@ -956,12 +961,14 @@ fn cmd_chat(args: &[String]) -> i32 {
 
     // TUI front-end (DR-20): if TTY + --tui (default), forward to the ratatui
     // TUI. --no-tui, non-TTY stdin/stdout, or the `tui` feature off → fall
-    // through to the existing REPL unchanged.
+    // through to the existing REPL unchanged. `--go-tui` opts into the Go
+    // Bubble Tea front-end (spawns orbit-go-tui as a child).
     #[cfg(feature = "tui")]
     {
         let want_tui = !args.iter().any(|a| a == "--no-tui")
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
             && std::io::IsTerminal::is_terminal(&std::io::stdout());
+        let want_go_tui = args.iter().any(|a| a == "--go-tui");
         if want_tui {
             let session_id = resumed_file
                 .as_ref()
@@ -979,6 +986,9 @@ fn cmd_chat(args: &[String]) -> i32 {
                 provider_id,
                 auto_tools: args.iter().any(|a| a == "--auto-tools"),
             };
+            if want_go_tui {
+                return go_bridge::run_go_tui(tui_config);
+            }
             return orbit_hud_tui::run(args, tui_worker::make_spawner(tui_config));
         }
     }
@@ -1129,6 +1139,7 @@ fn cmd_chat(args: &[String]) -> i32 {
                 &trimmed,
                 Some(transcript.clone()),
                 Some(&mut observer),
+                orbit_provider_http::CancelToken::new(),
             );
             println!();
             use std::io::Write;

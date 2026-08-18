@@ -76,10 +76,18 @@ pub struct ExportManifest {
     pub files: BTreeMap<String, BundleFile>,
 }
 
-/// Build an export bundle in memory: manifest + raw payload bytes (pre-encryption).
+/// Authenticated age plaintext: manifest and each file's bytes are encrypted
+/// together so restore can verify every content digest before trusting metadata.
+#[derive(Debug, Serialize, Deserialize)]
+struct SealedPayload {
+    manifest: ExportManifest,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+/// Build an export bundle in memory: manifest + file bytes (pre-encryption).
 pub struct ExportBuilder {
     manifest: ExportManifest,
-    payload: Vec<u8>,
+    files: BTreeMap<String, Vec<u8>>,
 }
 
 impl ExportBuilder {
@@ -93,31 +101,36 @@ impl ExportBuilder {
                 ledger_head_hash,
                 files: BTreeMap::new(),
             },
-            payload: Vec::new(),
+            files: BTreeMap::new(),
         }
     }
 
-    /// Add a file's bytes to the bundle (content-addressed).
+    /// Add a file's bytes to the bundle (content-addressed). Idempotent: a
+    /// path added twice keeps its first payload (prevents silent byte
+    /// duplication on retries).
     pub fn add_file(&mut self, path: String, bytes: &[u8]) -> &mut Self {
+        if self.manifest.files.contains_key(&path) {
+            return self;
+        }
         let digest = hex::encode(Sha256::digest(bytes));
         self.manifest.files.insert(
             path.clone(),
             BundleFile {
-                path,
+                path: path.clone(),
                 content_sha256: digest,
                 excluded_reason: None,
             },
         );
-        self.payload.extend_from_slice(bytes);
+        self.files.insert(path, bytes.to_vec());
         self
     }
 
     /// Mark a file as excluded (prompt bytes / credentials / live context — IF-10).
     pub fn exclude(&mut self, path: String, reason: &str) -> &mut Self {
         self.manifest.files.insert(
-            path,
+            path.clone(),
             BundleFile {
-                path: String::new(),
+                path: path.clone(),
                 content_sha256: String::new(),
                 excluded_reason: Some(reason.into()),
             },
@@ -125,23 +138,29 @@ impl ExportBuilder {
         self
     }
 
-    /// Encrypt the payload with age (X25519 recipient) and produce the bundle file.
+    /// Encrypt manifest + file bytes with age (X25519 recipient) and produce
+    /// the bundle file. The manifest is INSIDE the AEAD boundary — restore
+    /// cannot be fooled by editing the plaintext envelope.
     pub fn seal(self, recipient: &age::x25519::Recipient) -> Result<Vec<u8>, ExportError> {
-        // The on-disk bundle: a small envelope { manifest, encrypted_payload }.
-        let encrypted = encrypt_age(recipient, &self.payload)?;
-        let envelope = Envelope {
+        let sealed = SealedPayload {
             manifest: self.manifest,
-            ciphertext: encrypted,
+            files: self.files,
         };
-        serde_json::to_vec(&envelope).map_err(|e| ExportError::Io(e.to_string()))
+        let plaintext = serde_json::to_vec(&sealed).map_err(|e| ExportError::Io(e.to_string()))?;
+        let encrypted = encrypt_age(recipient, &plaintext)?;
+        serde_json::to_vec(&Envelope {
+            ciphertext: encrypted,
+        })
+        .map_err(|e| ExportError::Io(e.to_string()))
     }
 }
 
-/// The sealed on-disk bundle.
+/// The sealed on-disk bundle: an age-encrypted blob. The manifest lives
+/// inside the ciphertext (AEAD-authenticated), so tampering with the outer
+/// envelope is detected at decrypt time.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Envelope {
-    pub manifest: ExportManifest,
-    pub ciphertext: Vec<u8>, // age-encrypted payload
+    pub ciphertext: Vec<u8>, // age-encrypted SealedPayload (manifest + files)
 }
 
 /// Decrypt and validate an export bundle, restoring into a NEW session id.
@@ -153,15 +172,40 @@ pub fn restore(
 ) -> Result<ExportManifest, ExportError> {
     let envelope: Envelope = serde_json::from_slice(bundle_bytes)
         .map_err(|e| ExportError::SignatureVerificationFailed(format!("envelope: {e}")))?;
+    // Decrypt first — the AEAD authenticates everything inside.
+    let plaintext = decrypt_age(identity, &envelope.ciphertext)?;
+    let sealed: SealedPayload = serde_json::from_slice(&plaintext)
+        .map_err(|e| ExportError::SignatureVerificationFailed(format!("payload: {e}")))?;
     // Immutable restore: never into an existing session (DR-06 §6.19).
     if new_session_id == source_session_id {
         return Err(ExportError::RestoreIntoExistingSession(
             "restore must target a fresh session id (E0509)".into(),
         ));
     }
-    // Decrypt to prove the key is right + validate the manifest head.
-    let _plaintext = decrypt_age(identity, &envelope.ciphertext)?;
-    Ok(envelope.manifest)
+    // The caller's source_session_id must match the manifest (L3).
+    if sealed.manifest.source_session_id != source_session_id {
+        return Err(ExportError::PolicyMismatch(
+            "source_session_id does not match the bundle manifest (E0723)".into(),
+        ));
+    }
+    // Verify every content digest against the decrypted payload (H2).
+    for (path, file) in &sealed.manifest.files {
+        if file.excluded_reason.is_some() {
+            continue;
+        }
+        let Some(bytes) = sealed.files.get(path) else {
+            return Err(ExportError::SignatureVerificationFailed(format!(
+                "bundle missing payload for {path}"
+            )));
+        };
+        let digest = hex::encode(Sha256::digest(bytes));
+        if digest != file.content_sha256 {
+            return Err(ExportError::SignatureVerificationFailed(format!(
+                "content digest mismatch for {path}"
+            )));
+        }
+    }
+    Ok(sealed.manifest)
 }
 
 /// Encrypt `plaintext` with age X25519 recipient (age 0.12 API).
@@ -264,5 +308,37 @@ mod tests {
         b.add_file("f".into(), b"data");
         let sealed = b.seal(&recipient).unwrap();
         assert!(restore(&sealed, &id2, "s2", "s1").is_err());
+    }
+
+    #[test]
+    fn duplicate_add_file_is_idempotent() {
+        let (recipient, identity) = generate_local_key();
+        let mut b = ExportBuilder::new("s1".into(), "p1".into(), "0".repeat(64));
+        b.add_file("ledger/a".into(), b"data")
+            .add_file("ledger/a".into(), b"data");
+        let sealed = b.seal(&recipient).unwrap();
+        let manifest = restore(&sealed, &identity, "s2", "s1").unwrap();
+        assert!(manifest.files.contains_key("ledger/a"));
+    }
+
+    #[test]
+    fn source_session_mismatch_refused() {
+        let (recipient, identity) = generate_local_key();
+        let mut b = ExportBuilder::new("s1".into(), "p1".into(), "0".repeat(64));
+        b.add_file("f".into(), b"data");
+        let sealed = b.seal(&recipient).unwrap();
+        assert!(restore(&sealed, &identity, "s2", "other-session").is_err());
+    }
+
+    #[test]
+    fn tampered_envelope_detected() {
+        let (recipient, identity) = generate_local_key();
+        let mut b = ExportBuilder::new("s1".into(), "p1".into(), "0".repeat(64));
+        b.add_file("f".into(), b"data");
+        let mut sealed = b.seal(&recipient).unwrap();
+        // Flip a byte in the encrypted payload — AEAD must reject it.
+        let len = sealed.len();
+        sealed[len - 1] ^= 0xFF;
+        assert!(restore(&sealed, &identity, "s2", "s1").is_err());
     }
 }

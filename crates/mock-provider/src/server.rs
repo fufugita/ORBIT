@@ -5,6 +5,7 @@
 //! the homelab or in-process for the conformance tests.
 
 use axum::{
+    body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -81,7 +82,16 @@ async fn openai(
     } else {
         None
     };
-    let selected = implicit_tool_behavior.unwrap_or_else(|| behavior(&headers));
+    let model_has_slow = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|m| m.contains("slow"))
+        .unwrap_or(false);
+    let selected = if model_has_slow && headers.get("x-orbit-behavior").is_none() {
+        "slow-stream"
+    } else {
+        implicit_tool_behavior.unwrap_or_else(|| behavior(&headers))
+    };
     match selected {
         "rate-limit" => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -114,6 +124,34 @@ async fn openai(
                 StatusCode::OK,
                 [("content-type", "text/event-stream")],
                 openai_success(),
+            )
+                .into_response()
+        }
+        "slow-stream" => {
+            // Yield chunks with 200ms delays so Ctrl+C cancel is testable.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
+            tokio::spawn(async move {
+                let chunks = [
+                    r#"data: {"id":"r1","choices":[{"delta":{"content":"Hello "}}]}"#,
+                    r#"data: {"id":"r1","choices":[{"delta":{"content":"from "}}]}"#,
+                    r#"data: {"id":"r1","choices":[{"delta":{"content":"the "}}]}"#,
+                    r#"data: {"id":"r1","choices":[{"delta":{"content":"slow "}}]}"#,
+                    r#"data: {"id":"r1","choices":[{"delta":{"content":"stream."}}]}"#,
+                    r#"data: {"id":"r1","choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":5}}"#,
+                    "data: [DONE]",
+                ];
+                for chunk in chunks {
+                    let _ = tx
+                        .send(Ok(bytes::Bytes::from(format!("{chunk}\n\n"))))
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            });
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                Body::from_stream(stream),
             )
                 .into_response()
         }

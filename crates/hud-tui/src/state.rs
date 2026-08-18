@@ -146,6 +146,33 @@ pub struct App {
     pub reconnect_phase: u8,
     /// Copy mode flag — when true, TUI exits alt screen for plain text copy.
     pub copy_mode: bool,
+    /// Logo phase (DR-21 L19): splash → steady → working → shutdown.
+    pub logo_phase: LogoPhase,
+    /// Frames spent in the current logo phase (drives phase transitions).
+    pub logo_phase_frames: u8,
+    /// Composer state (DR-21 §3.4) — left glyph + border color.
+    pub composer_state: ComposerState,
+    /// Composer send animation phase (0..3 for ↗↘↗).
+    pub composer_send_phase: u8,
+    /// Queued prompts: typed while a turn is in flight. Drained one at a
+    /// time when a turn ends (ResponseFinished or CancelTurn). Rendered as
+    /// dimmed `⏳` lines above the composer.
+    pub queued: Vec<String>,
+    /// True while the worker is actively running a turn (streaming or in a
+    /// tool round). Drives whether Ctrl+C cancels the turn vs. quits.
+    pub turn_in_flight: bool,
+    /// Set when the operator cancels the in-flight turn; consumed by the
+    /// next ResponseFinished (which stamps the transcript).
+    pub cancel_requested: bool,
+    /// Braille spinner frame index (0..10, advances every 4 ticks = 8fps).
+    pub spinner_frame: u8,
+    /// Smooth focus transition phase 0..3. The renderer blends the border
+    /// color (dim → accent) over 3 frames when focus changes; None = settled.
+    pub focus_transition: Option<u8>,
+    /// Transcript viewport scroll offset (lines from top). 0 = top.
+    pub viewport_scroll: u16,
+    /// True when the operator has scrolled up (disables auto-scroll).
+    pub viewport_manual: bool,
 }
 
 /// The fixed local thinking phrases (never model-generated rationale).
@@ -169,6 +196,8 @@ pub enum TranscriptLine {
     Stripped {
         tool_name: String,
     },
+    /// System note (cancelled turn, queue drained, etc.) — dim, never bold.
+    System(String),
 }
 
 /// Connection state for the status bar.
@@ -178,6 +207,26 @@ pub enum ConnectionState {
     Online,
     Reconnecting,
     Offline,
+}
+
+/// Logo phase (DR-21 L19): splash → steady → working → shutdown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogoPhase {
+    #[default]
+    Splash,
+    Steady,
+    Working,
+    Shutdown,
+}
+
+/// Composer state (DR-21 §3.4) — drives the left glyph + border color.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerState {
+    Idle,
+    Typing,
+    Sending,
+    /// Blocked with a reason (rate limit, etc.).
+    Blocked(String),
 }
 
 /// Tool state for the status bar.
@@ -234,7 +283,33 @@ impl App {
             cost_flash_frames: 0,
             reconnect_phase: 0,
             copy_mode: false,
+            logo_phase: LogoPhase::Splash,
+            logo_phase_frames: 0,
+            composer_state: ComposerState::Idle,
+            composer_send_phase: 0,
+            queued: Vec::new(),
+            turn_in_flight: false,
+            cancel_requested: false,
+            spinner_frame: 0,
+            focus_transition: None,
+            viewport_scroll: 0,
+            viewport_manual: false,
         }
+    }
+
+    /// Pop the next queued prompt (if any) and mark a turn in flight.
+    /// Called by the event loop after a turn ends; the popped prompt is
+    /// forwarded to the worker's prompt channel by the caller.
+    pub fn take_next_queued(&mut self) -> Option<String> {
+        if self.turn_in_flight || self.queued.is_empty() {
+            return None;
+        }
+        let next = self.queued.remove(0);
+        self.turn_in_flight = true;
+        self.tool_state = ToolState::Streaming;
+        self.composer_state = ComposerState::Sending;
+        self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
+        Some(next)
     }
 }
 
@@ -277,11 +352,73 @@ impl App {
                     self.shimmer_phase = (self.shimmer_phase + 1) % 2;
                     self.dirty.set(DirtyFlags::LAYOUT);
                 }
-                // Reconnecting spinner: advance every ~375ms (24 ticks).
+                // Logo phase advance (DR-21 L19): 8 frames/tick → 1s per phase.
+                if self.tick_count.is_multiple_of(8) {
+                    self.logo_phase_frames = self.logo_phase_frames.saturating_add(1);
+                    // Always mark the layout dirty while the logo animates —
+                    // otherwise the star never visibly orbits (the frame
+                    // counter advances but nothing redraws).
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                    match self.logo_phase {
+                        LogoPhase::Splash if self.logo_phase_frames >= 8 => {
+                            self.logo_phase = LogoPhase::Steady;
+                            self.logo_phase_frames = 0;
+                        }
+                        LogoPhase::Steady
+                            if self.tool_state == ToolState::Streaming
+                                || matches!(self.tool_state, ToolState::Running(_)) =>
+                        {
+                            self.logo_phase = LogoPhase::Working;
+                            self.logo_phase_frames = 0;
+                        }
+                        LogoPhase::Working
+                            if self.tool_state != ToolState::Streaming
+                                && !matches!(self.tool_state, ToolState::Running(_)) =>
+                        {
+                            self.logo_phase = LogoPhase::Steady;
+                            self.logo_phase_frames = 0;
+                        }
+                        _ => {}
+                    }
+                }
+                // Braille spinner: advance every 4 ticks (8fps) while busy.
+                if (self.tool_state == ToolState::Streaming
+                    || matches!(self.tool_state, ToolState::Running(_))
+                    || self.connection == ConnectionState::Reconnecting)
+                    && self.tick_count.is_multiple_of(4)
+                {
+                    self.spinner_frame = (self.spinner_frame + 1) % 10;
+                    self.dirty.set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
+                }
+                // Smooth focus transition: advance phase, clear at 3.
+                if let Some(phase) = self.focus_transition {
+                    if phase >= 3 {
+                        self.focus_transition = None;
+                    } else {
+                        self.focus_transition = Some(phase + 1);
+                    }
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                }
+                // Reconnecting spinner: rotate every ~375ms (24 ticks).
                 if self.connection == ConnectionState::Reconnecting
                     && self.tick_count.is_multiple_of(24)
                 {
                     self.reconnect_phase = (self.reconnect_phase + 1) % 3;
+                    self.dirty.set(DirtyFlags::STATUS);
+                }
+                // Composer send animation: ↗↘↗ (3 frames, ~375ms per frame).
+                if self.composer_state == ComposerState::Sending
+                    && self.tick_count.is_multiple_of(24)
+                {
+                    self.composer_send_phase = (self.composer_send_phase + 1) % 3;
+                    self.dirty.set(DirtyFlags::STATUS);
+                }
+                // Composer returns to Idle when the stream finishes.
+                if self.tool_state != ToolState::Streaming
+                    && !matches!(self.tool_state, ToolState::Running(_))
+                    && self.composer_state == ComposerState::Sending
+                {
+                    self.composer_state = ComposerState::Idle;
                     self.dirty.set(DirtyFlags::STATUS);
                 }
                 // Cost flash: count down.
@@ -318,7 +455,17 @@ impl App {
                 self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
                 self.total_cost_microcents =
                     self.total_cost_microcents.saturating_add(cost_microcents);
+                if self.cancel_requested {
+                    // The operator aborted this turn — stamp it. Partial
+                    // text (if any) was already pushed above.
+                    self.transcript
+                        .push(TranscriptLine::System("⏹ cancelled by operator".into()));
+                    self.cancel_requested = false;
+                }
                 self.tool_state = ToolState::Idle;
+                self.composer_state = ComposerState::Idle;
+                self.composer_send_phase = 0;
+                self.turn_in_flight = false;
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
             Msg::ToolCallStarted { name, summary } => {
@@ -350,15 +497,30 @@ impl App {
                 self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS);
             }
             Msg::BackendError(err) => {
-                self.last_error = Some(err);
+                self.last_error = Some(err.clone());
+                self.composer_state = ComposerState::Blocked(err);
+                self.turn_in_flight = false;
+                self.cancel_requested = false;
                 self.dirty.set(DirtyFlags::STATUS);
             }
             Msg::TextSubmitted(text) => {
-                // The operator's prompt becomes a transcript line.
-                self.transcript.push(TranscriptLine::User(text));
-                self.in_flight.clear();
-                self.tool_state = ToolState::Streaming;
-                self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
+                if self.turn_in_flight {
+                    // A turn is streaming — queue the prompt; the worker
+                    // picks it up when the current turn ends.
+                    self.queued.push(text);
+                    self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
+                } else {
+                    // Idle — run immediately. (Also clears any stale cancel
+                    // flag from a turn that raced its own finish.)
+                    self.cancel_requested = false;
+                    self.transcript.push(TranscriptLine::User(text));
+                    self.in_flight.clear();
+                    self.tool_state = ToolState::Streaming;
+                    self.turn_in_flight = true;
+                    self.composer_state = ComposerState::Sending;
+                    self.composer_send_phase = 0;
+                    self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
+                }
             }
             Msg::ApprovalRequested {
                 call_id,
@@ -394,8 +556,23 @@ impl App {
             }
             Msg::ComposerChanged => {
                 self.dirty.set(DirtyFlags::LAYOUT);
+                if self.composer_state == ComposerState::Idle {
+                    self.composer_state = ComposerState::Typing;
+                }
             }
             Msg::CtrlC => {
+                // While a turn is streaming, Ctrl+C cancels the turn (the
+                // event loop also fires the worker's CancelToken). A second
+                // Ctrl+C while a cancel is still pending falls through to
+                // the quit path — the operator always has an escape hatch.
+                let cancelling =
+                    self.turn_in_flight && self.tool_state != ToolState::AwaitingApproval;
+                if cancelling && !self.cancel_requested {
+                    self.cancel_requested = true;
+                    self.last_status = "cancelling…".into();
+                    self.dirty.set(DirtyFlags::STATUS);
+                    return;
+                }
                 // Double Ctrl+C to quit: first press shows confirmation,
                 // second press within ~2 s (120 ticks at 16ms) actually quits.
                 let ticks_since_last = self.tick_count.saturating_sub(self.last_ctrl_c_tick);
@@ -411,6 +588,16 @@ impl App {
             Msg::EnterCopyMode => {
                 self.copy_mode = true;
                 self.dirty.set(DirtyFlags::LAYOUT);
+            }
+            Msg::CancelTurn => {
+                // The event loop fires the worker's CancelToken on this
+                // message; the reducer only needs to flag intent so the
+                // next ResponseFinished stamps the transcript.
+                if self.turn_in_flight {
+                    self.cancel_requested = true;
+                    self.last_status = "cancelling…".into();
+                    self.dirty.set(DirtyFlags::STATUS);
+                }
             }
             Msg::RequestQuit => {
                 // q/Esc/Ctrl+D request interactive confirmation.
@@ -435,6 +622,7 @@ impl App {
                 self.quit_confirmation = false;
                 self.copy_mode = false;
                 self.ctrl_c_count = 0;
+                self.logo_phase = LogoPhase::Shutdown;
                 self.should_quit = true;
             }
         }
@@ -465,22 +653,27 @@ impl App {
             }
             KeyAction::FocusNext => {
                 self.focus = self.focus.next();
+                self.focus_transition = Some(0);
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusPrev => {
                 self.focus = self.focus.prev();
+                self.focus_transition = Some(0);
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusLeft => {
                 self.focus = Focus::Left;
+                self.focus_transition = Some(0);
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusCenter => {
                 self.focus = Focus::Center;
+                self.focus_transition = Some(0);
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusRight => {
                 self.focus = Focus::Right;
+                self.focus_transition = Some(0);
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::TabSessions => {

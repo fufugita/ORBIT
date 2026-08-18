@@ -17,4 +17,5 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 age.workspace = true
+rust-embed.workspace = true
 chrono.workspace = true

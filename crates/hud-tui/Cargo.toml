@@ -15,12 +15,11 @@ description = "TUI front-end for ORBIT (ratatui + crossterm)"
 orbit-hud = { path = "../hud" }
 ratatui.workspace = true
 crossterm.workspace = true
-tui-markdown.workspace = true
-tui-textarea.workspace = true
-tui-widget-list.workspace = true
 toml.workspace = true
 serde.workspace = true
 signal-hook.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 
 [lib]
 name = "orbit_hud_tui"

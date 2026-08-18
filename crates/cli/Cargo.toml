@@ -21,6 +21,7 @@ rand.workspace = true
 age.workspace = true
 zeroize.workspace = true
 toml.workspace = true
+libc = { workspace = true }
 
 orbit-trust = { path = "../trust" }
 orbit-ledger = { path = "../ledger" }

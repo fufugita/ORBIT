@@ -22,6 +22,13 @@ handoff.md
 *.swp
 *.swo
 *~
+# Agent / tool working directories (CLAUDE.md: never commit agent state)
+/.claude/
+/.claude.worktrees/
+# Go TUI build artifact + local receipt dirs (generated, not source)
+/frontends/go-tui/orbit-go-tui
+/frontends/go-tui/receipts/
+/frontends/go-tui/review-receipts/
 
 # Coverage/profiling outputs
 coverage/

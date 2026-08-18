@@ -593,18 +593,24 @@ fn replay_pinned_uses_resolved_model_name() {
 
 #[test]
 fn export_excludes_prompt_bytes() {
-    // IF-10: the export manifest excludes prompt/credential files. The sealed
-    // bundle's manifest marks them excluded_reason, never payload bytes.
-    let (recipient, _id) = orbit_export::generate_local_key();
+    // IF-10: the export manifest excludes prompt/credential files. The
+    // bundle's manifest marks them with excluded_reason and the file has
+    // NO payload bytes (manifest is inside the AEAD, so we decrypt to
+    // inspect it).
+    let (recipient, identity) = orbit_export::generate_local_key();
     let mut b = orbit_export::ExportBuilder::new("s".into(), "p".into(), "0".repeat(64));
     b.exclude("prompt.txt".into(), "prompt bytes excluded (IF-10)");
     let sealed = b.seal(&recipient).unwrap();
-    // The manifest is plaintext in the envelope; it records the exclusion.
-    let s = String::from_utf8_lossy(&sealed);
-    assert!(
-        s.contains("excluded_reason"),
-        "exclusion is manifest-evidenced"
+    let manifest = orbit_export::restore(&sealed, &identity, "s2", "s").unwrap();
+    let entry = manifest
+        .files
+        .get("prompt.txt")
+        .expect("excluded path is in the manifest");
+    assert_eq!(
+        entry.excluded_reason.as_deref(),
+        Some("prompt bytes excluded (IF-10)")
     );
+    assert_eq!(entry.content_sha256, "");
 }
 
 #[test]

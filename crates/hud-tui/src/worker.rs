@@ -25,8 +25,15 @@ pub struct WorkerCtx {
     pub prompt_rx: mpsc::Receiver<String>,
 }
 
+/// Fires cancellation of the worker's CURRENT turn, if one is running.
+/// The CLI implements this around the provider `CancelToken`; the TUI only
+/// sees an opaque closure (no provider-http dependency here).
+pub type CancelHandle = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// Spawns the backend worker thread. The CLI provides the implementation
 /// (it owns `run_turn`); the TUI calls it after entering the terminal.
 /// `prompt_sink` is the sender end the CLI may keep if it wants to feed
 /// synthetic prompts; normally the TUI's input handler holds it.
-pub type WorkerSpawner = Box<dyn FnOnce(WorkerCtx, PromptSink) -> Result<(), String> + Send>;
+/// Returns a `CancelHandle` the event loop fires on Ctrl+C-mid-turn.
+pub type WorkerSpawner =
+    Box<dyn FnOnce(WorkerCtx, PromptSink) -> Result<CancelHandle, String> + Send>;

@@ -17,11 +17,12 @@ pub mod bus;
 mod coalesce;
 pub mod input;
 pub mod msg;
-mod render;
+pub mod render;
 mod rich;
 pub mod state;
 mod terminal;
 pub mod theme;
+pub mod unicode;
 pub mod worker;
 
 pub use approval::{ApprovalRegistry, ApprovalResponse};
@@ -92,9 +93,13 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         approvals: approvals.clone(),
         prompt_rx,
     };
-    if let Err(e) = worker_spawner(spawn_ctx, prompt_tx) {
-        eprintln!("orbit-tui: worker spawn failed: {e}");
-    }
+    let cancel_handle: worker::CancelHandle = match worker_spawner(spawn_ctx, prompt_tx) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("orbit-tui: worker spawn failed: {e}");
+            std::sync::Arc::new(|| {})
+        }
+    };
 
     let result = event_loop(
         &mut guard,
@@ -104,6 +109,7 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         &mut app,
         &mut key_parser,
         &prompt_forward,
+        &cancel_handle,
         &theme,
     );
 
@@ -143,6 +149,7 @@ fn event_loop(
     app: &mut App,
     key_parser: &mut KeyParser,
     prompt_forward: &std::sync::mpsc::Sender<String>,
+    cancel_handle: &worker::CancelHandle,
     theme: &ResolvedTheme,
 ) -> Result<LoopOutcome, String> {
     let mut last_tick = Instant::now();
@@ -168,10 +175,57 @@ fn event_loop(
         }
 
         while let Some(msg) = bus.try_recv() {
-            if let Msg::TextSubmitted(ref text) = msg {
-                let _ = prompt_forward.send(text.clone());
+            // Forward prompts to the worker ONLY when the reducer starts a
+            // new turn (not when it queues). We detect this by snapshotting
+            // turn_in_flight before reduce and checking it flipped to true.
+            let was_in_flight = app.turn_in_flight;
+            if let Msg::TextSubmitted(text) = msg {
+                app.reduce(Msg::TextSubmitted(text.clone()));
+                if !was_in_flight && app.turn_in_flight {
+                    let _ = prompt_forward.send(text);
+                }
+                continue;
             }
-            app.reduce(msg);
+            // Cancel: fire the worker's CancelToken when the operator aborts.
+            if let Msg::CancelTurn = msg {
+                app.reduce(Msg::CancelTurn);
+                (cancel_handle)();
+                continue;
+            }
+            // After a turn ends, drain the queue: pop the next prompt and
+            // forward it to the worker (the reducer already marked the new
+            // turn in flight via take_next_queued).
+            match msg {
+                Msg::ResponseFinished {
+                    output,
+                    input_tokens,
+                    output_tokens,
+                    cost_microcents,
+                } => {
+                    app.reduce(Msg::ResponseFinished {
+                        output,
+                        input_tokens,
+                        output_tokens,
+                        cost_microcents,
+                    });
+                    if let Some(next) = app.take_next_queued() {
+                        app.transcript
+                            .push(crate::state::TranscriptLine::User(next.clone()));
+                        let _ = prompt_forward.send(next);
+                    }
+                    continue;
+                }
+                Msg::BackendError(err) => {
+                    app.reduce(Msg::BackendError(err));
+                    if let Some(next) = app.take_next_queued() {
+                        app.transcript
+                            .push(crate::state::TranscriptLine::User(next.clone()));
+                        let _ = prompt_forward.send(next);
+                    }
+                    continue;
+                }
+                _ => app.reduce(msg),
+            }
         }
 
         // Copy mode: exit alt screen, print transcript, wait for key, re-enter.
@@ -190,10 +244,16 @@ fn event_loop(
         }
 
         if app.should_quit {
-            return Ok(LoopOutcome {
-                exit_code: 0,
-                note: None,
-            });
+            // Release any worker parked on an approval channel — otherwise
+            // the thread is killed at process exit without appending the
+            // ToolVerdict/ToolResult to the ledger (H3, fail-closed).
+            let denied = approvals.deny_all();
+            let note = if denied > 0 {
+                Some(format!("denied {denied} pending approval(s)"))
+            } else {
+                None
+            };
+            return Ok(LoopOutcome { exit_code: 0, note });
         }
 
         let timeout = UI_TICK
@@ -232,37 +292,51 @@ fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(),
     execute!(std::io::stdout(), Show, LeaveAlternateScreen)
         .map_err(|e| format!("leave alt screen: {e}"))?;
 
-    // Print the transcript as plain text.
+    // Instructions FIRST — everything below this point is pure transcript
+    // text, so a drag-selection captures only message content (no prefixes,
+    // no footer, no box art inside the selection region).
     println!();
-    println!("╭──────────────────────────────────────────────────────────╮");
-    println!("│  ORBIT — copy mode (select text, copy, press any key)   │");
-    println!("╰──────────────────────────────────────────────────────────╯");
+    println!("  copy mode — select the text below, copy, then press any key");
+    println!("  ────────────────────────────────────────────────────────────");
     println!();
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    let mut plain = String::new();
     for entry in &app.transcript {
         match entry {
             crate::state::TranscriptLine::User(text) => {
                 for line in text.lines() {
-                    println!("user> {line}");
+                    plain.push_str(line);
+                    plain.push('\n');
                 }
+                plain.push('\n');
             }
             crate::state::TranscriptLine::Assistant(text) => {
                 for line in text.lines() {
-                    println!("orbit> {line}");
+                    plain.push_str(line);
+                    plain.push('\n');
                 }
+                plain.push('\n');
             }
             crate::state::TranscriptLine::Stripped { tool_name } => {
-                println!("  [tool: {tool_name}]");
+                plain.push_str(&format!("[tool: {tool_name}]\n\n"));
+            }
+            crate::state::TranscriptLine::System(text) => {
+                plain.push_str(text);
+                plain.push('\n');
+                plain.push('\n');
             }
         }
     }
     if !app.in_flight.is_empty() {
         for line in app.in_flight.lines() {
-            println!("orbit> {line}");
+            plain.push_str(line);
+            plain.push('\n');
         }
     }
-    println!();
-    println!("── press any key to return to ORBIT ──");
-    use std::io::Write;
+    // Nothing after the transcript — selection to end-of-output is clean.
+    print!("{plain}");
     let _ = std::io::stdout().flush();
 
     // Wait for any key.
@@ -351,15 +425,58 @@ fn handle_key(
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    // Ctrl+C → double-press to quit (not immediate).
+    // Ctrl+C → cancel the in-flight turn if streaming; otherwise the
+    // double-press-to-quit flow. (During approval, quit wins — the worker
+    // is parked on the approval and the stream isn't running.)
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        sender.send(Msg::CtrlC);
+        if app.turn_in_flight && app.tool_state != crate::state::ToolState::AwaitingApproval {
+            sender.send(Msg::CancelTurn);
+        } else {
+            sender.send(Msg::CtrlC);
+        }
         return;
     }
 
     // Ctrl+D (EOF) → request quit with confirmation.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
         sender.send(Msg::RequestQuit);
+        return;
+    }
+
+    // ── Approval modal captures input (DR-21 L18) ─────────────────────────
+    // While an approval is pending the sheet is the ONLY interactive surface:
+    // y/n/R answer it, Esc denies, everything else is swallowed. This must
+    // run BEFORE the composer branch — focus defaults to Center, so `y`
+    // would otherwise be typed into the composer and never reach the modal.
+    if !app.pending_approvals.is_empty() {
+        let first = &app.pending_approvals[0];
+        let call_id = first.call_id.clone();
+        let name = first.tool_name.clone();
+        if let KeyCode::Char(c) = key.code {
+            match c {
+                'y' | 'Y' => {
+                    approvals.resolve(&call_id, ApprovalResponse::Allow);
+                    sender.send(Msg::ToolCallFinished { name, ok: true });
+                    return;
+                }
+                'n' | 'N' => {
+                    approvals.resolve(&call_id, ApprovalResponse::Deny);
+                    sender.send(Msg::ToolCallFinished { name, ok: false });
+                    return;
+                }
+                'r' | 'R' => {
+                    approvals.resolve(&call_id, ApprovalResponse::AllowSession);
+                    sender.send(Msg::ToolCallFinished { name, ok: true });
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if matches!(key.code, KeyCode::Esc) {
+            approvals.resolve(&call_id, ApprovalResponse::Deny);
+            sender.send(Msg::ToolCallFinished { name, ok: false });
+        }
+        // Any other key is consumed by the modal.
         return;
     }
 
@@ -401,6 +518,15 @@ fn handle_key(
             // Actually, let's use `Ctrl+Shift+C` or just a leader: `z` then `y`.
             // For now, skip — copy mode will be triggered by a leader key.
         }
+    }
+
+    // Focus navigation is global: Tab/BackTab must reach the key parser even
+    // while the center composer is focused. Handle it before composer input.
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        if let Some(action) = key_parser.parse(&key) {
+            sender.send(Msg::KeyAction(action));
+        }
+        return;
     }
 
     // Shift+Enter inserts a newline (multi-line composer).
@@ -463,48 +589,6 @@ fn handle_key(
                 // z+y → enter copy mode (yank transcript).
                 sender.send(Msg::EnterCopyMode);
             }
-        }
-        return;
-    }
-
-    // y / n / R are approval shortcuts when an approval is pending.
-    if !app.pending_approvals.is_empty() {
-        let call_id = app.pending_approvals[0].call_id.clone();
-        if let KeyCode::Char(c) = key.code {
-            match c {
-                'y' | 'Y' => {
-                    approvals.resolve(&call_id, ApprovalResponse::Allow);
-                    sender.send(Msg::ToolCallFinished {
-                        name: app.pending_approvals[0].tool_name.clone(),
-                        ok: true,
-                    });
-                    return;
-                }
-                'n' | 'N' => {
-                    approvals.resolve(&call_id, ApprovalResponse::Deny);
-                    sender.send(Msg::ToolCallFinished {
-                        name: app.pending_approvals[0].tool_name.clone(),
-                        ok: false,
-                    });
-                    return;
-                }
-                'r' | 'R' => {
-                    approvals.resolve(&call_id, ApprovalResponse::AllowSession);
-                    sender.send(Msg::ToolCallFinished {
-                        name: app.pending_approvals[0].tool_name.clone(),
-                        ok: true,
-                    });
-                    return;
-                }
-                _ => {}
-            }
-        }
-        if matches!(key.code, KeyCode::Esc) {
-            approvals.resolve(&call_id, ApprovalResponse::Deny);
-            sender.send(Msg::ToolCallFinished {
-                name: app.pending_approvals[0].tool_name.clone(),
-                ok: false,
-            });
         }
     }
 }

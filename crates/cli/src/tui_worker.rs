@@ -28,18 +28,38 @@ pub struct TuiTurnConfig {
 
 /// Build the worker spawner closure for the TUI. The CLI owns `run_turn`;
 /// this closure captures the turn config and spawns a thread that drives it.
+/// Returns a `CancelHandle` that cancels the turn currently in flight.
 pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
     Box::new(move |ctx: WorkerCtx, _prompt_sink: PromptSink| {
+        // Shared slot: worker_main installs the CURRENT turn's CancelToken;
+        // the handle fires it. None when no turn is running.
+        let slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let handle_slot = slot.clone();
         std::thread::Builder::new()
             .name("orbit-tui-worker".into())
-            .spawn(move || worker_main(ctx, config))
-            .map(|_| ())
+            .spawn(move || worker_main(ctx, config, slot))
+            .map(|_| {
+                let cancel_handle: orbit_hud_tui::worker::CancelHandle =
+                    std::sync::Arc::new(move || {
+                        if let Some(token) = handle_slot.lock().ok().and_then(|g| g.clone()) {
+                            token.cancel();
+                        }
+                    });
+                cancel_handle
+            })
             .map_err(|e| format!("spawn worker: {e}"))
     })
 }
 
 /// The worker's event loop — waits for prompts, runs turns, reports results.
-fn worker_main(ctx: WorkerCtx, config: TuiTurnConfig) {
+/// Each turn gets a fresh CancelToken installed in the shared slot so the
+/// TUI's Ctrl+C can abort the in-flight stream.
+fn worker_main(
+    ctx: WorkerCtx,
+    config: TuiTurnConfig,
+    cancel_slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
+) {
     let mut transcript: Vec<ChatMessage> = Vec::new();
 
     // Send identity to the TUI so the status bar shows model/provider/session.
@@ -50,22 +70,35 @@ fn worker_main(ctx: WorkerCtx, config: TuiTurnConfig) {
     });
 
     while let Ok(prompt) = ctx.prompt_rx.recv() {
-        let (ok, input, output, cost) = match run_tui_turn(
+        let token = orbit_provider_http::CancelToken::new();
+        if let Ok(mut guard) = cancel_slot.lock() {
+            *guard = Some(token.clone());
+        }
+        let (_ok, input, output, cost) = match run_tui_turn(
             &config,
             &mut transcript,
             &prompt,
             &ctx.sender,
             &ctx.approvals,
+            &token,
         ) {
             Ok(x) => x,
             Err(e) => {
                 orbit_hud_tui::emit_error(&ctx.sender, &e);
+                if let Ok(mut guard) = cancel_slot.lock() {
+                    *guard = None;
+                }
                 continue;
             }
         };
-        if ok {
-            orbit_hud_tui::emit_response_finished(&ctx.sender, "", input, output, cost);
+        if let Ok(mut guard) = cancel_slot.lock() {
+            *guard = None;
         }
+        // Always emit ResponseFinished — the TUI's turn_in_flight flag and
+        // queue drain both depend on it, whether the turn completed, was
+        // cancelled by the operator, or errored. The reducer stamps a
+        // "cancelled" note when cancel_requested was set.
+        orbit_hud_tui::emit_response_finished(&ctx.sender, "", input, output, cost);
     }
 }
 
@@ -111,6 +144,7 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
 
 /// Run one user turn against the gateway, streaming through the TUI bridge.
 /// Returns (turn_ok, input_tokens, output_tokens, cost_microcents).
+/// `cancel` is the per-turn token the TUI fires on Ctrl+C-mid-stream.
 #[allow(clippy::too_many_arguments)]
 pub fn run_tui_turn(
     config: &TuiTurnConfig,
@@ -118,6 +152,7 @@ pub fn run_tui_turn(
     prompt: &str,
     sender: &BusSender,
     approvals: &ApprovalRegistry,
+    cancel: &orbit_provider_http::CancelToken,
 ) -> Result<(bool, u64, u64, u64), String> {
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
@@ -161,6 +196,7 @@ pub fn run_tui_turn(
             prompt,
             Some(transcript.clone()),
             Some(&mut observer),
+            cancel.clone(),
         );
         let o = match outcome {
             Ok(o) => o,

@@ -67,7 +67,12 @@ pub enum Msg {
     /// every keystroke (the text lives in the event loop, not the App).
     ComposerChanged,
     /// Ctrl+C pressed — first press shows "press again to quit", second quits.
+    /// While a turn is streaming, the first press cancels the turn instead.
     CtrlC,
+    /// Cancel the in-flight turn (fired by Ctrl+C while streaming). The
+    /// event loop triggers the worker's CancelToken; the reducer sets
+    /// `cancel_requested` so the next `ResponseFinished` stamps the transcript.
+    CancelTurn,
     /// Enter plain-text transcript copy mode.
     EnterCopyMode,
     /// Request to quit — opens confirmation prompt (q, Ctrl+D).

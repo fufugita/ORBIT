@@ -5,6 +5,7 @@
 //! TUI reads from this struct — no hardcoded colors in render.rs.
 
 use ratatui::style::Color;
+use ratatui::symbols::border;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -34,6 +35,82 @@ pub const DEFAULT_ERROR: Color = Color::Rgb(255, 85, 85);
 pub const DEFAULT_SUCCESS: Color = Color::Rgb(80, 200, 120);
 /// Yellow — warnings/approvals.
 pub const DEFAULT_WARNING: Color = Color::Rgb(255, 200, 50);
+
+// ── Bubbles vocabulary (DR-21 L13, L17-L18) ─────────────────────────────────
+
+/// Miku cyan — "Hatsune Miku" inspired, the ORBIT brand focus color.
+pub const MIKU_CYAN: Color = Color::Rgb(57, 197, 187);
+/// Brighter Miku cyan — shimmer phase 1 / active accent.
+pub const MIKU_CYAN_BRIGHT: Color = Color::Rgb(127, 227, 217);
+/// Dim Miku cyan — muted secondary use.
+pub const MIKU_CYAN_DIM: Color = Color::Rgb(34, 120, 116);
+/// Dim gray-blue for unfocused panes.
+pub const PANE_DIM: Color = Color::Rgb(60, 60, 72);
+
+/// Rounded Unicode border set (Bubbles aesthetic) — DR-21 L13.
+pub const ROUNDED: border::Set = border::Set {
+    top_left: "╭",
+    top_right: "╮",
+    bottom_left: "╰",
+    bottom_right: "╯",
+    vertical_left: "│",
+    vertical_right: "│",
+    horizontal_top: "─",
+    horizontal_bottom: "─",
+};
+
+/// Double border set — used for the modal approval sheet (DR-21 L18).
+pub const DOUBLE: border::Set = border::Set {
+    top_left: "╔",
+    top_right: "╗",
+    bottom_left: "╚",
+    bottom_right: "╝",
+    vertical_left: "║",
+    vertical_right: "║",
+    horizontal_top: "═",
+    horizontal_bottom: "═",
+};
+
+/// Thick border set — used for the logo frame + status divider (DR-21 §3.1).
+pub const THICK: border::Set = border::Set {
+    top_left: "┏",
+    top_right: "┓",
+    bottom_left: "┗",
+    bottom_right: "┛",
+    vertical_left: "┃",
+    vertical_right: "┃",
+    horizontal_top: "━",
+    horizontal_bottom: "━",
+};
+
+/// 4-step gradient ramp used in the logo phase, splash, and section dividers.
+/// Each row is a `&'static str` of the same width; the renderer picks one per frame.
+pub const STAR_RAMP: &[&str] = &["✦", "✧", "⋆", "✦"];
+pub const RING_RAMP: &[&str] = &["◦", "◦", "·", "·"];
+pub const DIVIDER_RAMP: &[&str] = &[
+    "────────────────────────────────────",
+    "·──────────────────────────────────",
+    "─·─────────────────────────────────",
+    "──·────────────────────────────────",
+];
+
+/// Bubbles Braille dot spinner (10 frames, 8fps) — the signature Bubble Tea
+/// loading indicator. Ported from `charmbracelet/bubbles/spinner`.
+pub const BRAILLE_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The 8 positions of the orbital ring around the ORBIT logo (clockwise,
+/// starting at the top). Each is a (row, col) offset from the logo's top-left.
+/// The `✹` star rides on the ring, advancing one position per animation tick.
+pub const ORBIT_RING: &[(i8, i8)] = &[
+    (0, 10), // top
+    (1, 17), // top-right
+    (3, 20), // right
+    (5, 17), // bottom-right
+    (6, 10), // bottom
+    (5, 3),  // bottom-left
+    (3, 0),  // left
+    (1, 3),  // top-left
+];
 
 // ── Theme structs ────────────────────────────────────────────────────────────
 
@@ -163,7 +240,7 @@ impl Default for LayoutConfig {
             left_pct: 22,
             center_pct: 56,
             right_pct: 22,
-            header_lines: 3,
+            header_lines: 8,
             status_lines: 1,
             help_lines: 2,
             composer_lines: 3,

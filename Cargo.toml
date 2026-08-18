@@ -57,7 +57,12 @@ rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zeroize = "1"
 age = "0.12"
+# age 0.12 uses rust-embed for localized error strings. Embed those assets in
+# debug builds too; otherwise workspace builds resolve the relative i18n path
+# from ORBIT's root and age error formatting can panic before returning E0508.
+rust-embed = { version = "8", features = ["debug-embed"] }
 toml = "0.8"
+libc = "0.2"
 
 # v0.2 async provider stack — permissive-only (DR-13 §5, re-checked via cargo-deny).
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
@@ -74,10 +79,11 @@ rcgen = "0.13"
 # TUI stack (DR-20): ratatui + crossterm + signal handling.
 ratatui = "0.30"
 crossterm = "0.29"
-tui-markdown = "0.3"
-tui-textarea = "0.7"
-tui-widget-list = "0.13"
 signal-hook = "0.3"
+
+# Grapheme-aware text shaping (DR-21 L14) — permissive (MIT/Unicode, MIT/Apache-2.0).
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
 
 [profile.release]
 lto = "thin"
