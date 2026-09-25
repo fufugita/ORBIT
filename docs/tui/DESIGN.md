@@ -1929,31 +1929,31 @@ Also rejected up front: gradients on the wordmark; emoji status; sparklines of c
 
 ## 13.3 Component checklist
 
-- [ ] Theme. Replace ThemeColors with the §13.1 tokens and resolve once per tier (true colour, 256, 16, mono). No colour literal outside theme.rs (true today; keep it).
+- [x] Theme. Replace ThemeColors with the §13.1 tokens and resolve once per tier (true colour, 256, 16, mono). No colour literal outside theme.rs (true today; keep it).
 
-- [ ] Capabilities. Resolve colour tier, glyph set, brand tier and reduced motion once at startup (§3.7, §11.3). They can step down at runtime but never up.
+- [x] Capabilities. Resolve colour tier, glyph set, brand tier and reduced motion once at startup (§3.7, §11.3). They can step down at runtime but never up.
 
-- [ ] Layout. Breakpoints and rail widths from §5.2. Row priorities from §5.3. Prose measure min(col − 5, 100). Content centred past measure + 16.
+- [x] Layout. Breakpoints and rail widths from §5.2. Row priorities from §5.3. Prose measure min(col − 5, 100). Content centred past measure + 16.
 
-- [ ] Pane header (§6.1) replaces pane_block: no Borders::ALL, a ━ rule when focused, no ▶.
+- [x] Pane header (§6.1) replaces pane_block: no Borders::ALL, a ━ rule when focused, no ▶.
 
-- [ ] Divider and scrollbar (§6.14): full-height │, ┃ thumb, the ↓ n new · End pill.
+- [x] Divider and scrollbar (§6.14): full-height │, ┃ thumb, the ↓ n new · End pill.
 
-- [ ] Transcript. Bottom-anchored; turns per §6.2–6.8; a blank row between turns; gutter 3; tool lines middle-truncated; detail rules coloured by meaning.
+- [x] Transcript. Bottom-anchored; turns per §6.2–6.8; a blank row between turns; gutter 3; tool lines middle-truncated; detail rules coloured by meaning.
 
-- [ ] Markdown per §6.3–6.4: headings by weight, ∙/◦ bullets, surface code bands with ↪ wrap, three syntax colours.
+- [x] Markdown per §6.3–6.4: headings by weight, ∙/◦ bullets, surface code bands with ↪ wrap, three syntax colours.
 
-- [ ] Composer per §5.5: a band, not a box; auto-height; real cursor; grapheme editing; a queued-prompt row; replaced by the approval card.
+- [x] Composer per §5.5: a band, not a box; auto-height; real cursor; grapheme editing; a queued-prompt row; replaced by the approval card.
 
-- [ ] Approval card per §6.15: docked, magenta, the exact action never truncated, y/R disabled until fully seen, risk badge, facts only from structured data.
+- [x] Approval card per §6.15: docked, magenta, the exact action never truncated, y/R disabled until fully seen, risk badge, facts only from structured data.
 
-- [ ] Status line per §6.11: a dynamic left side, a fixed-slot right side, levels 0–3, the M5 turn report.
+- [x] Status line per §6.11: a dynamic left side, a fixed-slot right side, levels 0–3, the M5 turn report.
 
-- [ ] Workspace per §6.10: stepper, sections, eight task states, evidence tags.
+- [x] Workspace per §6.10: stepper, sections, eight task states, evidence tags.
 
-- [ ] Sessions and Activity per §6.9. Rename the Verbose tab to Activity (keep g v) and the Tasks pane to Workspace.
+- [x] Sessions and Activity per §6.9. Rename the Verbose tab to Activity (keep g v) and the Tasks pane to Workspace.
 
-- [ ] Palette, confirm, help per §6.13 and §6.16: solid, framed, no backdrop dimming.
+- [x] Palette, confirm, help per §6.13 and §6.16: solid, framed, no backdrop dimming.
 
 - [ ] Motion per §7:
 
@@ -1967,9 +1967,9 @@ Also rejected up front: gradients on the wordmark; emoji status; sparklines of c
 
 - [ ] Brand per §8: compact mark, expanded mark, startup frames, shutdown line, tier table.
 
-- [ ] Plain grammar (§11.4) for copy mode, the REPL and non-TTY output.
+- [x] Plain grammar (§11.4) for copy mode, the REPL and non-TTY output.
 
-- [ ] Remove the LANG/LC_ALL forcing; add the width probe.
+- [x] Remove the LANG/LC_ALL forcing; add the width probe.
 
 ## 13.4 tui.toml migration
 
