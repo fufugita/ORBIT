@@ -438,21 +438,24 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         Span::styled(mark, Style::default().fg(p.magenta)),
         sep.clone(),
         Span::styled(&app.model, Style::default().fg(p.ink2)),
-        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
         Span::styled(&app.provider, Style::default().fg(p.muted)),
-        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
         Span::styled(&app.session_id_prefix, Style::default().fg(p.faint)),
-        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
         tool_state,
-        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
         conn,
-        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
         Span::styled(tokens, Style::default().fg(p.muted)),
-        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
         Span::styled(cost_str, Style::default().fg(p.ink2)),
     ];
     if !app.last_status.is_empty() {
-        spans.push(Span::styled(" · ", Style::default().fg(p.faint)));
+        spans.push(Span::styled(
+            format!(" {} ", g.sep),
+            Style::default().fg(p.faint),
+        ));
         spans.push(Span::styled(&app.last_status, Style::default().fg(p.muted)));
     }
     frame.render_widget(Line::from(spans), area);

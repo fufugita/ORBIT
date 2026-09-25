@@ -78,6 +78,8 @@ pub struct Glyphs {
     /// Token counters: down / up arrows.
     pub tokens_down: &'static str,
     pub tokens_up: &'static str,
+    /// Status-line separator (unicode: ·, ascii: |).
+    pub sep: &'static str,
 
     // ── Motion — the working star (§4.3, one spinner, 4 fps) ──
     /// The four frames of the working star, in turn order.
@@ -141,6 +143,7 @@ impl Glyphs {
             risk_off: "▱",
             tokens_down: "↓",
             tokens_up: "↑",
+            sep: "·",
             working_star: &["◐", "◓", "◑", "◒"],
             working_star_ascii: &["-", "\\", "|", "/"],
             rule: "─",
@@ -192,6 +195,7 @@ impl Glyphs {
             risk_off: "-",
             tokens_down: "v",
             tokens_up: "^",
+            sep: "|",
             working_star: &["-", "\\", "|", "/"],
             working_star_ascii: &["-", "\\", "|", "/"],
             rule: "-",
