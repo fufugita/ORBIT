@@ -10,7 +10,8 @@
 use orbit_adapter::types::{ChatMessage, ChatRole, ProviderEventKind, ProviderStreamEvent};
 use orbit_hud_tui::bus::BusSender;
 use orbit_hud_tui::msg::Msg;
-use orbit_hud_tui::worker::{PromptSink, WorkerCtx};
+use orbit_hud_tui::state::TranscriptLine;
+use orbit_hud_tui::worker::{CommandSink, WorkerCommand, WorkerCtx};
 use orbit_hud_tui::{ApprovalRegistry, ApprovalResponse};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -24,13 +25,19 @@ pub struct TuiTurnConfig {
     pub model: String,
     pub provider_id: String,
     pub auto_tools: bool,
+    /// Restored session state. Empty/zero for a fresh chat.
+    pub initial_transcript: Vec<ChatMessage>,
+    pub initial_turns: u64,
+    pub initial_input_tokens: u64,
+    pub initial_output_tokens: u64,
+    pub initial_cost_microcents: u64,
 }
 
 /// Build the worker spawner closure for the TUI. The CLI owns `run_turn`;
 /// this closure captures the turn config and spawns a thread that drives it.
 /// Returns a `CancelHandle` that cancels the turn currently in flight.
 pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
-    Box::new(move |ctx: WorkerCtx, _prompt_sink: PromptSink| {
+    Box::new(move |ctx: WorkerCtx, _command_sink: CommandSink| {
         // Shared slot: worker_main installs the CURRENT turn's CancelToken;
         // the handle fires it. None when no turn is running.
         let slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>> =
@@ -57,10 +64,11 @@ pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
 /// TUI's Ctrl+C can abort the in-flight stream.
 fn worker_main(
     ctx: WorkerCtx,
-    config: TuiTurnConfig,
+    mut config: TuiTurnConfig,
     cancel_slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
 ) {
-    let mut transcript: Vec<ChatMessage> = Vec::new();
+    let mut transcript: Vec<ChatMessage> = config.initial_transcript.clone();
+    let mut turns: u64 = config.initial_turns;
 
     // Send identity to the TUI so the status bar shows model/provider/session.
     ctx.sender.send(Msg::Identity {
@@ -69,37 +77,168 @@ fn worker_main(
         session_prefix: config.session_id.chars().take(8).collect(),
     });
 
-    while let Ok(prompt) = ctx.prompt_rx.recv() {
-        let token = orbit_provider_http::CancelToken::new();
-        if let Ok(mut guard) = cancel_slot.lock() {
-            *guard = Some(token.clone());
-        }
-        let (_ok, input, output, cost) = match run_tui_turn(
-            &config,
-            &mut transcript,
-            &prompt,
-            &ctx.sender,
-            &ctx.approvals,
-            &token,
-        ) {
-            Ok(x) => x,
-            Err(e) => {
-                orbit_hud_tui::emit_error(&ctx.sender, &e);
+    // Boot with a resumed session, if any.
+    if config.initial_transcript.is_empty() && config.initial_turns == 0 {
+        // Fresh chat — nothing to restore.
+    } else {
+        let lines = session_to_transcript_lines(&config.initial_transcript);
+        ctx.sender.send(Msg::TranscriptLoaded {
+            lines,
+            input_tokens: config.initial_input_tokens,
+            output_tokens: config.initial_output_tokens,
+            cost_microcents: config.initial_cost_microcents,
+            turns: config.initial_turns,
+        });
+    }
+    while let Ok(cmd) = ctx.command_rx.recv() {
+        match cmd {
+            WorkerCommand::Prompt(prompt) => {
+                let token = orbit_provider_http::CancelToken::new();
+                if let Ok(mut guard) = cancel_slot.lock() {
+                    *guard = Some(token.clone());
+                }
+                let (_ok, input, output, cost) = match run_tui_turn(
+                    &config,
+                    &mut transcript,
+                    &prompt,
+                    &ctx.sender,
+                    &ctx.approvals,
+                    &token,
+                    turns,
+                ) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        orbit_hud_tui::emit_error(&ctx.sender, &e);
+                        if let Ok(mut guard) = cancel_slot.lock() {
+                            *guard = None;
+                        }
+                        continue;
+                    }
+                };
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = None;
                 }
-                continue;
+                turns = turns.saturating_add(1);
+                // Always emit ResponseFinished — the TUI's turn_in_flight flag
+                // and queue drain both depend on it, whether the turn
+                // completed, was cancelled by the operator, or errored. The
+                // reducer stamps a "cancelled" note when cancel_requested was
+                // set.
+                orbit_hud_tui::emit_response_finished(&ctx.sender, "", input, output, cost);
             }
-        };
-        if let Ok(mut guard) = cancel_slot.lock() {
-            *guard = None;
+            WorkerCommand::SetModel(model) => {
+                if model.is_empty() {
+                    continue;
+                }
+                let old = config.model.clone();
+                config.model = model.clone();
+                ctx.sender.send(Msg::ModelChanged(model.clone()));
+                orbit_hud_tui::emit_status(&ctx.sender, &format!("model → {model} (was {old})"));
+            }
+            WorkerCommand::ListModels => {
+                let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
+                let entries = cfg.all_models();
+                let text = if entries.is_empty() {
+                    "(no providers configured)".into()
+                } else {
+                    entries
+                        .iter()
+                        .map(|(p, m)| format!("{p} \t{m}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                ctx.sender.send(Msg::SystemMessage(text));
+            }
+            WorkerCommand::ListSessions => {
+                let text = match crate::sessions::list_sessions(&config.home) {
+                    Ok(list) if list.is_empty() => "(no saved sessions)".into(),
+                    Ok(list) => list
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{} \tmodel={} \tturns={} \tupdated={}",
+                                s.session_id, s.model, s.turns, s.updated_at
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    Err(e) => format!("error listing sessions: {e}"),
+                };
+                ctx.sender.send(Msg::SystemMessage(text));
+            }
+            WorkerCommand::ResumeSession(id) => {
+                match crate::sessions::load_session(&config.home, &id) {
+                    Ok(s) => {
+                        transcript = s.to_transcript();
+                        turns = s.turns;
+                        config.session_id = s.session_id.clone();
+                        config.model = s.model.clone();
+                        let lines = session_to_transcript_lines(&s.transcript);
+                        ctx.sender.send(Msg::TranscriptLoaded {
+                            lines,
+                            input_tokens: s.input_tokens,
+                            output_tokens: s.output_tokens,
+                            cost_microcents: s.cost_microcents,
+                            turns: s.turns,
+                        });
+                        ctx.sender.send(Msg::Identity {
+                            model: s.model.clone(),
+                            provider: s.provider.clone(),
+                            session_prefix: s.session_id.chars().take(8).collect(),
+                        });
+                    }
+                    Err(e) => {
+                        ctx.sender
+                            .send(Msg::SystemMessage(format!("cannot resume {id}: {e}")));
+                    }
+                }
+            }
         }
-        // Always emit ResponseFinished — the TUI's turn_in_flight flag and
-        // queue drain both depend on it, whether the turn completed, was
-        // cancelled by the operator, or errored. The reducer stamps a
-        // "cancelled" note when cancel_requested was set.
-        orbit_hud_tui::emit_response_finished(&ctx.sender, "", input, output, cost);
     }
+}
+
+/// Convert a saved session's transcript to TUI display lines. Assistant messages
+/// with tool_calls collapse to `Stripped` (same as the streaming path); tool
+/// results are dropped (they're already in the assistant's context). User and
+/// system messages pass through verbatim.
+fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
+    msgs.iter()
+        .filter_map(|msg| {
+            match msg.role {
+                ChatRole::User => Some(TranscriptLine::User(msg.content.clone())),
+                ChatRole::Assistant => {
+                    if let Some(calls) = &msg.tool_calls {
+                        // Tool-calling round: emit one Stripped line per tool call.
+                        // The content (if any) is the model's reasoning, which we
+                        // never render (CoT defense, H-12).
+                        if calls.is_empty() {
+                            // Degenerate: tool_calls array present but empty.
+                            None
+                        } else {
+                            // Emit the first tool call's name only — multiple calls
+                            // in one round would require N Stripped lines, but the
+                            // streaming path already handles that per-call. For
+                            // resume, one summary line is sufficient.
+                            Some(TranscriptLine::Stripped {
+                                tool_name: calls[0].name.clone(),
+                            })
+                        }
+                    } else if !msg.content.is_empty() {
+                        Some(TranscriptLine::Assistant(msg.content.clone()))
+                    } else {
+                        None
+                    }
+                }
+                ChatRole::System => Some(TranscriptLine::System(msg.content.clone())),
+                ChatRole::Tool => {
+                    // Tool results are already in the assistant's context; don't
+                    // render them as separate transcript lines (matches the
+                    // streaming path, which only emits Stripped + finished).
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// A TUI-aware approval channel. Implements the CLI's `ApprovalChannel` trait
@@ -153,6 +292,7 @@ pub fn run_tui_turn(
     sender: &BusSender,
     approvals: &ApprovalRegistry,
     cancel: &orbit_provider_http::CancelToken,
+    turns: u64,
 ) -> Result<(bool, u64, u64, u64), String> {
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
@@ -185,6 +325,11 @@ pub fn run_tui_turn(
     });
 
     let mut turn_ok = false;
+    // R-grants are session-scoped per tool NAME, but the in-memory grant set
+    // is (at minimum) scoped to one user turn — created here, once, so an R on
+    // the first tool call of a turn still applies to later calls in the same
+    // turn (matches the REPL: cmd_chat creates AutoGrants once per turn).
+    let mut auto_grants = crate::tool_runtime::AutoGrants::new();
     for round in 0..8u32 {
         let outcome = crate::run_turn(
             &config.home,
@@ -251,7 +396,6 @@ pub fn run_tui_turn(
 
         // Execute each tool call via the TUI approval channel.
         let mut approval_channel = TuiApprovalChannel::new(sender.clone(), approvals.clone());
-        let mut auto_grants = crate::tool_runtime::AutoGrants::new();
         for call in &o.tool_calls {
             // Display-safe summary first.
             let args =
@@ -290,14 +434,14 @@ pub fn run_tui_turn(
             "ORBIT-E0406: tool loop ended without a final assistant response",
         );
     } else {
-        // Save the session (same as REPL).
+        // Save the session (same as REPL) with the real turn count.
         let sf = crate::sessions::SessionFile::from_chat(
             &config.session_id,
             &config.model,
             &config.gate,
             &config.provider_id,
             transcript,
-            0,
+            turns.saturating_add(1),
             input_tokens,
             output_tokens,
             cost,

@@ -14,15 +14,14 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
 // ── Bridge ───────────────────────────────────────────────────────────────────
 
-// Event is a JSON message from the Rust core.
 type Event struct {
 	Type           string `json:"type"`
 	Model          string `json:"model,omitempty"`
@@ -42,7 +41,6 @@ type Event struct {
 	Verdict        string `json:"verdict,omitempty"`
 }
 
-// Action is a JSON message to the Rust core.
 type Action struct {
 	Type    string `json:"type"`
 	Text    string `json:"text,omitempty"`
@@ -50,21 +48,15 @@ type Action struct {
 	Verdict string `json:"verdict,omitempty"`
 }
 
-// conn is the Unix socket to the Rust core.
 var conn net.Conn
 
-// sendAction writes an action to the Rust bridge. Returns false on failure
-// so callers can roll back UI state (restore the composer, stop the spinner)
-// instead of silently losing input (M2/M8).
 func sendAction(a Action) bool {
 	if conn == nil {
-		fmt.Fprintln(os.Stderr, "orbit-go-tui: sendAction: conn is nil")
 		return false
 	}
 	b, _ := json.Marshal(a)
 	b = append(b, '\n')
 	if _, err := conn.Write(b); err != nil {
-		fmt.Fprintf(os.Stderr, "orbit-go-tui: sendAction write: %v\n", err)
 		return false
 	}
 	return true
@@ -73,6 +65,7 @@ func sendAction(a Action) bool {
 // ── Messages ────────────────────────────────────────────────────────────────
 
 type eventMsg Event
+type tickMsg struct{}
 
 // ── Focus ───────────────────────────────────────────────────────────────────
 
@@ -84,8 +77,18 @@ const (
 	FocusTasks
 )
 
-func (f Focus) next() Focus {
-	return (f + 1) % 3
+func (f Focus) next() Focus  { return (f + 1) % 3 }
+func (f Focus) prev() Focus  { return (f + 2) % 3 }
+func (f Focus) String() string {
+	switch f {
+	case FocusSessions:
+		return "Sessions"
+	case FocusChat:
+		return "Chat"
+	case FocusTasks:
+		return "Tasks"
+	}
+	return "?"
 }
 
 // ── Model ───────────────────────────────────────────────────────────────────
@@ -93,10 +96,10 @@ func (f Focus) next() Focus {
 type Model struct {
 	reader *bufio.Scanner
 
-	identitySet bool
-	model       string
-	provider    string
-	session     string
+	model    string
+	provider string
+	session  string
+
 	transcript  []TranscriptItem
 	streamBuf   string
 	queued      []string
@@ -119,13 +122,11 @@ type Model struct {
 	cancelled bool
 }
 
-// TranscriptItem is one rendered line in the conversation.
 type TranscriptItem struct {
-	Speaker string // "you" | "orbit" | "tool" | "system"
+	Speaker string
 	Text    string
 }
 
-// ToolCall is a pending tool approval.
 type ToolCall struct {
 	CallID  string
 	Name    string
@@ -144,8 +145,6 @@ func initialModel() Model {
 		help:        NewHelpBar(),
 		focus:       FocusChat,
 	}
-	// Focus the composer synchronously so the initial model starts focused.
-	// Init()'s Focus() cmd runs on a copy and the focus would be lost.
 	m.composer.FocusNow()
 	return m
 }
@@ -156,14 +155,16 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		readBridge(m.reader),
 		m.spinner.Init(),
+		tickCmd(),
 	)
 }
 
-// readBridge blocks on the JSON reader and emits events. This is a ONE-SHOT
-// cmd: it reads exactly one frame and returns. The Update loop re-schedules it
-// after each eventMsg, so exactly one reader is outstanding at a time — never
-// two goroutines blocked on the same bufio.Scanner (that would corrupt the
-// event stream).
+func tickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return tickMsg{}
+	})
+}
+
 func readBridge(scanner *bufio.Scanner) tea.Cmd {
 	return func() tea.Msg {
 		if scanner.Scan() {
@@ -186,23 +187,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		// Exact height budget (no overflow → no diff-bleed):
-		//   logo 8 rows + 1 blank + body + 1 blank + composer 3
-		//   + 1 blank + status 1 + 1 blank + help 1 = 16 + body.
-		// The body panes each add 2 rows for their own borders, so the
-		// viewport inner height is body-2.
-		bodyH := msg.Height - 16
-		if bodyH < 5 {
-			bodyH = 5
-		}
-		leftW := msg.Width * 18 / 100
-		centerW := msg.Width*62/100 - 2
-		rightW := msg.Width * 20 / 100
-		m.viewport.SetSize(centerW-2, bodyH-2)
-		m.composer.SetSize(msg.Width - 4)
-		m.sessions.SetSize(leftW-2, bodyH-2)
-		m.tasks.SetSize(rightW-2, bodyH-2)
 		return m, nil
+
+	case tickMsg:
+		m.spinner.Advance()
+		cmds = append(cmds, tickCmd())
+
+	case spinnerTickMsg:
+		m.spinner.Advance()
+		cmds = append(cmds, m.spinner.tick())
 
 	case tea.KeyMsg:
 		if m.approval != nil {
@@ -228,8 +221,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			sendAction(Action{Type: "quit"})
 			return m, tea.Quit
 		case "tab":
-			// Cycle focus.
 			m.focus = m.focus.next()
+			switch m.focus {
+			case FocusSessions:
+				m.composer.Blur()
+			case FocusChat:
+				cmds = append(cmds, m.composer.Focus())
+			case FocusTasks:
+				m.composer.Blur()
+			}
+			return m, tea.Batch(cmds...)
+		case "shift+tab":
+			m.focus = m.focus.prev()
 			switch m.focus {
 			case FocusSessions:
 				m.composer.Blur()
@@ -252,15 +255,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.composer.Blur()
 			return m, nil
 		case "?":
-			m.showHelp = true
+			m.showHelp = !m.showHelp
 			return m, nil
 		case "enter":
-			// Only the chat pane submits. A stale draft must not be sent when
-			// focus is on Sessions/Tasks (H1).
 			if m.focus != FocusChat {
 				return m, nil
 			}
-			// Command or prompt?
 			if m.composer.IsCommand() {
 				return m.runCommand(), nil
 			}
@@ -276,17 +276,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if sendAction(Action{Type: "prompt", Text: text}) {
 					m.spinner.Start()
 				} else {
-					// Bridge is dead — restore the draft and surface the error
-					// instead of losing the prompt (M8).
 					m.composer.SetValue(text)
 					m.transcript = append(m.transcript, TranscriptItem{Speaker: "system", Text: "error: bridge write failed"})
 				}
 			}
-			m.viewport.SetContent(renderTranscriptWith(m.transcript, m.viewport.renderer))
-			m.viewport.GotoBottom()
 			return m, nil
 		default:
-			// Route to the focused component.
 			switch m.focus {
 			case FocusSessions:
 				var cmd tea.Cmd
@@ -308,7 +303,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.model = ev.Model
 			m.provider = ev.Provider
 			m.session = ev.Session
-			m.identitySet = true
 			m.sessions.SetItems([]SessionItem{{
 				ID:     ev.Session,
 				Model:  ev.Model,
@@ -316,9 +310,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}})
 		case "delta":
 			m.streamBuf += ev.Text
-			// Render partial output immediately. Previously deltas only mutated
-			// streamBuf, so users saw a spinner until the final frame instead of
-			// the promised live token stream.
 			items := append([]TranscriptItem(nil), m.transcript...)
 			if m.streamBuf != "" {
 				items = append(items, TranscriptItem{Speaker: "orbit", Text: m.streamBuf})
@@ -331,15 +322,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.approval == nil {
 				m.approval = NewApprovalModal(ToolCall{CallID: ev.CallID, Name: ev.Name, Summary: ev.Summary})
 			}
-			// If a modal is already open, show the queued count in its footer
-			// so concurrent tool calls are visible (M3).
 			if m.approval != nil {
 				m.approval.queued = len(m.toolPending) - 1
 			}
 		case "tool_call_finished":
 			delete(m.toolPending, ev.CallID)
-			// If the call in the current modal finished (e.g. timeout), close
-			// the modal so the user can't approve a dead call (M4).
 			if m.approval != nil && m.approval.call.CallID == ev.CallID {
 				m.approval = nil
 			}
@@ -353,8 +340,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if text != "" {
 				m.transcript = append(m.transcript, TranscriptItem{Speaker: "orbit", Text: text})
 			} else {
-				// Bridge finished with no output — record it so the turn is
-				// visible and the next queued prompt isn't sent invisibly (H3).
 				m.transcript = append(m.transcript, TranscriptItem{Speaker: "system", Text: "<no output>"})
 			}
 			if m.cancelled {
@@ -378,8 +363,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(renderTranscriptWith(m.transcript, m.viewport.renderer))
 			m.viewport.GotoBottom()
 		case "cancelled":
-			// Mark the transcript immediately and reset the flag — a later
-			// `finished` (for a fresh turn) must not stamp a stale cancel (H2).
 			m.transcript = append(m.transcript, TranscriptItem{Speaker: "system", Text: "⏹ cancelled by operator"})
 			m.cancelled = false
 			m.streamBuf = ""
@@ -387,23 +370,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(renderTranscriptWith(m.transcript, m.viewport.renderer))
 			m.viewport.GotoBottom()
 		}
-		// Exactly one bridge read is outstanding at a time: schedule the next
-		// read only after the current event was consumed.
 		cmds = append(cmds, readBridge(m.reader))
-
-	case spinner.TickMsg:
-		m.spinner.Advance()
-		var cmd tea.Cmd
-		m.spinner.Model, cmd = m.spinner.Model.Update(msg)
-		cmds = append(cmds, cmd)
 	}
 
-	// readBridge is a one-shot cmd. eventMsg schedules the next read above;
-	// other updates (keys, ticks, resize) must not schedule extra readers.
 	return m, tea.Batch(cmds...)
 }
 
-// runCommand executes a "/" command.
 func (m Model) runCommand() Model {
 	cmdText := m.composer.CommandText()
 	m.composer.SetValue("")
@@ -450,79 +422,101 @@ func (m Model) runCommand() Model {
 // ── View ────────────────────────────────────────────────────────────────────
 
 func (m Model) View() string {
-	if m.approval != nil {
-		// Sizes are set on a local copy (View is value-receiver), so renderApp
-		// computes pane sizes from m.width/m.height instead of mutating the
-		// shared model (H9).
-		m2 := m
-		m2.approval = nil
-		base := m2.renderAppLocked()
-		modal := m.approval.Render(m.width, m.height)
-		return overlay(base, modal, m.width, m.height)
+	if m.width == 0 || m.height == 0 {
+		return "" // wait for WindowSizeMsg before rendering
 	}
-	return m.renderAppLocked()
-}
 
-// renderAppLocked is the shared render body. It recomputes pane sizes from
-// the last WindowSizeMsg rather than mutating the model (View must stay pure).
-func (m *Model) renderAppLocked() string {
+	// Layout budget:
+	//   logo: 4 rows (3 wordmark + 1 rule)
+	//   1 blank
+	//   body: fill
+	//   1 blank
+	//   composer: 3 rows (border + content + border)
+	//   status: 1 row
+	//   help: 1 row
+	// Total fixed: 10
+	logoH := logoHeight(m.width)
+	fixedH := logoH + 1 + 3 + 1 + 1 + 1 // logo + gap + composer + gap + status + help
+	bodyH := m.height - fixedH
+	if bodyH < 5 {
+		bodyH = 5
+	}
+
+	// Widths: 18% / 62% / 20% with 1-cell gutters
+	leftW := m.width * 18 / 100
+	centerW := m.width * 62 / 100
+	rightW := m.width * 20 / 100
+	// Adjust for gutters
+	if leftW+centerW+rightW+2 > m.width {
+		centerW = m.width - leftW - rightW - 2
+	}
+	if centerW < 20 {
+		centerW = 20
+	}
+
+	// ── Build the view ────────────────────────────────────────────────────────
 	var sb strings.Builder
 
-	// Header: orbital logo (animated), measured height.
-	sb.WriteString(renderLogo(m.spinner.Frame(), m.width))
-	sb.WriteString("\n")
+	// Logo header
+	sb.WriteString(renderLogo(m.spinner.index, m.width))
+	sb.WriteString("\n\n")
 
-	// Body: three panes joined horizontally. Widths total <= terminal so no
-	// pane is clipped; 1-cell gutters between.
-	bodyWidth := m.width
-	leftW := bodyWidth * 18 / 100
-	centerW := bodyWidth * 62 / 100
-	rightW := bodyWidth * 20 / 100
-	// Reserve 2 columns for the gutters so the total fits the terminal.
-	centerW = centerW - 2
-	bodyH := m.height - 16
-
-	m.viewport.SetSize(centerW-2, bodyH-2)
+	// Body: three panes with focus-aware borders
+	m.viewport.SetSize(centerW-4, bodyH-2)
 	m.sessions.SetSize(leftW-2, bodyH-2)
 	m.tasks.SetSize(rightW-2, bodyH-2)
 
-	left := m.sessions.Render()
-	center := m.viewport.Render()
-	right := m.tasks.Render()
+	// Render each pane with its focus style
+	left := focusStyle(m.focus == FocusSessions).
+		Width(leftW - 2).
+		Height(bodyH).
+		Render(m.sessions.Render())
+	center := focusStyle(m.focus == FocusChat).
+		Width(centerW - 2).
+		Height(bodyH).
+		Render(m.viewport.Render())
+	right := focusStyle(m.focus == FocusTasks).
+		Width(rightW - 2).
+		Height(bodyH).
+		Render(m.tasks.Render())
+
 	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, " ", center, " ", right))
 	sb.WriteString("\n")
 
-	// Queue summary (kept inside the composer line budget).
+	// Queue indicator
 	if len(m.queued) > 0 {
-		sb.WriteString(dimStyle.Render(fmt.Sprintf("⏳ %d queued", len(m.queued))))
-		sb.WriteString(" ")
+		sb.WriteString(warnStyle.Render(fmt.Sprintf("  ⏳ %d queued", len(m.queued))))
+		sb.WriteString("\n")
 	}
 
-	// Composer (3 rows including rounded border).
+	// Composer
+	m.composer.SetSize(m.width)
 	sb.WriteString(m.composer.Render())
-
-	// Status bar (spinner state includes streaming).
 	sb.WriteString("\n")
-	sb.WriteString(m.status.Render(m.model, m.provider, m.session, m.spinner.Running(), m.streamBuf != ""))
 
-	// Help bar.
+	// Status bar
+	sb.WriteString(statusStyle.Width(m.width).Render(
+		m.status.Render(m.model, m.provider, m.session, m.spinner.Running(), m.streamBuf != ""),
+	))
 	sb.WriteString("\n")
-	sb.WriteString(m.help.Render())
 
+	// Help bar
+	sb.WriteString(helpStyle.Width(m.width).Render(m.help.Render()))
+
+	// Help overlay
 	if m.showHelp {
-		sb.WriteString("\n\n")
+		sb.WriteString("\n")
 		sb.WriteString(m.help.RenderFull())
 	}
 
-	// Pad to exactly the terminal height so Bubble Tea's diff renderer has
-	// no rows below the content to write changed lines into (prevents the
-	// star-orbit bleed).
-	out := sb.String()
-	rows := strings.Count(out, "\n") + 1
-	if rows < m.height {
-		out += strings.Repeat("\n", m.height-rows)
+	// Approval modal overlay
+	if m.approval != nil {
+		base := sb.String()
+		modal := m.approval.Render(m.width, m.height)
+		return overlay(base, modal, m.width, m.height)
 	}
-	return out
+
+	return sb.String()
 }
 
 // overlay centers the modal on top of the base view.
@@ -544,8 +538,8 @@ func overlay(base, modal string, w, h int) string {
 		}
 		baseLines[row] = padRight(baseLines[row], w)
 		r := []rune(baseLines[row])
-		m := []rune(line)
-		for j, ch := range m {
+		mr := []rune(line)
+		for j, ch := range mr {
 			if startX+j < len(r) {
 				r[startX+j] = ch
 			}
@@ -595,8 +589,6 @@ func main() {
 	conn = c
 
 	scanner := bufio.NewScanner(c)
-	// 16 MB max line — large LLM outputs (full code blocks, long replies)
-	// must not terminate the TUI with bufio.ErrTooLong (H7).
 	scanner.Buffer(make([]byte, 4096), 16*1024*1024)
 
 	m := initialModel()

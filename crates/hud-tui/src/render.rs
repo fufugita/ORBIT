@@ -27,9 +27,12 @@ fn pane_block<'a>(title: &'a str, focused: bool, app: &App, theme: &ResolvedThem
         theme.colors.accent_bright
     };
     let base = if focused { accent } else { PANE_DIM };
-    // Smooth focus blend: interpolate PANE_DIM → accent over the transition.
+    // Smooth focus blend. The focused blend starts from accent_dim (a visible
+    // "warming up" color), NOT PANE_DIM — so the focused pane is identifiable
+    // on the very first frame after a focus change, even mid-burst when the
+    // blend keeps restarting. Unfocused panes fade toward PANE_DIM as before.
     let color = match app.focus_transition {
-        Some(phase) if focused => blend_color(PANE_DIM, accent, phase as f32 / 3.0),
+        Some(phase) if focused => blend_color(theme.colors.accent_dim, accent, phase as f32 / 3.0),
         Some(phase) if !focused => blend_color(accent, PANE_DIM, phase as f32 / 3.0),
         _ => base,
     };
@@ -586,7 +589,7 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &
     };
 
     let sep = Span::styled(" │ ", Style::default().fg(c.dim));
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(&app.model, Style::default().fg(c.accent)),
         sep.clone(),
         Span::styled(&app.provider, Style::default().fg(c.text)),
@@ -603,7 +606,15 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &
             format!("{cost_str}{cost_flash}"),
             Style::default().fg(c.text),
         ),
-    ]);
+    ];
+    // Last status (model change confirmation, tool result, cancel note) —
+    // appended dimmed at the end; the render buffer clips overflow at the
+    // status-bar width (ratatui truncates a Line to its area).
+    if !app.last_status.is_empty() {
+        spans.push(Span::styled(" │ ", Style::default().fg(c.dim)));
+        spans.push(Span::styled(&app.last_status, Style::default().fg(c.dim)));
+    }
+    let line = Line::from(spans);
     frame.render_widget(line, area);
 }
 

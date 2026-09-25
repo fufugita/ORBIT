@@ -30,7 +30,7 @@ pub use bridge::{
     emit_cost, emit_error, emit_response_finished, emit_status, emit_text, emit_tool_finished,
     emit_tool_started, safe_text, strip_cot,
 };
-pub use worker::{WorkerCtx, WorkerSpawner};
+pub use worker::{CommandSink, WorkerCommand, WorkerCtx, WorkerSpawner};
 
 use crossterm::event::{self, Event, KeyEvent};
 use input::{KeyAction, KeyParser};
@@ -80,20 +80,20 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         app.reduce(Msg::Resize(size.0, size.1));
     }
 
-    // Build the prompt channel — the worker owns the receiver, the input
-    // handler holds the sender. Forwarding user prompts through this channel
-    // keeps the Bus single-consumer (the main loop's reducer).
-    let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
-    let prompt_forward = prompt_tx.clone();
+    // Build the worker-command channel — the worker owns the receiver, the
+    // event loop holds the sender. Prompts AND /commands flow through this
+    // typed channel, keeping the Bus single-consumer (the main loop reducer).
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let command_sink = cmd_tx.clone();
 
     // Spawn the worker thread (owns the backend pipeline). Errors are surfaced
     // via Msg::BackendError to the reducer.
     let spawn_ctx = worker::WorkerCtx {
         sender: sender.clone(),
         approvals: approvals.clone(),
-        prompt_rx,
+        command_rx: cmd_rx,
     };
-    let cancel_handle: worker::CancelHandle = match worker_spawner(spawn_ctx, prompt_tx) {
+    let cancel_handle: worker::CancelHandle = match worker_spawner(spawn_ctx, cmd_tx) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("orbit-tui: worker spawn failed: {e}");
@@ -108,7 +108,7 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         &approvals,
         &mut app,
         &mut key_parser,
-        &prompt_forward,
+        &command_sink,
         &cancel_handle,
         &theme,
     );
@@ -138,6 +138,90 @@ struct LoopOutcome {
     note: Option<String>,
 }
 
+/// Parse and dispatch a `/command` typed in the composer (REPL parity,
+/// DR-21). Local commands reduce immediately; anything needing the worker
+/// (model switch, model/session listing, session resume) goes through the
+/// typed `CommandSink` and its result comes back as `Msg::SystemMessage` /
+/// `Msg::TranscriptLoaded`.
+fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSink, app: &mut App) {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // Plain quit/exit (REPL parity — no leading slash needed).
+    if trimmed == "quit" || trimmed == "exit" {
+        app.reduce(Msg::RequestQuit);
+        return;
+    }
+
+    // The full command may carry an argument (e.g. `/model glm-5.2`).
+    let (name, arg) = match trimmed.split_once(char::is_whitespace) {
+        Some((n, a)) => (n, a.trim()),
+        None => (trimmed, ""),
+    };
+
+    match name {
+        "/help" => {
+            app.reduce(Msg::SystemMessage(
+                "commands: exit, /help, /model <M>, /clear, /usage, /models, /sessions, /resume <id>, /cancel"
+                    .into(),
+            ));
+        }
+        "/clear" => {
+            app.reduce(Msg::ClearTranscript);
+        }
+        "/usage" => {
+            let (turns, input, output, cost) = (
+                app.total_turns,
+                app.total_input_tokens,
+                app.total_output_tokens,
+                app.total_cost_microcents,
+            );
+            app.reduce(Msg::SystemMessage(format!(
+                "turns {turns} · in {input} · out {output} · ${}.{:06}",
+                cost / 1_000_000,
+                cost % 1_000_000
+            )));
+        }
+        "/model" => {
+            if arg.is_empty() {
+                app.reduce(Msg::SystemMessage("usage: /model <model-id>".into()));
+            } else {
+                let _ = command_sink.send(WorkerCommand::SetModel(arg.to_string()));
+            }
+        }
+        "/models" => {
+            let _ = command_sink.send(WorkerCommand::ListModels);
+        }
+        "/sessions" => {
+            let _ = command_sink.send(WorkerCommand::ListSessions);
+        }
+        "/resume" => {
+            if arg.is_empty() {
+                app.reduce(Msg::SystemMessage("usage: /resume <session-id>".into()));
+            } else {
+                let _ = command_sink.send(WorkerCommand::ResumeSession(arg.to_string()));
+            }
+        }
+        "/cancel" => {
+            if app.turn_in_flight {
+                sender.send(Msg::CancelTurn);
+            } else {
+                app.reduce(Msg::SystemMessage("no turn in flight".into()));
+            }
+        }
+        "/quit" | "/exit" => {
+            app.reduce(Msg::RequestQuit);
+        }
+        _ => {
+            app.reduce(Msg::SystemMessage(format!(
+                "unknown command: {trimmed}; try /help"
+            )));
+        }
+    }
+}
+
 /// The main event loop — polls crossterm events and UI ticks, reduces, renders.
 /// Returns the process outcome (0 = interactive quit, 128+n = signal death).
 #[allow(clippy::too_many_arguments)]
@@ -148,7 +232,7 @@ fn event_loop(
     approvals: &ApprovalRegistry,
     app: &mut App,
     key_parser: &mut KeyParser,
-    prompt_forward: &std::sync::mpsc::Sender<String>,
+    command_sink: &CommandSink,
     cancel_handle: &worker::CancelHandle,
     theme: &ResolvedTheme,
 ) -> Result<LoopOutcome, String> {
@@ -175,6 +259,12 @@ fn event_loop(
         }
 
         while let Some(msg) = bus.try_recv() {
+            // A /command from the composer — parse and dispatch locally;
+            // anything needing the worker goes through the typed channel.
+            if let Msg::SlashCommand(cmd) = msg {
+                handle_slash_command(&cmd, sender, command_sink, app);
+                continue;
+            }
             // Forward prompts to the worker ONLY when the reducer starts a
             // new turn (not when it queues). We detect this by snapshotting
             // turn_in_flight before reduce and checking it flipped to true.
@@ -182,7 +272,7 @@ fn event_loop(
             if let Msg::TextSubmitted(text) = msg {
                 app.reduce(Msg::TextSubmitted(text.clone()));
                 if !was_in_flight && app.turn_in_flight {
-                    let _ = prompt_forward.send(text);
+                    let _ = command_sink.send(WorkerCommand::Prompt(text));
                 }
                 continue;
             }
@@ -211,7 +301,7 @@ fn event_loop(
                     if let Some(next) = app.take_next_queued() {
                         app.transcript
                             .push(crate::state::TranscriptLine::User(next.clone()));
-                        let _ = prompt_forward.send(next);
+                        let _ = command_sink.send(WorkerCommand::Prompt(next));
                     }
                     continue;
                 }
@@ -220,7 +310,7 @@ fn event_loop(
                     if let Some(next) = app.take_next_queued() {
                         app.transcript
                             .push(crate::state::TranscriptLine::User(next.clone()));
-                        let _ = prompt_forward.send(next);
+                        let _ = command_sink.send(WorkerCommand::Prompt(next));
                     }
                     continue;
                 }
@@ -455,26 +545,32 @@ fn handle_key(
         if let KeyCode::Char(c) = key.code {
             match c {
                 'y' | 'Y' => {
-                    approvals.resolve(&call_id, ApprovalResponse::Allow);
+                    // Send the dismissal BEFORE resolving the approval. The
+                    // worker unblocks on resolve and immediately starts the
+                    // next round; if ToolCallFinished lands in the bus AFTER
+                    // the round-2 messages, the modal is still showing when
+                    // the round-2 text is processed — and the renderer
+                    // hides the transcript behind the modal (DR-21 L18).
                     sender.send(Msg::ToolCallFinished { name, ok: true });
+                    approvals.resolve(&call_id, ApprovalResponse::Allow);
                     return;
                 }
                 'n' | 'N' => {
-                    approvals.resolve(&call_id, ApprovalResponse::Deny);
                     sender.send(Msg::ToolCallFinished { name, ok: false });
+                    approvals.resolve(&call_id, ApprovalResponse::Deny);
                     return;
                 }
                 'r' | 'R' => {
-                    approvals.resolve(&call_id, ApprovalResponse::AllowSession);
                     sender.send(Msg::ToolCallFinished { name, ok: true });
+                    approvals.resolve(&call_id, ApprovalResponse::AllowSession);
                     return;
                 }
                 _ => {}
             }
         }
         if matches!(key.code, KeyCode::Esc) {
-            approvals.resolve(&call_id, ApprovalResponse::Deny);
             sender.send(Msg::ToolCallFinished { name, ok: false });
+            approvals.resolve(&call_id, ApprovalResponse::Deny);
         }
         // Any other key is consumed by the modal.
         return;
@@ -504,22 +600,6 @@ fn handle_key(
         return;
     }
 
-    // `c` when center is focused → enter copy mode.
-    if app.focus == crate::state::Focus::Center
-        && !key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-    {
-        if let KeyCode::Char('c') = key.code {
-            // Only trigger copy mode if not typing in the composer
-            // (i.e., the composer is empty or we're not in typing mode).
-            // Actually, `c` should be a composer character when typing.
-            // Use Ctrl+C for copy instead? No — Ctrl+C is quit.
-            // Use a different key: `y` for "yank" (vim-style copy).
-            // Actually, let's use `Ctrl+Shift+C` or just a leader: `z` then `y`.
-            // For now, skip — copy mode will be triggered by a leader key.
-        }
-    }
-
     // Focus navigation is global: Tab/BackTab must reach the key parser even
     // while the center composer is focused. Handle it before composer input.
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -536,11 +616,17 @@ fn handle_key(
         return;
     }
 
-    // Enter (no shift) sends the composer.
+    // Enter (no shift) sends the composer. A leading `/` (or bare quit/exit)
+    // is a command, not a prompt — the event loop parses it.
     if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
         let text = composer.take();
-        if !text.trim().is_empty() {
-            sender.send(Msg::TextSubmitted(text));
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            if trimmed.starts_with('/') || trimmed == "quit" || trimmed == "exit" {
+                sender.send(Msg::SlashCommand(text));
+            } else {
+                sender.send(Msg::TextSubmitted(text));
+            }
         }
         sender.send(Msg::ComposerChanged);
         return;

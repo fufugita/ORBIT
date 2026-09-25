@@ -50,8 +50,9 @@ impl DirtyFlags {
 /// Which pane has keyboard focus.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
-    #[default]
     Left,
+    /// Default — the operator can type immediately on boot, no Tab needed.
+    #[default]
     Center,
     Right,
     Status,
@@ -108,6 +109,8 @@ pub struct App {
     pub total_input_tokens: u64,
     /// Cumulative output tokens.
     pub total_output_tokens: u64,
+    /// Completed user turns (REPL parity for `/usage`, H-17).
+    pub total_turns: u64,
     /// Current provider (from cmd_chat config).
     pub provider: String,
     /// Current model (from cmd_chat config).
@@ -264,6 +267,7 @@ impl App {
             total_cost_microcents: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_turns: 0,
             provider: String::new(),
             model: String::new(),
             session_id_prefix: String::new(),
@@ -443,18 +447,35 @@ impl App {
                 output_tokens,
                 cost_microcents,
             } => {
+                // ResponseFinished follows the final TextDelta immediately, so
+                // the coalescer's 30 ms interval may not have elapsed. Drain it
+                // now or the final streamed chunk would be silently lost.
+                if let Some(text) = self.coalescer.flush() {
+                    self.in_flight.push_str(&text);
+                }
                 // Finalize the in-flight turn.
-                if !self.in_flight.is_empty() {
+                let has_in_flight = !self.in_flight.is_empty();
+                let has_output = !output.is_empty();
+                if has_in_flight {
                     self.transcript
                         .push(TranscriptLine::Assistant(self.in_flight.clone()));
                     self.in_flight.clear();
-                } else if !output.is_empty() {
+                } else if has_output {
                     self.transcript.push(TranscriptLine::Assistant(output));
                 }
                 self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
                 self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
                 self.total_cost_microcents =
                     self.total_cost_microcents.saturating_add(cost_microcents);
+                // Only bump turns if this ResponseFinished actually produced a
+                // transcript entry (a cancelled turn with no partial text, or
+                // a pure-tool-round echo with no user-visible output, is NOT a
+                // completed user turn for /usage purposes).
+                let produced_output =
+                    has_in_flight || has_output || input_tokens > 0 || output_tokens > 0;
+                if produced_output {
+                    self.total_turns = self.total_turns.saturating_add(1);
+                }
                 if self.cancel_requested {
                     // The operator aborted this turn — stamp it. Partial
                     // text (if any) was already pushed above.
@@ -469,24 +490,29 @@ impl App {
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
             Msg::ToolCallStarted { name, summary } => {
+                // Display-only: push transcript lines + set tool state. Do NOT
+                // push a pending approval here — the real call_id arrives later
+                // via Msg::ApprovalRequested (from the worker's
+                // TuiApprovalChannel). Pushing a fake call_id here would shadow
+                // the real one and deadlock the approval (BUG-1).
                 self.tool_state = ToolState::Running(name.clone());
                 self.transcript.push(TranscriptLine::Stripped {
                     tool_name: name.clone(),
                 });
-                // Also append a display-safe note line.
                 self.transcript
                     .push(TranscriptLine::Assistant(format!("[tool] {summary}")));
-                self.pending_approvals.push(PendingApproval {
-                    call_id: format!("call-{}", self.pending_approvals.len()),
-                    tool_name: name,
-                    summary,
-                });
-                self.tool_state = ToolState::AwaitingApproval;
-                self.dirty
-                    .set(DirtyFlags::TRANSCRIPT | DirtyFlags::APPROVAL | DirtyFlags::STATUS);
+                self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
             Msg::ToolCallFinished { name, ok } => {
-                self.pending_approvals.retain(|p| p.tool_name != name);
+                // Dismiss the FIRST pending approval that was resolved. The
+                // worker sends ApprovalRequested (with a real call_id) for
+                // each tool call, and handle_key resolves that exact call_id.
+                // Removing by tool_name could drop a DIFFERENT pending call of
+                // the same tool name, so we remove only the head — that is
+                // the call whose verdict the worker just received.
+                if !self.pending_approvals.is_empty() {
+                    self.pending_approvals.remove(0);
+                }
                 self.tool_state = ToolState::Idle;
                 // Note: we never render model-supplied rationale; only status.
                 self.last_status = if ok {
@@ -501,6 +527,7 @@ impl App {
                 self.composer_state = ComposerState::Blocked(err);
                 self.turn_in_flight = false;
                 self.cancel_requested = false;
+                self.tool_state = ToolState::Idle;
                 self.dirty.set(DirtyFlags::STATUS);
             }
             Msg::TextSubmitted(text) => {
@@ -559,6 +586,50 @@ impl App {
                 if self.composer_state == ComposerState::Idle {
                     self.composer_state = ComposerState::Typing;
                 }
+            }
+            Msg::SlashCommand(_) => {
+                // The event loop parses and dispatches /commands; the
+                // reducer only mirrors the local `last_status` so the status
+                // bar reflects where the operator is.
+                self.dirty.set(DirtyFlags::STATUS);
+            }
+            Msg::ClearTranscript => {
+                // Clear the visible transcript + streaming buffers only. If a
+                // turn is mid-flight, it keeps streaming into the fresh view
+                // (same as the REPL /clear, which never resets turn state).
+                self.transcript.clear();
+                self.in_flight.clear();
+                self.coalescer.flush();
+                self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
+            }
+            Msg::ModelChanged(model) => {
+                self.model = model;
+                self.last_status = format!("model → {}", self.model);
+                self.dirty.set(DirtyFlags::STATUS);
+            }
+            Msg::SystemMessage(text) => {
+                self.transcript.push(TranscriptLine::System(text));
+                self.dirty.set(DirtyFlags::TRANSCRIPT);
+            }
+            Msg::TranscriptLoaded {
+                lines,
+                input_tokens,
+                output_tokens,
+                cost_microcents,
+                turns,
+            } => {
+                self.transcript = lines;
+                self.in_flight.clear();
+                self.total_input_tokens = input_tokens;
+                self.total_output_tokens = output_tokens;
+                self.total_cost_microcents = cost_microcents;
+                self.total_turns = turns;
+                self.tool_state = ToolState::Idle;
+                self.turn_in_flight = false;
+                self.queued.clear();
+                self.cancel_requested = false;
+                self.last_status = "session loaded".into();
+                self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
             Msg::CtrlC => {
                 // While a turn is streaming, Ctrl+C cancels the turn (the
@@ -653,27 +724,40 @@ impl App {
             }
             KeyAction::FocusNext => {
                 self.focus = self.focus.next();
-                self.focus_transition = Some(0);
+                // Don't restart a running blend mid-burst — if the previous
+                // blend hasn't finished, let it continue so intermediate panes
+                // stay visually distinct (fixes the Tab-skip perception).
+                if self.focus_transition.is_none() {
+                    self.focus_transition = Some(0);
+                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusPrev => {
                 self.focus = self.focus.prev();
-                self.focus_transition = Some(0);
+                if self.focus_transition.is_none() {
+                    self.focus_transition = Some(0);
+                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusLeft => {
                 self.focus = Focus::Left;
-                self.focus_transition = Some(0);
+                if self.focus_transition.is_none() {
+                    self.focus_transition = Some(0);
+                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusCenter => {
                 self.focus = Focus::Center;
-                self.focus_transition = Some(0);
+                if self.focus_transition.is_none() {
+                    self.focus_transition = Some(0);
+                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusRight => {
                 self.focus = Focus::Right;
-                self.focus_transition = Some(0);
+                if self.focus_transition.is_none() {
+                    self.focus_transition = Some(0);
+                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::TabSessions => {
@@ -787,10 +871,14 @@ mod tests {
     }
 
     #[test]
+    fn default_focus_is_center_so_operator_can_type_on_boot() {
+        let app = App::new();
+        assert_eq!(app.focus, Focus::Center);
+    }
+
+    #[test]
     fn reduce_focus_next_cycles() {
         let mut app = App::new();
-        assert_eq!(app.focus, Focus::Left);
-        app.reduce(Msg::KeyAction(KeyAction::FocusNext));
         assert_eq!(app.focus, Focus::Center);
         app.reduce(Msg::KeyAction(KeyAction::FocusNext));
         assert_eq!(app.focus, Focus::Right);
@@ -798,13 +886,15 @@ mod tests {
         assert_eq!(app.focus, Focus::Status);
         app.reduce(Msg::KeyAction(KeyAction::FocusNext));
         assert_eq!(app.focus, Focus::Left);
+        app.reduce(Msg::KeyAction(KeyAction::FocusNext));
+        assert_eq!(app.focus, Focus::Center);
     }
 
     #[test]
     fn reduce_focus_prev_cycles() {
         let mut app = App::new();
         app.reduce(Msg::KeyAction(KeyAction::FocusPrev));
-        assert_eq!(app.focus, Focus::Status);
+        assert_eq!(app.focus, Focus::Left);
     }
 
     #[test]
@@ -845,25 +935,53 @@ mod tests {
     }
 
     #[test]
-    fn reduce_tool_call_started_adds_approval() {
+    fn tool_call_started_does_not_push_approval() {
+        // BUG-1: ToolCallStarted must NOT push a pending approval with a fake
+        // call_id. Only ApprovalRequested (which carries the worker's real
+        // call_id) may populate the queue — otherwise handle_key resolves a
+        // fake id and the worker never unblocks (deadlock).
         let mut app = App::new();
         app.reduce(Msg::ToolCallStarted {
             name: "calculator".into(),
             summary: "calculator(expression)".into(),
         });
+        assert!(app.pending_approvals.is_empty());
+        assert_eq!(app.tool_state, ToolState::Running("calculator".into()));
+    }
+
+    #[test]
+    fn approval_requested_pushes_real_call_id() {
+        let mut app = App::new();
+        app.reduce(Msg::ToolCallStarted {
+            name: "calculator".into(),
+            summary: "calculator(expression)".into(),
+        });
+        app.reduce(Msg::ApprovalRequested {
+            call_id: "call-42".into(),
+            tool_name: "calculator".into(),
+            summary: "calculator(expression)".into(),
+        });
         assert_eq!(app.pending_approvals.len(), 1);
-        assert_eq!(app.pending_approvals[0].tool_name, "calculator");
+        assert_eq!(app.pending_approvals[0].call_id, "call-42");
         assert_eq!(app.tool_state, ToolState::AwaitingApproval);
         assert!(app.dirty.is_set(DirtyFlags::APPROVAL));
     }
 
     #[test]
     fn reduce_tool_call_finished_clears_approval() {
+        // Real event sequence: started → ApprovalRequested (real call_id) →
+        // ToolCallFinished dismisses the head of the queue.
         let mut app = App::new();
         app.reduce(Msg::ToolCallStarted {
             name: "calculator".into(),
             summary: "calculator(expression)".into(),
         });
+        app.reduce(Msg::ApprovalRequested {
+            call_id: "call-42".into(),
+            tool_name: "calculator".into(),
+            summary: "calculator(expression)".into(),
+        });
+        assert_eq!(app.pending_approvals.len(), 1);
         app.reduce(Msg::ToolCallFinished {
             name: "calculator".into(),
             ok: true,
@@ -871,6 +989,67 @@ mod tests {
         assert!(app.pending_approvals.is_empty());
         assert_eq!(app.tool_state, ToolState::Idle);
         assert!(app.last_status.contains("ok"));
+    }
+
+    #[test]
+    fn tool_call_finished_dismisses_head_not_same_name() {
+        // Two queued approvals of the SAME tool name: ToolCallFinished for the
+        // first must drop only the head (whose verdict the worker just
+        // received), leaving the second pending for the operator.
+        let mut app = App::new();
+        for (i, call_id) in ["call-1", "call-2"].iter().enumerate() {
+            app.reduce(Msg::ToolCallStarted {
+                name: "ssh".into(),
+                summary: format!("run command #{i}"),
+            });
+            app.reduce(Msg::ApprovalRequested {
+                call_id: (*call_id).into(),
+                tool_name: "ssh".into(),
+                summary: format!("run command #{i}"),
+            });
+        }
+        assert_eq!(app.pending_approvals.len(), 2);
+        app.reduce(Msg::ToolCallFinished {
+            name: "ssh".into(),
+            ok: true,
+        });
+        assert_eq!(app.pending_approvals.len(), 1);
+        assert_eq!(app.pending_approvals[0].call_id, "call-2");
+    }
+
+    #[test]
+    fn reduce_response_finished_flushes_coalescer() {
+        // BUG-2: ResponseFinished must drain the coalescer (30 ms tick) or the
+        // final streamed chunk is silently dropped when the finish event lands
+        // before the next tick.
+        let mut app = App::new();
+        app.reduce(Msg::TextDelta("final words".into()));
+        // No manual flush — the reducer must do it.
+        app.reduce(Msg::ResponseFinished {
+            output: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_microcents: 0,
+        });
+        assert_eq!(app.transcript.len(), 1);
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptLine::Assistant(t) if t == "final words"
+        ));
+    }
+
+    #[test]
+    fn reduce_backend_error_resets_tool_state() {
+        // BUG-3: a backend error mid-tool-call must not leave the status bar
+        // showing Running/AwaitingApproval forever.
+        let mut app = App::new();
+        app.reduce(Msg::ToolCallStarted {
+            name: "calculator".into(),
+            summary: "calculator(expression)".into(),
+        });
+        assert_eq!(app.tool_state, ToolState::Running("calculator".into()));
+        app.reduce(Msg::BackendError("provider unreachable".into()));
+        assert_eq!(app.tool_state, ToolState::Idle);
     }
 
     #[test]

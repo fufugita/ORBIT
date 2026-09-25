@@ -84,4 +84,22 @@ pub enum Msg {
     /// Noninteractive shutdown (SIGHUP/SIGTERM/SIGINT via `kill`): terminal
     /// is gone or an external manager demands exit — skip the modal, quit now.
     SignalShutdown,
+    /// A `/command` was typed in the composer (handled by the event loop).
+    SlashCommand(String),
+    /// `/clear` — wipe the visible transcript (and any in-flight buffer).
+    ClearTranscript,
+    /// The active model changed (status bar + future turns).
+    ModelChanged(String),
+    /// A display-safe system line appended to the transcript (e.g. command
+    /// results such as `/help`, `/usage`, `/models`, `/sessions`).
+    SystemMessage(String),
+    /// The worker restored a session on boot or via `/resume <id>` — replaces
+    /// the transcript and counters in one reduce.
+    TranscriptLoaded {
+        lines: Vec<crate::state::TranscriptLine>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_microcents: u64,
+        turns: u64,
+    },
 }

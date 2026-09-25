@@ -1,5 +1,6 @@
-// Status bar — lipgloss-styled single line with model · provider · session ·
-// tool-state · connection · tokens · cost.
+// Status bar — a single styled line at the bottom of the TUI.
+// Shows: model · provider · session · tool-state · connection · tokens · cost.
+// Each field is individually styled so the operator can scan it at a glance.
 
 package main
 
@@ -25,27 +26,39 @@ func (s *StatusBar) SetCost(microcents, in, out uint64) {
 }
 
 func (s *StatusBar) Render(model, provider, session string, busy bool, streaming bool) string {
-	toolState := "◯ idle"
+	// Tool state with a colored glyph
+	var toolState string
 	if streaming {
-		toolState = "◐ stream"
+		toolState = successStyle.Render("◐ streaming")
 	} else if busy {
-		toolState = "◉ busy"
+		toolState = warnStyle.Render("◉ busy")
+	} else {
+		toolState = dimStyle.Render("◯ idle")
 	}
-	conn := "● online"
 
+	// Connection — always online for now
+	conn := successStyle.Render("● online")
+
+	// Cost
 	costStr := fmt.Sprintf("$%d.%06d", s.cost/1_000_000, s.cost%1_000_000)
+
+	// Tokens
 	tokens := fmt.Sprintf("↓%s ↑%s", formatCount(s.inputTokens), formatCount(s.outputTokens))
+
+	// Build the bar with styled segments and dim separators
+	sep := dimStyle.Render(" │ ")
 
 	parts := []string{
 		titleStyle.Render(model),
 		dimStyle.Render(provider),
 		dimStyle.Render(session),
-		dimStyle.Render(toolState),
-		dimStyle.Render(conn),
+		toolState,
+		conn,
 		dimStyle.Render(tokens),
-		statusStyle.Render(costStr),
+		boldStyle.Render(costStr),
 	}
-	return " " + strings.Join(parts, " │ ") + " "
+
+	return " " + strings.Join(parts, sep) + " "
 }
 
 func formatCount(n uint64) string {

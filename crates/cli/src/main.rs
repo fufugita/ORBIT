@@ -985,6 +985,17 @@ fn cmd_chat(args: &[String]) -> i32 {
                 model: model.clone(),
                 provider_id,
                 auto_tools: args.iter().any(|a| a == "--auto-tools"),
+                initial_transcript: resumed_file
+                    .as_ref()
+                    .map(|s| s.to_transcript())
+                    .unwrap_or_default(),
+                initial_turns: resumed_file.as_ref().map(|s| s.turns).unwrap_or(0),
+                initial_input_tokens: resumed_file.as_ref().map(|s| s.input_tokens).unwrap_or(0),
+                initial_output_tokens: resumed_file.as_ref().map(|s| s.output_tokens).unwrap_or(0),
+                initial_cost_microcents: resumed_file
+                    .as_ref()
+                    .map(|s| s.cost_microcents)
+                    .unwrap_or(0),
             };
             if want_go_tui {
                 return go_bridge::run_go_tui(tui_config);

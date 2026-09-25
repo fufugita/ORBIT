@@ -39,3 +39,6 @@ profraw/
 # Release candidate build outputs (reproducible from the tag)
 /dist/
 /orbit-v0.1.0-rc.1.tar.gz
+
+# Local ORBIT home created by interactive `orbit init` runs in-repo (credentials live here)
+/.orbit/

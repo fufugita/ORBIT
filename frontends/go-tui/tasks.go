@@ -1,4 +1,5 @@
-// Tasks pane — bubbles/table for the workspace task list.
+// Tasks — right pane. A simple table showing the workspace task list.
+// Styled with accent headers and dim cells.
 
 package main
 
@@ -14,16 +15,18 @@ type TasksPane struct {
 func NewTasksPane() TasksPane {
 	columns := []table.Column{
 		{Title: "Phase", Width: 6},
-		{Title: "Task", Width: 12},
-		{Title: "Status", Width: 6},
+		{Title: "Task", Width: 14},
+		{Title: "Status", Width: 8},
 	}
 	t := table.New(
 		table.WithColumns(columns),
 		table.WithRows([]table.Row{
-			{"A", "Trust Spine", "done"},
-			{"B", "Phase Router", "done"},
-			{"C", "HUD Harness", "done"},
-			{"D", "Trace/Replay", "next"},
+			{"A", "Trust Spine", "✓ done"},
+			{"B", "Phase Router", "✓ done"},
+			{"C", "HUD Harness", "✓ done"},
+			{"D", "Trace/Replay", "→ next"},
+			{"E", "Go TUI", "→ next"},
+			{"F", "Browser", "○ plan"},
 		}),
 		table.WithFocused(true),
 		table.WithHeight(8),
@@ -44,11 +47,10 @@ func (t *TasksPane) SetSize(w, h int) {
 	if h < 3 {
 		h = 3
 	}
-	// Inner width: the pane border takes 2, table cells need padding.
 	t.Model.SetWidth(w - 2)
 	t.Model.SetHeight(h - 2)
 }
 
 func (t *TasksPane) Render() string {
-	return focusedPaneStyle.Render(t.Model.View())
+	return paneStyle.Render(t.Model.View())
 }

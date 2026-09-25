@@ -1,4 +1,5 @@
-// Approval modal — huh-style form with focusable y/n/R buttons.
+// Approval modal — a centered overlay with the tool name, summary, and
+// three buttons (y/n/R). Tab/arrows cycle; Enter confirms; Esc denies.
 
 package main
 
@@ -7,6 +8,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type ApprovalModal struct {
@@ -14,21 +16,18 @@ type ApprovalModal struct {
 	button int // 0 = y, 1 = n, 2 = R
 	width  int
 	height int
-	queued int // additional pending tool calls behind this one (M3)
+	queued int
 }
 
 func NewApprovalModal(call ToolCall) *ApprovalModal {
 	return &ApprovalModal{call: call, button: 0}
 }
 
-// Update handles keys while the modal is open. Returns the updated model.
 func (a *ApprovalModal) Update(m Model, msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.String() {
 	case "left", "h", "shift+tab":
-		// Move backward (left). Previously left/right were swapped (H5).
 		a.button = (a.button + 2) % 3
 	case "right", "l", "tab":
-		// Move forward (right).
 		a.button = (a.button + 1) % 3
 	case "y", "Y":
 		sendAction(Action{Type: "approve", CallID: a.call.CallID, Verdict: "allow"})
@@ -44,9 +43,6 @@ func (a *ApprovalModal) Update(m Model, msg tea.KeyMsg) (Model, tea.Cmd) {
 		sendAction(Action{Type: "approve", CallID: a.call.CallID, Verdict: verdict})
 		m.approval = nil
 	case "esc":
-		// Escape is fail-closed: dismissing the approval UI denies the tool.
-		// The footer says "Esc denies" so the visible contract matches the
-		// verdict sent to the Rust core.
 		sendAction(Action{Type: "approve", CallID: a.call.CallID, Verdict: "deny"})
 		m.approval = nil
 	}
@@ -57,55 +53,33 @@ func (a *ApprovalModal) Render(w, h int) string {
 	a.width = w
 	a.height = h
 
-	btn := func(label string, focused bool) string {
-		if focused {
-			return accentStyleBold.Render("[" + label + "]")
-		}
-		return dimStyle.Render("[" + label + "]")
-	}
-
-	labels := []string{"y once", "n deny", "R session"}
+	labels := []string{"y allow", "n deny", "R session"}
 	var buttons []string
 	for i, l := range labels {
-		buttons = append(buttons, btn(l, i == a.button))
+		if i == a.button {
+			buttons = append(buttons, approvalButtonActive.Render("["+l+"]"))
+		} else {
+			buttons = append(buttons, approvalButtonInactive.Render("["+l+"]"))
+		}
 	}
 
-	footer := "  Esc denies"
+	footer := dimStyle.Render("  Esc denies")
 	if a.queued > 0 {
-		footer = fmt.Sprintf("  Esc denies   (+%d more)", a.queued)
+		footer = fmt.Sprintf("  %s   %s", dimStyle.Render("Esc denies"), warnStyle.Render(fmt.Sprintf("+%d more", a.queued)))
 	}
 
 	lines := []string{
-		" ? Approval Required ",
+		titleStyle.Render("  ⚠ Approval Required"),
 		"",
-		"  " + titleStyle.Render(a.call.Name),
-		"  " + a.call.Summary,
+		"  " + boldStyle.Render(a.call.Name),
+		"  " + lipgloss.NewStyle().Foreground(text).Render(a.call.Summary),
 		"",
-		"  " + strings.Join(buttons, "   "),
+		"  " + strings.Join(buttons, "  "),
 		"",
 		footer,
 	}
 
-	// Center in a rounded box.
-	width := 52
-	if a.width > 0 && a.width < width {
-		width = a.width - 4
-	}
-	box := accentBox(lines, width)
-	return box
-}
-
-// accentBox draws a rounded border around the given lines.
-func accentBox(lines []string, width int) string {
-	var sb strings.Builder
-	sb.WriteString("╭" + strings.Repeat("─", width) + "╮\n")
-	for _, l := range lines {
-		padded := l
-		if len(padded) > width {
-			padded = padded[:width]
-		}
-		sb.WriteString("│" + padRight(padded, width) + "│\n")
-	}
-	sb.WriteString("╰" + strings.Repeat("─", width) + "╯")
-	return sb.String()
+	// Wrap in a styled box
+	content := strings.Join(lines, "\n")
+	return approvalStyle.Render(content)
 }
