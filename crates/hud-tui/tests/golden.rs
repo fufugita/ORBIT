@@ -240,6 +240,33 @@ fn golden_workspace_pane() {
     assert!(text.contains("restore.rs"), "finding source");
 }
 
+/// Welcome screen (§8.1): an empty session shows the expanded mark; the
+/// first turn replaces it.
+#[test]
+fn golden_welcome_mark() {
+    let d = design();
+    // Empty app (no transcript) → the mark renders.
+    let app = App::new();
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    // The wordmark is block letters (▄▀█) + the braille ring + the star.
+    assert!(text.contains("▀▀▀▄"), "the block letterforms");
+    assert!(
+        text.contains("harness that orbits around you"),
+        "the tagline"
+    );
+    assert!(text.contains("✦"), "the star");
+
+    // With a transcript → no mark (the first turn replaced it).
+    let app = idle_app();
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    assert!(
+        !text.contains("harness that orbits around you"),
+        "mark gone after first turn"
+    );
+}
+
 // ── Design invariants (§13.5) ────────────────────────────────────────────────
 
 /// invariant_one_frame_max: at most one rounded frame in any buffer.

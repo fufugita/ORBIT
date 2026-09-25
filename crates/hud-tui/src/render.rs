@@ -230,7 +230,27 @@ fn render_center_pane(
         .split(area);
 
     // ── Transcript ─────────────────────────────────────────────────────────
+    // The welcome screen (§8.1): an empty session shows the expanded mark,
+    // centered in the conversation. The first turn replaces it.
     let mut lines: Vec<Line> = Vec::new();
+    if app.transcript.is_empty() && app.in_flight.is_empty() {
+        let mark = welcome_mark(d, g);
+        let mark_w = 36u16; // widest mark row
+        let mark_h = mark.len() as u16;
+        if center[0].width > mark_w + 4 && center[0].height > mark_h + 4 {
+            let pad_y = (center[0].height.saturating_sub(mark_h)) / 3;
+            for _ in 0..pad_y {
+                lines.push(Line::from(""));
+            }
+            let pad_x = (center[0].width.saturating_sub(mark_w)) / 2;
+            let pad = " ".repeat(pad_x as usize);
+            for l in mark {
+                let mut padded = vec![Span::raw(pad.clone())];
+                padded.extend(l.spans);
+                lines.push(Line::from(padded));
+            }
+        }
+    }
     // Gutter 3 (§6.5): the you-glyph at col 0, text from col 2.
     let user_gutter = || Span::styled(format!("{}  ", g.you), Style::default().fg(p.muted));
     let orbit_gutter = |live: bool| {
@@ -815,22 +835,46 @@ fn render_approval_modal(
 
 // ── Startup / empty-state mark (§8) ──────────────────────────────────────────
 
-/// The expanded mark for the welcome screen: the two-row wordmark with the
-/// star. Static (deterministic, flicker-free) — motion lives in the status
-/// line's working star alone.
-pub fn welcome_mark(d: &Design, g: &Glyphs) -> Vec<Line<'static>> {
+/// The expanded mark (§8.1): half-block letterforms, a braille ring tilted
+/// behind the strokes, the star at the ring's upper right, the tagline
+/// beneath. Static — motion lives in the status line's working star alone.
+///
+/// Letters are ink, the ring magenta_dim, the star magenta, the tagline
+/// muted. It appears only on the welcome screen of an empty session; the
+/// first turn replaces it.
+pub fn welcome_mark(d: &Design, _g: &Glyphs) -> Vec<Line<'static>> {
     let p = &d.palette;
-    let rows = ["✦ ORBIT", "  orbits you"];
-    rows.iter()
-        .map(|r| {
-            Line::from(Span::styled(
-                r.to_string(),
-                Style::default().fg(if r.starts_with(g.orbit) {
+    // 3 rows × 31 columns (§8.1). The ring is braille dots; where it crosses
+    // a letterform stroke it hides (the letterform wins).
+    let row0 = "    ▄▀▀▀▄⠤⠤✦ █▀▀▀▄ █▀▀▀▄ ▀█▀ ▀▀█▀▀";
+    let row1 = " ⣠⠖⠋█   █⣠⠴⠋ █▄▄▄▀ █▀▀▀▄  █    █";
+    let row2 = " ⠙⠒⠒▀▄▄▄▀    █  ▀▄ █▄▄▄▀ ▄█▄   █";
+    let tagline = "    the harness that orbits around you";
+    let mark_line = |row: &str| -> Line<'static> {
+        // Split each row into ring cells (braille) vs letter cells (blocks):
+        // braille → magenta_dim, blocks → ink, the star → magenta.
+        let spans: Vec<Span> = row
+            .chars()
+            .map(|c| {
+                let color = if c == '✦' {
                     p.magenta
+                } else if c.is_ascii_alphanumeric() || "▄▀█".contains(c) {
+                    p.ink
                 } else {
-                    p.muted
-                }),
-            ))
-        })
-        .collect()
+                    p.magenta_dim // braille ring + spaces ride the dim colour
+                };
+                Span::styled(c.to_string(), Style::default().fg(color))
+            })
+            .collect();
+        Line::from(spans)
+    };
+    vec![
+        mark_line(row0),
+        mark_line(row1),
+        mark_line(row2),
+        Line::from(Span::styled(
+            tagline.to_string(),
+            Style::default().fg(p.muted),
+        )),
+    ]
 }
