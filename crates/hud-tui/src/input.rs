@@ -21,6 +21,8 @@ pub enum KeyAction {
     ToggleToolDetail,
     ToggleCost,
     CommandPalette,
+    /// Open the command palette (§6.13).
+    OpenPalette,
     /// Key was recognized but not actionable in the current context.
     Unknown,
 }
@@ -66,6 +68,7 @@ impl KeyParser {
                 // Single keys.
                 match c {
                     'q' => Some(KeyAction::Quit),
+                    '?' => Some(KeyAction::OpenPalette),
                     '1' => Some(KeyAction::FocusLeft),
                     '2' => Some(KeyAction::FocusCenter),
                     '3' => Some(KeyAction::FocusRight),

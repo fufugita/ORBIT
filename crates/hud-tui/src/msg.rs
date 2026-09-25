@@ -78,6 +78,16 @@ pub enum Msg {
     CancelTurn,
     /// Enter plain-text transcript copy mode.
     EnterCopyMode,
+    /// Command palette (§6.13): toggle open/closed.
+    PaletteToggle,
+    /// A character typed into the palette query.
+    PaletteChar(char),
+    /// Backspace in the palette query.
+    PaletteBackspace,
+    /// Move the palette selection (true = down, false = up).
+    PaletteMove(bool),
+    /// Execute the selected palette command.
+    PaletteExecute,
     /// Request to quit — opens confirmation prompt (q, Ctrl+D).
     RequestQuit,
     /// Confirm quit from the modal.

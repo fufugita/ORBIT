@@ -162,6 +162,99 @@ pub enum VerificationResult {
     Pending,
 }
 
+/// The command palette (§6.13): an overlay with a fuzzy query.
+#[derive(Debug, Default)]
+pub struct PaletteState {
+    pub open: bool,
+    pub query: String,
+    /// Index into the filtered command list.
+    pub selected: usize,
+}
+
+/// One palette command.
+#[derive(Debug, Clone)]
+pub struct PaletteCommand {
+    pub label: String,
+    pub description: String,
+    pub hint: String,
+}
+
+/// Fuzzy-filter the palette commands by the query: a simple subsequence
+/// match (each query char appears in order). Case-insensitive.
+pub fn filtered_commands(query: &str) -> Vec<PaletteCommand> {
+    let all = palette_commands();
+    if query.is_empty() {
+        return all;
+    }
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    all.into_iter()
+        .filter(|cmd| {
+            let hay: Vec<char> = format!("{} {}", cmd.label, cmd.description)
+                .to_lowercase()
+                .chars()
+                .collect();
+            let mut qi = 0;
+            for c in hay {
+                if qi < q.len() && c == q[qi] {
+                    qi += 1;
+                }
+            }
+            qi == q.len()
+        })
+        .collect()
+}
+
+/// The built-in palette commands (§6.13 COMMANDS section).
+pub fn palette_commands() -> Vec<PaletteCommand> {
+    vec![
+        PaletteCommand {
+            label: "new session".into(),
+            description: "start a fresh conversation".into(),
+            hint: "g n".into(),
+        },
+        PaletteCommand {
+            label: "copy transcript".into(),
+            description: "yank the transcript as plain text".into(),
+            hint: "z y".into(),
+        },
+        PaletteCommand {
+            label: "sessions".into(),
+            description: "switch to the sessions rail".into(),
+            hint: "g s".into(),
+        },
+        PaletteCommand {
+            label: "activity".into(),
+            description: "switch to the activity rail".into(),
+            hint: "g v".into(),
+        },
+        PaletteCommand {
+            label: "workspace".into(),
+            description: "focus the workspace rail".into(),
+            hint: "g r".into(),
+        },
+        PaletteCommand {
+            label: "conversation".into(),
+            description: "focus the conversation".into(),
+            hint: "g c".into(),
+        },
+        PaletteCommand {
+            label: "toggle tool detail".into(),
+            description: "expand or collapse tool output".into(),
+            hint: "z t".into(),
+        },
+        PaletteCommand {
+            label: "toggle cost".into(),
+            description: "show or hide the cost line".into(),
+            hint: "z c".into(),
+        },
+        PaletteCommand {
+            label: "quit".into(),
+            description: "leave ORBIT".into(),
+            hint: "q".into(),
+        },
+    ]
+}
+
 /// The reducer state.
 #[derive(Debug)]
 pub struct App {
@@ -201,6 +294,8 @@ pub struct App {
     pub pending_approvals: Vec<PendingApproval>,
     /// Workspace snapshot (§6.10) — empty until the backend fills it (PR-F).
     pub workspace: Workspace,
+    /// Command palette (§6.13).
+    pub palette: PaletteState,
     /// Last status one-liner (shown in toast / status bar).
     pub last_status: String,
     /// Active error from the backend, if any.
@@ -337,6 +432,7 @@ impl App {
             tool_state: ToolState::Idle,
             pending_approvals: Vec::new(),
             workspace: Workspace::default(),
+            palette: PaletteState::default(),
             last_status: String::new(),
             last_error: None,
             transcript_scroll: 0,
@@ -591,6 +687,51 @@ impl App {
                 });
                 self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS);
             }
+            Msg::PaletteToggle => {
+                self.palette.open = !self.palette.open;
+                if !self.palette.open {
+                    self.palette.query.clear();
+                    self.palette.selected = 0;
+                }
+                self.dirty.set(DirtyFlags::LAYOUT);
+            }
+            Msg::PaletteChar(c) => {
+                if self.palette.open {
+                    self.palette.query.push(c);
+                    self.palette.selected = 0;
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                }
+            }
+            Msg::PaletteBackspace => {
+                if self.palette.open {
+                    self.palette.query.pop();
+                    self.palette.selected = 0;
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                }
+            }
+            Msg::PaletteMove(down) => {
+                if self.palette.open {
+                    let len = filtered_commands(&self.palette.query).len();
+                    if len > 0 {
+                        if down {
+                            self.palette.selected = (self.palette.selected + 1) % len;
+                        } else {
+                            self.palette.selected = (self.palette.selected + len - 1) % len;
+                        }
+                    }
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                }
+            }
+            Msg::PaletteExecute => {
+                // The event loop reads the selection and dispatches the
+                // command; the reducer just closes the palette.
+                if self.palette.open {
+                    self.palette.open = false;
+                    self.palette.query.clear();
+                    self.palette.selected = 0;
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                }
+            }
             Msg::ConnectionChanged(state) => {
                 self.connection = state;
                 self.dirty.set(DirtyFlags::STATUS);
@@ -783,6 +924,7 @@ impl App {
             | KeyAction::ToggleToolDetail
             | KeyAction::ToggleCost
             | KeyAction::CommandPalette
+            | KeyAction::OpenPalette
             | KeyAction::Unknown => {}
         }
     }
@@ -790,6 +932,37 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn palette_filter_subsequence() {
+        use super::filtered_commands;
+        // Empty query → all commands.
+        assert_eq!(filtered_commands("").len(), 9);
+        // "sess" matches sessions (and any label containing the
+        // subsequence).
+        let hits = filtered_commands("sess");
+        assert!(hits.iter().any(|c| c.label == "sessions"));
+        // "zzz" matches nothing.
+        assert!(filtered_commands("zzz").is_empty());
+    }
+
+    #[test]
+    fn palette_toggle_and_type() {
+        use super::{App, Msg};
+        let mut app = App::new();
+        assert!(!app.palette.open);
+        app.reduce(Msg::PaletteToggle);
+        assert!(app.palette.open);
+        app.reduce(Msg::PaletteChar('s'));
+        app.reduce(Msg::PaletteChar('e'));
+        assert_eq!(app.palette.query, "se");
+        app.reduce(Msg::PaletteBackspace);
+        assert_eq!(app.palette.query, "s");
+        // Close resets the query.
+        app.reduce(Msg::PaletteToggle);
+        assert!(!app.palette.open);
+        assert!(app.palette.query.is_empty());
+    }
+
     use super::*;
 
     #[test]

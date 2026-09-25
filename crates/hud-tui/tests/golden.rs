@@ -267,6 +267,26 @@ fn golden_welcome_mark() {
     );
 }
 
+/// Command palette (§6.13): the overlay renders with query, sections,
+/// fuzzy matches, and the selected row.
+#[test]
+fn golden_command_palette() {
+    let d = design();
+    let mut app = App::new();
+    app.palette.open = true;
+    app.palette.query = "sess".into();
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    assert!(text.contains("COMMANDS"), "the section label");
+    assert!(text.contains("sessions"), "the filtered command");
+    assert!(text.contains("esc close"), "the esc note");
+    assert!(text.contains("select · enter run"), "the key footer");
+    // The query renders.
+    assert!(text.contains("sess"), "the query text");
+    // Fuzzy filtering dropped non-matching commands.
+    assert!(!text.contains("toggle cost"), "non-match filtered out");
+}
+
 // ── Design invariants (§13.5) ────────────────────────────────────────────────
 
 /// invariant_one_frame_max: at most one rounded frame in any buffer.

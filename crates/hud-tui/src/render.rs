@@ -114,6 +114,12 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     render_center_pane(frame, main[2], app, composer_text, d, g);
     render_divider(frame, main[3], app, d, g, true);
     render_right_pane(frame, main[4], app, d, g);
+    // Command palette (§6.13): an overlay above the panes, under the
+    // status line.
+    if app.palette.open {
+        render_palette(frame, outer[0], app, d, g);
+    }
+
     render_status_bar(frame, outer[1], app, d, g);
 
     // Overlays — the only frames on screen (one at a time, §1).
@@ -568,6 +574,136 @@ fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
     }
 
     frame.render_widget(Paragraph::new(lines), body);
+}
+
+/// The command palette overlay (§6.13): 78 columns (or W−8), top edge on
+/// row 5, rule_hi rounded frame, surface2 fill, query row with a magenta ›,
+/// sections, fuzzy-matched chars in magenta bold, the selected row in wash
+/// with a ▌. No backdrop dimming; open and close are instant.
+fn render_palette(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+    let p = &d.palette;
+    let w = 78u16.min(area.width.saturating_sub(8));
+    let h = 16u16.min(area.height.saturating_sub(8));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = 5u16.min(area.height.saturating_sub(h));
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    // Clear the underlying cells first — the overlay must fully cover
+    // whatever is beneath it (§6.13: no bleed-through).
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    // Frame: rounded, rule_hi, surface2 fill.
+    let block = Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(p.rule_hi))
+        .style(Style::default().bg(p.surface2));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Query row: magenta › + the query + esc close on the right.
+    let esc_note = "esc close";
+    // › + space + query + padding + esc note must fit inner.width.
+    let used = 2 + app.palette.query.chars().count();
+    let query_space = (inner.width as usize).saturating_sub(used + esc_note.len());
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} ", g.you), Style::default().fg(p.magenta)),
+        Span::styled(
+            format!("{}{}", app.palette.query, " ".repeat(query_space)),
+            Style::default().fg(p.ink),
+        ),
+        Span::styled(esc_note.to_string(), Style::default().fg(p.faint)),
+    ]));
+    // Hairline.
+    lines.push(Line::from(Span::styled(
+        "─".repeat(inner.width as usize),
+        Style::default().fg(p.rule),
+    )));
+
+    // COMMANDS section.
+    let commands = crate::state::filtered_commands(&app.palette.query);
+    lines.push(Line::from(vec![
+        Span::styled("COMMANDS", Style::default().fg(p.muted)),
+        Span::styled(
+            format!("  {}", commands.len()),
+            Style::default().fg(p.faint),
+        ),
+    ]));
+
+    // Rows: label with fuzzy-matched chars in magenta bold, description in
+    // muted at column 22, hint on the right. Selected row: wash + ▌.
+    for (i, cmd) in commands.iter().enumerate() {
+        let selected = i == app.palette.selected;
+        // Fuzzy match positions in the label.
+        let matched = fuzzy_positions(&cmd.label, &app.palette.query);
+        let mut label_spans: Vec<Span> = Vec::new();
+        for (ci, ch) in cmd.label.chars().enumerate() {
+            let is_match = matched.contains(&ci);
+            let mut style = if is_match {
+                Style::default().fg(p.magenta).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.ink2)
+            };
+            if selected {
+                style = style.bg(p.wash);
+            }
+            label_spans.push(Span::styled(ch.to_string(), style));
+        }
+        let desc_pad = 22usize.saturating_sub(cmd.label.chars().count() + 2);
+        let mut row: Vec<Span> = vec![Span::styled(
+            if selected { "▌ " } else { "  " },
+            Style::default().fg(if selected { p.magenta } else { p.faint }),
+        )];
+        row.extend(label_spans);
+        row.push(Span::styled(
+            format!("{}{}", " ".repeat(desc_pad), cmd.description),
+            Style::default()
+                .fg(p.muted)
+                .bg(if selected { p.wash } else { p.surface2 }),
+        ));
+        lines.push(Line::from(row));
+    }
+
+    // Footer of keys.
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "↑↓ select · enter run · esc close",
+        Style::default().fg(p.faint),
+    )]));
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(p.surface2)),
+        inner,
+    );
+}
+
+/// Positions in `text` matched by the fuzzy `query` (subsequence).
+fn fuzzy_positions(text: &str, query: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let hay: Vec<char> = text.to_lowercase().chars().collect();
+    let mut qi = 0;
+    for (i, c) in hay.iter().enumerate() {
+        if qi < query.len()
+            && *c
+                == query
+                    .chars()
+                    .nth(qi)
+                    .unwrap()
+                    .to_lowercase()
+                    .next()
+                    .unwrap()
+        {
+            positions.push(i);
+            qi += 1;
+        }
+    }
+    positions
 }
 
 fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {

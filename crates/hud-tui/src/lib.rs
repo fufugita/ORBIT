@@ -293,6 +293,33 @@ fn event_loop(
                 handle_slash_command(&cmd, sender, command_sink, app);
                 continue;
             }
+            // Palette execution (§6.13): run the selected command. The
+            // reducer already closed the palette; we read the selection
+            // BEFORE reduce consumed it — so intercept here.
+            if let Msg::PaletteExecute = msg {
+                let (label, selected) = {
+                    let sel = app.palette.selected;
+                    let cmds = crate::state::filtered_commands(&app.palette.query);
+                    let label = cmds.get(sel).map(|c| c.label.clone()).unwrap_or_default();
+                    (label, sel)
+                };
+                app.reduce(Msg::PaletteExecute);
+                match label.as_str() {
+                    "new session" => app.reduce(Msg::KeyAction(KeyAction::NewSession)),
+                    "copy transcript" => app.reduce(Msg::EnterCopyMode),
+                    "sessions" => app.reduce(Msg::KeyAction(KeyAction::TabSessions)),
+                    "activity" => app.reduce(Msg::KeyAction(KeyAction::TabVerbose)),
+                    "workspace" => app.reduce(Msg::KeyAction(KeyAction::FocusRight)),
+                    "conversation" => app.reduce(Msg::KeyAction(KeyAction::FocusCenter)),
+                    "toggle tool detail" => app.reduce(Msg::KeyAction(KeyAction::ToggleToolDetail)),
+                    "toggle cost" => app.reduce(Msg::KeyAction(KeyAction::ToggleCost)),
+                    "quit" => app.reduce(Msg::RequestQuit),
+                    _ => {
+                        let _ = selected;
+                    }
+                }
+                continue;
+            }
             // Forward prompts to the worker ONLY when the reducer starts a
             // new turn (not when it queues). We detect this by snapshotting
             // turn_in_flight before reduce and checking it flipped to true.
@@ -527,6 +554,21 @@ fn handle_key(
     app: &App,
     approvals: &ApprovalRegistry,
 ) {
+    // Command palette (§6.13): when open, ALL keys route to the palette —
+    // chars build the query, ↑↓ move, enter executes, esc closes.
+    if app.palette.open {
+        match key.code {
+            KeyCode::Esc => sender.send(Msg::PaletteToggle),
+            KeyCode::Up => sender.send(Msg::PaletteMove(false)),
+            KeyCode::Down => sender.send(Msg::PaletteMove(true)),
+            KeyCode::Enter => sender.send(Msg::PaletteExecute),
+            KeyCode::Backspace => sender.send(Msg::PaletteBackspace),
+            KeyCode::Char(c) => sender.send(Msg::PaletteChar(c)),
+            _ => {}
+        }
+        return;
+    }
+
     use crossterm::event::{KeyCode, KeyModifiers};
 
     // Ctrl+C → cancel the in-flight turn if streaming; otherwise the
@@ -688,6 +730,10 @@ fn handle_key(
             KeyAction::CommandPalette => {
                 // z+y → enter copy mode (yank transcript).
                 sender.send(Msg::EnterCopyMode);
+            }
+            KeyAction::OpenPalette => {
+                // ? → the command palette (§6.13).
+                sender.send(Msg::PaletteToggle);
             }
         }
     }
