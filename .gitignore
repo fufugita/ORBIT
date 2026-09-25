@@ -42,3 +42,11 @@ profraw/
 
 # Local ORBIT home created by interactive `orbit init` runs in-repo (credentials live here)
 /.orbit/
+
+# local session artifacts (never commit)
+docs/handoff-pivot-to-claude-code.md
+docs/handoff-tui-endtoend.md
+.planning/
+scripts/__pycache__/
+crates/hud-tui/receipts/
+crates/hud-tui/review-receipts/
