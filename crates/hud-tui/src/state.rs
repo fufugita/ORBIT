@@ -236,6 +236,8 @@ pub struct PendingApproval {
     pub call_id: String,
     pub tool_name: String,
     pub summary: String,
+    /// Structured risk level 0..=3 (▰▰▱ badge, §6.15).
+    pub risk: u8,
 }
 
 impl App {
@@ -503,12 +505,14 @@ impl App {
                 call_id,
                 tool_name,
                 summary,
+                risk,
             } => {
                 self.tool_state = ToolState::AwaitingApproval;
                 self.pending_approvals.push(PendingApproval {
                     call_id,
                     tool_name,
                     summary,
+                    risk,
                 });
                 self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS);
             }
@@ -892,6 +896,7 @@ mod tests {
             call_id: "call-42".into(),
             tool_name: "calculator".into(),
             summary: "calculator(expression)".into(),
+            risk: 1,
         });
         assert_eq!(app.pending_approvals.len(), 1);
         assert_eq!(app.pending_approvals[0].call_id, "call-42");
@@ -912,6 +917,7 @@ mod tests {
             call_id: "call-42".into(),
             tool_name: "calculator".into(),
             summary: "calculator(expression)".into(),
+            risk: 1,
         });
         assert_eq!(app.pending_approvals.len(), 1);
         app.reduce(Msg::ToolCallFinished {
@@ -938,6 +944,7 @@ mod tests {
                 call_id: (*call_id).into(),
                 tool_name: "ssh".into(),
                 summary: format!("run command #{i}"),
+                risk: 1,
             });
         }
         assert_eq!(app.pending_approvals.len(), 2);

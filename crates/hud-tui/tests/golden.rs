@@ -77,6 +77,7 @@ fn approval_app() -> App {
         call_id: "call-0".into(),
         tool_name: "workspace.apply_patch".into(),
         summary: "Apply patch to 2 files in /work/atlas".into(),
+        risk: 2,
     });
     app
 }
@@ -156,6 +157,30 @@ fn golden_approval_card() {
         text.contains("Action not executed"),
         "post-decision honesty line (GPT-AMEND 4)"
     );
+    // The risk badge (▰▰▱ at level 2) renders in the title (§6.15).
+    assert!(text.contains('▰'), "risk badge present");
+}
+
+/// Composer auto-height (§5.5): one row empty, one per line, capped at half.
+#[test]
+fn golden_composer_auto_height() {
+    let d = design();
+    let app = idle_app();
+    // Empty composer: 1 row — the prompt line is the last row of the frame.
+    let empty = render_buf(&app, &d, 80, 30);
+    assert!(buf_text(&empty).contains("ask orbit"));
+
+    // Multi-line composer: 3 lines of text → 3 rows, transcript keeps ≥3.
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+    terminal
+        .draw(|f| render(f, &app, "first line\nsecond line\nthird line", &d))
+        .unwrap();
+    let text = buf_text(terminal.backend().buffer());
+    assert!(text.contains("first line"));
+    assert!(
+        text.contains("third line"),
+        "all lines visible under the cap"
+    );
 }
 
 // ── Design invariants (§13.5) ────────────────────────────────────────────────
@@ -228,6 +253,7 @@ fn invariant_no_truncated_approval() {
         call_id: "call-0".into(),
         tool_name: "workspace.apply_patch".into(),
         summary: summary.into(),
+        risk: 2,
     });
     for (w, h) in [(150u16, 44u16), (110, 30), (80, 30)] {
         let buf = render_buf(&app, &d, w, h);

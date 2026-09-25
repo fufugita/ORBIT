@@ -207,13 +207,16 @@ fn render_center_pane(
     let p = &d.palette;
 
     // No pane header on the conversation — it IS the centre of gravity
-    // (§1). Split: transcript (fill) | queue | composer band (1–2 rows).
+    // (§1). Split: transcript (fill) | queue | composer band.
+    //
+    // Composer auto-height (§5.5): one row when empty, one row per line of
+    // content, capped at half the pane so the transcript always keeps ≥3
+    // rows. Lines beyond the cap show the last ones (the newest line stays
+    // visible).
     let queue_h = app.queued.len() as u16;
-    let composer_h = if composer_text.lines().count() > 0 {
-        2
-    } else {
-        1
-    };
+    let text_lines = composer_text.lines().count().max(1) as u16;
+    let composer_cap = (area.height / 2).max(1);
+    let composer_h = text_lines.min(composer_cap);
     let center = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -338,6 +341,7 @@ fn render_center_pane(
         || matches!(app.tool_state, ToolState::Running(_));
     let cursor_on = !turn_live && (app.tick_count / 16).is_multiple_of(2);
     let cursor = if cursor_on { "▏" } else { " " };
+    let first_text_line = composer_text.lines().next().unwrap_or("");
     let prompt_line = if composer_text.is_empty() {
         Line::from(vec![
             Span::styled(format!("{} ", g.you), Style::default().fg(prompt_color)),
@@ -347,21 +351,33 @@ fn render_center_pane(
     } else {
         Line::from(vec![
             Span::styled(format!("{} ", g.you), Style::default().fg(prompt_color)),
-            Span::styled(composer_text, Style::default().fg(p.ink)),
+            Span::styled(first_text_line, Style::default().fg(p.ink)),
         ])
     };
-    let mut composer_lines = vec![prompt_line];
-    // Second row for multi-line text (first continuation line only; the
-    // composer grows with content — full auto-height is a later step).
-    if composer_text.lines().count() > 1 {
-        if let Some(second) = composer_text.lines().nth(1) {
-            composer_lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(second, Style::default().fg(p.ink)),
-            ]));
-        }
-    }
-    frame.render_widget(Paragraph::new(composer_lines), center[2]);
+    // All content lines, capped: when the text exceeds the cap, show the
+    // LAST lines (the newest input stays visible; older lines scroll out).
+    let all_lines: Vec<&str> = composer_text.lines().collect();
+    let visible: Vec<Line> = if all_lines.is_empty() {
+        vec![prompt_line]
+    } else {
+        let take = (all_lines.len() as u16).min(composer_h) as usize;
+        let start = all_lines.len() - take;
+        all_lines[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if start + i == 0 {
+                    prompt_line.clone()
+                } else {
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(*line, Style::default().fg(p.ink)),
+                    ])
+                }
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(visible), center[2]);
 }
 
 // ── Right rail (§6.10) ───────────────────────────────────────────────────────
@@ -589,10 +605,11 @@ fn render_approval_modal(
         ])
         .split(dock[1]);
 
+    let badge = g.risk_meter(first.risk);
     let title = if queue_note.is_empty() {
-        format!("Allow {}?", first.tool_name)
+        format!("Allow {}? {badge}", first.tool_name)
     } else {
-        format!("Allow {}? · {queue_note}", first.tool_name)
+        format!("Allow {}? {badge} · {queue_note}", first.tool_name)
     };
 
     let summary = if app.pending_approvals.len() > 1 {

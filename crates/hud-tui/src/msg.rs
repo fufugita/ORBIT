@@ -52,6 +52,9 @@ pub enum Msg {
         call_id: String,
         tool_name: String,
         summary: String,
+        /// Structured risk (0..=3) from the backend classification —
+        /// backend-authoritative, the UI renders it (§6.15).
+        risk: u8,
     },
     /// Connection state changed (set by the harness on provider errors).
     ConnectionChanged(crate::state::ConnectionState),

@@ -40,6 +40,7 @@ fn main() {
             call_id: "call-0".into(),
             tool_name: "calculator".into(),
             summary: "calculator(expression)".into(),
+            risk: 1,
         });
         app.tool_state = ToolState::AwaitingApproval;
     }

@@ -324,9 +324,76 @@ pub fn is_known_tool(name: &str) -> bool {
     builtin_tools().iter().any(|t| t.name == name)
 }
 
+/// Structured risk classification for a tool (backend-authoritative — the
+/// UI never classifies actions itself; docs/tui/DESIGN.md §6.15 facts rule).
+/// All current built-ins are pure-data calculators: low risk. Shell/fs/net
+/// tools, when they exist, will classify higher by construction.
+/// The full classification vocabulary exists so future tools (shell, fs,
+/// net) slot in without reshaping the type; v0.1's pure-data built-ins only
+/// construct Low. `as_str` is exercised by tests and used by ledger/REPL
+/// surfaces as they adopt the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Destructive,
+}
+
+impl RiskLevel {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Destructive => "destructive",
+        }
+    }
+
+    /// 0..=3 for the ▰▰▱ badge.
+    pub fn level(self) -> u8 {
+        match self {
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 3,
+            Self::Destructive => 3,
+        }
+    }
+}
+
+/// Risk classification for a known tool. Unknown tools never reach the UI
+/// (deny-by-default before the approval channel), so this is total over the
+/// known set.
+pub fn tool_risk(name: &str) -> RiskLevel {
+    // All v0.1 built-ins are pure-data (calculator, session snapshot, model
+    // list). Anything not explicitly classified defaults to medium — fail
+    // toward caution, never silently low.
+    match name {
+        "calculator" | "current_session" | "list_models" => RiskLevel::Low,
+        _ => RiskLevel::Medium,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn risk_classification_is_backend_authoritative() {
+        // Known pure-data tools are low; anything unclassified fails toward
+        // medium, never silently low.
+        assert_eq!(tool_risk("calculator"), RiskLevel::Low);
+        assert_eq!(tool_risk("current_session"), RiskLevel::Low);
+        assert_eq!(tool_risk("list_models"), RiskLevel::Low);
+        assert_eq!(tool_risk("some_future_tool"), RiskLevel::Medium);
+        assert_eq!(RiskLevel::Low.as_str(), "low");
+        assert_eq!(RiskLevel::Medium.as_str(), "medium");
+        assert_eq!(RiskLevel::High.as_str(), "high");
+        assert_eq!(RiskLevel::Destructive.as_str(), "destructive");
+        assert_eq!(RiskLevel::Destructive.level(), 3);
+    }
 
     #[test]
     fn calculator_evaluates_without_code_execution() {

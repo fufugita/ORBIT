@@ -269,6 +269,7 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
             call_id: req.call_id.clone(),
             tool_name: req.tool_name.clone(),
             summary: req.summary.clone(),
+            risk: req.risk.level(),
         });
         // Park until the operator responds (y/n/R). Esc handled as deny.
         match rx.recv() {

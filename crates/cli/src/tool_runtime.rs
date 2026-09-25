@@ -40,6 +40,10 @@ pub struct ApprovalRequest {
     #[allow(dead_code)] // wired in PR-D (TUI approval modal)
     pub tool_name: String,
     pub summary: String,
+    /// Structured risk classification (backend-authoritative; the UI renders
+    /// it, never infers it). §6.15: the risk badge lives here so the
+    /// approval card can draw ▰▰▱ without classifying on its own.
+    pub risk: crate::tools::RiskLevel,
 }
 
 /// Approval channel — how the operator is asked to approve a tool call.
@@ -181,6 +185,7 @@ pub fn execute_call(
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
                 summary: safe_call_summary(call),
+                risk: crate::tools::tool_risk(&call.name),
             },
             auto_tools,
         )

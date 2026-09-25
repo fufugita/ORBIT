@@ -727,6 +727,7 @@ mod tests {
             call_id: "c1".into(),
             tool_name: "calculator".into(),
             summary: "calc(expr)".into(),
+            risk: 1,
         });
         assert!(!composer_wants_char(&char_key('y'), &app));
         assert!(!composer_wants_char(&char_key('n'), &app));
