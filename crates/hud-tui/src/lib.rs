@@ -22,6 +22,7 @@ mod rich;
 pub mod state;
 mod terminal;
 pub mod theme;
+pub mod tokens;
 pub mod unicode;
 pub mod worker;
 
@@ -40,6 +41,7 @@ use crate::bus::{Bus, BusSender};
 use crate::msg::Msg;
 use crate::state::App;
 use crate::theme::{ResolvedTheme, Theme};
+use crate::tokens::Design;
 
 /// The UI tick interval (16 ms ≈ 60 fps cap). Empty frames are forbidden —
 /// we only redraw when `app.dirty.is_dirty()`.
@@ -61,6 +63,23 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(".orbit"));
     let theme = Theme::load(&home).resolve();
+
+    // Design context: palette resolved for the detected colour tier + display
+    // capabilities, ONCE at startup (docs/tui/DESIGN.md §3.7). Tiers step
+    // down at runtime, never up. Migration notices print once, then drop.
+    let raw: crate::tokens::Theme = {
+        // The new-schema load; a file written for the old schema parses with
+        // deprecation keys intact (both live in one struct).
+        let path = home.join("tui.toml");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| toml::from_str(&raw).ok())
+            .unwrap_or_default()
+    };
+    let design = Design::resolve(&raw, &|k| std::env::var(k).ok());
+    for notice in &design.notices {
+        eprintln!("orbit-tui: {notice}");
+    }
 
     let mut guard = match terminal::TerminalGuard::enter() {
         Ok(g) => g,
