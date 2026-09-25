@@ -792,7 +792,21 @@ impl Design {
         }
         let glyphs = match theme.capabilities.glyphs.as_str() {
             "ascii" => GlyphSet::Ascii,
-            _ => GlyphSet::Unicode,
+            "unicode" => GlyphSet::Unicode,
+            // "auto" (and any unknown value): detect the locale — a
+            // non-UTF-8 locale cannot render the unicode set (§11.3).
+            _ => {
+                let utf8 = env("LANG")
+                    .or_else(|| env("LC_ALL"))
+                    .or_else(|| env("LC_CTYPE"))
+                    .map(|v| v.to_ascii_lowercase().contains("utf-8"))
+                    .unwrap_or(true);
+                if utf8 {
+                    GlyphSet::Unicode
+                } else {
+                    GlyphSet::Ascii
+                }
+            }
         };
         let brand = match theme.capabilities.brand.as_str() {
             "static" => BrandTier::Static,
@@ -859,6 +873,21 @@ reduced = true
         assert_eq!(d.caps.glyphs, GlyphSet::Ascii);
         assert_eq!(d.caps.brand, BrandTier::Text);
         assert!(d.caps.reduced_motion);
+    }
+
+    #[test]
+    fn auto_glyphs_detect_locale() {
+        // "auto" + UTF-8 locale → unicode.
+        let t: Theme = toml::from_str("[color]\nglyphs = \"auto\"\n").unwrap();
+        let d = Design::resolve(&t, &|k| (k == "LANG").then(|| "en_US.UTF-8".into()));
+        assert_eq!(d.caps.glyphs, GlyphSet::Unicode);
+        // "auto" + C locale → ascii (§11.3: a non-UTF-8 locale cannot render
+        // the unicode set).
+        let d = Design::resolve(&t, &|k| (k == "LANG").then(|| "C".into()));
+        assert_eq!(d.caps.glyphs, GlyphSet::Ascii);
+        // "auto" + no locale vars at all → unicode (the common modern default).
+        let d = Design::resolve(&t, &|_| None);
+        assert_eq!(d.caps.glyphs, GlyphSet::Unicode);
     }
 
     #[test]

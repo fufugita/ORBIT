@@ -105,16 +105,55 @@ pub struct TerminalGuard {
     pub terminal: Term,
 }
 
+/// Ambiguous-width probe (§11.3): print ● at column 0, ask the terminal
+/// where the cursor is (ESC[6n), check whether it moved one column or two,
+/// then erase the line. 100 ms timeout; no answer → assume narrow.
+///
+/// Runs BEFORE the alternate screen (it must be visible to the terminal,
+/// not swallowed by the alt-screen switch). Returns true when ambiguous-
+/// width glyphs render wide — the caller selects the ASCII glyph set.
+pub fn probe_ambiguous_width() -> bool {
+    use std::io::Write;
+
+    // The probe needs raw mode to read the response without a newline.
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return false; // not a TTY we can probe — assume narrow
+    }
+    let wide = {
+        let mut out = std::io::stdout();
+        // Print ● (U+25CF, ambiguous width) at column 0.
+        let _ = write!(out, "\u{25cf}");
+        let _ = out.flush();
+        // crossterm's cursor::position() sends ESC[6n and reads the reply,
+        // but it blocks with NO timeout — a terminal that ignores DSR would
+        // hang the probe forever. Run it on a thread and give it the spec's
+        // 100 ms budget; no answer in time → assume narrow (§11.3).
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pos = crossterm::cursor::position();
+            let _ = tx.send(pos);
+        });
+        let wide = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|(_, col)| col > 1)
+            .unwrap_or(false);
+        // Erase the line — the probe leaves no trace.
+        let _ = write!(out, "\r\x1b[2K");
+        let _ = out.flush();
+        wide
+    };
+    let _ = crossterm::terminal::disable_raw_mode();
+    wide
+}
+
 impl TerminalGuard {
     /// Enter raw mode + alternate screen, hide cursor, install signal handlers.
     pub fn enter() -> Result<Self, String> {
-        // Ensure UTF-8 locale.
-        if std::env::var("LANG").unwrap_or_default().is_empty() {
-            std::env::set_var("LANG", "en_US.UTF-8");
-        }
-        if std::env::var("LC_ALL").unwrap_or_default().is_empty() {
-            std::env::set_var("LC_ALL", "en_US.UTF-8");
-        }
+        // NOTE: no locale forcing. Forcing LANG/LC_ALL to en_US.UTF-8 hides
+        // non-UTF-8 terminals (H-7 hard downgrade); the glyph set is chosen
+        // by locale detection + the width probe instead (§11.3).
 
         // Install signal handlers — set flags instead of dying mid-render.
         // The event loop converts them into noninteractive shutdown (the

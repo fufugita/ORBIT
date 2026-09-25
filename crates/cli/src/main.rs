@@ -1004,6 +1004,11 @@ fn cmd_chat(args: &[String]) -> i32 {
         }
     }
 
+    // Plain front-end (REPL / non-TTY): the shared plain grammar owns
+    // stdout lines (§11.4). The TUI never enables this — its worker threads
+    // must not print to the alt screen.
+    tool_runtime::enable_plain_output();
+
     if let Some(s) = &resumed_file {
         eprintln!("resumed session {} ({} prior turns)", s.session_id, s.turns);
     }
@@ -1092,6 +1097,10 @@ fn cmd_chat(args: &[String]) -> i32 {
             continue;
         }
 
+        // Plain grammar (§11.4): the turn boundary is stamped — one event
+        // per line, words not glyphs. Same grammar as copy mode and non-TTY.
+        println!("{} you: {}", hhmm_now(), trimmed);
+
         // Build the transcript for THIS user turn. A user turn may contain
         // multiple provider rounds when the model calls tools.
         transcript.push(orbit_adapter::types::ChatMessage {
@@ -1131,10 +1140,16 @@ fn cmd_chat(args: &[String]) -> i32 {
 
         let mut turn_ok = false;
         for round in 0..8u32 {
-            // Live observer: print TextDeltas as they stream in.
+            // Live observer: print TextDeltas as they stream in, prefixed
+            // with the plain-grammar stamp on the first delta.
+            let mut stamped = false;
             let mut observer = |ev: &orbit_adapter::types::ProviderStreamEvent| {
                 if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &ev.event {
                     let s = String::from_utf8_lossy(bytes).into_owned();
+                    if !stamped {
+                        stamped = true;
+                        print!("{} orbit: ", hhmm_now());
+                    }
                     print!("{s}");
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
@@ -1381,6 +1396,16 @@ fn handle_chat_command(
 /// Render a HUD event to the terminal, honoring the display-safety gate (H-3)
 /// and the stdout/stderr split (H-9). A payload rejected by the gate renders a
 /// safe placeholder to stderr — never a crash, never leaked bytes.
+/// Current wall-clock time as HH:MM for the plain grammar's line stamps.
+fn hhmm_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (h, m) = ((secs / 3600) % 24, (secs / 60) % 60);
+    format!("{h:02}:{m:02}")
+}
+
 fn render_hud(hud: &orbit_hud::Hud, event: &orbit_hud::HudEvent) {
     // Apply the display-safety gate (H-3) to text-bearing events first.
     let event = match event {

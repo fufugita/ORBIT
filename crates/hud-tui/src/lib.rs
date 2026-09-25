@@ -18,6 +18,7 @@ mod coalesce;
 pub mod glyphs;
 pub mod input;
 pub mod msg;
+pub mod plain;
 pub mod render;
 mod rich;
 pub mod state;
@@ -73,7 +74,18 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
             .and_then(|raw| toml::from_str(&raw).ok())
             .unwrap_or_default()
     };
+    // Width probe (§11.3): runs BEFORE the alternate screen. When the
+    // locale is UTF-8 but ambiguous-width glyphs render wide, the ASCII
+    // set is forced (the probe's verdict overrides the locale detection).
+    let probe_wide = terminal::probe_ambiguous_width();
     let design = Design::resolve(&raw, &|k| std::env::var(k).ok());
+    let design = if probe_wide && design.caps.glyphs == crate::tokens::GlyphSet::Unicode {
+        let mut forced = raw.clone();
+        forced.capabilities.glyphs = "ascii".into();
+        Design::resolve(&forced, &|k| std::env::var(k).ok())
+    } else {
+        design
+    };
     for notice in &design.notices {
         eprintln!("orbit-tui: {notice}");
     }
@@ -383,6 +395,16 @@ fn event_loop(
     }
 }
 
+/// Current wall-clock time as HH:MM for the plain grammar's line stamps.
+fn hhmm_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (h, m) = ((secs / 3600) % 24, (secs / 60) % 60);
+    format!("{h:02}:{m:02}")
+}
+
 /// Enter copy mode: temporarily exit the alt screen, print the transcript as
 /// plain text (no borders, no panes, no ANSI), wait for any key, then re-enter.
 /// The operator can select and copy individual lines with the terminal's
@@ -408,38 +430,14 @@ fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(),
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
-    let mut plain = String::new();
-    for entry in &app.transcript {
-        match entry {
-            crate::state::TranscriptLine::User(text) => {
-                for line in text.lines() {
-                    plain.push_str(line);
-                    plain.push('\n');
-                }
-                plain.push('\n');
-            }
-            crate::state::TranscriptLine::Assistant(text) => {
-                for line in text.lines() {
-                    plain.push_str(line);
-                    plain.push('\n');
-                }
-                plain.push('\n');
-            }
-            crate::state::TranscriptLine::Stripped { tool_name } => {
-                plain.push_str(&format!("[tool: {tool_name}]\n\n"));
-            }
-            crate::state::TranscriptLine::System(text) => {
-                plain.push_str(text);
-                plain.push('\n');
-                plain.push('\n');
-            }
-        }
-    }
-    if !app.in_flight.is_empty() {
-        for line in app.in_flight.lines() {
-            plain.push_str(line);
-            plain.push('\n');
-        }
+    // The shared plain grammar (§11.4): one event per line, words not
+    // glyphs, a timestamp on each line. Same module the REPL and non-TTY
+    // output use, so the surfaces cannot drift.
+    let now = hhmm_now();
+    let lines = crate::plain::transcript_lines(app, &now);
+    let mut plain = lines.join("\n");
+    if !plain.is_empty() {
+        plain.push('\n');
     }
     // Nothing after the transcript — selection to end-of-output is clean.
     print!("{plain}");

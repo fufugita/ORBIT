@@ -183,6 +183,63 @@ fn golden_composer_auto_height() {
     );
 }
 
+/// Workspace rail (§6.10): stepper + sections + task rows render from state.
+#[test]
+fn golden_workspace_pane() {
+    let d = design();
+    let mut app = idle_app();
+    app.workspace = orbit_hud_tui::state::Workspace {
+        phase_index: 2,
+        plan: vec![
+            orbit_hud_tui::state::Task {
+                title: "Fix refresh".into(),
+                state: orbit_hud_tui::state::TaskState::Active,
+                sub: Some("reading crates/export/src/restore.rs".into()),
+                evidence: 2,
+            },
+            orbit_hud_tui::state::Task {
+                title: "Retest clean-machine e2e".into(),
+                state: orbit_hud_tui::state::TaskState::Blocked,
+                sub: Some("waiting on the patch".into()),
+                evidence: 0,
+            },
+        ],
+        findings: vec![orbit_hud_tui::state::Finding {
+            title: "fresh genesis".into(),
+            source: Some("restore.rs:8".into()),
+        }],
+        verification: vec![
+            orbit_hud_tui::state::Verification {
+                name: "unit suite".into(),
+                result: orbit_hud_tui::state::VerificationResult::Passed,
+                proof_count: 2,
+            },
+            orbit_hud_tui::state::Verification {
+                name: "ledger check".into(),
+                result: orbit_hud_tui::state::VerificationResult::Pending,
+                proof_count: 0,
+            },
+        ],
+    };
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    // Stepper + phase name + count.
+    assert!(text.contains("act"), "current phase name");
+    assert!(text.contains("3/5"), "phase count");
+    // Sections with counts.
+    assert!(text.contains("PLAN"), "plan section");
+    assert!(text.contains("FINDINGS"), "findings section");
+    assert!(text.contains("VERIFICATION"), "verification section");
+    // Task rows + sub-lines + evidence.
+    assert!(text.contains("Fix refresh"), "task title");
+    assert!(text.contains("reading crates"), "active sub-line");
+    assert!(text.contains("2 proofs"), "evidence tag");
+    assert!(text.contains("claimed"), "claimed tag");
+    // Findings + source.
+    assert!(text.contains("fresh genesis"), "finding title");
+    assert!(text.contains("restore.rs"), "finding source");
+}
+
 // ── Design invariants (§13.5) ────────────────────────────────────────────────
 
 /// invariant_one_frame_max: at most one rounded frame in any buffer.

@@ -86,6 +86,82 @@ pub enum LeftTab {
     Verbose,
 }
 
+/// The five phases of the ORBIT reactor (§6.10 stepper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Orient,
+    Reason,
+    Act,
+    Verify,
+    Respond,
+}
+
+impl Phase {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Orient => "orient",
+            Self::Reason => "reason",
+            Self::Act => "act",
+            Self::Verify => "verify",
+            Self::Respond => "respond",
+        }
+    }
+}
+
+/// A workspace task (§6.10 task rows).
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub title: String,
+    pub state: TaskState,
+    /// Optional single sub-line (what it's doing / why blocked / etc.).
+    pub sub: Option<String>,
+    /// Right-aligned evidence tag: number of verified proofs (0 = claimed).
+    pub evidence: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Active,
+    Blocked,
+    Failed,
+    Retest,
+    AwaitingApproval,
+    Done,
+}
+
+/// The workspace snapshot the pane renders (§6.10). All sections optional;
+/// the pane renders only the sections with data. The backend fills these
+/// (PR-F wires the bridge).
+#[derive(Debug, Clone, Default)]
+pub struct Workspace {
+    pub phase_index: usize, // 0..5
+    pub plan: Vec<Task>,
+    pub findings: Vec<Finding>,
+    pub verification: Vec<Verification>,
+}
+
+/// One finding row: title + inline source path.
+#[derive(Debug, Clone)]
+pub struct Finding {
+    pub title: String,
+    pub source: Option<String>,
+}
+
+/// One verification row: check name + result.
+#[derive(Debug, Clone)]
+pub struct Verification {
+    pub name: String,
+    pub result: VerificationResult,
+    pub proof_count: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationResult {
+    Passed,
+    Failed,
+    Pending,
+}
+
 /// The reducer state.
 #[derive(Debug)]
 pub struct App {
@@ -123,13 +199,12 @@ pub struct App {
     pub tool_state: ToolState,
     /// Pending tool calls awaiting approval (PR-C will render these).
     pub pending_approvals: Vec<PendingApproval>,
+    /// Workspace snapshot (§6.10) — empty until the backend fills it (PR-F).
+    pub workspace: Workspace,
     /// Last status one-liner (shown in toast / status bar).
     pub last_status: String,
     /// Active error from the backend, if any.
     pub last_error: Option<String>,
-    /// Thinking indicator phase (spinner frame index, modular).
-    /// Thinking indicator phrase index (rotates every ~2.4 s).
-    /// Tick count at which the last phrase rotation happened.
     /// Transcript scroll offset (lines from top). Auto-scrolls to bottom.
     pub transcript_scroll: u16,
     /// Ctrl+C press count — 0 = none, 1 = "press again to quit", 2 = quit.
@@ -138,7 +213,6 @@ pub struct App {
     pub last_ctrl_c_tick: u64,
     /// Quit confirmation message (shown when ctrl_c_count == 1).
     pub quit_confirmation: bool,
-    /// Focus shimmer phase (0 or 1, alternates every ~125ms).
     /// Cost flash frames (counts down from 8 when cost changes).
     pub cost_flash_frames: u8,
     /// Reconnecting spinner phase (0..3).
@@ -262,6 +336,7 @@ impl App {
             connection: ConnectionState::Online,
             tool_state: ToolState::Idle,
             pending_approvals: Vec::new(),
+            workspace: Workspace::default(),
             last_status: String::new(),
             last_error: None,
             transcript_scroll: 0,

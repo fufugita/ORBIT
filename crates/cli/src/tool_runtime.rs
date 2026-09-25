@@ -30,6 +30,32 @@ pub enum ApprovalVerdict {
     AllowSession,
 }
 
+thread_local! {
+    /// True when the front-end is a plain surface (REPL / non-TTY) and
+    /// stdout lines are safe. The TUI leaves it false — its worker threads
+    /// must never print to the alt screen.
+    static PLAIN_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable plain-grammar stdout lines (REPL / non-TTY front-ends).
+pub fn enable_plain_output() {
+    PLAIN_OUTPUT.with(|c| c.set(true));
+}
+
+fn plain_output_enabled() -> bool {
+    PLAIN_OUTPUT.with(|c| c.get())
+}
+
+/// Current wall-clock time as HH:MM for the plain grammar's line stamps.
+fn hhmm_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (h, m) = ((secs / 3600) % 24, (secs / 60) % 60);
+    format!("{h:02}:{m:02}")
+}
+
 /// A pending tool call awaiting approval — the data the channel sees.
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
@@ -75,9 +101,15 @@ impl ApprovalChannel for StdApprovalChannel {
         if !self.interactive {
             return ApprovalVerdict::Deny;
         }
-        // Existing blocking stdin reader — identical to the old prompt_approval.
+        // Plain grammar (§11.4): words not glyphs, risk in words, the
+        // choices spelled out. Same grammar as the TUI's copy mode.
         use std::io::Write;
-        print!("[tool] {} allow? [y/N/R]: ", req.summary);
+        print!(
+            "approval needed: {} ({} risk). y allow once, R allow {} this session, n deny: ",
+            req.summary,
+            req.risk.as_str(),
+            req.tool_name
+        );
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {
@@ -228,6 +260,24 @@ pub fn execute_call(
             reason: reason.into(),
         }))
         .map_err(|e| format!("record tool verdict: {e}"))?;
+
+    // Plain grammar (§11.4): the verdict is one stamped line on stdout —
+    // words not glyphs, greppable, screen-reader friendly. Only in plain
+    // mode: the TUI worker shares this code path, and a println from it
+    // would scribble on the alternate screen.
+    if plain_output_enabled() {
+        println!(
+            "{} tool {} {}: {}",
+            hhmm_now(),
+            call.name,
+            safe_call_summary(call),
+            if allowed {
+                "allowed by you"
+            } else {
+                "denied by you"
+            }
+        );
+    }
 
     if !allowed {
         let output = tool_error(reason);

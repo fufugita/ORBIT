@@ -8,7 +8,10 @@
 
 use crate::glyphs::Glyphs;
 use crate::rich::render_message;
-use crate::state::{App, ConnectionState, Focus, LeftTab, LogoPhase, ToolState, TranscriptLine};
+use crate::state::{
+    App, ConnectionState, Focus, LeftTab, LogoPhase, TaskState, ToolState, TranscriptLine,
+    VerificationResult,
+};
 use crate::tokens::Design;
 use crate::unicode::truncate_graphemes;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -382,20 +385,170 @@ fn render_center_pane(
 
 // ── Right rail (§6.10) ───────────────────────────────────────────────────────
 
+/// A workspace section label: muted label + faint count (§6.10).
+fn section_line(label: &str, count: usize, p: &crate::tokens::ResolvedPalette) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label.to_string(), Style::default().fg(p.muted)),
+        Span::styled(format!("  {count}"), Style::default().fg(p.faint)),
+    ])
+}
+
 fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
     let body = render_pane_header(frame, area, "Workspace", app.focus == Focus::Right, d, g);
-    let placeholder = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "(workspace file — PR-F)",
-            Style::default().fg(p.faint),
-        )]),
-    ]);
-    frame.render_widget(placeholder, body);
-}
+    let mut lines: Vec<Line> = vec![Line::from("")];
 
-// ── Status line (§6.11) ──────────────────────────────────────────────────────
+    let w = &app.workspace;
+    if w.plan.is_empty() && w.findings.is_empty() && w.verification.is_empty() {
+        // Backend hasn't filled it yet (PR-F).
+        lines.push(Line::from(vec![Span::styled(
+            "(workspace empty — PR-F wires the bridge)",
+            Style::default().fg(p.faint),
+        )]));
+    } else {
+        // ── Phase stepper (§6.10) ──────────────────────────────────────────
+        // ✓━━✓━━◉──◌──◌  execute  3/5
+        let current = w.phase_index.min(4);
+        let mut stepper: Vec<Span> = Vec::new();
+        for i in 0..5 {
+            let color = if i < current {
+                p.muted
+            } else if i == current {
+                p.cyan
+            } else {
+                p.faint
+            };
+            let ch = if i < current {
+                g.done.to_string()
+            } else {
+                ["◉", "◌", "◌"][(i - current).min(2)].to_string()
+            };
+            let weight = if i == current {
+                Style::default().fg(p.cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            stepper.push(Span::styled(ch, weight));
+            if i < 4 {
+                let connector = if i < current { "━━" } else { "──" };
+                let c_color = if i < current { p.muted } else { p.faint };
+                stepper.push(Span::styled(connector, Style::default().fg(c_color)));
+            }
+        }
+        let phase_names = ["orient", "reason", "act", "verify", "respond"];
+        let mut header = stepper;
+        header.push(Span::raw(" "));
+        header.push(Span::styled(
+            phase_names[current],
+            Style::default().fg(p.cyan).add_modifier(Modifier::BOLD),
+        ));
+        header.push(Span::styled(
+            format!("  {}/5", current + 1),
+            Style::default().fg(p.faint),
+        ));
+        lines.push(Line::from(header));
+        lines.push(Line::from(""));
+
+        // ── Section helper ────────────────────────────────────────────────
+
+        // PLAN
+        if !w.plan.is_empty() {
+            lines.push(section_line("PLAN", w.plan.len(), p));
+            for task in &w.plan {
+                let (glyph, color, bold) = match task.state {
+                    TaskState::Active => ("●", p.cyan, true),
+                    TaskState::Blocked => (g.blocked, p.amber, false),
+                    TaskState::Failed => (g.failed, p.red, false),
+                    TaskState::Retest => (g.retest, p.amber, false),
+                    TaskState::AwaitingApproval => ("◇", p.magenta, false),
+                    TaskState::Done => (g.done, p.muted, false),
+                };
+                let mut title_style = Style::default().fg(p.ink);
+                if bold {
+                    title_style = title_style.add_modifier(Modifier::BOLD);
+                }
+                let evidence = if task.evidence > 0 {
+                    format!(
+                        "  {} proof{}",
+                        task.evidence,
+                        if task.evidence == 1 { "" } else { "s" }
+                    )
+                } else {
+                    "  claimed".to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                    Span::styled(task.title.clone(), title_style),
+                    Span::styled(
+                        evidence,
+                        Style::default().fg(if task.evidence > 0 { p.green } else { p.faint }),
+                    ),
+                ]));
+                if let Some(sub) = &task.sub {
+                    let sub_color = match task.state {
+                        TaskState::Active => p.cyan,
+                        TaskState::Failed => p.red,
+                        TaskState::Blocked | TaskState::Retest => p.amber,
+                        TaskState::AwaitingApproval => p.muted,
+                        TaskState::Done => p.faint,
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("      ", Style::default()),
+                        Span::styled(sub.clone(), Style::default().fg(sub_color)),
+                    ]));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+
+        // FINDINGS
+        if !w.findings.is_empty() {
+            lines.push(section_line("FINDINGS", w.findings.len(), p));
+            for f in &w.findings {
+                let source = f
+                    .source
+                    .as_deref()
+                    .map(|s| format!(" {s}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("  ∙ ", Style::default().fg(p.faint)),
+                    Span::styled(f.title.clone(), Style::default().fg(p.ink2)),
+                    Span::styled(source, Style::default().fg(p.faint)),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+
+        // VERIFICATION
+        if !w.verification.is_empty() {
+            lines.push(section_line("VERIFICATION", w.verification.len(), p));
+            for v in &w.verification {
+                let (glyph, color) = match v.result {
+                    VerificationResult::Passed => (g.done, p.green),
+                    VerificationResult::Failed => (g.failed, p.red),
+                    VerificationResult::Pending => ("◌", p.faint),
+                };
+                let proof = if v.proof_count > 0 {
+                    format!(
+                        "  {} proof{}",
+                        v.proof_count,
+                        if v.proof_count == 1 { "" } else { "s" }
+                    )
+                } else {
+                    "  claimed".to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {glyph} "), Style::default().fg(color)),
+                    Span::styled(v.name.clone(), Style::default().fg(p.ink2)),
+                    Span::styled(proof, Style::default().fg(p.faint)),
+                ]));
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), body);
+}
 
 fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
