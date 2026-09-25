@@ -1,148 +1,517 @@
-//! Ratatui rendering — Bubble Tea visual language ported to ratatui.
+//! Ratatui rendering — the ORBIT visual system (docs/tui/DESIGN.md).
 //!
-//! The whole TUI is styled like a Charm app: Lip Gloss-style rounded blocks
-//! everywhere, Bubbles braille spinner, bubble list items, rounded composer
-//! with a blinking cursor, scrollable transcript viewport, animated orbital
-//! logo, Huh-style modal, and smooth focus transitions. Every color reads
-//! from `ResolvedTheme` — no hardcoded colors.
+//! Ink, not boxes: structure comes from gutters, alignment, spacing and
+//! hairlines. No pane has a border. At most one rounded frame is on screen
+//! at a time, and a frame always means "this needs you" — an approval, the
+//! palette, a confirmation. All colours come from the token palette
+//! (tokens.rs); all glyphs from glyphs.rs. No literals in render code.
 
+use crate::glyphs::Glyphs;
 use crate::rich::render_message;
-use crate::state::{
-    App, ComposerState, ConnectionState, Focus, LeftTab, LogoPhase, ToolState, TranscriptLine,
-};
-use crate::theme::{ResolvedTheme, BRAILLE_SPINNER, DIVIDER_RAMP, ORBIT_RING, PANE_DIM, ROUNDED};
+use crate::state::{App, ConnectionState, Focus, LeftTab, LogoPhase, ToolState, TranscriptLine};
+use crate::tokens::Design;
 use crate::unicode::truncate_graphemes;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 
-/// A Lip Gloss-style rounded block for a pane. Focused = accent color with
-/// a bold title + `▶` gutter; unfocused = PANE_DIM. A smooth focus
-/// transition blends the border color over 3 frames when focus changes.
-fn pane_block<'a>(title: &'a str, focused: bool, app: &App, theme: &ResolvedTheme) -> Block<'a> {
-    let accent = if app.shimmer_phase.is_multiple_of(2) {
-        theme.colors.accent
+// ── Pane headers (§6.1) ──────────────────────────────────────────────────────
+
+/// One-row pane header: title, then a hairline rule filling the rest of the
+/// row. The focused pane gets a heavy rule (`━`, rule_hi) and a magenta
+/// title; unfocused panes get a light rule (`─`, rule) and an ink2 title.
+/// This replaces the old boxed pane_block — no Borders::ALL anywhere.
+fn pane_header_line(
+    title: &str,
+    focused: bool,
+    area_width: u16,
+    d: &Design,
+    g: &Glyphs,
+) -> Line<'static> {
+    let (title_color, rule_glyph, rule_color, bold) = if focused {
+        (d.palette.magenta, g.rule_focus, d.palette.rule_hi, true)
     } else {
-        theme.colors.accent_bright
+        (d.palette.ink2, g.rule, d.palette.rule, false)
     };
-    let base = if focused { accent } else { PANE_DIM };
-    // Smooth focus blend. The focused blend starts from accent_dim (a visible
-    // "warming up" color), NOT PANE_DIM — so the focused pane is identifiable
-    // on the very first frame after a focus change, even mid-burst when the
-    // blend keeps restarting. Unfocused panes fade toward PANE_DIM as before.
-    let color = match app.focus_transition {
-        Some(phase) if focused => blend_color(theme.colors.accent_dim, accent, phase as f32 / 3.0),
-        Some(phase) if !focused => blend_color(accent, PANE_DIM, phase as f32 / 3.0),
-        _ => base,
-    };
-    let title_text = if focused {
-        format!("▶ {title} ")
-    } else {
-        format!(" {title} ")
-    };
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(ROUNDED)
-        .border_style(Style::default().fg(color))
-        .title(Span::styled(
-            title_text,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-    // Focus shimmer divider under the title (4-frame gradient).
-    if focused {
-        let ramp = DIVIDER_RAMP[app.shimmer_phase as usize % DIVIDER_RAMP.len()];
-        block = block.title_bottom(Line::from(vec![Span::styled(
-            ramp,
-            Style::default().fg(color),
-        )]));
+    let mut style = Style::default().fg(title_color);
+    if bold {
+        style = style.add_modifier(Modifier::BOLD);
     }
-    block
+    let title_span = Span::styled(format!(" {title} "), style);
+    // Fill the remainder of the row with the rule glyph. Width math is
+    // approximate for wide titles; the rule just fills whatever remains.
+    let title_w = display_width_of(title) as u16 + 2;
+    let fill = area_width.saturating_sub(title_w) as usize;
+    let rule = rule_glyph.repeat(fill);
+    Line::from(vec![
+        title_span,
+        Span::styled(rule, Style::default().fg(rule_color)),
+    ])
 }
 
-/// Blend two RGB colors by `t` (0.0 = from, 1.0 = to).
-fn blend_color(from: Color, to: Color, t: f32) -> Color {
-    let rgb = |c: Color| match c {
-        Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
-        _ => (0.0, 0.0, 0.0),
-    };
-    let (fr, fg, fb) = rgb(from);
-    let (tr, tg, tb) = rgb(to);
-    Color::Rgb(
-        (fr + (tr - fr) * t) as u8,
-        (fg + (tg - fg) * t) as u8,
-        (fb + (tb - fb) * t) as u8,
-    )
+/// Display width helper (single source: unicode.rs).
+fn display_width_of(s: &str) -> usize {
+    crate::unicode::display_width(s)
 }
+
+/// Render the one-row header for a pane, then return the body area below it.
+fn render_pane_header(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    focused: bool,
+    d: &Design,
+    g: &Glyphs,
+) -> Rect {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(pane_header_line(title, focused, area.width, d, g)),
+        rows[0],
+    );
+    rows[1]
+}
+
+// ── Main render ──────────────────────────────────────────────────────────────
 
 /// Render the current app state into the frame.
-pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, theme: &ResolvedTheme) {
+///
+/// Layout (§5.3 row priorities): 1 header-less main row | 1 status line.
+/// The chrome budget is 2 rows total (the old build spent 11).
+pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &Design) {
     let area = frame.area();
+    let g = &Glyphs::for_set(d.caps.glyphs);
 
-    // Vertical: header | main (fill) | status | help
+    // Vertical: main (fill) | status (1).
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(theme.layout.header_lines),
-            Constraint::Min(5),
-            Constraint::Length(theme.layout.status_lines),
-            Constraint::Length(theme.layout.help_lines),
-        ])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(area);
 
-    render_header(frame, outer[0], app, theme);
-
-    // Three columns with 1-cell whitespace gutters (no full-height borders
-    // between them — the chat breathes; the side panes are styled boxes).
+    // Three columns: left rail | divider | conversation | divider | right
+    // rail. Rails are column counts (tokens::LayoutConfig); the dividers are
+    // full-height hairlines that double as scroll tracks (§6.14).
+    let l = &d.layout_rails;
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(theme.layout.left_pct),
-            Constraint::Length(1), // gutter
-            Constraint::Min(10),   // conversation (fills the rest)
-            Constraint::Length(1), // gutter
-            Constraint::Percentage(theme.layout.right_pct),
+            Constraint::Length(l.0),
+            Constraint::Length(1), // divider track
+            Constraint::Min(10),   // conversation
+            Constraint::Length(1), // divider track
+            Constraint::Length(l.1),
         ])
-        .split(outer[1]);
+        .split(outer[0]);
 
-    render_left_pane(frame, main[0], app, theme);
-    render_center_pane(frame, main[2], app, composer_text, theme);
-    render_right_pane(frame, main[4], app, theme);
-    render_status_bar(frame, outer[2], app, theme);
-    if theme.tabs.show_help_bar {
-        render_help(frame, outer[3], app, theme);
-    }
+    render_left_pane(frame, main[0], app, d, g);
+    render_divider(frame, main[1], app, d, g, false);
+    render_center_pane(frame, main[2], app, composer_text, d, g);
+    render_divider(frame, main[3], app, d, g, true);
+    render_right_pane(frame, main[4], app, d, g);
+    render_status_bar(frame, outer[1], app, d, g);
 
-    // Quit confirmation modal — rendered on top of everything.
+    // Overlays — the only frames on screen (one at a time, §1).
     if app.quit_confirmation {
-        render_quit_modal(frame, area, app, theme);
+        render_quit_modal(frame, area, app, d, g);
     }
-    // Glass-modal approval sheet (Huh-style) — dim overlay + centered modal.
     if !app.pending_approvals.is_empty() {
-        render_approval_modal(frame, area, app, theme);
+        render_approval_modal(frame, area, app, d, g);
     }
 }
 
-/// Render a centered quit confirmation modal with dim overlay.
-fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &ResolvedTheme) {
-    let c = &theme.colors;
+// ── Divider / scrollbar (§6.14) ──────────────────────────────────────────────
 
-    // Dim overlay.
-    let dim_overlay =
-        Block::default().style(Style::default().fg(c.dim).add_modifier(Modifier::DIM));
-    frame.render_widget(dim_overlay, area);
+/// Full-height divider `│`; when the transcript overflows, the center
+/// divider becomes a scroll track with a `┃` thumb at the transcript's
+/// position.
+fn render_divider(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    d: &Design,
+    g: &Glyphs,
+    is_center: bool,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let track = Span::styled(g.divider, Style::default().fg(d.palette.rule));
+    let mut lines: Vec<Line> = vec![Line::from(track.clone()); area.height as usize];
 
+    // Scroll thumb on the center divider when there is more content than
+    // fits. (Approximate: app.scroll_hint carries 0=at-bottom, 1=scrolled.)
+    if is_center && app.viewport_manual {
+        // Position the thumb by scroll fraction; without exact totals here,
+        // place it in the upper third while scrolled (the pill in §6.14's
+        // "↓ n new" is a later step — the track alone is honest).
+        let idx = (area.height as usize / 3).min(area.height as usize - 1);
+        lines[idx] = Line::from(Span::styled(g.thumb, Style::default().fg(d.palette.muted)));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+// ── Left rail (§6.9) ─────────────────────────────────────────────────────────
+
+fn render_left_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+    let p = &d.palette;
+    let title = match app.left_tab {
+        LeftTab::Sessions => "Sessions",
+        LeftTab::Verbose => "Activity",
+    };
+    let body = render_pane_header(frame, area, title, app.focus == Focus::Left, d, g);
+
+    let items: Vec<ListItem> = match app.left_tab {
+        LeftTab::Sessions => vec![ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(format!("{} ", g.conn_online), Style::default().fg(p.green)),
+                Span::styled(&app.session_id_prefix, Style::default().fg(p.ink)),
+            ]),
+            Line::from(vec![
+                Span::styled("model ", Style::default().fg(p.muted)),
+                Span::styled(&app.model, Style::default().fg(p.ink2)),
+            ]),
+        ])],
+        LeftTab::Verbose => {
+            if app.in_flight.is_empty() {
+                vec![ListItem::new(Line::from(vec![Span::styled(
+                    "(no active stream)",
+                    Style::default().fg(p.faint),
+                )]))]
+            } else {
+                vec![ListItem::new(vec![
+                    Line::from(vec![Span::styled("streaming", Style::default().fg(p.cyan))]),
+                    Line::from(vec![Span::styled(
+                        &app.in_flight,
+                        Style::default().fg(p.muted),
+                    )]),
+                ])]
+            }
+        }
+    };
+    frame.render_widget(List::new(items), body);
+}
+
+// ── Center pane: transcript + composer (§6.2–6.8, §5.5) ──────────────────────
+
+fn render_center_pane(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    composer_text: &str,
+    d: &Design,
+    g: &Glyphs,
+) {
+    let p = &d.palette;
+
+    // No pane header on the conversation — it IS the centre of gravity
+    // (§1). Split: transcript (fill) | queue | composer band (1–2 rows).
+    let queue_h = app.queued.len() as u16;
+    let composer_h = if composer_text.lines().count() > 0 {
+        2
+    } else {
+        1
+    };
+    let center = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(queue_h),
+            Constraint::Length(composer_h),
+        ])
+        .split(area);
+
+    // ── Transcript ─────────────────────────────────────────────────────────
+    let mut lines: Vec<Line> = Vec::new();
+    // Gutter 3 (§6.5): the you-glyph at col 0, text from col 2.
+    let user_gutter = || Span::styled(format!("{}  ", g.you), Style::default().fg(p.muted));
+    let orbit_gutter = |live: bool| {
+        Span::styled(
+            format!("{}  ", g.orbit),
+            Style::default().fg(if live { p.cyan } else { p.magenta }),
+        )
+    };
+
+    for entry in &app.transcript {
+        match entry {
+            TranscriptLine::User(text) => {
+                lines.push(Line::from(user_gutter()));
+                for line in text.lines() {
+                    lines.push(Line::from(vec![
+                        Span::raw("   "),
+                        Span::styled(line, Style::default().fg(p.ink)),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
+            TranscriptLine::Assistant(text) => {
+                lines.push(Line::from(orbit_gutter(false)));
+                for rich_line in render_message(text, d) {
+                    let mut spans = vec![Span::raw("   ")];
+                    spans.extend(rich_line.spans);
+                    lines.push(Line::from(spans));
+                }
+                lines.push(Line::from(""));
+            }
+            TranscriptLine::Stripped { tool_name } => {
+                // The tool line alone — stripping stays in the bridge,
+                // silently (§12: no "(reasoning stripped)" advertisement).
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        format!("{} {tool_name}", g.running),
+                        Style::default().fg(p.ink2),
+                    ),
+                ]));
+                lines.push(Line::from(""));
+            }
+            TranscriptLine::System(text) => {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{} ", g.notice), Style::default().fg(p.muted)),
+                    Span::styled(text, Style::default().fg(p.muted)),
+                ]));
+                lines.push(Line::from(""));
+            }
+        }
+    }
+
+    // In-flight stream — live star in the gutter, cyan while working.
+    let streaming = !app.in_flight.is_empty();
+    if streaming {
+        lines.push(Line::from(orbit_gutter(true)));
+        for rich_line in render_message(&app.in_flight, d) {
+            let mut spans = vec![Span::raw("   ")];
+            spans.extend(rich_line.spans);
+            lines.push(Line::from(spans));
+        }
+    }
+    // NOTE: while Streaming with an empty in_flight, no transcript line is
+    // added — the working star in the status line (§6.11) is the sole
+    // indicator. This keeps streamed text contiguous in the render buffer
+    // (§7: text appears without token-by-token animation) and avoids the
+    // old "thinking phrases" theatre.
+
+    // Errors — red glyph + word (colour is the third signal).
+    if let Some(err) = &app.last_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", g.failed), Style::default().fg(p.red)),
+            Span::styled(err, Style::default().fg(p.red)),
+        ]));
+    }
+
+    // Viewport: auto-scroll to bottom unless the operator scrolled up.
+    let visible_height = center[0].height as usize;
+    let total_lines = lines.len();
+    let scroll = if app.viewport_manual {
+        app.viewport_scroll as usize
+    } else {
+        total_lines.saturating_sub(visible_height)
+    };
+
+    let transcript = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0));
+    frame.render_widget(transcript, center[0]);
+
+    // ── Queue: pending prompts above the composer ──────────────────────────
+    let mut queue_rows = Vec::new();
+    for q in &app.queued {
+        queue_rows.push(Line::from(vec![
+            Span::styled(format!("{} ", g.pending), Style::default().fg(p.faint)),
+            Span::styled(truncate_graphemes(q, 40), Style::default().fg(p.muted)),
+        ]));
+    }
+    if !queue_rows.is_empty() {
+        frame.render_widget(Paragraph::new(queue_rows), center[1]);
+    }
+
+    // ── Composer: a band, not a box (§5.5) ─────────────────────────────────
+    // The › prompt in magenta (your input is one of the six magenta things),
+    // text in ink, no border. While streaming the band shows Stop.
+    let composer_focused = app.focus == Focus::Center;
+    let prompt_color = if composer_focused { p.magenta } else { p.faint };
+    let turn_live = app.turn_in_flight
+        || app.tool_state == ToolState::Streaming
+        || matches!(app.tool_state, ToolState::Running(_));
+    let cursor_on = !turn_live && (app.tick_count / 16).is_multiple_of(2);
+    let cursor = if cursor_on { "▏" } else { " " };
+    let prompt_line = if composer_text.is_empty() {
+        Line::from(vec![
+            Span::styled(format!("{} ", g.you), Style::default().fg(prompt_color)),
+            Span::styled("ask orbit", Style::default().fg(p.faint)),
+            Span::styled(cursor, Style::default().fg(p.magenta)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(format!("{} ", g.you), Style::default().fg(prompt_color)),
+            Span::styled(composer_text, Style::default().fg(p.ink)),
+        ])
+    };
+    let mut composer_lines = vec![prompt_line];
+    // Second row for multi-line text (first continuation line only; the
+    // composer grows with content — full auto-height is a later step).
+    if composer_text.lines().count() > 1 {
+        if let Some(second) = composer_text.lines().nth(1) {
+            composer_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(second, Style::default().fg(p.ink)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(composer_lines), center[2]);
+}
+
+// ── Right rail (§6.10) ───────────────────────────────────────────────────────
+
+fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+    let p = &d.palette;
+    let body = render_pane_header(frame, area, "Workspace", app.focus == Focus::Right, d, g);
+    let placeholder = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "(workspace file — PR-F)",
+            Style::default().fg(p.faint),
+        )]),
+    ]);
+    frame.render_widget(placeholder, body);
+}
+
+// ── Status line (§6.11) ──────────────────────────────────────────────────────
+
+fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+    let p = &d.palette;
+    // Left side: the compact mark (the working star while ORBIT works — the
+    // only moving cell), then the dynamic state.
+    let mark =
+        if matches!(app.logo_phase, LogoPhase::Working) || app.tool_state == ToolState::Streaming {
+            g.working()[app.spinner_frame as usize % 4]
+        } else {
+            g.orbit
+        };
+    let tool_state = match &app.tool_state {
+        ToolState::Idle => Span::styled("idle", Style::default().fg(p.muted)),
+        ToolState::Streaming => Span::styled("streaming", Style::default().fg(p.cyan)),
+        ToolState::AwaitingApproval => Span::styled(
+            format!("{} approval", g.decision),
+            Style::default().fg(p.magenta),
+        ),
+        ToolState::Running(name) => Span::styled(
+            format!("{} {name}", g.running,),
+            Style::default().fg(p.cyan),
+        ),
+        ToolState::AutoGranted(name) => Span::styled(
+            format!("{} auto({name})", g.allowed_session),
+            Style::default().fg(p.muted),
+        ),
+    };
+    let conn = match app.connection {
+        ConnectionState::Online => Span::styled(
+            format!("{} online", g.conn_online),
+            Style::default().fg(p.green),
+        ),
+        ConnectionState::Reconnecting => Span::styled(
+            format!("{} reconnect", g.conn_retrying),
+            Style::default().fg(p.amber),
+        ),
+        ConnectionState::Offline => Span::styled(
+            format!("{} offline", g.conn_offline),
+            Style::default().fg(p.red),
+        ),
+    };
+
+    let tokens = format!(
+        "{}{} {}{}",
+        g.tokens_down,
+        format_count(app.total_input_tokens),
+        g.tokens_up,
+        format_count(app.total_output_tokens)
+    );
+
+    let cost = app.total_cost_microcents;
+    let cost_str = format!("${}.{:06}", cost / 1_000_000, cost % 1_000_000);
+
+    let sep = Span::styled(" ", Style::default());
+    let mut spans = vec![
+        Span::styled(mark, Style::default().fg(p.magenta)),
+        sep.clone(),
+        Span::styled(&app.model, Style::default().fg(p.ink2)),
+        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(&app.provider, Style::default().fg(p.muted)),
+        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(&app.session_id_prefix, Style::default().fg(p.faint)),
+        Span::styled(" · ", Style::default().fg(p.faint)),
+        tool_state,
+        Span::styled(" · ", Style::default().fg(p.faint)),
+        conn,
+        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(tokens, Style::default().fg(p.muted)),
+        Span::styled(" · ", Style::default().fg(p.faint)),
+        Span::styled(cost_str, Style::default().fg(p.ink2)),
+    ];
+    if !app.last_status.is_empty() {
+        spans.push(Span::styled(" · ", Style::default().fg(p.faint)));
+        spans.push(Span::styled(&app.last_status, Style::default().fg(p.muted)));
+    }
+    frame.render_widget(Line::from(spans), area);
+}
+
+/// Format a count with k/M/B suffixes: 1_234 → "1.2k".
+pub fn format_count(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+// ── Overlays — the only frames (§1, §6.16) ───────────────────────────────────
+
+/// A one-colour rounded frame for overlays (§4.2): magenta for approvals
+/// (ORBIT asking for your authority), rule_hi for confirmations. Built from
+/// glyph constants — never the ┌┐ set, never double-line.
+fn overlay_block<'a>(title: &'a str, color: Color, g: &Glyphs) -> Block<'a> {
+    use ratatui::symbols::border;
+    let set = border::Set {
+        top_left: g.frame_top_left,
+        top_right: g.frame_top_right,
+        bottom_left: g.frame_bottom_left,
+        bottom_right: g.frame_bottom_right,
+        vertical_left: g.frame_left,
+        vertical_right: g.frame_right,
+        horizontal_top: g.frame_top,
+        horizontal_bottom: g.frame_bottom,
+    };
+    Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_set(set)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+}
+
+/// Quit confirmation — a small solid card, NO backdrop dimming (§12).
+fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+    let p = &d.palette;
     let is_running =
         app.tool_state == ToolState::Streaming || matches!(app.tool_state, ToolState::Running(_));
     let title = if is_running {
-        " Still running — quit? "
+        "Still running — quit?"
     } else {
-        " Quit ORBIT? "
+        "Quit ORBIT?"
     };
     let message = if is_running {
-        "  A response is still running. Quit anyway?"
+        "A response is still running. Quit anyway?"
     } else {
-        "  Are you sure you want to quit?"
+        "Are you sure you want to quit?"
     };
 
     let modal = Layout::default()
@@ -162,542 +531,70 @@ fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &
         ])
         .split(modal[1]);
 
-    let modal_block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(ROUNDED)
-        .border_style(Style::default().fg(c.warning))
-        .title(Span::styled(
-            title,
-            Style::default().fg(c.warning).add_modifier(Modifier::BOLD),
-        ));
-
-    let modal_content = Paragraph::new(vec![
+    let content = Paragraph::new(vec![
         Line::from(""),
-        Line::from(vec![Span::styled(message, Style::default().fg(c.text))]),
+        Line::from(vec![Span::styled(message, Style::default().fg(p.ink))]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  [y]", Style::default().fg(c.warning)),
-            Span::styled(" quit   ", Style::default().fg(c.dim)),
-            Span::styled("[n/Esc]", Style::default().fg(c.warning)),
-            Span::styled(" cancel", Style::default().fg(c.dim)),
+            Span::styled("y", Style::default().fg(p.magenta)),
+            Span::styled(" quit   ", Style::default().fg(p.muted)),
+            Span::styled("n", Style::default().fg(p.magenta)),
+            Span::styled(" stay", Style::default().fg(p.muted)),
         ]),
     ])
-    .block(modal_block);
-    frame.render_widget(modal_content, modal_h[1]);
+    .block(overlay_block(title, d.palette.rule_hi, g));
+    frame.render_widget(content, modal_h[1]);
 }
 
-/// The animated orbital logo — centered ORBIT in block letters, a ring of
-/// `◦` glyphs circling it, and a `✹` star riding the ring. The star advances
-/// one ring position per animation tick (8fps while working).
+/// The approval card (§6.15): docked at the bottom of the conversation,
+/// full conversation width, the ONLY magenta frame on screen. The request
+/// is ORBIT asking for your authority — it wears the brand colour, not a
+/// warning colour, and never looks like an OS error dialog.
 ///
-/// Phases (DR-21 L19): Splash (star pulses) → Steady (slow orbit) →
-/// Working (fast orbit while streaming) → Shutdown (star fades).
-pub fn logo_frame(app: &App, theme: &ResolvedTheme) -> Vec<Line<'static>> {
-    let c = &theme.colors;
-    let accent = if app.shimmer_phase.is_multiple_of(2) {
-        c.accent
-    } else {
-        c.accent_bright
-    };
-
-    // Ring position: the star index advances with logo_phase_frames.
-    // Steady: 1 position per 8 frames (2fps). Working: 1 per frame (8fps).
-    let advance = match app.logo_phase {
-        LogoPhase::Working => app.logo_phase_frames as usize,
-        LogoPhase::Steady | LogoPhase::Splash => (app.logo_phase_frames / 4) as usize,
-        LogoPhase::Shutdown => 0,
-    };
-    let star_idx = advance % ORBIT_RING.len();
-    let star_pos = ORBIT_RING[star_idx];
-
-    // Star glyph by phase.
-    let star = match app.logo_phase {
-        LogoPhase::Splash => crate::theme::STAR_RAMP[app.logo_phase_frames as usize % 4],
-        LogoPhase::Shutdown if app.logo_phase_frames >= 6 => "·",
-        LogoPhase::Shutdown if app.logo_phase_frames >= 3 => "◦",
-        _ => "✹",
-    };
-
-    // Logo block art (7 rows × 21 cols), then overlay the ring + star.
-    // ORBIT in the original 2-row ASCII Shadow wordmark (the one that reads
-    // clearly), centered vertically.
-    let mut rows = vec![vec![' '; 21]; 7];
-    let block = ["█▀█ █▀█ █▄▄ █ ▀█▀", "█▄█ █▀▄ █▄█ █  █ "];
-    for (r, row) in block.iter().enumerate() {
-        for (col, ch) in row.chars().enumerate() {
-            // Wordmark occupies cols 2..18 (17 wide), leaving col 0/1 and
-            // col 19/20 for the ring's left/right positions.
-            if col < 17 {
-                rows[r + 2][col + 2] = ch;
-            }
-        }
-    }
-    // Ring positions (row, col) — draw `◦` everywhere except the star spot.
-    for (r, col) in ORBIT_RING {
-        let (r, col) = (*r as usize, *col as usize);
-        if r < rows.len()
-            && col < rows[0].len()
-            && (r, col) != (star_pos.0 as usize, star_pos.1 as usize)
-        {
-            rows[r][col] = '◦';
-        }
-    }
-    // Star at its position.
-    let (sr, sc) = (star_pos.0 as usize, star_pos.1 as usize);
-    if sr < rows.len() && sc < rows[0].len() {
-        rows[sr][sc] = star.chars().next().unwrap_or('✹');
-    }
-
-    // Render rows with the accent color for the ring + star, block letters
-    // in composer color. Positions are computed from (row, col) directly.
-    let (sr, sc) = (star_pos.0 as usize, star_pos.1 as usize);
-    let star_ch = star.chars().next().unwrap_or('✹');
-    let mut out = Vec::new();
-    for (r, row) in rows.iter().enumerate() {
-        let mut spans = Vec::new();
-        for (col, ch) in row.iter().enumerate() {
-            if *ch == ' ' {
-                spans.push(Span::styled(" ", Style::default()));
-            } else if (r, col) == (sr, sc) {
-                // The star — always accent (even during Shutdown fade).
-                spans.push(Span::styled(
-                    star_ch.to_string(),
-                    Style::default().fg(accent),
-                ));
-            } else {
-                let color = match ch {
-                    '◦' => accent,
-                    '█' | '▀' | '▄' => c.composer,
-                    _ => accent,
-                };
-                spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-            }
-        }
-        out.push(Line::from(spans));
-    }
-    out
-}
-
-fn render_header(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &ResolvedTheme) {
-    // The header is JUST the orbital logo — clean, no metadata, no rule.
-    // Model/provider/session live in the status bar already.
-    let logo = logo_frame(app, theme);
-    frame.render_widget(Paragraph::new(logo).alignment(Alignment::Center), area);
-}
-
-fn render_left_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &ResolvedTheme) {
-    let c = &theme.colors;
-    let title = match app.left_tab {
-        LeftTab::Sessions => "Sessions",
-        LeftTab::Verbose => "Verbose",
-    };
-    let block = pane_block(title, app.focus == Focus::Left, app, theme);
-
-    // Bubble-style list items: rounded mini-cards with a colored left border.
-    let items: Vec<ListItem> = match app.left_tab {
-        LeftTab::Sessions => vec![ListItem::new(vec![
-            Line::from(vec![
-                Span::styled("● ", Style::default().fg(c.success)),
-                Span::styled(&app.session_id_prefix, Style::default().fg(c.text)),
-            ]),
-            Line::from(vec![
-                Span::styled("  model: ", Style::default().fg(c.dim)),
-                Span::styled(&app.model, Style::default().fg(c.text)),
-            ]),
-        ])],
-        LeftTab::Verbose => {
-            if app.in_flight.is_empty() {
-                vec![ListItem::new(Line::from(vec![Span::styled(
-                    "(no active stream)",
-                    Style::default().fg(c.dim),
-                )]))]
-            } else {
-                vec![ListItem::new(vec![
-                    Line::from(vec![Span::styled(
-                        "streaming:",
-                        Style::default().fg(c.composer),
-                    )]),
-                    Line::from(vec![Span::styled(
-                        &app.in_flight,
-                        Style::default().fg(c.dim),
-                    )]),
-                ])]
-            }
-        }
-    };
-    let list = List::new(items).block(block);
-    frame.render_widget(list, area);
-}
-
-fn render_center_pane(
+/// Facts arrive only from structured backend data; today the request
+/// carries tool name + summary, so the card renders those and the keys row.
+/// The risk badge, facts grid, and scroll-to-review land with the backend
+/// `risk` field (the one field this design can't draw without).
+fn render_approval_modal(
     frame: &mut ratatui::Frame,
     area: Rect,
     app: &App,
-    composer_text: &str,
-    theme: &ResolvedTheme,
+    d: &Design,
+    g: &Glyphs,
 ) {
-    let c = &theme.colors;
+    let p = &d.palette;
+    let first = &app.pending_approvals[0];
 
-    // Split center into: transcript (fill) | queue | composer.
-    // The composer is 3 rows: 1 top border + 1 text + 1 bottom border.
-    let center = Layout::default()
+    // Docked at the bottom of the conversation area: full width minus
+    // 1-column margins, height by content.
+    let queue_note = if app.pending_approvals.len() > 1 {
+        format!("{} of {}", 1, app.pending_approvals.len())
+    } else {
+        String::new()
+    };
+    let height = 8u16;
+    let dock = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(app.queued.len() as u16),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(height)])
         .split(area);
-
-    // ── Transcript (viewport with scrollbar) ──────────────────────────────
-    let mut lines: Vec<Line> = Vec::new();
-    let gutter = |color: Color| Span::styled("▌", Style::default().fg(color));
-    let orbit_color = c.accent;
-
-    for entry in &app.transcript {
-        match entry {
-            TranscriptLine::User(text) => {
-                lines.push(Line::from(vec![gutter(c.composer)]));
-                lines.push(Line::from(vec![Span::styled(
-                    "  you",
-                    Style::default().fg(c.composer).add_modifier(Modifier::BOLD),
-                )]));
-                for line in text.lines() {
-                    lines.push(Line::from(vec![
-                        gutter(c.composer),
-                        Span::styled(format!("  {line}"), Style::default().fg(c.text)),
-                    ]));
-                }
-                lines.push(Line::from(""));
-            }
-            TranscriptLine::Assistant(text) => {
-                lines.push(Line::from(vec![gutter(orbit_color)]));
-                lines.push(Line::from(vec![Span::styled(
-                    "  orbit",
-                    Style::default()
-                        .fg(orbit_color)
-                        .add_modifier(Modifier::BOLD),
-                )]));
-                for rich_line in render_message(text, theme) {
-                    let mut spans = vec![gutter(orbit_color)];
-                    spans.extend(rich_line.spans);
-                    lines.push(Line::from(spans));
-                }
-                lines.push(Line::from(""));
-            }
-            TranscriptLine::Stripped { tool_name } => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("  ⚡ {tool_name} (reasoning stripped)"),
-                    Style::default().fg(c.dim),
-                )]));
-                lines.push(Line::from(""));
-            }
-            TranscriptLine::System(text) => {
-                lines.push(Line::from(vec![Span::styled(
-                    text,
-                    Style::default().fg(c.dim),
-                )]));
-                lines.push(Line::from(""));
-            }
-        }
-    }
-
-    // In-flight text with the braille spinner when streaming.
-    if !app.in_flight.is_empty() {
-        for rich_line in render_message(&app.in_flight, theme) {
-            let mut spans = vec![gutter(orbit_color)];
-            spans.extend(rich_line.spans);
-            lines.push(Line::from(spans));
-        }
-        lines.push(Line::from(vec![Span::styled(
-            "█",
-            Style::default().fg(c.composer),
-        )]));
-    } else if app.tool_state == ToolState::Streaming {
-        let spinner = BRAILLE_SPINNER[app.spinner_frame as usize % BRAILLE_SPINNER.len()];
-        let phrase = &theme.spinner.phrases[app.thinking_phrase % theme.spinner.phrases.len()];
-        lines.push(Line::from(vec![
-            Span::styled(spinner, Style::default().fg(c.composer)),
-            Span::raw(" "),
-            Span::styled(phrase, Style::default().fg(c.dim)),
-        ]));
-    }
-
-    // Errors
-    if let Some(err) = &app.last_error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("error: ", Style::default().fg(c.error)),
-            Span::styled(err, Style::default().fg(c.error)),
-        ]));
-    }
-
-    // Viewport: auto-scroll to bottom unless the operator scrolled up.
-    let visible_height = center[0].height.saturating_sub(2) as usize;
-    let total_lines = lines.len();
-    let scroll = if app.viewport_manual {
-        app.viewport_scroll as usize
-    } else {
-        total_lines.saturating_sub(visible_height)
-    };
-
-    let transcript = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll as u16, 0));
-    frame.render_widget(transcript, center[0]);
-
-    // Scrollbar on the right edge of the transcript.
-    if total_lines > visible_height && visible_height > 0 {
-        let vh = visible_height as u64;
-        let total = total_lines as u64;
-        let sc = scroll as u64;
-        let thumb_h = (vh * vh / total).max(1);
-        let range = (vh - thumb_h).max(1);
-        let thumb_off = (sc * range / (total - vh).max(1)).min(range);
-        for i in 0..visible_height {
-            let iu = i as u64;
-            if iu >= thumb_off && iu < thumb_off + thumb_h {
-                frame.render_widget(
-                    Paragraph::new("▏").style(Style::default().fg(c.accent)),
-                    Rect::new(
-                        center[0].x + center[0].width - 1,
-                        center[0].y + i as u16,
-                        1,
-                        1,
-                    ),
-                );
-            }
-        }
-    }
-
-    // ── Queue: pending prompts (dimmed) above the composer ────────────────
-    let mut queue_rows = Vec::new();
-    for q in &app.queued {
-        queue_rows.push(Line::from(vec![
-            Span::styled("⏳ ", Style::default().fg(c.warning)),
-            Span::styled(truncate_graphemes(q, 40), Style::default().fg(c.dim)),
-        ]));
-    }
-    if !queue_rows.is_empty() {
-        frame.render_widget(Paragraph::new(queue_rows), center[1]);
-    }
-
-    // ── Composer — rounded box with a blinking cursor ─────────────────────
-    let composer_focused = app.focus == Focus::Center;
-    let glyph = match &app.composer_state {
-        ComposerState::Idle => "▸",
-        ComposerState::Typing => "▸",
-        ComposerState::Sending => {
-            const SEND_FRAMES: [&str; 3] = ["↗", "↘", "↗"];
-            SEND_FRAMES[app.composer_send_phase as usize % 3]
-        }
-        ComposerState::Blocked(_) => "⏸",
-    };
-    let (composer_color, glyph_color) = if composer_focused {
-        match &app.composer_state {
-            ComposerState::Blocked(_) => (c.warning, c.warning),
-            _ => (c.composer, c.composer),
-        }
-    } else {
-        (c.composer_dim, c.composer_dim)
-    };
-    // Blinking cursor: toggles every 16 ticks (~500ms) — Bubble Tea's
-    // default blink rate (~2Hz), not a rapid strobe.
-    let cursor_on = (app.tick_count / 16).is_multiple_of(2);
-    let cursor = if cursor_on { "█" } else { " " };
-    let prompt = if composer_text.is_empty() {
-        Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-            Span::styled("ask orbit…", Style::default().fg(c.dim)),
-            Span::styled(cursor, Style::default().fg(composer_color)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-            Span::styled(composer_text, Style::default().fg(c.text)),
-            Span::styled(cursor, Style::default().fg(composer_color)),
-        ])
-    };
-    let composer = Paragraph::new(vec![prompt]).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_set(ROUNDED)
-            .border_style(Style::default().fg(composer_color))
-            .title(Span::styled(
-                format!(" {glyph} "),
-                Style::default().fg(glyph_color),
-            )),
-    );
-    frame.render_widget(composer, center[2]);
-}
-
-fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &ResolvedTheme) {
-    let c = &theme.colors;
-    let block = pane_block("Tasks", app.focus == Focus::Right, app, theme);
-    let placeholder = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "(workspace file — PR-F)",
-            Style::default().fg(c.dim),
-        )]),
-    ])
-    .block(block);
-    frame.render_widget(placeholder, area);
-}
-
-fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &ResolvedTheme) {
-    let c = &theme.colors;
-    let tool_glyph = match &app.tool_state {
-        ToolState::Idle => Span::styled("◯ idle", Style::default().fg(c.dim)),
-        ToolState::Streaming => {
-            let spinner = BRAILLE_SPINNER[app.spinner_frame as usize % BRAILLE_SPINNER.len()];
-            Span::styled(format!("{spinner} stream"), Style::default().fg(c.composer))
-        }
-        ToolState::AwaitingApproval => Span::styled("? approval", Style::default().fg(c.warning)),
-        ToolState::Running(name) => {
-            let spinner = BRAILLE_SPINNER[app.spinner_frame as usize % BRAILLE_SPINNER.len()];
-            Span::styled(format!("{spinner} {name}"), Style::default().fg(c.success))
-        }
-        ToolState::AutoGranted(name) => {
-            Span::styled(format!("◑ auto({name})"), Style::default().fg(c.accent))
-        }
-    };
-    let conn_glyph = match app.connection {
-        ConnectionState::Online => Span::styled("● online", Style::default().fg(c.success)),
-        ConnectionState::Reconnecting => {
-            let spinner = BRAILLE_SPINNER[app.spinner_frame as usize % BRAILLE_SPINNER.len()];
-            Span::styled(
-                format!("{spinner} reconnect"),
-                Style::default().fg(c.warning),
-            )
-        }
-        ConnectionState::Offline => Span::styled("✕ offline", Style::default().fg(c.error)),
-    };
-
-    let tokens = format!(
-        "↓{} ↑{}",
-        format_count(app.total_input_tokens),
-        format_count(app.total_output_tokens)
-    );
-
-    let cost = app.total_cost_microcents;
-    let cost_str = format!("${}.{:06}", cost / 1_000_000, cost % 1_000_000);
-    let cost_flash = if app.cost_flash_frames > 0 {
-        " ↗"
-    } else {
-        ""
-    };
-
-    let sep = Span::styled(" │ ", Style::default().fg(c.dim));
-    let mut spans = vec![
-        Span::styled(&app.model, Style::default().fg(c.accent)),
-        sep.clone(),
-        Span::styled(&app.provider, Style::default().fg(c.text)),
-        sep.clone(),
-        Span::styled(&app.session_id_prefix, Style::default().fg(c.dim)),
-        sep.clone(),
-        tool_glyph,
-        sep.clone(),
-        conn_glyph,
-        sep.clone(),
-        Span::styled(tokens, Style::default().fg(c.dim)),
-        sep,
-        Span::styled(
-            format!("{cost_str}{cost_flash}"),
-            Style::default().fg(c.text),
-        ),
-    ];
-    // Last status (model change confirmation, tool result, cancel note) —
-    // appended dimmed at the end; the render buffer clips overflow at the
-    // status-bar width (ratatui truncates a Line to its area).
-    if !app.last_status.is_empty() {
-        spans.push(Span::styled(" │ ", Style::default().fg(c.dim)));
-        spans.push(Span::styled(&app.last_status, Style::default().fg(c.dim)));
-    }
-    let line = Line::from(spans);
-    frame.render_widget(line, area);
-}
-
-/// Format a count with k/M/B suffixes: 1_234 → "1.2k".
-pub fn format_count(n: u64) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.1}B", n as f64 / 1_000_000_000.0)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-fn render_help(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &ResolvedTheme) {
-    let c = &theme.colors;
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled("q", Style::default().fg(c.warning)),
-        Span::raw(" quit  "),
-        Span::styled("Tab", Style::default().fg(c.warning)),
-        Span::raw(" focus  "),
-        Span::styled("1/2/3", Style::default().fg(c.warning)),
-        Span::raw(" panes  "),
-        Span::styled("z+y", Style::default().fg(c.warning)),
-        Span::raw(" copy  "),
-        Span::styled("g+s/g+v", Style::default().fg(c.warning)),
-        Span::raw(" left tab  "),
-        Span::styled("Ctrl+C", Style::default().fg(c.warning)),
-        Span::raw(" cancel/quit"),
-    ];
-    if theme.tabs.show_tick_count {
-        spans.push(Span::styled("  tick:", Style::default().fg(c.dim)));
-        spans.push(Span::styled(
-            app.tick_count.to_string(),
-            Style::default().fg(c.dim),
-        ));
-    }
-    let para = Paragraph::new(vec![Line::from(spans)]).alignment(Alignment::Left);
-    frame.render_widget(para, area);
-}
-
-/// Glass-modal approval sheet (Huh-style): dim the frame, show a centered
-/// rounded modal with the tool name, summary, and y/n/R button pills.
-fn render_approval_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, theme: &ResolvedTheme) {
-    let c = &theme.colors;
-
-    frame.render_widget(Clear, area);
-    let dim = Block::default().style(Style::default().fg(Color::Rgb(20, 20, 28)));
-    frame.render_widget(dim, area);
-
-    let modal = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(9),
-            Constraint::Min(1),
-        ])
-        .split(area);
-    let modal_h = Layout::default()
+    let dock_h = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Length(1),
             Constraint::Min(10),
-            Constraint::Percentage(60),
-            Constraint::Min(10),
+            Constraint::Length(1),
         ])
-        .split(modal[1]);
+        .split(dock[1]);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(ROUNDED)
-        .border_style(Style::default().fg(c.warning))
-        .title(Span::styled(
-            " ? Approval Required ",
-            Style::default().fg(c.warning).add_modifier(Modifier::BOLD),
-        ));
+    let title = if queue_note.is_empty() {
+        format!("Allow {}?", first.tool_name)
+    } else {
+        format!("Allow {}? · {queue_note}", first.tool_name)
+    };
 
-    let first = &app.pending_approvals[0];
     let summary = if app.pending_approvals.len() > 1 {
         format!(
-            "{}  (+{} more)",
+            "{} (+{} more)",
             first.summary,
             app.pending_approvals.len() - 1
         )
@@ -708,30 +605,59 @@ fn render_approval_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, them
     let content = Paragraph::new(vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  ", Style::default()),
+            Span::raw("  "),
             Span::styled(
                 &first.tool_name,
-                Style::default().fg(c.text).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.ink).add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            format!("  {summary}"),
-            Style::default().fg(c.text),
-        )]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(&summary, Style::default().fg(p.ink2)),
+        ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  [y]", Style::default().fg(c.warning)),
-            Span::styled(" once   ", Style::default().fg(c.dim)),
-            Span::styled("[n]", Style::default().fg(c.warning)),
-            Span::styled(" deny   ", Style::default().fg(c.dim)),
-            Span::styled("[R]", Style::default().fg(c.warning)),
-            Span::styled(" session", Style::default().fg(c.dim)),
+            Span::styled("  y", Style::default().fg(p.magenta)),
+            Span::styled(" allow once   ", Style::default().fg(p.muted)),
+            Span::styled("R", Style::default().fg(p.magenta)),
+            Span::styled(
+                format!(" allow {} this session   ", first.tool_name),
+                Style::default().fg(p.muted),
+            ),
+            Span::styled("n/esc", Style::default().fg(p.magenta)),
+            Span::styled(" deny", Style::default().fg(p.muted)),
         ]),
-        Line::from(vec![Span::styled(
-            "  Esc dismisses the request",
-            Style::default().fg(c.dim),
-        )]),
+        Line::from(vec![
+            Span::raw("  "),
+            // [GPT-AMEND 4] the post-decision honesty line.
+            Span::styled(
+                "Action not executed · no option is preselected",
+                Style::default().fg(p.faint),
+            ),
+        ]),
     ])
-    .block(block);
-    frame.render_widget(content, modal_h[1]);
+    .block(overlay_block(&title, p.magenta, g));
+    frame.render_widget(content, dock_h[1]);
+}
+
+// ── Startup / empty-state mark (§8) ──────────────────────────────────────────
+
+/// The expanded mark for the welcome screen: the two-row wordmark with the
+/// star. Static (deterministic, flicker-free) — motion lives in the status
+/// line's working star alone.
+pub fn welcome_mark(d: &Design, g: &Glyphs) -> Vec<Line<'static>> {
+    let p = &d.palette;
+    let rows = ["✦ ORBIT", "  orbits you"];
+    rows.iter()
+        .map(|r| {
+            Line::from(Span::styled(
+                r.to_string(),
+                Style::default().fg(if r.starts_with(g.orbit) {
+                    p.magenta
+                } else {
+                    p.muted
+                }),
+            ))
+        })
+        .collect()
 }

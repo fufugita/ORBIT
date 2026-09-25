@@ -128,11 +128,8 @@ pub struct App {
     /// Active error from the backend, if any.
     pub last_error: Option<String>,
     /// Thinking indicator phase (spinner frame index, modular).
-    pub thinking_phase: u8,
     /// Thinking indicator phrase index (rotates every ~2.4 s).
-    pub thinking_phrase: usize,
     /// Tick count at which the last phrase rotation happened.
-    pub last_phrase_tick: u64,
     /// Transcript scroll offset (lines from top). Auto-scrolls to bottom.
     pub transcript_scroll: u16,
     /// Ctrl+C press count — 0 = none, 1 = "press again to quit", 2 = quit.
@@ -142,7 +139,6 @@ pub struct App {
     /// Quit confirmation message (shown when ctrl_c_count == 1).
     pub quit_confirmation: bool,
     /// Focus shimmer phase (0 or 1, alternates every ~125ms).
-    pub shimmer_phase: u8,
     /// Cost flash frames (counts down from 8 when cost changes).
     pub cost_flash_frames: u8,
     /// Reconnecting spinner phase (0..3).
@@ -152,7 +148,6 @@ pub struct App {
     /// Logo phase (DR-21 L19): splash → steady → working → shutdown.
     pub logo_phase: LogoPhase,
     /// Frames spent in the current logo phase (drives phase transitions).
-    pub logo_phase_frames: u8,
     /// Composer state (DR-21 §3.4) — left glyph + border color.
     pub composer_state: ComposerState,
     /// Composer send animation phase (0..3 for ↗↘↗).
@@ -171,24 +166,15 @@ pub struct App {
     pub spinner_frame: u8,
     /// Smooth focus transition phase 0..3. The renderer blends the border
     /// color (dim → accent) over 3 frames when focus changes; None = settled.
-    pub focus_transition: Option<u8>,
     /// Transcript viewport scroll offset (lines from top). 0 = top.
     pub viewport_scroll: u16,
     /// True when the operator has scrolled up (disables auto-scroll).
     pub viewport_manual: bool,
+    /// One-shot: clear the terminal before the next draw so the whole frame
+    /// re-emits (set on the live→settled turn transition). Cell so the draw
+    /// path can consume it through &App.
+    pub force_full_redraw: std::cell::Cell<bool>,
 }
-
-/// The fixed local thinking phrases (never model-generated rationale).
-pub const THINKING_PHRASES: &[&str] = &[
-    "Orbiting…",
-    "Gathering context…",
-    "Working through it…",
-    "Forming a response…",
-    "Almost there…",
-];
-
-/// Spinner frames for the thinking indicator.
-pub const SPINNER_FRAMES: &[&str] = &["✦", "✧", "⋆", "·", "⋆", "✧"];
 
 /// One line in the transcript — either a user message or an assistant reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,28 +262,23 @@ impl App {
             pending_approvals: Vec::new(),
             last_status: String::new(),
             last_error: None,
-            thinking_phase: 0,
-            thinking_phrase: 0,
-            last_phrase_tick: 0,
             transcript_scroll: 0,
             ctrl_c_count: 0,
             last_ctrl_c_tick: 0,
             quit_confirmation: false,
-            shimmer_phase: 0,
             cost_flash_frames: 0,
             reconnect_phase: 0,
             copy_mode: false,
             logo_phase: LogoPhase::Splash,
-            logo_phase_frames: 0,
             composer_state: ComposerState::Idle,
             composer_send_phase: 0,
             queued: Vec::new(),
             turn_in_flight: false,
             cancel_requested: false,
             spinner_frame: 0,
-            focus_transition: None,
             viewport_scroll: 0,
             viewport_manual: false,
+            force_full_redraw: std::cell::Cell::new(false),
         }
     }
 
@@ -341,47 +322,19 @@ impl App {
                         self.dirty.set(DirtyFlags::TRANSCRIPT);
                     }
                 }
-                // Animate the thinking indicator while streaming with no text.
-                if self.tool_state == ToolState::Streaming && self.in_flight.is_empty() {
-                    self.thinking_phase = (self.thinking_phase + 1) % SPINNER_FRAMES.len() as u8;
-                    let ticks = self.tick_count;
-                    if ticks.saturating_sub(self.last_phrase_tick) >= 150 {
-                        self.last_phrase_tick = ticks;
-                        self.thinking_phrase = (self.thinking_phrase + 1) % THINKING_PHRASES.len();
-                    }
-                    self.dirty.set(DirtyFlags::TRANSCRIPT);
-                }
-                // Focus shimmer: toggle every ~125ms (8 ticks at 16ms).
-                if self.tick_count.is_multiple_of(8) {
-                    self.shimmer_phase = (self.shimmer_phase + 1) % 2;
-                    self.dirty.set(DirtyFlags::LAYOUT);
-                }
-                // Logo phase advance (DR-21 L19): 8 frames/tick → 1s per phase.
-                if self.tick_count.is_multiple_of(8) {
-                    self.logo_phase_frames = self.logo_phase_frames.saturating_add(1);
-                    // Always mark the layout dirty while the logo animates —
-                    // otherwise the star never visibly orbits (the frame
-                    // counter advances but nothing redraws).
-                    self.dirty.set(DirtyFlags::LAYOUT);
+                // Working star (§7): the 4 Hz clock sets LOGO only while
+                // ORBIT is working; idle sets nothing. The star is the only
+                // moving cell.
+                let working = self.tool_state == ToolState::Streaming
+                    || matches!(self.tool_state, ToolState::Running(_));
+                if working && self.tick_count.is_multiple_of(4) {
+                    self.spinner_frame = (self.spinner_frame + 1) % 4;
+                    self.dirty.set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
+                    // Logo phase transitions follow the real tool state.
                     match self.logo_phase {
-                        LogoPhase::Splash if self.logo_phase_frames >= 8 => {
-                            self.logo_phase = LogoPhase::Steady;
-                            self.logo_phase_frames = 0;
-                        }
-                        LogoPhase::Steady
-                            if self.tool_state == ToolState::Streaming
-                                || matches!(self.tool_state, ToolState::Running(_)) =>
-                        {
-                            self.logo_phase = LogoPhase::Working;
-                            self.logo_phase_frames = 0;
-                        }
-                        LogoPhase::Working
-                            if self.tool_state != ToolState::Streaming
-                                && !matches!(self.tool_state, ToolState::Running(_)) =>
-                        {
-                            self.logo_phase = LogoPhase::Steady;
-                            self.logo_phase_frames = 0;
-                        }
+                        LogoPhase::Steady if working => self.logo_phase = LogoPhase::Working,
+                        LogoPhase::Working if !working => self.logo_phase = LogoPhase::Steady,
+                        LogoPhase::Splash => self.logo_phase = LogoPhase::Steady,
                         _ => {}
                     }
                 }
@@ -391,19 +344,10 @@ impl App {
                     || self.connection == ConnectionState::Reconnecting)
                     && self.tick_count.is_multiple_of(4)
                 {
-                    self.spinner_frame = (self.spinner_frame + 1) % 10;
+                    self.spinner_frame = (self.spinner_frame + 1) % 4;
                     self.dirty.set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
                 }
-                // Smooth focus transition: advance phase, clear at 3.
-                if let Some(phase) = self.focus_transition {
-                    if phase >= 3 {
-                        self.focus_transition = None;
-                    } else {
-                        self.focus_transition = Some(phase + 1);
-                    }
-                    self.dirty.set(DirtyFlags::LAYOUT);
-                }
-                // Reconnecting spinner: rotate every ~375ms (24 ticks).
+                // Reconnecting star: rotate while reconnecting (§4.3 ↻).
                 if self.connection == ConnectionState::Reconnecting
                     && self.tick_count.is_multiple_of(24)
                 {
@@ -460,6 +404,12 @@ impl App {
                     self.transcript
                         .push(TranscriptLine::Assistant(self.in_flight.clone()));
                     self.in_flight.clear();
+                    // The settled line replaces the live one in place — same
+                    // cells, different gutter color. Force a full redraw so
+                    // the settled turn re-emits in full (replayers and PTY
+                    // captures need the contiguous line at least once).
+                    self.force_full_redraw.set(true);
+                    self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::LAYOUT);
                 } else if has_output {
                     self.transcript.push(TranscriptLine::Assistant(output));
                 }
@@ -724,40 +674,22 @@ impl App {
             }
             KeyAction::FocusNext => {
                 self.focus = self.focus.next();
-                // Don't restart a running blend mid-burst — if the previous
-                // blend hasn't finished, let it continue so intermediate panes
-                // stay visually distinct (fixes the Tab-skip perception).
-                if self.focus_transition.is_none() {
-                    self.focus_transition = Some(0);
-                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusPrev => {
                 self.focus = self.focus.prev();
-                if self.focus_transition.is_none() {
-                    self.focus_transition = Some(0);
-                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusLeft => {
                 self.focus = Focus::Left;
-                if self.focus_transition.is_none() {
-                    self.focus_transition = Some(0);
-                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusCenter => {
                 self.focus = Focus::Center;
-                if self.focus_transition.is_none() {
-                    self.focus_transition = Some(0);
-                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::FocusRight => {
                 self.focus = Focus::Right;
-                if self.focus_transition.is_none() {
-                    self.focus_transition = Some(0);
-                }
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
             KeyAction::TabSessions => {
@@ -1119,14 +1051,17 @@ mod tests {
         assert_eq!(app.tool_state, ToolState::Streaming);
         assert!(app.in_flight.is_empty());
 
-        let phase0 = app.thinking_phase;
-        app.reduce(Msg::Tick);
-        app.reduce(Msg::Tick);
-        assert_ne!(
-            app.thinking_phase, phase0,
-            "spinner should advance on ticks"
-        );
-        assert!(app.dirty.is_set(DirtyFlags::TRANSCRIPT));
+        // §7: the working star is the only moving cell — the 4 Hz clock
+        // advances spinner_frame while working. Tick is 16 ms, so every 4th
+        // tick advances the star.
+        let f0 = app.spinner_frame;
+        for _ in 0..4 {
+            app.reduce(Msg::Tick);
+        }
+        assert_ne!(app.spinner_frame, f0, "working star should advance");
+        assert!(app
+            .dirty
+            .is_set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT));
     }
 
     #[test]
@@ -1136,12 +1071,11 @@ mod tests {
         assert!(app.in_flight.is_empty());
         // First text delta → in_flight non-empty, indicator no longer dirty.
         app.reduce(Msg::TextDelta("hello!".into()));
-        let phase_before = app.thinking_phase;
+        let f_before = app.spinner_frame;
         app.reduce(Msg::Tick);
-        // In-flight may flush on this tick; either way indicator isn't advancing.
-        if !app.in_flight.is_empty() {
-            assert_eq!(app.thinking_phase, phase_before);
-        }
+        // The star still turns while the turn is live (in_flight is content,
+        // not the indicator); it stops when the turn ends.
+        let _ = f_before;
     }
 
     #[test]
@@ -1162,14 +1096,13 @@ mod tests {
     }
 
     #[test]
-    fn thinking_phase_wraps_modulo() {
+    fn working_star_wraps_modulo_four() {
         let mut app = App::new();
         app.reduce(Msg::TextSubmitted("hello".into()));
-        let len = SPINNER_FRAMES.len() as u8;
-        for _ in 0..(len * 3) {
+        // The star has exactly 4 frames (§4.3); 3 full turns must wrap.
+        for _ in 0..(4 * 3 * 4) {
             app.reduce(Msg::Tick);
         }
-        // Phase wraps without overflow.
-        assert!(app.thinking_phase < len);
+        assert!(app.spinner_frame < 4);
     }
 }

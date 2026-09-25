@@ -22,7 +22,6 @@ pub mod render;
 mod rich;
 pub mod state;
 mod terminal;
-pub mod theme;
 pub mod tokens;
 pub mod unicode;
 pub mod worker;
@@ -41,7 +40,6 @@ use std::time::{Duration, Instant};
 use crate::bus::{Bus, BusSender};
 use crate::msg::Msg;
 use crate::state::App;
-use crate::theme::{ResolvedTheme, Theme};
 use crate::tokens::Design;
 
 /// The UI tick interval (16 ms ≈ 60 fps cap). Empty frames are forbidden —
@@ -63,8 +61,6 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
     let home = std::env::var("ORBIT_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(".orbit"));
-    let theme = Theme::load(&home).resolve();
-
     // Design context: palette resolved for the detected colour tier + display
     // capabilities, ONCE at startup (docs/tui/DESIGN.md §3.7). Tiers step
     // down at runtime, never up. Migration notices print once, then drop.
@@ -130,7 +126,7 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         &mut key_parser,
         &command_sink,
         &cancel_handle,
-        &theme,
+        &design,
     );
 
     // Restore the terminal BEFORE printing anything — raw mode + alternate
@@ -254,7 +250,7 @@ fn event_loop(
     key_parser: &mut KeyParser,
     command_sink: &CommandSink,
     cancel_handle: &worker::CancelHandle,
-    theme: &ResolvedTheme,
+    design: &Design,
 ) -> Result<LoopOutcome, String> {
     let mut last_tick = Instant::now();
     let mut composer = Composer::new();
@@ -349,7 +345,7 @@ fn event_loop(
         }
 
         if app.dirty.is_dirty() {
-            guard.draw(app, composer.text(), theme)?;
+            guard.draw(app, composer.text(), design)?;
             app.dirty.clear();
         }
 

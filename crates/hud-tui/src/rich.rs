@@ -4,7 +4,7 @@
 //! ORBIT surfaces to the model's plain-text responses. Uses theme colors.
 //! DR-21 L15: emoji → ASCII fallback when the terminal font lacks glyphs.
 
-use crate::theme::ResolvedTheme;
+use crate::tokens::Design;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::borrow::Cow;
@@ -87,61 +87,61 @@ pub fn apply_ascii_fallback(text: &str) -> Cow<'_, str> {
 }
 
 /// Render one line into styled spans using theme colors.
-pub fn render_line<'a>(text: &'a str, theme: &ResolvedTheme) -> Line<'a> {
+pub fn render_line<'a>(text: &'a str, d: &Design) -> Line<'a> {
     // ASCII-emoji fallback first (DR-21 L15), then grapheme-safe rendering.
-    render_line_inner(&apply_ascii_fallback(text), theme)
+    render_line_inner(&apply_ascii_fallback(text), d)
 }
 
 /// Inner renderer — every span it produces is an owned `String`, so the
 /// returned line is `'static` regardless of the input borrow. The public
 /// wrapper re-attaches the caller's lifetime.
-fn render_line_inner(text: &str, theme: &ResolvedTheme) -> Line<'static> {
-    let c = &theme.colors;
+fn render_line_inner(text: &str, d: &Design) -> Line<'static> {
+    let p = &d.palette;
     let trimmed = text.trim_start();
 
     // Headings.
     if let Some(rest) = trimmed.strip_prefix("### ") {
         return Line::from(vec![Span::styled(
             rest.to_string(),
-            Style::default().fg(c.composer).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.ink).add_modifier(Modifier::BOLD),
         )]);
     }
     if let Some(rest) = trimmed.strip_prefix("## ") {
         return Line::from(vec![Span::styled(
             rest.to_string(),
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.ink).add_modifier(Modifier::BOLD),
         )]);
     }
     if let Some(rest) = trimmed.strip_prefix("# ") {
         return Line::from(vec![Span::styled(
             rest.to_string(),
-            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.ink).add_modifier(Modifier::BOLD),
         )]);
     }
     // Bullets.
     if let Some(rest) = trimmed.strip_prefix("- ") {
         return Line::from(vec![
-            Span::styled("• ", Style::default().fg(c.composer)),
-            Span::styled(rest.to_string(), Style::default().fg(c.text)),
+            Span::styled("• ", Style::default().fg(p.muted)),
+            Span::styled(rest.to_string(), Style::default().fg(p.ink)),
         ]);
     }
     if let Some(rest) = trimmed.strip_prefix("* ") {
         return Line::from(vec![
-            Span::styled("• ", Style::default().fg(c.composer)),
-            Span::styled(rest.to_string(), Style::default().fg(c.text)),
+            Span::styled("• ", Style::default().fg(p.muted)),
+            Span::styled(rest.to_string(), Style::default().fg(p.ink)),
         ]);
     }
     // Slash command at line start.
     if trimmed.starts_with('/') {
         if let Some((cmd, rest)) = trimmed.split_once(' ') {
             return Line::from(vec![
-                Span::styled(cmd.to_string(), Style::default().fg(c.composer)),
-                Span::styled(rest.to_string(), Style::default().fg(c.text)),
+                Span::styled(cmd.to_string(), Style::default().fg(p.syn_kw)),
+                Span::styled(rest.to_string(), Style::default().fg(p.ink)),
             ]);
         }
         return Line::from(vec![Span::styled(
             trimmed.to_string(),
-            Style::default().fg(c.composer),
+            Style::default().fg(p.muted),
         )]);
     }
     // Fenced code marker.
@@ -153,15 +153,15 @@ fn render_line_inner(text: &str, theme: &ResolvedTheme) -> Line<'static> {
             } else {
                 format!("── {} ──", lang)
             },
-            Style::default().fg(c.dim),
+            Style::default().fg(p.muted),
         )]);
     }
     // Default: inline-code aware rendering.
-    inline_code_line(text, theme)
+    inline_code_line(text, d)
 }
 
-fn inline_code_line(text: &str, theme: &ResolvedTheme) -> Line<'static> {
-    let c = &theme.colors;
+fn inline_code_line(text: &str, d: &Design) -> Line<'static> {
+    let p = &d.palette;
     let mut spans: Vec<Span> = Vec::new();
     let mut cur = String::new();
     let mut in_code = false;
@@ -173,12 +173,12 @@ fn inline_code_line(text: &str, theme: &ResolvedTheme) -> Line<'static> {
                 if in_code {
                     spans.push(Span::styled(
                         std::mem::take(&mut cur),
-                        Style::default().fg(c.code_fg),
+                        Style::default().fg(p.syn_kw),
                     ));
                 } else {
                     spans.push(Span::styled(
                         std::mem::take(&mut cur),
-                        Style::default().fg(c.text),
+                        Style::default().fg(p.ink),
                     ));
                 }
             }
@@ -189,28 +189,29 @@ fn inline_code_line(text: &str, theme: &ResolvedTheme) -> Line<'static> {
     }
     if !cur.is_empty() {
         if in_code {
-            spans.push(Span::styled(cur, Style::default().fg(c.code_fg)));
+            spans.push(Span::styled(cur, Style::default().fg(p.syn_kw)));
         } else {
-            spans.push(Span::styled(cur, Style::default().fg(c.text)));
+            spans.push(Span::styled(cur, Style::default().fg(p.ink)));
         }
     }
     Line::from(spans)
 }
 
 /// Render a full message (multi-line) with Markdown awareness.
-pub fn render_message<'a>(text: &'a str, theme: &ResolvedTheme) -> Vec<Line<'a>> {
+pub fn render_message<'a>(text: &'a str, d: &Design) -> Vec<Line<'a>> {
     text.lines()
-        .map(|l| render_line(l, theme))
+        .map(|l| render_line(l, d))
         .collect::<Vec<Line<'_>>>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::Theme;
+    use crate::tokens::{Design, Theme as TokenTheme};
 
-    fn test_theme() -> ResolvedTheme {
-        Theme::default().resolve()
+    fn test_design() -> Design {
+        let t = TokenTheme::default();
+        Design::resolve(&t, &|_| None)
     }
 
     fn span_text(line: &Line<'_>) -> String {
@@ -219,51 +220,44 @@ mod tests {
 
     #[test]
     fn heading_hides_marker() {
-        let theme = test_theme();
-        let line = render_line("## Summary", &theme);
+        let line = render_line("## Summary", &test_design());
         assert_eq!(span_text(&line), "Summary");
         assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
     fn h1_hides_single_marker() {
-        let theme = test_theme();
-        let line = render_line("# Big", &theme);
+        let line = render_line("# Big", &test_design());
         assert_eq!(span_text(&line), "Big");
     }
 
     #[test]
     fn h3_hides_triple_marker() {
-        let theme = test_theme();
-        let line = render_line("### Small", &theme);
+        let line = render_line("### Small", &test_design());
         assert_eq!(span_text(&line), "Small");
     }
 
     #[test]
     fn bullet_renders_with_dot() {
-        let theme = test_theme();
-        let line = render_line("- item", &theme);
+        let line = render_line("- item", &test_design());
         assert_eq!(span_text(&line), "• item");
     }
 
     #[test]
     fn star_bullet_renders() {
-        let theme = test_theme();
-        let line = render_line("* alt item", &theme);
+        let line = render_line("* alt item", &test_design());
         assert_eq!(span_text(&line), "• alt item");
     }
 
     #[test]
     fn fenced_code_hides_markers() {
-        let theme = test_theme();
-        let line = render_line("```rust", &theme);
+        let line = render_line("```rust", &test_design());
         assert_eq!(span_text(&line), "── rust ──");
     }
 
     #[test]
     fn inline_code_hides_backticks() {
-        let theme = test_theme();
-        let line = render_line("use `ratatui` here", &theme);
+        let line = render_line("use `ratatui` here", &test_design());
         assert_eq!(span_text(&line), "use ratatui here");
         assert!(line
             .spans
@@ -273,8 +267,7 @@ mod tests {
 
     #[test]
     fn command_line_styles_command() {
-        let theme = test_theme();
-        let line = render_line("/model glm-5.2", &theme);
+        let line = render_line("/model glm-5.2", &test_design());
         let text = span_text(&line);
         assert!(text.starts_with("/model"));
         assert!(text.contains("glm-5.2"));
@@ -282,16 +275,14 @@ mod tests {
 
     #[test]
     fn plain_text_passthrough() {
-        let theme = test_theme();
-        let line = render_line("hello world", &theme);
+        let line = render_line("hello world", &test_design());
         assert_eq!(span_text(&line), "hello world");
     }
 
     #[test]
     fn message_multiline() {
-        let theme = test_theme();
         let msg = "## Title\n- item\n```rs\ncode\n```\nplain";
-        let lines = render_message(msg, &theme);
+        let lines = render_message(msg, &test_design());
         assert_eq!(lines.len(), 6);
         assert_eq!(span_text(&lines[0]), "Title");
         assert_eq!(span_text(&lines[1]), "• item");
@@ -302,24 +293,21 @@ mod tests {
 
     #[test]
     fn wave_fallback() {
-        let theme = test_theme();
-        let line = render_line("Hi 👋", &theme);
+        let line = render_line("Hi 👋", &test_design());
         assert_eq!(span_text(&line), "Hi (wave)");
     }
 
     #[test]
     fn star_fallback() {
-        let theme = test_theme();
-        let line = render_line("Nice ✨", &theme);
+        let line = render_line("Nice ✨", &test_design());
         assert_eq!(span_text(&line), "Nice *");
     }
 
     #[test]
     fn unmapped_passthrough() {
-        let theme = test_theme();
         // 🦄 is NOT in the map — passes through unchanged (terminal decides).
         let text = "unicorn 🦄";
-        let line = render_line(text, &theme);
+        let line = render_line(text, &test_design());
         assert_eq!(span_text(&line), text);
     }
 
@@ -337,8 +325,7 @@ mod tests {
 
     #[test]
     fn code_with_no_lang() {
-        let theme = test_theme();
-        let line = render_line("```", &theme);
+        let line = render_line("```", &test_design());
         assert_eq!(span_text(&line), "── code ──");
     }
 }

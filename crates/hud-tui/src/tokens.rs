@@ -769,6 +769,10 @@ pub struct Capabilities {
 pub struct Design {
     pub palette: ResolvedPalette,
     pub caps: Capabilities,
+    /// Rail widths in columns (LayoutConfig, §13.4) — (left, right).
+    pub layout_rails: (u16, u16),
+    /// Prose measure cap in columns (§5.2). Content centers past measure+16.
+    pub layout_measure: u16,
     /// Deprecation notices from tui.toml migration (§13.4), shown once at
     /// startup, then dropped.
     pub notices: Vec<String>,
@@ -806,6 +810,8 @@ impl Design {
                 brand,
                 reduced_motion,
             },
+            layout_rails: (theme.layout.rail_left, theme.layout.rail_right),
+            layout_measure: theme.layout.measure,
             notices,
         }
     }

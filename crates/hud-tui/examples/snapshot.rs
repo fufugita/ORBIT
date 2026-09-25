@@ -8,16 +8,16 @@ use orbit_hud_tui::state::{
     App, ComposerState, ConnectionState, Focus, LeftTab, LogoPhase, PendingApproval, ToolState,
     TranscriptLine,
 };
-use orbit_hud_tui::theme::Theme;
+use orbit_hud_tui::tokens::{Design, Theme};
 
 fn main() {
     let show_approval = std::env::args().nth(1).as_deref() == Some("approval");
-    let theme = Theme::default().resolve();
+    let design = Design::resolve(&Theme::default(), &|_| None);
     let mut app = App::new();
     app.focus = Focus::Center;
     app.left_tab = LeftTab::Sessions;
-    app.model = "glm-5.2".into();
-    app.provider = "verboo".into();
+    app.model = "coder".into();
+    app.provider = "local".into();
     app.session_id_prefix = "01J8K".into();
     app.connection = ConnectionState::Online;
     app.tool_state = ToolState::Idle;
@@ -35,7 +35,6 @@ fn main() {
     app.transcript.push(TranscriptLine::Stripped {
         tool_name: "calculator".into(),
     });
-    app.shimmer_phase = 0;
     if show_approval {
         app.pending_approvals.push(PendingApproval {
             call_id: "call-0".into(),
@@ -47,7 +46,7 @@ fn main() {
 
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|f| render(f, &app, "", &theme)).unwrap();
+    terminal.draw(|f| render(f, &app, "", &design)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     let mut out = String::new();
     for y in 0..30 {
