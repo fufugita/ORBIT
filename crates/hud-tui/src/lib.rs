@@ -15,6 +15,7 @@ pub mod approval;
 pub mod bridge;
 pub mod bus;
 mod coalesce;
+pub mod glyphs;
 pub mod input;
 pub mod msg;
 pub mod render;
