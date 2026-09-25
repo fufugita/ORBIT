@@ -30,26 +30,29 @@ fn pane_header_line(
     focused: bool,
     area_width: u16,
     d: &Design,
-    g: &Glyphs,
+    _g: &Glyphs,
 ) -> Line<'static> {
-    let (title_color, rule_glyph, rule_color, bold) = if focused {
-        (d.palette.magenta, g.rule_focus, d.palette.rule_hi, true)
+    // Multiplexer-style zone anchor: a filled header bar. The focused pane
+    // gets the accent fill; unfocused panes get surface2. The title rides
+    // the bar; the rest of the row fills with the same background so the
+    // bar spans the full pane width.
+    let (title_color, bg, bold) = if focused {
+        (d.palette.bg, d.palette.magenta, true)
     } else {
-        (d.palette.ink2, g.rule, d.palette.rule, false)
+        (d.palette.ink2, d.palette.surface2, false)
     };
-    let mut style = Style::default().fg(title_color);
+    let mut style = Style::default().fg(title_color).bg(bg);
     if bold {
         style = style.add_modifier(Modifier::BOLD);
     }
     let title_span = Span::styled(format!(" {title} "), style);
-    // Fill the remainder of the row with the rule glyph. Width math is
-    // approximate for wide titles; the rule just fills whatever remains.
+    // Fill the remainder of the row with the bar background.
     let title_w = display_width_of(title) as u16 + 2;
     let fill = area_width.saturating_sub(title_w) as usize;
-    let rule = rule_glyph.repeat(fill);
+    let rule = " ".repeat(fill);
     Line::from(vec![
         title_span,
-        Span::styled(rule, Style::default().fg(rule_color)),
+        Span::styled(rule, Style::default().bg(bg)),
     ])
 }
 
@@ -147,7 +150,16 @@ fn render_divider(
     if area.height == 0 {
         return;
     }
-    let track = Span::styled(g.divider, Style::default().fg(d.palette.rule));
+    // Stronger zone boundary: the divider is a solid rule. The divider
+    // adjacent to the focused pane takes the accent colour so focus is
+    // obvious at the pane boundary.
+    let divider_color =
+        if (is_center && app.focus == Focus::Center) || (!is_center && app.focus == Focus::Left) {
+            d.palette.magenta_dim
+        } else {
+            d.palette.rule
+        };
+    let track = Span::styled(g.divider, Style::default().fg(divider_color));
     let mut lines: Vec<Line> = vec![Line::from(track.clone()); area.height as usize];
 
     // Scroll thumb on the center divider when there is more content than
@@ -166,6 +178,12 @@ fn render_divider(
 
 fn render_left_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
+    // Zone isolation: the rail gets a surface fill (the center stays bg) —
+    // the panes read as distinct regions, multiplexer-style.
+    frame.render_widget(
+        ratatui::widgets::Block::default().style(Style::default().bg(p.surface)),
+        area,
+    );
     let title = match app.left_tab {
         LeftTab::Sessions => "Sessions",
         LeftTab::Verbose => "Activity",
@@ -200,7 +218,7 @@ fn render_left_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desig
             }
         }
     };
-    frame.render_widget(List::new(items), body);
+    frame.render_widget(List::new(items).style(Style::default().bg(p.surface)), body);
 }
 
 // ── Center pane: transcript + composer (§6.2–6.8, §5.5) ──────────────────────
@@ -421,6 +439,11 @@ fn section_line(label: &str, count: usize, p: &crate::tokens::ResolvedPalette) -
 
 fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
+    // Zone isolation: surface fill (same as the left rail).
+    frame.render_widget(
+        ratatui::widgets::Block::default().style(Style::default().bg(p.surface)),
+        area,
+    );
     let body = render_pane_header(frame, area, "Workspace", app.focus == Focus::Right, d, g);
     let mut lines: Vec<Line> = vec![Line::from("")];
 
@@ -708,6 +731,11 @@ fn fuzzy_positions(text: &str, query: &str) -> Vec<usize> {
 
 fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
+    // The status line rides a surface2 bar — the bottom zone anchor.
+    frame.render_widget(
+        ratatui::widgets::Block::default().style(Style::default().bg(p.surface2)),
+        area,
+    );
     // Left side: the compact mark (the working star while ORBIT works — the
     // only moving cell), then the dynamic state.
     let mark =
@@ -783,7 +811,10 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         ));
         spans.push(Span::styled(&app.last_status, Style::default().fg(p.muted)));
     }
-    frame.render_widget(Line::from(spans), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(p.surface2)),
+        area,
+    );
 }
 
 /// Format a count with k/M/B suffixes: 1_234 → "1.2k".

@@ -700,9 +700,15 @@ fn handle_key(
     }
 
     // Plain character input into the composer — ONLY when the center pane
-    // (conversation) is focused. On other panes, letters go to the key parser
-    // so leader keys (g, z) and shortcuts work instead of typing.
-    if app.focus == crate::state::Focus::Center && composer_wants_char(&key, app) {
+    // (conversation) is focused AND the composer has text (or the key is a
+    // plain letter that isn't a command). When the composer is EMPTY, single
+    // keys route to the parser so q/?/g/z work immediately — the standard
+    // TUI pattern (type to enter input mode, commands work at rest).
+    let composer_has_text = !composer.text.is_empty();
+    if app.focus == crate::state::Focus::Center
+        && composer_has_text
+        && composer_wants_char(&key, app)
+    {
         if let KeyCode::Char(c) = key.code {
             composer.push(c);
             sender.send(Msg::ComposerChanged);

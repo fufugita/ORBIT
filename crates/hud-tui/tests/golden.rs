@@ -454,11 +454,12 @@ fn invariant_magenta_closed_list() {
         .iter()
         .filter(|c| c.fg == ratatui::style::Color::Magenta || c.fg == magenta)
         .count();
-    // The mark (1) + composer prompt '›' + focused title chars (~8) + the
-    // orbit voice glyph. Bound generously but absolutely.
+    // The focused pane's header bar is a magenta fill (the zone anchor —
+    // ~rail width 22 cells) + the mark + composer prompt + voice glyph.
+    // Bound: header bar + the closed list of small accents.
     assert!(
-        magenta_cells <= 32,
-        "idle frame has {magenta_cells} magenta cells — magenta is leaking into general rendering"
+        magenta_cells <= 64,
+        "idle frame has {magenta_cells} magenta cells — magenta is leaking beyond the header bar + accents"
     );
 
     // Approval: the card frame joins — still bounded (frame + title + keys).
@@ -468,9 +469,10 @@ fn invariant_magenta_closed_list() {
         .iter()
         .filter(|c| c.fg == ratatui::style::Color::Magenta || c.fg == magenta)
         .count();
-    // The card frame perimeter (≈2×(width+height)) + title + key glyphs.
+    // The card frame perimeter (≈2×(width+height)) + title + key glyphs
+    // + the focused header bar fill.
     assert!(
-        magenta_cells <= 360,
-        "approval frame has {magenta_cells} magenta cells — beyond frame + title + keys"
+        magenta_cells <= 420,
+        "approval frame has {magenta_cells} magenta cells — beyond frame + title + keys + header"
     );
 }
