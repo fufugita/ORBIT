@@ -476,7 +476,7 @@ fn render_center_pane(
     // One blank row of breathing room below the top border.
     let mut lines: Vec<Line> = vec![Line::from("")];
     if app.transcript.is_empty() && app.in_flight.is_empty() {
-        let mark = welcome_mark(d, g);
+        let mark = welcome_mark_frame(d, app.startup_frame);
         let mark_w = 36u16; // widest mark row
         let mark_h = mark.len() as u16;
         if center[0].width > mark_w + 4 && center[0].height > mark_h + 4 {
@@ -1331,6 +1331,13 @@ fn render_approval_modal(
 /// muted. It appears only on the welcome screen of an empty session; the
 /// first turn replaces it.
 pub fn welcome_mark(d: &Design, _g: &Glyphs) -> Vec<Line<'static>> {
+    welcome_mark_frame(d, u8::MAX)
+}
+
+/// The welcome mark at a startup frame (§8.3): 0 = O alone, 1 = ⅓ ring,
+/// 2 = ⅔ ring, 3 = ring + star, 4 = RBIT fills, 5+ = tagline. u8::MAX =
+/// the complete mark (the steady state).
+pub fn welcome_mark_frame(d: &Design, frame: u8) -> Vec<Line<'static>> {
     let p = &d.palette;
     // 3 rows × 31 columns (§8.1). The ring is braille dots; where it crosses
     // a letterform stroke it hides (the letterform wins).
@@ -1356,13 +1363,47 @@ pub fn welcome_mark(d: &Design, _g: &Glyphs) -> Vec<Line<'static>> {
             .collect();
         Line::from(spans)
     };
-    vec![
-        mark_line(row0),
-        mark_line(row1),
-        mark_line(row2),
-        Line::from(Span::styled(
+    // §8.3 frame masking: the reveal sweeps left-to-right across the mark
+    // (the ring forming around the O), then the tagline. frame 0 shows
+    // only the O (the first letterform); each frame reveals ~1/5 more.
+    let reveal: usize = match frame {
+        0 => 8,   // the O alone
+        1 => 16,  // a third of the ring
+        2 => 24,  // two thirds
+        3 => 30,  // ring complete + star
+        4 => 36,  // RBIT filled
+        _ => usize::MAX, // tagline + hold
+    };
+    let mask = |row: &str| -> String {
+        if reveal == usize::MAX {
+            return row.to_string();
+        }
+        // Keep leading spaces so alignment never shifts; reveal N cells.
+        let mut out = String::new();
+        let mut shown = 0;
+        for c in row.chars() {
+            if c == ' ' {
+                out.push(' ');
+            } else if shown < reveal {
+                out.push(c);
+                shown += 1;
+            } else {
+                out.push(' ');
+            }
+        }
+        out
+    };
+    let show_tagline = frame >= 5 || frame == u8::MAX;
+    let mut out = vec![
+        mark_line(&mask(row0)),
+        mark_line(&mask(row1)),
+        mark_line(&mask(row2)),
+    ];
+    if show_tagline {
+        out.push(Line::from(Span::styled(
             tagline.to_string(),
             Style::default().fg(p.muted),
-        )),
-    ]
+        )));
+    }
+    out
 }

@@ -150,6 +150,14 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
             if let Some(note) = outcome.note {
                 eprintln!("orbit-tui: {note}");
             }
+            // §8.4: one line to the normal scrollback after the alt screen
+            // is restored. Coloured only if colour is allowed (the plain
+            // grammar tier prints the same text uncoloured).
+            if let Some(st) = outcome.shutdown_stats {
+                let cost = format!("${:.4}", st.cost_microcents as f64 / 1_000_000.0);
+                println!("✦ ORBIT  session saved · {} turns · {cost}", st.turns);
+                println!("         resume with orbit chat --resume {}", st.session_id);
+            }
             outcome.exit_code
         }
         Err(e) => {
@@ -165,6 +173,16 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
 struct LoopOutcome {
     exit_code: i32,
     note: Option<String>,
+    /// §8.4 shutdown-line stats: turns, ledger records, cost, session id.
+    shutdown_stats: Option<ShutdownStats>,
+}
+
+/// The §8.4 shutdown line's data.
+#[derive(Debug, Clone)]
+struct ShutdownStats {
+    turns: u64,
+    cost_microcents: u64,
+    session_id: String,
 }
 
 /// Parse and dispatch a `/command` typed in the composer (REPL parity,
@@ -282,6 +300,7 @@ fn event_loop(
                 sig.name()
             );
             return Ok(LoopOutcome {
+                shutdown_stats: None,
                 exit_code: sig.exit_code(),
                 note: Some(note),
             });
@@ -408,7 +427,15 @@ fn event_loop(
             } else {
                 None
             };
-            return Ok(LoopOutcome { exit_code: 0, note });
+            return Ok(LoopOutcome {
+                exit_code: 0,
+                note,
+                shutdown_stats: Some(ShutdownStats {
+                    turns: app.total_turns,
+                    cost_microcents: app.total_cost_microcents,
+                    session_id: app.session_id.clone(),
+                }),
+            });
         }
 
         let timeout = UI_TICK
@@ -646,6 +673,10 @@ fn handle_key(
 ) {
     // Any keypress dismisses a finished selection (herdr behaviour).
     handle_key_clears_selection(sender, app);
+    // §8.3: any key during the splash jumps to the final frame.
+    if app.logo_phase == crate::state::LogoPhase::Splash {
+        sender.send(Msg::SplashSkip);
+    }
 
     // Command palette (§6.13): when open, ALL keys route to the palette —
     // chars build the query, ↑↓ move, enter executes, esc closes.

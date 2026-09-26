@@ -337,6 +337,8 @@ pub struct App {
     pub model: String,
     /// Session id (first 8 chars shown in status bar).
     pub session_id_prefix: String,
+    /// The full session id (for the §8.4 shutdown line's resume hint).
+    pub session_id: String,
     /// Connection state.
     pub connection: ConnectionState,
     /// Tool state (idle / streaming / awaiting approval / running / auto-grant).
@@ -380,6 +382,9 @@ pub struct App {
     pub copy_mode: bool,
     /// Logo phase (DR-21 L19): splash → steady → working → shutdown.
     pub logo_phase: LogoPhase,
+    /// §8.3 startup frame: 0..=5 while Splash; the welcome mark reveals
+    /// progressively at 4 fps. Any key jumps to the last frame.
+    pub startup_frame: u8,
     /// Frames spent in the current logo phase (drives phase transitions).
     /// Composer state (DR-21 §3.4) — left glyph + border color.
     pub composer_state: ComposerState,
@@ -493,6 +498,7 @@ impl App {
             provider: String::new(),
             model: String::new(),
             session_id_prefix: String::new(),
+            session_id: String::new(),
             connection: ConnectionState::Online,
             tool_state: ToolState::Idle,
             pending_approvals: Vec::new(),
@@ -513,6 +519,7 @@ impl App {
             reconnect_phase: 0,
             copy_mode: false,
             logo_phase: LogoPhase::Splash,
+            startup_frame: 0,
             composer_state: ComposerState::Idle,
             composer_send_phase: 0,
             queued: Vec::new(),
@@ -563,6 +570,18 @@ impl App {
                     if let Some(text) = self.coalescer.flush() {
                         self.in_flight.push_str(&text);
                         self.dirty.set(DirtyFlags::TRANSCRIPT);
+                    }
+                }
+                // §8.3 startup: the splash reveals at 4 fps (every 15 ticks
+                // ≈ 250 ms), 6 frames total, then settles to Steady.
+                if self.logo_phase == LogoPhase::Splash {
+                    if self.tick_count.is_multiple_of(15) {
+                        if self.startup_frame < 5 {
+                            self.startup_frame += 1;
+                            self.dirty.set(DirtyFlags::TRANSCRIPT);
+                        } else {
+                            self.logo_phase = LogoPhase::Steady;
+                        }
                     }
                 }
                 // Working star (§7): the 4 Hz clock sets LOGO only while
@@ -856,6 +875,13 @@ impl App {
                 self.workspace = w;
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
+            Msg::SplashSkip => {
+                if self.logo_phase == LogoPhase::Splash {
+                    self.startup_frame = 5;
+                    self.logo_phase = LogoPhase::Steady;
+                    self.dirty.set(DirtyFlags::TRANSCRIPT);
+                }
+            }
             Msg::PaletteToggle => {
                 self.palette.open = !self.palette.open;
                 if !self.palette.open {
@@ -913,10 +939,12 @@ impl App {
                 model,
                 provider,
                 session_prefix,
+                session_id,
             } => {
                 self.model = model;
                 self.provider = provider;
                 self.session_id_prefix = session_prefix;
+                self.session_id = session_id;
                 self.dirty
                     .set(DirtyFlags::SESSION_LIST | DirtyFlags::STATUS);
             }

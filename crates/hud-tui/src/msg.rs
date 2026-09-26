@@ -65,6 +65,9 @@ pub enum Msg {
         model: String,
         provider: String,
         session_prefix: String,
+        /// The full session id (the §8.4 shutdown line needs it for the
+        /// resume hint).
+        session_id: String,
     },
     /// Composer's text changed — force a re-render so the composer box updates
     /// every keystroke (the text lives in the event loop, not the App).
@@ -113,6 +116,8 @@ pub enum Msg {
     /// The workspace pane's live state (plan/findings/verification) —
     /// emitted by the worker as the turn progresses.
     WorkspaceUpdate(crate::state::Workspace),
+    /// §8.3: skip the startup reveal to the final frame.
+    SplashSkip,
     /// Request to quit — opens confirmation prompt (q, Ctrl+D).
     RequestQuit,
     /// Confirm quit from the modal.

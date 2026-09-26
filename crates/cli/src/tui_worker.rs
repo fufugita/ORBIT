@@ -75,6 +75,7 @@ fn worker_main(
         model: config.model.clone(),
         provider: config.provider_id.clone(),
         session_prefix: config.session_id.chars().take(8).collect(),
+        session_id: config.session_id.clone(),
     });
 
     // Boot with a resumed session, if any.
@@ -185,6 +186,7 @@ fn worker_main(
                             model: s.model.clone(),
                             provider: s.provider.clone(),
                             session_prefix: s.session_id.chars().take(8).collect(),
+                            session_id: s.session_id.clone(),
                         });
                     }
                     Err(e) => {

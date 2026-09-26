@@ -301,8 +301,11 @@ fn golden_workspace_pane() {
 #[test]
 fn golden_welcome_mark() {
     let d = design();
-    // Empty app (no transcript) → the mark renders.
-    let app = App::new();
+    // Empty app (no transcript) → the mark renders. Settled (frame 5) —
+    // the §8.3 reveal completes before the assertions.
+    let mut app = App::new();
+    app.startup_frame = 5;
+    app.logo_phase = LogoPhase::Steady;
     let buf = render_buf(&app, &d, 150, 44);
     let text = buf_text(&buf);
     // The wordmark is block letters (▄▀█) + the braille ring + the star.
