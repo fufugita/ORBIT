@@ -51,11 +51,7 @@ pub enum FrontendEvent {
     /// The connection state changed.
     ConnectionChanged(ConnectionState),
     /// Session identity (model/provider/session id) — sent at boot.
-    Identity {
-        model: String,
-        provider: String,
-        session_id: String,
-    },
+    Identity(Identity),
     /// An error from the backend.
     Error { message: String },
     /// A transient status note (toast-class).
@@ -96,6 +92,14 @@ pub enum ApprovalDecision {
 }
 
 // ── Shared state shapes ─────────────────────────────────────────────────────
+
+/// Session identity — the model, provider, and session id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Identity {
+    pub model: String,
+    pub provider: String,
+    pub session_id: String,
+}
 
 /// The connection to the model gate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

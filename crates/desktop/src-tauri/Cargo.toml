@@ -1,0 +1,21 @@
+[package]
+name = "orbit-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ORBIT desktop shell (Tauri)"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+orbit-frontend-protocol = { path = "../../frontend-protocol" }
+
+[lib]
+name = "orbit_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
