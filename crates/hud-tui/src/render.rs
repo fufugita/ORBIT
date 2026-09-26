@@ -149,6 +149,18 @@ fn draw_ascii_pane_border(
 }
 
 
+// ── Keycap chips (§6.15 keycap style, reused in hints) ───────────────────────
+
+/// A keycap chip: surface2 bg, ink2 key. Used in hint rows and approval
+/// keys. Mono tier falls back to [key] (brackets survive Reset colors).
+fn keycap(key: &str, p: &crate::tokens::ResolvedPalette, mono: bool) -> Span<'static> {
+    if mono {
+        Span::styled(format!(" [{key}] "), Style::default().fg(p.muted))
+    } else {
+        Span::styled(format!(" {key} "), Style::default().fg(p.ink2).bg(p.surface2))
+    }
+}
+
 // ── Main render ──────────────────────────────────────────────────────────────
 
 /// Render the current app state into the frame.
@@ -761,18 +773,23 @@ fn render_center_pane(
         frame.render_widget(Paragraph::new(visible), inner);
     }
 
-    // ── Hint row: context keys left, toast right (§5.5, §6.12) ────────────
+    // ── Hint row: keycap chips left, toast right (§5.5, §6.12) ────────────
+    let mono = d.caps.color == crate::tokens::ColorTier::Mono;
     let mut hint_spans: Vec<Span> = Vec::new();
     if turn_live {
-        hint_spans.push(Span::styled(
-            "ctrl+c stop · ⏎ queue",
-            Style::default().fg(p.faint),
-        ));
+        hint_spans.push(keycap("ctrl+c", p, mono));
+        hint_spans.push(Span::styled(" stop · ", Style::default().fg(p.faint)));
+        hint_spans.push(keycap("⏎", p, mono));
+        hint_spans.push(Span::styled(" queue", Style::default().fg(p.faint)));
     } else {
-        hint_spans.push(Span::styled(
-            "⏎ send · ⇧⏎ newline · / commands · ? keys",
-            Style::default().fg(p.faint),
-        ));
+        hint_spans.push(keycap("⏎", p, mono));
+        hint_spans.push(Span::styled(" send · ", Style::default().fg(p.faint)));
+        hint_spans.push(keycap("⇧⏎", p, mono));
+        hint_spans.push(Span::styled(" newline · ", Style::default().fg(p.faint)));
+        hint_spans.push(keycap("/", p, mono));
+        hint_spans.push(Span::styled(" commands · ", Style::default().fg(p.faint)));
+        hint_spans.push(keycap("?", p, mono));
+        hint_spans.push(Span::styled(" keys", Style::default().fg(p.faint)));
     }
     if let Some(toast) = &app.toast {
         let (glyph, color) = match toast.kind {
