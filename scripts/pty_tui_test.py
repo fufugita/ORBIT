@@ -438,15 +438,16 @@ def main():
         # ≥6 means the focus cycled through panes repeatedly without a
         # single keypress getting lost (each of the 8 tabs produces at
         # least one header rewrite for the newly-focused pane).
-        # New design (herdr-style): the focused pane's border is the accent
-        # (magenta 38;2;227;86;208). Each Tab press moves focus → the
-        # newly-focused pane's border redraws in magenta. Count magenta
-        # border runs across the burst: ≥4 means focus cycled R,L,R,L
-        # without a lost keypress.
-        # raw is a UTF-8-decoded str: real ESC chars + real border
-        # glyphs. ratatui emits the fg color with a trailing bg field
-        # (e.g. ;49 for default) before the m.
-        markers = _re.findall(r"\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[─╭╮╰╯]+", raw)
+        # Quiet-boxes design: the border is rule/rule_hi (never magenta);
+        # focus lives in the TITLE. The focused pane's title is magenta
+        # (38;2;227;86;208) + BOLD. Each Tab moves focus → the newly
+        # focused pane's title redraws in magenta. Count magenta title
+        # writes across the burst: ≥4 means focus cycled R,L,R,L without
+        # a lost keypress.
+        # raw is a UTF-8-decoded str: real ESC chars + real glyphs.
+        # ratatui emits the fg color with a trailing bg field (e.g. ;49)
+        # before the m. The title word is letters, not box glyphs.
+        markers = _re.findall(r"\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[ ]?[A-Za-z]+", raw)
         has_alternation = len(markers) >= 4
         check("tab burst cycles focus one-by-one",
               has_alternation,

@@ -38,13 +38,16 @@ fn render_pane_frame(
     g: &Glyphs,
 ) -> Rect {
     let p = &d.palette;
+    // Keep the boxes quiet: focus belongs to the title, not a bright frame
+    // around an entire pane. The focused outline is only one subtle step up
+    // from the resting rule; magenta remains confined to the title word.
     let (border_color, title_style) = if focused {
         (
-            p.magenta,
+            p.rule_hi,
             Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
         )
     } else {
-        (p.muted, Style::default().fg(p.ink2))
+        (p.rule, Style::default().fg(p.ink2))
     };
     // The ASCII tier keeps every chrome cell printable ASCII (§13.5):
     // ratatui's Plain border set is unicode, so the ASCII tier draws its
