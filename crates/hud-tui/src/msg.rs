@@ -78,6 +78,14 @@ pub enum Msg {
     CancelTurn,
     /// Enter plain-text transcript copy mode.
     EnterCopyMode,
+    /// Exit copy mode without yanking.
+    ExitCopyMode,
+    /// Move the copy cursor by delta lines (per-pane copy mode).
+    CopyMove(i32),
+    /// Start/extend selection at the copy cursor.
+    CopySelect,
+    /// Yank the current selection to the system clipboard.
+    CopyYank,
     /// Command palette (§6.13): toggle open/closed.
     PaletteToggle,
     /// A character typed into the palette query.
@@ -88,6 +96,23 @@ pub enum Msg {
     PaletteMove(bool),
     /// Execute the selected palette command.
     PaletteExecute,
+    /// Input mode changed (insert ↔ normal).
+    InputModeChanged(crate::state::InputMode),
+    /// Scroll the focused pane by delta lines (positive = down).
+    PaneScroll { pane: crate::state::Focus, delta: i32 },
+    /// Toggle zoom on a pane (herdr-style fullscreen).
+    ZoomToggle(crate::state::Focus),
+    /// Anchor a per-pane selection at (row, col).
+    SelectionAnchor { pane: crate::state::Focus, row: u16, col: u16 },
+    /// Extend the active selection (clamped to its pane).
+    SelectionExtend { pane: crate::state::Focus, row: u16, col: u16 },
+    /// Finalize the selection on mouse-up (copies via OSC 52).
+    SelectionFinish,
+    /// Clear the selection.
+    SelectionClear,
+    /// The workspace pane's live state (plan/findings/verification) —
+    /// emitted by the worker as the turn progresses.
+    WorkspaceUpdate(crate::state::Workspace),
     /// Request to quit — opens confirmation prompt (q, Ctrl+D).
     RequestQuit,
     /// Confirm quit from the modal.

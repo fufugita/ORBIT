@@ -106,6 +106,19 @@ fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
 // ── Golden frames ────────────────────────────────────────────────────────────
 
 #[test]
+fn preview_dump() {
+    // Dev-only: dump frames to /tmp for visual inspection.
+    if std::env::var("ORBIT_PREVIEW").is_err() {
+        return;
+    }
+    let buf = render_buf(&idle_app(), &design(), 150, 44);
+    std::fs::write("/tmp/preview-idle.txt", buf_text(&buf)).unwrap();
+    let mut app = working_app();
+    let buf = render_buf(&app, &design(), 150, 44);
+    std::fs::write("/tmp/preview-working.txt", buf_text(&buf)).unwrap();
+}
+
+#[test]
 fn golden_idle_wide_150x44() {
     let buf = render_buf(&idle_app(), &design(), 150, 44);
     let text = buf_text(&buf);
@@ -289,14 +302,28 @@ fn golden_command_palette() {
 
 // ── Design invariants (§13.5) ────────────────────────────────────────────────
 
-/// invariant_one_frame_max: at most one rounded frame in any buffer.
+/// invariant_one_frame_max: at most one OVERLAY frame (modal) at a time
+/// (§1). The three pane borders are the layout, not overlays — they're
+/// exempt. A modal (quit confirmation, approval) draws its own frame; two
+/// modals at once would violate the one-frame rule.
 #[test]
 fn invariant_one_frame_max() {
     let d = design();
-    for app in [idle_app(), working_app(), approval_app()] {
+    // The pane layout: 3 panes × 4 corners = 12 baseline.
+    let base = render_buf(&idle_app(), &d, 150, 44);
+    let base_corners: usize = base
+        .content()
+        .iter()
+        .filter(|c| {
+            c.symbol() == "╭" || c.symbol() == "╮" || c.symbol() == "╰" || c.symbol() == "╯"
+        })
+        .count();
+    assert_eq!(base_corners, 12, "3 panes × 4 corners");
+
+    // With a modal open, the modal adds exactly one frame (+4 corners).
+    for app in [approval_app()] {
         for (w, h) in [(150u16, 44u16), (80, 30)] {
             let buf = render_buf(&app, &d, w, h);
-            // Count corner glyphs — each frame contributes 4.
             let corners: usize = buf
                 .content()
                 .iter()
@@ -304,9 +331,10 @@ fn invariant_one_frame_max() {
                     c.symbol() == "╭" || c.symbol() == "╮" || c.symbol() == "╰" || c.symbol() == "╯"
                 })
                 .count();
+            // 12 (panes) + 4 (modal) = 16 max. Two modals would be 20.
             assert!(
-                corners <= 4,
-                "at most one frame (4 corners) — found {corners} at {w}x{h}"
+                corners <= 16,
+                "at most one overlay frame beyond the panes — found {corners} at {w}x{h}"
             );
         }
     }
@@ -454,12 +482,11 @@ fn invariant_magenta_closed_list() {
         .iter()
         .filter(|c| c.fg == ratatui::style::Color::Magenta || c.fg == magenta)
         .count();
-    // The focused pane's header bar is a magenta fill (the zone anchor —
-    // ~rail width 22 cells) + the mark + composer prompt + voice glyph.
-    // Bound: header bar + the closed list of small accents.
+    // The focused pane's border is the accent (herdr-style focus): the
+    // center pane perimeter ≈ 2×(width+height) cells + the mark + prompt.
     assert!(
-        magenta_cells <= 64,
-        "idle frame has {magenta_cells} magenta cells — magenta is leaking beyond the header bar + accents"
+        magenta_cells <= 320,
+        "idle frame has {magenta_cells} magenta cells — magenta is leaking beyond the focused border + accents"
     );
 
     // Approval: the card frame joins — still bounded (frame + title + keys).
@@ -470,9 +497,9 @@ fn invariant_magenta_closed_list() {
         .filter(|c| c.fg == ratatui::style::Color::Magenta || c.fg == magenta)
         .count();
     // The card frame perimeter (≈2×(width+height)) + title + key glyphs
-    // + the focused header bar fill.
+    // + the focused center-pane border (herdr-style accent).
     assert!(
-        magenta_cells <= 420,
-        "approval frame has {magenta_cells} magenta cells — beyond frame + title + keys + header"
+        magenta_cells <= 640,
+        "approval frame has {magenta_cells} magenta cells — beyond frame + title + keys + border"
     );
 }

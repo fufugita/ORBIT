@@ -55,6 +55,13 @@ pub struct Glyphs {
     pub conn_retrying: &'static str,
     pub conn_rate_limited: &'static str,
     pub conn_offline: &'static str,
+    // Rounded-corner pane border glyphs (herdr-style softer frame).
+    pub border_tl: &'static str,
+    pub border_tr: &'static str,
+    pub border_bl: &'static str,
+    pub border_br: &'static str,
+    pub border_h: &'static str,
+    pub border_v: &'static str,
 
     // ── Structure ──
     /// Disclosure collapsed.
@@ -132,6 +139,12 @@ impl Glyphs {
             conn_retrying: "↻",
             conn_rate_limited: "◔",
             conn_offline: "✕",
+            border_tl: "╭",
+            border_tr: "╮",
+            border_bl: "╰",
+            border_br: "╯",
+            border_h: "─",
+            border_v: "│",
             collapsed: "▸",
             expanded: "▾",
             bullet: "∙",
@@ -184,6 +197,12 @@ impl Glyphs {
             conn_retrying: "~",
             conn_rate_limited: "%",
             conn_offline: "x",
+            border_tl: "+",
+            border_tr: "+",
+            border_bl: "+",
+            border_br: "+",
+            border_h: "-",
+            border_v: "|",
             collapsed: ">",
             expanded: "v",
             bullet: "-",
@@ -228,6 +247,12 @@ impl Glyphs {
     }
 
     /// The four-frame working-star sequence for this glyph set.
+    pub fn corner_tl(&self) -> &'static str { self.border_tl }
+    pub fn corner_tr(&self) -> &'static str { self.border_tr }
+    pub fn corner_bl(&self) -> &'static str { self.border_bl }
+    pub fn corner_br(&self) -> &'static str { self.border_br }
+    pub fn border_h(&self) -> &'static str { self.border_h }
+    pub fn border_v(&self) -> &'static str { self.border_v }
     pub fn working(&self) -> &'static [&'static str; 4] {
         match self.set {
             GlyphSet::Unicode => self.working_star,

@@ -342,10 +342,9 @@ def main():
     print(f"  [health] after modal: port8088={_port_open(8088)} mock_alive={mock_proc is not None and mock_proc.poll() is None}")
     if ok:
         s.key("y")  # allow
-        # The rendered "hello world" may be clipped at the viewport edge
-        # (the final 'd' can be cut off). Match the stable prefix "hello word"
-        # plus the tool-ok status to prove the round-trip completed.
-        ok2, buf2 = s.wait_for("hello word", timeout=45)
+        # The second round streams "hello world". With the bordered panes
+        # the text fits fully; match the stable prefix either way.
+        ok2, buf2 = s.wait_for("hello worl", timeout=45)
         check("approval 'y' allows tool -> second round text", ok2, buf2[-300:])
 
     # ── 5. Ctrl+C cancel mid-stream (graceful, TUI stays up) ───────────────
@@ -411,7 +410,8 @@ def main():
         # Send 8 Tabs in one write (worst case: crossterm coalesces them).
         sb.write(b"\t" * 8)
         time.sleep(1.5)
-        buf = sb.clean(sb.read(2.0))
+        raw = sb.read(2.0)
+        buf = sb.clean(raw)
         # Count ordered ▶ markers. Focus cycle from Center is:
         # Right(▶ Tasks) → Status(no marker) → Left(▶ Sessions) → Center(no marker) → repeat
         # So 8 Tabs should produce: Tasks, Sessions, Tasks, Sessions, Tasks, Sessions, Tasks, Sessions
@@ -423,7 +423,15 @@ def main():
         # ≥6 means the focus cycled through panes repeatedly without a
         # single keypress getting lost (each of the 8 tabs produces at
         # least one header rewrite for the newly-focused pane).
-        markers = _re.findall(r'━+', buf)
+        # New design (herdr-style): the focused pane's border is the accent
+        # (magenta 38;2;227;86;208). Each Tab press moves focus → the
+        # newly-focused pane's border redraws in magenta. Count magenta
+        # border runs across the burst: ≥4 means focus cycled R,L,R,L
+        # without a lost keypress.
+        # raw is a UTF-8-decoded str: real ESC chars + real border
+        # glyphs. ratatui emits the fg color with a trailing bg field
+        # (e.g. ;49 for default) before the m.
+        markers = _re.findall("\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[─┌┐└┘]+", raw)
         has_alternation = len(markers) >= 4
         check("tab burst cycles focus one-by-one",
               has_alternation,

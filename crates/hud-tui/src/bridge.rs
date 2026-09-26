@@ -237,6 +237,11 @@ pub fn emit_tool_finished(sender: &BusSender, name: &str, ok: bool) {
     });
 }
 
+/// Emit a workspace update (the right rail's live state).
+pub fn emit_workspace(sender: &BusSender, w: crate::state::Workspace) {
+    sender.send(Msg::WorkspaceUpdate(w));
+}
+
 /// Emit a response-finished event with usage + cost.
 pub fn emit_response_finished(
     sender: &BusSender,

@@ -192,7 +192,9 @@ impl Palette {
                 mono: DarkGray,
             },
             faint: Token {
-                true_color: rgb(101, 95, 115),
+                // Lifted from (101,95,115): section labels and hints need
+                // to stay legible on the dark bg (WCAG-ish ≥4.5:1).
+                true_color: rgb(117, 110, 133),
                 c256: Indexed(60),
                 c16: DarkGray,
                 mono: DarkGray,
@@ -380,8 +382,8 @@ pub struct LayoutConfig {
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
-            rail_left: 22,
-            rail_right: 28,
+            rail_left: 24,
+            rail_right: 40,
             measure: 100,
         }
     }
@@ -718,8 +720,11 @@ magenta = "#FF00FF"
     #[test]
     fn layout_defaults_are_columns_not_percent() {
         let l = LayoutConfig::default();
-        assert_eq!(l.rail_left, 22);
-        assert_eq!(l.rail_right, 28);
+        // herdr-style bordered panes need wider rails: the border eats 2
+        // columns each side, so 24/40 keep the same content budget the old
+        // 22/28 borderless rails had (22 ≈ 24-2, 28 < 40-2 for sub-lines).
+        assert_eq!(l.rail_left, 24);
+        assert_eq!(l.rail_right, 40);
         assert_eq!(l.measure, 100);
     }
 

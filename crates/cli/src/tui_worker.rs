@@ -331,6 +331,11 @@ pub fn run_tui_turn(
     // the first tool call of a turn still applies to later calls in the same
     // turn (matches the REPL: cmd_chat creates AutoGrants once per turn).
     let mut auto_grants = crate::tool_runtime::AutoGrants::new();
+    // The workspace rail tracks the turn's phases (§6.10):
+    // 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
+    let mut ws = orbit_hud_tui::state::Workspace::default();
+    ws.phase_index = 0;
+    orbit_hud_tui::emit_workspace(sender, ws.clone());
     for round in 0..8u32 {
         let outcome = crate::run_turn(
             &config.home,
@@ -355,9 +360,16 @@ pub fn run_tui_turn(
         output_tokens += o.output_tokens;
         cost += o.cost_microcents;
         orbit_hud_tui::emit_cost(sender, cost);
+        // The model is reasoning (round 0) or responding (later rounds).
+        if round == 0 {
+            ws.phase_index = 1;
+            orbit_hud_tui::emit_workspace(sender, ws.clone());
+        }
 
         if o.tool_calls.is_empty() {
-            // Normal text terminal.
+            // Normal text terminal: the respond phase.
+            ws.phase_index = 4;
+            orbit_hud_tui::emit_workspace(sender, ws.clone());
             transcript.push(ChatMessage {
                 role: ChatRole::Assistant,
                 content: o.output.clone(),
@@ -395,6 +407,9 @@ pub fn run_tui_turn(
             tool_result: None,
         });
 
+        // Tools are running: the act phase.
+        ws.phase_index = 2;
+        orbit_hud_tui::emit_workspace(sender, ws.clone());
         // Execute each tool call via the TUI approval channel.
         let mut approval_channel = TuiApprovalChannel::new(sender.clone(), approvals.clone());
         for call in &o.tool_calls {

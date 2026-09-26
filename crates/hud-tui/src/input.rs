@@ -23,6 +23,14 @@ pub enum KeyAction {
     CommandPalette,
     /// Open the command palette (§6.13).
     OpenPalette,
+    /// Enter INSERT mode (from NORMAL).
+    EnterInsert,
+    /// Toggle zoom on the focused pane (herdr-style fullscreen).
+    ZoomToggle,
+    /// Scroll the focused pane up by n lines.
+    ScrollUp(u16),
+    /// Scroll the focused pane down by n lines.
+    ScrollDown(u16),
     /// Key was recognized but not actionable in the current context.
     Unknown,
 }
@@ -73,6 +81,8 @@ impl KeyParser {
                     '2' => Some(KeyAction::FocusCenter),
                     '3' => Some(KeyAction::FocusRight),
                     '/' => Some(KeyAction::CommandPalette),
+                    'i' => Some(KeyAction::EnterInsert),
+                    'Z' => Some(KeyAction::ZoomToggle),
                     'g' | 'z' => {
                         self.pending_leader = Some(c);
                         None // waiting for next key
@@ -87,6 +97,24 @@ impl KeyParser {
             KeyCode::BackTab => {
                 self.pending_leader = None;
                 Some(KeyAction::FocusPrev)
+            }
+            // Per-pane scroll (herdr-style functional isolation): the
+            // scroll keys act on whichever pane is focused.
+            KeyCode::Up => {
+                self.pending_leader = None;
+                Some(KeyAction::ScrollUp(1))
+            }
+            KeyCode::Down => {
+                self.pending_leader = None;
+                Some(KeyAction::ScrollDown(1))
+            }
+            KeyCode::PageUp => {
+                self.pending_leader = None;
+                Some(KeyAction::ScrollUp(10))
+            }
+            KeyCode::PageDown => {
+                self.pending_leader = None;
+                Some(KeyAction::ScrollDown(10))
             }
             _ => {
                 self.pending_leader = None;

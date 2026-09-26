@@ -109,7 +109,7 @@ impl Phase {
 }
 
 /// A workspace task (§6.10 task rows).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
     pub title: String,
     pub state: TaskState,
@@ -132,7 +132,7 @@ pub enum TaskState {
 /// The workspace snapshot the pane renders (§6.10). All sections optional;
 /// the pane renders only the sections with data. The backend fills these
 /// (PR-F wires the bridge).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Workspace {
     pub phase_index: usize, // 0..5
     pub plan: Vec<Task>,
@@ -141,14 +141,14 @@ pub struct Workspace {
 }
 
 /// One finding row: title + inline source path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub title: String,
     pub source: Option<String>,
 }
 
 /// One verification row: check name + result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verification {
     pub name: String,
     pub result: VerificationResult,
@@ -160,6 +160,57 @@ pub enum VerificationResult {
     Passed,
     Failed,
     Pending,
+}
+
+impl App {
+    /// The plain-text lines of a pane, for selection extraction. The
+    /// transcript is the Center pane's content; the rails render their
+    /// own lines (a full impl would cache them at render time).
+    pub fn pane_lines(&self, pane: Focus) -> Vec<String> {
+        match pane {
+            Focus::Center => self
+                .transcript
+                .iter()
+                .map(|l| match l {
+                    crate::state::TranscriptLine::User(t)
+                    | crate::state::TranscriptLine::Assistant(t)
+                    | crate::state::TranscriptLine::System(t) => t.clone(),
+                    crate::state::TranscriptLine::Stripped { tool_name } => {
+                        format!("[tool] {tool_name}")
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The last-rendered pane rects — the mouse hit-test boundary. Interior
+/// mutability (Cell) so the renderer can record them through &App.
+#[derive(Debug, Clone, Default)]
+pub struct PaneRects {
+    pub left: std::cell::Cell<Option<ratatui::layout::Rect>>,
+    pub center: std::cell::Cell<Option<ratatui::layout::Rect>>,
+    pub right: std::cell::Cell<Option<ratatui::layout::Rect>>,
+}
+
+/// Modal input (the multiplexer pattern): INSERT types into the composer
+/// (the boot default — type to talk); NORMAL runs single-key commands
+/// (q, g/z leaders, ?). Esc from an empty composer toggles to NORMAL;
+/// `i` or Enter returns to INSERT. The status line shows the mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputMode {
+    /// Type into the composer (the boot default).
+    #[default]
+    Insert,
+    /// Single-key commands (q, g/z leaders, ?).
+    Normal,
+    /// Prefix mode (herdr/tmux-style): the next key is a command. Entered
+    /// with Ctrl+B; Esc cancels. The status line shows PREFIX.
+    Prefix,
+    /// Copy mode: j/k move a cursor through the transcript, v selects,
+    /// y yanks. Per-pane (herdr-style).
+    Copy,
 }
 
 /// The command palette (§6.13): an overlay with a fuzzy query.
@@ -296,6 +347,19 @@ pub struct App {
     pub workspace: Workspace,
     /// Command palette (§6.13).
     pub palette: PaletteState,
+    /// Modal input state (insert vs normal).
+    pub input_mode: InputMode,
+    /// Zoomed pane (herdr-style): the pane fills the whole surface; the
+    /// other panes are hidden. None = normal 3-pane layout.
+    pub zoomed_pane: Option<Focus>,
+    /// Last-rendered pane rects (screen coords) — the mouse hit-test
+    /// boundary. Updated by the renderer each frame.
+    pub pane_rects: PaneRects,
+    /// The active per-pane text selection (None = no selection).
+    pub selection: Option<crate::selection::Selection>,
+    /// A pending OSC 52 clipboard write — the terminal loop emits it once
+    /// then clears it (the reducer can't write to stdout).
+    pub osc52_pending: Option<String>,
     /// Last status one-liner (shown in toast / status bar).
     pub last_status: String,
     /// Active error from the backend, if any.
@@ -335,8 +399,9 @@ pub struct App {
     pub spinner_frame: u8,
     /// Smooth focus transition phase 0..3. The renderer blends the border
     /// color (dim → accent) over 3 frames when focus changes; None = settled.
-    /// Transcript viewport scroll offset (lines from top). 0 = top.
-    pub viewport_scroll: u16,
+    /// Per-pane scroll offsets (lines from top). 0 = top. Each pane
+    /// scrolls independently — functional isolation (herdr-style).
+    pub pane_scroll: [u16; 3],
     /// True when the operator has scrolled up (disables auto-scroll).
     pub viewport_manual: bool,
     /// One-shot: clear the terminal before the next draw so the whole frame
@@ -433,6 +498,11 @@ impl App {
             pending_approvals: Vec::new(),
             workspace: Workspace::default(),
             palette: PaletteState::default(),
+            input_mode: InputMode::Insert,
+            zoomed_pane: None,
+            pane_rects: PaneRects::default(),
+            selection: None,
+            osc52_pending: None,
             last_status: String::new(),
             last_error: None,
             transcript_scroll: 0,
@@ -449,7 +519,7 @@ impl App {
             turn_in_flight: false,
             cancel_requested: false,
             spinner_frame: 0,
-            viewport_scroll: 0,
+            pane_scroll: [0, 0, 0],
             viewport_manual: false,
             force_full_redraw: std::cell::Cell::new(false),
         }
@@ -686,6 +756,105 @@ impl App {
                     risk,
                 });
                 self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS);
+            }
+            Msg::InputModeChanged(mode) => {
+                self.input_mode = mode;
+                self.dirty.set(DirtyFlags::STATUS);
+            }
+            Msg::ExitCopyMode => {
+                self.copy_mode = false;
+                self.input_mode = InputMode::Insert;
+                self.dirty.set(DirtyFlags::STATUS | DirtyFlags::LAYOUT);
+            }
+            Msg::CopyMove(d) => {
+                // Move the per-pane copy cursor.
+                let idx = match self.focus {
+                    Focus::Left => 0,
+                    Focus::Center => 1,
+                    Focus::Right => 2,
+                    _ => return,
+                };
+                let cur = self.pane_scroll[idx] as i32;
+                let next = (cur + d).max(0) as u16;
+                self.pane_scroll[idx] = next;
+                self.dirty.set(DirtyFlags::LAYOUT);
+            }
+            Msg::CopySelect => {
+                // Selection state would live here in a full impl; for the
+                // MVP, mark selection as active so the renderer can show
+                // it.
+                self.dirty.set(DirtyFlags::LAYOUT);
+            }
+            Msg::CopyYank => {
+                // The MVP: just exit copy mode. A full impl would extract
+                // the transcript range and write to the system clipboard
+                // via arboard or OSC 52.
+                self.copy_mode = false;
+                self.input_mode = InputMode::Insert;
+                self.dirty.set(DirtyFlags::STATUS | DirtyFlags::LAYOUT);
+            }
+            Msg::PaneScroll { pane, delta } => {
+                let idx = match pane {
+                    Focus::Left => 0,
+                    Focus::Center => 1,
+                    Focus::Right => 2,
+                    _ => return,
+                };
+                let cur = self.pane_scroll[idx] as i32;
+                // Clamp at 0 (top); bottom is unbounded (render clamps).
+                let next = (cur + delta).max(0) as u16;
+                if next != self.pane_scroll[idx] {
+                    self.pane_scroll[idx] = next;
+                    self.dirty.set(DirtyFlags::LAYOUT | DirtyFlags::TRANSCRIPT);
+                }
+            }
+            Msg::ZoomToggle(pane) => {
+                self.zoomed_pane = if self.zoomed_pane == Some(pane) {
+                    None
+                } else {
+                    Some(pane)
+                };
+                self.dirty.set(DirtyFlags::LAYOUT | DirtyFlags::TRANSCRIPT);
+            }
+            Msg::SelectionAnchor { pane, row, col } => {
+                self.selection = Some(crate::selection::Selection::anchor(pane, row, col));
+                self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::LAYOUT);
+            }
+            Msg::SelectionExtend { pane, row, col } => {
+                // Drags only extend the selection that belongs to the same
+                // pane — a drag crossing into another pane is clamped out
+                // (the pane boundary is the isolation boundary).
+                if let Some(sel) = self.selection.as_mut() {
+                    if sel.pane == pane {
+                        sel.extend(row, col);
+                        self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::LAYOUT);
+                    }
+                }
+            }
+            Msg::SelectionFinish => {
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.finish();
+                }
+                // Extract + copy outside the mutable borrow.
+                if let Some(sel) = self.selection.as_ref() {
+                    if sel.is_visible() {
+                        let lines = self.pane_lines(sel.pane);
+                        let text = sel.extract(&lines).join("\n");
+                        if !text.is_empty() {
+                            self.osc52_pending = Some(crate::selection::osc52_sequence(&text));
+                        }
+                    }
+                }
+                self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::LAYOUT);
+            }
+            Msg::SelectionClear => {
+                if self.selection.take().is_some() {
+                    self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::LAYOUT);
+                }
+            }
+            Msg::WorkspaceUpdate(w) => {
+                self.workspace = w;
+                self.dirty.set(DirtyFlags::LAYOUT);
             }
             Msg::PaletteToggle => {
                 self.palette.open = !self.palette.open;
@@ -926,12 +1095,71 @@ impl App {
             | KeyAction::CommandPalette
             | KeyAction::OpenPalette
             | KeyAction::Unknown => {}
+            // Scroll/zoom/insert are handled by the dedicated Msg arms
+            // (PaneScroll/ZoomToggle/InputModeChanged) — the KeyAction
+            // variants exist so the parser can emit them.
+            KeyAction::EnterInsert
+            | KeyAction::ZoomToggle
+            | KeyAction::ScrollUp(_)
+            | KeyAction::ScrollDown(_) => {}
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // herdr-style functional isolation tests
+    #[test]
+    fn per_pane_scroll_is_isolated() {
+        let mut app = App::default();
+        app.reduce(Msg::PaneScroll { pane: Focus::Left, delta: 5 });
+        assert_eq!(app.pane_scroll[0], 5, "left pane scrolled");
+        assert_eq!(app.pane_scroll[1], 0, "center untouched");
+        assert_eq!(app.pane_scroll[2], 0, "right untouched");
+        app.reduce(Msg::PaneScroll { pane: Focus::Right, delta: 3 });
+        assert_eq!(app.pane_scroll[0], 5, "left still 5");
+        assert_eq!(app.pane_scroll[2], 3, "right scrolled");
+    }
+
+    #[test]
+    fn scroll_clamps_at_top() {
+        let mut app = App::default();
+        app.reduce(Msg::PaneScroll { pane: Focus::Center, delta: -10 });
+        assert_eq!(app.pane_scroll[1], 0, "cannot scroll above the top");
+    }
+
+    #[test]
+    fn zoom_toggles_per_pane() {
+        let mut app = App::default();
+        app.reduce(Msg::ZoomToggle(Focus::Left));
+        assert_eq!(app.zoomed_pane, Some(Focus::Left));
+        app.reduce(Msg::ZoomToggle(Focus::Left));
+        assert_eq!(app.zoomed_pane, None);
+        app.reduce(Msg::ZoomToggle(Focus::Right));
+        assert_eq!(app.zoomed_pane, Some(Focus::Right));
+        app.reduce(Msg::ZoomToggle(Focus::Right));
+        assert_eq!(app.zoomed_pane, None);
+    }
+
+    #[test]
+    fn prefix_mode_round_trip() {
+        let mut app = App::default();
+        app.reduce(Msg::InputModeChanged(InputMode::Prefix));
+        assert_eq!(app.input_mode, InputMode::Prefix);
+        app.reduce(Msg::InputModeChanged(InputMode::Insert));
+        assert_eq!(app.input_mode, InputMode::Insert);
+    }
+
+    #[test]
+    fn copy_mode_exits_to_insert() {
+        let mut app = App::default();
+        app.reduce(Msg::InputModeChanged(InputMode::Copy));
+        assert_eq!(app.input_mode, InputMode::Copy);
+        app.reduce(Msg::CopyYank);
+        assert_eq!(app.input_mode, InputMode::Insert);
+        assert!(!app.copy_mode);
+    }
+
     #[test]
     fn palette_filter_subsequence() {
         use super::filtered_commands;

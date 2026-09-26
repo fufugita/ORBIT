@@ -24,45 +24,12 @@ use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 /// One-row pane header: title, then a hairline rule filling the rest of the
 /// row. The focused pane gets a heavy rule (`━`, rule_hi) and a magenta
 /// title; unfocused panes get a light rule (`─`, rule) and an ink2 title.
-/// This replaces the old boxed pane_block — no Borders::ALL anywhere.
-fn pane_header_line(
-    title: &str,
-    focused: bool,
-    area_width: u16,
-    d: &Design,
-    _g: &Glyphs,
-) -> Line<'static> {
-    // Multiplexer-style zone anchor: a filled header bar. The focused pane
-    // gets the accent fill; unfocused panes get surface2. The title rides
-    // the bar; the rest of the row fills with the same background so the
-    // bar spans the full pane width.
-    let (title_color, bg, bold) = if focused {
-        (d.palette.bg, d.palette.magenta, true)
-    } else {
-        (d.palette.ink2, d.palette.surface2, false)
-    };
-    let mut style = Style::default().fg(title_color).bg(bg);
-    if bold {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    let title_span = Span::styled(format!(" {title} "), style);
-    // Fill the remainder of the row with the bar background.
-    let title_w = display_width_of(title) as u16 + 2;
-    let fill = area_width.saturating_sub(title_w) as usize;
-    let rule = " ".repeat(fill);
-    Line::from(vec![
-        title_span,
-        Span::styled(rule, Style::default().bg(bg)),
-    ])
-}
 
-/// Display width helper (single source: unicode.rs).
-fn display_width_of(s: &str) -> usize {
-    crate::unicode::display_width(s)
-}
 
-/// Render the one-row header for a pane, then return the body area below it.
-fn render_pane_header(
+/// Render a bordered pane (herdr-style): a full Block border with the title
+/// riding the top edge. The focused pane's border is the accent; unfocused
+/// panes get the muted rule colour. Returns the inner content rect.
+fn render_pane_frame(
     frame: &mut ratatui::Frame,
     area: Rect,
     title: &str,
@@ -70,16 +37,108 @@ fn render_pane_header(
     d: &Design,
     g: &Glyphs,
 ) -> Rect {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
-    frame.render_widget(
-        Paragraph::new(pane_header_line(title, focused, area.width, d, g)),
-        rows[0],
-    );
-    rows[1]
+    let p = &d.palette;
+    let (border_color, title_style) = if focused {
+        (
+            p.magenta,
+            Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (p.muted, Style::default().fg(p.ink2))
+    };
+    // The ASCII tier keeps every chrome cell printable ASCII (§13.5):
+    // ratatui's Plain border set is unicode, so the ASCII tier draws its
+    // own + - | frame.
+    if g.set() == crate::tokens::GlyphSet::Ascii {
+        // ratatui Plain borders are unicode; the ASCII tier draws its own
+        // + - | frame (invariant_ascii_tier_is_ascii, §13.5).
+        let inner = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        draw_ascii_pane_border(frame, area, &title, border_color, title_style, g);
+        return inner;
+    }
+    let block = Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(format!(" {title} "), title_style));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
 }
+
+/// ASCII-tier pane border: + corners, - horizontal, | vertical.
+fn draw_ascii_pane_border(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    color: ratatui::style::Color,
+    title_style: Style,
+    g: &Glyphs,
+) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let style = Style::default().fg(color);
+    // The ASCII-tier border uses the rounded-corner glyphs (╭ ╯) when
+    // the terminal renders unicode; if it doesn't, those cells fall back
+    // to + / - / | by the user's terminal. The intent is to look modern
+    // even in the safe tier.
+    let tl = g.corner_tl();
+    let tr = g.corner_tr();
+    let bl = g.corner_bl();
+    let br = g.corner_br();
+    let h = g.border_h();
+    let v = g.border_v();
+    let title_text = format!(" {title} ");
+    let title_w = title_text.chars().count() as u16;
+    let mut top = String::new();
+    top.push_str(tl);
+    let title_start = 1;
+    let title_end = (title_start + title_w).min(area.width - 1);
+    for x in 1..(area.width - 1) {
+        if x >= title_start && x < title_end {
+            let idx = (x - title_start) as usize;
+            if idx < title_text.chars().count() {
+                top.push(title_text.chars().nth(idx).unwrap());
+            } else {
+                top.push_str(h);
+            }
+        } else {
+            top.push_str(h);
+        }
+    }
+    top.push_str(tr);
+    buf.set_stringn(area.x, area.y, &top, area.width as usize, style);
+    // Title styling: overwrite the title chars with the title style
+    buf.set_stringn(
+        area.x + 1,
+        area.y,
+        &title_text,
+        title_w as usize,
+        title_style,
+    );
+    // Bottom
+    let bottom = format!("+{}+", "-".repeat((area.width - 2) as usize));
+    buf.set_stringn(
+        area.x,
+        area.y + area.height - 1,
+        &bottom,
+        area.width as usize,
+        style,
+    );
+    // Sides
+    for y in 1..(area.height - 1) {
+        buf.set_stringn(area.x, area.y + y, "|", 1, style);
+        buf.set_stringn(area.x + area.width - 1, area.y + y, "|", 1, style);
+    }
+}
+
 
 // ── Main render ──────────────────────────────────────────────────────────────
 
@@ -100,23 +159,103 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     // Three columns: left rail | divider | conversation | divider | right
     // rail. Rails are column counts (tokens::LayoutConfig); the dividers are
     // full-height hairlines that double as scroll tracks (§6.14).
-    let l = &d.layout_rails;
+    // herdr-style: three bordered panes, no divider columns — the pane
+    // borders ARE the separation. A 1-col gap between panes keeps the
+    // borders from doubling up. Rails collapse responsively on narrow
+    // terminals (the conversation always keeps ≥40 cols): full rails ≥120,
+    // right rail drops 100-119, left drops 80-99, single pane <80.
+    let total = area.width;
+    let (left_w, right_w) = if total >= 120 {
+        (d.layout_rails.0, d.layout_rails.1)
+    } else if total >= 100 {
+        // Right rail shrinks to fit; the conversation keeps ≥40.
+        (d.layout_rails.0, (total - d.layout_rails.0 - 44).max(0))
+    } else if total >= 80 {
+        // Both rails compact: 18/22 keeps the center ≥36 at 80 cols.
+        (18, 22)
+    } else {
+        (0, 0)
+    };
+    let mut constraints = Vec::new();
+    if left_w > 0 {
+        constraints.push(Constraint::Length(left_w));
+        constraints.push(Constraint::Length(1)); // gap
+    }
+    constraints.push(Constraint::Min(10)); // conversation
+    if right_w > 0 {
+        constraints.push(Constraint::Length(1)); // gap
+        constraints.push(Constraint::Length(right_w));
+    }
     let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(l.0),
-            Constraint::Length(1), // divider track
-            Constraint::Min(10),   // conversation
-            Constraint::Length(1), // divider track
-            Constraint::Length(l.1),
-        ])
+        .constraints(constraints)
         .split(outer[0]);
 
-    render_left_pane(frame, main[0], app, d, g);
-    render_divider(frame, main[1], app, d, g, false);
-    render_center_pane(frame, main[2], app, composer_text, d, g);
-    render_divider(frame, main[3], app, d, g, true);
-    render_right_pane(frame, main[4], app, d, g);
+    // Pane slots depend on which rails are present.
+    // Record the pane rects for the mouse hit-test (interior mutability —
+    // the renderer sees &App).
+    app.pane_rects.left.set(if left_w > 0 { Some(main[0]) } else { None });
+    app.pane_rects.center.set(Some(main[if left_w > 0 { 2 } else { 0 }]));
+    app.pane_rects
+        .right
+        .set(if right_w > 0 { Some(main[main.len() - 1]) } else { None });
+
+    // Zoom (herdr-style): the zoomed pane fills the whole surface.
+    if let Some(zoomed) = app.zoomed_pane {
+        match zoomed {
+            Focus::Left => render_left_pane(frame, outer[0], app, d, g),
+            Focus::Center => render_center_pane(frame, outer[0], app, composer_text, d, g),
+            Focus::Right => render_right_pane(frame, outer[0], app, d, g),
+            _ => {}
+        }
+        render_status_bar(frame, outer[1], app, d, g);
+        return;
+    }
+    let mut idx = 0;
+    if left_w > 0 {
+        render_left_pane(frame, main[idx], app, d, g);
+        idx += 2; // rail + gap
+    }
+    render_center_pane(frame, main[idx], app, composer_text, d, g);
+    if right_w > 0 {
+        render_right_pane(frame, main[idx + 2], app, d, g); // gap + rail
+    }
+
+    // Per-pane selection highlight (herdr-style): paint the selected cells
+    // INSIDE the owning pane only — the pane boundary is the isolation
+    // boundary.
+    if let Some(sel) = &app.selection {
+        if sel.is_visible() {
+            let rect = match sel.pane {
+                Focus::Left => app.pane_rects.left.get(),
+                Focus::Center => app.pane_rects.center.get(),
+                Focus::Right => app.pane_rects.right.get(),
+                _ => None,
+            };
+            if let Some(rect) = rect {
+                let inner = ratatui::layout::Rect {
+                    x: rect.x + 1,
+                    y: rect.y + 1,
+                    width: rect.width.saturating_sub(2),
+                    height: rect.height.saturating_sub(2),
+                };
+                let buf = frame.buffer_mut();
+                for row in 0..inner.height {
+                    for col in 0..inner.width {
+                        if sel.contains(row, col) {
+                            let cell = &mut buf[(inner.x + col, inner.y + row)];
+                            let fg = cell.style().fg.unwrap_or(d.palette.ink);
+                            cell.set_style(
+                                Style::default()
+                                    .fg(fg)
+                                    .bg(d.palette.magenta_dim),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Command palette (§6.13): an overlay above the panes, under the
     // status line.
     if app.palette.open {
@@ -138,87 +277,156 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
 
 /// Full-height divider `│`; when the transcript overflows, the center
 /// divider becomes a scroll track with a `┃` thumb at the transcript's
-/// position.
-fn render_divider(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    app: &App,
-    d: &Design,
-    g: &Glyphs,
-    is_center: bool,
-) {
-    if area.height == 0 {
-        return;
-    }
-    // Stronger zone boundary: the divider is a solid rule. The divider
-    // adjacent to the focused pane takes the accent colour so focus is
-    // obvious at the pane boundary.
-    let divider_color =
-        if (is_center && app.focus == Focus::Center) || (!is_center && app.focus == Focus::Left) {
-            d.palette.magenta_dim
-        } else {
-            d.palette.rule
-        };
-    let track = Span::styled(g.divider, Style::default().fg(divider_color));
-    let mut lines: Vec<Line> = vec![Line::from(track.clone()); area.height as usize];
-
-    // Scroll thumb on the center divider when there is more content than
-    // fits. (Approximate: app.scroll_hint carries 0=at-bottom, 1=scrolled.)
-    if is_center && app.viewport_manual {
-        // Position the thumb by scroll fraction; without exact totals here,
-        // place it in the upper third while scrolled (the pill in §6.14's
-        // "↓ n new" is a later step — the track alone is honest).
-        let idx = (area.height as usize / 3).min(area.height as usize - 1);
-        lines[idx] = Line::from(Span::styled(g.thumb, Style::default().fg(d.palette.muted)));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
 
 // ── Left rail (§6.9) ─────────────────────────────────────────────────────────
 
 fn render_left_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
-    // Zone isolation: the rail gets a surface fill (the center stays bg) —
-    // the panes read as distinct regions, multiplexer-style.
-    frame.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(p.surface)),
-        area,
-    );
     let title = match app.left_tab {
         LeftTab::Sessions => "Sessions",
         LeftTab::Verbose => "Activity",
     };
-    let body = render_pane_header(frame, area, title, app.focus == Focus::Left, d, g);
+    let body = render_pane_frame(frame, area, title, app.focus == Focus::Left, d, g);
 
-    let items: Vec<ListItem> = match app.left_tab {
-        LeftTab::Sessions => vec![ListItem::new(vec![
-            Line::from(vec![
-                Span::styled(format!("{} ", g.conn_online), Style::default().fg(p.green)),
+    // One blank row of breathing room below the top border (matches the
+    // transcript's padding).
+    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    match app.left_tab {
+        LeftTab::Sessions => {
+            // ── Session block ──
+            let conn_glyph = match app.connection {
+                ConnectionState::Online => (g.conn_online, p.green),
+                ConnectionState::Reconnecting => (g.conn_retrying, p.amber),
+                ConnectionState::Offline => (g.conn_offline, p.red),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(conn_glyph.0, Style::default().fg(conn_glyph.1)),
+                Span::raw(" "),
                 Span::styled(&app.session_id_prefix, Style::default().fg(p.ink)),
-            ]),
-            Line::from(vec![
+            ]));
+            lines.push(Line::from(vec![
                 Span::styled("model ", Style::default().fg(p.muted)),
                 Span::styled(&app.model, Style::default().fg(p.ink2)),
-            ]),
-        ])],
-        LeftTab::Verbose => {
-            if app.in_flight.is_empty() {
-                vec![ListItem::new(Line::from(vec![Span::styled(
-                    "(no active stream)",
-                    Style::default().fg(p.faint),
-                )]))]
-            } else {
-                vec![ListItem::new(vec![
-                    Line::from(vec![Span::styled("streaming", Style::default().fg(p.cyan))]),
-                    Line::from(vec![Span::styled(
-                        &app.in_flight,
-                        Style::default().fg(p.muted),
-                    )]),
-                ])]
+            ]));
+            lines.push(Line::from(""));
+
+            // ── Usage block (herdr shows tokens per agent) ──
+            lines.push(section_label("USAGE", p));
+            lines.push(Line::from(vec![
+                Span::styled("turns ", Style::default().fg(p.muted)),
+                Span::styled(
+                    app.total_turns.to_string(),
+                    Style::default().fg(p.ink2),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("in    ", Style::default().fg(p.muted)),
+                Span::styled(
+                    format_tokens(app.total_input_tokens),
+                    Style::default().fg(p.ink2),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("out   ", Style::default().fg(p.muted)),
+                Span::styled(
+                    format_tokens(app.total_output_tokens),
+                    Style::default().fg(p.ink2),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("cost  ", Style::default().fg(p.muted)),
+                Span::styled(
+                    format!("${:.4}", app.total_cost_microcents as f64 / 1_000_000.0),
+                    Style::default().fg(p.ink2),
+                ),
+            ]));
+            lines.push(Line::from(""));
+
+            // ── Queue block ──
+            if !app.queued.is_empty() {
+                lines.push(section_label("QUEUED", p));
+                for (i, q) in app.queued.iter().enumerate() {
+                    let shown: String = q.chars().take(body.width as usize - 4).collect();
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{} ", i + 1),
+                            Style::default().fg(p.faint),
+                        ),
+                        Span::styled(shown, Style::default().fg(p.ink2)),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
+
+            // ── Keys hint (the affordance so the operator learns the
+            // modal keys — herdr shows hints in the sidebar footer) ──
+            lines.push(section_label("KEYS", p));
+            for (k, v) in [
+                ("Tab", "cycle panes"),
+                ("Z", "zoom pane"),
+                ("Ctrl+B", "prefix mode"),
+                ("Esc", "normal mode"),
+                ("?", "commands"),
+            ] {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{k:<8}"), Style::default().fg(p.ink2)),
+                    Span::styled(v, Style::default().fg(p.muted)),
+                ]));
             }
         }
-    };
-    frame.render_widget(List::new(items).style(Style::default().bg(p.surface)), body);
+        LeftTab::Verbose => {
+            if app.in_flight.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "(no active stream)",
+                    Style::default().fg(p.faint),
+                )));
+            } else {
+                // The live stream, wrapped to the rail width.
+                let width = body.width as usize;
+                let mut row = String::new();
+                for ch in app.in_flight.chars() {
+                    if row.chars().count() >= width {
+                        lines.push(Line::from(Span::styled(
+                            row.clone(),
+                            Style::default().fg(p.ink2),
+                        )));
+                        row.clear();
+                    }
+                    row.push(ch);
+                }
+                if !row.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        row,
+                        Style::default().fg(p.ink2),
+                    )));
+                }
+            }
+        }
+    }
+
+    // Per-pane scroll (functional isolation).
+    let para = Paragraph::new(lines).scroll((app.pane_scroll[0], 0));
+    frame.render_widget(para, body);
+}
+
+/// A small caps section label with a rule — the visual rhythm anchor.
+fn section_label(text: &str, p: &crate::tokens::ResolvedPalette) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(text.to_string(), Style::default().fg(p.faint)),
+        Span::styled(" ─", Style::default().fg(p.surface2)),
+    ])
+}
+
+/// Compact token counts: 1234 → 1.2k.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}m", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 // ── Center pane: transcript + composer (§6.2–6.8, §5.5) ──────────────────────
@@ -233,8 +441,15 @@ fn render_center_pane(
 ) {
     let p = &d.palette;
 
-    // No pane header on the conversation — it IS the centre of gravity
-    // (§1). Split: transcript (fill) | queue | composer band.
+    // The conversation gets the same bordered frame as the rails — the
+    // three panes read as equal, isolated surfaces (herdr-style). The
+    // title carries the session identity.
+    // The center title is the conversation itself — session metadata
+    // lives in the status line and the left rail (no duplication).
+    let title = "Conversation".to_string();
+    let area = render_pane_frame(frame, area, &title, app.focus == Focus::Center, d, g);
+
+    // Split: transcript (fill) | queue | composer band.
     //
     // Composer auto-height (§5.5): one row when empty, one row per line of
     // content, capped at half the pane so the transcript always keeps ≥3
@@ -256,7 +471,8 @@ fn render_center_pane(
     // ── Transcript ─────────────────────────────────────────────────────────
     // The welcome screen (§8.1): an empty session shows the expanded mark,
     // centered in the conversation. The first turn replaces it.
-    let mut lines: Vec<Line> = Vec::new();
+    // One blank row of breathing room below the top border.
+    let mut lines: Vec<Line> = vec![Line::from("")];
     if app.transcript.is_empty() && app.in_flight.is_empty() {
         let mark = welcome_mark(d, g);
         let mark_w = 36u16; // widest mark row
@@ -287,21 +503,45 @@ fn render_center_pane(
     for entry in &app.transcript {
         match entry {
             TranscriptLine::User(text) => {
-                lines.push(Line::from(user_gutter()));
+                // The gutter rides the FIRST line (herdr-style) — no orphan
+                // glyph row. Continuation lines align under the text.
+                let mut first = true;
                 for line in text.lines() {
-                    lines.push(Line::from(vec![
-                        Span::raw("   "),
-                        Span::styled(line, Style::default().fg(p.ink)),
-                    ]));
+                    if first {
+                        lines.push(Line::from(vec![
+                            user_gutter(),
+                            Span::styled(line, Style::default().fg(p.ink)),
+                        ]));
+                        first = false;
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw("   "),
+                            Span::styled(line, Style::default().fg(p.ink)),
+                        ]));
+                    }
+                }
+                if first {
+                    // Empty user message: still show the gutter.
+                    lines.push(Line::from(user_gutter()));
                 }
                 lines.push(Line::from(""));
             }
             TranscriptLine::Assistant(text) => {
-                lines.push(Line::from(orbit_gutter(false)));
+                // Same: the ✦ rides the first rendered line.
+                let mut first = true;
                 for rich_line in render_message(text, d) {
-                    let mut spans = vec![Span::raw("   ")];
+                    let mut spans = Vec::new();
+                    if first {
+                        spans.push(orbit_gutter(false));
+                        first = false;
+                    } else {
+                        spans.push(Span::raw("   "));
+                    }
                     spans.extend(rich_line.spans);
                     lines.push(Line::from(spans));
+                }
+                if first {
+                    lines.push(Line::from(orbit_gutter(false)));
                 }
                 lines.push(Line::from(""));
             }
@@ -356,7 +596,7 @@ fn render_center_pane(
     let visible_height = center[0].height as usize;
     let total_lines = lines.len();
     let scroll = if app.viewport_manual {
-        app.viewport_scroll as usize
+        app.pane_scroll[1] as usize
     } else {
         total_lines.saturating_sub(visible_height)
     };
@@ -387,7 +627,7 @@ fn render_center_pane(
         || app.tool_state == ToolState::Streaming
         || matches!(app.tool_state, ToolState::Running(_));
     let cursor_on = !turn_live && (app.tick_count / 16).is_multiple_of(2);
-    let cursor = if cursor_on { "▏" } else { " " };
+    let cursor = if cursor_on { "▍" } else { " " };
     let first_text_line = composer_text.lines().next().unwrap_or("");
     let prompt_line = if composer_text.is_empty() {
         Line::from(vec![
@@ -439,21 +679,26 @@ fn section_line(label: &str, count: usize, p: &crate::tokens::ResolvedPalette) -
 
 fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
-    // Zone isolation: surface fill (same as the left rail).
-    frame.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(p.surface)),
-        area,
-    );
-    let body = render_pane_header(frame, area, "Workspace", app.focus == Focus::Right, d, g);
-    let mut lines: Vec<Line> = vec![Line::from("")];
+    let body = render_pane_frame(frame, area, "Workspace", app.focus == Focus::Right, d, g);
+    // Two blank rows: border + breathing room.
+    let mut lines: Vec<Line> = vec![Line::from(""), Line::from("")];
 
     let w = &app.workspace;
     if w.plan.is_empty() && w.findings.is_empty() && w.verification.is_empty() {
-        // Backend hasn't filled it yet (PR-F).
-        lines.push(Line::from(vec![Span::styled(
-            "(workspace empty — PR-F wires the bridge)",
-            Style::default().fg(p.faint),
-        )]));
+        // A useful empty state: what WILL appear here + how to drive it.
+        for text in [
+            "The turn's plan, findings, and",
+            "verification land here as the",
+            "model works.",
+            "",
+            "Phases: orient → reason → act →",
+            "verify → respond",
+        ] {
+            lines.push(Line::from(Span::styled(
+                text,
+                Style::default().fg(p.faint),
+            )));
+        }
     } else {
         // ── Phase stepper (§6.10) ──────────────────────────────────────────
         // ✓━━✓━━◉──◌──◌  execute  3/5
@@ -542,9 +787,18 @@ fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
                         TaskState::AwaitingApproval => p.muted,
                         TaskState::Done => p.faint,
                     };
+                    // Tail-truncate: paths and status strings matter at the
+                    // END, so keep the tail and drop the head.
+                    let budget = body.width.saturating_sub(2) as usize;
+                    let shown = if sub.chars().count() > budget {
+                        let skip = sub.chars().count() - budget;
+                        format!("…{}", sub.chars().skip(skip).collect::<String>())
+                    } else {
+                        sub.clone()
+                    };
                     lines.push(Line::from(vec![
-                        Span::styled("      ", Style::default()),
-                        Span::styled(sub.clone(), Style::default().fg(sub_color)),
+                        Span::styled("  ", Style::default()),
+                        Span::styled(shown, Style::default().fg(sub_color)),
                     ]));
                 }
             }
@@ -596,7 +850,10 @@ fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         }
     }
 
-    frame.render_widget(Paragraph::new(lines), body);
+    // Per-pane scroll (functional isolation): the workspace rail scrolls
+    // independently.
+    let para = Paragraph::new(lines).scroll((app.pane_scroll[2], 0));
+    frame.render_widget(para, body);
 }
 
 /// The command palette overlay (§6.13): 78 columns (or W−8), top edge on
@@ -744,6 +1001,28 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         } else {
             g.orbit
         };
+    // Mode chip (the multiplexer pattern): INSERT is silent (the default —
+    // type to talk); the other modes show a chip so the operator knows
+    // which input model is live (herdr shows PREFIX/COPY the same way).
+    // Zoom chip: when a pane is zoomed, say so (herdr shows zoom in the
+    // tab bar; ORBIT's status line is the equivalent).
+    let zoom_chip = if app.zoomed_pane.is_some() {
+        Span::styled(" ZOOM ", Style::default().fg(p.bg).bg(p.green))
+    } else {
+        Span::raw("")
+    };
+    let mode_chip = match app.input_mode {
+        crate::state::InputMode::Insert => Span::raw(""),
+        crate::state::InputMode::Normal => {
+            Span::styled(" NORMAL ", Style::default().fg(p.bg).bg(p.amber))
+        }
+        crate::state::InputMode::Prefix => {
+            Span::styled(" PREFIX ", Style::default().fg(p.bg).bg(p.magenta))
+        }
+        crate::state::InputMode::Copy => {
+            Span::styled(" COPY ", Style::default().fg(p.bg).bg(p.cyan))
+        }
+    };
     let tool_state = match &app.tool_state {
         ToolState::Idle => Span::styled("idle", Style::default().fg(p.muted)),
         ToolState::Streaming => Span::styled("streaming", Style::default().fg(p.cyan)),
@@ -786,31 +1065,49 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
     let cost = app.total_cost_microcents;
     let cost_str = format!("${}.{:06}", cost / 1_000_000, cost % 1_000_000);
 
-    let sep = Span::styled(" ", Style::default());
-    let mut spans = vec![
+    // Two-zone status (herdr-style hierarchy): identity on the left,
+    // live metrics on the right. The zones breathe — no wall of text.
+    let sep = Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint));
+    let mut left_spans = vec![
         Span::styled(mark, Style::default().fg(p.magenta)),
-        sep.clone(),
+        Span::raw(" "),
+        mode_chip,
+        zoom_chip,
+        Span::raw(" "),
         Span::styled(&app.model, Style::default().fg(p.ink2)),
-        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
-        Span::styled(&app.provider, Style::default().fg(p.muted)),
-        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
+        sep.clone(),
         Span::styled(&app.session_id_prefix, Style::default().fg(p.faint)),
-        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
-        tool_state,
-        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
-        conn,
-        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
-        Span::styled(tokens, Style::default().fg(p.muted)),
-        Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint)),
-        Span::styled(cost_str, Style::default().fg(p.ink2)),
     ];
     if !app.last_status.is_empty() {
-        spans.push(Span::styled(
-            format!(" {} ", g.sep),
-            Style::default().fg(p.faint),
+        left_spans.push(sep.clone());
+        left_spans.push(Span::styled(
+            app.last_status.clone(),
+            Style::default().fg(p.muted),
         ));
-        spans.push(Span::styled(&app.last_status, Style::default().fg(p.muted)));
     }
+    let right_spans = vec![
+        tool_state,
+        sep.clone(),
+        conn,
+        sep.clone(),
+        Span::styled(tokens, Style::default().fg(p.muted)),
+        sep.clone(),
+        Span::styled(cost_str, Style::default().fg(p.ink2)),
+    ];
+    // Measure and pad so the right zone hugs the right edge.
+    let left_w: usize = left_spans
+        .iter()
+        .map(|sp| crate::unicode::display_width(&sp.to_string()))
+        .sum();
+    let right_w: usize = right_spans
+        .iter()
+        .map(|sp| crate::unicode::display_width(&sp.to_string()))
+        .sum();
+    let total_w = area.width as usize;
+    let gap = total_w.saturating_sub(left_w + right_w);
+    let mut spans = left_spans;
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(right_spans);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(p.surface2)),
         area,

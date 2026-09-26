@@ -16,6 +16,7 @@ pub mod bridge;
 pub mod bus;
 mod coalesce;
 pub mod glyphs;
+pub mod selection;
 pub mod input;
 pub mod msg;
 pub mod plain;
@@ -30,7 +31,7 @@ pub mod worker;
 pub use approval::{ApprovalRegistry, ApprovalResponse};
 pub use bridge::{
     emit_cost, emit_error, emit_response_finished, emit_status, emit_text, emit_tool_finished,
-    emit_tool_started, safe_text, strip_cot,
+    emit_tool_started, emit_workspace, safe_text, strip_cot,
 };
 pub use worker::{CommandSink, WorkerCommand, WorkerCtx, WorkerSpawner};
 
@@ -373,6 +374,15 @@ fn event_loop(
             }
         }
 
+        // A finalized selection queued an OSC 52 clipboard write — emit it
+        // once (the reducer can't touch stdout) and clear the pending slot.
+        if let Some(seq) = app.osc52_pending.take() {
+            use std::io::Write as _;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(seq.as_bytes());
+            let _ = out.flush();
+        }
+
         // Copy mode: exit alt screen, print transcript, wait for key, re-enter.
         if app.copy_mode {
             app.copy_mode = false;
@@ -410,6 +420,9 @@ fn event_loop(
                 Event::Key(key) => {
                     handle_key(key, sender, &mut composer, key_parser, app, approvals)
                 }
+                Event::Mouse(me) => {
+                    handle_mouse(me, sender, app);
+                }
                 Event::Resize(w, h) => sender.send(Msg::Resize(w, h)),
                 _ => {}
             }
@@ -441,10 +454,11 @@ fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(),
     use crossterm::execute;
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 
     // Exit alt screen + raw mode.
     disable_raw_mode().map_err(|e| format!("disable_raw_mode: {e}"))?;
-    execute!(std::io::stdout(), Show, LeaveAlternateScreen)
+    execute!(std::io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen)
         .map_err(|e| format!("leave alt screen: {e}"))?;
 
     // Instructions FIRST — everything below this point is pure transcript
@@ -475,7 +489,10 @@ fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(),
 
     // Re-enter alt screen + raw mode.
     enable_raw_mode().map_err(|e| format!("enable_raw_mode: {e}"))?;
-    execute!(std::io::stdout(), EnterAlternateScreen, Hide)
+    // Mouse capture (SGR mode): the app owns the mouse so selection can
+    // be per-pane (the host terminal's native selection grabs across
+    // pane borders — it doesn't know they exist).
+    execute!(std::io::stdout(), EnterAlternateScreen, Hide, EnableMouseCapture)
         .map_err(|e| format!("enter alt screen: {e}"))?;
 
     // Force the terminal to redraw.
@@ -546,6 +563,79 @@ fn composer_wants_char(key: &KeyEvent, app: &App) -> bool {
 
 /// Convert a crossterm key event into a `Msg`, approval response, or composer
 /// mutation. Approval responses resolve the first pending approval.
+/// Mouse handling (per-pane selection, herdr-style):
+///   - Down in a pane's content → anchor a selection there
+///   - Drag → extend (clamped to the pane)
+///   - Up → finalize + OSC 52 copy
+///   - Any click/key clears a Done selection first
+///
+/// Clicks on borders/gaps hit no pane and are ignored — the borders are
+/// the isolation boundary.
+fn handle_mouse(
+    me: crossterm::event::MouseEvent,
+    sender: &BusSender,
+    app: &App,
+) {
+    use crossterm::event::MouseEventKind;
+
+    let rects = &app.pane_rects;
+    let hit = crate::selection::hit_test(
+        me.row,
+        me.column,
+        rects.left.get(),
+        rects.center.get().unwrap_or_default(),
+        rects.right.get(),
+    );
+
+    // Shift+Click: bypass app selection — the host terminal's native
+    // selection takes over (the universal terminal convention: Shift
+    // suspends mouse reporting for that gesture). This is the escape
+    // hatch for whole-screen selection when the operator wants it.
+    if me
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::SHIFT)
+    {
+        return;
+    }
+
+    match me.kind {
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            // A click clears any existing selection.
+            sender.send(Msg::SelectionClear);
+            if let Some((pane, row, col)) = hit {
+                sender.send(Msg::SelectionAnchor { pane, row, col });
+            }
+        }
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            if let Some((pane, row, col)) = hit {
+                sender.send(Msg::SelectionExtend { pane, row, col });
+            }
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            sender.send(Msg::SelectionFinish);
+        }
+        // Scroll wheel: per-pane scroll (functional isolation).
+        MouseEventKind::ScrollUp => {
+            if let Some((pane, _, _)) = hit {
+                sender.send(Msg::PaneScroll { pane, delta: -3 });
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some((pane, _, _)) = hit {
+                sender.send(Msg::PaneScroll { pane, delta: 3 });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_key_clears_selection(sender: &BusSender, app: &App) {
+    // Any keypress dismisses a finished selection (herdr behaviour).
+    if app.selection.is_some() {
+        sender.send(Msg::SelectionClear);
+    }
+}
+
 fn handle_key(
     key: KeyEvent,
     sender: &BusSender,
@@ -554,6 +644,9 @@ fn handle_key(
     app: &App,
     approvals: &ApprovalRegistry,
 ) {
+    // Any keypress dismisses a finished selection (herdr behaviour).
+    handle_key_clears_selection(sender, app);
+
     // Command palette (§6.13): when open, ALL keys route to the palette —
     // chars build the query, ↑↓ move, enter executes, esc closes.
     if app.palette.open {
@@ -587,6 +680,92 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
         sender.send(Msg::RequestQuit);
         return;
+    }
+
+    // Ctrl+B → prefix mode (herdr/tmux-style modal dispatch): the next
+    // key is a command, not composer text. Esc cancels.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+        sender.send(Msg::InputModeChanged(crate::state::InputMode::Prefix));
+        return;
+    }
+
+    // ── Prefix mode: the next key is a command (herdr ClientShellMode::Prefix) ──
+    if app.input_mode == crate::state::InputMode::Prefix {
+        let return_mode = if app.input_mode == crate::state::InputMode::Copy {
+            crate::state::InputMode::Copy
+        } else {
+            crate::state::InputMode::Insert
+        };
+        match key.code {
+            KeyCode::Esc => {
+                sender.send(Msg::InputModeChanged(return_mode));
+                return;
+            }
+            // Prefix commands: pane management (herdr's core).
+            KeyCode::Char('z') => {
+                sender.send(Msg::InputModeChanged(return_mode));
+                sender.send(Msg::ZoomToggle(app.focus));
+                return;
+            }
+            KeyCode::Char('o') => {
+                // cycle panes
+                sender.send(Msg::InputModeChanged(return_mode));
+                sender.send(Msg::KeyAction(KeyAction::FocusNext));
+                return;
+            }
+            KeyCode::Char('1') => {
+                sender.send(Msg::InputModeChanged(return_mode));
+                sender.send(Msg::KeyAction(KeyAction::FocusLeft));
+                return;
+            }
+            KeyCode::Char('2') => {
+                sender.send(Msg::InputModeChanged(return_mode));
+                sender.send(Msg::KeyAction(KeyAction::FocusCenter));
+                return;
+            }
+            KeyCode::Char('3') => {
+                sender.send(Msg::InputModeChanged(return_mode));
+                sender.send(Msg::KeyAction(KeyAction::FocusRight));
+                return;
+            }
+            KeyCode::Char('[') => {
+                // enter copy mode (tmux heritage)
+                sender.send(Msg::InputModeChanged(crate::state::InputMode::Copy));
+                return;
+            }
+            _ => {
+                // Unknown prefix key: cancel back.
+                sender.send(Msg::InputModeChanged(return_mode));
+                return;
+            }
+        }
+    }
+
+    // ── Copy mode: j/k move, v select, y yank, Esc exits (herdr-style) ──
+    if app.input_mode == crate::state::InputMode::Copy {
+        match key.code {
+            KeyCode::Esc => {
+                sender.send(Msg::ExitCopyMode);
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                sender.send(Msg::CopyMove(1));
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                sender.send(Msg::CopyMove(-1));
+                return;
+            }
+            KeyCode::Char('v') => {
+                sender.send(Msg::CopySelect);
+                return;
+            }
+            KeyCode::Char('y') => {
+                sender.send(Msg::CopyYank);
+                return;
+            }
+            _ => return, // copy mode swallows everything else
+        }
     }
 
     // ── Approval modal captures input (DR-21 L18) ─────────────────────────
@@ -656,6 +835,29 @@ fn handle_key(
         return;
     }
 
+    // Modal input toggle (the multiplexer pattern): Esc from an empty
+    // composer → NORMAL mode (single-key commands); `i` or Enter in NORMAL
+    // → INSERT. The status line shows which mode you're in.
+    match key.code {
+        KeyCode::Esc if app.input_mode == crate::state::InputMode::Insert => {
+            if composer.text.is_empty() {
+                sender.send(Msg::InputModeChanged(crate::state::InputMode::Normal));
+                return;
+            }
+            // Text present: Esc clears the composer first (existing feel).
+            composer.clear();
+            sender.send(Msg::ComposerChanged);
+            return;
+        }
+        KeyCode::Char('i') | KeyCode::Enter
+            if app.input_mode == crate::state::InputMode::Normal =>
+        {
+            sender.send(Msg::InputModeChanged(crate::state::InputMode::Insert));
+            return;
+        }
+        _ => {}
+    }
+
     // Focus navigation is global: Tab/BackTab must reach the key parser even
     // while the center composer is focused. Handle it before composer input.
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -699,14 +901,12 @@ fn handle_key(
         return;
     }
 
-    // Plain character input into the composer — ONLY when the center pane
-    // (conversation) is focused AND the composer has text (or the key is a
-    // plain letter that isn't a command). When the composer is EMPTY, single
-    // keys route to the parser so q/?/g/z work immediately — the standard
-    // TUI pattern (type to enter input mode, commands work at rest).
-    let composer_has_text = !composer.text.is_empty();
+    // Plain character input into the composer — when the center pane
+    // (conversation) is focused and we're in INSERT mode. In NORMAL mode
+    // (Esc from an empty composer), letters route to the command parser —
+    // the modal pattern every multiplexer uses (herdr/tmux/vim).
     if app.focus == crate::state::Focus::Center
-        && composer_has_text
+        && app.input_mode == crate::state::InputMode::Insert
         && composer_wants_char(&key, app)
     {
         if let KeyCode::Char(c) = key.code {
@@ -740,6 +940,26 @@ fn handle_key(
             KeyAction::OpenPalette => {
                 // ? → the command palette (§6.13).
                 sender.send(Msg::PaletteToggle);
+            }
+            KeyAction::EnterInsert => {
+                sender.send(Msg::InputModeChanged(crate::state::InputMode::Insert));
+            }
+            KeyAction::ZoomToggle => {
+                // Z → zoom the focused pane (herdr-style fullscreen).
+                sender.send(Msg::ZoomToggle(app.focus));
+            }
+            KeyAction::ScrollUp(n) => {
+                // Scroll acts on the FOCUSED pane (functional isolation).
+                sender.send(Msg::PaneScroll {
+                    pane: app.focus,
+                    delta: -(n as i32),
+                });
+            }
+            KeyAction::ScrollDown(n) => {
+                sender.send(Msg::PaneScroll {
+                    pane: app.focus,
+                    delta: n as i32,
+                });
             }
         }
     }
