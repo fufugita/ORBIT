@@ -431,7 +431,7 @@ def main():
         # raw is a UTF-8-decoded str: real ESC chars + real border
         # glyphs. ratatui emits the fg color with a trailing bg field
         # (e.g. ;49 for default) before the m.
-        markers = _re.findall("\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[─┌┐└┘]+", raw)
+        markers = _re.findall("\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[─╭╮╰╯]+", raw)
         has_alternation = len(markers) >= 4
         check("tab burst cycles focus one-by-one",
               has_alternation,

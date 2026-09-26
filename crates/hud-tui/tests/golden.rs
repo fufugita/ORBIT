@@ -135,6 +135,17 @@ fn preview_dump() {
     pa.palette.open = true;
     let buf = render_buf(&pa, &design(), 150, 44);
     std::fs::write("/tmp/preview-palette.txt", buf_text(&buf)).unwrap();
+    // Streaming mid-turn
+    let mut st = working_app();
+    st.in_flight = "The patch serializes refreshes by token ID so concurrent".to_string();
+    st.tool_state = ToolState::Streaming;
+    let buf = render_buf(&st, &design(), 150, 44);
+    std::fs::write("/tmp/preview-streaming.txt", buf_text(&buf)).unwrap();
+    // Zoomed center
+    let mut zm = idle_app();
+    zm.zoomed_pane = Some(Focus::Center);
+    let buf = render_buf(&zm, &design(), 150, 44);
+    std::fs::write("/tmp/preview-zoom.txt", buf_text(&buf)).unwrap();
 }
 
 #[test]

@@ -572,11 +572,21 @@ fn render_center_pane(
     // In-flight stream — live star in the gutter, cyan while working.
     let streaming = !app.in_flight.is_empty();
     if streaming {
-        lines.push(Line::from(orbit_gutter(true)));
+        // The gutter rides the first line (no orphan ✦ row).
+        let mut first = true;
         for rich_line in render_message(&app.in_flight, d) {
-            let mut spans = vec![Span::raw("   ")];
+            let mut spans = Vec::new();
+            if first {
+                spans.push(orbit_gutter(true));
+                first = false;
+            } else {
+                spans.push(Span::raw("   "));
+            }
             spans.extend(rich_line.spans);
             lines.push(Line::from(spans));
+        }
+        if first {
+            lines.push(Line::from(orbit_gutter(true)));
         }
     }
     // NOTE: while Streaming with an empty in_flight, no transcript line is
