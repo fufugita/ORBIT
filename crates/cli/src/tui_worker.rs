@@ -223,6 +223,13 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                             // resume, one summary line is sufficient.
                             Some(TranscriptLine::Stripped {
                                 tool_name: calls[0].name.clone(),
+                                // Restored sessions carry no argument
+                                // summary — the call args aren't in the
+                                // display-safe form (they're raw JSON).
+                                // The outcome is unknown from the saved
+                                // transcript; settled-neutral is honest.
+                                summary: String::new(),
+                                outcome: Some(true),
                             })
                         }
                     } else if !msg.content.is_empty() {

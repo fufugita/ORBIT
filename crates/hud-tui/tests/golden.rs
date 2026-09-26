@@ -23,7 +23,7 @@
 use orbit_hud_tui::render::render;
 use orbit_hud_tui::state::{
     App, ComposerState, ConnectionState, Finding, Focus, LeftTab, LogoPhase, PendingApproval,
-    Task, TaskState, ToolState, TranscriptLine,
+    Task, TaskState, Toast, ToastKind, ToolState, TranscriptLine,
 };
 use orbit_hud_tui::tokens::{Design, GlyphSet, Theme};
 
@@ -201,6 +201,74 @@ fn golden_streaming_with_tools() {
     let text = buf_text(&buf);
     assert!(text.contains("auth suite"), "running tool name in status");
     assert!(text.contains("serializes"), "in-flight stream text");
+}
+
+/// The §6.12 toast rides the hint row's right end — and ONLY there (the
+/// old queue-row toast render was removed; a queued prompt + toast must
+/// not double-render).
+#[test]
+fn golden_toast_on_hint_row_once() {
+    let d = design();
+    let mut app = idle_app();
+    app.queued.push("a queued prompt".into());
+    app.toast = Some(Toast {
+        text: "copied 42 lines".into(),
+        kind: ToastKind::Success,
+    });
+    // The toast auto-dismisses 3 s after its emit tick; stamp it as
+    // just-emitted so the render under test still shows it.
+    app.toast_emitted_at = Some(app.tick_count);
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    let count = text.matches("copied 42 lines").count();
+    assert_eq!(count, 1, "toast renders exactly once (on the hint row)");
+    // The queued prompt still renders as its own row.
+    assert!(text.contains("a queued prompt"), "queued prompt row");
+}
+
+/// A running tool card: cyan ◉, bold name, right-aligned "running" meta.
+/// A settled same-name card keeps its ✓ — the running state belongs to
+/// the LAST unsettled card only.
+#[test]
+fn golden_tool_card_running_vs_settled() {
+    let d = design();
+    let mut app = idle_app();
+    app.turn_in_flight = true;
+    app.tool_state = ToolState::Running("shell".into());
+    // First shell call: settled ok.
+    app.transcript.push(TranscriptLine::Stripped {
+        tool_name: "shell".into(),
+        summary: "cargo test -p orbit-export".into(),
+        outcome: Some(true),
+    });
+    // Second shell call: running now.
+    app.transcript.push(TranscriptLine::Stripped {
+        tool_name: "shell".into(),
+        summary: "cargo test -p orbit-ledger".into(),
+        outcome: None,
+    });
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    // Exactly one "running" meta — the second card.
+    assert_eq!(text.matches("running").count(), 1, "one running card");
+    // Both cards render with their arguments (tail-truncated).
+    assert!(text.contains("cargo test -p orbit-export"), "settled card arg");
+    assert!(text.contains("cargo test -p orbit-ledger"), "running card arg");
+}
+
+/// A failed tool call settles to ✕ red with "failed" meta (§6.5).
+#[test]
+fn golden_tool_card_failed() {
+    let d = design();
+    let mut app = idle_app();
+    app.transcript.push(TranscriptLine::Stripped {
+        tool_name: "shell".into(),
+        summary: "cargo test".into(),
+        outcome: Some(false),
+    });
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    assert!(text.contains("failed"), "failed meta on the card");
 }
 
 #[test]

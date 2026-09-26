@@ -198,8 +198,16 @@ impl App {
                     crate::state::TranscriptLine::User(t)
                     | crate::state::TranscriptLine::Assistant(t)
                     | crate::state::TranscriptLine::System(t) => t.clone(),
-                    crate::state::TranscriptLine::Stripped { tool_name } => {
-                        format!("[tool] {tool_name}")
+                    crate::state::TranscriptLine::Stripped {
+                        tool_name,
+                        summary,
+                        ..
+                    } => {
+                        if summary.is_empty() {
+                            format!("[tool] {tool_name}")
+                        } else {
+                            format!("[tool] {tool_name} {summary}")
+                        }
                     }
                 })
                 .collect(),
@@ -460,6 +468,12 @@ pub enum TranscriptLine {
     /// CoT-stripped placeholder (NEVER shows raw reasoning).
     Stripped {
         tool_name: String,
+        /// Display-safe argument summary (the bridge's safe_text output).
+        /// Rendered as the tool card's argument column (§6.5).
+        summary: String,
+        /// The call's settled outcome (None while running). Set by
+        /// ToolCallFinished — the card's glyph depends on it (§6.5).
+        outcome: Option<bool>,
     },
     /// System note (cancelled turn, queue drained, etc.) — dim, never bold.
     System(String),
@@ -786,9 +800,9 @@ impl App {
                 self.tool_state = ToolState::Running(name.clone());
                 self.transcript.push(TranscriptLine::Stripped {
                     tool_name: name.clone(),
+                    summary: summary.clone(),
+                    outcome: None,
                 });
-                self.transcript
-                    .push(TranscriptLine::Assistant(format!("[tool] {summary}")));
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
             Msg::ToolCallFinished { name, ok } => {
@@ -802,13 +816,30 @@ impl App {
                     self.pending_approvals.remove(0);
                 }
                 self.tool_state = ToolState::Idle;
+                // Settle the card: the LAST still-running Stripped entry of
+                // this name takes the outcome. Earlier same-name cards are
+                // already settled (a second shell call starts only after the
+                // first finished), so this never overwrites a settled card.
+                for entry in self.transcript.iter_mut().rev() {
+                    if let TranscriptLine::Stripped {
+                        tool_name: n,
+                        outcome,
+                        ..
+                    } = entry
+                    {
+                        if n == &name && outcome.is_none() {
+                            *outcome = Some(ok);
+                            break;
+                        }
+                    }
+                }
                 // Note: we never render model-supplied rationale; only status.
                 self.last_status = if ok {
                     format!("tool {name}: ok")
                 } else {
                     format!("tool {name}: error")
                 };
-                self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS);
+                self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
             }
             Msg::BackendError(err) => {
                 self.last_error = Some(err.clone());

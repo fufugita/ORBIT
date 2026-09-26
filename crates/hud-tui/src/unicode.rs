@@ -164,6 +164,36 @@ pub fn truncate_graphemes(s: &str, max_width: usize) -> String {
     out
 }
 
+/// Truncate `s` to at most `max_width` cells, KEEPING the tail and
+/// prefixing `…` if truncated — `crates/…/restore.rs`. The end of a path
+/// or command is its most specific part (§6.5). Never truncates
+/// mid-grapheme; total width (including the ellipsis) ≤ `max_width`.
+pub fn truncate_graphemes_tail(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max_width {
+        return s.to_string();
+    }
+    // Reserve one cell for the leading ellipsis; fill from the end.
+    let budget = max_width.saturating_sub(1);
+    let graphemes: Vec<&str> = s.graphemes(true).collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut width = 0usize;
+    for g in graphemes.iter().rev() {
+        let w = grapheme_width(g);
+        if width + w > budget {
+            break;
+        }
+        out.push(g);
+        width += w;
+    }
+    out.reverse();
+    let mut result = String::from("…");
+    result.extend(out);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     // Regression (2026-09-26): text-presentation glyphs in Misc Symbols /

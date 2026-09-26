@@ -477,6 +477,8 @@ fn render_center_pane(
     // lives in the status line and the left rail (no duplication).
     let title = "Conversation".to_string();
     let area = render_pane_frame(frame, area, &title, app.focus == Focus::Center, d, g);
+    // The transcript's text width — tool-card meta right-aligns to it.
+    let body_w = area.width.saturating_sub(4) as usize;
 
     // Split: transcript (fill) | queue | composer box | hint row.
     //
@@ -581,16 +583,71 @@ fn render_center_pane(
                 }
                 lines.push(Line::from(""));
             }
-            TranscriptLine::Stripped { tool_name } => {
-                // The tool line alone — stripping stays in the bridge,
-                // silently (§12: no "(reasoning stripped)" advertisement).
-                lines.push(Line::from(vec![
+            TranscriptLine::Stripped {
+                tool_name,
+                summary,
+                outcome,
+            } => {
+                // The tool card (§6.5): state glyph, name, argument, meta —
+                // one row that reads like a Claude Code tool-call line.
+                // Stripping stays silent (§12).
+                //   ◉ calculator  expression="2*(3+4)"        running
+                //   ✓ calculator  expression="2*(3+4)"
+                //   ✕ shell  cargo test                      failed
+                // The card is running only while it is the LAST entry of
+                // this name AND still unsettled — an earlier same-name card
+                // that already settled keeps its outcome even while a later
+                // call of the same tool runs.
+                let is_running = outcome.is_none()
+                    && matches!(&app.tool_state, ToolState::Running(n) if n == tool_name)
+                    && app.turn_in_flight;
+                let (glyph, glyph_color, name_color, meta) = match (is_running, outcome) {
+                    (true, _) => (g.running, p.cyan, p.ink, "running".to_string()),
+                    (false, Some(true)) => (g.done, p.muted, p.ink2, String::new()),
+                    (false, Some(false)) => (g.failed, p.red, p.ink2, "failed".to_string()),
+                    // Unsettled but not running (e.g. the turn was cancelled
+                    // mid-call): the honest neutral state.
+                    (false, None) => (g.pending, p.faint, p.ink2, String::new()),
+                };
+                let mut spans = vec![
                     Span::raw("   "),
+                    Span::styled(glyph, Style::default().fg(glyph_color)),
+                    Span::raw(" "),
                     Span::styled(
-                        format!("{} {tool_name}", g.running),
-                        Style::default().fg(p.ink2),
+                        tool_name.clone(),
+                        Style::default().fg(name_color).add_modifier(if is_running {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                     ),
-                ]));
+                ];
+                // The argument column: the display-safe summary, muted,
+                // truncated head-first (the END of a path/command is its
+                // most specific part, §6.5: crates/…/restore.rs).
+                if !summary.is_empty() {
+                    let budget = body_w.saturating_sub(tool_name.chars().count() + 8);
+                    let arg = crate::unicode::truncate_graphemes_tail(summary, budget.max(8));
+                    spans.push(Span::styled(
+                        format!("  {arg}"),
+                        Style::default().fg(p.muted),
+                    ));
+                }
+                if !meta.is_empty() {
+                    let meta_w = crate::unicode::display_width(&meta);
+                    let used: usize = spans
+                        .iter()
+                        .map(|sp| crate::unicode::display_width(&sp.to_string()))
+                        .sum();
+                    // Align to the pane's inner right edge, like the queue toast.
+                    let pad = (center[0].width as usize).saturating_sub(used + meta_w);
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    spans.push(Span::styled(
+                        meta,
+                        Style::default().fg(if is_running { p.cyan } else { p.red }),
+                    ));
+                }
+                lines.push(Line::from(spans));
                 lines.push(Line::from(""));
             }
             TranscriptLine::System(text) => {
@@ -652,34 +709,13 @@ fn render_center_pane(
         .scroll((scroll as u16, 0));
     frame.render_widget(transcript, center[0]);
 
-    // ── Queue + toast: pending prompts left, the §6.12 toast right ────────
+    // ── Queue: pending prompts (the §6.12 toast rides the hint row) ───────
     let mut queue_rows = Vec::new();
     for q in &app.queued {
         queue_rows.push(Line::from(vec![
             Span::styled(format!("{} ", g.pending), Style::default().fg(p.faint)),
             Span::styled(truncate_graphemes(q, 40), Style::default().fg(p.muted)),
         ]));
-    }
-    if let Some(toast) = &app.toast {
-        // The toast rides the queue row, right-aligned: ✓ text (green) /
-        // plain text (muted) / ✕ text (red). Never floats over content.
-        let (glyph, color) = match toast.kind {
-            crate::state::ToastKind::Success => (g.done, p.green),
-            crate::state::ToastKind::Neutral => ("", p.muted),
-            crate::state::ToastKind::Error => (g.failed, p.red),
-        };
-        let text = if glyph.is_empty() {
-            toast.text.clone()
-        } else {
-            format!("{glyph} {}", toast.text)
-        };
-        let text_w = crate::unicode::display_width(&text);
-        let row = center[1].width as usize;
-        let pad = row.saturating_sub(text_w + 2);
-        let mut line = queue_rows.pop().unwrap_or_default();
-        line.spans.push(Span::raw(" ".repeat(pad)));
-        line.spans.push(Span::styled(text, Style::default().fg(color)));
-        queue_rows.push(line);
     }
     if !queue_rows.is_empty() {
         frame.render_widget(Paragraph::new(queue_rows), center[1]);
@@ -804,7 +840,13 @@ fn render_center_pane(
         };
         let text_w = crate::unicode::display_width(&text);
         let row = center[3].width as usize;
-        let pad = row.saturating_sub(text_w + 2);
+        let used: usize = hint_spans
+            .iter()
+            .map(|sp| crate::unicode::display_width(&sp.to_string()))
+            .sum();
+        // The toast right-aligns within the space LEFT after the hints —
+        // never past the row edge (clipped text is invisible text).
+        let pad = row.saturating_sub(used + text_w + 2);
         hint_spans.push(Span::raw(" ".repeat(pad)));
         hint_spans.push(Span::styled(text, Style::default().fg(color)));
     }

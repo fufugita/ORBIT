@@ -34,6 +34,8 @@ fn main() {
     ));
     app.transcript.push(TranscriptLine::Stripped {
         tool_name: "calculator".into(),
+        summary: r#"expression="2*(3+4)""#.into(),
+        outcome: Some(true),
     });
     if show_approval {
         app.pending_approvals.push(PendingApproval {
