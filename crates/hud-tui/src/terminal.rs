@@ -24,6 +24,7 @@
 
 use crate::state::App;
 use crossterm::cursor::{Hide, Show};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -164,7 +165,11 @@ impl TerminalGuard {
 
         enable_raw_mode().map_err(|e| format!("enable_raw_mode: {e}"))?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide)
+        // Mouse capture (SGR mode): the app owns the mouse so selection is
+        // per-pane — the host terminal's native selection grabs rectangular
+        // regions across pane borders because it doesn't know the panes
+        // exist. Shift+Click bypasses capture for whole-screen selection.
+        execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)
             .map_err(|e| format!("enter alt screen: {e}"))?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).map_err(|e| format!("create terminal: {e}"))?;
@@ -201,7 +206,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        execute!(std::io::stdout(), Show, LeaveAlternateScreen).ok();
+        execute!(std::io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen).ok();
         disable_raw_mode().ok();
     }
 }

@@ -17,7 +17,7 @@ use crate::unicode::truncate_graphemes;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 // ── Pane headers (§6.1) ──────────────────────────────────────────────────────
 
@@ -123,8 +123,8 @@ fn draw_ascii_pane_border(
         title_w as usize,
         title_style,
     );
-    // Bottom
-    let bottom = format!("+{}+", "-".repeat((area.width - 2) as usize));
+    // Bottom — rounded corners to match the top.
+    let bottom = format!("{bl}{}{br}", h.repeat((area.width - 2) as usize));
     buf.set_stringn(
         area.x,
         area.y + area.height - 1,
@@ -134,8 +134,8 @@ fn draw_ascii_pane_border(
     );
     // Sides
     for y in 1..(area.height - 1) {
-        buf.set_stringn(area.x, area.y + y, "|", 1, style);
-        buf.set_stringn(area.x + area.width - 1, area.y + y, "|", 1, style);
+        buf.set_stringn(area.x, area.y + y, v, 1, style);
+        buf.set_stringn(area.x + area.width - 1, area.y + y, v, 1, style);
     }
 }
 

@@ -60,9 +60,15 @@ class PtySession:
             start_new_session=True,
         )
         os.close(self.slave)
+        # Every byte ever read, never stripped — for control-sequence asserts.
+        self.raw_log = b""
 
     def read(self, timeout=2.0):
-        """Read available output, waiting up to timeout."""
+        """Read available output, waiting up to timeout.
+
+        All bytes are also appended to self.raw_log (never stripped) so
+        tests can assert on control sequences (mouse capture, OSC 52…).
+        """
         out = b""
         end = time.time() + timeout
         while time.time() < end:
@@ -75,6 +81,7 @@ class PtySession:
                 if not chunk:
                     break
                 out += chunk
+                self.raw_log += chunk
             elif out:
                 break
         return out.decode("utf-8", errors="replace")
@@ -458,10 +465,17 @@ def main():
         [args.binary, "--home", args.home, "--model", args.model],
         env=env, timeout=20, rows=30, cols=110,
     )
-    ok, _ = sb.wait_for("orbit", timeout=15)
+    ok, bootbuf = sb.wait_for("orbit", timeout=15)
     check("boots TUI for mouse test", ok)
     if ok:
         time.sleep(0.8)
+        # The boot path must own the mouse (TerminalGuard::enter enables
+        # SGR capture). Regression guard: the enable sequences must be in
+        # the boot stream — not only echo, the app consuming mouse events
+        # depends on it.
+        has_enable = any(x in sb.raw_log for x in (b"?1000h", b"?1006h", b"?1002h"))
+        check("mouse capture enabled at boot", has_enable,
+              "no mouse-enable sequence in boot stream")
         # Type a prompt so the transcript has content, then drag across it.
         sb.type("hello world test")
         sb.key("enter")
