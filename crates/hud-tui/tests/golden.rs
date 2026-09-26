@@ -175,7 +175,7 @@ fn golden_idle_wide_150x44() {
     assert!(text.contains("Workspace"), "right rail header");
     assert!(text.contains("What is 2*(3+4)?"), "user turn");
     assert!(text.contains("Result"), "assistant markdown heading");
-    assert!(text.contains("ask orbit"), "composer prompt");
+    assert!(text.contains("Ask ORBIT, or / for commands"), "composer prompt");
     assert!(text.contains("online"), "status line connection");
     assert!(text.contains("$0.002500"), "status line cost");
     // Chrome budget: the header row + status line = 2 rows of chrome.
@@ -191,7 +191,7 @@ fn golden_idle_narrow_80x30() {
     assert!(text.contains("Sessions"));
     assert!(text.contains("Workspace"));
     assert!(text.contains("What is 2*(3+4)?"));
-    assert!(text.contains("ask orbit"));
+    assert!(text.contains("Ask ORBIT, or / for commands"));
     assert!(text.contains("online"));
 }
 
@@ -229,7 +229,7 @@ fn golden_composer_auto_height() {
     let app = idle_app();
     // Empty composer: 1 row — the prompt line is the last row of the frame.
     let empty = render_buf(&app, &d, 80, 30);
-    assert!(buf_text(&empty).contains("ask orbit"));
+    assert!(buf_text(&empty).contains("Ask ORBIT, or / for commands"));
 
     // Multi-line composer: 3 lines of text → 3 rows, transcript keeps ≥3.
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
@@ -354,9 +354,9 @@ fn golden_command_palette() {
 // ── Design invariants (§13.5) ────────────────────────────────────────────────
 
 /// invariant_one_frame_max: at most one OVERLAY frame (modal) at a time
-/// (§1). The three pane borders are the layout, not overlays — they're
-/// exempt. A modal (quit confirmation, approval) draws its own frame; two
-/// modals at once would violate the one-frame rule.
+/// (§1). The pane borders and the composer box are the layout, not
+/// overlays — they're exempt. A modal (quit confirmation, approval) draws
+/// its own frame; two modals at once would violate the one-frame rule.
 #[test]
 fn invariant_one_frame_max() {
     let d = design();
@@ -369,7 +369,8 @@ fn invariant_one_frame_max() {
             c.symbol() == "╭" || c.symbol() == "╮" || c.symbol() == "╰" || c.symbol() == "╯"
         })
         .count();
-    assert_eq!(base_corners, 12, "3 panes × 4 corners");
+    // 3 panes + the composer box = 4 frames × 4 corners = 16 baseline.
+    assert_eq!(base_corners, 16, "3 panes + composer box");
 
     // With a modal open, the modal adds exactly one frame (+4 corners).
     for app in [approval_app()] {

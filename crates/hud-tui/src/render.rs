@@ -460,12 +460,18 @@ fn render_center_pane(
     let title = "Conversation".to_string();
     let area = render_pane_frame(frame, area, &title, app.focus == Focus::Center, d, g);
 
-    // Split: transcript (fill) | queue | composer band.
+    // Split: transcript (fill) | queue | composer box | hint row.
     //
-    // Composer auto-height (§5.5): one row when empty, one row per line of
+    // The composer is a rounded box (the Claude Code / Codex convention):
+    // magenta border when the center pane is focused ("you" — one of the
+    // six magenta things), cyan while a turn is live, rule otherwise.
+    // The hint row beneath carries the context keys; the §6.12 toast
+    // rides its right end.
+    //
+    // Composer auto-height (§5.5): the box grows one row per line of
     // content, capped at half the pane so the transcript always keeps ≥3
-    // rows. Lines beyond the cap show the last ones (the newest line stays
-    // visible).
+    // rows. Lines beyond the cap show the last ones (the newest line
+    // stays visible).
     let queue_h = app.queued.len() as u16;
     let text_lines = composer_text.lines().count().max(1) as u16;
     let composer_cap = (area.height / 2).max(1);
@@ -475,7 +481,8 @@ fn render_center_pane(
         .constraints([
             Constraint::Min(3),
             Constraint::Length(queue_h),
-            Constraint::Length(composer_h),
+            Constraint::Length(composer_h + 2), // box: border + content + border
+            Constraint::Length(1),              // hint row
         ])
         .split(area);
 
@@ -660,22 +667,35 @@ fn render_center_pane(
         frame.render_widget(Paragraph::new(queue_rows), center[1]);
     }
 
-    // ── Composer: a band, not a box (§5.5) ─────────────────────────────────
+    // ── Composer: a rounded box (the Claude Code / Codex convention) ──────
     // The › prompt in magenta (your input is one of the six magenta things),
-    // text in ink, no border. While streaming the band shows Stop.
+    // text in ink, inside a rounded box. The border is magenta when the
+    // composer is focused, cyan while a turn is live, rule otherwise.
     let composer_focused = app.focus == Focus::Center;
-    let prompt_color = if composer_focused { p.magenta } else { p.faint };
     let turn_live = app.turn_in_flight
         || app.tool_state == ToolState::Streaming
         || matches!(app.tool_state, ToolState::Running(_));
+    let box_color = if turn_live {
+        p.cyan
+    } else if composer_focused {
+        p.magenta
+    } else {
+        p.rule
+    };
+    let prompt_color = if composer_focused { p.magenta } else { p.faint };
     // Standard terminal blink cadence (~530 ms on, ~530 ms off).
     let cursor_on = !turn_live && (app.tick_count / 33).is_multiple_of(2);
     let cursor = if cursor_on { "▍" } else { " " };
     let first_text_line = composer_text.lines().next().unwrap_or("");
+    let placeholder = if turn_live {
+        "Add to the queue, or wait for ORBIT"
+    } else {
+        "Ask ORBIT, or / for commands"
+    };
     let prompt_line = if composer_text.is_empty() {
         Line::from(vec![
             Span::styled(format!("{} ", g.you), Style::default().fg(prompt_color)),
-            Span::styled("ask orbit", Style::default().fg(p.faint)),
+            Span::styled(placeholder, Style::default().fg(p.faint)),
             Span::styled(cursor, Style::default().fg(p.magenta)),
         ])
     } else {
@@ -713,7 +733,59 @@ fn render_center_pane(
             })
             .collect()
     };
-    frame.render_widget(Paragraph::new(visible), center[2]);
+    // The box: rounded, colored by state, no title. The ASCII tier keeps
+    // every chrome cell printable (§13.5) — ratatui's Plain set is
+    // unicode, so the ASCII tier draws its own frame.
+    if g.set() == crate::tokens::GlyphSet::Ascii {
+        let inner = Rect {
+            x: center[2].x + 1,
+            y: center[2].y + 1,
+            width: center[2].width.saturating_sub(2),
+            height: center[2].height.saturating_sub(2),
+        };
+        draw_ascii_pane_border(frame, center[2], "", box_color, Style::default(), g);
+        frame.render_widget(Paragraph::new(visible), inner);
+    } else {
+        let block = Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(box_color));
+        let inner = block.inner(center[2]);
+        frame.render_widget(block, center[2]);
+        frame.render_widget(Paragraph::new(visible), inner);
+    }
+
+    // ── Hint row: context keys left, toast right (§5.5, §6.12) ────────────
+    let mut hint_spans: Vec<Span> = Vec::new();
+    if turn_live {
+        hint_spans.push(Span::styled(
+            "ctrl+c stop · ⏎ queue",
+            Style::default().fg(p.faint),
+        ));
+    } else {
+        hint_spans.push(Span::styled(
+            "⏎ send · ⇧⏎ newline · / commands · ? keys",
+            Style::default().fg(p.faint),
+        ));
+    }
+    if let Some(toast) = &app.toast {
+        let (glyph, color) = match toast.kind {
+            crate::state::ToastKind::Success => (g.done, p.green),
+            crate::state::ToastKind::Neutral => ("", p.muted),
+            crate::state::ToastKind::Error => (g.failed, p.red),
+        };
+        let text = if glyph.is_empty() {
+            toast.text.clone()
+        } else {
+            format!("{glyph} {}", toast.text)
+        };
+        let text_w = crate::unicode::display_width(&text);
+        let row = center[3].width as usize;
+        let pad = row.saturating_sub(text_w + 2);
+        hint_spans.push(Span::raw(" ".repeat(pad)));
+        hint_spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(hint_spans)), center[3]);
 }
 
 // ── Right rail (§6.10) ───────────────────────────────────────────────────────

@@ -262,7 +262,7 @@ def main():
         [args.binary, "--home", args.home, "--model", args.model],
         env=env, timeout=20, rows=30, cols=110,
     )
-    ok, buf = s.wait_for("orbit", timeout=15)
+    ok, buf = s.wait_for("ORBIT", timeout=15)
     check("boots to TUI", ok, buf[-500:])
     time.sleep(0.8)
     try:
@@ -418,7 +418,7 @@ def main():
         [args.binary, "--home", args.home, "--model", args.model],
         env=env, timeout=20, rows=30, cols=110,
     )
-    ok, _ = sb.wait_for("orbit", timeout=15)
+    ok, _ = sb.wait_for("ORBIT", timeout=15)
     check("boots TUI for tab burst test", ok)
     if ok:
         time.sleep(0.8)
@@ -464,7 +464,7 @@ def main():
         [args.binary, "--home", args.home, "--model", args.model],
         env=env, timeout=20, rows=30, cols=110,
     )
-    ok, bootbuf = sb.wait_for("orbit", timeout=15)
+    ok, bootbuf = sb.wait_for("ORBIT", timeout=15)
     check("boots TUI for mouse test", ok)
     if ok:
         time.sleep(0.8)
@@ -512,7 +512,7 @@ def main():
         [args.binary, "--home", args.home, "--model", args.model],
         env=env, timeout=20, rows=30, cols=100,
     )
-    ok, _ = s5.wait_for("orbit", timeout=15)
+    ok, _ = s5.wait_for("ORBIT", timeout=15)
     check("boots TUI for SIGHUP test", ok)
     if ok:
         os.kill(s5.proc.pid, signal.SIGHUP)
@@ -528,7 +528,7 @@ def main():
         [args.binary, "--home", args.home, "--model", args.model],
         env=env, timeout=20, rows=30, cols=100,
     )
-    ok, _ = s4.wait_for("orbit", timeout=15)
+    ok, _ = s4.wait_for("ORBIT", timeout=15)
     check("boots TUI for resize test", ok)
     if ok:
         s4.resize(24, 80)
