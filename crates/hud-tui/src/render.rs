@@ -38,14 +38,20 @@ fn render_pane_frame(
     g: &Glyphs,
 ) -> Rect {
     let p = &d.palette;
-    // Keep the boxes quiet: focus belongs to the title, not a bright frame
-    // around an entire pane. The focused outline is only one subtle step up
-    // from the resting rule; magenta remains confined to the title word.
+    // Focus is the tmux active-tab convention: the focused pane's title is
+    // a FILLED chip (magenta bg, canvas-ink text, bold) riding the top
+    // border — unmistakable at any size, and still "a word" of magenta
+    // (§1). The borders stay quiet (rule / rule_hi); the chip carries the
+    // focus. In mono the chip falls back to reversed video (the third
+    // signal, §1) because a Reset bg fill would be invisible.
     let (border_color, title_style) = if focused {
-        (
-            p.rule_hi,
-            Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
-        )
+        let mut chip = Style::default().fg(p.bg).bg(p.magenta);
+        if d.caps.color == crate::tokens::ColorTier::Mono {
+            // Mono: magenta resolves to Reset, so the bg fill vanishes.
+            // Reversed video gives the same solid-block read.
+            chip = Style::default().fg(p.magenta).add_modifier(Modifier::REVERSED);
+        }
+        (p.rule_hi, chip.add_modifier(Modifier::BOLD))
     } else {
         (p.rule, Style::default().fg(p.ink2))
     };
