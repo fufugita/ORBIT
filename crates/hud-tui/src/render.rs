@@ -269,7 +269,9 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
         render_quit_modal(frame, area, app, d, g);
     }
     if !app.pending_approvals.is_empty() {
-        render_approval_modal(frame, area, app, d, g);
+        // Docked inside the pane area (outer[0]) — never collides with the
+        // status line.
+        render_approval_modal(frame, outer[0], app, d, g);
     }
 }
 
@@ -1199,6 +1201,7 @@ fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         ]),
     ])
     .block(overlay_block(title, d.palette.rule_hi, g));
+    frame.render_widget(ratatui::widgets::Clear, modal_h[1]);
     frame.render_widget(content, modal_h[1]);
 }
 
@@ -1229,10 +1232,18 @@ fn render_approval_modal(
         String::new()
     };
     let height = 8u16;
+    // Dock 1 row above the pane's bottom border so the modal's frame
+    // never doubles with the pane's corners.
     let dock = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(height)])
+        .constraints([Constraint::Min(1), Constraint::Length(height + 1)])
         .split(area);
+    let dock_area = Rect {
+        x: dock[1].x,
+        y: dock[1].y,
+        width: dock[1].width,
+        height,
+    };
     let dock_h = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1240,7 +1251,7 @@ fn render_approval_modal(
             Constraint::Min(10),
             Constraint::Length(1),
         ])
-        .split(dock[1]);
+        .split(dock_area);
 
     let badge = g.risk_meter(first.risk);
     let title = if queue_note.is_empty() {
@@ -1294,6 +1305,9 @@ fn render_approval_modal(
         ]),
     ])
     .block(overlay_block(&title, p.magenta, g));
+    // Clear the underlying pane borders so the modal reads as a solid
+    // surface, not a frame over frames.
+    frame.render_widget(ratatui::widgets::Clear, dock_h[1]);
     frame.render_widget(content, dock_h[1]);
 }
 

@@ -113,9 +113,28 @@ fn preview_dump() {
     }
     let buf = render_buf(&idle_app(), &design(), 150, 44);
     std::fs::write("/tmp/preview-idle.txt", buf_text(&buf)).unwrap();
-    let mut app = working_app();
-    let buf = render_buf(&app, &design(), 150, 44);
+    let buf = render_buf(&working_app(), &design(), 150, 44);
     std::fs::write("/tmp/preview-working.txt", buf_text(&buf)).unwrap();
+    // Approval modal
+    let buf = render_buf(&approval_app(), &design(), 150, 44);
+    std::fs::write("/tmp/preview-approval.txt", buf_text(&buf)).unwrap();
+    // Narrow (80x30) — the rails collapse
+    let buf = render_buf(&idle_app(), &design(), 80, 30);
+    std::fs::write("/tmp/preview-narrow.txt", buf_text(&buf)).unwrap();
+    // Very narrow (60x20)
+    let buf = render_buf(&idle_app(), &design(), 60, 20);
+    std::fs::write("/tmp/preview-tiny.txt", buf_text(&buf)).unwrap();
+    // Welcome (empty transcript)
+    let mut w = idle_app();
+    w.transcript.clear();
+    w.in_flight.clear();
+    let buf = render_buf(&w, &design(), 150, 44);
+    std::fs::write("/tmp/preview-welcome.txt", buf_text(&buf)).unwrap();
+    // Palette open
+    let mut pa = idle_app();
+    pa.palette.open = true;
+    let buf = render_buf(&pa, &design(), 150, 44);
+    std::fs::write("/tmp/preview-palette.txt", buf_text(&buf)).unwrap();
 }
 
 #[test]
