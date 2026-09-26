@@ -2026,7 +2026,11 @@ Encode the thesis as tests, so the design can't drift one tweak at a time:
 
 - golden_orbit_letterform_4frames: back the existing placeholder test with the startup frames from §8.3.
 
-- invariant_one_frame_max: at most one rounded frame in any buffer.
+- invariant_one_frame_max: at most one *overlay* frame in any buffer. The
+  pane borders and composer box are layout, not overlays — they're exempt.
+  A modal (quit confirmation, approval, palette, help) draws its own frame;
+  two modals at once would violate the rule. (Amended by the herdr-style
+  pane-border pivot + composer-box upgrade, 2026-04-02.)
 
 - invariant_magenta_closed_list: magenta cells only at the six places listed in §1, principle 3.
 
@@ -2072,3 +2076,39 @@ Four concrete contributions adopted from the losing entry. Each strengthens §6.
    decision is pending, the line under the keys row reads
    `Action not executed · no approval option is preselected` — making both
    facts explicit until a verdict is applied.
+
+
+## Post-spec amendments — harness-grade polish (2026-04-02)
+
+These supersede the relevant passages in §§1, 5, 6 above. The design system
+(tokens, glyph vocabulary, color tiers) is unchanged.
+
+1. **Focus chip (tmux active-tab convention).** The focused pane's title
+   rides the top border as a filled chip: magenta bg, canvas-ink text,
+   bold. Unfocused titles stay ink2. Borders stay quiet (rule / rule_hi).
+   Mono tier falls back to reversed video (the third signal). This stays
+   inside the "magenta never fills an area larger than a word" principle.
+
+2. **Composer box (Claude Code / Codex convention).** The composer is a
+   rounded box docked at the bottom of the center pane: magenta border
+   when focused, cyan while a turn is live, rule otherwise. Placeholder:
+   "Ask ORBIT, or / for commands"; while streaming: "Add to the queue, or
+   wait for ORBIT". Hint row below: keycap chips for ⏎ send, ⇧⏎ newline,
+   / commands, ? keys. While live: ctrl+c stop, ⏎ queue. Toast rides the
+   hint row's right end. Auto-height is unchanged (one row per line,
+   capped at half the pane).
+
+3. **Tool-call cards (§6.5 fulfilled).** The transcript tool line carries
+   state glyph + name + display-safe argument summary (muted, truncated
+   start) + right-aligned meta. Running: ◉ cyan, name ink bold, meta
+   "running". Settled: ✓ muted, name ink2. Restored sessions render the
+   card without an argument (raw call args aren't display-safe).
+
+4. **Product header (Codex / Gemini convention).** One identity row above
+   the panes: ✦ ORBIT (magenta star, bold word) · model · session prefix
+   left, connection glyph + ? keys right. Model and session move out of
+   the status line; its left side becomes purely live activity. Chrome
+   budget: 3 rows total (header + pane header + status).
+
+5. **Keycap chips.** Hint-row keys render as surface2 bg / ink2 text —
+   the §6.15 approval-card keycap style. Mono tier uses bracketed keys.
