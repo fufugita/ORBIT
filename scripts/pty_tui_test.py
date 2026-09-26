@@ -259,11 +259,15 @@ def main():
     check("boots to TUI", ok, buf[-500:])
     time.sleep(0.8)
     try:
-        s.type("hello")
-        # Read immediately: ratatui only redraws changed cells, so the
-        # typed text lands in the frames right after the keystrokes; a
-        # late read sees only the cursor blink.
-        b2 = s.read(1.5)
+        # Read DURING typing: ratatui redraws only changed cells, so
+        # each keystroke's frame lands between the writes; a read after
+        # all keystrokes sees only the cursor blink.
+        b2 = ""
+        for ch in "hello":
+            s.write(ch.encode())
+            time.sleep(0.05)
+            b2 += s.read(0.3)
+        b2 += s.read(0.5)
         # The TUI draws whole frames each tick — a multi-char phrase is
         # spread across frames (chars re-render as overlays). Assert all
         # letters appear IN ORDER in the cleaned buffer, not contiguously.
@@ -435,7 +439,7 @@ def main():
         # raw is a UTF-8-decoded str: real ESC chars + real border
         # glyphs. ratatui emits the fg color with a trailing bg field
         # (e.g. ;49 for default) before the m.
-        markers = _re.findall("\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[─╭╮╰╯]+", raw)
+        markers = _re.findall(r"\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[─╭╮╰╯]+", raw)
         has_alternation = len(markers) >= 4
         check("tab burst cycles focus one-by-one",
               has_alternation,
@@ -449,6 +453,39 @@ def main():
             sb.terminate()
 
     # ── 8. SIGHUP → clean exit ─────────────────────────────────────────────
+# ── Mouse selection test (per-pane isolation) ────────────────────────────────
+print("\n== Mouse selection test ==")
+sb = PtySession(
+    [args.binary, "--home", args.home, "--model", args.model],
+    env=env, timeout=20, rows=30, cols=110,
+)
+ok, _ = sb.wait_for("orbit", timeout=15)
+check("boots TUI for mouse test", ok)
+if ok:
+    time.sleep(0.8)
+    # Type a prompt so the transcript has content, then drag across it.
+    sb.type("hello world test")
+    sb.key("enter")
+    time.sleep(1.5)
+    # Drag from (col 30, row 5) to (col 50, row 7) inside the center pane.
+    # SGR mouse: ESC [ < button ; col ; row M/A
+    def sgr(button, col, row, release=False):
+        m = "m" if release else "M"
+        sb.write(f"\x1b[<{button};{col};{row}{m}".encode())
+    sgr(0, 30, 5)           # button 0 = left press
+    sgr(32, 40, 6)          # drag (button 32 = left held)
+    sgr(32, 50, 7)          # drag
+    sgr(0, 50, 7, True)     # release
+    time.sleep(1.0)
+    raw = sb.read(2.0)
+    # OSC 52 should appear (selection copy).
+    has_osc52 = "\x1b]52;c;" in raw
+    check("selection copies via OSC 52", has_osc52,
+          "no OSC 52 sequence after drag-release")
+    sb.key("ctrl+d")
+    time.sleep(0.5)
+
+
     print("\n== SIGHUP test ==")
     s5 = PtySession(
         [args.binary, "--home", args.home, "--model", args.model],

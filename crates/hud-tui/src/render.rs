@@ -670,10 +670,16 @@ fn render_center_pane(
             Span::styled(cursor, Style::default().fg(p.magenta)),
         ])
     } else {
-        Line::from(vec![
+        // The cursor rides the text end (a real terminal cursor) —
+        // blinking only when the composer is focused and no turn is live.
+        let mut spans = vec![
             Span::styled(format!("{} ", g.you), Style::default().fg(prompt_color)),
             Span::styled(first_text_line, Style::default().fg(p.ink)),
-        ])
+        ];
+        if composer_focused && !turn_live {
+            spans.push(Span::styled(cursor, Style::default().fg(p.magenta)));
+        }
+        Line::from(spans)
     };
     // All content lines, capped: when the text exceeds the cap, show the
     // LAST lines (the newest input stays visible; older lines scroll out).
