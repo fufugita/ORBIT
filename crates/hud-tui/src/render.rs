@@ -153,17 +153,23 @@ fn draw_ascii_pane_border(
 
 /// Render the current app state into the frame.
 ///
-/// Layout (§5.3 row priorities): 1 header-less main row | 1 status line.
-/// The chrome budget is 2 rows total (the old build spent 11).
+/// Layout (§5.3 row priorities): 1 header row | 1 main row | 1 status line.
+/// The chrome budget is 3 rows total (the old build spent 11).
 pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &Design) {
     let area = frame.area();
     let g = &Glyphs::for_set(d.caps.glyphs);
 
-    // Vertical: main (fill) | status (1).
+    // Vertical: header (1) | main (fill) | status (1).
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(area);
+
+    render_header_row(frame, outer[0], app, d, g);
 
     // Three columns: left rail | divider | conversation | divider | right
     // rail. Rails are column counts (tokens::LayoutConfig); the dividers are
@@ -198,7 +204,7 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
-        .split(outer[0]);
+        .split(outer[1]);
 
     // Pane slots depend on which rails are present.
     // Record the pane rects for the mouse hit-test (interior mutability —
@@ -212,12 +218,12 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     // Zoom (herdr-style): the zoomed pane fills the whole surface.
     if let Some(zoomed) = app.zoomed_pane {
         match zoomed {
-            Focus::Left => render_left_pane(frame, outer[0], app, d, g),
-            Focus::Center => render_center_pane(frame, outer[0], app, composer_text, d, g),
-            Focus::Right => render_right_pane(frame, outer[0], app, d, g),
+            Focus::Left => render_left_pane(frame, outer[1], app, d, g),
+            Focus::Center => render_center_pane(frame, outer[1], app, composer_text, d, g),
+            Focus::Right => render_right_pane(frame, outer[1], app, d, g),
             _ => {}
         }
-        render_status_bar(frame, outer[1], app, d, g);
+        render_status_bar(frame, outer[2], app, d, g);
         return;
     }
     let mut idx = 0;
@@ -268,10 +274,10 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     // Command palette (§6.13): an overlay above the panes, under the
     // status line.
     if app.palette.open {
-        render_palette(frame, outer[0], app, d, g);
+        render_palette(frame, outer[1], app, d, g);
     }
 
-    render_status_bar(frame, outer[1], app, d, g);
+    render_status_bar(frame, outer[2], app, d, g);
 
     // Overlays — the only frames on screen (one at a time, §1).
     if app.quit_confirmation {
@@ -281,9 +287,9 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
         render_help_overlay(frame, area, app, d, g);
     }
     if !app.pending_approvals.is_empty() {
-        // Docked inside the pane area (outer[0]) — never collides with the
+        // Docked inside the pane area (outer[1]) — never collides with the
         // status line.
-        render_approval_modal(frame, outer[0], app, d, g);
+        render_approval_modal(frame, outer[1], app, d, g);
     }
 }
 
@@ -1107,6 +1113,40 @@ fn fuzzy_positions(text: &str, query: &str) -> Vec<usize> {
     positions
 }
 
+/// Product header: compact ORBIT mark, model/session context, and help key.
+/// This is the stable identity row; the status bar below remains live activity.
+fn render_header_row(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+    let p = &d.palette;
+    let conn = match app.connection {
+        ConnectionState::Online => (g.conn_online, p.green),
+        ConnectionState::Reconnecting => (g.conn_retrying, p.amber),
+        ConnectionState::Offline => (g.conn_offline, p.red),
+    };
+    let sep = Span::styled(
+        format!("  {}  ", g.sep),
+        Style::default().fg(p.faint),
+    );
+    let left = vec![
+        Span::styled(g.orbit, Style::default().fg(p.magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(" ORBIT", Style::default().fg(p.ink2).add_modifier(Modifier::BOLD)),
+        sep.clone(),
+        Span::styled(&app.model, Style::default().fg(p.ink)),
+        sep.clone(),
+        Span::styled(&app.session_id_prefix, Style::default().fg(p.muted)),
+    ];
+    let right = vec![
+        Span::styled(conn.0, Style::default().fg(conn.1)),
+        Span::styled("  ? keys", Style::default().fg(p.faint)),
+    ];
+    let left_w: usize = left.iter().map(|s| crate::unicode::display_width(&s.to_string())).sum();
+    let right_w: usize = right.iter().map(|s| crate::unicode::display_width(&s.to_string())).sum();
+    let gap = (area.width as usize).saturating_sub(left_w + right_w);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(right);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
     // The status line rides a surface2 bar — the bottom zone anchor.
@@ -1189,15 +1229,13 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
     // Two-zone status (herdr-style hierarchy): identity on the left,
     // live metrics on the right. The zones breathe — no wall of text.
     let sep = Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint));
+    // Model + session moved to the header row; the status line's left side
+    // is now purely live activity (§6.11's original intent).
     let mut left_spans = vec![
         Span::styled(mark, Style::default().fg(p.magenta)),
         Span::raw(" "),
         mode_chip,
         zoom_chip,
-        Span::raw(" "),
-        Span::styled(&app.model, Style::default().fg(p.ink2)),
-        sep.clone(),
-        Span::styled(&app.session_id_prefix, Style::default().fg(p.faint)),
     ];
     if !app.last_status.is_empty() {
         left_spans.push(sep.clone());

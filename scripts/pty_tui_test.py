@@ -486,15 +486,18 @@ def main():
             if "done" in sb.clean(r).lower():
                 break
         time.sleep(1.0)
-        # Drag from (col 30, row 5) to (col 50, row 7) inside the center pane.
+        # Drag from (col 30, row 3) to (col 55, row 5) inside the center
+        # pane. Rows are 1-based screen rows; the header row (row 1) means
+        # transcript content starts one row lower than the pre-header
+        # layout (the old coordinates 2-4 now hit the pane border).
         # SGR mouse: ESC [ < button ; col ; row M/A
         def sgr(button, col, row, release=False):
             m = "m" if release else "M"
             sb.write(f"\x1b[<{button};{col};{row}{m}".encode())
-        sgr(0, 30, 2)           # button 0 = left press (transcript row 2)
-        sgr(32, 40, 3)          # drag (button 32 = left held)
-        sgr(32, 55, 4)          # drag
-        sgr(0, 55, 4, True)     # release
+        sgr(0, 30, 3)           # button 0 = left press (transcript row 3)
+        sgr(32, 40, 4)          # drag (button 32 = left held)
+        sgr(32, 55, 5)          # drag
+        sgr(0, 55, 5, True)     # release
         time.sleep(1.0)
         raw = sb.read(2.0)
         # OSC 52 should appear (selection copy).
