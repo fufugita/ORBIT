@@ -146,6 +146,11 @@ fn preview_dump() {
     zm.zoomed_pane = Some(Focus::Center);
     let buf = render_buf(&zm, &design(), 150, 44);
     std::fs::write("/tmp/preview-zoom.txt", buf_text(&buf)).unwrap();
+    // Help overlay
+    let mut hp = idle_app();
+    hp.help_open = true;
+    let buf = render_buf(&hp, &design(), 150, 44);
+    std::fs::write("/tmp/preview-help.txt", buf_text(&buf)).unwrap();
     // Workspace filled (mid-turn)
     let mut wf = working_app();
     wf.workspace.phase_index = 2;

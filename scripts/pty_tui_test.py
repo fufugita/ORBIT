@@ -260,15 +260,19 @@ def main():
     time.sleep(0.8)
     try:
         s.type("hello")
-        time.sleep(0.5)
-        b2 = s.read(1.0)
+        # Read immediately: ratatui only redraws changed cells, so the
+        # typed text lands in the frames right after the keystrokes; a
+        # late read sees only the cursor blink.
+        b2 = s.read(1.5)
         # The TUI draws whole frames each tick — a multi-char phrase is
         # spread across frames (chars re-render as overlays). Assert all
         # letters appear IN ORDER in the cleaned buffer, not contiguously.
         c = s.clean(b2)
+        # The whole buffer: the cursor blink + splash reveal rewrite cells
+        # continuously, so the tail window alone can miss the text.
         check("types into composer on boot (default focus)",
               "h" in c and "e" in c and "l" in c and "l" in c and "o" in c,
-              b2[-200:])
+              b2[-2000:])
     except Exception as e:
         check("types into composer on boot (default focus)", False, str(e))
 

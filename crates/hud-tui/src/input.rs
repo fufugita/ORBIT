@@ -23,6 +23,8 @@ pub enum KeyAction {
     CommandPalette,
     /// Open the command palette (§6.13).
     OpenPalette,
+    /// Toggle the help overlay (§6.16).
+    HelpToggle,
     /// Enter INSERT mode (from NORMAL).
     EnterInsert,
     /// Toggle zoom on the focused pane (herdr-style fullscreen).
@@ -76,7 +78,7 @@ impl KeyParser {
                 // Single keys.
                 match c {
                     'q' => Some(KeyAction::Quit),
-                    '?' => Some(KeyAction::OpenPalette),
+                    '?' => Some(KeyAction::HelpToggle),
                     '1' => Some(KeyAction::FocusLeft),
                     '2' => Some(KeyAction::FocusCenter),
                     '3' => Some(KeyAction::FocusRight),

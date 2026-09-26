@@ -677,6 +677,15 @@ fn handle_key(
     if app.logo_phase == crate::state::LogoPhase::Splash {
         sender.send(Msg::SplashSkip);
     }
+    // §6.12: any key dismisses the toast.
+    if app.toast.is_some() {
+        sender.send(Msg::ToastDismiss);
+    }
+    // §6.16: any key closes the help overlay (except the toggle itself,
+    // which flips it closed anyway).
+    if app.help_open {
+        sender.send(Msg::HelpToggle);
+    }
 
     // Command palette (§6.13): when open, ALL keys route to the palette —
     // chars build the query, ↑↓ move, enter executes, esc closes.
@@ -971,6 +980,10 @@ fn handle_key(
             KeyAction::OpenPalette => {
                 // ? → the command palette (§6.13).
                 sender.send(Msg::PaletteToggle);
+            }
+            KeyAction::HelpToggle => {
+                // ? → the help overlay (§6.16).
+                sender.send(Msg::HelpToggle);
             }
             KeyAction::EnterInsert => {
                 sender.send(Msg::InputModeChanged(crate::state::InputMode::Insert));

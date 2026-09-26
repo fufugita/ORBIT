@@ -118,6 +118,12 @@ pub enum Msg {
     WorkspaceUpdate(crate::state::Workspace),
     /// §8.3: skip the startup reveal to the final frame.
     SplashSkip,
+    /// §6.12: show a toast (3 s or until the next keypress).
+    ToastShow { text: String, kind: crate::state::ToastKind },
+    /// §6.12: dismiss the toast (any keypress).
+    ToastDismiss,
+    /// §6.16: toggle the help overlay.
+    HelpToggle,
     /// Request to quit — opens confirmation prompt (q, Ctrl+D).
     RequestQuit,
     /// Confirm quit from the modal.

@@ -268,6 +268,9 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     if app.quit_confirmation {
         render_quit_modal(frame, area, app, d, g);
     }
+    if app.help_open {
+        render_help_overlay(frame, area, app, d, g);
+    }
     if !app.pending_approvals.is_empty() {
         // Docked inside the pane area (outer[0]) — never collides with the
         // status line.
@@ -361,15 +364,12 @@ fn render_left_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desig
                 lines.push(Line::from(""));
             }
 
-            // ── Keys hint (the affordance so the operator learns the
-            // modal keys — herdr shows hints in the sidebar footer) ──
+            // ── Keys hint: the three essentials; ? shows the full map ──
             lines.push(section_label("KEYS", p));
             for (k, v) in [
                 ("Tab", "cycle panes"),
                 ("Z", "zoom pane"),
-                ("Ctrl+B", "prefix mode"),
-                ("Esc", "normal mode"),
-                ("?", "commands"),
+                ("?", "all keys"),
             ] {
                 lines.push(Line::from(vec![
                     Span::styled(format!("{k:<8}"), Style::default().fg(p.ink2)),
@@ -618,13 +618,34 @@ fn render_center_pane(
         .scroll((scroll as u16, 0));
     frame.render_widget(transcript, center[0]);
 
-    // ── Queue: pending prompts above the composer ──────────────────────────
+    // ── Queue + toast: pending prompts left, the §6.12 toast right ────────
     let mut queue_rows = Vec::new();
     for q in &app.queued {
         queue_rows.push(Line::from(vec![
             Span::styled(format!("{} ", g.pending), Style::default().fg(p.faint)),
             Span::styled(truncate_graphemes(q, 40), Style::default().fg(p.muted)),
         ]));
+    }
+    if let Some(toast) = &app.toast {
+        // The toast rides the queue row, right-aligned: ✓ text (green) /
+        // plain text (muted) / ✕ text (red). Never floats over content.
+        let (glyph, color) = match toast.kind {
+            crate::state::ToastKind::Success => (g.done, p.green),
+            crate::state::ToastKind::Neutral => ("", p.muted),
+            crate::state::ToastKind::Error => (g.failed, p.red),
+        };
+        let text = if glyph.is_empty() {
+            toast.text.clone()
+        } else {
+            format!("{glyph} {}", toast.text)
+        };
+        let text_w = crate::unicode::display_width(&text);
+        let row = center[1].width as usize;
+        let pad = row.saturating_sub(text_w + 2);
+        let mut line = queue_rows.pop().unwrap_or_default();
+        line.spans.push(Span::raw(" ".repeat(pad)));
+        line.spans.push(Span::styled(text, Style::default().fg(color)));
+        queue_rows.push(line);
     }
     if !queue_rows.is_empty() {
         frame.render_widget(Paragraph::new(queue_rows), center[1]);
@@ -638,7 +659,8 @@ fn render_center_pane(
     let turn_live = app.turn_in_flight
         || app.tool_state == ToolState::Streaming
         || matches!(app.tool_state, ToolState::Running(_));
-    let cursor_on = !turn_live && (app.tick_count / 16).is_multiple_of(2);
+    // Standard terminal blink cadence (~530 ms on, ~530 ms off).
+    let cursor_on = !turn_live && (app.tick_count / 33).is_multiple_of(2);
     let cursor = if cursor_on { "▍" } else { " " };
     let first_text_line = composer_text.lines().next().unwrap_or("");
     let prompt_line = if composer_text.is_empty() {
@@ -1213,6 +1235,71 @@ fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
     .block(overlay_block(title, d.palette.rule_hi, g));
     frame.render_widget(ratatui::widgets::Clear, modal_h[1]);
     frame.render_widget(content, modal_h[1]);
+}
+
+/// §6.16 help overlay: the same frame as quit, two columns of keys
+/// grouped by pane. Any key closes it.
+fn render_help_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App, d: &Design, g: &Glyphs) {
+    let p = &d.palette;
+    let w = 64u16.min(area.width.saturating_sub(8));
+    let h = 20u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let block = overlay_block("Keys", p.rule_hi, g);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let key = |k: &str, v: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("{k:<14}"), Style::default().fg(p.magenta)),
+            Span::styled(v.to_string(), Style::default().fg(p.ink2)),
+        ])
+    };
+    let label = |t: &str| -> Line<'static> {
+        Line::from(Span::styled(t.to_string(), Style::default().fg(p.faint)))
+    };
+
+    let left = vec![
+        label("CONVERSATION"),
+        key("enter", "send the prompt"),
+        key("esc", "normal mode"),
+        key("i", "insert mode"),
+        key("ctrl+b", "prefix mode"),
+        key("ctrl+k", "clear composer"),
+        key("ctrl+c", "quit (twice)"),
+        Line::from(""),
+        label("PANES"),
+        key("tab", "cycle focus"),
+        key("1 2 3", "jump to pane"),
+        key("Z", "zoom the pane"),
+        key("g g / G", "top / bottom"),
+        key("j k / ↑↓", "scroll the pane"),
+    ];
+    let right = vec![
+        label("MODES"),
+        key("y", "yank (copy mode)"),
+        key("?", "this help"),
+        key("/", "command palette"),
+        Line::from(""),
+        label("RAILS"),
+        key("g s", "sessions rail"),
+        key("g v", "activity rail"),
+        key("g w", "workspace rail"),
+        Line::from(""),
+        label("MOUSE"),
+        key("drag", "select in a pane"),
+        key("shift+click", "native selection"),
+        key("wheel", "scroll the pane"),
+    ];
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(left), cols[0]);
+    frame.render_widget(Paragraph::new(right), cols[1]);
 }
 
 /// The approval card (§6.15): docked at the bottom of the conversation,

@@ -147,6 +147,21 @@ pub struct Finding {
     pub source: Option<String>,
 }
 
+/// §6.12 toast: a transient status line above the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub text: String,
+    /// ✓ when success, no glyph for neutral, ✕ for error (the colour
+    /// follows the glyph — green / muted / red).
+    pub kind: ToastKind,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Success,
+    Neutral,
+    Error,
+}
+
 /// One verification row: check name + result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verification {
@@ -385,6 +400,12 @@ pub struct App {
     /// §8.3 startup frame: 0..=5 while Splash; the welcome mark reveals
     /// progressively at 4 fps. Any key jumps to the last frame.
     pub startup_frame: u8,
+    /// §6.16 help overlay: two columns of keys grouped by pane.
+    pub help_open: bool,
+    /// §6.12 toast: text + frame counter (the toast auto-dismisses at 3 s).
+    pub toast: Option<crate::state::Toast>,
+    /// Tick counter when the toast was emitted (used for the 3-s timer).
+    pub toast_emitted_at: Option<u64>,
     /// Frames spent in the current logo phase (drives phase transitions).
     /// Composer state (DR-21 §3.4) — left glyph + border color.
     pub composer_state: ComposerState,
@@ -520,6 +541,9 @@ impl App {
             copy_mode: false,
             logo_phase: LogoPhase::Splash,
             startup_frame: 0,
+            help_open: false,
+            toast: None,
+            toast_emitted_at: None,
             composer_state: ComposerState::Idle,
             composer_send_phase: 0,
             queued: Vec::new(),
@@ -570,6 +594,14 @@ impl App {
                     if let Some(text) = self.coalescer.flush() {
                         self.in_flight.push_str(&text);
                         self.dirty.set(DirtyFlags::TRANSCRIPT);
+                    }
+                }
+                // §6.12: the toast dismisses after 3 s (180 ticks).
+                if let Some(at) = self.toast_emitted_at {
+                    if self.tick_count.saturating_sub(at) >= 180 {
+                        self.toast = None;
+                        self.toast_emitted_at = None;
+                        self.dirty.set(DirtyFlags::LAYOUT);
                     }
                 }
                 // §8.3 startup: the splash reveals at 4 fps (every 15 ticks
@@ -861,6 +893,12 @@ impl App {
                         let text = sel.extract(&lines).join("\n");
                         if !text.is_empty() {
                             self.osc52_pending = Some(crate::selection::osc52_sequence(&text));
+                            // §6.12: the copy confirms with a toast.
+                            self.toast = Some(Toast {
+                                text: format!("copied {} lines", text.lines().count()),
+                                kind: ToastKind::Success,
+                            });
+                            self.toast_emitted_at = Some(self.tick_count);
                         }
                     }
                 }
@@ -881,6 +919,21 @@ impl App {
                     self.logo_phase = LogoPhase::Steady;
                     self.dirty.set(DirtyFlags::TRANSCRIPT);
                 }
+            }
+            Msg::ToastShow { text, kind } => {
+                self.toast = Some(Toast { text, kind });
+                self.toast_emitted_at = Some(self.tick_count);
+                self.dirty.set(DirtyFlags::LAYOUT);
+            }
+            Msg::ToastDismiss => {
+                if self.toast.take().is_some() {
+                    self.toast_emitted_at = None;
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                }
+            }
+            Msg::HelpToggle => {
+                self.help_open = !self.help_open;
+                self.dirty.set(DirtyFlags::LAYOUT);
             }
             Msg::PaletteToggle => {
                 self.palette.open = !self.palette.open;
@@ -1122,6 +1175,7 @@ impl App {
             | KeyAction::ToggleCost
             | KeyAction::CommandPalette
             | KeyAction::OpenPalette
+            | KeyAction::HelpToggle
             | KeyAction::Unknown => {}
             // Scroll/zoom/insert are handled by the dedicated Msg arms
             // (PaneScroll/ZoomToggle/InputModeChanged) — the KeyAction
