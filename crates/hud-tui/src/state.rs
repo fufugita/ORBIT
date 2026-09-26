@@ -662,26 +662,29 @@ impl App {
                 }
                 // Working star (§7): the 4 Hz clock sets LOGO only while
                 // ORBIT is working; idle sets nothing. The star is the only
-                // moving cell.
+                // moving cell. Its FRAME advance lives in the spinner block
+                // below — this block only tracks the logo phase. (The old
+                // code advanced spinner_frame in both blocks; the double
+                // step showed only 2 of the 4 frames: ◐◑◐◑, never ◓◒.)
                 let working = self.tool_state == ToolState::Streaming
                     || matches!(self.tool_state, ToolState::Running(_));
                 if working && self.tick_count.is_multiple_of(4) {
-                    self.spinner_frame = (self.spinner_frame + 1) % 4;
-                    self.dirty.set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
-                    // Logo phase transitions follow the real tool state.
-                    match self.logo_phase {
-                        LogoPhase::Steady if working => self.logo_phase = LogoPhase::Working,
-                        LogoPhase::Working if !working => self.logo_phase = LogoPhase::Steady,
-                        LogoPhase::Splash => self.logo_phase = LogoPhase::Steady,
-                        _ => {}
+                    let next = match self.logo_phase {
+                        LogoPhase::Steady => LogoPhase::Working,
+                        LogoPhase::Splash => LogoPhase::Steady,
+                        other => other,
+                    };
+                    if next != self.logo_phase {
+                        self.logo_phase = next;
+                        self.dirty.set(DirtyFlags::STATUS);
                     }
                 }
-                // Braille spinner: advance every 4 ticks (8fps) while busy.
-                if (self.tool_state == ToolState::Streaming
-                    || matches!(self.tool_state, ToolState::Running(_))
-                    || self.connection == ConnectionState::Reconnecting)
-                    && self.tick_count.is_multiple_of(4)
-                {
+                // Spinner (the star's only motion, §7): advance every 4
+                // ticks while ORBIT is busy (working or reconnecting).
+                // ONE increment per cadence.
+                let busy = working
+                    || self.connection == ConnectionState::Reconnecting;
+                if busy && self.tick_count.is_multiple_of(4) {
                     self.spinner_frame = (self.spinner_frame + 1) % 4;
                     self.dirty.set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
                 }
