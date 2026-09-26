@@ -437,8 +437,9 @@ fn invariant_one_frame_max() {
             c.symbol() == "╭" || c.symbol() == "╮" || c.symbol() == "╰" || c.symbol() == "╯"
         })
         .count();
-    // 3 panes + the composer box = 4 frames × 4 corners = 16 baseline.
-    assert_eq!(base_corners, 16, "3 panes + composer box");
+    // Quiet rails: only the composer box draws a frame in the base
+    // layout — the panes are borderless (§5). 4 corners = the composer.
+    assert_eq!(base_corners, 4, "composer box only");
 
     // With a modal open, the modal adds exactly one frame (+4 corners).
     for app in [approval_app()] {

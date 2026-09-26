@@ -438,14 +438,13 @@ def main():
         # ≥6 means the focus cycled through panes repeatedly without a
         # single keypress getting lost (each of the 8 tabs produces at
         # least one header rewrite for the newly-focused pane).
-        # Focus-chip design: the focused pane's title is a FILLED chip —
-        # fg canvas-ink, bg magenta, bold. ratatui emits fg+bg as one
-        # combined SGR (…38;2;16;14;22;48;2;227;86;208m), so the marker is
-        # the bg-magenta field followed by the title word. Each Tab moves
-        # focus → the newly focused pane's title chip redraws. Count chip
-        # writes across the burst: ≥4 means focus cycled R,L,R,L without
-        # a lost keypress.
-        markers = _re.findall(r"48;2;227;86;208m[ ]?[A-Za-z]+", raw)
+        # Quiet-rail design: the focused RAIL's title is magenta bold
+        # (38;2;227;86;208) with a heavy rule; the Center pane has no
+        # header at all (the conversation is the hero, §5). Focus cycle
+        # from Center: R(Workspace) → L(Sessions) → Center(no marker) →
+        # repeat. Count magenta title writes: ≥4 means the focus cycled
+        # R,L,R,L without a lost keypress.
+        markers = _re.findall(r"\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[ ]?[A-Za-z]+", raw)
         has_alternation = len(markers) >= 4
         check("tab burst cycles focus one-by-one",
               has_alternation,

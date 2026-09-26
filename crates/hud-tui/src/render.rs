@@ -183,22 +183,21 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
 
     render_header_row(frame, outer[0], app, d, g);
 
-    // Three columns: left rail | divider | conversation | divider | right
-    // rail. Rails are column counts (tokens::LayoutConfig); the dividers are
-    // full-height hairlines that double as scroll tracks (§6.14).
-    // herdr-style: three bordered panes, no divider columns — the pane
-    // borders ARE the separation. A 1-col gap between panes keeps the
-    // borders from doubling up. Rails collapse responsively on narrow
-    // terminals (the conversation always keeps ≥40 cols): full rails ≥120,
-    // right rail drops 100-119, left drops 80-99, single pane <80.
+    // Quiet rails (§5, the original spec): the conversation is the hero —
+    // no border, full brightness. The rails are dim sidebars behind
+    // full-height hairline dividers that double as scroll tracks (§6.14).
+    // The herdr pivot boxed all three panes equally, which read as a tmux
+    // dashboard; this restores the hierarchy: you sit at the centre with
+    // the brightest ink, everything else orbits in progressively dimmer
+    // rings. Only zoom mode (Z) retains a frame.
+    // Rails collapse responsively (the conversation keeps ≥40 cols):
+    // full rails ≥120, right drops 100-119, left drops 80-99, single <80.
     let total = area.width;
     let (left_w, right_w) = if total >= 120 {
         (d.layout_rails.0, d.layout_rails.1)
     } else if total >= 100 {
-        // Right rail shrinks to fit; the conversation keeps ≥40.
         (d.layout_rails.0, (total - d.layout_rails.0 - 44).max(0))
     } else if total >= 80 {
-        // Both rails compact: 18/22 keeps the center ≥36 at 80 cols.
         (18, 22)
     } else {
         (0, 0)
@@ -206,11 +205,11 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     let mut constraints = Vec::new();
     if left_w > 0 {
         constraints.push(Constraint::Length(left_w));
-        constraints.push(Constraint::Length(1)); // gap
+        constraints.push(Constraint::Length(1)); // divider
     }
     constraints.push(Constraint::Min(10)); // conversation
     if right_w > 0 {
-        constraints.push(Constraint::Length(1)); // gap
+        constraints.push(Constraint::Length(1)); // divider
         constraints.push(Constraint::Length(right_w));
     }
     let main = Layout::default()
@@ -227,25 +226,41 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
         .right
         .set(if right_w > 0 { Some(main[main.len() - 1]) } else { None });
 
-    // Zoom (herdr-style): the zoomed pane fills the whole surface.
+    // Zoom: the zoomed pane fills the whole surface, framed (Z is an
+    // explicit "give me this pane big" — a frame is honest there).
     if let Some(zoomed) = app.zoomed_pane {
         match zoomed {
-            Focus::Left => render_left_pane(frame, outer[1], app, d, g),
-            Focus::Center => render_center_pane(frame, outer[1], app, composer_text, d, g),
-            Focus::Right => render_right_pane(frame, outer[1], app, d, g),
+            Focus::Left => render_left_pane(frame, outer[1], app, d, g, true),
+            Focus::Center => render_center_pane(frame, outer[1], app, composer_text, d, g, true),
+            Focus::Right => render_right_pane(frame, outer[1], app, d, g, true),
             _ => {}
         }
         render_status_bar(frame, outer[2], app, d, g);
         return;
     }
     let mut idx = 0;
+    let mut left_div: Option<Rect> = None;
     if left_w > 0 {
-        render_left_pane(frame, main[idx], app, d, g);
-        idx += 2; // rail + gap
+        render_left_pane(frame, main[idx], app, d, g, false);
+        left_div = Some(main[idx + 1]);
+        idx += 2; // rail + divider
     }
-    render_center_pane(frame, main[idx], app, composer_text, d, g);
+    render_center_pane(frame, main[idx], app, composer_text, d, g, false);
+    let mut right_div: Option<Rect> = None;
     if right_w > 0 {
-        render_right_pane(frame, main[idx + 2], app, d, g); // gap + rail
+        right_div = Some(main[idx + 1]);
+        render_right_pane(frame, main[idx + 2], app, d, g, false); // divider + rail
+    }
+    // The dividers: full-height hairlines (§6.14). The right divider is
+    // the transcript's scroll track when the transcript overflows.
+    if let Some(rect) = left_div.or(right_div) {
+        let _ = rect;
+    }
+    if let Some(rect) = left_div {
+        render_divider(frame, rect, d, g);
+    }
+    if let Some(rect) = right_div {
+        render_divider(frame, rect, d, g);
     }
 
     // Per-pane selection highlight (herdr-style): paint the selected cells
@@ -307,20 +322,87 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
 
 // ── Divider / scrollbar (§6.14) ──────────────────────────────────────────────
 
-/// Full-height divider `│`; when the transcript overflows, the center
-/// divider becomes a scroll track with a `┃` thumb at the transcript's
+/// A full-height hairline divider — the separation between the hero
+/// conversation and a dim rail. Doubles as a scroll track (§6.14).
+fn render_divider(frame: &mut ratatui::Frame, area: Rect, d: &Design, g: &Glyphs) {
+    if area.width < 1 || area.height < 1 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        buf[(area.x, y)].set_symbol(g.divider).set_style(Style::default().fg(d.palette.rule));
+    }
+}
 
 // ── Left rail (§6.9) ─────────────────────────────────────────────────────────
 
-fn render_left_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+/// A quiet rail header (§6.1): small-caps title, then a hairline rule
+/// filling the rest of the row. The focused rail's title is magenta with a
+/// heavier rule; unfocused is ink2. NO box — the rail is a dim sidebar,
+/// not a pane.
+fn render_rail_header(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    focused: bool,
+    d: &Design,
+    g: &Glyphs,
+) -> Rect {
+    let p = &d.palette;
+    let inner = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+    if area.width < 4 || area.height < 2 {
+        return inner;
+    }
+    let buf = frame.buffer_mut();
+    // Title with a 1-col left inset, then the rule to the row's end.
+    let mut x = area.x + 1;
+    buf[(area.x, area.y)].set_symbol(" ");
+    for c in title.chars() {
+        if x >= area.right() - 1 {
+            break;
+        }
+        buf[(x, area.y)].set_symbol(&c.to_string()).set_style(
+            Style::default()
+                .fg(if focused { p.magenta } else { p.ink2 })
+                .add_modifier(Modifier::BOLD),
+        );
+        x += 1;
+    }
+    // The rule fills the rest of the row.
+    while x < area.right() {
+        let rule = if focused { g.rule_focus } else { g.rule };
+        let color = if focused { p.rule_hi } else { p.rule };
+        buf[(x, area.y)].set_symbol(rule).set_style(Style::default().fg(color));
+        x += 1;
+    }
+    inner
+}
+
+fn render_left_pane(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    d: &Design,
+    g: &Glyphs,
+    framed: bool,
+) {
     let p = &d.palette;
     let title = match app.left_tab {
         LeftTab::Sessions => "Sessions",
         LeftTab::Verbose => "Activity",
     };
-    let body = render_pane_frame(frame, area, title, app.focus == Focus::Left, d, g);
+    let body = if framed {
+        render_pane_frame(frame, area, title, app.focus == Focus::Left, d, g)
+    } else {
+        render_rail_header(frame, area, title, app.focus == Focus::Left, d, g)
+    };
 
-    // One blank row of breathing room below the top border (matches the
+    // One blank row of breathing room below the header (matches the
     // transcript's padding).
     let mut lines: Vec<Line> = vec![Line::from("")];
 
@@ -467,16 +549,20 @@ fn render_center_pane(
     composer_text: &str,
     d: &Design,
     g: &Glyphs,
+    framed: bool,
 ) {
     let p = &d.palette;
 
-    // The conversation gets the same bordered frame as the rails — the
-    // three panes read as equal, isolated surfaces (herdr-style). The
-    // title carries the session identity.
-    // The center title is the conversation itself — session metadata
-    // lives in the status line and the left rail (no duplication).
-    let title = "Conversation".to_string();
-    let area = render_pane_frame(frame, area, &title, app.focus == Focus::Center, d, g);
+    // Quiet rails (§5): the conversation is the hero — NO border, NO
+    // title. Its brightness and the hairline dividers set it apart from
+    // the dim rails. Zoom mode (Z) frames it: "give me this pane big"
+    // is an explicit ask, and a frame is honest there.
+    let area = if framed {
+        let title = "Conversation".to_string();
+        render_pane_frame(frame, area, &title, app.focus == Focus::Center, d, g)
+    } else {
+        area
+    };
     // The transcript's text width — tool-card meta right-aligns to it.
     let body_w = area.width.saturating_sub(4) as usize;
 
@@ -863,11 +949,22 @@ fn section_line(label: &str, count: usize, p: &crate::tokens::ResolvedPalette) -
     ])
 }
 
-fn render_right_pane(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+fn render_right_pane(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    d: &Design,
+    g: &Glyphs,
+    framed: bool,
+) {
     let p = &d.palette;
-    let body = render_pane_frame(frame, area, "Workspace", app.focus == Focus::Right, d, g);
-    // Two blank rows: border + breathing room.
-    let mut lines: Vec<Line> = vec![Line::from(""), Line::from("")];
+    let body = if framed {
+        render_pane_frame(frame, area, "Workspace", app.focus == Focus::Right, d, g)
+    } else {
+        render_rail_header(frame, area, "Workspace", app.focus == Focus::Right, d, g)
+    };
+    // One blank row of breathing room below the header.
+    let mut lines: Vec<Line> = vec![Line::from("")];
 
     let w = &app.workspace;
     if w.plan.is_empty() && w.findings.is_empty() && w.verification.is_empty() {
