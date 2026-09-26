@@ -468,6 +468,11 @@ fn invariant_idle_draws_nothing() {
         output_tokens: 1,
         cost_microcents: 1,
     });
+    // 200 ticks: past the M5 turn report's 2 s window (its dismissal
+    // sets STATUS once) — then settle.
+    for _ in 0..200 {
+        app.reduce(orbit_hud_tui::msg::Msg::Tick);
+    }
     app.dirty.clear();
     // 1,000 ticks in steady idle.
     for _ in 0..1000 {

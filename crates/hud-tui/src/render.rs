@@ -1119,6 +1119,21 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
             Style::default().fg(p.muted),
         ));
     }
+    // §6.11 M5: the turn report rides the left side for 2 s.
+    if let Some(r) = &app.turn_report {
+        let secs = r.duration_ms as f64 / 1000.0;
+        let cost = format!("+${:.4}", r.cost_microcents as f64 / 1_000_000.0);
+        let tools = if r.tool_count == 1 {
+            "1 tool".to_string()
+        } else {
+            format!("{} tools", r.tool_count)
+        };
+        left_spans.push(sep.clone());
+        left_spans.push(Span::styled(
+            format!("✓ done · {secs:.0}s · {tools} · {cost}"),
+            Style::default().fg(p.green),
+        ));
+    }
     let right_spans = vec![
         tool_state,
         sep.clone(),

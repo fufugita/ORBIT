@@ -147,6 +147,14 @@ pub struct Finding {
     pub source: Option<String>,
 }
 
+/// §6.11 M5: the post-turn status report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnReport {
+    pub duration_ms: u64,
+    pub tool_count: u32,
+    pub cost_microcents: u64,
+}
+
 /// §6.12 toast: a transient status line above the composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
@@ -402,6 +410,14 @@ pub struct App {
     pub startup_frame: u8,
     /// §6.16 help overlay: two columns of keys grouped by pane.
     pub help_open: bool,
+    /// §6.11 M5: the last turn's report (shown for 2 s after the turn).
+    pub turn_report: Option<TurnReport>,
+    /// Tick when the turn report was stamped (2 s window).
+    pub turn_report_at: Option<u64>,
+    /// When the current turn started (Instant) — for the M5 duration.
+    turn_started_at: Option<std::time::Instant>,
+    /// Tool calls made in the current turn (for the M5 report).
+    turn_tool_count: u32,
     /// §6.12 toast: text + frame counter (the toast auto-dismisses at 3 s).
     pub toast: Option<crate::state::Toast>,
     /// Tick counter when the toast was emitted (used for the 3-s timer).
@@ -542,6 +558,10 @@ impl App {
             logo_phase: LogoPhase::Splash,
             startup_frame: 0,
             help_open: false,
+            turn_report: None,
+            turn_report_at: None,
+            turn_started_at: None,
+            turn_tool_count: 0,
             toast: None,
             toast_emitted_at: None,
             composer_state: ComposerState::Idle,
@@ -567,6 +587,8 @@ impl App {
         self.turn_in_flight = true;
         self.tool_state = ToolState::Streaming;
         self.composer_state = ComposerState::Sending;
+        self.turn_started_at = Some(std::time::Instant::now());
+        self.turn_tool_count = 0;
         self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
         Some(next)
     }
@@ -602,6 +624,14 @@ impl App {
                         self.toast = None;
                         self.toast_emitted_at = None;
                         self.dirty.set(DirtyFlags::LAYOUT);
+                    }
+                }
+                // §6.11 M5: the turn report dismisses after 2 s (120 ticks).
+                if let Some(at) = self.turn_report_at {
+                    if self.tick_count.saturating_sub(at) >= 120 {
+                        self.turn_report = None;
+                        self.turn_report_at = None;
+                        self.dirty.set(DirtyFlags::STATUS);
                     }
                 }
                 // §8.3 startup: the splash reveals at 4 fps (every 15 ticks
@@ -711,6 +741,19 @@ impl App {
                 self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
                 self.total_cost_microcents =
                     self.total_cost_microcents.saturating_add(cost_microcents);
+                // §6.11 M5: stamp the turn report (shown for 2 s).
+                let duration_ms = self
+                    .turn_started_at
+                    .take()
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                self.turn_report = Some(TurnReport {
+                    duration_ms,
+                    tool_count: self.turn_tool_count,
+                    cost_microcents,
+                });
+                self.turn_report_at = Some(self.tick_count);
+                self.turn_tool_count = 0;
                 // Only bump turns if this ResponseFinished actually produced a
                 // transcript entry (a cancelled turn with no partial text, or
                 // a pure-tool-round echo with no user-visible output, is NOT a
@@ -734,6 +777,7 @@ impl App {
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
             Msg::ToolCallStarted { name, summary } => {
+                self.turn_tool_count += 1;
                 // Display-only: push transcript lines + set tool state. Do NOT
                 // push a pending approval here — the real call_id arrives later
                 // via Msg::ApprovalRequested (from the worker's
@@ -790,6 +834,8 @@ impl App {
                     self.turn_in_flight = true;
                     self.composer_state = ComposerState::Sending;
                     self.composer_send_phase = 0;
+                    self.turn_started_at = Some(std::time::Instant::now());
+                    self.turn_tool_count = 0;
                     self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
                 }
             }
