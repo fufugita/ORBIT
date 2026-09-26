@@ -452,38 +452,46 @@ def main():
         except subprocess.TimeoutExpired:
             sb.terminate()
 
+    # ── Mouse selection test (per-pane isolation) ────────────────────────────────
+    print("\n== Mouse selection test ==")
+    sb = PtySession(
+        [args.binary, "--home", args.home, "--model", args.model],
+        env=env, timeout=20, rows=30, cols=110,
+    )
+    ok, _ = sb.wait_for("orbit", timeout=15)
+    check("boots TUI for mouse test", ok)
+    if ok:
+        time.sleep(0.8)
+        # Type a prompt so the transcript has content, then drag across it.
+        sb.type("hello world test")
+        sb.key("enter")
+        # Wait for the stream to finish so the transcript has text to
+        # select (dragging during streaming selects empty rows).
+        end = time.time() + 25
+        while time.time() < end:
+            r = sb.read(0.3)
+            if "done" in sb.clean(r).lower():
+                break
+        time.sleep(1.0)
+        # Drag from (col 30, row 5) to (col 50, row 7) inside the center pane.
+        # SGR mouse: ESC [ < button ; col ; row M/A
+        def sgr(button, col, row, release=False):
+            m = "m" if release else "M"
+            sb.write(f"\x1b[<{button};{col};{row}{m}".encode())
+        sgr(0, 30, 2)           # button 0 = left press (transcript row 2)
+        sgr(32, 40, 3)          # drag (button 32 = left held)
+        sgr(32, 55, 4)          # drag
+        sgr(0, 55, 4, True)     # release
+        time.sleep(1.0)
+        raw = sb.read(2.0)
+        # OSC 52 should appear (selection copy).
+        has_osc52 = "\x1b]52;c;" in raw
+        check("selection copies via OSC 52", has_osc52,
+              "no OSC 52 sequence after drag-release")
+        sb.key("ctrl+d")
+        time.sleep(0.5)
+
     # ── 8. SIGHUP → clean exit ─────────────────────────────────────────────
-# ── Mouse selection test (per-pane isolation) ────────────────────────────────
-print("\n== Mouse selection test ==")
-sb = PtySession(
-    [args.binary, "--home", args.home, "--model", args.model],
-    env=env, timeout=20, rows=30, cols=110,
-)
-ok, _ = sb.wait_for("orbit", timeout=15)
-check("boots TUI for mouse test", ok)
-if ok:
-    time.sleep(0.8)
-    # Type a prompt so the transcript has content, then drag across it.
-    sb.type("hello world test")
-    sb.key("enter")
-    time.sleep(1.5)
-    # Drag from (col 30, row 5) to (col 50, row 7) inside the center pane.
-    # SGR mouse: ESC [ < button ; col ; row M/A
-    def sgr(button, col, row, release=False):
-        m = "m" if release else "M"
-        sb.write(f"\x1b[<{button};{col};{row}{m}".encode())
-    sgr(0, 30, 5)           # button 0 = left press
-    sgr(32, 40, 6)          # drag (button 32 = left held)
-    sgr(32, 50, 7)          # drag
-    sgr(0, 50, 7, True)     # release
-    time.sleep(1.0)
-    raw = sb.read(2.0)
-    # OSC 52 should appear (selection copy).
-    has_osc52 = "\x1b]52;c;" in raw
-    check("selection copies via OSC 52", has_osc52,
-          "no OSC 52 sequence after drag-release")
-    sb.key("ctrl+d")
-    time.sleep(0.5)
 
 
     print("\n== SIGHUP test ==")
