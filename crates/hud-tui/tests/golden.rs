@@ -22,8 +22,8 @@
 
 use orbit_hud_tui::render::render;
 use orbit_hud_tui::state::{
-    App, ComposerState, ConnectionState, Focus, LeftTab, LogoPhase, PendingApproval, ToolState,
-    TranscriptLine,
+    App, ComposerState, ConnectionState, Finding, Focus, LeftTab, LogoPhase, PendingApproval,
+    Task, TaskState, ToolState, TranscriptLine,
 };
 use orbit_hud_tui::tokens::{Design, GlyphSet, Theme};
 
@@ -146,6 +146,19 @@ fn preview_dump() {
     zm.zoomed_pane = Some(Focus::Center);
     let buf = render_buf(&zm, &design(), 150, 44);
     std::fs::write("/tmp/preview-zoom.txt", buf_text(&buf)).unwrap();
+    // Workspace filled (mid-turn)
+    let mut wf = working_app();
+    wf.workspace.phase_index = 2;
+    wf.workspace.plan = vec![
+        Task { title: "Read the auth middleware".into(), state: TaskState::Done, sub: None, evidence: 2 },
+        Task { title: "Trace the token refresh path".into(), state: TaskState::Active, sub: Some("following refresh_token".into()), evidence: 0 },
+        Task { title: "Patch the race window".into(), state: TaskState::Blocked, sub: Some("awaiting approval".into()), evidence: 0 },
+    ];
+    wf.workspace.findings = vec![
+        Finding { title: "Refresh tokens not single-use".into(), source: Some("auth/refresh.rs:88".into()) },
+    ];
+    let buf = render_buf(&wf, &design(), 150, 44);
+    std::fs::write("/tmp/preview-workspace.txt", buf_text(&buf)).unwrap();
 }
 
 #[test]
