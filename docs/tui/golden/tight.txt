@@ -1,0 +1,20 @@
+ Sessions   Conversation   Workspace 2/5 ━━━━━━━━
+
+
+
+
+
+
+
+
+
+
+ › Do it, and add a regression test.
+
+ ✦ ✓ edit_file  crates/expor…c/restore.rs  +9 −3
+   ◉ shell  cargo test -p orbit-export   running
+
+   Running the export suite now.▍
+
+  ›  Add to the queue, or wait
+ ◐ ORBIT   running shell · 3.2s           $0.0183

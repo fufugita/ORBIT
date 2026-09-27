@@ -1,0 +1,30 @@
+ Sessions   Conversation   Workspace 2/5 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+ ✦ The restored namespace starts a brand-new chain: restore writes a     14:02
+   fresh genesis record, so the head no longer matches the digest in
+   the export bundle and verify-ledger reports a break at record 1 [1].
+
+   ✓ read_file  crates/export/src/restore.rs                  212 lines · 0.1s
+   ✓ grep  "genesis" crates/ledger/src                           3 hits · 0.2s
+
+   The bundle already carries the head digest [2], so the fix is to seed the
+   restored chain from it instead of from genesis:
+
+    let head = bundle.ledger_head()?;                                     rust
+    ledger.seed_from(head, bundle.records())?; // keep the chain continuous
+
+   sources  [1] export/src/restore.rs:88   [2] export/src/bundle.rs:41
+
+ › Do it, and add a regression test.                                     14:06
+
+ ✦ ✓ edit_file  crates/export/src/restore.rs                      +9 −3 · 0.1s
+   ✓ shell  cargo test -p orbit-export                        48 passed · 3.9s
+
+   Both checks pass. The restored chain now starts from the exported head
+   0913…a0c3, so verify-ledger walks all 7 records without a break. Next I
+   would run the clean-machine▍
+
+  ›  Add to the queue, or wait for ORBIT
+    ⏎ queue   ⇧⏎ newline   tab views
+ ◐ ORBIT   streaming · 212 tokens                        glm-5.2   ●    $0.0196

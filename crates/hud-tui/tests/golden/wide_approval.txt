@@ -1,0 +1,44 @@
+ Sessions  Activity ───────── │ Restore keeps chain head ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 14 turns │ Workspace ────────────────────────
+                              │                                                                                  │
+  TODAY                       │                                                                                  │  ✓━━✓━━✓━━◉──◌  verify         4/5
+   Restore keeps chain h… now │ ✦ Plan is in the workspace. Short version: reproduce on a clean home,     13:59  │
+   Display gate: URL dige… 2h │   find where the restored namespace builds its chain, fix, then prove it         │  PLAN                          4/5
+   Plugin pool eviction t… 5h │   with the unit suite and the clean-machine script.                              │  ✓ Reproduce restore failure
+                              │                                                                                  ┃  ✓ Find where the chain resets
+  YESTERDAY                   │ › orbit verify-ledger fails right after orbit restore on a clean home.    14:02  ┃  ✓ Seed chain from exported head
+   Provider TLS pin rotat… 1d │   Can you find out why?                                                          ┃  ✓ Add restore_preserves_head
+ ✕ Cost rounding in µ¢     1d │                                                                                  ┃  ◇ Run clean-machine e2e
+                              │ ✦ The restored namespace starts a brand-new chain: restore writes a       14:02  ┃    waiting on your approval
+  THIS WEEK                   │   fresh genesis record, so the head no longer matches the digest in the          ┃
+   WASI kill lifecycle     3d │   export bundle and verify-ledger reports a break at record 1 [1].               ┃  FINDINGS                        2
+   Migrator: workflow v2 … 4d │                                                                                  ┃  ∙ restore writes a fresh genesis
+   Coalescer at 30 ms      5d │   ✓ read_file  crates/export/src/restore.rs                    212 lines · 0.1s  ┃    record restore.rs:88
+   Signal guard for SIGHUP 6d │   ✓ grep  "genesis" crates/ledger/src                             3 hits · 0.2s  ┃  ∙ bundle already carries the head
+   Approval surface polish 6d │                                                                                  ┃    digest bundle.rs:41
+                              │   The bundle already carries the head digest [2], so the fix is to seed the      ┃
+                              │   restored chain from it instead of from genesis:                                ┃  VERIFICATION                  2/3
+                              │                                                                                  ┃  ✓ unit · orbit-export   48 passed
+                              │    let head = bundle.ledger_head()?;                                       rust  ┃  ✓ ledger · restored     7 records
+                              │    ledger.seed_from(head, bundle.records())?; // keep the chain continuous       ┃    home
+                              │                                                                                  ┃  ↻ e2e · clean machine      retest
+                              │   sources  [1] export/src/restore.rs:88   [2] export/src/bundle.rs:41            ┃
+                              │                                                                                  ┃
+                              │ › Do it, and add a regression test.                                       14:06  ┃
+                              │                                                                                  ┃
+                              │ ✦ Unit suite and ledger check pass. Last step is the clean-machine        14:06  ┃
+                              │   script, which needs your go-ahead.                                             ┃
+                              │                                                                                  ┃
+                              │   ✓ shell  cargo test -p orbit-export                          48 passed · 3.9s  ┃
+                              │   ✓ shell  orbit verify-ledger --home /tmp/orbit-restored      7 records · 0.4s  ┃
+                              │   ◇ shell  scripts/e2e-clean-machine.sh --keep-home                awaiting you  ┃
+                              │                                                                                  │
+                              │ ╭─ ◇ Allow shell? ────────────────────────────────────────── ▰▰▱ medium risk ──╮ │
+                              │ │                                                                              │ │
+                              │ │  scripts/e2e-clean-machine.sh --keep-home                                    │ │
+                              │ │                                                                              │ │
+                              │ │  runs in  ~/src/orbit                 sandbox  landlock · rw /tmp only       │ │
+                              │ │  egress   none                        ledger   decision is recorded          │ │
+                              │ │                                                                              │ │
+                              │ │   y  allow once     R  allow shell for this session     n   esc  deny        │ │
+                              │ ╰──────────────────────────────────────────────────────────────────────────────╯ │
+ ✦ ORBIT   ◇ approval needed · shell                                      glm-5.2 · local     ● online    ↓17.6k ↑2.7k    $0.0209   01J8ZK4Q   ? keys

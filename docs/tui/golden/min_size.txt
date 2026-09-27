@@ -1,0 +1,9 @@
+ ✦
+
+     ORBIT needs at least 40 × 10
+       this terminal is 38 × 9
+
+      enlarge the window or run
+         orbit chat --no-tui
+
+

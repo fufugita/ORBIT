@@ -1,0 +1,36 @@
+ Sessions  Activity ━━━━━━━━━ │ Restore keeps chain head ───────────────────────────────────────────────────── 14 turns
+                              │
+  TODAY                       │ › orbit verify-ledger fails right after orbit restore on a clean home. Can you   14:02
+▌  Restore keeps chain h… now │   find out why?
+   Display gate: URL dige… 2h │
+   Plugin pool eviction t… 5h │ ✦ The restored namespace starts a brand-new chain: restore writes a fresh        14:02
+                              │   genesis record, so the head no longer matches the digest in the export bundle
+  YESTERDAY                   │   and verify-ledger reports a break at record 1 [1].
+   Provider TLS pin rotat… 1d │
+ ✕ Cost rounding in µ¢     1d │   ✓ read_file  crates/export/src/restore.rs                           212 lines · 0.1s
+                              │   ✓ grep  "genesis" crates/ledger/src                                    3 hits · 0.2s
+  THIS WEEK                   │
+   WASI kill lifecycle     3d │   The bundle already carries the head digest [2], so the fix is to seed the restored
+   Migrator: workflow v2 … 4d │   chain from it instead of from genesis:
+   Coalescer at 30 ms      5d │
+   Signal guard for SIGHUP 6d │    let head = bundle.ledger_head()?;                                              rust
+   Approval surface polish 6d │    ledger.seed_from(head, bundle.records())?; // keep the chain continuous
+                              │
+                              │   sources  [1] export/src/restore.rs:88   [2] export/src/bundle.rs:41
+                              │
+                              │ › Do it, and add a regression test.                                              14:06
+                              │
+                              │ ✦ Done. Restore now seeds the chain from the exported head, and                  14:09
+                              │   restore_preserves_head covers the regression.
+                              │
+                              │   ✓ edit_file  crates/export/src/restore.rs                               +9 −3 · 0.1s
+                              │   ✓ shell  cargo test -p orbit-export                                 48 passed · 3.9s
+                              │   ✓ shell  orbit verify-ledger --home /tmp/orbit-restored             7 records · 0.4s
+                              │
+                              │   ✓ verified  2 checks · retest attestation recorded
+                              │   │ cargo test -p orbit-export                                               48 passed
+                              │   │ orbit verify-ledger                                     7 records · head 0913…a0c3
+                              │
+                              │  ›  Ask ORBIT, or type / for commands
+                              │
+ ✦ ORBIT   ready                                       glm-5.2 · local     ● online    ↓18.2k ↑2.9k    $0.0214   ? keys

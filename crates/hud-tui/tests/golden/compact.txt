@@ -1,0 +1,24 @@
+ Sessions   Conversation   Workspace 4/5 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+
+
+
+
+
+ › Do it, and add a regression test.
+
+ ✦ Done. Restore now seeds the chain from the exported head, and
+   restore_preserves_head covers the regression.
+
+   ✓ edit_file  crates/export/src/restore.rs                   +9 −3
+   ✓ shell  cargo test -p orbit-export                     48 passed
+   ✓ shell  orbit verify-ledger --…me /tmp/orbit-restored  7 records
+
+   ✓ verified  2 checks
+   │ cargo test -p orbit-export                            48 passed
+   │ orbit verify-ledger                                   7 records
+
+  ›  Ask ORBIT, or type / for commands
+    ⏎ send   ⇧⏎ newline   tab views
+ ✦ ORBIT   ready                               glm-5.2   ●    $0.0214

@@ -1,0 +1,44 @@
+ Sessions  Activity ───────── │ Restore keeps chain head ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 14 turns │ Workspace ────────────────────────
+                              │                                                                                  │
+  TODAY                       │   bug.                                                                           │  ✓━━✓━━◉──◌──◌  execute        3/5
+   Restore keeps chain h… now │                                                                                  │
+   Display gate: URL dige… 2h │ ✦ Plan is in the workspace. Short version: reproduce on a clean home,     13:59  │  PLAN                          2/5
+   Plugin pool eviction t… 5h │   find where the restored namespace builds its chain, fix, then prove it         ┃  ✓ Reproduce restore failure
+                              │   with the unit suite and the clean-machine script.                              ┃  ✓ Find where the chain resets
+  YESTERDAY                   │                                                                                  ┃  ◉ Seed chain from exported head
+   Provider TLS pin rotat… 1d │ › orbit verify-ledger fails right after orbit restore on a clean home.    14:02  ┃    running shell · cargo test
+ ✕ Cost rounding in µ¢     1d │   Can you find out why?                                                          ┃  ◌ Add restore_preserves_head
+                              │                                                                                  ┃  ◌ Run clean-machine e2e
+  THIS WEEK                   │ ✦ The restored namespace starts a brand-new chain: restore writes a       14:02  ┃
+   WASI kill lifecycle     3d │   fresh genesis record, so the head no longer matches the digest in the          ┃  FINDINGS                        2
+   Migrator: workflow v2 … 4d │   export bundle and verify-ledger reports a break at record 1 [1].               ┃  ∙ restore writes a fresh genesis
+   Coalescer at 30 ms      5d │                                                                                  ┃    record restore.rs:88
+   Signal guard for SIGHUP 6d │   ✓ read_file  crates/export/src/restore.rs                    212 lines · 0.1s  ┃  ∙ bundle already carries the head
+   Approval surface polish 6d │   ✓ grep  "genesis" crates/ledger/src                             3 hits · 0.2s  ┃    digest bundle.rs:41
+                              │                                                                                  ┃
+                              │   The bundle already carries the head digest [2], so the fix is to seed the      ┃  VERIFICATION                  0/3
+                              │   restored chain from it instead of from genesis:                                ┃  ◉ unit · orbit-export     running
+                              │                                                                                  ┃  ◌ ledger · restored home   queued
+                              │    let head = bundle.ledger_head()?;                                       rust  ┃  ◌ e2e · clean machine      queued
+                              │    ledger.seed_from(head, bundle.records())?; // keep the chain continuous       ┃
+                              │                                                                                  ┃
+                              │   sources  [1] export/src/restore.rs:88   [2] export/src/bundle.rs:41            ┃
+                              │                                                                                  ┃
+                              │ › Do it, and add a regression test.                                       14:06  ┃
+                              │                                                                                  ┃
+                              │ ✦ Seeding the restored chain from the exported head. I will change        14:06  ┃
+                              │   restore.rs, add the test, then run the export suite.                           ┃
+                              │                                                                                  ┃
+                              │   ✓ edit_file  crates/export/src/restore.rs                        +9 −3 · 0.1s  ┃
+                              │   ✓ edit_file  crates/export/tests/restore.rs                        +31 · 0.1s  ┃
+                              │   ◉ shell  cargo test -p orbit-export                                   running  ┃
+                              │    │    Compiling orbit-export v0.1.0 (crates/export)                            ┃
+                              │    │     Finished test profile in 2.71s                                          ┃
+                              │    │      Running unittests src/lib.rs                                           ┃
+                              │   ◌ shell  orbit verify-ledger --home /tmp/orbit-restored                queued  ┃
+                              │                                                                                  ┃
+                              │ › also check that export still refuses a bundle with a forged head       queued  ┃
+                              │                                                                                  │
+                              │  ›  Add to the queue, or wait for ORBIT                                          │
+                              │    ⏎ queue   ⇧⏎ newline   pgup scroll                                            │
+ ◐ ORBIT   running shell · cargo test · 3.2s                              glm-5.2 · local     ● online    ↓15.9k ↑2.1k    $0.0183   01J8ZK4Q   ? keys
