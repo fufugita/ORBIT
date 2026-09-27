@@ -346,6 +346,9 @@ pub struct App {
     pub focus: Focus,
     pub left_tab: LeftTab,
     pub tick_count: u64,
+    /// Reduced-motion preference (tui.toml `reduced = true`): spinners
+    /// hold still; only data-driven changes move.
+    pub reduced_motion: bool,
 
     // ── Data state (filled by the backend bridge) ──────────────────────────
     /// Lines in the conversation transcript (user + assistant).
@@ -454,10 +457,6 @@ pub struct App {
     pub pane_scroll: [u16; 3],
     /// True when the operator has scrolled up (disables auto-scroll).
     pub viewport_manual: bool,
-    /// One-shot: clear the terminal before the next draw so the whole frame
-    /// re-emits (set on the live→settled turn transition). Cell so the draw
-    /// path can consume it through &App.
-    pub force_full_redraw: std::cell::Cell<bool>,
 }
 
 /// One line in the transcript — either a user message or an assistant reply.
@@ -474,6 +473,9 @@ pub enum TranscriptLine {
         /// The call's settled outcome (None while running). Set by
         /// ToolCallFinished — the card's glyph depends on it (§6.5).
         outcome: Option<bool>,
+        /// When the call started — drives the live ticking duration on the
+        /// running card. None for entries restored from a session file.
+        started_at: Option<std::time::Instant>,
     },
     /// System note (cancelled turn, queue drained, etc.) — dim, never bold.
     System(String),
@@ -586,7 +588,7 @@ impl App {
             spinner_frame: 0,
             pane_scroll: [0, 0, 0],
             viewport_manual: false,
-            force_full_redraw: std::cell::Cell::new(false),
+            reduced_motion: false,
         }
     }
 
@@ -679,14 +681,37 @@ impl App {
                         self.dirty.set(DirtyFlags::STATUS);
                     }
                 }
-                // Spinner (the star's only motion, §7): advance every 4
-                // ticks while ORBIT is busy (working or reconnecting).
-                // ONE increment per cadence.
+                // Spinner (§7): the braille busy spinner advances every 6
+                // ticks (~10 fps) while ORBIT is busy — working, waiting for
+                // the first token, or reconnecting. ONE increment per cadence.
+                // The renderer indexes its frame set modulo that set's length,
+                // so a single 0..10 counter drives both the 10-frame braille
+                // cycle and the 4-frame ASCII quadrants.
                 let busy = working
                     || self.connection == ConnectionState::Reconnecting;
-                if busy && self.tick_count.is_multiple_of(4) {
-                    self.spinner_frame = (self.spinner_frame + 1) % 4;
+                // Reduced motion (tui.toml `reduced = true`): the spinner
+                // holds frame 0 — a still glyph, no cycling.
+                if busy
+                    && !self.reduced_motion
+                    && self.tick_count.is_multiple_of(6)
+                {
+                    self.spinner_frame = (self.spinner_frame + 1) % 10;
                     self.dirty.set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
+                }
+                // A running tool card ticks its live duration every frame
+                // (~16 ms is fine — one line, cheap).
+                if matches!(self.tool_state, ToolState::Running(_)) && working {
+                    self.dirty.set(DirtyFlags::TRANSCRIPT);
+                }
+                // Splash orbit: after the reveal settles (frame 5), a dim
+                // satellite dot circles the mark's corner positions every
+                // 15 ticks while the transcript is still empty.
+                if self.logo_phase == LogoPhase::Steady
+                    && self.transcript.is_empty()
+                    && self.in_flight.is_empty()
+                    && self.tick_count.is_multiple_of(15)
+                {
+                    self.dirty.set(DirtyFlags::TRANSCRIPT);
                 }
                 // Reconnecting star: rotate while reconnecting (§4.3 ↻).
                 if self.connection == ConnectionState::Reconnecting
@@ -746,10 +771,9 @@ impl App {
                         .push(TranscriptLine::Assistant(self.in_flight.clone()));
                     self.in_flight.clear();
                     // The settled line replaces the live one in place — same
-                    // cells, different gutter color. Force a full redraw so
-                    // the settled turn re-emits in full (replayers and PTY
-                    // captures need the contiguous line at least once).
-                    self.force_full_redraw.set(true);
+                    // cells, different gutter color. The normal diff emits
+                    // just the gutter + SGR change; a full repaint here
+                    // caused a visible whole-screen flash on every turn.
                     self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::LAYOUT);
                 } else if has_output {
                     self.transcript.push(TranscriptLine::Assistant(output));
@@ -805,6 +829,7 @@ impl App {
                     tool_name: name.clone(),
                     summary: summary.clone(),
                     outcome: None,
+                    started_at: Some(std::time::Instant::now()),
                 });
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
@@ -1696,14 +1721,13 @@ mod tests {
         assert_eq!(app.tool_state, ToolState::Streaming);
         assert!(app.in_flight.is_empty());
 
-        // §7: the working star is the only moving cell — the 4 Hz clock
-        // advances spinner_frame while working. Tick is 16 ms, so every 4th
-        // tick advances the star.
+        // §7: the braille busy spinner advances while working. Tick is
+        // 16 ms; the spinner clock fires every 6th tick (~10 fps).
         let f0 = app.spinner_frame;
-        for _ in 0..4 {
+        for _ in 0..6 {
             app.reduce(Msg::Tick);
         }
-        assert_ne!(app.spinner_frame, f0, "working star should advance");
+        assert_ne!(app.spinner_frame, f0, "busy spinner should advance");
         assert!(app
             .dirty
             .is_set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT));
@@ -1741,13 +1765,13 @@ mod tests {
     }
 
     #[test]
-    fn working_star_wraps_modulo_four() {
+    fn busy_spinner_wraps_modulo_ten() {
         let mut app = App::new();
         app.reduce(Msg::TextSubmitted("hello".into()));
-        // The star has exactly 4 frames (§4.3); 3 full turns must wrap.
-        for _ in 0..(4 * 3 * 4) {
+        // The spinner has 10 braille frames; several full turns must wrap.
+        for _ in 0..(10 * 3 * 6) {
             app.reduce(Msg::Tick);
         }
-        assert!(app.spinner_frame < 4);
+        assert!(app.spinner_frame < 10);
     }
 }

@@ -88,11 +88,15 @@ pub struct Glyphs {
     /// Status-line separator (unicode: ·, ascii: |).
     pub sep: &'static str,
 
-    // ── Motion — the working star (§4.3, one spinner, 4 fps) ──
+    // ── Motion (§4.3, one spinner) ──
     /// The four frames of the working star, in turn order.
     pub working_star: &'static [&'static str; 4],
     /// ASCII working-star frames (the classic spinner quadrants).
     pub working_star_ascii: &'static [&'static str; 4],
+    /// The ten braille spinner frames — the "busy" animation while ORBIT
+    /// works. Braille is narrow-width in every terminal, so it stays in the
+    /// unicode tier even when the ambiguous-width probe reports wide.
+    pub working_braille: &'static [&'static str; 10],
 
     // ── Lines and frames (§4.2) ──
     /// Header rule — unfocused pane headers.
@@ -159,6 +163,7 @@ impl Glyphs {
             sep: "·",
             working_star: &["◐", "◓", "◑", "◒"],
             working_star_ascii: &["-", "\\", "|", "/"],
+            working_braille: &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
             rule: "─",
             rule_focus: "━",
             divider: "│",
@@ -217,6 +222,7 @@ impl Glyphs {
             sep: "|",
             working_star: &["-", "\\", "|", "/"],
             working_star_ascii: &["-", "\\", "|", "/"],
+                        working_braille: &["-", "\\", "|", "/", "\\", "-", "/", "|", "-", "\\"],
             rule: "-",
             rule_focus: "=",
             divider: "|",
@@ -258,6 +264,23 @@ impl Glyphs {
             GlyphSet::Unicode => self.working_star,
             GlyphSet::Ascii => self.working_star_ascii,
         }
+    }
+
+    /// The busy spinner frames for this glyph set. Unicode gets the
+    /// 10-frame braille cycle (~one full turn per second at 10 fps);
+    /// ASCII keeps the classic 4-frame quadrants.
+    pub fn busy_frames(&self) -> &'static [&'static str] {
+        match self.set {
+            GlyphSet::Unicode => self.working_braille,
+            GlyphSet::Ascii => self.working_star_ascii,
+        }
+    }
+
+    /// The busy-spinner frame for a tick count — one frame per 6 ticks
+    /// (16 ms tick → ~10.4 fps), wrapping the set's cycle.
+    pub fn busy_frame(&self, tick: u64) -> &'static str {
+        let frames = self.busy_frames();
+        frames[(tick / 6) as usize % frames.len()]
     }
 
     /// Build a risk meter string (`▰▰▱`-style) for levels 0..=3.
@@ -331,6 +354,9 @@ mod tests {
         for g in U.working() {
             assert_eq!(display_width(g), 1, "working frame {g:?} must be one cell");
         }
+        for g in U.busy_frames() {
+            assert_eq!(display_width(g), 1, "busy frame {g:?} must be one cell");
+        }
     }
 
     #[test]
@@ -389,6 +415,9 @@ mod tests {
         for g in A.working() {
             assert!(all_ascii(g), "ASCII working frame {g:?} must be printable");
         }
+        for g in A.busy_frames() {
+            assert!(all_ascii(g), "ASCII busy frame {g:?} must be printable");
+        }
     }
 
     #[test]
@@ -432,6 +461,21 @@ mod tests {
         assert_eq!(A.working().len(), 4);
         // one full turn per second at 4 fps — order is the turn order
         assert_eq!(U.working(), &["◐", "◓", "◑", "◒"]);
+    }
+
+    #[test]
+    fn braille_spinner_cycles_ten_frames() {
+        // Unicode busy spinner: 10 distinct braille frames, full cycle
+        // at ~1 s (6 ticks/frame at 16 ms ≈ 10.4 fps).
+        assert_eq!(U.busy_frames().len(), 10);
+        let first: std::collections::HashSet<&str> = U.busy_frames().iter().copied().collect();
+        assert_eq!(first.len(), 10, "all frames distinct");
+        // ASCII keeps the 4-frame quadrants.
+        assert_eq!(A.busy_frames().len(), 4);
+        // busy_frame advances every 6 ticks and wraps.
+        assert_eq!(U.busy_frame(0), "⠋");
+        assert_eq!(U.busy_frame(6), "⠙");
+        assert_eq!(U.busy_frame(60), "⠋", "wraps at 10 frames");
     }
 
     #[test]

@@ -21,133 +21,98 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 // ── Pane headers (§6.1) ──────────────────────────────────────────────────────
 
-/// One-row pane header: title, then a hairline rule filling the rest of the
-/// row. The focused pane gets a heavy rule (`━`, rule_hi) and a magenta
-/// title; unfocused panes get a light rule (`─`, rule) and an ink2 title.
+/// Interpolate between two colors for the band fade. Returns the nearest
+/// step of `steps` colors from a to b (truecolor blends exactly; indexed
+/// tiers snap to their own palettes via the token system, so this helper
+/// only ever blends truecolor values).
+fn blend_color(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg_, bb)) => Color::Rgb(
+            ar + ((br as f32 - ar as f32) * t).round() as u8,
+            ag + ((bg_ as f32 - ag as f32) * t).round() as u8,
+            ab + ((bb as f32 - ab as f32) * t).round() as u8,
+        ),
+        // Non-RGB tiers keep the base color — the fade is a truecolor-only
+        // nicety; 256/16/mono get a flat band (still zero glyphs).
+        _ => a,
+    }
+}
 
+/// Draw a header band: a title chip on a background row that fades to the
+/// canvas over the last FADE_COLS columns. Pure color — zero line glyphs,
+/// so the ASCII tier renders identically (minus color depth) and the
+/// ambiguous-width probe can never demote it to `----`.
+///
+/// Focus is the tmux active-tab convention: the focused pane's title is a
+/// FILLED chip (magenta bg, canvas text, bold) and its band rides
+/// magenta_dim fading to canvas; unfocused panes get a surface2 band and
+/// an ink2 title. Mono falls back to reversed video on the chip only.
+const FADE_COLS: u16 = 10;
 
-/// Render a bordered pane (herdr-style): a full Block border with the title
-/// riding the top edge. The focused pane's border is the accent; unfocused
-/// panes get the muted rule colour. Returns the inner content rect.
+fn draw_header_band(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    title: &str,
+    focused: bool,
+    d: &Design,
+) {
+    let p = &d.palette;
+    if area.width < 2 {
+        return;
+    }
+    let (band, title_style) = if focused {
+        let mut chip = Style::default().fg(p.bg).bg(p.magenta);
+        if d.caps.color == crate::tokens::ColorTier::Mono {
+            chip = Style::default().fg(p.magenta).add_modifier(Modifier::REVERSED);
+        }
+        (p.magenta_dim, chip.add_modifier(Modifier::BOLD))
+    } else {
+        (p.surface2, Style::default().fg(p.ink2).bg(p.surface2))
+    };
+    // The band: full-row bg fill fading to canvas bg over the tail.
+    let fade_start = area.width.saturating_sub(FADE_COLS).max(1);
+    for x in 0..area.width {
+        let t = if x < fade_start {
+            0.0
+        } else {
+            (x - fade_start) as f32 / (area.width - fade_start) as f32
+        };
+        let cell_color = blend_color(band, p.bg, t);
+        let cell = &mut buf[(area.x + x, area.y)];
+        cell.set_symbol(" ").set_style(Style::default().bg(cell_color));
+    }
+    // The title chip rides the band's left edge.
+    let title_text = format!(" {title} ");
+    let chars: Vec<char> = title_text.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if (i as u16) >= area.width {
+            break;
+        }
+        let cell = &mut buf[(area.x + i as u16, area.y)];
+        cell.set_symbol(&c.to_string()).set_style(title_style);
+    }
+}
+
+/// Render a pane with a banded header (no border, no frame glyphs): one
+/// header row of color + a 1-col inset each side for breathing room.
+/// Returns the inner content rect.
 fn render_pane_frame(
     frame: &mut ratatui::Frame,
     area: Rect,
     title: &str,
     focused: bool,
     d: &Design,
-    g: &Glyphs,
 ) -> Rect {
-    let p = &d.palette;
-    // Focus is the tmux active-tab convention: the focused pane's title is
-    // a FILLED chip (magenta bg, canvas-ink text, bold) riding the top
-    // border — unmistakable at any size, and still "a word" of magenta
-    // (§1). The borders stay quiet (rule / rule_hi); the chip carries the
-    // focus. In mono the chip falls back to reversed video (the third
-    // signal, §1) because a Reset bg fill would be invisible.
-    let (border_color, title_style) = if focused {
-        let mut chip = Style::default().fg(p.bg).bg(p.magenta);
-        if d.caps.color == crate::tokens::ColorTier::Mono {
-            // Mono: magenta resolves to Reset, so the bg fill vanishes.
-            // Reversed video gives the same solid-block read.
-            chip = Style::default().fg(p.magenta).add_modifier(Modifier::REVERSED);
-        }
-        (p.rule_hi, chip.add_modifier(Modifier::BOLD))
-    } else {
-        (p.rule, Style::default().fg(p.ink2))
-    };
-    // The ASCII tier keeps every chrome cell printable ASCII (§13.5):
-    // ratatui's Plain border set is unicode, so the ASCII tier draws its
-    // own + - | frame.
-    if g.set() == crate::tokens::GlyphSet::Ascii {
-        // ratatui Plain borders are unicode; the ASCII tier draws its own
-        // + - | frame (invariant_ascii_tier_is_ascii, §13.5).
-        let inner = Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        };
-        draw_ascii_pane_border(frame, area, &title, border_color, title_style, g);
-        return inner;
+    if area.width >= 2 && area.height >= 2 {
+        draw_header_band(frame.buffer_mut(), area, title, focused, d);
     }
-    let block = Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(format!(" {title} "), title_style));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    inner
-}
-
-/// ASCII-tier pane border: + corners, - horizontal, | vertical.
-fn draw_ascii_pane_border(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    title: &str,
-    color: ratatui::style::Color,
-    title_style: Style,
-    g: &Glyphs,
-) {
-    if area.width < 2 || area.height < 2 {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    let style = Style::default().fg(color);
-    // The ASCII-tier border uses the rounded-corner glyphs (╭ ╯) when
-    // the terminal renders unicode; if it doesn't, those cells fall back
-    // to + / - / | by the user's terminal. The intent is to look modern
-    // even in the safe tier.
-    let tl = g.corner_tl();
-    let tr = g.corner_tr();
-    let bl = g.corner_bl();
-    let br = g.corner_br();
-    let h = g.border_h();
-    let v = g.border_v();
-    let title_text = format!(" {title} ");
-    let title_w = title_text.chars().count() as u16;
-    let mut top = String::new();
-    top.push_str(tl);
-    let title_start = 1;
-    let title_end = (title_start + title_w).min(area.width - 1);
-    for x in 1..(area.width - 1) {
-        if x >= title_start && x < title_end {
-            let idx = (x - title_start) as usize;
-            if idx < title_text.chars().count() {
-                top.push(title_text.chars().nth(idx).unwrap());
-            } else {
-                top.push_str(h);
-            }
-        } else {
-            top.push_str(h);
-        }
-    }
-    top.push_str(tr);
-    buf.set_stringn(area.x, area.y, &top, area.width as usize, style);
-    // Title styling: overwrite the title chars with the title style
-    buf.set_stringn(
-        area.x + 1,
-        area.y,
-        &title_text,
-        title_w as usize,
-        title_style,
-    );
-    // Bottom — rounded corners to match the top.
-    let bottom = format!("{bl}{}{br}", h.repeat((area.width - 2) as usize));
-    buf.set_stringn(
-        area.x,
-        area.y + area.height - 1,
-        &bottom,
-        area.width as usize,
-        style,
-    );
-    // Sides
-    for y in 1..(area.height - 1) {
-        buf.set_stringn(area.x, area.y + y, v, 1, style);
-        buf.set_stringn(area.x + area.width - 1, area.y + y, v, 1, style);
+    Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
     }
 }
-
 
 // ── Keycap chips (§6.15 keycap style, reused in hints) ───────────────────────
 
@@ -324,13 +289,17 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
 
 /// A full-height hairline divider — the separation between the hero
 /// conversation and a dim rail. Doubles as a scroll track (§6.14).
-fn render_divider(frame: &mut ratatui::Frame, area: Rect, d: &Design, g: &Glyphs) {
+fn render_divider(frame: &mut ratatui::Frame, area: Rect, d: &Design, _g: &Glyphs) {
+    // A 1-column color gutter, not a │ glyph — the seam between panes is
+    // a surface-tinted column that reads as a soft shadow.
     if area.width < 1 || area.height < 1 {
         return;
     }
     let buf = frame.buffer_mut();
     for y in area.top()..area.bottom() {
-        buf[(area.x, y)].set_symbol(g.divider).set_style(Style::default().fg(d.palette.rule));
+        buf[(area.x, y)]
+            .set_symbol(" ")
+            .set_style(Style::default().bg(d.palette.surface));
     }
 }
 
@@ -346,9 +315,8 @@ fn render_rail_header(
     title: &str,
     focused: bool,
     d: &Design,
-    g: &Glyphs,
+    _g: &Glyphs,
 ) -> Rect {
-    let p = &d.palette;
     let inner = Rect {
         x: area.x,
         y: area.y + 1,
@@ -358,28 +326,10 @@ fn render_rail_header(
     if area.width < 4 || area.height < 2 {
         return inner;
     }
-    let buf = frame.buffer_mut();
-    // Title with a 1-col left inset, then the rule to the row's end.
-    let mut x = area.x + 1;
-    buf[(area.x, area.y)].set_symbol(" ");
-    for c in title.chars() {
-        if x >= area.right() - 1 {
-            break;
-        }
-        buf[(x, area.y)].set_symbol(&c.to_string()).set_style(
-            Style::default()
-                .fg(if focused { p.magenta } else { p.ink2 })
-                .add_modifier(Modifier::BOLD),
-        );
-        x += 1;
-    }
-    // The rule fills the rest of the row.
-    while x < area.right() {
-        let rule = if focused { g.rule_focus } else { g.rule };
-        let color = if focused { p.rule_hi } else { p.rule };
-        buf[(x, area.y)].set_symbol(rule).set_style(Style::default().fg(color));
-        x += 1;
-    }
+    // The rail rides the same color-band header as the panes — no rule
+    // glyphs anywhere. Focused: magenta chip on magenta_dim band;
+    // unfocused: ink2 chip on surface2 band.
+    draw_header_band(frame.buffer_mut(), area, title, focused, d);
     inner
 }
 
@@ -397,7 +347,7 @@ fn render_left_pane(
         LeftTab::Verbose => "Activity",
     };
     let body = if framed {
-        render_pane_frame(frame, area, title, app.focus == Focus::Left, d, g)
+        render_pane_frame(frame, area, title, app.focus == Focus::Left, d)
     } else {
         render_rail_header(frame, area, title, app.focus == Focus::Left, d, g)
     };
@@ -523,9 +473,11 @@ fn render_left_pane(
 
 /// A small caps section label with a rule — the visual rhythm anchor.
 fn section_label(text: &str, p: &crate::tokens::ResolvedPalette) -> Line<'static> {
+    // The label rides a short color tail instead of a ─ glyph: a surface
+    // band under the two cells after the word. Zero glyphs, fluid.
     Line::from(vec![
         Span::styled(text.to_string(), Style::default().fg(p.faint)),
-        Span::styled(" ─", Style::default().fg(p.surface2)),
+        Span::styled("  ".to_string(), Style::default().bg(p.surface)),
     ])
 }
 
@@ -559,7 +511,7 @@ fn render_center_pane(
     // is an explicit ask, and a frame is honest there.
     let area = if framed {
         let title = "Conversation".to_string();
-        render_pane_frame(frame, area, &title, app.focus == Focus::Center, d, g)
+        render_pane_frame(frame, area, &title, app.focus == Focus::Center, d)
     } else {
         area
     };
@@ -598,10 +550,36 @@ fn render_center_pane(
     // One blank row of breathing room below the top border.
     let mut lines: Vec<Line> = vec![Line::from("")];
     if app.transcript.is_empty() && app.in_flight.is_empty() {
-        let mark = welcome_mark_frame(d, app.startup_frame);
+        let mut mark = welcome_mark_frame(d, app.startup_frame);
         let mark_w = 36u16; // widest mark row
         let mark_h = mark.len() as u16;
         if center[0].width > mark_w + 4 && center[0].height > mark_h + 4 {
+            // Splash orbit: once the reveal settles, a dim satellite dot
+            // circles the ring's four corner positions — the mark itself
+            // breathes while it waits for the first prompt. Reduced motion
+            // keeps the static mark.
+            if app.startup_frame >= 5 && !d.caps.reduced_motion {
+                let phase = (app.tick_count / 15) % 4;
+                // Corner cells around the 3-row mark, hand-placed to trace
+                // the ring's arc (row, col) — dim magenta ·
+                let spots: [(usize, usize); 4] = [
+                    (0, 19), // upper right, beside the star
+                    (1, 35), // right
+                    (2, 19), // lower right
+                    (1, 1),  // left
+                ];
+                let (r, c) = spots[phase as usize];
+                if r < mark.len() {
+                    let line = &mut mark[r];
+                    if let Some(spot_span) = line.spans.get_mut(c) {
+                        let styled = Span::styled(
+                            "·".to_string(),
+                            Style::default().fg(p.magenta_dim),
+                        );
+                        *spot_span = styled;
+                    }
+                }
+            }
             let pad_y = (center[0].height.saturating_sub(mark_h)) / 3;
             for _ in 0..pad_y {
                 lines.push(Line::from(""));
@@ -622,6 +600,17 @@ fn render_center_pane(
             format!("{}  ", g.orbit),
             Style::default().fg(if live { p.cyan } else { p.magenta }),
         )
+    };
+    // The LIVE gutter: the braille busy spinner rides the streaming line
+    // so the motion sits where the operator is reading (Cline-style).
+    let busy_gutter = || {
+        // Reduced motion: the still star, not a spinner frame.
+        let glyph = if app.reduced_motion {
+            g.orbit
+        } else {
+            g.busy_frames()[app.spinner_frame as usize % g.busy_frames().len()]
+        };
+        Span::styled(format!("{glyph}  "), Style::default().fg(p.cyan))
     };
 
     for entry in &app.transcript {
@@ -673,6 +662,7 @@ fn render_center_pane(
                 tool_name,
                 summary,
                 outcome,
+                started_at,
             } => {
                 // The tool card (§6.5): state glyph, name, argument, meta —
                 // one row that reads like a Claude Code tool-call line.
@@ -687,8 +677,18 @@ fn render_center_pane(
                 let is_running = outcome.is_none()
                     && matches!(&app.tool_state, ToolState::Running(n) if n == tool_name)
                     && app.turn_in_flight;
+                // The running card's meta is a LIVE duration (1.4s →
+                // 1.6s…), ticking while the call runs — the card itself
+                // carries the progress feel.
+                let running_meta = match started_at {
+                    Some(t) => {
+                        let secs = t.elapsed().as_millis() as f64 / 1000.0;
+                        format!("{secs:.1}s")
+                    }
+                    None => "running".to_string(),
+                };
                 let (glyph, glyph_color, name_color, meta) = match (is_running, outcome) {
-                    (true, _) => (g.running, p.cyan, p.ink, "running".to_string()),
+                    (true, _) => (g.running, p.cyan, p.ink, running_meta),
                     (false, Some(true)) => (g.done, p.muted, p.ink2, String::new()),
                     (false, Some(false)) => (g.failed, p.red, p.ink2, "failed".to_string()),
                     // Unsettled but not running (e.g. the turn was cancelled
@@ -746,15 +746,16 @@ fn render_center_pane(
         }
     }
 
-    // In-flight stream — live star in the gutter, cyan while working.
+    // In-flight stream — the busy spinner in the gutter, cyan while
+    // working. Motion lives where the eyes are.
     let streaming = !app.in_flight.is_empty();
     if streaming {
-        // The gutter rides the first line (no orphan ✦ row).
+        // The gutter rides the first line (no orphan glyph row).
         let mut first = true;
         for rich_line in render_message(&app.in_flight, d) {
             let mut spans = Vec::new();
             if first {
-                spans.push(orbit_gutter(true));
+                spans.push(busy_gutter());
                 first = false;
             } else {
                 spans.push(Span::raw("   "));
@@ -763,8 +764,13 @@ fn render_center_pane(
             lines.push(Line::from(spans));
         }
         if first {
-            lines.push(Line::from(orbit_gutter(true)));
+            lines.push(Line::from(busy_gutter()));
         }
+    }
+    // Waiting for the first token: the spinner rides a lone gutter row so
+    // dead air still shows life (the old design showed nothing here).
+    if app.turn_in_flight && !streaming && app.tool_state == ToolState::Streaming {
+        lines.push(Line::from(busy_gutter()));
     }
     // NOTE: while Streaming with an empty in_flight, no transcript line is
     // added — the working star in the status line (§6.11) is the sole
@@ -815,13 +821,7 @@ fn render_center_pane(
     let turn_live = app.turn_in_flight
         || app.tool_state == ToolState::Streaming
         || matches!(app.tool_state, ToolState::Running(_));
-    let box_color = if turn_live {
-        p.cyan
-    } else if composer_focused {
-        p.magenta
-    } else {
-        p.rule
-    };
+
     let prompt_color = if composer_focused { p.magenta } else { p.faint };
     // Standard terminal blink cadence (~530 ms on, ~530 ms off).
     let cursor_on = !turn_live && (app.tick_count / 33).is_multiple_of(2);
@@ -873,27 +873,31 @@ fn render_center_pane(
             })
             .collect()
     };
-    // The box: rounded, colored by state, no title. The ASCII tier keeps
-    // every chrome cell printable (§13.5) — ratatui's Plain set is
-    // unicode, so the ASCII tier draws its own frame.
-    if g.set() == crate::tokens::GlyphSet::Ascii {
-        let inner = Rect {
-            x: center[2].x + 1,
-            y: center[2].y + 1,
-            width: center[2].width.saturating_sub(2),
-            height: center[2].height.saturating_sub(2),
-        };
-        draw_ascii_pane_border(frame, center[2], "", box_color, Style::default(), g);
-        frame.render_widget(Paragraph::new(visible), inner);
+    // The composer is a color-filled surface, not a box: state-colored
+    // wash (cyan while a turn is live, magenta when focused, surface
+    // idle) with the text inset by one column. No frame glyphs in any
+    // tier — the fill IS the affordance.
+    let wash = if turn_live {
+        blend_color(p.cyan, p.bg, 0.86)
+    } else if composer_focused {
+        blend_color(p.magenta, p.bg, 0.88)
     } else {
-        let block = Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::default().fg(box_color));
-        let inner = block.inner(center[2]);
-        frame.render_widget(block, center[2]);
-        frame.render_widget(Paragraph::new(visible), inner);
+        p.surface
+    };
+    let inner = Rect {
+        x: center[2].x + 1,
+        y: center[2].y,
+        width: center[2].width.saturating_sub(2),
+        height: center[2].height,
+    };
+    for y in center[2].top()..center[2].bottom() {
+        for x in center[2].left()..center[2].right() {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                cell.set_style(Style::default().bg(wash));
+            }
+        }
     }
+    frame.render_widget(Paragraph::new(visible), inner);
 
     // ── Hint row: keycap chips left, toast right (§5.5, §6.12) ────────────
     let mono = d.caps.color == crate::tokens::ColorTier::Mono;
@@ -959,7 +963,7 @@ fn render_right_pane(
 ) {
     let p = &d.palette;
     let body = if framed {
-        render_pane_frame(frame, area, "Workspace", app.focus == Focus::Right, d, g)
+        render_pane_frame(frame, area, "Workspace", app.focus == Focus::Right, d)
     } else {
         render_rail_header(frame, area, "Workspace", app.focus == Focus::Right, d, g)
     };
@@ -1310,11 +1314,15 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         ratatui::widgets::Block::default().style(Style::default().bg(p.surface2)),
         area,
     );
-    // Left side: the compact mark (the working star while ORBIT works — the
-    // only moving cell), then the dynamic state.
+    // Left side: the compact mark — the braille busy spinner while ORBIT
+    // works (waiting, streaming, running tools), the star when idle.
     let mark =
         if matches!(app.logo_phase, LogoPhase::Working) || app.tool_state == ToolState::Streaming {
-            g.working()[app.spinner_frame as usize % 4]
+            if app.reduced_motion {
+                g.orbit
+            } else {
+                g.busy_frames()[app.spinner_frame as usize % g.busy_frames().len()]
+            }
         } else {
             g.orbit
         };
@@ -1459,33 +1467,28 @@ pub fn format_count(n: u64) -> String {
 
 // ── Overlays — the only frames (§1, §6.16) ───────────────────────────────────
 
-/// A one-colour rounded frame for overlays (§4.2): magenta for approvals
-/// (ORBIT asking for your authority), rule_hi for confirmations. Built from
-/// glyph constants — never the ┌┐ set, never double-line.
-fn overlay_block<'a>(title: &'a str, color: Color, g: &Glyphs) -> Block<'a> {
-    use ratatui::symbols::border;
-    let set = border::Set {
-        top_left: g.frame_top_left,
-        top_right: g.frame_top_right,
-        bottom_left: g.frame_bottom_left,
-        bottom_right: g.frame_bottom_right,
-        vertical_left: g.frame_left,
-        vertical_right: g.frame_right,
-        horizontal_top: g.frame_top,
-        horizontal_bottom: g.frame_bottom,
-    };
+/// A filled overlay card (§4.2 evolved): solid surface2 fill, one header
+/// row carrying the title in the overlay color, and a 1-col inset. No
+/// frame glyphs — the fill + elevation (Clear underneath) IS the frame.
+/// Magenta fill tone for approvals (ORBIT asking for your authority),
+/// rule tone for confirmations.
+fn overlay_block(title: &str, fill: Color, p: &crate::tokens::ResolvedPalette) -> Block<'static> {
+    // Solid fill card (the fill is pre-blended toward canvas so text stays
+    // readable), title chip in the overlay's accent with canvas text.
+    // `fill` carries the authority tone: magenta-tinged for approvals,
+    // rule-toned for confirmations.
     Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .border_set(set)
-        .border_style(Style::default().fg(color))
+        .borders(ratatui::widgets::Borders::NONE)
+        .style(Style::default().bg(fill))
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.bg).bg(p.magenta).add_modifier(Modifier::BOLD),
         ))
+        .padding(ratatui::widgets::Padding::horizontal(1))
 }
 
 /// Quit confirmation — a small solid card, NO backdrop dimming (§12).
-fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
+fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, _g: &Glyphs) {
     let p = &d.palette;
     let is_running =
         app.tool_state == ToolState::Streaming || matches!(app.tool_state, ToolState::Running(_));
@@ -1528,14 +1531,14 @@ fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
             Span::styled(" stay", Style::default().fg(p.muted)),
         ]),
     ])
-    .block(overlay_block(title, d.palette.rule_hi, g));
+    .block(overlay_block(title, blend_color(d.palette.rule_hi, d.palette.bg, 0.92), &d.palette));
     frame.render_widget(ratatui::widgets::Clear, modal_h[1]);
     frame.render_widget(content, modal_h[1]);
 }
 
 /// §6.16 help overlay: the same frame as quit, two columns of keys
 /// grouped by pane. Any key closes it.
-fn render_help_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App, d: &Design, g: &Glyphs) {
+fn render_help_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App, d: &Design, _g: &Glyphs) {
     let p = &d.palette;
     let w = 64u16.min(area.width.saturating_sub(8));
     let h = 20u16.min(area.height.saturating_sub(4));
@@ -1543,7 +1546,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App, d: &D
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect { x, y, width: w, height: h };
     frame.render_widget(ratatui::widgets::Clear, rect);
-    let block = overlay_block("Keys", p.rule_hi, g);
+    let block = overlay_block("Keys", blend_color(p.rule_hi, p.bg, 0.92), p);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -1697,7 +1700,7 @@ fn render_approval_modal(
             ),
         ]),
     ])
-    .block(overlay_block(&title, p.magenta, g));
+    .block(overlay_block(&title, blend_color(p.magenta, p.bg, 0.9), p));
     // Clear the underlying pane borders so the modal reads as a solid
     // surface, not a frame over frames.
     frame.render_widget(ratatui::widgets::Clear, dock_h[1]);

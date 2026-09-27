@@ -288,15 +288,27 @@ def main():
         check("types into composer on boot (default focus)", False, str(e))
 
     # ── 2. Stream a response (mock-slow), proving the prompt was sent ──────
+    # The busy spinner repaints between streamed words (diff rendering
+    # interleaves cursor moves), so match the words IN ORDER rather than
+    # as one contiguous substring.
+    def words_in_order(buf, words):
+        pos = -1
+        for w in words:
+            pos = buf.find(w, pos + 1)
+            if pos == -1:
+                return False
+        return True
     s.key("enter")
     clean = ""
     end = time.time() + 20
     while time.time() < end:
         clean += s.read(0.5)
-        if "Hello from the slow stream" in clean:
+        if words_in_order(clean, ["Hello", "from", "the", "slow", "stream"]):
             break
         time.sleep(0.2)
-    check("sends prompt + streams response", "Hello from the slow stream" in clean, clean[-300:])
+    check("sends prompt + streams response",
+          words_in_order(clean, ["Hello", "from", "the", "slow", "stream"]),
+          clean[-300:])
 
     # ── 3. Slash commands (REPL parity in the TUI) ─────────────────────────
     # After the slow-stream turn, the TUI is idle and ready for commands.
@@ -444,11 +456,14 @@ def main():
         # from Center: R(Workspace) → L(Sessions) → Center(no marker) →
         # repeat. Count magenta title writes: ≥4 means the focus cycled
         # R,L,R,L without a lost keypress.
-        markers = _re.findall(r"\x1b\[38;2;227;86;208(?:;[0-9;]*)?m[ ]?[A-Za-z]+", raw)
+        # Fluid chrome: focus change rewrites the header band's title chip
+        # (magenta bg 48;2;227;86;208 + title text). Count chip writes:
+        # ≥4 means the focus cycled R,L,R,L without a lost keypress.
+        markers = _re.findall(r"48;2;227;86;208m[ ]?[A-Za-z]+", raw)
         has_alternation = len(markers) >= 4
         check("tab burst cycles focus one-by-one",
               has_alternation,
-              f"focus-rule writes={len(markers)} (need ≥4: R,L,R,L — Center has no header)")
+              f"focus-chip writes={len(markers)} (need ≥4: R,L,R,L — Center has no header)")
         sb.key("ctrl+d")
         time.sleep(0.5)
         sb.key("y")

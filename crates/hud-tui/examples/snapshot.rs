@@ -36,6 +36,7 @@ fn main() {
         tool_name: "calculator".into(),
         summary: r#"expression="2*(3+4)""#.into(),
         outcome: Some(true),
+        started_at: None,
     });
     if show_approval {
         app.pending_approvals.push(PendingApproval {

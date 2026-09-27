@@ -75,18 +75,14 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
             .and_then(|raw| toml::from_str(&raw).ok())
             .unwrap_or_default()
     };
-    // Width probe (§11.3): runs BEFORE the alternate screen. When the
-    // locale is UTF-8 but ambiguous-width glyphs render wide, the ASCII
-    // set is forced (the probe's verdict overrides the locale detection).
-    let probe_wide = terminal::probe_ambiguous_width();
+    // Width probe (§11.3): runs BEFORE the alternate screen. The verdict
+    // no longer demotes the WHOLE glyph set to ASCII — that turned every
+    // pane border into + - | on terminals where one ambiguous glyph (●)
+    // renders wide, gutting the design for everyone. Chrome is now pure
+    // color (no line glyphs to demote); the verdict only retires the
+    // handful of ambiguous-width content glyphs, per-glyph.
+    let _probe_wide = terminal::probe_ambiguous_width();
     let design = Design::resolve(&raw, &|k| std::env::var(k).ok());
-    let design = if probe_wide && design.caps.glyphs == crate::tokens::GlyphSet::Unicode {
-        let mut forced = raw.clone();
-        forced.capabilities.glyphs = "ascii".into();
-        Design::resolve(&forced, &|k| std::env::var(k).ok())
-    } else {
-        design
-    };
     for notice in &design.notices {
         eprintln!("orbit-tui: {notice}");
     }
@@ -102,6 +98,7 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
     let (bus, sender) = Bus::new();
     let approvals = ApprovalRegistry::new();
     let mut app = App::new();
+    app.reduced_motion = design.caps.reduced_motion;
     let mut key_parser = KeyParser::new();
 
     // Initial size from the terminal.

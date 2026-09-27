@@ -230,6 +230,8 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                                 // transcript; settled-neutral is honest.
                                 summary: String::new(),
                                 outcome: Some(true),
+                                // Restored calls have no live duration.
+                                started_at: None,
                             })
                         }
                     } else if !msg.content.is_empty() {

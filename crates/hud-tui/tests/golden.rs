@@ -240,17 +240,20 @@ fn golden_tool_card_running_vs_settled() {
         tool_name: "shell".into(),
         summary: "cargo test -p orbit-export".into(),
         outcome: Some(true),
+        started_at: None,
     });
     // Second shell call: running now.
     app.transcript.push(TranscriptLine::Stripped {
         tool_name: "shell".into(),
         summary: "cargo test -p orbit-ledger".into(),
         outcome: None,
+        started_at: Some(std::time::Instant::now()),
     });
     let buf = render_buf(&app, &d, 150, 44);
     let text = buf_text(&buf);
-    // Exactly one "running" meta — the second card.
-    assert_eq!(text.matches("running").count(), 1, "one running card");
+    // The running card shows a live ticking duration (e.g. "0.0s");
+    // settled cards show none.
+    assert!(text.contains("0.0s"), "running card ticks its duration");
     // Both cards render with their arguments (tail-truncated).
     assert!(text.contains("cargo test -p orbit-export"), "settled card arg");
     assert!(text.contains("cargo test -p orbit-ledger"), "running card arg");
@@ -265,6 +268,7 @@ fn golden_tool_card_failed() {
         tool_name: "shell".into(),
         summary: "cargo test".into(),
         outcome: Some(false),
+        started_at: None,
     });
     let buf = render_buf(&app, &d, 150, 44);
     let text = buf_text(&buf);
@@ -437,9 +441,8 @@ fn invariant_one_frame_max() {
             c.symbol() == "╭" || c.symbol() == "╮" || c.symbol() == "╰" || c.symbol() == "╯"
         })
         .count();
-    // Quiet rails: only the composer box draws a frame in the base
-    // layout — the panes are borderless (§5). 4 corners = the composer.
-    assert_eq!(base_corners, 4, "composer box only");
+    // Fluid chrome: no frame glyphs exist anywhere — corners must be 0.
+    assert_eq!(base_corners, 0, "no frame glyphs in the base layout");
 
     // With a modal open, the modal adds exactly one frame (+4 corners).
     for app in [approval_app()] {
@@ -575,18 +578,23 @@ fn invariant_single_moving_cell() {
             }
         }
     }
-    // All differing cells must be in the status line (the mark) — the star
-    // is the only moving cell.
+    // Motion zones (fluid design): the status mark, the live transcript
+    // gutter, and the running tool card's ticking duration — all in the
+    // center column (the conversation), never the rails or header.
+    let status_y = 43;
+    let center_x = 24; // left rail is 24 cols; center starts at 24
     for (x, y) in &diff {
-        assert_eq!(
-            *y, 43,
-            "cell ({x},{y}) changed outside the status line — the star is the only moving cell"
+        let in_status = *y == status_y;
+        let in_center = *x >= center_x && *y < status_y;
+        assert!(
+            in_status || in_center,
+            "cell ({x},{y}) changed outside the motion zones"
         );
     }
-    assert!(!diff.is_empty(), "the star should advance between frames");
+    assert!(!diff.is_empty(), "the spinner should advance between frames");
     assert!(
-        diff.len() <= 4,
-        "only the mark cell (+counters) may change; {} cells did",
+        diff.len() <= 12,
+        "only the spinner + duration cells may change; {} cells did",
         diff.len()
     );
 }

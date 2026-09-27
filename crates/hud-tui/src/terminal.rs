@@ -178,25 +178,18 @@ impl TerminalGuard {
 
     /// Render the app state to the terminal.
     ///
-    /// `app.force_full_redraw` requests a clear before the next draw so the
-    /// whole frame is written (used on the live→settled turn transition,
-    /// where the settled line occupies the same cells as the live one and
-    /// the incremental diff would otherwise emit nothing).
+    /// Pure diff rendering — ratatui emits only changed cells. There is
+    /// deliberately no full-repaint path: the live→settled turn transition
+    /// is a normal diff (same cells, new gutter style), and forcing a
+    /// whole-screen re-emit there caused a visible flash on every turn.
+    /// Real Resize events still repaint fully via ratatui's own resize
+    /// handling in the event loop.
     pub fn draw(
         &mut self,
         app: &App,
         composer_text: &str,
         design: &crate::tokens::Design,
     ) -> Result<(), String> {
-        if app.force_full_redraw.replace(false) {
-            // Full redraw without terminal.clear() (which queries the cursor
-            // position — unanswerable under a PTY harness and flaky in odd
-            // terminals). Re-resizing to the current size resets ratatui's
-            // previous buffer, so the next draw re-emits every cell.
-            if let Ok((w, h)) = crossterm::terminal::size() {
-                let _ = self.terminal.resize(ratatui::layout::Rect::new(0, 0, w, h));
-            }
-        }
         self.terminal
             .draw(|frame| crate::render::render(frame, app, composer_text, design))
             .map(|_| ())
