@@ -347,11 +347,13 @@ pub fn emit_tool_started(sender: &BusSender, name: &str, summary: &str) {
     });
 }
 
-/// Emit a tool-call-finished event.
-pub fn emit_tool_finished(sender: &BusSender, name: &str, ok: bool) {
+/// Emit a tool-call-finished event. The outcome distinguishes an operator
+/// denial and a pre-run block from a genuine tool failure (§11.5 rule 4:
+/// a `Denied` outcome keeps `⊘`, never a red `✕`).
+pub fn emit_tool_finished(sender: &BusSender, name: &str, outcome: crate::state::ToolOutcome) {
     sender.send(Msg::ToolCallFinished {
         name: name.to_string(),
-        ok,
+        outcome,
     });
 }
 

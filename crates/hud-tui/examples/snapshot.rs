@@ -5,8 +5,8 @@
 
 use orbit_hud_tui::render::render;
 use orbit_hud_tui::state::{
-    App, ComposerState, ConnectionState, Focus, LeftTab, LogoPhase, PendingApproval, ToolState,
-    TranscriptLine,
+    App, ComposerState, ConnectionState, Focus, LeftTab, LogoPhase, PendingApproval, ToolOutcome,
+    ToolState, TranscriptLine,
 };
 use orbit_hud_tui::tokens::{Design, Theme};
 
@@ -35,7 +35,7 @@ fn main() {
     app.transcript.push(TranscriptLine::Stripped {
         tool_name: "calculator".into(),
         summary: r#"expression="2*(3+4)""#.into(),
-        outcome: Some(true),
+        outcome: Some(ToolOutcome::Ok),
         started_at: None,
     });
     if show_approval {

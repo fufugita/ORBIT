@@ -23,7 +23,7 @@
 use orbit_hud_tui::render::render;
 use orbit_hud_tui::state::{
     App, ComposerState, ConnectionState, Finding, Focus, LeftTab, LogoPhase, PendingApproval, Task,
-    TaskState, Toast, ToastKind, ToolState, TranscriptLine,
+    TaskState, Toast, ToastKind, ToolOutcome, ToolState, TranscriptLine,
 };
 use orbit_hud_tui::tokens::{Design, GlyphSet, Theme};
 
@@ -258,7 +258,7 @@ fn golden_tool_card_running_vs_settled() {
     app.transcript.push(TranscriptLine::Stripped {
         tool_name: "shell".into(),
         summary: "cargo test -p orbit-export".into(),
-        outcome: Some(true),
+        outcome: Some(ToolOutcome::Ok),
         started_at: None,
     });
     // Second shell call: running now.
@@ -292,12 +292,49 @@ fn golden_tool_card_failed() {
     app.transcript.push(TranscriptLine::Stripped {
         tool_name: "shell".into(),
         summary: "cargo test".into(),
-        outcome: Some(false),
+        outcome: Some(ToolOutcome::Failed),
         started_at: None,
     });
     let buf = render_buf(&app, &d, 150, 44);
     let text = buf_text(&buf);
     assert!(text.contains("failed"), "failed meta on the card");
+}
+
+/// A denial is a decision, not a failure: `⊘` muted with `denied by you`
+/// meta — never the red `✕ failed` treatment (§11.5 rule 4).
+#[test]
+fn golden_tool_card_denied() {
+    let d = design();
+    let mut app = idle_app();
+    app.transcript.push(TranscriptLine::Stripped {
+        tool_name: "shell".into(),
+        summary: "rm -rf /tmp/scratch".into(),
+        outcome: Some(ToolOutcome::Denied),
+        started_at: None,
+    });
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    assert!(text.contains("denied by you"), "denied meta on the card");
+    assert!(!text.contains("failed"), "a refusal never reads as failed");
+}
+
+/// A pre-run block (unknown tool / no consent) is amber `⊖ blocked`,
+/// distinct from both failed and denied.
+#[test]
+fn golden_tool_card_blocked() {
+    let d = design();
+    let mut app = idle_app();
+    app.transcript.push(TranscriptLine::Stripped {
+        tool_name: "nestar.init".into(),
+        summary: "provider=nano".into(),
+        outcome: Some(ToolOutcome::Blocked),
+        started_at: None,
+    });
+    let buf = render_buf(&app, &d, 150, 44);
+    let text = buf_text(&buf);
+    assert!(text.contains("blocked"), "blocked meta on the card");
+    assert!(!text.contains("failed"), "a block never reads as failed");
+    assert!(!text.contains("denied by you"), "a block is not a denial");
 }
 
 #[test]

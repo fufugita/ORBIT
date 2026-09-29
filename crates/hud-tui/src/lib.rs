@@ -870,27 +870,27 @@ fn handle_key(
     if !app.pending_approvals.is_empty() {
         let first = &app.pending_approvals[0];
         let call_id = first.call_id.clone();
-        let name = first.tool_name.clone();
         if let KeyCode::Char(c) = key.code {
             match c {
+                // D3 (§11.5 rule 4): the key handler ONLY resolves the
+                // approval through the registry — it never sends
+                // ToolCallFinished itself. The line's final state comes
+                // from the worker's emit_tool_finished, which fires after
+                // the tool actually runs (or is denied). Reporting ok:true
+                // before execution would lie to the transcript; ok:false
+                // would record an operator denial as a tool error.
                 'y' | 'Y' => {
-                    // Send the dismissal BEFORE resolving the approval. The
-                    // worker unblocks on resolve and immediately starts the
-                    // next round; if ToolCallFinished lands in the bus AFTER
-                    // the round-2 messages, the modal is still showing when
-                    // the round-2 text is processed — and the renderer
-                    // hides the transcript behind the modal (DR-21 L18).
-                    sender.send(Msg::ToolCallFinished { name, ok: true });
                     approvals.resolve(&call_id, ApprovalResponse::Allow);
                     return;
                 }
                 'n' | 'N' => {
-                    sender.send(Msg::ToolCallFinished { name, ok: false });
                     approvals.resolve(&call_id, ApprovalResponse::Deny);
                     return;
                 }
-                'r' | 'R' => {
-                    sender.send(Msg::ToolCallFinished { name, ok: true });
+                // Session grant is `R` only; bare `r` is swallowed by the
+                // modal (no accidental session-wide grants). Terminals
+                // deliver Shift+R as Char('R') — case is the distinction.
+                'R' => {
                     approvals.resolve(&call_id, ApprovalResponse::AllowSession);
                     return;
                 }
@@ -898,7 +898,6 @@ fn handle_key(
             }
         }
         if matches!(key.code, KeyCode::Esc) {
-            sender.send(Msg::ToolCallFinished { name, ok: false });
             approvals.resolve(&call_id, ApprovalResponse::Deny);
         }
         // Any other key is consumed by the modal.

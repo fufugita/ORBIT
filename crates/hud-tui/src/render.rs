@@ -9,8 +9,8 @@
 use crate::glyphs::Glyphs;
 use crate::rich::render_message;
 use crate::state::{
-    App, ConnectionState, Focus, LeftTab, LogoPhase, TaskState, ToolState, TranscriptLine,
-    VerificationResult,
+    App, ConnectionState, Focus, LeftTab, LogoPhase, TaskState, ToolOutcome, ToolState,
+    TranscriptLine, VerificationResult,
 };
 use crate::tokens::Design;
 use crate::unicode::truncate_graphemes;
@@ -693,8 +693,22 @@ fn render_center_pane(
                 };
                 let (glyph, glyph_color, name_color, meta) = match (is_running, outcome) {
                     (true, _) => (g.running, p.cyan, p.ink, running_meta),
-                    (false, Some(true)) => (g.done, p.muted, p.ink2, String::new()),
-                    (false, Some(false)) => (g.failed, p.red, p.ink2, "failed".to_string()),
+                    (false, Some(ToolOutcome::Ok)) => {
+                        (g.done, p.muted, p.ink2, String::new())
+                    }
+                    (false, Some(ToolOutcome::Failed)) => {
+                        (g.failed, p.red, p.ink2, "failed".to_string())
+                    }
+                    // A refusal is a decision, not a failure: muted `⊘`,
+                    // `denied by you` meta — never a red cell.
+                    (false, Some(ToolOutcome::Denied)) => {
+                        (g.denied, p.muted, p.ink2, "denied by you".to_string())
+                    }
+                    // Blocked before running (unknown tool / no consent):
+                    // amber `⊖`, distinct from both failed and denied.
+                    (false, Some(ToolOutcome::Blocked)) => {
+                        (g.blocked, p.amber, p.ink2, "blocked".to_string())
+                    }
                     // Unsettled but not running (e.g. the turn was cancelled
                     // mid-call): the honest neutral state.
                     (false, None) => (g.pending, p.faint, p.ink2, String::new()),

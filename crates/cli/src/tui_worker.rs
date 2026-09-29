@@ -69,6 +69,16 @@ fn worker_main(
 ) {
     let mut transcript: Vec<ChatMessage> = config.initial_transcript.clone();
     let mut turns: u64 = config.initial_turns;
+    // D9 (§13.5 rule 5): the session file must carry CUMULATIVE totals —
+    // resumed values plus everything this run adds. Tracking them per-turn
+    // only (as run_tui_turn does) made every save overwrite the history.
+    let mut cum_input: u64 = config.initial_input_tokens;
+    let mut cum_output: u64 = config.initial_output_tokens;
+    let mut cum_cost: u64 = config.initial_cost_microcents;
+    // D8 (§13.5 rule 1): R-grants are SESSION-scoped. Created once here —
+    // not per provider round, and not per turn — so `R` means what its
+    // label says. Reset on resume and on a new session.
+    let mut auto_grants = crate::tool_runtime::AutoGrants::new();
 
     // Send identity to the TUI so the status bar shows model/provider/session.
     // D18: priced=false makes the status bar show `cost n/a` for models
@@ -113,6 +123,7 @@ fn worker_main(
                     &ctx.approvals,
                     &token,
                     turns,
+                    &mut auto_grants,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
@@ -127,12 +138,37 @@ fn worker_main(
                     *guard = None;
                 }
                 turns = turns.saturating_add(1);
+                // D9: accumulate CUMULATIVE session totals (initial + every
+                // turn this run). The save below persists these, and
+                // ResponseFinished commits them to the TUI so a later resume
+                // shows the full history, not just the last turn.
+                cum_input = cum_input.saturating_add(input);
+                cum_output = cum_output.saturating_add(output);
+                cum_cost = cum_cost.saturating_add(cost);
                 // Always emit ResponseFinished — the TUI's turn_in_flight flag
                 // and queue drain both depend on it, whether the turn
                 // completed, was cancelled by the operator, or errored. The
                 // reducer stamps a "cancelled" note when cancel_requested was
                 // set.
-                orbit_hud_tui::emit_response_finished(&ctx.sender, "", input, output, cost);
+                orbit_hud_tui::emit_response_finished(&ctx.sender, "", cum_input, cum_output, cum_cost);
+                // D9 (§13.5 rule 5): save with CUMULATIVE totals — the
+                // resumed baseline plus every turn this run — so a
+                // save/resume/save cycle accumulates instead of
+                // overwriting, and turns reflects the full count.
+                let sf = crate::sessions::SessionFile::from_chat(
+                    &config.session_id,
+                    &config.model,
+                    &config.gate,
+                    &config.provider_id,
+                    &transcript,
+                    turns,
+                    cum_input,
+                    cum_output,
+                    cum_cost,
+                );
+                if let Err(e) = crate::sessions::save_session(&config.home, &sf) {
+                    orbit_hud_tui::emit_error(&ctx.sender, &format!("warning: session not saved: {e}"));
+                }
             }
             WorkerCommand::SetModel(model) => {
                 if model.is_empty() {
@@ -201,6 +237,15 @@ fn worker_main(
                                 .and_then(|cfg| cfg.pricing_for_model(&s.model))
                                 .is_some(),
                         });
+                        // D9: the resumed session's totals become the new
+                        // baseline — the next save carries them plus whatever
+                        // this run adds.
+                        cum_input = s.input_tokens;
+                        cum_output = s.output_tokens;
+                        cum_cost = s.cost_microcents;
+                        // D8: resuming into a different session clears any
+                        // R-grants made in the previous one.
+                        auto_grants = crate::tool_runtime::AutoGrants::new();
                     }
                     Err(e) => {
                         ctx.sender
@@ -242,7 +287,7 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                                 // The outcome is unknown from the saved
                                 // transcript; settled-neutral is honest.
                                 summary: String::new(),
-                                outcome: Some(true),
+                                outcome: Some(orbit_hud_tui::state::ToolOutcome::Ok),
                                 // Restored calls have no live duration.
                                 started_at: None,
                             })
@@ -276,6 +321,26 @@ pub struct TuiApprovalChannel {
 impl TuiApprovalChannel {
     pub fn new(sender: BusSender, approvals: ApprovalRegistry) -> Self {
         Self { sender, approvals }
+    }
+}
+
+/// Classify a tool result JSON into a `ToolOutcome` for the transcript card.
+/// The denial and block paths in `execute_call` produce `ok:false` results
+/// with these exact error strings (crates/cli/src/tool_runtime.rs:243-251);
+/// everything else with `ok:true` is a success, and any other `ok:false`
+/// means the tool genuinely ran and failed. A refusal must never render as
+/// a red `✕ failed` card (§11.5 rule 4, `denied_is_not_failed`).
+fn classify_tool_result(result: &str) -> orbit_hud_tui::state::ToolOutcome {
+    if result.contains("\"ok\":true") {
+        orbit_hud_tui::state::ToolOutcome::Ok
+    } else if result.contains("operator denied") {
+        orbit_hud_tui::state::ToolOutcome::Denied
+    } else if result.contains("non-interactive tool call requires --auto-tools")
+        || result.contains("unknown tool (deny-by-default)")
+    {
+        orbit_hud_tui::state::ToolOutcome::Blocked
+    } else {
+        orbit_hud_tui::state::ToolOutcome::Failed
     }
 }
 
@@ -317,7 +382,10 @@ pub fn run_tui_turn(
     sender: &BusSender,
     approvals: &ApprovalRegistry,
     cancel: &orbit_provider_http::CancelToken,
-    turns: u64,
+    // Kept for signature stability; the worker loop owns turn counting and
+    // session saving (D9) — the turn itself no longer needs it.
+    _turns: u64,
+    auto_grants: &mut crate::tool_runtime::AutoGrants,
 ) -> Result<(bool, u64, u64, u64), String> {
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
@@ -353,11 +421,6 @@ pub fn run_tui_turn(
     });
 
     let mut turn_ok = false;
-    // R-grants are session-scoped per tool NAME, but the in-memory grant set
-    // is (at minimum) scoped to one user turn — created here, once, so an R on
-    // the first tool call of a turn still applies to later calls in the same
-    // turn (matches the REPL: cmd_chat creates AutoGrants once per turn).
-    let mut auto_grants = crate::tool_runtime::AutoGrants::new();
     // The workspace rail tracks the turn's phases (§6.10):
     // 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
     let mut ws = orbit_hud_tui::state::Workspace::default();
@@ -457,11 +520,15 @@ pub fn run_tui_turn(
                 config.auto_tools,
                 true,
                 &mut approval_channel,
-                &mut auto_grants,
+                auto_grants,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
-            let ok = result.contains("\"ok\":true");
-            orbit_hud_tui::emit_tool_finished(sender, &call.name, ok);
+            // Classify the result into a ToolOutcome: a refusal must render
+            // as `⊘ denied by you`, not a red `✕ failed` (§11.5 rule 4).
+            // execute_call's denial paths return ok:false with these exact
+            // error strings (tool_runtime.rs:243-251), so match on them.
+            let outcome = classify_tool_result(&result);
+            orbit_hud_tui::emit_tool_finished(sender, &call.name, outcome);
             transcript.push(ChatMessage {
                 role: ChatRole::Tool,
                 content: result.clone(),
@@ -478,22 +545,6 @@ pub fn run_tui_turn(
             sender,
             "ORBIT-E0406: tool loop ended without a final assistant response",
         );
-    } else {
-        // Save the session (same as REPL) with the real turn count.
-        let sf = crate::sessions::SessionFile::from_chat(
-            &config.session_id,
-            &config.model,
-            &config.gate,
-            &config.provider_id,
-            transcript,
-            turns.saturating_add(1),
-            input_tokens,
-            output_tokens,
-            cost,
-        );
-        if let Err(e) = crate::sessions::save_session(&config.home, &sf) {
-            orbit_hud_tui::emit_error(sender, &format!("warning: session not saved: {e}"));
-        }
     }
 
     Ok((turn_ok, input_tokens, output_tokens, cost))

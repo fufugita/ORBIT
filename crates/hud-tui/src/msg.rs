@@ -37,8 +37,14 @@ pub enum Msg {
     },
     /// A tool call started (name + display-safe argument summary).
     ToolCallStarted { name: String, summary: String },
-    /// A tool call finished (display-safe result summary).
-    ToolCallFinished { name: String, ok: bool },
+    /// A tool call finished. `outcome` distinguishes success, failure, an
+    /// operator denial (a decision, not an error — §11.5 rule 4) and an
+    /// unknown-tool block (deny-by-default), so the transcript never shows
+    /// a red `✕ failed` for a refusal.
+    ToolCallFinished {
+        name: String,
+        outcome: crate::state::ToolOutcome,
+    },
     /// An error from the backend (provider failure, etc.).
     BackendError(String),
 

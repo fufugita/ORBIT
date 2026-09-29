@@ -485,7 +485,7 @@ pub enum TranscriptLine {
         summary: String,
         /// The call's settled outcome (None while running). Set by
         /// ToolCallFinished — the card's glyph depends on it (§6.5).
-        outcome: Option<bool>,
+        outcome: Option<ToolOutcome>,
         /// When the call started — drives the live ticking duration on the
         /// running card. None for entries restored from a session file.
         started_at: Option<std::time::Instant>,
@@ -495,6 +495,23 @@ pub enum TranscriptLine {
     /// A text chunk the bridge rejected (D7). NEVER shows the rejected
     /// text; renders as a one-line chip: `[blocked: <kind>]`.
     Redacted(crate::RedactionKind),
+}
+
+/// How a tool call ended (§6.5, §11.5 rule 4). `Denied` and `Blocked` are
+/// decisions, not failures: an operator refusal must never render as a red
+/// `✕ failed` — audits read refusals and crashes differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutcome {
+    /// Ran and succeeded: `✓` muted.
+    Ok,
+    /// Ran and failed: `✕` red + `failed` meta.
+    Failed,
+    /// Denied by the operator (or deny-by-default rules): `⊘` muted +
+    /// `denied by you` meta.
+    Denied,
+    /// Blocked before running (unknown tool, non-interactive without
+    /// consent): `⊖` amber + `blocked` meta.
+    Blocked,
 }
 
 /// Why the bridge rejected a text chunk (D7). Names the gate, not the text.
@@ -857,7 +874,7 @@ impl App {
                 });
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
-            Msg::ToolCallFinished { name, ok } => {
+            Msg::ToolCallFinished { name, outcome: outcome_of_call } => {
                 // Dismiss the FIRST pending approval that was resolved. The
                 // worker sends ApprovalRequested (with a real call_id) for
                 // each tool call, and handle_key resolves that exact call_id.
@@ -880,16 +897,19 @@ impl App {
                     } = entry
                     {
                         if n == &name && outcome.is_none() {
-                            *outcome = Some(ok);
+                            *outcome = Some(outcome_of_call);
                             break;
                         }
                     }
                 }
                 // Note: we never render model-supplied rationale; only status.
-                self.last_status = if ok {
-                    format!("tool {name}: ok")
-                } else {
-                    format!("tool {name}: error")
+                self.last_status = match outcome_of_call {
+                    ToolOutcome::Ok => format!("tool {name}: ok"),
+                    ToolOutcome::Failed => format!("tool {name}: error"),
+                    // A refusal is a decision the operator made — status text
+                    // names the decision, not a failure word.
+                    ToolOutcome::Denied => format!("tool {name}: denied by you"),
+                    ToolOutcome::Blocked => format!("tool {name}: blocked"),
                 };
                 self.dirty
                     .set(DirtyFlags::APPROVAL | DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
@@ -1666,11 +1686,37 @@ mod tests {
         assert_eq!(app.pending_approvals.len(), 1);
         app.reduce(Msg::ToolCallFinished {
             name: "calculator".into(),
-            ok: true,
+            outcome: ToolOutcome::Ok,
         });
         assert!(app.pending_approvals.is_empty());
         assert_eq!(app.tool_state, ToolState::Idle);
         assert!(app.last_status.contains("ok"));
+    }
+
+    #[test]
+    fn tool_call_finished_denied_is_not_failed() {
+        // §11.5 rule 4: an operator denial must never settle as a failure.
+        // The status line names the decision, and the card's outcome field
+        // carries Denied (rendered `⊘ denied by you`, never red `✕`).
+        let mut app = App::new();
+        app.reduce(Msg::ToolCallStarted {
+            name: "shell".into(),
+            summary: "rm -rf /tmp/scratch".into(),
+        });
+        app.reduce(Msg::ToolCallFinished {
+            name: "shell".into(),
+            outcome: ToolOutcome::Denied,
+        });
+        // Status names the decision, not an error word.
+        assert!(app.last_status.contains("denied by you"));
+        assert!(!app.last_status.contains("error"));
+        // The card carries the Denied outcome, not a failure.
+        match app.transcript.last() {
+            Some(TranscriptLine::Stripped { outcome, .. }) => {
+                assert_eq!(*outcome, Some(ToolOutcome::Denied));
+            }
+            other => panic!("expected a Stripped card, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1694,7 +1740,7 @@ mod tests {
         assert_eq!(app.pending_approvals.len(), 2);
         app.reduce(Msg::ToolCallFinished {
             name: "ssh".into(),
-            ok: true,
+            outcome: ToolOutcome::Ok,
         });
         assert_eq!(app.pending_approvals.len(), 1);
         assert_eq!(app.pending_approvals[0].call_id, "call-2");
