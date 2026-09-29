@@ -198,6 +198,10 @@ impl App {
                     crate::state::TranscriptLine::User(t)
                     | crate::state::TranscriptLine::Assistant(t)
                     | crate::state::TranscriptLine::System(t) => t.clone(),
+                    // D7: the chip line, as plain words.
+                    crate::state::TranscriptLine::Redacted(kind) => {
+                        format!("[blocked: {}]", kind.label())
+                    }
                     crate::state::TranscriptLine::Stripped {
                         tool_name, summary, ..
                     } => {
@@ -347,6 +351,12 @@ pub struct App {
     /// Reduced-motion preference (tui.toml `reduced = true`): spinners
     /// hold still; only data-driven changes move.
     pub reduced_motion: bool,
+    /// D17: tui.toml `[color] bell_on_approval` — ring BEL when an
+    /// approval card appears.
+    pub bell_on_approval: bool,
+    /// A pending BEL emission — the event loop writes `\x07` to stdout
+    /// once and clears it (the reducer can't touch stdout).
+    pub bell_pending: bool,
 
     // ── Data state (filled by the backend bridge) ──────────────────────────
     /// Lines in the conversation transcript (user + assistant).
@@ -355,9 +365,18 @@ pub struct App {
     pub in_flight: String,
     /// Streaming text coalescer — flushes every 30 ms.
     pub coalescer: Coalescer,
-    /// Cumulative cost in microcents (H-17).
+    /// Cumulative cost in microcents (H-17). Committed turns only — the
+    /// in-flight turn's cost is tracked separately (D5) so the two are
+    /// never double-counted.
     pub total_cost_microcents: u64,
-    /// Cumulative input tokens.
+    /// The current turn's running cost (§13.3 D5). Turn-scoped: reset to 0
+    /// by PromptSubmitted / TextSubmitted, grown by TurnCostUpdated, and
+    /// committed into total_cost_microcents by ResponseFinished exactly
+    /// once (the commit value is the final number, not added on top).
+    pub turn_cost_microcents: u64,
+    /// D18: the active model has a pricing entry. False → status bar shows
+    /// `cost n/a` instead of a dollar figure.
+    pub model_priced: bool,
     pub total_input_tokens: u64,
     /// Cumulative output tokens.
     pub total_output_tokens: u64,
@@ -433,6 +452,9 @@ pub struct App {
     /// time when a turn ends (ResponseFinished or CancelTurn). Rendered as
     /// dimmed `⏳` lines above the composer.
     pub queued: Vec<String>,
+    /// D3: the last submitted prompt — `r` in NORMAL mode re-submits it.
+    /// Updated on every TextSubmitted that starts a turn (not queued ones).
+    pub last_prompt: Option<String>,
     /// True while the worker is actively running a turn (streaming or in a
     /// tool round). Drives whether Ctrl+C cancels the turn vs. quits.
     pub turn_in_flight: bool,
@@ -470,6 +492,34 @@ pub enum TranscriptLine {
     },
     /// System note (cancelled turn, queue drained, etc.) — dim, never bold.
     System(String),
+    /// A text chunk the bridge rejected (D7). NEVER shows the rejected
+    /// text; renders as a one-line chip: `[blocked: <kind>]`.
+    Redacted(crate::RedactionKind),
+}
+
+/// Why the bridge rejected a text chunk (D7). Names the gate, not the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionKind {
+    /// `safe_text` found a secret pattern in the chunk.
+    Secret,
+    /// The chunk was not valid UTF-8 (`from_utf8` failed).
+    InvalidUtf8,
+    /// The chunk failed the display-safe escape scan.
+    Escape,
+    /// Provider died mid-stream (`rx.recv()` returned None).
+    StreamInterrupted,
+}
+
+impl RedactionKind {
+    /// The chip label (§7.3-style: lowercase words, no glyphs needed).
+    pub fn label(&self) -> &'static str {
+        match self {
+            RedactionKind::Secret => "credential",
+            RedactionKind::InvalidUtf8 => "encoding",
+            RedactionKind::Escape => "escape",
+            RedactionKind::StreamInterrupted => "stream interrupted",
+        }
+    }
 }
 
 /// Connection state for the status bar.
@@ -536,6 +586,8 @@ impl App {
             in_flight: String::new(),
             coalescer: Coalescer::new(DATA_TICK),
             total_cost_microcents: 0,
+            turn_cost_microcents: 0,
+            model_priced: true,
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_turns: 0,
@@ -571,12 +623,15 @@ impl App {
             toast_emitted_at: None,
             composer_state: ComposerState::Idle,
             queued: Vec::new(),
+            last_prompt: None,
             turn_in_flight: false,
             cancel_requested: false,
             spinner_frame: 0,
             pane_scroll: [0, 0, 0],
             viewport_manual: false,
             reduced_motion: false,
+            bell_on_approval: false,
+            bell_pending: false,
         }
     }
 
@@ -745,8 +800,13 @@ impl App {
                 }
                 self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
                 self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
+                // D5: commit the turn cost exactly once. The value the worker
+                // sends here is the FINAL turn total (it accumulated the
+                // rounds itself); the turn accumulator is reset, so the
+                // mid-turn TurnCostUpdated numbers can never stack on it.
                 self.total_cost_microcents =
                     self.total_cost_microcents.saturating_add(cost_microcents);
+                self.turn_cost_microcents = 0;
                 // §6.11 M5: stamp the turn report (shown for 2 s).
                 let duration_ms = self
                     .turn_started_at
@@ -852,6 +912,7 @@ impl App {
                     // Idle — run immediately. (Also clears any stale cancel
                     // flag from a turn that raced its own finish.)
                     self.cancel_requested = false;
+                    self.last_prompt = Some(text.clone());
                     self.transcript.push(TranscriptLine::User(text));
                     self.in_flight.clear();
                     self.tool_state = ToolState::Streaming;
@@ -859,6 +920,9 @@ impl App {
                     self.composer_state = ComposerState::Sending;
                     self.turn_started_at = Some(std::time::Instant::now());
                     self.turn_tool_count = 0;
+                    // D5: a fresh turn starts its cost accumulator at 0 (a
+                    // stale value would inflate the status display).
+                    self.turn_cost_microcents = 0;
                     self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
                 }
             }
@@ -875,11 +939,29 @@ impl App {
                     summary,
                     risk,
                 });
+                // D17: ring the terminal bell when configured — the
+                // operator watching something else hears the approval.
+                if self.bell_on_approval {
+                    self.bell_pending = true;
+                }
                 self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS);
             }
             Msg::InputModeChanged(mode) => {
                 self.input_mode = mode;
                 self.dirty.set(DirtyFlags::STATUS);
+            }
+            Msg::ApprovalsDenied => {
+                // D8: Ctrl+C denied all pending approvals — the registry
+                // already released the worker; the reducer clears the cards
+                // and returns the tool state to running (the turn continues
+                // with the denied results).
+                self.pending_approvals.clear();
+                if self.turn_in_flight {
+                    self.tool_state = ToolState::Running("denied".into());
+                } else {
+                    self.tool_state = ToolState::Idle;
+                }
+                self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS);
             }
             Msg::ExitCopyMode => {
                 self.copy_mode = false;
@@ -1053,19 +1135,42 @@ impl App {
                 self.connection = state;
                 self.dirty.set(DirtyFlags::STATUS);
             }
-            Msg::CostUpdated(cost) => {
-                self.total_cost_microcents = cost;
+            Msg::TurnCostUpdated(cost) => {
+                // D5: the worker reports the CURRENT TURN's running cost
+                // after each provider round. It never touches the committed
+                // total — ResponseFinished commits it exactly once.
+                self.turn_cost_microcents = cost;
                 self.dirty.set(DirtyFlags::STATUS);
+            }
+            Msg::CostUpdated(cost) => {
+                // Legacy cumulative emitter (Go bridge). Overwrite the
+                // committed total and zero the turn accumulator so the two
+                // can't stack.
+                self.total_cost_microcents = cost;
+                self.turn_cost_microcents = 0;
+                self.dirty.set(DirtyFlags::STATUS);
+            }
+            Msg::Redacted { kind } => {
+                // D7: the bridge rejected a chunk. Flush any coalesced text
+                // first so the chip lands after the surviving prose, then
+                // append the chip. The rejected text is never rendered.
+                if let Some(text) = self.coalescer.flush() {
+                    self.in_flight.push_str(&text);
+                }
+                self.transcript.push(TranscriptLine::Redacted(kind));
+                self.dirty.set(DirtyFlags::TRANSCRIPT);
             }
             Msg::Identity {
                 model,
                 provider,
                 session_prefix,
                 session_id,
+                priced,
             } => {
                 self.model = model;
                 self.provider = provider;
                 self.session_id_prefix = session_prefix;
+                self.model_priced = priced;
                 self.session_id = session_id;
                 self.dirty
                     .set(DirtyFlags::SESSION_LIST | DirtyFlags::STATUS);
@@ -1211,6 +1316,9 @@ impl App {
                 self.quit_confirmation = true;
                 self.dirty.set(DirtyFlags::STATUS | DirtyFlags::LAYOUT);
             }
+            // D3: `r` is dispatched in the event loop (needs the worker
+            // command sink); the reducer sees nothing here.
+            KeyAction::RerunLast => {}
             KeyAction::FocusNext => {
                 self.focus = self.focus.next();
                 self.dirty.set(DirtyFlags::LAYOUT);
@@ -1746,5 +1854,222 @@ mod tests {
             app.reduce(Msg::Tick);
         }
         assert!(app.spinner_frame < 10);
+    }
+
+    // ── D5: turn-scoped cost accounting ─────────────────────────────────
+
+    #[test]
+    fn turn_cost_never_stacks_on_committed_total() {
+        let mut app = App::default();
+        // Round 1 of a turn reports 100µ¢ running.
+        app.reduce(Msg::TextSubmitted("hi".into()));
+        app.reduce(Msg::TurnCostUpdated(100));
+        assert_eq!(app.turn_cost_microcents, 100);
+        assert_eq!(app.total_cost_microcents, 0, "committed untouched mid-turn");
+        // Round 2 reports the ACCUMULATED turn cost (300), not a delta.
+        app.reduce(Msg::TurnCostUpdated(300));
+        assert_eq!(app.turn_cost_microcents, 300);
+        // Finish: the final turn cost is committed once; accumulator resets.
+        app.reduce(Msg::ResponseFinished {
+            output: String::new(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cost_microcents: 300,
+        });
+        assert_eq!(app.total_cost_microcents, 300);
+        assert_eq!(app.turn_cost_microcents, 0);
+    }
+
+    #[test]
+    fn new_turn_resets_stale_turn_cost() {
+        let mut app = App::default();
+        app.reduce(Msg::TextSubmitted("one".into()));
+        app.reduce(Msg::TurnCostUpdated(500));
+        app.reduce(Msg::ResponseFinished {
+            output: String::new(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_microcents: 500,
+        });
+        app.reduce(Msg::TextSubmitted("two".into()));
+        assert_eq!(app.turn_cost_microcents, 0, "fresh turn starts at 0");
+    }
+
+    #[test]
+    fn legacy_cost_updated_zeroes_turn_accumulator() {
+        // The Go bridge still sends cumulative CostUpdated — it must never
+        // stack with a stale turn accumulator.
+        let mut app = App::default();
+        app.reduce(Msg::TurnCostUpdated(123));
+        app.reduce(Msg::CostUpdated(1000));
+        assert_eq!(app.total_cost_microcents, 1000);
+        assert_eq!(app.turn_cost_microcents, 0);
+    }
+
+    // ── D7: redaction chip lands in the transcript ─────────────────────
+
+    #[test]
+    fn redacted_chip_appends_never_renders_text() {
+        let mut app = App::default();
+        app.reduce(Msg::Redacted {
+            kind: crate::state::RedactionKind::Secret,
+        });
+        assert_eq!(app.transcript.len(), 1);
+        match &app.transcript[0] {
+            TranscriptLine::Redacted(kind) => {
+                assert_eq!(*kind, crate::state::RedactionKind::Secret)
+            }
+            other => panic!("expected Redacted, got {other:?}"),
+        }
+        // The chip's plain rendering names the gate, never the text.
+        assert_eq!(app.pane_lines(Focus::Center), vec!["[blocked: credential]"]);
+    }
+
+    // ── D18: unpriced models show cost n/a ─────────────────────────────
+
+    #[test]
+    fn identity_unpriced_disables_cost_display() {
+        let mut app = App::default();
+        app.reduce(Msg::Identity {
+            model: "local-lab".into(),
+            provider: "ollama".into(),
+            session_prefix: "deadbeef".into(),
+            session_id: "deadbeef-cafe".into(),
+            priced: false,
+        });
+        assert!(!app.model_priced);
+    }
+
+    #[test]
+    fn identity_priced_default_true() {
+        let mut app = App::default();
+        assert!(app.model_priced, "default assumes priced until told");
+    }
+}
+
+#[cfg(test)]
+mod rerun_tests {
+    use super::*;
+
+    fn app_idle() -> App {
+        let mut app = App::new();
+        app.turn_in_flight = false;
+        app
+    }
+
+    #[test]
+    fn text_submitted_records_last_prompt() {
+        let mut app = app_idle();
+        app.reduce(Msg::TextSubmitted("first prompt".into()));
+        assert_eq!(app.last_prompt.as_deref(), Some("first prompt"));
+    }
+
+    #[test]
+    fn last_prompt_updates_on_each_submission() {
+        let mut app = app_idle();
+        app.reduce(Msg::TextSubmitted("one".into()));
+        app.reduce(Msg::ResponseFinished {
+            output: String::new(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_microcents: 1,
+        });
+        app.reduce(Msg::TextSubmitted("two".into()));
+        assert_eq!(app.last_prompt.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn last_prompt_none_before_first_turn() {
+        let app = app_idle();
+        assert!(app.last_prompt.is_none());
+    }
+
+    #[test]
+    fn rerun_keyaction_is_noop_in_reducer() {
+        let mut app = app_idle();
+        app.reduce(Msg::KeyAction(KeyAction::RerunLast));
+        assert!(!app.should_quit);
+        assert!(app.last_prompt.is_none());
+    }
+}
+
+#[cfg(test)]
+mod bell_tests {
+    use super::*;
+
+    fn approval_msg() -> Msg {
+        Msg::ApprovalRequested {
+            call_id: "c1".into(),
+            tool_name: "shell".into(),
+            summary: "ls".into(),
+            risk: 0,
+        }
+    }
+
+    #[test]
+    fn approval_sets_bell_pending_when_enabled() {
+        let mut app = App::new();
+        app.bell_on_approval = true;
+        app.reduce(approval_msg());
+        assert!(app.bell_pending, "D17: bell rings on approval");
+    }
+
+    #[test]
+    fn approval_silent_when_not_configured() {
+        let mut app = App::new(); // bell_on_approval defaults false
+        app.reduce(approval_msg());
+        assert!(!app.bell_pending);
+    }
+
+    #[test]
+    fn bell_flag_defaults_off() {
+        let app = App::new();
+        assert!(!app.bell_on_approval);
+        assert!(!app.bell_pending);
+    }
+}
+
+#[cfg(test)]
+mod approvals_denied_tests {
+    use super::*;
+
+    fn approval() -> Msg {
+        Msg::ApprovalRequested {
+            call_id: "c1".into(),
+            tool_name: "shell".into(),
+            summary: "rm -rf /tmp/x".into(),
+            risk: 2,
+        }
+    }
+
+    #[test]
+    fn ctrl_c_during_approval_clears_cards_not_session() {
+        let mut app = App::new();
+        app.reduce(approval());
+        assert_eq!(app.pending_approvals.len(), 1);
+        assert_eq!(app.tool_state, ToolState::AwaitingApproval);
+        // D8: the deny gesture clears the cards and keeps the session alive.
+        app.reduce(Msg::ApprovalsDenied);
+        assert!(app.pending_approvals.is_empty());
+        assert!(!app.should_quit);
+        assert!(!app.quit_confirmation);
+    }
+
+    #[test]
+    fn denied_during_turn_returns_to_running() {
+        let mut app = App::new();
+        app.reduce(Msg::TextSubmitted("go".into()));
+        app.reduce(approval());
+        app.reduce(Msg::ApprovalsDenied);
+        assert!(matches!(app.tool_state, ToolState::Running(_)));
+        assert!(app.turn_in_flight, "the turn continues with denied results");
+    }
+
+    #[test]
+    fn denied_when_idle_returns_to_idle() {
+        let mut app = App::new();
+        app.reduce(approval());
+        app.reduce(Msg::ApprovalsDenied);
+        assert_eq!(app.tool_state, ToolState::Idle);
     }
 }

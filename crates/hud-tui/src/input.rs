@@ -33,15 +33,35 @@ pub enum KeyAction {
     ScrollUp(u16),
     /// Scroll the focused pane down by n lines.
     ScrollDown(u16),
+    /// D3: re-submit the last prompt (`r` in NORMAL mode).
+    RerunLast,
     /// Key was recognized but not actionable in the current context.
     Unknown,
 }
 
 /// Two-state leader-key parser.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct KeyParser {
     /// `Some('g')` or `Some('z')` when waiting for the second key of a chord.
     pending_leader: Option<char>,
+    /// D14: when the pending leader was set. A leader older than
+    /// LEADER_TIMEOUT is stale — the next key must NOT be consumed as a
+    /// chord second (an operator who pressed `g`, got distracted, and
+    /// later typed `s` meant a literal `s`, not `g s`).
+    leader_set_at: Option<std::time::Instant>,
+}
+
+/// D14: a pending leader expires after 1 s (herdr/tmux feel — chords are
+/// fast; anything slower is typing, not a chord).
+pub const LEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Default for KeyParser {
+    fn default() -> Self {
+        Self {
+            pending_leader: None,
+            leader_set_at: None,
+        }
+    }
 }
 
 impl KeyParser {
@@ -71,8 +91,17 @@ impl KeyParser {
         // No modifiers from here on.
         match event.code {
             KeyCode::Char(c) => {
+                // D14: expire a stale leader BEFORE consuming — a chord
+                // second pressed after LEADER_TIMEOUT is a fresh key.
+                if let Some(at) = self.leader_set_at {
+                    if at.elapsed() > LEADER_TIMEOUT {
+                        self.pending_leader = None;
+                        self.leader_set_at = None;
+                    }
+                }
                 // If we have a pending leader, consume it.
                 if let Some(leader) = self.pending_leader.take() {
+                    self.leader_set_at = None;
                     return Some(self.parse_leader(leader, c));
                 }
                 // Single keys.
@@ -84,9 +113,11 @@ impl KeyParser {
                     '3' => Some(KeyAction::FocusRight),
                     '/' => Some(KeyAction::CommandPalette),
                     'i' => Some(KeyAction::EnterInsert),
+                    'r' => Some(KeyAction::RerunLast),
                     'Z' => Some(KeyAction::ZoomToggle),
                     'g' | 'z' => {
                         self.pending_leader = Some(c);
+                        self.leader_set_at = Some(std::time::Instant::now());
                         None // waiting for next key
                     }
                     _ => Some(KeyAction::Unknown),
@@ -138,9 +169,9 @@ impl KeyParser {
     }
 
     /// Reset any pending leader (e.g. on focus change or timeout).
-    #[allow(dead_code)] // wired in PR-D (focus change resets leader)
     pub fn reset(&mut self) {
         self.pending_leader = None;
+        self.leader_set_at = None;
     }
 
     /// True if waiting for the second key of a chord.
@@ -255,5 +286,36 @@ mod tests {
         assert!(p.has_pending_leader());
         p.reset();
         assert!(!p.has_pending_leader());
+    }
+
+    // ── D14: leader expiry ─────────────────────────────────────────────
+
+    #[test]
+    fn stale_leader_expires_and_key_is_fresh() {
+        let mut p = KeyParser::new();
+        assert!(p.parse(&key('g')).is_none()); // leader set
+        // Age the leader past the timeout.
+        p.leader_set_at = Some(std::time::Instant::now() - LEADER_TIMEOUT - std::time::Duration::from_millis(50));
+        // `s` now must be a FRESH key (Unknown), not the g+s chord.
+        assert_eq!(p.parse(&key('s')), Some(KeyAction::Unknown));
+        assert!(!p.has_pending_leader());
+    }
+
+    #[test]
+    fn fresh_leader_still_forms_chord() {
+        let mut p = KeyParser::new();
+        assert!(p.parse(&key('g')).is_none());
+        assert_eq!(p.parse(&key('s')), Some(KeyAction::TabSessions));
+    }
+
+    #[test]
+    fn reset_clears_leader_and_timestamp() {
+        let mut p = KeyParser::new();
+        assert!(p.parse(&key('z')).is_none());
+        p.reset();
+        assert!(!p.has_pending_leader());
+        assert!(p.leader_set_at.is_none());
+        // After reset, `t` is a fresh key — not z+t.
+        assert_eq!(p.parse(&key('t')), Some(KeyAction::Unknown));
     }
 }

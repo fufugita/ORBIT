@@ -197,19 +197,137 @@ pub fn safe_text(text: &str) -> String {
     }
 }
 
+/// D7: probe the display-safe gate without coercing — `true` = the chunk is
+/// clean (use as-is); `false` = rejected (caller emits a Redacted msg).
+pub fn safe_text_probe(text: &str) -> bool {
+    orbit_hud::display_safe(text).is_ok()
+}
+
+/// D6: stateful CoT stripper for streaming deltas. Owns two pieces of
+/// cross-delta state:
+///
+/// 1. `inside` — an opening tag was seen with no closing tag yet; everything
+///    is suppressed until the close arrives (fail closed).
+/// 2. `pending` — a partial tag prefix (`<thi`) at a buffer boundary; held
+///    back until the next delta either completes or disproves it.
+#[derive(Default)]
+pub struct CotStripper {
+    inside: Option<String>, // the open tag name, e.g. "think"
+    pending: String,        // trailing partial-tag bytes
+}
+
+impl CotStripper {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one delta; returns the displayable remainder.
+    pub fn push(&mut self, delta: &str) -> String {
+        // Fast path: mid-block. Scan only for the closing tag.
+        if let Some(tag) = self.inside.clone() {
+            let close = format!("</{tag}>");
+            let hay = format!("{}{}", self.pending, delta);
+            self.pending.clear();
+            if let Some(pos) = hay.to_lowercase().find(&close.to_lowercase()) {
+                // Close found: resume AFTER it, re-entering normal mode for
+                // the remainder of this delta.
+                let after = hay[pos + close.len()..].to_string();
+                self.inside = None;
+                return self.push(&after);
+            }
+            // Still inside: keep a tail only if a partial `</...` prefix
+            // straddles the boundary. Inclusive range — the longest tail
+            // (i == hay.len()) must be reachable, else a delta that IS
+            // entirely a close-prefix would be dropped instead of held.
+            let mut keep = String::new();
+            let max_tail = hay.len().min(close.len());
+            for i in (1..=max_tail).rev() {
+                if !hay.is_char_boundary(hay.len() - i) {
+                    continue;
+                }
+                let tail = &hay[hay.len() - i..];
+                if close.to_lowercase().starts_with(&tail.to_lowercase()) {
+                    keep = tail.to_string();
+                    break;
+                }
+            }
+            self.pending = keep;
+            return String::new();
+        }
+
+        // Normal mode: not inside a block. Prepend any held-back partial tag.
+        let hay = format!("{}{}", self.pending, delta);
+        self.pending.clear();
+        let lower = hay.to_lowercase();
+        let chars: Vec<char> = hay.chars().collect();
+
+        // Look for a complete opening tag.
+        for tag in COT_TAGS {
+            let open = format!("<{tag}>");
+            if let Some(pos) = lower.find(&open.to_lowercase()) {
+                // Emit what precedes it, then enter the block and recurse on
+                // the remainder (which may itself contain the close).
+                let pos_ch = lower[..pos].chars().count();
+                let open_ch = open.chars().count();
+                let before: String = chars[..pos_ch].iter().collect();
+                let rest: String = chars[pos_ch + open_ch..].iter().collect();
+                self.inside = Some(tag.to_string());
+                return before + &self.push(&rest);
+            }
+        }
+
+        // No complete tag. Hold back a trailing partial open-tag prefix
+        // (`<thi`) so a tag split across deltas is still caught.
+        let mut hold = String::new();
+        for i in (1..hay.len().min(8).saturating_sub(0)).rev() {
+            if !hay.is_char_boundary(hay.len() - i) {
+                continue;
+            }
+            let tail = &hay[hay.len() - i..];
+            if COT_TAGS
+                .iter()
+                .any(|t| format!("<{t}>").to_lowercase().starts_with(&tail.to_lowercase()) && tail.starts_with('<'))
+            {
+                hold = tail.to_string();
+                break;
+            }
+        }
+        let emit_len = hay.len() - hold.len();
+        let out = hay[..emit_len].to_string();
+        self.pending = hold;
+        out
+    }
+}
+
 /// The full bridge pipeline: strip CoT → emoji-sanitize → display_safe → emit TextDelta.
-pub fn emit_text(sender: &BusSender, bytes: &[u8]) {
+/// D6: CoT stripping is STATEFUL across deltas — the stripper is owned by the
+/// caller (one per stream) so a `<think>` that arrives alone in one delta
+/// suppresses everything until its `</think>` lands, in whatever later delta.
+pub fn emit_text(stripper: &mut CotStripper, sender: &BusSender, bytes: &[u8]) {
     // The bytes come from serde_json's &str → as_bytes(), so they ARE valid
     // UTF-8. Use from_utf8 (not from_utf8_lossy) to avoid silent corruption.
     let raw = match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
-        Err(_) => return, // skip invalid UTF-8 rather than corrupting it
+        Err(_) => {
+            // D7: name the gate; never render the rejected bytes.
+            sender.send(Msg::Redacted {
+                kind: crate::state::RedactionKind::InvalidUtf8,
+            });
+            return;
+        }
     };
-    let stripped = strip_cot(&raw);
+    let stripped = stripper.push(&raw);
     let sanitized = sanitize_glyphs(&stripped);
-    let safe = safe_text(&sanitized);
-    if !safe.is_empty() {
-        sender.send(Msg::TextDelta(safe));
+    let match_before = safe_text_probe(&sanitized);
+    if !match_before {
+        // D7: rejected by the display-safe gate — emit the chip, not the text.
+        sender.send(Msg::Redacted {
+            kind: crate::state::RedactionKind::Secret,
+        });
+        return;
+    }
+    if !sanitized.is_empty() {
+        sender.send(Msg::TextDelta(sanitized));
     }
 }
 
@@ -265,9 +383,16 @@ pub fn emit_error(sender: &BusSender, error: &str) {
     sender.send(Msg::BackendError(safe));
 }
 
-/// Emit a cumulative cost update to the status bar.
+/// Emit the cumulative cost update (legacy bridge path — Go bridge).
 pub fn emit_cost(sender: &BusSender, cost_microcents: u64) {
     sender.send(Msg::CostUpdated(cost_microcents));
+}
+
+/// D5: emit the CURRENT turn's running cost (microcents). The worker calls
+/// this after each provider round; the final number is committed by
+/// ResponseFinished, not here.
+pub fn emit_turn_cost(sender: &BusSender, cost_microcents: u64) {
+    sender.send(Msg::TurnCostUpdated(cost_microcents));
 }
 
 #[cfg(test)]
@@ -362,6 +487,7 @@ mod tests {
     fn emit_text_strips_cot_and_gates() {
         let (bus, sender) = Bus::new();
         emit_text(
+            &mut CotStripper::new(),
             &sender,
             b"hello<antml:thinking>secret</antml:thinking>world",
         );
@@ -375,13 +501,17 @@ mod tests {
 
     #[test]
     fn emit_text_redacts_secrets() {
+        // D7: a rejected chunk emits a Redacted chip naming the gate — the
+        // text itself never reaches the bus.
         let (bus, sender) = Bus::new();
-        emit_text(&sender, b"api_key=leaked");
+        emit_text(&mut CotStripper::new(), &sender, b"api_key=leaked");
         let msgs = drain(&bus);
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
-            Msg::TextDelta(t) => assert_eq!(t, "[redacted]"),
-            other => panic!("expected TextDelta, got {other:?}"),
+            Msg::Redacted { kind } => {
+                assert_eq!(*kind, crate::state::RedactionKind::Secret)
+            }
+            other => panic!("expected Redacted, got {other:?}"),
         }
     }
 
@@ -448,8 +578,63 @@ mod tests {
     #[test]
     fn emit_text_empty_after_strip_sends_nothing() {
         let (bus, sender) = Bus::new();
-        emit_text(&sender, b"<reasoning>all cot</reasoning>");
+        emit_text(&mut CotStripper::new(), &sender, b"<reasoning>all cot</reasoning>");
         let msgs = drain(&bus);
         assert!(msgs.is_empty());
     }
+
+    // ── D6: stateful cross-delta CoT stripping ───────────────────────────
+
+    #[test]
+    fn cot_split_open_and_close_across_deltas() {
+        let mut s = CotStripper::new();
+        // Delta 1 ends mid-open-tag; delta 2 completes it and ends mid-close.
+        assert_eq!(s.push("clean text <thin"), "clean text ");
+        assert_eq!(s.push("king>hidden reasoning"), "");
+        assert_eq!(s.push("</thin"), "");
+        assert_eq!(s.push("king> visible"), " visible");
+    }
+
+    #[test]
+    fn cot_suppresses_forever_without_close() {
+        // Fail closed: an open tag with no close suppresses the rest of the
+        // stream, not just the first delta.
+        let mut s = CotStripper::new();
+        assert_eq!(s.push("before <thinking>"), "before ");
+        assert_eq!(s.push("secret one"), "");
+        assert_eq!(s.push("secret two"), "");
+        // Still no close — still suppressed.
+        assert_eq!(s.push("still secret"), "");
+    }
+
+    #[test]
+    fn cot_partial_tag_held_not_lost() {
+        // A lone `<` at a boundary is held, then released when disproven.
+        let mut s = CotStripper::new();
+        assert_eq!(s.push("a <"), "a ");
+        assert_eq!(s.push(" b"), "< b");
+    }
+
+    #[test]
+    fn cot_normal_text_unaffected() {
+        let mut s = CotStripper::new();
+        assert_eq!(s.push("math: 1 < 2 and 3 > 2"), "math: 1 < 2 and 3 > 2");
+        assert_eq!(s.push("no tags here"), "no tags here");
+    }
+
+    #[test]
+    fn emit_text_utf8_reject_emits_chip() {
+        // D7: invalid UTF-8 emits a Redacted(InvalidUtf8) chip, not silence.
+        let (bus, sender) = Bus::new();
+        emit_text(&mut CotStripper::new(), &sender, &[0xff, 0xfe]);
+        let msgs = drain(&bus);
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Msg::Redacted { kind } => {
+                assert_eq!(*kind, crate::state::RedactionKind::InvalidUtf8)
+            }
+            other => panic!("expected Redacted, got {other:?}"),
+        }
+    }
 }
+

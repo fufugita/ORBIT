@@ -71,11 +71,18 @@ fn worker_main(
     let mut turns: u64 = config.initial_turns;
 
     // Send identity to the TUI so the status bar shows model/provider/session.
+    // D18: priced=false makes the status bar show `cost n/a` for models
+    // without a pricing entry (never a fake $0.0000).
+    let boot_priced = crate::config::ProvidersConfig::load(&config.home)
+        .ok()
+        .and_then(|cfg| cfg.pricing_for_model(&config.model))
+        .is_some();
     ctx.sender.send(Msg::Identity {
         model: config.model.clone(),
         provider: config.provider_id.clone(),
         session_prefix: config.session_id.chars().take(8).collect(),
         session_id: config.session_id.clone(),
+        priced: boot_priced,
     });
 
     // Boot with a resumed session, if any.
@@ -187,6 +194,12 @@ fn worker_main(
                             provider: s.provider.clone(),
                             session_prefix: s.session_id.chars().take(8).collect(),
                             session_id: s.session_id.clone(),
+                            // D18: priced stays true unless we know the
+                            // resumed model is unpriced.
+                            priced: crate::config::ProvidersConfig::load(&config.home)
+                                .ok()
+                                .and_then(|cfg| cfg.pricing_for_model(&s.model))
+                                .is_some(),
                         });
                     }
                     Err(e) => {
@@ -310,10 +323,13 @@ pub fn run_tui_turn(
     let mut output_tokens = 0u64;
     let mut cost = 0u64;
 
-    // Observer: map stream events to TUI messages via the bridge.
+    // Observer: map stream events to TUI messages via the bridge. The CoT
+    // stripper is owned by this closure — one per turn — so a `<think>` tag
+    // split across deltas is still caught (D6).
+    let mut cot = orbit_hud_tui::CotStripper::new();
     let mut observer = |ev: &ProviderStreamEvent| {
         if let ProviderEventKind::TextDelta { bytes } = &ev.event {
-            orbit_hud_tui::emit_text(sender, bytes);
+            orbit_hud_tui::emit_text(&mut cot, sender, bytes);
         }
     };
 
@@ -370,7 +386,9 @@ pub fn run_tui_turn(
         input_tokens += o.input_tokens;
         output_tokens += o.output_tokens;
         cost += o.cost_microcents;
-        orbit_hud_tui::emit_cost(sender, cost);
+        // D5: report the TURN's running cost; the committed total is only
+        // touched by ResponseFinished (which carries the final number).
+        orbit_hud_tui::emit_turn_cost(sender, cost);
         // The model is reasoning (round 0) or responding (later rounds).
         if round == 0 {
             ws.phase_index = 1;

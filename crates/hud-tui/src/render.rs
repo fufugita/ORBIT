@@ -405,10 +405,7 @@ fn render_left_pane(
             ]));
             lines.push(Line::from(vec![
                 Span::styled("cost  ", Style::default().fg(p.muted)),
-                Span::styled(
-                    format!("${:.4}", app.total_cost_microcents as f64 / 1_000_000.0),
-                    Style::default().fg(p.ink2),
-                ),
+                Span::styled(cost_display_string(app), Style::default().fg(p.ink2)),
             ]));
             lines.push(Line::from(""));
 
@@ -489,6 +486,16 @@ fn format_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// D5 + D18: the cost string for the verbose pane. Committed + current-turn
+/// cost; `cost n/a` when the model has no pricing entry.
+fn cost_display_string(app: &App) -> String {
+    if !app.model_priced {
+        return crate::format::cost_unpriced().to_string();
+    }
+    let total = app.total_cost_microcents.saturating_add(app.turn_cost_microcents);
+    crate::format::cost(total)
 }
 
 // ── Center pane: transcript + composer (§6.2–6.8, §5.5) ──────────────────────
@@ -737,6 +744,18 @@ fn render_center_pane(
                 lines.push(Line::from(vec![
                     Span::styled(format!("{} ", g.notice), Style::default().fg(p.muted)),
                     Span::styled(text, Style::default().fg(p.muted)),
+                ]));
+                lines.push(Line::from(""));
+            }
+            TranscriptLine::Redacted(kind) => {
+                // D7: a chip that names the gate — the rejected text itself
+                // is never in the buffer.
+                lines.push(Line::from(vec![
+                    Span::styled(g.notice.to_string(), Style::default().fg(p.amber)),
+                    Span::styled(
+                        format!(" blocked: {}", kind.label()),
+                        Style::default().fg(p.amber),
+                    ),
                 ]));
                 lines.push(Line::from(""));
             }
@@ -1390,8 +1409,12 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         format_count(app.total_output_tokens)
     );
 
-    let cost = app.total_cost_microcents;
-    let cost_str = format!("${}.{:06}", cost / 1_000_000, cost % 1_000_000);
+    let cost = app.total_cost_microcents.saturating_add(app.turn_cost_microcents);
+    let cost_str = if app.model_priced {
+        format!("${}.{:06}", cost / 1_000_000, cost % 1_000_000)
+    } else {
+        crate::format::cost_unpriced().to_string()
+    };
 
     // Two-zone status (herdr-style hierarchy): identity on the left,
     // live metrics on the right. The zones breathe — no wall of text.

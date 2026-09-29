@@ -47,6 +47,10 @@ pub fn transcript_lines(app: &App, now: &str) -> Vec<String> {
             TranscriptLine::System(text) => {
                 out.push(format!("{now} {text}"));
             }
+            TranscriptLine::Redacted(kind) => {
+                // D7: chip in plain words (screen-reader safe, no glyphs).
+                out.push(format!("{now} redacted: {}", kind.label()));
+            }
         }
     }
     if !app.in_flight.is_empty() {

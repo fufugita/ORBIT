@@ -213,7 +213,7 @@ pub struct ToolResult {
     pub decision_id: String,
     pub call_id: String,
     pub tool_name: String,
-    pub status: String, // ok | error
+    pub status: String, // ok | error | denied (D9: refusal ≠ failure)
     pub output_sha256: String,
     pub output_bytes: u64,
 }

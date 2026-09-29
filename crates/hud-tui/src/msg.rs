@@ -58,8 +58,19 @@ pub enum Msg {
     },
     /// Connection state changed (set by the harness on provider errors).
     ConnectionChanged(crate::state::ConnectionState),
-    /// Cumulative cost updated (status bar).
+    /// The current turn's running cost (microcents) — after each provider
+    /// round (§13.3 D5). The displayed total is committed + this; the
+    /// commit happens on ResponseFinished, which carries the final turn
+    /// cost exactly once.
+    TurnCostUpdated(u64),
+    /// Legacy alias kept while the Go bridge catches up (emits the
+    /// session-cumulative number). Maps to committed-only display.
     CostUpdated(u64),
+    /// The bridge rejected a text chunk (D7) — never renders the text.
+    /// `kind` names the gate that rejected it for the chip label.
+    Redacted {
+        kind: crate::state::RedactionKind,
+    },
     /// Initialize status-bar identity before the first render.
     Identity {
         model: String,
@@ -68,6 +79,9 @@ pub enum Msg {
         /// The full session id (the §8.4 shutdown line needs it for the
         /// resume hint).
         session_id: String,
+        /// D18: false when the model has no pricing entry — the status bar
+        /// shows `cost n/a` instead of `$0.0000`.
+        priced: bool,
     },
     /// Composer's text changed — force a re-render so the composer box updates
     /// every keystroke (the text lives in the event loop, not the App).
@@ -147,6 +161,9 @@ pub enum Msg {
     /// Noninteractive shutdown (SIGHUP/SIGTERM/SIGINT via `kill`): terminal
     /// is gone or an external manager demands exit — skip the modal, quit now.
     SignalShutdown,
+    /// D8: Ctrl+C while approvals are pending — deny them all (releases
+    /// the parked worker) and clear the cards. NOT a quit gesture.
+    ApprovalsDenied,
     /// A `/command` was typed in the composer (handled by the event loop).
     SlashCommand(String),
     /// `/clear` — wipe the visible transcript (and any in-flight buffer).

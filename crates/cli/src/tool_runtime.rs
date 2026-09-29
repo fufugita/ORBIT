@@ -281,7 +281,9 @@ pub fn execute_call(
 
     if !allowed {
         let output = tool_error(reason);
-        record_result(&mut writer, session_id, decision_id, call, "error", &output)?;
+        // D9: a denial is not an error — audits must be able to tell an
+        // operator refusal apart from a tool that ran and failed.
+        record_result(&mut writer, session_id, decision_id, call, "denied", &output)?;
         return Ok(output);
     }
 
@@ -454,6 +456,20 @@ mod tests {
             execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants).unwrap();
         assert!(out.contains("operator denied"));
         assert!(!out.contains("\"result\":7"));
+        // D9: the ledger records a DENIED status, not error — refusal is
+        // distinct from failure for audit purposes.
+        let mut ledger = String::new();
+        for e in std::fs::read_dir(home.join("ledger/segments"))
+            .unwrap()
+            .flatten()
+        {
+            let bytes = std::fs::read(e.path()).unwrap_or_default();
+            ledger.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        assert!(
+            ledger.contains("\"status\":\"denied\""),
+            "denied verdict must record status=denied, got: {ledger}"
+        );
     }
 
     #[test]

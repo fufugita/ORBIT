@@ -169,8 +169,17 @@ impl TerminalGuard {
         // per-pane — the host terminal's native selection grabs rectangular
         // regions across pane borders because it doesn't know the panes
         // exist. Shift+Click bypasses capture for whole-screen selection.
-        execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)
-            .map_err(|e| format!("enter alt screen: {e}"))?;
+        // Bracketed paste (D12): without it, a pasted multi-line block
+        // arrives as individual keystrokes — every line's first Enter
+        // submits a partial prompt.
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Hide,
+            EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
+        )
+        .map_err(|e| format!("enter alt screen: {e}"))?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).map_err(|e| format!("create terminal: {e}"))?;
         Ok(Self { terminal })
@@ -203,6 +212,7 @@ impl Drop for TerminalGuard {
             std::io::stdout(),
             Show,
             DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
             LeaveAlternateScreen
         )
         .ok();

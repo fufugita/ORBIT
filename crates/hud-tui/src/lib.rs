@@ -15,6 +15,7 @@ pub mod approval;
 pub mod bridge;
 pub mod bus;
 mod coalesce;
+pub mod format;
 pub mod glyphs;
 pub mod input;
 pub mod msg;
@@ -29,9 +30,10 @@ pub mod unicode;
 pub mod worker;
 
 pub use approval::{ApprovalRegistry, ApprovalResponse};
+pub use state::RedactionKind;
 pub use bridge::{
     emit_cost, emit_error, emit_response_finished, emit_status, emit_text, emit_tool_finished,
-    emit_tool_started, emit_workspace, safe_text, strip_cot,
+    emit_tool_started, emit_turn_cost, emit_workspace, safe_text, strip_cot, CotStripper,
 };
 pub use worker::{CommandSink, WorkerCommand, WorkerCtx, WorkerSpawner};
 
@@ -99,6 +101,7 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
     let approvals = ApprovalRegistry::new();
     let mut app = App::new();
     app.reduced_motion = design.caps.reduced_motion;
+    app.bell_on_approval = design.caps.bell_on_approval;
     let mut key_parser = KeyParser::new();
 
     // Initial size from the terminal.
@@ -399,6 +402,16 @@ fn event_loop(
             let _ = out.flush();
         }
 
+        // D17: a pending bell (approval arrived, tui.toml opt-in) — one
+        // BEL byte, once, then cleared.
+        if app.bell_pending {
+            app.bell_pending = false;
+            use std::io::Write as _;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x07");
+            let _ = out.flush();
+        }
+
         // Copy mode: exit alt screen, print transcript, wait for key, re-enter.
         if app.copy_mode {
             app.copy_mode = false;
@@ -442,7 +455,30 @@ fn event_loop(
         if event::poll(timeout).map_err(|e| format!("poll: {e}"))? {
             match event::read().map_err(|e| format!("read: {e}"))? {
                 Event::Key(key) => {
-                    handle_key(key, sender, &mut composer, key_parser, app, approvals)
+                    handle_key(key, sender, &mut composer, key_parser, app, approvals, command_sink)
+                }
+                Event::Paste(text) => {
+                    // D12: bracketed paste — the whole block lands in the
+                    // composer as one edit. Newlines are preserved (the
+                    // operator pastes code, logs, heredocs); nothing is
+                    // auto-submitted. Sanitize control chars that terminals
+                    // can smuggle inside a paste (ESC, CSI leaders) — the
+                    // paste is data, never key bindings.
+                    if app.focus == crate::state::Focus::Center
+                        && app.input_mode == crate::state::InputMode::Insert
+                    {
+                        let clean: String = text
+                            .chars()
+                            .filter(|c| {
+                                !c.is_control()
+                                    || *c == '\n'
+                                    || *c == '\r'
+                                    || *c == '\t'
+                            })
+                            .collect();
+                        composer.push_block(&clean);
+                        sender.send(Msg::ComposerChanged);
+                    }
                 }
                 Event::Mouse(me) => {
                     handle_mouse(me, sender, app);
@@ -555,6 +591,14 @@ impl Composer {
     }
     pub fn newline(&mut self) {
         self.text.push('\n');
+    }
+    /// D12: bracketed-paste insertion. The whole block lands as one edit
+    /// (one undo unit, one ComposerChanged); CRLF/CR newlines normalize
+    /// to LF so pasted Windows text doesn't render stray glyphs.
+    pub fn push_block(&mut self, block: &str) {
+        if !block.is_empty() {
+            self.text.push_str(&block.replace("\r\n", "\n").replace('\r', "\n"));
+        }
     }
     pub fn backspace_word(&mut self) {
         // Naive: pop until whitespace.
@@ -670,6 +714,7 @@ fn handle_key(
     key_parser: &mut KeyParser,
     app: &App,
     approvals: &ApprovalRegistry,
+    command_sink: &CommandSink,
 ) {
     // Any keypress dismisses a finished selection (herdr behaviour).
     handle_key_clears_selection(sender, app);
@@ -704,11 +749,20 @@ fn handle_key(
 
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    // Ctrl+C → cancel the in-flight turn if streaming; otherwise the
-    // double-press-to-quit flow. (During approval, quit wins — the worker
-    // is parked on the approval and the stream isn't running.)
+    // Ctrl+C → deny pending approvals first (D8: the operator's interrupt
+    // intent applies to the modal in front of them — releasing the parked
+    // worker — not to the whole session). Then cancel the in-flight turn if
+    // streaming; otherwise the double-press-to-quit flow.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if app.turn_in_flight && app.tool_state != crate::state::ToolState::AwaitingApproval {
+        if !app.pending_approvals.is_empty() {
+            let denied = approvals.deny_all();
+            sender.send(Msg::ApprovalsDenied);
+            if denied > 0 {
+                sender.send(Msg::SystemMessage(format!(
+                    "denied {denied} pending approval(s)"
+                )));
+            }
+        } else if app.turn_in_flight && app.tool_state != crate::state::ToolState::AwaitingApproval {
             sender.send(Msg::CancelTurn);
         } else {
             sender.send(Msg::CtrlC);
@@ -960,6 +1014,16 @@ fn handle_key(
     if let Some(action) = key_parser.parse(&key) {
         match action {
             KeyAction::Quit => sender.send(Msg::RequestQuit),
+            KeyAction::RerunLast => {
+                // D3: `r` in NORMAL mode re-submits the last prompt —
+                // the fastest retry loop when iterating on a task. No-op
+                // before the first turn of a session.
+                if let Some(prompt) = app.last_prompt.clone() {
+                    if !prompt.is_empty() {
+                        let _ = command_sink.send(WorkerCommand::Prompt(prompt));
+                    }
+                }
+            }
             KeyAction::FocusNext
             | KeyAction::FocusPrev
             | KeyAction::FocusLeft
@@ -1062,5 +1126,38 @@ mod tests {
         let app = App::new();
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(!composer_wants_char(&key, &app));
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::Composer;
+
+    #[test]
+    fn paste_block_preserves_newlines_never_submits() {
+        let mut c = Composer::new();
+        c.push_block("line one\nline two\nline three");
+        assert_eq!(c.text(), "line one\nline two\nline three");
+    }
+
+    #[test]
+    fn paste_block_normalizes_crlf() {
+        let mut c = Composer::new();
+        c.push_block("windows\r\ntext");
+        assert_eq!(c.text(), "windows\ntext");
+    }
+
+    #[test]
+    fn paste_block_empty_is_noop() {
+        let mut c = Composer::new();
+        c.push_block("");
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn paste_lone_cr_becomes_lf() {
+        let mut c = Composer::new();
+        c.push_block("old\rmac");
+        assert_eq!(c.text(), "old\nmac");
     }
 }

@@ -796,6 +796,10 @@ pub struct Capabilities {
     pub brand: BrandTier,
     pub reduced_motion: bool,
     pub ambiguous_wide: bool,
+    /// D17: tui.toml `[color] bell_on_approval = true` — ring the terminal
+    /// bell when an approval card appears (audible attention for
+    /// background-watching operators).
+    pub bell_on_approval: bool,
 }
 
 /// The complete design context the renderer consumes: the palette resolved
@@ -881,6 +885,7 @@ impl Design {
                 brand,
                 reduced_motion,
                 ambiguous_wide,
+                bell_on_approval: theme.capabilities.bell_on_approval,
             },
             layout_rails: (theme.layout.rail_left, theme.layout.rail_right),
             layout_measure: theme.layout.measure,
@@ -968,5 +973,22 @@ accent = "#0000FF"
         let theme: Theme = toml::from_str(toml).unwrap();
         let d = Design::resolve(&theme, &no_env);
         assert!(d.notices.iter().any(|n| n.contains("'accent'")));
+    }
+
+    #[test]
+    fn bell_on_approval_plumbs_through_design() {
+        // D17: the [color] table's bell_on_approval reaches Capabilities.
+        let theme = Theme {
+            capabilities: CapabilitiesConfig {
+                bell_on_approval: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let d = Design::resolve(&theme, &|_| None);
+        assert!(d.caps.bell_on_approval);
+        // And the default stays off.
+        let off = Design::resolve(&Theme::default(), &|_| None);
+        assert!(!off.caps.bell_on_approval);
     }
 }
