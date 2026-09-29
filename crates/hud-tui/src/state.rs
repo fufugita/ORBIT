@@ -8,10 +8,6 @@
 use crate::coalesce::Coalescer;
 use crate::input::KeyAction;
 use crate::msg::Msg;
-use std::time::Duration;
-
-/// Coalescing interval for streaming text (DR-20 §2.4 — 30 ms data tick).
-pub const DATA_TICK: Duration = Duration::from_millis(30);
 
 /// Bitset tracking which regions need redraw.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -438,8 +434,9 @@ pub struct App {
     pub turn_report: Option<TurnReport>,
     /// Tick when the turn report was stamped (2 s window).
     pub turn_report_at: Option<u64>,
-    /// When the current turn started (Instant) — for the M5 duration.
-    turn_started_at: Option<std::time::Instant>,
+    /// The tick the current turn started at — for the M5 duration
+    /// (§16.1 seam: tick counts, not Instants, so tests play Ticks).
+    turn_started_at: Option<u64>,
     /// Tool calls made in the current turn (for the M5 report).
     turn_tool_count: u32,
     /// §6.12 toast: text + frame counter (the toast auto-dismisses at 3 s).
@@ -486,9 +483,10 @@ pub enum TranscriptLine {
         /// The call's settled outcome (None while running). Set by
         /// ToolCallFinished — the card's glyph depends on it (§6.5).
         outcome: Option<ToolOutcome>,
-        /// When the call started — drives the live ticking duration on the
-        /// running card. None for entries restored from a session file.
-        started_at: Option<std::time::Instant>,
+        /// The tick the call started at — drives the live ticking duration
+        /// on the running card. None for entries restored from a session
+        /// file. (§16.1 seam: ticks, not Instants.)
+        started_at: Option<u64>,
     },
     /// System note (cancelled turn, queue drained, etc.) — dim, never bold.
     System(String),
@@ -601,7 +599,7 @@ impl App {
             tick_count: 0,
             transcript: Vec::new(),
             in_flight: String::new(),
-            coalescer: Coalescer::new(DATA_TICK),
+            coalescer: Coalescer::new(2), // 2 ticks ≈ 32 ms (the 30 ms data cadence)
             total_cost_microcents: 0,
             turn_cost_microcents: 0,
             model_priced: true,
@@ -663,7 +661,7 @@ impl App {
         self.turn_in_flight = true;
         self.tool_state = ToolState::Streaming;
         self.composer_state = ComposerState::Sending;
-        self.turn_started_at = Some(std::time::Instant::now());
+        self.turn_started_at = Some(self.tick_count);
         self.turn_tool_count = 0;
         self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
         Some(next)
@@ -688,8 +686,8 @@ impl App {
             Msg::Tick => {
                 self.tick_count = self.tick_count.saturating_add(1);
                 // Flush streamed text at the 30 ms data cadence.
-                if self.coalescer.should_flush() {
-                    if let Some(text) = self.coalescer.flush() {
+                if self.coalescer.should_flush(self.tick_count) {
+                    if let Some(text) = self.coalescer.flush(self.tick_count) {
                         self.in_flight.push_str(&text);
                         self.dirty.set(DirtyFlags::TRANSCRIPT);
                     }
@@ -797,7 +795,7 @@ impl App {
                 // ResponseFinished follows the final TextDelta immediately, so
                 // the coalescer's 30 ms interval may not have elapsed. Drain it
                 // now or the final streamed chunk would be silently lost.
-                if let Some(text) = self.coalescer.flush() {
+                if let Some(text) = self.coalescer.flush(self.tick_count) {
                     self.in_flight.push_str(&text);
                 }
                 // Finalize the in-flight turn.
@@ -828,7 +826,7 @@ impl App {
                 let duration_ms = self
                     .turn_started_at
                     .take()
-                    .map(|t| t.elapsed().as_millis() as u64)
+                    .map(|start| self.tick_count.saturating_sub(start) * 16)
                     .unwrap_or(0);
                 self.turn_report = Some(TurnReport {
                     duration_ms,
@@ -870,7 +868,7 @@ impl App {
                     tool_name: name.clone(),
                     summary: summary.clone(),
                     outcome: None,
-                    started_at: Some(std::time::Instant::now()),
+                    started_at: Some(self.tick_count),
                 });
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
@@ -938,7 +936,7 @@ impl App {
                     self.tool_state = ToolState::Streaming;
                     self.turn_in_flight = true;
                     self.composer_state = ComposerState::Sending;
-                    self.turn_started_at = Some(std::time::Instant::now());
+                    self.turn_started_at = Some(self.tick_count);
                     self.turn_tool_count = 0;
                     // D5: a fresh turn starts its cost accumulator at 0 (a
                     // stale value would inflate the status display).
@@ -1174,7 +1172,7 @@ impl App {
                 // D7: the bridge rejected a chunk. Flush any coalesced text
                 // first so the chip lands after the surviving prose, then
                 // append the chip. The rejected text is never rendered.
-                if let Some(text) = self.coalescer.flush() {
+                if let Some(text) = self.coalescer.flush(self.tick_count) {
                     self.in_flight.push_str(&text);
                 }
                 self.transcript.push(TranscriptLine::Redacted(kind));
@@ -1213,7 +1211,7 @@ impl App {
                 // (same as the REPL /clear, which never resets turn state).
                 self.transcript.clear();
                 self.in_flight.clear();
-                self.coalescer.flush();
+                self.coalescer.flush(self.tick_count);
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
             Msg::ModelChanged(model) => {
@@ -1555,7 +1553,7 @@ mod tests {
         // text may be lost: it's in `in_flight` or still in the coalescer.
         app.reduce(Msg::Tick);
         if app.in_flight.is_empty() {
-            if let Some(text) = app.coalescer.flush() {
+            if let Some(text) = app.coalescer.flush(app.tick_count) {
                 app.in_flight.push_str(&text);
             }
         }
@@ -1805,7 +1803,7 @@ mod tests {
         app.transcript.push(TranscriptLine::User("hi".into()));
         app.reduce(Msg::TextDelta("hello!".into()));
         // Flush coalescer manually (bypass timing).
-        if let Some(text) = app.coalescer.flush() {
+        if let Some(text) = app.coalescer.flush(app.tick_count) {
             app.in_flight.push_str(&text);
         }
         app.reduce(Msg::ResponseFinished {

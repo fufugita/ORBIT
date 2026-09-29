@@ -266,7 +266,7 @@ fn golden_tool_card_running_vs_settled() {
         tool_name: "shell".into(),
         summary: "cargo test -p orbit-ledger".into(),
         outcome: None,
-        started_at: Some(std::time::Instant::now()),
+        started_at: Some(app.tick_count),
     });
     let buf = render_buf(&app, &d, 150, 44);
     let text = buf_text(&buf);

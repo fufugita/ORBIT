@@ -685,8 +685,10 @@ fn render_center_pane(
                 // 1.6s…), ticking while the call runs — the card itself
                 // carries the progress feel.
                 let running_meta = match started_at {
-                    Some(t) => {
-                        let secs = t.elapsed().as_millis() as f64 / 1000.0;
+                    Some(start_tick) => {
+                        // §16.1 seam: tick arithmetic, not Instant::elapsed.
+                        let ticks = app.tick_count.saturating_sub(*start_tick);
+                        let secs = (ticks * 16) as f64 / 1000.0;
                         format!("{secs:.1}s")
                     }
                     None => "running".to_string(),
