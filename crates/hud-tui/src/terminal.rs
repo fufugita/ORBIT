@@ -199,7 +199,13 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        execute!(std::io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen).ok();
+        execute!(
+            std::io::stdout(),
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )
+        .ok();
         disable_raw_mode().ok();
     }
 }

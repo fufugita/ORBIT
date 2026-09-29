@@ -6,7 +6,7 @@
 //! 2 cells (the EAW-Wide convention, DR-21 §5.1).
 
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+pub use unicode_width::UnicodeWidthStr;
 
 /// Display width of `s` in terminal cells, using EAW (East Asian Width)
 /// for CJK/Ambiguous and treating emoji sequences as 2 cells.
@@ -65,6 +65,31 @@ pub fn is_emoji(c: char) -> bool {
 /// Wrap `s` to `max_width` cells, breaking on grapheme boundaries.
 /// Never breaks inside a grapheme cluster (emoji ZWJ, skin tone, etc.),
 /// and never splits a single grapheme wider than the target.
+pub fn prev_grapheme_boundary(s: &str, byte_index: usize) -> usize {
+    let idx = byte_index.min(s.len());
+    s.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .chain(std::iter::once(s.len()))
+        .take_while(|&index| index <= idx)
+        .last()
+        .unwrap_or(0)
+}
+
+/// Return the next grapheme boundary at or after a byte index.
+pub fn next_grapheme_boundary(s: &str, byte_index: usize) -> usize {
+    s.grapheme_indices(true)
+        .map(|(index, grapheme)| index + grapheme.len())
+        .find(|&end| end > byte_index)
+        .unwrap_or(s.len())
+}
+
+/// Split at the nearest prior grapheme boundary.
+pub fn split_at_boundary(s: &str, byte_index: usize) -> (&str, &str) {
+    let index = prev_grapheme_boundary(s, byte_index.min(s.len()));
+    s.split_at(index)
+}
+
+/// Wrap `s` to `max_width` cells, breaking on grapheme boundaries.
 pub fn wrap_graphemes(s: &str, max_width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -84,57 +109,74 @@ pub fn wrap_graphemes(s: &str, max_width: usize) -> Vec<String> {
     out
 }
 
-/// Word-wrap variant: prefer breaking on whitespace, fall back to grapheme
-/// boundary when no whitespace fits.
+/// Word-wrap variant: greedy on spaces per PROMPT.md §7.4.
+///
+/// A line never starts with the spaces at a break, and spaces at the end of a
+/// broken line are dropped. A word longer than the line is hard-broken at the
+/// width on grapheme boundaries.
 pub fn wrap_words(s: &str, max_width: usize) -> Vec<String> {
-    // Split into words (whitespace-separated runs + single whitespace chars).
-    let mut out = Vec::new();
+    if max_width == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
     let mut line = String::new();
     let mut line_width = 0usize;
 
-    let mut words: Vec<&str> = Vec::new();
-    for w in s.split_inclusive(char::is_whitespace) {
-        words.push(w);
-    }
-
-    for word in words {
+    for word in s.split_whitespace() {
         let w = display_width(word);
-        if line_width + w > max_width && !line.is_empty() && !word.trim().is_empty() {
-            // Flush the current line only when the next word is non-space.
-            out.push(std::mem::take(&mut line));
-            line_width = 0;
-        }
-        // A single overlong token: hard-split on grapheme boundaries.
+        // A word longer than the line is hard-broken at the width.
         if w > max_width {
             if !line.is_empty() {
                 out.push(std::mem::take(&mut line));
                 line_width = 0;
             }
-            // Word itself with no internal spaces: wrap_graphemes handles it,
-            // but preserve the trailing whitespace separately.
-            for piece in wrap_graphemes(word.trim_end(), max_width) {
-                out.push(piece);
+            let mut pieces = wrap_graphemes(word, max_width);
+            if let Some(tail) = pieces.pop() {
+                line_width = display_width(&tail);
+                line = tail;
             }
-            let tail: String = word.chars().skip_while(|c| !c.is_whitespace()).collect();
-            if !tail.is_empty() {
-                line.push_str(&tail);
-                line_width += display_width(&tail);
-            }
+            out.extend(pieces);
             continue;
+        }
+        if line.is_empty() {
+            line.push_str(word);
+            line_width = w;
+            continue;
+        }
+        // The single separating space counts toward the line width.
+        if line_width + 1 + w > max_width {
+            out.push(std::mem::take(&mut line));
+            line_width = w;
+        } else {
+            line.push(' ');
+            line_width += 1;
         }
         line.push_str(word);
         line_width += w;
-        // If the line is now exactly full and the word ended in whitespace,
-        // flush eagerly.
-        if line_width >= max_width && word.ends_with(char::is_whitespace) {
-            out.push(std::mem::take(&mut line));
-            line_width = 0;
-        }
     }
     if !line.is_empty() {
         out.push(line);
     }
     out
+}
+
+/// Wrap plain text greedily by spaces and indent continuation lines.
+/// Styled spans are not represented by this string-only helper, so callers
+/// must preserve style at the span layer while wrapping each span sequence.
+pub fn wrap(s: &str, width: usize, indent: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let prefix = " ".repeat(indent.min(width.saturating_sub(1)));
+    let content_width = width.saturating_sub(prefix.len()).max(1);
+    let mut lines = wrap_words(s, content_width);
+    if lines.is_empty() {
+        return lines;
+    }
+    for line in lines.iter_mut().skip(1) {
+        *line = format!("{prefix}{line}");
+    }
+    lines
 }
 
 /// Truncate `s` to at most `max_width` cells, appending `…` (U+2026, 1 cell)
@@ -162,6 +204,51 @@ pub fn truncate_graphemes(s: &str, max_width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// End-truncate at a grapheme boundary, appending an ellipsis if needed.
+pub fn truncate_end(s: &str, max_width: usize) -> String {
+    truncate_graphemes(s, max_width)
+}
+
+/// Middle truncation per PROMPT.md §7.4: with `w` columns available, keep the
+/// last `ceil((w − 1) / 2)` clusters and the first `w − 1 − that` clusters,
+/// joined by `…`. Widths are measured in cells; a wide cluster that does not
+/// fit its side is dropped rather than split.
+pub fn truncate_middle(s: &str, max_width: usize) -> String {
+    if display_width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let tail_budget = (max_width - 1).div_ceil(2);
+    let head_budget = max_width - 1 - tail_budget;
+    let clusters: Vec<&str> = s.graphemes(true).collect();
+    let mut head = String::new();
+    let mut head_width = 0;
+    for cluster in clusters.iter().take(head_budget) {
+        let width = grapheme_width(cluster);
+        if head_width + width > head_budget {
+            break;
+        }
+        head.push_str(cluster);
+        head_width += width;
+    }
+    let mut tail = String::new();
+    let mut tail_width = 0;
+    for cluster in clusters.iter().rev().take(tail_budget) {
+        let width = grapheme_width(cluster);
+        if tail_width + width > tail_budget {
+            break;
+        }
+        tail.insert_str(0, cluster);
+        tail_width += width;
+    }
+    format!("{head}…{tail}")
 }
 
 /// Truncate `s` to at most `max_width` cells, KEEPING the tail and
@@ -223,6 +310,32 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn grapheme_boundary_helpers_preserve_clusters() {
+        let text = "á界";
+        assert_eq!(prev_grapheme_boundary(text, 2), 0);
+        assert_eq!(next_grapheme_boundary(text, 1), 3);
+        assert_eq!(split_at_boundary(text, 2), ("", text));
+        assert_eq!(split_at_boundary(text, 3), ("á", "界"));
+    }
+
+    #[test]
+    fn truncation_helpers_obey_width() {
+        assert_eq!(truncate_end("abcdef", 4), "abc…");
+        // Head and tail each get (w-1) cells split as ceil/floor: 3+1+3.
+        assert_eq!(truncate_middle("abcdefghij", 7), "abc…hij");
+        assert!(display_width(&truncate_middle("日本語の題名", 5)) <= 5);
+    }
+
+    #[test]
+    fn wrap_drops_spaces_and_indents_continuations() {
+        assert_eq!(
+            wrap("alpha beta gamma", 8, 2),
+            vec!["alpha", "  beta", "  gamma"]
+        );
+        assert_eq!(wrap("  alpha   beta  ", 8, 0), vec!["alpha", "beta"]);
+    }
 
     #[test]
     fn ascii_width_one() {

@@ -36,9 +36,7 @@ pub fn transcript_lines(app: &App, now: &str) -> Vec<String> {
                 }
             }
             TranscriptLine::Stripped {
-                tool_name,
-                summary,
-                ..
+                tool_name, summary, ..
             } => {
                 if summary.is_empty() {
                     out.push(format!("{now} tool {tool_name}: ran"));

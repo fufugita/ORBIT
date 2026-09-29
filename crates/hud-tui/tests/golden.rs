@@ -22,8 +22,8 @@
 
 use orbit_hud_tui::render::render;
 use orbit_hud_tui::state::{
-    App, ComposerState, ConnectionState, Finding, Focus, LeftTab, LogoPhase, PendingApproval,
-    Task, TaskState, Toast, ToastKind, ToolState, TranscriptLine,
+    App, ComposerState, ConnectionState, Finding, Focus, LeftTab, LogoPhase, PendingApproval, Task,
+    TaskState, Toast, ToastKind, ToolState, TranscriptLine,
 };
 use orbit_hud_tui::tokens::{Design, GlyphSet, Theme};
 
@@ -155,13 +155,29 @@ fn preview_dump() {
     let mut wf = working_app();
     wf.workspace.phase_index = 2;
     wf.workspace.plan = vec![
-        Task { title: "Read the auth middleware".into(), state: TaskState::Done, sub: None, evidence: 2 },
-        Task { title: "Trace the token refresh path".into(), state: TaskState::Active, sub: Some("following refresh_token".into()), evidence: 0 },
-        Task { title: "Patch the race window".into(), state: TaskState::Blocked, sub: Some("awaiting approval".into()), evidence: 0 },
+        Task {
+            title: "Read the auth middleware".into(),
+            state: TaskState::Done,
+            sub: None,
+            evidence: 2,
+        },
+        Task {
+            title: "Trace the token refresh path".into(),
+            state: TaskState::Active,
+            sub: Some("following refresh_token".into()),
+            evidence: 0,
+        },
+        Task {
+            title: "Patch the race window".into(),
+            state: TaskState::Blocked,
+            sub: Some("awaiting approval".into()),
+            evidence: 0,
+        },
     ];
-    wf.workspace.findings = vec![
-        Finding { title: "Refresh tokens not single-use".into(), source: Some("auth/refresh.rs:88".into()) },
-    ];
+    wf.workspace.findings = vec![Finding {
+        title: "Refresh tokens not single-use".into(),
+        source: Some("auth/refresh.rs:88".into()),
+    }];
     let buf = render_buf(&wf, &design(), 150, 44);
     std::fs::write("/tmp/preview-workspace.txt", buf_text(&buf)).unwrap();
 }
@@ -175,7 +191,10 @@ fn golden_idle_wide_150x44() {
     assert!(text.contains("Workspace"), "right rail header");
     assert!(text.contains("What is 2*(3+4)?"), "user turn");
     assert!(text.contains("Result"), "assistant markdown heading");
-    assert!(text.contains("Ask ORBIT, or / for commands"), "composer prompt");
+    assert!(
+        text.contains("Ask ORBIT, or / for commands"),
+        "composer prompt"
+    );
     assert!(text.contains("online"), "status line connection");
     assert!(text.contains("$0.002500"), "status line cost");
     // Chrome budget: the header row + status line = 2 rows of chrome.
@@ -255,8 +274,14 @@ fn golden_tool_card_running_vs_settled() {
     // settled cards show none.
     assert!(text.contains("0.0s"), "running card ticks its duration");
     // Both cards render with their arguments (tail-truncated).
-    assert!(text.contains("cargo test -p orbit-export"), "settled card arg");
-    assert!(text.contains("cargo test -p orbit-ledger"), "running card arg");
+    assert!(
+        text.contains("cargo test -p orbit-export"),
+        "settled card arg"
+    );
+    assert!(
+        text.contains("cargo test -p orbit-ledger"),
+        "running card arg"
+    );
 }
 
 /// A failed tool call settles to ✕ red with "failed" meta (§6.5).
@@ -591,7 +616,10 @@ fn invariant_single_moving_cell() {
             "cell ({x},{y}) changed outside the motion zones"
         );
     }
-    assert!(!diff.is_empty(), "the spinner should advance between frames");
+    assert!(
+        !diff.is_empty(),
+        "the spinner should advance between frames"
+    );
     assert!(
         diff.len() <= 12,
         "only the spinner + duration cells may change; {} cells did",

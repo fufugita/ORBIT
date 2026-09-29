@@ -170,7 +170,12 @@ pub fn hit_test(
 ) -> Option<(Focus, u16, u16)> {
     let in_inner = |r: ratatui::layout::Rect| -> Option<(u16, u16)> {
         // Inner rect: skip the 1-cell border on each side.
-        let (x, y, w, h) = (r.x + 1, r.y + 1, r.width.saturating_sub(2), r.height.saturating_sub(2));
+        let (x, y, w, h) = (
+            r.x + 1,
+            r.y + 1,
+            r.width.saturating_sub(2),
+            r.height.saturating_sub(2),
+        );
         if w == 0 || h == 0 {
             return None;
         }
@@ -235,9 +240,15 @@ mod tests {
         let center = Rect::new(25, 0, 60, 30);
         let right = Rect::new(86, 0, 40, 30);
         // Inside the left pane's content.
-        assert_eq!(hit_test(5, 5, Some(left), center, Some(right)), Some((Focus::Left, 4, 4)));
+        assert_eq!(
+            hit_test(5, 5, Some(left), center, Some(right)),
+            Some((Focus::Left, 4, 4))
+        );
         // Inside the center.
-        assert_eq!(hit_test(5, 50, Some(left), center, Some(right)), Some((Focus::Center, 4, 24)));
+        assert_eq!(
+            hit_test(5, 50, Some(left), center, Some(right)),
+            Some((Focus::Center, 4, 24))
+        );
         // On the left pane's border (col 0) — no pane.
         assert_eq!(hit_test(5, 0, Some(left), center, Some(right)), None);
         // In the gap between panes — no pane.

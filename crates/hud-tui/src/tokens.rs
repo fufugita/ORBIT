@@ -47,16 +47,19 @@ impl Ord for ColorTier {
 }
 
 impl ColorTier {
-    /// Detect from the environment, most specific first.
+    /// Detect from the environment, most specific first (§12.1).
     pub fn detect(env: &dyn Fn(&str) -> Option<String>) -> Self {
         if env("NO_COLOR").is_some() {
             return Self::Mono;
         }
         if let Some(ct) = env("COLORTERM") {
             let ct = ct.to_ascii_lowercase();
-            if ct.contains("truecolor") || ct.contains("24bit") {
+            if ct == "truecolor" || ct == "24bit" {
                 return Self::TrueColor;
             }
+        }
+        if env("WT_SESSION").is_some() {
+            return Self::TrueColor;
         }
         if let Some(term) = env("TERM") {
             if term.contains("256color") {
@@ -395,10 +398,10 @@ impl Default for LayoutConfig {
 pub struct CapabilitiesConfig {
     /// "auto" | "truecolor" | "256" | "16" | "mono"
     pub mode: String,
-    /// "unicode" | "ascii"
+    /// "auto" | "unicode" | "ascii"
     pub glyphs: String,
     pub reduced: bool,
-    /// "full" | "static" | "text"
+    /// "off" | "text" | "static" | "anim"
     pub brand: String,
     pub bell_on_approval: bool,
 }
@@ -407,9 +410,9 @@ impl Default for CapabilitiesConfig {
     fn default() -> Self {
         Self {
             mode: "auto".into(),
-            glyphs: "unicode".into(),
+            glyphs: "auto".into(),
             reduced: false,
-            brand: "full".into(),
+            brand: "anim".into(),
             bell_on_approval: false,
         }
     }
@@ -732,9 +735,9 @@ magenta = "#FF00FF"
     fn capabilities_default_auto() {
         let c = CapabilitiesConfig::default();
         assert_eq!(c.mode, "auto");
-        assert_eq!(c.glyphs, "unicode");
+        assert_eq!(c.glyphs, "auto");
         assert!(!c.reduced);
-        assert_eq!(c.brand, "full");
+        assert_eq!(c.brand, "anim");
         assert!(!c.bell_on_approval);
     }
 }
@@ -752,9 +755,36 @@ pub enum GlyphSet {
 /// Brand tier (§8): full (animated star) | static | text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrandTier {
-    Full,
+    Anim,
     Static,
     Text,
+    Off,
+}
+
+impl BrandTier {
+    fn degrade(self, floor: Self) -> Self {
+        self.max(floor)
+    }
+}
+
+impl PartialOrd for BrandTier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BrandTier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn rank(tier: &BrandTier) -> u8 {
+            match tier {
+                BrandTier::Anim => 0,
+                BrandTier::Static => 1,
+                BrandTier::Text => 2,
+                BrandTier::Off => 3,
+            }
+        }
+        rank(self).cmp(&rank(other))
+    }
 }
 
 /// All display capabilities, resolved ONCE at startup from environment +
@@ -765,6 +795,7 @@ pub struct Capabilities {
     pub glyphs: GlyphSet,
     pub brand: BrandTier,
     pub reduced_motion: bool,
+    pub ambiguous_wide: bool,
 }
 
 /// The complete design context the renderer consumes: the palette resolved
@@ -788,38 +819,59 @@ impl Design {
     /// tests. Order (§3.7): tui.toml override > NO_COLOR > COLORTERM > TERM.
     pub fn resolve(theme: &Theme, env: &dyn Fn(&str) -> Option<String>) -> Self {
         let mut color = ColorTier::detect(env);
+        // §12.1: config can only lower the detected tier. NO_COLOR is sticky.
+        let no_color = env("NO_COLOR").is_some();
         match theme.capabilities.mode.as_str() {
-            "truecolor" => color = ColorTier::TrueColor,
-            "256" => color = ColorTier::T256,
-            "16" => color = ColorTier::Ansi16,
+            "truecolor" if color == ColorTier::TrueColor => {}
+            "256" if color >= ColorTier::T256 => color = ColorTier::T256,
+            "16" if color >= ColorTier::Ansi16 => color = ColorTier::Ansi16,
             "mono" => color = ColorTier::Mono,
+            "truecolor" | "256" | "16" => {}
             _ => {} // "auto"
         }
-        let glyphs = match theme.capabilities.glyphs.as_str() {
+        if no_color {
+            color = ColorTier::Mono;
+        }
+        // §12.2: the first non-empty LC_ALL/LC_CTYPE/LANG decides UTF-8.
+        // A non-UTF-8 locale is a hard downgrade no config can override.
+        // No locale vars at all → assume UTF-8 (the modern default); Windows
+        // Terminal reports no vars either, so WT_SESSION also implies UTF-8.
+        let locale_utf8 = [env("LC_ALL"), env("LC_CTYPE"), env("LANG")]
+            .into_iter()
+            .flatten()
+            .find(|value| !value.is_empty())
+            .map(|value| {
+                let lower = value.to_ascii_lowercase();
+                lower.contains("utf-8") || lower.contains("utf8")
+            })
+            .unwrap_or(true);
+        let requested_glyphs = match theme.capabilities.glyphs.as_str() {
             "ascii" => GlyphSet::Ascii,
-            "unicode" => GlyphSet::Unicode,
-            // "auto" (and any unknown value): detect the locale — a
-            // non-UTF-8 locale cannot render the unicode set (§11.3).
-            _ => {
-                let utf8 = env("LANG")
-                    .or_else(|| env("LC_ALL"))
-                    .or_else(|| env("LC_CTYPE"))
-                    .map(|v| v.to_ascii_lowercase().contains("utf-8"))
-                    .unwrap_or(true);
-                if utf8 {
-                    GlyphSet::Unicode
-                } else {
-                    GlyphSet::Ascii
-                }
-            }
+            _ => GlyphSet::Unicode,
         };
-        let brand = match theme.capabilities.brand.as_str() {
+        let auto_glyphs = theme.capabilities.glyphs == "auto";
+        let probe_required = locale_utf8 && auto_glyphs;
+        let ambiguous_wide = probe_required && crate::terminal::probe_ambiguous_width();
+        let glyphs = if !locale_utf8 || requested_glyphs == GlyphSet::Ascii || ambiguous_wide {
+            GlyphSet::Ascii
+        } else {
+            GlyphSet::Unicode
+        };
+        let reduced_motion =
+            theme.capabilities.reduced || env("ORBIT_REDUCED_MOTION").as_deref() == Some("1");
+        let configured_brand = match theme.capabilities.brand.as_str() {
+            "anim" => BrandTier::Anim,
             "static" => BrandTier::Static,
             "text" => BrandTier::Text,
-            _ => BrandTier::Full,
+            _ => BrandTier::Off,
         };
-        let reduced_motion = theme.capabilities.reduced;
-
+        let mut brand = configured_brand;
+        if no_color || glyphs == GlyphSet::Ascii {
+            brand = brand.degrade(BrandTier::Text);
+        }
+        if reduced_motion {
+            brand = brand.degrade(BrandTier::Static);
+        }
         let (palette, notices) = theme.palette();
         Design {
             palette: palette.resolve(color),
@@ -828,6 +880,7 @@ impl Design {
                 glyphs,
                 brand,
                 reduced_motion,
+                ambiguous_wide,
             },
             layout_rails: (theme.layout.rail_left, theme.layout.rail_right),
             layout_measure: theme.layout.measure,
@@ -845,13 +898,12 @@ mod capability_tests {
     }
 
     #[test]
-    fn design_resolves_full_by_default() {
+    fn design_resolves_anim_by_default() {
         let theme = Theme::default();
-        // default env (no COLORTERM/TERM) → Ansi16 floor, unicode, full brand
         let d = Design::resolve(&theme, &no_env);
         assert_eq!(d.caps.color, ColorTier::Ansi16);
         assert_eq!(d.caps.glyphs, GlyphSet::Unicode);
-        assert_eq!(d.caps.brand, BrandTier::Full);
+        assert_eq!(d.caps.brand, BrandTier::Anim);
         assert!(!d.caps.reduced_motion);
         assert!(d.notices.is_empty());
     }

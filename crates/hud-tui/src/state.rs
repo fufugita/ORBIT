@@ -199,9 +199,7 @@ impl App {
                     | crate::state::TranscriptLine::Assistant(t)
                     | crate::state::TranscriptLine::System(t) => t.clone(),
                     crate::state::TranscriptLine::Stripped {
-                        tool_name,
-                        summary,
-                        ..
+                        tool_name, summary, ..
                     } => {
                         if summary.is_empty() {
                             format!("[tool] {tool_name}")
@@ -408,10 +406,6 @@ pub struct App {
     pub last_ctrl_c_tick: u64,
     /// Quit confirmation message (shown when ctrl_c_count == 1).
     pub quit_confirmation: bool,
-    /// Cost flash frames (counts down from 8 when cost changes).
-    pub cost_flash_frames: u8,
-    /// Reconnecting spinner phase (0..3).
-    pub reconnect_phase: u8,
     /// Copy mode flag — when true, TUI exits alt screen for plain text copy.
     pub copy_mode: bool,
     /// Logo phase (DR-21 L19): splash → steady → working → shutdown.
@@ -433,11 +427,8 @@ pub struct App {
     pub toast: Option<crate::state::Toast>,
     /// Tick counter when the toast was emitted (used for the 3-s timer).
     pub toast_emitted_at: Option<u64>,
-    /// Frames spent in the current logo phase (drives phase transitions).
     /// Composer state (DR-21 §3.4) — left glyph + border color.
     pub composer_state: ComposerState,
-    /// Composer send animation phase (0..3 for ↗↘↗).
-    pub composer_send_phase: u8,
     /// Queued prompts: typed while a turn is in flight. Drained one at a
     /// time when a turn ends (ResponseFinished or CancelTurn). Rendered as
     /// dimmed `⏳` lines above the composer.
@@ -568,8 +559,6 @@ impl App {
             ctrl_c_count: 0,
             last_ctrl_c_tick: 0,
             quit_confirmation: false,
-            cost_flash_frames: 0,
-            reconnect_phase: 0,
             copy_mode: false,
             logo_phase: LogoPhase::Splash,
             startup_frame: 0,
@@ -581,7 +570,6 @@ impl App {
             toast: None,
             toast_emitted_at: None,
             composer_state: ComposerState::Idle,
-            composer_send_phase: 0,
             queued: Vec::new(),
             turn_in_flight: false,
             cancel_requested: false,
@@ -652,14 +640,12 @@ impl App {
                 }
                 // §8.3 startup: the splash reveals at 4 fps (every 15 ticks
                 // ≈ 250 ms), 6 frames total, then settles to Steady.
-                if self.logo_phase == LogoPhase::Splash {
-                    if self.tick_count.is_multiple_of(15) {
-                        if self.startup_frame < 5 {
-                            self.startup_frame += 1;
-                            self.dirty.set(DirtyFlags::TRANSCRIPT);
-                        } else {
-                            self.logo_phase = LogoPhase::Steady;
-                        }
+                if self.logo_phase == LogoPhase::Splash && self.tick_count.is_multiple_of(15) {
+                    if self.startup_frame < 5 {
+                        self.startup_frame += 1;
+                        self.dirty.set(DirtyFlags::TRANSCRIPT);
+                    } else {
+                        self.logo_phase = LogoPhase::Steady;
                     }
                 }
                 // Working star (§7): the 4 Hz clock sets LOGO only while
@@ -687,14 +673,10 @@ impl App {
                 // The renderer indexes its frame set modulo that set's length,
                 // so a single 0..10 counter drives both the 10-frame braille
                 // cycle and the 4-frame ASCII quadrants.
-                let busy = working
-                    || self.connection == ConnectionState::Reconnecting;
+                let busy = working || self.connection == ConnectionState::Reconnecting;
                 // Reduced motion (tui.toml `reduced = true`): the spinner
                 // holds frame 0 — a still glyph, no cycling.
-                if busy
-                    && !self.reduced_motion
-                    && self.tick_count.is_multiple_of(6)
-                {
+                if busy && !self.reduced_motion && self.tick_count.is_multiple_of(6) {
                     self.spinner_frame = (self.spinner_frame + 1) % 10;
                     self.dirty.set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
                 }
@@ -713,31 +695,14 @@ impl App {
                 {
                     self.dirty.set(DirtyFlags::TRANSCRIPT);
                 }
-                // Reconnecting star: rotate while reconnecting (§4.3 ↻).
-                if self.connection == ConnectionState::Reconnecting
-                    && self.tick_count.is_multiple_of(24)
-                {
-                    self.reconnect_phase = (self.reconnect_phase + 1) % 3;
-                    self.dirty.set(DirtyFlags::STATUS);
-                }
-                // Composer send animation: ↗↘↗ (3 frames, ~375ms per frame).
-                if self.composer_state == ComposerState::Sending
-                    && self.tick_count.is_multiple_of(24)
-                {
-                    self.composer_send_phase = (self.composer_send_phase + 1) % 3;
-                    self.dirty.set(DirtyFlags::STATUS);
-                }
-                // Composer returns to Idle when the stream finishes.
+                // Composer returns to Idle when the stream finishes. (The
+                // composer never animates — §10 — so Sending is a state,
+                // not a frame counter.)
                 if self.tool_state != ToolState::Streaming
                     && !matches!(self.tool_state, ToolState::Running(_))
                     && self.composer_state == ComposerState::Sending
                 {
                     self.composer_state = ComposerState::Idle;
-                    self.dirty.set(DirtyFlags::STATUS);
-                }
-                // Cost flash: count down.
-                if self.cost_flash_frames > 0 {
-                    self.cost_flash_frames = self.cost_flash_frames.saturating_sub(1);
                     self.dirty.set(DirtyFlags::STATUS);
                 }
             }
@@ -813,7 +778,6 @@ impl App {
                 }
                 self.tool_state = ToolState::Idle;
                 self.composer_state = ComposerState::Idle;
-                self.composer_send_phase = 0;
                 self.turn_in_flight = false;
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
@@ -867,7 +831,8 @@ impl App {
                 } else {
                     format!("tool {name}: error")
                 };
-                self.dirty.set(DirtyFlags::APPROVAL | DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
+                self.dirty
+                    .set(DirtyFlags::APPROVAL | DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
             }
             Msg::BackendError(err) => {
                 self.last_error = Some(err.clone());
@@ -892,7 +857,6 @@ impl App {
                     self.tool_state = ToolState::Streaming;
                     self.turn_in_flight = true;
                     self.composer_state = ComposerState::Sending;
-                    self.composer_send_phase = 0;
                     self.turn_started_at = Some(std::time::Instant::now());
                     self.turn_tool_count = 0;
                     self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
@@ -1299,11 +1263,17 @@ mod tests {
     #[test]
     fn per_pane_scroll_is_isolated() {
         let mut app = App::default();
-        app.reduce(Msg::PaneScroll { pane: Focus::Left, delta: 5 });
+        app.reduce(Msg::PaneScroll {
+            pane: Focus::Left,
+            delta: 5,
+        });
         assert_eq!(app.pane_scroll[0], 5, "left pane scrolled");
         assert_eq!(app.pane_scroll[1], 0, "center untouched");
         assert_eq!(app.pane_scroll[2], 0, "right untouched");
-        app.reduce(Msg::PaneScroll { pane: Focus::Right, delta: 3 });
+        app.reduce(Msg::PaneScroll {
+            pane: Focus::Right,
+            delta: 3,
+        });
         assert_eq!(app.pane_scroll[0], 5, "left still 5");
         assert_eq!(app.pane_scroll[2], 3, "right scrolled");
     }
@@ -1311,7 +1281,10 @@ mod tests {
     #[test]
     fn scroll_clamps_at_top() {
         let mut app = App::default();
-        app.reduce(Msg::PaneScroll { pane: Focus::Center, delta: -10 });
+        app.reduce(Msg::PaneScroll {
+            pane: Focus::Center,
+            delta: -10,
+        });
         assert_eq!(app.pane_scroll[1], 0, "cannot scroll above the top");
     }
 

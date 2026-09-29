@@ -222,7 +222,7 @@ impl Glyphs {
             sep: "|",
             working_star: &["-", "\\", "|", "/"],
             working_star_ascii: &["-", "\\", "|", "/"],
-                        working_braille: &["-", "\\", "|", "/", "\\", "-", "/", "|", "-", "\\"],
+            working_braille: &["-", "\\", "|", "/", "\\", "-", "/", "|", "-", "\\"],
             rule: "-",
             rule_focus: "=",
             divider: "|",
@@ -253,12 +253,24 @@ impl Glyphs {
     }
 
     /// The four-frame working-star sequence for this glyph set.
-    pub fn corner_tl(&self) -> &'static str { self.border_tl }
-    pub fn corner_tr(&self) -> &'static str { self.border_tr }
-    pub fn corner_bl(&self) -> &'static str { self.border_bl }
-    pub fn corner_br(&self) -> &'static str { self.border_br }
-    pub fn border_h(&self) -> &'static str { self.border_h }
-    pub fn border_v(&self) -> &'static str { self.border_v }
+    pub fn corner_tl(&self) -> &'static str {
+        self.border_tl
+    }
+    pub fn corner_tr(&self) -> &'static str {
+        self.border_tr
+    }
+    pub fn corner_bl(&self) -> &'static str {
+        self.border_bl
+    }
+    pub fn corner_br(&self) -> &'static str {
+        self.border_br
+    }
+    pub fn border_h(&self) -> &'static str {
+        self.border_h
+    }
+    pub fn border_v(&self) -> &'static str {
+        self.border_v
+    }
     pub fn working(&self) -> &'static [&'static str; 4] {
         match self.set {
             GlyphSet::Unicode => self.working_star,

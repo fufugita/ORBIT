@@ -102,13 +102,24 @@ pub enum Msg {
     /// Input mode changed (insert ↔ normal).
     InputModeChanged(crate::state::InputMode),
     /// Scroll the focused pane by delta lines (positive = down).
-    PaneScroll { pane: crate::state::Focus, delta: i32 },
+    PaneScroll {
+        pane: crate::state::Focus,
+        delta: i32,
+    },
     /// Toggle zoom on a pane (herdr-style fullscreen).
     ZoomToggle(crate::state::Focus),
     /// Anchor a per-pane selection at (row, col).
-    SelectionAnchor { pane: crate::state::Focus, row: u16, col: u16 },
+    SelectionAnchor {
+        pane: crate::state::Focus,
+        row: u16,
+        col: u16,
+    },
     /// Extend the active selection (clamped to its pane).
-    SelectionExtend { pane: crate::state::Focus, row: u16, col: u16 },
+    SelectionExtend {
+        pane: crate::state::Focus,
+        row: u16,
+        col: u16,
+    },
     /// Finalize the selection on mouse-up (copies via OSC 52).
     SelectionFinish,
     /// Clear the selection.
@@ -119,7 +130,10 @@ pub enum Msg {
     /// §8.3: skip the startup reveal to the final frame.
     SplashSkip,
     /// §6.12: show a toast (3 s or until the next keypress).
-    ToastShow { text: String, kind: crate::state::ToastKind },
+    ToastShow {
+        text: String,
+        kind: crate::state::ToastKind,
+    },
     /// §6.12: dismiss the toast (any keypress).
     ToastDismiss,
     /// §6.16: toggle the help overlay.

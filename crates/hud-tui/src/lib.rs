@@ -16,12 +16,12 @@ pub mod bridge;
 pub mod bus;
 mod coalesce;
 pub mod glyphs;
-pub mod selection;
 pub mod input;
 pub mod msg;
 pub mod plain;
 pub mod render;
 mod rich;
+pub mod selection;
 pub mod state;
 mod terminal;
 pub mod tokens;
@@ -475,15 +475,20 @@ fn hhmm_now() -> String {
 /// native text selection.
 fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(), String> {
     use crossterm::cursor::{Hide, Show};
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::execute;
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 
     // Exit alt screen + raw mode.
     disable_raw_mode().map_err(|e| format!("disable_raw_mode: {e}"))?;
-    execute!(std::io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen)
-        .map_err(|e| format!("leave alt screen: {e}"))?;
+    execute!(
+        std::io::stdout(),
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .map_err(|e| format!("leave alt screen: {e}"))?;
 
     // Instructions FIRST — everything below this point is pure transcript
     // text, so a drag-selection captures only message content (no prefixes,
@@ -516,8 +521,13 @@ fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(),
     // Mouse capture (SGR mode): the app owns the mouse so selection can
     // be per-pane (the host terminal's native selection grabs across
     // pane borders — it doesn't know they exist).
-    execute!(std::io::stdout(), EnterAlternateScreen, Hide, EnableMouseCapture)
-        .map_err(|e| format!("enter alt screen: {e}"))?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        Hide,
+        EnableMouseCapture
+    )
+    .map_err(|e| format!("enter alt screen: {e}"))?;
 
     // Force the terminal to redraw.
     let _ = guard.terminal.clear();
@@ -595,11 +605,7 @@ fn composer_wants_char(key: &KeyEvent, app: &App) -> bool {
 ///
 /// Clicks on borders/gaps hit no pane and are ignored — the borders are
 /// the isolation boundary.
-fn handle_mouse(
-    me: crossterm::event::MouseEvent,
-    sender: &BusSender,
-    app: &App,
-) {
+fn handle_mouse(me: crossterm::event::MouseEvent, sender: &BusSender, app: &App) {
     use crossterm::event::MouseEventKind;
 
     let rects = &app.pane_rects;
@@ -615,10 +621,7 @@ fn handle_mouse(
     // selection takes over (the universal terminal convention: Shift
     // suspends mouse reporting for that gesture). This is the escape
     // hatch for whole-screen selection when the operator wants it.
-    if me
-        .modifiers
-        .contains(crossterm::event::KeyModifiers::SHIFT)
-    {
+    if me.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
         return;
     }
 

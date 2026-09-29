@@ -63,7 +63,9 @@ fn draw_header_band(
     let (band, title_style) = if focused {
         let mut chip = Style::default().fg(p.bg).bg(p.magenta);
         if d.caps.color == crate::tokens::ColorTier::Mono {
-            chip = Style::default().fg(p.magenta).add_modifier(Modifier::REVERSED);
+            chip = Style::default()
+                .fg(p.magenta)
+                .add_modifier(Modifier::REVERSED);
         }
         (p.magenta_dim, chip.add_modifier(Modifier::BOLD))
     } else {
@@ -79,7 +81,8 @@ fn draw_header_band(
         };
         let cell_color = blend_color(band, p.bg, t);
         let cell = &mut buf[(area.x + x, area.y)];
-        cell.set_symbol(" ").set_style(Style::default().bg(cell_color));
+        cell.set_symbol(" ")
+            .set_style(Style::default().bg(cell_color));
     }
     // The title chip rides the band's left edge.
     let title_text = format!(" {title} ");
@@ -122,7 +125,10 @@ fn keycap(key: &str, p: &crate::tokens::ResolvedPalette, mono: bool) -> Span<'st
     if mono {
         Span::styled(format!(" [{key}] "), Style::default().fg(p.muted))
     } else {
-        Span::styled(format!(" {key} "), Style::default().fg(p.ink2).bg(p.surface2))
+        Span::styled(
+            format!(" {key} "),
+            Style::default().fg(p.ink2).bg(p.surface2),
+        )
     }
 }
 
@@ -161,7 +167,7 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     let (left_w, right_w) = if total >= 120 {
         (d.layout_rails.0, d.layout_rails.1)
     } else if total >= 100 {
-        (d.layout_rails.0, (total - d.layout_rails.0 - 44).max(0))
+        (d.layout_rails.0, total - d.layout_rails.0 - 44)
     } else if total >= 80 {
         (18, 22)
     } else {
@@ -185,11 +191,17 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     // Pane slots depend on which rails are present.
     // Record the pane rects for the mouse hit-test (interior mutability —
     // the renderer sees &App).
-    app.pane_rects.left.set(if left_w > 0 { Some(main[0]) } else { None });
-    app.pane_rects.center.set(Some(main[if left_w > 0 { 2 } else { 0 }]));
     app.pane_rects
-        .right
-        .set(if right_w > 0 { Some(main[main.len() - 1]) } else { None });
+        .left
+        .set(if left_w > 0 { Some(main[0]) } else { None });
+    app.pane_rects
+        .center
+        .set(Some(main[if left_w > 0 { 2 } else { 0 }]));
+    app.pane_rects.right.set(if right_w > 0 {
+        Some(main[main.len() - 1])
+    } else {
+        None
+    });
 
     // Zoom: the zoomed pane fills the whole surface, framed (Z is an
     // explicit "give me this pane big" — a frame is honest there).
@@ -252,11 +264,7 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
                         if sel.contains(row, col) {
                             let cell = &mut buf[(inner.x + col, inner.y + row)];
                             let fg = cell.style().fg.unwrap_or(d.palette.ink);
-                            cell.set_style(
-                                Style::default()
-                                    .fg(fg)
-                                    .bg(d.palette.magenta_dim),
-                            );
+                            cell.set_style(Style::default().fg(fg).bg(d.palette.magenta_dim));
                         }
                     }
                 }
@@ -379,10 +387,7 @@ fn render_left_pane(
             lines.push(section_label("USAGE", p));
             lines.push(Line::from(vec![
                 Span::styled("turns ", Style::default().fg(p.muted)),
-                Span::styled(
-                    app.total_turns.to_string(),
-                    Style::default().fg(p.ink2),
-                ),
+                Span::styled(app.total_turns.to_string(), Style::default().fg(p.ink2)),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("in    ", Style::default().fg(p.muted)),
@@ -413,10 +418,7 @@ fn render_left_pane(
                 for (i, q) in app.queued.iter().enumerate() {
                     let shown: String = q.chars().take(body.width as usize - 4).collect();
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{} ", i + 1),
-                            Style::default().fg(p.faint),
-                        ),
+                        Span::styled(format!("{} ", i + 1), Style::default().fg(p.faint)),
                         Span::styled(shown, Style::default().fg(p.ink2)),
                     ]));
                 }
@@ -457,10 +459,7 @@ fn render_left_pane(
                     row.push(ch);
                 }
                 if !row.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        row,
-                        Style::default().fg(p.ink2),
-                    )));
+                    lines.push(Line::from(Span::styled(row, Style::default().fg(p.ink2))));
                 }
             }
         }
@@ -572,10 +571,8 @@ fn render_center_pane(
                 if r < mark.len() {
                     let line = &mut mark[r];
                     if let Some(spot_span) = line.spans.get_mut(c) {
-                        let styled = Span::styled(
-                            "·".to_string(),
-                            Style::default().fg(p.magenta_dim),
-                        );
+                        let styled =
+                            Span::styled("·".to_string(), Style::default().fg(p.magenta_dim));
                         *spot_span = styled;
                     }
                 }
@@ -981,10 +978,7 @@ fn render_right_pane(
             "Phases: orient → reason → act →",
             "verify → respond",
         ] {
-            lines.push(Line::from(Span::styled(
-                text,
-                Style::default().fg(p.faint),
-            )));
+            lines.push(Line::from(Span::styled(text, Style::default().fg(p.faint))));
         }
     } else {
         // ── Phase stepper (§6.10) ──────────────────────────────────────────
@@ -1282,13 +1276,16 @@ fn render_header_row(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         ConnectionState::Reconnecting => (g.conn_retrying, p.amber),
         ConnectionState::Offline => (g.conn_offline, p.red),
     };
-    let sep = Span::styled(
-        format!("  {}  ", g.sep),
-        Style::default().fg(p.faint),
-    );
+    let sep = Span::styled(format!("  {}  ", g.sep), Style::default().fg(p.faint));
     let left = vec![
-        Span::styled(g.orbit, Style::default().fg(p.magenta).add_modifier(Modifier::BOLD)),
-        Span::styled(" ORBIT", Style::default().fg(p.ink2).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            g.orbit,
+            Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ORBIT",
+            Style::default().fg(p.ink2).add_modifier(Modifier::BOLD),
+        ),
         sep.clone(),
         Span::styled(&app.model, Style::default().fg(p.ink)),
         sep.clone(),
@@ -1298,8 +1295,14 @@ fn render_header_row(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         Span::styled(conn.0, Style::default().fg(conn.1)),
         Span::styled("  ? keys", Style::default().fg(p.faint)),
     ];
-    let left_w: usize = left.iter().map(|s| crate::unicode::display_width(&s.to_string())).sum();
-    let right_w: usize = right.iter().map(|s| crate::unicode::display_width(&s.to_string())).sum();
+    let left_w: usize = left
+        .iter()
+        .map(|s| crate::unicode::display_width(&s.to_string()))
+        .sum();
+    let right_w: usize = right
+        .iter()
+        .map(|s| crate::unicode::display_width(&s.to_string()))
+        .sum();
     let gap = (area.width as usize).saturating_sub(left_w + right_w);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(gap)));
@@ -1482,7 +1485,10 @@ fn overlay_block(title: &str, fill: Color, p: &crate::tokens::ResolvedPalette) -
         .style(Style::default().bg(fill))
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(p.bg).bg(p.magenta).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(p.bg)
+                .bg(p.magenta)
+                .add_modifier(Modifier::BOLD),
         ))
         .padding(ratatui::widgets::Padding::horizontal(1))
 }
@@ -1531,20 +1537,35 @@ fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
             Span::styled(" stay", Style::default().fg(p.muted)),
         ]),
     ])
-    .block(overlay_block(title, blend_color(d.palette.rule_hi, d.palette.bg, 0.92), &d.palette));
+    .block(overlay_block(
+        title,
+        blend_color(d.palette.rule_hi, d.palette.bg, 0.92),
+        &d.palette,
+    ));
     frame.render_widget(ratatui::widgets::Clear, modal_h[1]);
     frame.render_widget(content, modal_h[1]);
 }
 
 /// §6.16 help overlay: the same frame as quit, two columns of keys
 /// grouped by pane. Any key closes it.
-fn render_help_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App, d: &Design, _g: &Glyphs) {
+fn render_help_overlay(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    _app: &App,
+    d: &Design,
+    _g: &Glyphs,
+) {
     let p = &d.palette;
     let w = 64u16.min(area.width.saturating_sub(8));
     let h = 20u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(ratatui::widgets::Clear, rect);
     let block = overlay_block("Keys", blend_color(p.rule_hi, p.bg, 0.92), p);
     let inner = block.inner(rect);
@@ -1753,11 +1774,11 @@ pub fn welcome_mark_frame(d: &Design, frame: u8) -> Vec<Line<'static>> {
     // (the ring forming around the O), then the tagline. frame 0 shows
     // only the O (the first letterform); each frame reveals ~1/5 more.
     let reveal: usize = match frame {
-        0 => 8,   // the O alone
-        1 => 16,  // a third of the ring
-        2 => 24,  // two thirds
-        3 => 30,  // ring complete + star
-        4 => 36,  // RBIT filled
+        0 => 8,          // the O alone
+        1 => 16,         // a third of the ring
+        2 => 24,         // two thirds
+        3 => 30,         // ring complete + star
+        4 => 36,         // RBIT filled
         _ => usize::MAX, // tagline + hold
     };
     let mask = |row: &str| -> String {
