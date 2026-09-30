@@ -22,8 +22,8 @@
 
 use orbit_hud_tui::render::render;
 use orbit_hud_tui::state::{
-    App, ComposerState, ConnectionState, Finding, Focus, LeftTab, LogoPhase, PendingApproval, Task,
-    TaskState, Toast, ToastKind, ToolOutcome, ToolState, TranscriptLine,
+    ActivityRow, App, ComposerState, ConnectionState, Finding, Focus, LeftTab, LogoPhase,
+    PendingApproval, Task, TaskState, Toast, ToastKind, ToolOutcome, ToolState, TranscriptLine,
 };
 use orbit_hud_tui::tokens::{Design, GlyphSet, Theme};
 
@@ -179,6 +179,43 @@ fn preview_dump() {
     }];
     let buf = render_buf(&wf, &design(), 150, 44);
     std::fs::write("/tmp/preview-workspace.txt", buf_text(&buf)).unwrap();
+
+    // ── herdr panel-isolation frames ──────────────────────────────────
+    // The operator validates visually: pane borders (magenta = focused,
+    // muted = unfocused), the Activity tab, focus cycling, approval card.
+
+    // Activity tab open (g v): the left rail swaps to event rows.
+    let mut act = idle_app();
+    act.left_tab = LeftTab::Verbose;
+    act.activity = act_activity_fixture();
+    let buf = render_buf(&act, &design(), 150, 44);
+    std::fs::write("/tmp/preview-activity.txt", buf_text(&buf)).unwrap();
+
+    // Focus cycling: the same frame with focus on Left / Center / Right —
+    // the accent border moves; the other panes drop to muted rule colour.
+    // (App isn't Clone; rebuild the fixture per frame.)
+    for (name, focus) in [
+        ("left", Focus::Left),
+        ("center", Focus::Center),
+        ("right", Focus::Right),
+    ] {
+        let mut f = idle_app();
+        f.left_tab = LeftTab::Verbose;
+        f.activity = act_activity_fixture();
+        f.focus = focus;
+        let buf = render_buf(&f, &design(), 150, 44);
+        std::fs::write(&format!("/tmp/preview-focus-{name}.txt"), buf_text(&buf)).unwrap();
+    }
+}
+
+/// Activity rows shared by the isolation preview frames.
+fn act_activity_fixture() -> Vec<ActivityRow> {
+    vec![
+        ActivityRow { time: "14:04:39".into(), kind: "model", text: "glm-5.2 via local".into() },
+        ActivityRow { time: "14:04:52".into(), kind: "tool",  text: "shell · ok".into() },
+        ActivityRow { time: "14:04:58".into(), kind: "grant", text: "shell · once · you".into() },
+        ActivityRow { time: "14:05:01".into(), kind: "error", text: "E0408".into() },
+    ]
 }
 
 #[test]

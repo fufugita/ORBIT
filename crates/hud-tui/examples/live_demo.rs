@@ -140,6 +140,22 @@ fn main() -> io::Result<()> {
                 match (k.code, k.modifiers) {
                     (crossterm::event::KeyCode::Char('q'), _)
                     | (crossterm::event::KeyCode::Esc, _) => break,
+                    // herdr panel isolation: Tab cycles focus (the accent
+                    // border moves), g v toggles the Activity tab.
+                    (crossterm::event::KeyCode::Tab, _) => {
+                        app.focus = match app.focus {
+                            Focus::Left => Focus::Center,
+                            Focus::Center => Focus::Right,
+                            Focus::Right | Focus::Status => Focus::Left,
+                        };
+                    }
+                    (crossterm::event::KeyCode::Char('v'), _) => {
+                        app.left_tab = if app.left_tab == LeftTab::Sessions {
+                            LeftTab::Verbose
+                        } else {
+                            LeftTab::Sessions
+                        };
+                    }
                     (crossterm::event::KeyCode::Char('y'), _) if !app.pending_approvals.is_empty() => {
                         app.pending_approvals.clear();
                         app.tool_state = ToolState::Running("cargo test".into());
