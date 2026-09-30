@@ -464,6 +464,9 @@ pub struct App {
     pub queued: Vec<String>,
     /// Sessions rail rows (§6.9) — filled by the backend bridge.
     pub sessions: Vec<SessionRow>,
+    /// The Activity rail's structured event rows (§9.16), newest last.
+    /// Capped at 500 (§9.16).
+    pub activity: Vec<ActivityRow>,
     /// The conversation header's title (the open session's title).
     pub header_title: String,
     /// The conversation header's right meta (e.g. `14 turns`).
@@ -504,6 +507,19 @@ pub struct SessionRow {
     pub failed: bool,
     /// True for the open session (bold ink title).
     pub open: bool,
+}
+
+/// One row of the Activity rail (§9.16): a structured event, never model
+/// text, never reasoning. Kinds: plan tool grant ledger cite model warn
+/// error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityRow {
+    /// HH:MM:SS stamp (faint, §8.4).
+    pub time: String,
+    /// The event kind (muted, §8.4).
+    pub kind: &'static str,
+    /// The event text (amber for warnings, red for errors, ink2 otherwise).
+    pub text: String,
 }
 
 /// One line in the transcript — either a user message or an assistant reply.
@@ -644,6 +660,18 @@ pub struct PendingApproval {
     pub risk: u8,
 }
 
+/// The operator's answer to an approval card (§12): drives the Activity
+/// `grant` row text (§9.16) and the tool-line marker (◆ once / ◈ session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// `y` — allow this one call.
+    Once,
+    /// `R` — allow this tool for the session.
+    Session,
+    /// `n` / Esc — deny.
+    Denied,
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -699,6 +727,7 @@ impl App {
             header_meta: String::new(),
             workspace_meta: String::new(),
             session_cursor: 0,
+            activity: Vec::new(),
             last_prompt: None,
             turn_in_flight: false,
             cancel_requested: false,
@@ -716,6 +745,26 @@ impl App {
     /// stamps set `transcript` directly.
     fn now_hhmm(&self) -> Option<String> {
         Some(crate::format::time_of_day(chrono::Local::now()))
+    }
+
+    /// The HH:MM:SS stamp for a new Activity row (§8.4).
+    fn now_hhmmss(&self) -> String {
+        crate::format::activity_time(chrono::Local::now())
+    }
+
+    /// Append one structured event to the Activity rail (§9.16), newest
+    /// last, capped at 500 rows.
+    fn push_activity(&mut self, kind: &'static str, text: String) {
+        self.activity.push(ActivityRow {
+            time: self.now_hhmmss(),
+            kind,
+            text,
+        });
+        if self.activity.len() > 500 {
+            let drop = self.activity.len() - 500;
+            self.activity.drain(0..drop);
+        }
+        self.dirty.set(DirtyFlags::SESSION_LIST);
     }
 
     /// Pop the next queued prompt (if any) and mark a turn in flight.
@@ -969,6 +1018,19 @@ impl App {
                         }
                     }
                 }
+                // Activity `tool` row (§9.16): `{name} {argument} · {ok|failed|denied|blocked}`.
+                // (No argument summary survives to this arm today; the name
+                // plus the outcome is the honest row.)
+                let verdict = match &outcome_of_call {
+                    ToolOutcome::Ok => "ok",
+                    ToolOutcome::Failed => "failed",
+                    ToolOutcome::Denied => "denied",
+                    ToolOutcome::Blocked => "blocked",
+                };
+                self.push_activity(
+                    "tool",
+                    format!("{name} · {verdict}"),
+                );
                 // Note: we never render model-supplied rationale; only status.
                 self.last_status = match outcome_of_call {
                     ToolOutcome::Ok => format!("tool {name}: ok"),
@@ -983,10 +1045,12 @@ impl App {
             }
             Msg::BackendError(err) => {
                 self.last_error = Some(err.clone());
-                self.composer_state = ComposerState::Blocked(err);
+                self.composer_state = ComposerState::Blocked(err.clone());
                 self.turn_in_flight = false;
                 self.cancel_requested = false;
                 self.tool_state = ToolState::Idle;
+                // Activity `error` row (§9.16): the error code, or `turn failed`.
+                self.push_activity("error", err);
                 self.dirty.set(DirtyFlags::STATUS);
             }
             Msg::TextSubmitted(text) => {
@@ -1036,6 +1100,23 @@ impl App {
             Msg::InputModeChanged(mode) => {
                 self.input_mode = mode;
                 self.dirty.set(DirtyFlags::STATUS);
+            }
+            Msg::ApprovalDecision { tool, decision } => {
+                // Activity `grant` row (§9.16): `{tool} · once · you`,
+                // `{tool} · session · you` or `{tool} · denied · you`.
+                let verdict = match decision {
+                    ApprovalDecision::Once => "once · you",
+                    ApprovalDecision::Session => "session · you",
+                    ApprovalDecision::Denied => "denied · you",
+                };
+                self.push_activity("grant", format!("{tool} · {verdict}"));
+                // The tool-line marker (§12): ◆ once / ◈ session rides the
+                // running card; denied needs no marker (the ⊘ outcome row
+                // carries it).
+                if let ApprovalDecision::Session = decision {
+                    self.tool_state = ToolState::AutoGranted(tool);
+                }
+                self.dirty.set(DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
             }
             Msg::ApprovalsDenied => {
                 // D8: Ctrl+C denied all pending approvals — the registry
@@ -1259,6 +1340,11 @@ impl App {
                 self.session_id_prefix = session_prefix;
                 self.model_priced = priced;
                 self.session_id = session_id;
+                // Activity `model` row (§9.16): `{model} via {provider}`.
+                self.push_activity(
+                    "model",
+                    format!("{} via {}", self.model, self.provider),
+                );
                 self.dirty
                     .set(DirtyFlags::SESSION_LIST | DirtyFlags::STATUS);
             }
@@ -1286,6 +1372,8 @@ impl App {
             Msg::ModelChanged(model) => {
                 self.model = model;
                 self.last_status = format!("model → {}", self.model);
+                // Activity `model` row (§9.16): `model → {model}`.
+                self.push_activity("model", format!("model → {}", self.model));
                 self.dirty.set(DirtyFlags::STATUS);
             }
             Msg::SystemMessage(text) => {
@@ -1425,6 +1513,14 @@ impl App {
             KeyAction::FocusRight => {
                 self.focus = Focus::Right;
                 self.dirty.set(DirtyFlags::LAYOUT);
+            }
+            // Click-to-focus (herdr-style): the mouse hit-test resolves a
+            // pane; this sets it directly.
+            KeyAction::FocusSet(f) => {
+                if self.focus != f {
+                    self.focus = f;
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                }
             }
             KeyAction::TabSessions => {
                 self.left_tab = LeftTab::Sessions;
@@ -1672,6 +1768,85 @@ mod tests {
         app.reduce(Msg::KeyAction(KeyAction::TabVerbose));
         assert_eq!(app.left_tab, LeftTab::Verbose);
         assert!(app.dirty.is_set(DirtyFlags::LAYOUT));
+    }
+
+    #[test]
+    fn activity_records_tool_finish_and_model_events() {
+        let mut app = App::new();
+        app.reduce(Msg::Identity {
+            model: "glm-5.2".into(),
+            provider: "local".into(),
+            session_prefix: "01J8ZK4Q".into(),
+            session_id: "session-01J8ZK4QX2M7C9RT5VWEHN3B6D".into(),
+            priced: true,
+        });
+        app.reduce(Msg::ToolCallFinished {
+            name: "shell".into(),
+            outcome: ToolOutcome::Ok,
+        });
+        app.reduce(Msg::ModelChanged("kimi-k2.7".into()));
+        app.reduce(Msg::BackendError("E0408".into()));
+        // Rows: model-at-start, tool, model-change, error — newest last.
+        assert_eq!(app.activity.len(), 4);
+        assert_eq!(app.activity[0].kind, "model");
+        assert!(app.activity[0].text.contains("glm-5.2 via local"));
+        assert_eq!(app.activity[1].kind, "tool");
+        assert!(app.activity[1].text.contains("shell · ok"));
+        assert_eq!(app.activity[2].kind, "model");
+        assert!(app.activity[2].text.contains("model → kimi-k2.7"));
+        assert_eq!(app.activity[3].kind, "error");
+        assert!(app.activity[3].text.contains("E0408"));
+        // Every row carries an HH:MM:SS stamp.
+        assert!(app.activity.iter().all(|r| r.time.len() == 8));
+    }
+
+    #[test]
+    fn activity_caps_at_500_rows() {
+        let mut app = App::new();
+        for i in 0..600 {
+            app.reduce(Msg::BackendError(format!("e{i}")));
+        }
+        assert_eq!(app.activity.len(), 500);
+        // The oldest 100 were dropped; the newest is e599.
+        assert!(app.activity.last().unwrap().text.contains("e599"));
+        assert!(app.activity.first().unwrap().text.contains("e100"));
+    }
+
+    #[test]
+    fn click_to_focus_sets_focus_and_dirty() {
+        let mut app = App::new();
+        app.dirty.clear();
+        app.reduce(Msg::KeyAction(KeyAction::FocusSet(Focus::Right)));
+        assert_eq!(app.focus, Focus::Right);
+        assert!(app.dirty.is_set(DirtyFlags::LAYOUT));
+        // Re-setting the same focus is a no-op (no spurious dirty).
+        app.dirty.clear();
+        app.reduce(Msg::KeyAction(KeyAction::FocusSet(Focus::Right)));
+        assert!(!app.dirty.is_set(DirtyFlags::LAYOUT));
+    }
+
+    #[test]
+    fn approval_decision_records_grant_row() {
+        let mut app = App::new();
+        app.reduce(Msg::ApprovalDecision {
+            tool: "shell".into(),
+            decision: ApprovalDecision::Once,
+        });
+        app.reduce(Msg::ApprovalDecision {
+            tool: "edit_file".into(),
+            decision: ApprovalDecision::Session,
+        });
+        app.reduce(Msg::ApprovalDecision {
+            tool: "shell".into(),
+            decision: ApprovalDecision::Denied,
+        });
+        assert_eq!(app.activity.len(), 3);
+        assert_eq!(app.activity[0].kind, "grant");
+        assert!(app.activity[0].text.contains("shell · once · you"));
+        assert!(app.activity[1].text.contains("edit_file · session · you"));
+        assert!(app.activity[2].text.contains("shell · denied · you"));
+        // A session grant flips the tool state to AutoGranted (the ◈ slot).
+        assert!(matches!(app.tool_state, ToolState::AutoGranted(_)));
     }
 
     #[test]

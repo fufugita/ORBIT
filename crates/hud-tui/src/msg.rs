@@ -7,6 +7,7 @@
 //! messages come from the worker thread (stream events, usage, tool calls).
 
 use crate::input::KeyAction;
+use crate::state::ApprovalDecision;
 
 /// A message processed by the reducer (`App::reduce`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +38,13 @@ pub enum Msg {
     },
     /// A tool call started (name + display-safe argument summary).
     ToolCallStarted { name: String, summary: String },
+    /// The operator answered an approval card (§12): `once`, `session` or
+    /// `denied`. Records the Activity `grant` row (§9.16) and the tool-line
+    /// marker (◆ once / ◈ session).
+    ApprovalDecision {
+        tool: String,
+        decision: ApprovalDecision,
+    },
     /// A tool call finished. `outcome` distinguishes success, failure, an
     /// operator denial (a decision, not an error — §11.5 rule 4) and an
     /// unknown-tool block (deny-by-default), so the transcript never shows

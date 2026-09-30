@@ -1,28 +1,27 @@
-//! Ratatui rendering — the ORBIT visual system (PROMPT.md §6, §8).
+//! Ratatui rendering — the ORBIT visual system (herdr-style pane isolation).
 //!
-//! Ink, not boxes: structure comes from gutters, alignment, spacing and
-//! hairlines. No pane has a border. At most one rounded frame is on screen
-//! at a time, and a frame always means "this needs you" — an approval, the
-//! palette, a confirmation. All colours come from the token palette
-//! (tokens.rs); all glyphs from glyphs.rs. No literals in render code.
+//! Every pane is a bordered surface (rounded Block frame, herdr-style):
+//! the focused pane's border is the magenta accent with a bold title;
+//! unfocused panes get the muted rule colour. The pane borders ARE the
+//! separation — no divider columns. A 1-col gap keeps borders from
+//! doubling up. Panes are customizable via tui.toml [layout.panes]
+//! (order, widths, visibility); clicks focus the clicked pane.
 //!
-//! Layout (§8): one shared pane-header row, air, pane bodies with the
-//! transcript bottom-anchored, air, the composer (input + hint), and the
-//! status line. Width classes (§8.2) pick which panes exist; the
-//! conversation column geometry (§8.3) fixes every offset.
+//! All colours come from the token palette (tokens.rs); all glyphs from
+//! glyphs.rs. No literals in render code.
 
 use crate::glyphs::Glyphs;
 use crate::rich::render_message;
 use crate::state::{
-    App, ConnectionState, Focus, LeftTab, LogoPhase, SessionRow, TaskState, ToolOutcome,
-    ToolState, TranscriptLine, VerificationResult,
+    App, ConnectionState, Focus, LeftTab, TaskState, ToolOutcome, ToolState, TranscriptLine,
+    VerificationResult,
 };
 use crate::tokens::Design;
 use crate::unicode::{display_width, truncate_graphemes};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 // ── Width classes (§8.2) ─────────────────────────────────────────────────────
 
@@ -530,6 +529,11 @@ fn render_sessions_rail(
     d: &Design,
     g: &Glyphs,
 ) {
+    // The Activity tab renders the structured event rail instead (§9.16).
+    if app.left_tab == LeftTab::Verbose {
+        render_activity_rail(frame, area, app, d);
+        return;
+    }
     let p = &d.palette;
     let focused = app.focus == Focus::Left;
     let buf = frame.buffer_mut();
@@ -613,6 +617,92 @@ fn render_sessions_rail(
                 .set_style(Style::default().fg(rec_fg).bg(fill));
         }
         y += 1;
+    }
+}
+
+// ── Activity rail (§9.16) ────────────────────────────────────────────────────
+
+/// The Activity tab's structured event rows (§8.4): time at x+1 (faint),
+/// kind at x+11 (muted), text at x+18 end-truncated at x+w-1. Warnings
+/// amber, errors red, everything else ink2. The rail follows the newest
+/// entry unless the operator scrolled (pane_scroll[0]).
+fn render_activity_rail(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    d: &Design,
+) {
+    let p = &d.palette;
+    let buf = frame.buffer_mut();
+    if area.width < 20 || area.height < 1 {
+        return;
+    }
+    // Follow the newest entry unless scrolled (§9.16).
+    let rows = &app.activity;
+    let visible = area.height as usize;
+    let total = rows.len();
+    let scroll = if app.viewport_manual {
+        app.pane_scroll[0] as usize
+    } else {
+        total.saturating_sub(visible)
+    };
+    let start = scroll.min(total);
+    let end = (start + visible).min(total);
+    let mut y = area.y;
+    for row in rows.get(start..end).unwrap_or(&[]) {
+        if y >= area.bottom() {
+            break;
+        }
+        // Time at x+1, faint.
+        for (j, c) in row.time.chars().enumerate() {
+            let x = area.x + 1 + j as u16;
+            if x >= area.x + area.width {
+                break;
+            }
+            buf[(x, y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.faint));
+        }
+        // Kind at x+11, muted.
+        for (j, c) in row.kind.chars().enumerate() {
+            let x = area.x + 11 + j as u16;
+            if x >= area.x + area.width {
+                break;
+            }
+            buf[(x, y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.muted));
+        }
+        // Text at x+18, end-truncated at x+w-1. Warnings amber, errors red.
+        let text_color = match row.kind {
+            "warn" => p.amber,
+            "error" => p.red,
+            _ => p.ink2,
+        };
+        let budget = (area.width as usize).saturating_sub(19).max(1);
+        let text = truncate_graphemes(&row.text, budget);
+        for (j, c) in text.chars().enumerate() {
+            let x = area.x + 18 + j as u16;
+            if x >= area.x + area.width {
+                break;
+            }
+            buf[(x, y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(text_color));
+        }
+        y += 1;
+    }
+    // Empty state: one faint line.
+    if rows.is_empty() && area.height >= 1 {
+        for (j, c) in "(no events yet)".chars().enumerate() {
+            let x = area.x + 2 + j as u16;
+            if x >= area.x + area.width {
+                break;
+            }
+            buf[(x, area.y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.faint));
+        }
     }
 }
 
@@ -1030,7 +1120,7 @@ fn render_conversation(
             buf[(x, hint_row.y)].set_style(Style::default().bg(p.surface));
         }
         let mut x = cl + 1;
-        let mut put = |text: &str, style: Style, x: &mut u16, buf: &mut ratatui::buffer::Buffer| {
+        let put = |text: &str, style: Style, x: &mut u16, buf: &mut ratatui::buffer::Buffer| {
             for c in text.chars() {
                 if *x >= hint_row.x + hint_row.width {
                     return;
@@ -1300,7 +1390,7 @@ fn render_workspace_rail(
                 } else {
                     color
                 };
-                let mut title_style = if bold {
+                let title_style = if bold {
                     Style::default().fg(p.ink).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(p.ink2)
@@ -1955,7 +2045,7 @@ fn render_palette(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design,
     }
 
     let mut row_y = inner.y + 2;
-    let mut put_row = |text: &str, style: Style, row_y: &mut u16, buf: &mut ratatui::buffer::Buffer| {
+    let put_row = |text: &str, style: Style, row_y: &mut u16, buf: &mut ratatui::buffer::Buffer| {
         if *row_y >= inner.y + inner.height {
             return;
         }
@@ -2213,7 +2303,7 @@ fn render_help_overlay(
         ("R", "allow tool for session"),
         ("n  esc", "deny"),
     ];
-    let mut put = |col_x: u16, rows: &[(&str, &str)], buf: &mut ratatui::buffer::Buffer| {
+    let put = |col_x: u16, rows: &[(&str, &str)], buf: &mut ratatui::buffer::Buffer| {
         for (i, (key, desc)) in rows.iter().enumerate() {
             let yy = rect.y + 2 + i as u16;
             if yy >= rect.y + rect.height - 1 {
@@ -2353,7 +2443,7 @@ fn render_approval_modal(
     let mut kx = rect.x + 3;
     // Keys row: keycap chips, all writes bounds-checked (narrow terminals).
     let key_row_end = rect.x + rect.width - 1;
-    let mut put_key = |key: &str, desc: &str, kx: &mut u16, buf: &mut ratatui::buffer::Buffer| {
+    let put_key = |key: &str, desc: &str, kx: &mut u16, buf: &mut ratatui::buffer::Buffer| {
         for (j, c) in format!(" {key} ").chars().enumerate() {
             if *kx + j as u16 > key_row_end {
                 return;

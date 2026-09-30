@@ -15,6 +15,8 @@ pub enum KeyAction {
     FocusLeft,
     FocusCenter,
     FocusRight,
+    /// Click-to-focus: set focus directly (from the mouse hit-test).
+    FocusSet(crate::state::Focus),
     TabSessions,
     TabVerbose,
     NewSession,

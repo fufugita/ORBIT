@@ -673,7 +673,11 @@ fn handle_mouse(me: crossterm::event::MouseEvent, sender: &BusSender, app: &App)
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
             // A click clears any existing selection.
             sender.send(Msg::SelectionClear);
+            // Click-to-focus (herdr-style): a click inside a pane's content
+            // focuses that pane first — the pane boundary is the isolation
+            // boundary, and the click tells the operator where focus went.
             if let Some((pane, row, col)) = hit {
+                sender.send(Msg::KeyAction(crate::input::KeyAction::FocusSet(pane)));
                 sender.send(Msg::SelectionAnchor { pane, row, col });
             }
         }
@@ -870,6 +874,7 @@ fn handle_key(
     if !app.pending_approvals.is_empty() {
         let first = &app.pending_approvals[0];
         let call_id = first.call_id.clone();
+        let tool_name = first.tool_name.clone();
         if let KeyCode::Char(c) = key.code {
             match c {
                 // D3 (§11.5 rule 4): the key handler ONLY resolves the
@@ -881,10 +886,18 @@ fn handle_key(
                 // would record an operator denial as a tool error.
                 'y' | 'Y' => {
                     approvals.resolve(&call_id, ApprovalResponse::Allow);
+                    sender.send(Msg::ApprovalDecision {
+                        tool: tool_name,
+                        decision: crate::state::ApprovalDecision::Once,
+                    });
                     return;
                 }
                 'n' | 'N' => {
                     approvals.resolve(&call_id, ApprovalResponse::Deny);
+                    sender.send(Msg::ApprovalDecision {
+                        tool: tool_name,
+                        decision: crate::state::ApprovalDecision::Denied,
+                    });
                     return;
                 }
                 // Session grant is `R` only; bare `r` is swallowed by the
@@ -892,6 +905,10 @@ fn handle_key(
                 // deliver Shift+R as Char('R') — case is the distinction.
                 'R' => {
                     approvals.resolve(&call_id, ApprovalResponse::AllowSession);
+                    sender.send(Msg::ApprovalDecision {
+                        tool: tool_name,
+                        decision: crate::state::ApprovalDecision::Session,
+                    });
                     return;
                 }
                 _ => {}
@@ -899,6 +916,10 @@ fn handle_key(
         }
         if matches!(key.code, KeyCode::Esc) {
             approvals.resolve(&call_id, ApprovalResponse::Deny);
+            sender.send(Msg::ApprovalDecision {
+                tool: tool_name,
+                decision: crate::state::ApprovalDecision::Denied,
+            });
         }
         // Any other key is consumed by the modal.
         return;
@@ -1028,6 +1049,7 @@ fn handle_key(
             | KeyAction::FocusLeft
             | KeyAction::FocusCenter
             | KeyAction::FocusRight
+            | KeyAction::FocusSet(_)
             | KeyAction::TabSessions
             | KeyAction::TabVerbose
             | KeyAction::NewSession

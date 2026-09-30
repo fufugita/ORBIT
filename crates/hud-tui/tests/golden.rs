@@ -223,6 +223,54 @@ fn golden_streaming_with_tools() {
     assert!(text.contains("serializes"), "in-flight stream text");
 }
 
+/// The Activity tab (§9.16): structured events — time / kind / text —
+/// render in the left rail when `g v` switches it in, and the session
+/// list is gone.
+#[test]
+fn golden_activity_tab_replaces_sessions_rail() {
+    let mut app = idle_app();
+    app.left_tab = LeftTab::Verbose;
+    app.activity = vec![
+        orbit_hud_tui::state::ActivityRow {
+            time: "14:04:39".into(),
+            kind: "model",
+            text: "glm-5.2 via local".into(),
+        },
+        orbit_hud_tui::state::ActivityRow {
+            time: "14:04:52".into(),
+            kind: "tool",
+            text: "shell · ok".into(),
+        },
+        orbit_hud_tui::state::ActivityRow {
+            time: "14:05:01".into(),
+            kind: "error",
+            text: "E0408".into(),
+        },
+    ];
+    let buf = render_buf(&app, &design(), 150, 44);
+    let text = buf_text(&buf);
+    assert!(text.contains("Activity"), "Activity tab header");
+    assert!(text.contains("14:04:39"), "event time stamp");
+    // §8.4: text at x+18 end-truncated at x+w-1 — the 30-col rail gives an
+    // 11-char budget, so the model row truncates with an ellipsis.
+    assert!(text.contains("glm-5.2 vi…"), "model event text (truncated)");
+    assert!(text.contains("shell · ok"), "tool event text");
+    assert!(text.contains("E0408"), "error event text");
+    // The sessions list is NOT rendered while the Activity tab is open.
+    assert!(!text.contains("Approval surface polish"), "sessions rows hidden");
+}
+
+/// Empty activity: one faint placeholder line, not a blank rail.
+#[test]
+fn golden_activity_tab_empty_state() {
+    let mut app = idle_app();
+    app.left_tab = LeftTab::Verbose;
+    app.sessions.clear();
+    let buf = render_buf(&app, &design(), 150, 44);
+    let text = buf_text(&buf);
+    assert!(text.contains("(no events yet)"), "activity empty state");
+}
+
 /// The §6.12 toast rides the hint row's right end — and ONLY there (the
 /// old queue-row toast render was removed; a queued prompt + toast must
 /// not double-render).

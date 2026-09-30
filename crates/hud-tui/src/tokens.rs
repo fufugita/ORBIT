@@ -380,6 +380,56 @@ pub struct LayoutConfig {
     pub rail_left: u16,
     pub rail_right: u16,
     pub measure: u16,
+    /// Pane customization (herdr-style): which panes exist, in what order,
+    /// and their preferred widths. The renderer clamps to the terminal.
+    /// Names: "sessions", "activity", "conversation", "workspace".
+    /// The conversation pane is always present and always last-but-one in
+    /// the center; the others are optional and ordered as listed.
+    pub panes: PaneLayoutConfig,
+}
+
+/// Which panes exist and their widths (tui.toml `[layout.panes]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaneLayoutConfig {
+    /// Pane order, left to right, by name. "conversation" must appear
+    /// exactly once; it anchors the center. Unknown names are ignored.
+    pub order: Vec<String>,
+    /// Preferred width per pane name (columns). Rails clamp to the
+    /// terminal; the conversation takes the remainder.
+    pub width: std::collections::BTreeMap<String, u16>,
+    /// Panes to hide entirely (by name).
+    pub hide: Vec<String>,
+}
+
+impl Default for PaneLayoutConfig {
+    fn default() -> Self {
+        Self {
+            order: vec![
+                "sessions".into(),
+                "activity".into(),
+                "conversation".into(),
+                "workspace".into(),
+            ],
+            width: std::collections::BTreeMap::from([
+                ("sessions".into(), 28),
+                ("activity".into(), 22),
+                ("workspace".into(), 36),
+            ]),
+            hide: vec!["activity".into()],
+        }
+    }
+}
+
+impl PaneLayoutConfig {
+    /// Is a pane visible (listed, not hidden)?
+    pub fn visible(&self, name: &str) -> bool {
+        self.order.iter().any(|o| o == name) && !self.hide.iter().any(|h| h == name)
+    }
+    /// Preferred width for a pane (0 = unset → renderer default).
+    pub fn width_of(&self, name: &str) -> u16 {
+        self.width.get(name).copied().unwrap_or(0)
+    }
 }
 
 impl Default for LayoutConfig {
@@ -388,6 +438,7 @@ impl Default for LayoutConfig {
             rail_left: 24,
             rail_right: 40,
             measure: 100,
+            panes: PaneLayoutConfig::default(),
         }
     }
 }
