@@ -375,7 +375,7 @@ fn event_loop(
                     });
                     if let Some(next) = app.take_next_queued() {
                         app.transcript
-                            .push(crate::state::TranscriptLine::User(next.clone()));
+                            .push(crate::state::TranscriptLine::User { text: next.clone(), time: None });
                         let _ = command_sink.send(WorkerCommand::Prompt(next));
                     }
                     continue;
@@ -384,7 +384,7 @@ fn event_loop(
                     app.reduce(Msg::BackendError(err));
                     if let Some(next) = app.take_next_queued() {
                         app.transcript
-                            .push(crate::state::TranscriptLine::User(next.clone()));
+                            .push(crate::state::TranscriptLine::User { text: next.clone(), time: None });
                         let _ = command_sink.send(WorkerCommand::Prompt(next));
                     }
                     continue;

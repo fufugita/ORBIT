@@ -24,3 +24,6 @@ unicode-width.workspace = true
 
 [lib]
 name = "orbit_hud_tui"
+
+[dev-dependencies]
+serde_json.workspace = true

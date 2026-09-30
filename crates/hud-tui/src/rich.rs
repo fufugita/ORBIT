@@ -109,6 +109,129 @@ pub fn render_line<'a>(text: &'a str, d: &Design) -> Line<'a> {
     render_line_inner(&apply_ascii_fallback(text), d)
 }
 
+/// How inline code renders (the goldens differ by turn type: user turns
+/// chip it, ORBIT turns render it muted plain).
+#[derive(Clone, Copy, PartialEq)]
+pub enum CodeStyle {
+    /// surface2 chip with ink text (§6.4, user turns).
+    Chip,
+    /// Muted plain text (ORBIT turns, per the goldens).
+    Muted,
+}
+
+/// The styled runs for a line, owned (for wrap-then-render flows).
+pub fn runs_for(text: &str, d: &Design) -> Vec<(String, Style)> {
+    runs_for_mode(text, d, CodeStyle::Chip)
+}
+
+/// The styled runs with an explicit inline-code mode.
+pub fn runs_for_mode(text: &str, d: &Design, mode: CodeStyle) -> Vec<(String, Style)> {
+    let line = render_line_inner_mode(&apply_ascii_fallback(text), d, mode);
+    line.spans
+        .into_iter()
+        .map(|sp| (sp.content.to_string(), sp.style))
+        .collect()
+}
+
+fn render_line_inner_mode(text: &str, d: &Design, mode: CodeStyle) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    let p = &d.palette;
+    let mono = d.palette.tier == ColorTier::Mono;
+    let mut cur = String::new();
+    let mut in_code = false;
+    for g in unicode_segmentation::UnicodeSegmentation::graphemes(text, true) {
+        if g == "`" {
+            if !cur.is_empty() {
+                push_text_span_mode(&mut spans, std::mem::take(&mut cur), p, mono, in_code, mode);
+            }
+            in_code = !in_code;
+            if mono && in_code {
+                spans.push(Span::styled("`", Style::default().fg(p.ink)));
+            }
+        } else {
+            cur.push_str(g);
+        }
+    }
+    if !cur.is_empty() {
+        push_text_span_mode(&mut spans, cur, p, mono, in_code, mode);
+    }
+    Line::from(spans)
+}
+
+fn push_text_span_mode(
+    spans: &mut Vec<Span<'static>>,
+    text: String,
+    p: &crate::tokens::ResolvedPalette,
+    mono: bool,
+    in_code: bool,
+    mode: CodeStyle,
+) {
+    if in_code {
+        let style = match (p.tier, mode) {
+            (ColorTier::TrueColor | ColorTier::T256, CodeStyle::Chip) => {
+                Style::default().fg(p.ink).bg(p.surface2)
+            }
+            (ColorTier::TrueColor | ColorTier::T256, CodeStyle::Muted) => {
+                Style::default().fg(p.muted)
+            }
+            (ColorTier::Ansi16, _) => Style::default().fg(p.cyan),
+            (ColorTier::Mono, _) => Style::default().fg(p.ink),
+        };
+        let _ = mono;
+        spans.push(Span::styled(text, style));
+    } else {
+        push_plain_span(spans, text, p);
+    }
+}
+
+/// Plain (non-code) text: emphasis + citation handling.
+fn push_plain_span(spans: &mut Vec<Span<'static>>, text: String, p: &crate::tokens::ResolvedPalette) {
+    // Citations [n] render cyan (§6.7).
+    if text.contains('[') {
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find('[') {
+            if let Some(j) = rest[i..].find(']') {
+                let (before, after) = rest.split_at(i);
+                if !before.is_empty() {
+                    push_emphasis_span(spans, before.to_string(), p);
+                }
+                spans.push(Span::styled(
+                    rest[i..=i + j].to_string(),
+                    Style::default().fg(p.cyan),
+                ));
+                rest = &after[j + 1..];
+            } else {
+                break;
+            }
+        }
+        if !rest.is_empty() {
+            push_emphasis_span(spans, rest.to_string(), p);
+        }
+        return;
+    }
+    push_emphasis_span(spans, text, p);
+}
+
+/// Emphasis only (no citations).
+fn push_emphasis_span(spans: &mut Vec<Span<'static>>, text: String, p: &crate::tokens::ResolvedPalette) {
+    if text.contains("**") {
+        let parts: Vec<&str> = text.split("**").collect();
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() {
+                continue;
+            }
+            let style = if i % 2 == 1 {
+                Style::default().fg(p.ink).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.ink)
+            };
+            spans.push(Span::styled(part.to_string(), style));
+        }
+    } else {
+        spans.push(Span::styled(text, Style::default().fg(p.ink)));
+    }
+}
+
 fn render_line_inner(text: &str, d: &Design) -> Line<'static> {
     let p = &d.palette;
     let g = &Glyphs::for_set(d.caps.glyphs);
@@ -302,32 +425,21 @@ fn push_text_span(
     in_code: bool,
 ) {
     if in_code {
+        // §6.4: a surface2 chip with ink text (cyan text in 16; mono keeps
+        // the backticks — handled by the caller). Multi-word code chips
+        // per word: the spaces between stay plain (golden).
         let style = match p.tier {
-            ColorTier::TrueColor | ColorTier::T256 => Style::default().fg(p.syn_kw),
+            ColorTier::TrueColor | ColorTier::T256 => {
+                Style::default().fg(p.ink).bg(p.surface2)
+            }
             ColorTier::Ansi16 => Style::default().fg(p.cyan),
             ColorTier::Mono => Style::default().fg(p.ink),
         };
         let _ = mono;
         spans.push(Span::styled(text, style));
     } else {
-        // Emphasis (§6.3): **bold** renders bold; *italics* render plain
-        // (markers dropped either way).
-        if text.contains("**") {
-            let parts: Vec<&str> = text.split("**").collect();
-            for (i, part) in parts.iter().enumerate() {
-                if part.is_empty() {
-                    continue;
-                }
-                let style = if i % 2 == 1 {
-                    Style::default().fg(p.ink).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(p.ink)
-                };
-                spans.push(Span::styled(part.to_string(), style));
-            }
-        } else {
-            spans.push(Span::styled(text, Style::default().fg(p.ink)));
-        }
+        // Citations + emphasis (§6.7, §6.3).
+        push_plain_span(spans, text, p);
     }
 }
 

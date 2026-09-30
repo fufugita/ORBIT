@@ -3958,6 +3958,7 @@ dependencies = [
  "orbit-hud",
  "ratatui",
  "serde",
+ "serde_json",
  "signal-hook",
  "toml 0.8.23",
  "unicode-segmentation",

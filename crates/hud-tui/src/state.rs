@@ -118,6 +118,8 @@ pub struct Task {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Active,
+    /// Not started yet (the golden's ◌ pending rows).
+    Pending,
     Blocked,
     Failed,
     Retest,
@@ -172,6 +174,9 @@ pub struct Verification {
     pub name: String,
     pub result: VerificationResult,
     pub proof_count: u8,
+    /// The right-aligned result text ('48 passed', 'retest') — structured
+    /// backend data, never model prose (§6.10).
+    pub result_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,13 +196,21 @@ impl App {
                 .transcript
                 .iter()
                 .map(|l| match l {
-                    crate::state::TranscriptLine::User(t)
-                    | crate::state::TranscriptLine::Assistant(t)
+                    crate::state::TranscriptLine::User { text: t, .. }
+                    | crate::state::TranscriptLine::Assistant { text: t, .. }
                     | crate::state::TranscriptLine::System(t) => t.clone(),
                     // D7: the chip line, as plain words.
                     crate::state::TranscriptLine::Redacted(kind) => {
                         format!("[blocked: {}]", kind.label())
                     }
+                    crate::state::TranscriptLine::Evidence { checks, .. } => {
+                        format!("[verified] {checks}")
+                    }
+                    crate::state::TranscriptLine::Sources(srcs) => srcs
+                        .iter()
+                        .map(|(i, p)| format!("[{i}] {p}"))
+                        .collect::<Vec<_>>()
+                        .join("   "),
                     crate::state::TranscriptLine::Stripped {
                         tool_name, summary, ..
                     } => {
@@ -449,6 +462,16 @@ pub struct App {
     /// time when a turn ends (ResponseFinished or CancelTurn). Rendered as
     /// dimmed `⏳` lines above the composer.
     pub queued: Vec<String>,
+    /// Sessions rail rows (§6.9) — filled by the backend bridge.
+    pub sessions: Vec<SessionRow>,
+    /// The conversation header's title (the open session's title).
+    pub header_title: String,
+    /// The conversation header's right meta (e.g. `14 turns`).
+    pub header_meta: String,
+    /// The workspace header's right meta (e.g. `4/5`).
+    pub workspace_meta: String,
+    /// The cursor row index in the Sessions rail.
+    pub session_cursor: usize,
     /// D3: the last submitted prompt — `r` in NORMAL mode re-submits it.
     /// Updated on every TextSubmitted that starts a turn (not queued ones).
     pub last_prompt: Option<String>,
@@ -469,11 +492,29 @@ pub struct App {
     pub viewport_manual: bool,
 }
 
+/// One row of the Sessions rail (§6.9): title, recency, state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    pub title: String,
+    /// Recency label right-aligned (now, 2h, 1d…).
+    pub recency: String,
+    /// Group heading (TODAY, YESTERDAY, THIS WEEK, OLDER).
+    pub group: &'static str,
+    /// ✕ failed state glyph; blank when idle.
+    pub failed: bool,
+    /// True for the open session (bold ink title).
+    pub open: bool,
+}
+
 /// One line in the transcript — either a user message or an assistant reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptLine {
-    User(String),
-    Assistant(String),
+    /// A user turn. `time` is the HH:MM stamp shown right-aligned on the
+    /// first row (None in Compact, which hides timestamps).
+    User { text: String, time: Option<String> },
+    /// An ORBIT turn. `time` as for User; `live` marks the in-flight turn
+    /// (cyan gutter) — settled turns render magenta.
+    Assistant { text: String, time: Option<String> },
     /// CoT-stripped placeholder (NEVER shows raw reasoning).
     Stripped {
         tool_name: String,
@@ -483,6 +524,9 @@ pub enum TranscriptLine {
         /// The call's settled outcome (None while running). Set by
         /// ToolCallFinished — the card's glyph depends on it (§6.5).
         outcome: Option<ToolOutcome>,
+        /// The settled outcome summary ('48 passed', '+9 −3') — right-
+        /// aligned meta on the card (§6.5). Empty while running.
+        meta: String,
         /// The tick the call started at — drives the live ticking duration
         /// on the running card. None for entries restored from a session
         /// file. (§16.1 seam: ticks, not Instants.)
@@ -490,6 +534,18 @@ pub enum TranscriptLine {
     },
     /// System note (cancelled turn, queue drained, etc.) — dim, never bold.
     System(String),
+    /// §6.6 evidence card: header + rows, built only from structured
+    /// verification data (never model prose).
+    Evidence {
+        /// The header's count text (e.g. `2 checks`).
+        checks: String,
+        /// The header's attestation note (e.g. `retest attestation recorded`).
+        note: String,
+        /// Rows: (check name, result text).
+        rows: Vec<(String, String)>,
+    },
+    /// §6.7 citations: the sources line after a turn's content.
+    Sources(Vec<(String, String)>),
     /// A text chunk the bridge rejected (D7). NEVER shows the rejected
     /// text; renders as a one-line chip: `[blocked: <kind>]`.
     Redacted(crate::RedactionKind),
@@ -638,6 +694,11 @@ impl App {
             toast_emitted_at: None,
             composer_state: ComposerState::Idle,
             queued: Vec::new(),
+            sessions: Vec::new(),
+            header_title: String::new(),
+            header_meta: String::new(),
+            workspace_meta: String::new(),
+            session_cursor: 0,
             last_prompt: None,
             turn_in_flight: false,
             cancel_requested: false,
@@ -648,6 +709,13 @@ impl App {
             bell_on_approval: false,
             bell_pending: false,
         }
+    }
+
+    /// The HH:MM stamp for a new transcript entry. The wall clock is read
+    /// here (the reducer's only wall-clock read); tests that need fixed
+    /// stamps set `transcript` directly.
+    fn now_hhmm(&self) -> Option<String> {
+        Some(crate::format::time_of_day(chrono::Local::now()))
     }
 
     /// Pop the next queued prompt (if any) and mark a turn in flight.
@@ -803,7 +871,7 @@ impl App {
                 let has_output = !output.is_empty();
                 if has_in_flight {
                     self.transcript
-                        .push(TranscriptLine::Assistant(self.in_flight.clone()));
+                        .push(TranscriptLine::Assistant { text: self.in_flight.clone(), time: self.now_hhmm() });
                     self.in_flight.clear();
                     // The settled line replaces the live one in place — same
                     // cells, different gutter color. The normal diff emits
@@ -811,7 +879,7 @@ impl App {
                     // caused a visible whole-screen flash on every turn.
                     self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::LAYOUT);
                 } else if has_output {
-                    self.transcript.push(TranscriptLine::Assistant(output));
+                    self.transcript.push(TranscriptLine::Assistant { text: output, time: self.now_hhmm() });
                 }
                 self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
                 self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
@@ -868,6 +936,7 @@ impl App {
                     tool_name: name.clone(),
                     summary: summary.clone(),
                     outcome: None,
+                    meta: String::new(),
                     started_at: Some(self.tick_count),
                 });
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
@@ -931,7 +1000,7 @@ impl App {
                     // flag from a turn that raced its own finish.)
                     self.cancel_requested = false;
                     self.last_prompt = Some(text.clone());
-                    self.transcript.push(TranscriptLine::User(text));
+                    self.transcript.push(TranscriptLine::User { text, time: self.now_hhmm() });
                     self.in_flight.clear();
                     self.tool_state = ToolState::Streaming;
                     self.turn_in_flight = true;
@@ -1761,7 +1830,7 @@ mod tests {
         assert_eq!(app.transcript.len(), 1);
         assert!(matches!(
             &app.transcript[0],
-            TranscriptLine::Assistant(t) if t == "final words"
+            TranscriptLine::Assistant { text: t, .. } if t == "final words"
         ));
     }
 
@@ -1800,7 +1869,7 @@ mod tests {
     #[test]
     fn transcript_grows_on_user_and_assistant() {
         let mut app = App::new();
-        app.transcript.push(TranscriptLine::User("hi".into()));
+        app.transcript.push(TranscriptLine::User { text: "hi".into(), time: None });
         app.reduce(Msg::TextDelta("hello!".into()));
         // Flush coalescer manually (bypass timing).
         if let Some(text) = app.coalescer.flush(app.tick_count) {
@@ -1813,8 +1882,8 @@ mod tests {
             cost_microcents: 0,
         });
         assert_eq!(app.transcript.len(), 2);
-        assert!(matches!(app.transcript[0], TranscriptLine::User(_)));
-        assert!(matches!(app.transcript[1], TranscriptLine::Assistant(_)));
+        assert!(matches!(app.transcript[0], TranscriptLine::User { .. }));
+        assert!(matches!(app.transcript[1], TranscriptLine::Assistant { .. }));
     }
 
     #[test]

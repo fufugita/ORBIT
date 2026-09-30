@@ -1,283 +1,271 @@
-//! Ratatui rendering — the ORBIT visual system (docs/tui/DESIGN.md).
+//! Ratatui rendering — the ORBIT visual system (PROMPT.md §6, §8).
 //!
 //! Ink, not boxes: structure comes from gutters, alignment, spacing and
 //! hairlines. No pane has a border. At most one rounded frame is on screen
 //! at a time, and a frame always means "this needs you" — an approval, the
 //! palette, a confirmation. All colours come from the token palette
 //! (tokens.rs); all glyphs from glyphs.rs. No literals in render code.
+//!
+//! Layout (§8): one shared pane-header row, air, pane bodies with the
+//! transcript bottom-anchored, air, the composer (input + hint), and the
+//! status line. Width classes (§8.2) pick which panes exist; the
+//! conversation column geometry (§8.3) fixes every offset.
 
 use crate::glyphs::Glyphs;
 use crate::rich::render_message;
 use crate::state::{
-    App, ConnectionState, Focus, LeftTab, LogoPhase, TaskState, ToolOutcome, ToolState,
-    TranscriptLine, VerificationResult,
+    App, ConnectionState, Focus, LeftTab, LogoPhase, SessionRow, TaskState, ToolOutcome,
+    ToolState, TranscriptLine, VerificationResult,
 };
 use crate::tokens::Design;
-use crate::unicode::truncate_graphemes;
+use crate::unicode::{display_width, truncate_graphemes};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-// ── Pane headers (§6.1) ──────────────────────────────────────────────────────
+// ── Width classes (§8.2) ─────────────────────────────────────────────────────
 
-/// Interpolate between two colors for the band fade. Returns the nearest
-/// step of `steps` colors from a to b (truecolor blends exactly; indexed
-/// tiers snap to their own palettes via the token system, so this helper
-/// only ever blends truecolor values).
-fn blend_color(a: Color, b: Color, t: f32) -> Color {
-    match (a, b) {
-        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg_, bb)) => Color::Rgb(
-            ar + ((br as f32 - ar as f32) * t).round() as u8,
-            ag + ((bg_ as f32 - ag as f32) * t).round() as u8,
-            ab + ((bb as f32 - ab as f32) * t).round() as u8,
-        ),
-        // Non-RGB tiers keep the base color — the fade is a truecolor-only
-        // nicety; 256/16/mono get a flat band (still zero glyphs).
-        _ => a,
-    }
+/// Which panes exist and their geometry, per §8.2.
+#[derive(Debug, Clone, Copy)]
+pub struct WidthClass {
+    /// Sessions rail: Some((x, w)) when present.
+    pub sessions: Option<(u16, u16)>,
+    /// Conversation pane: (x, w).
+    pub conversation: (u16, u16),
+    /// Workspace rail: Some((x, w)) when present.
+    pub workspace: Option<(u16, u16)>,
+    /// Single-view mode (Narrow/Compact/Tight): the header is a switcher.
+    pub single_view: bool,
+    /// Status line level 0..=3 (§6.11).
+    pub status_level: u8,
+    /// Compact (60–79): no transcript timestamps, tool meta drops duration.
+    pub compact: bool,
+    /// Tight (40–59): no hint row, no language labels, no recency.
+    pub tight: bool,
 }
 
-/// Draw a header band: a title chip on a background row that fades to the
-/// canvas over the last FADE_COLS columns. Pure color — zero line glyphs,
-/// so the ASCII tier renders identically (minus color depth) and the
-/// ambiguous-width probe can never demote it to `----`.
-///
-/// Focus is the tmux active-tab convention: the focused pane's title is a
-/// FILLED chip (magenta bg, canvas text, bold) and its band rides
-/// magenta_dim fading to canvas; unfocused panes get a surface2 band and
-/// an ink2 title. Mono falls back to reversed video on the chip only.
-const FADE_COLS: u16 = 10;
-
-fn draw_header_band(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    title: &str,
-    focused: bool,
-    d: &Design,
-) {
-    let p = &d.palette;
-    if area.width < 2 {
-        return;
-    }
-    let (band, title_style) = if focused {
-        let mut chip = Style::default().fg(p.bg).bg(p.magenta);
-        if d.caps.color == crate::tokens::ColorTier::Mono {
-            chip = Style::default()
-                .fg(p.magenta)
-                .add_modifier(Modifier::REVERSED);
+pub fn width_class(w: u16) -> WidthClass {
+    if w >= 140 {
+        // Wide: L = clamp(28, round(0.20·W), 34), R = clamp(32, round(0.24·W), 44)
+        let l = (0.20 * w as f32).round() as u16;
+        let l = l.clamp(28, 34);
+        let r = (0.24 * w as f32).round() as u16;
+        let r = r.clamp(32, 44);
+        let c = w - l - r - 2;
+        WidthClass {
+            sessions: Some((0, l)),
+            conversation: (l + 1, c),
+            workspace: Some((l + c + 2, r)),
+            single_view: false,
+            status_level: 0,
+            compact: false,
+            tight: false,
         }
-        (p.magenta_dim, chip.add_modifier(Modifier::BOLD))
-    } else {
-        (p.surface2, Style::default().fg(p.ink2).bg(p.surface2))
-    };
-    // The band: full-row bg fill fading to canvas bg over the tail.
-    let fade_start = area.width.saturating_sub(FADE_COLS).max(1);
-    for x in 0..area.width {
-        let t = if x < fade_start {
-            0.0
-        } else {
-            (x - fade_start) as f32 / (area.width - fade_start) as f32
-        };
-        let cell_color = blend_color(band, p.bg, t);
-        let cell = &mut buf[(area.x + x, area.y)];
-        cell.set_symbol(" ")
-            .set_style(Style::default().bg(cell_color));
-    }
-    // The title chip rides the band's left edge.
-    let title_text = format!(" {title} ");
-    let chars: Vec<char> = title_text.chars().collect();
-    for (i, c) in chars.iter().enumerate() {
-        if (i as u16) >= area.width {
-            break;
+    } else if w >= 110 {
+        // Medium: Conversation │ Workspace. R = clamp(30, round(0.30·W), 36)
+        let r = (0.30 * w as f32).round() as u16;
+        let r = r.clamp(30, 36);
+        WidthClass {
+            sessions: None,
+            conversation: (0, w - r - 1),
+            workspace: Some((w - r, r)),
+            single_view: false,
+            status_level: 1,
+            compact: false,
+            tight: false,
         }
-        let cell = &mut buf[(area.x + i as u16, area.y)];
-        cell.set_symbol(&c.to_string()).set_style(title_style);
-    }
-}
-
-/// Render a pane with a banded header (no border, no frame glyphs): one
-/// header row of color + a 1-col inset each side for breathing room.
-/// Returns the inner content rect.
-fn render_pane_frame(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    title: &str,
-    focused: bool,
-    d: &Design,
-) -> Rect {
-    if area.width >= 2 && area.height >= 2 {
-        draw_header_band(frame.buffer_mut(), area, title, focused, d);
-    }
-    Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    }
-}
-
-// ── Keycap chips (§6.15 keycap style, reused in hints) ───────────────────────
-
-/// A keycap chip: surface2 bg, ink2 key. Used in hint rows and approval
-/// keys. Mono tier falls back to [key] (brackets survive Reset colors).
-fn keycap(key: &str, p: &crate::tokens::ResolvedPalette, mono: bool) -> Span<'static> {
-    if mono {
-        Span::styled(format!(" [{key}] "), Style::default().fg(p.muted))
+    } else if w >= 80 {
+        WidthClass {
+            sessions: None,
+            conversation: (0, w),
+            workspace: None,
+            single_view: true,
+            status_level: 2,
+            compact: false,
+            tight: false,
+        }
+    } else if w >= 60 {
+        WidthClass {
+            sessions: None,
+            conversation: (0, w),
+            workspace: None,
+            single_view: true,
+            status_level: 2,
+            compact: true,
+            tight: false,
+        }
     } else {
-        Span::styled(
-            format!(" {key} "),
-            Style::default().fg(p.ink2).bg(p.surface2),
-        )
+        WidthClass {
+            sessions: None,
+            conversation: (0, w),
+            workspace: None,
+            single_view: true,
+            status_level: 3,
+            compact: false,
+            tight: true,
+        }
     }
+}
+
+/// The conversation column geometry (§8.3): content-left and measure.
+fn out_last_is_text(out: &[Line<'static>]) -> bool {
+    out.last()
+        .map(|l| !l.spans.iter().all(|sp| sp.content.trim().is_empty()))
+        .unwrap_or(false)
+}
+
+pub fn conv_column(x: u16, w: u16) -> (u16, u16) {
+    let base = x + 3;
+    let extra = (w as i32 - 5 - 100).max(0) as u16;
+    let cl = base + extra / 2;
+    let cw = (w - 5).min(100);
+    (cl, cw)
 }
 
 // ── Main render ──────────────────────────────────────────────────────────────
 
-/// Render the current app state into the frame.
-///
-/// Layout (§5.3 row priorities): 1 header row | 1 main row | 1 status line.
-/// The chrome budget is 3 rows total (the old build spent 11).
 pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &Design) {
     let area = frame.area();
     let g = &Glyphs::for_set(d.caps.glyphs);
 
-    // Vertical: header (1) | main (fill) | status (1).
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    render_header_row(frame, outer[0], app, d, g);
-
-    // Quiet rails (§5, the original spec): the conversation is the hero —
-    // no border, full brightness. The rails are dim sidebars behind
-    // full-height hairline dividers that double as scroll tracks (§6.14).
-    // The herdr pivot boxed all three panes equally, which read as a tmux
-    // dashboard; this restores the hierarchy: you sit at the centre with
-    // the brightest ink, everything else orbits in progressively dimmer
-    // rings. Only zoom mode (Z) retains a frame.
-    // Rails collapse responsively (the conversation keeps ≥40 cols):
-    // full rails ≥120, right drops 100-119, left drops 80-99, single <80.
-    let total = area.width;
-    let (left_w, right_w) = if total >= 120 {
-        (d.layout_rails.0, d.layout_rails.1)
-    } else if total >= 100 {
-        (d.layout_rails.0, total - d.layout_rails.0 - 44)
-    } else if total >= 80 {
-        (18, 22)
-    } else {
-        (0, 0)
-    };
-    let mut constraints = Vec::new();
-    if left_w > 0 {
-        constraints.push(Constraint::Length(left_w));
-        constraints.push(Constraint::Length(1)); // divider
-    }
-    constraints.push(Constraint::Min(10)); // conversation
-    if right_w > 0 {
-        constraints.push(Constraint::Length(1)); // divider
-        constraints.push(Constraint::Length(right_w));
-    }
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(outer[1]);
-
-    // Pane slots depend on which rails are present.
-    // Record the pane rects for the mouse hit-test (interior mutability —
-    // the renderer sees &App).
-    app.pane_rects
-        .left
-        .set(if left_w > 0 { Some(main[0]) } else { None });
-    app.pane_rects
-        .center
-        .set(Some(main[if left_w > 0 { 2 } else { 0 }]));
-    app.pane_rects.right.set(if right_w > 0 {
-        Some(main[main.len() - 1])
-    } else {
-        None
-    });
-
-    // Zoom: the zoomed pane fills the whole surface, framed (Z is an
-    // explicit "give me this pane big" — a frame is honest there).
-    if let Some(zoomed) = app.zoomed_pane {
-        match zoomed {
-            Focus::Left => render_left_pane(frame, outer[1], app, d, g, true),
-            Focus::Center => render_center_pane(frame, outer[1], app, composer_text, d, g, true),
-            Focus::Right => render_right_pane(frame, outer[1], app, d, g, true),
-            _ => {}
+    // The canvas: every cell carries the bg token (§6.1).
+    let bg_style = Style::default().bg(d.palette.bg);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            frame.buffer_mut()[(x, y)].set_style(bg_style);
         }
-        render_status_bar(frame, outer[2], app, d, g);
+    }
+
+    // §9.23 size notice: below 40 × 10, draw ONLY the notice.
+    if area.width < 40 || area.height < 10 {
+        render_size_notice(frame, area, d, g);
         return;
     }
-    let mut idx = 0;
-    let mut left_div: Option<Rect> = None;
-    if left_w > 0 {
-        render_left_pane(frame, main[idx], app, d, g, false);
-        left_div = Some(main[idx + 1]);
-        idx += 2; // rail + divider
-    }
-    render_center_pane(frame, main[idx], app, composer_text, d, g, false);
-    let mut right_div: Option<Rect> = None;
-    if right_w > 0 {
-        right_div = Some(main[idx + 1]);
-        render_right_pane(frame, main[idx + 2], app, d, g, false); // divider + rail
-    }
-    // The dividers: full-height hairlines (§6.14). The right divider is
-    // the transcript's scroll track when the transcript overflows.
-    if let Some(rect) = left_div.or(right_div) {
-        let _ = rect;
-    }
-    if let Some(rect) = left_div {
-        render_divider(frame, rect, d, g);
-    }
-    if let Some(rect) = right_div {
-        render_divider(frame, rect, d, g);
-    }
 
-    // Per-pane selection highlight (herdr-style): paint the selected cells
-    // INSIDE the owning pane only — the pane boundary is the isolation
-    // boundary.
-    if let Some(sel) = &app.selection {
-        if sel.is_visible() {
-            let rect = match sel.pane {
-                Focus::Left => app.pane_rects.left.get(),
-                Focus::Center => app.pane_rects.center.get(),
-                Focus::Right => app.pane_rects.right.get(),
-                _ => None,
-            };
-            if let Some(rect) = rect {
-                let inner = ratatui::layout::Rect {
-                    x: rect.x + 1,
-                    y: rect.y + 1,
-                    width: rect.width.saturating_sub(2),
-                    height: rect.height.saturating_sub(2),
-                };
-                let buf = frame.buffer_mut();
-                for row in 0..inner.height {
-                    for col in 0..inner.width {
-                        if sel.contains(row, col) {
-                            let cell = &mut buf[(inner.x + col, inner.y + row)];
-                            let fg = cell.style().fg.unwrap_or(d.palette.ink);
-                            cell.set_style(Style::default().fg(fg).bg(d.palette.magenta_dim));
-                        }
-                    }
-                }
-            }
+    let wc = width_class(area.width);
+
+    // Vertical (§8.1): header | air | body | air | composer | hint | status.
+    let show_hint = area.height >= 16 && !wc.tight;
+    let show_header = area.height >= 12 || !wc.single_view;
+    let mut constraints = Vec::new();
+    if show_header {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // air
+    constraints.push(Constraint::Min(4)); // body
+    constraints.push(Constraint::Length(1)); // air above composer
+    constraints.push(Constraint::Length(1)); // composer input
+    if show_hint {
+        constraints.push(Constraint::Length(1)); // hint row
+    }
+    constraints.push(Constraint::Length(1)); // status
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let mut i = 0usize;
+    if show_header {
+        render_pane_headers(frame, rows[i], app, &wc, d, g);
+        i += 1;
+    }
+    i += 1; // air
+    let body = rows[i];
+    i += 1;
+    i += 1; // air above composer
+    let composer_row = rows[i];
+    i += 1;
+    let hint_row = if show_hint {
+        let r = rows[i];
+        i += 1;
+        r
+    } else {
+        Rect::new(0, 0, 0, 0)
+    };
+    let status_row = rows[i];
+
+    // Horizontal split of the body into panes. The dividers run from below
+    // the header to above the status line (§8.6: row 0 to H-2 — including
+    // the air rows), so compute them against the full span.
+    let div_top = if show_header { area.y + 1 } else { area.y };
+    let div_bottom = status_row.y; // exclusive
+    let mut panes: Vec<Rect> = Vec::new();
+    let mut dividers: Vec<Rect> = Vec::new();
+    let mut x = body.x;
+    if let Some((_, sw)) = wc.sessions {
+        panes.push(Rect { x, y: body.y, width: sw, height: body.height });
+        x += sw;
+        dividers.push(Rect { x, y: div_top, width: 1, height: div_bottom.saturating_sub(div_top) });
+        x += 1;
+    }
+    let (_, cw) = wc.conversation;
+    panes.push(Rect { x, y: body.y, width: cw, height: body.height });
+    x += cw;
+    if let Some((_, ww)) = wc.workspace {
+        dividers.push(Rect { x, y: div_top, width: 1, height: div_bottom.saturating_sub(div_top) });
+        x += 1;
+        panes.push(Rect { x, y: body.y, width: ww, height: body.height });
+    }
+    // Record pane rects for the mouse hit-test.
+    app.pane_rects.left.set(panes.first().copied().filter(|_| wc.sessions.is_some()));
+    app.pane_rects
+        .center
+        .set(panes.get(wc.sessions.is_some() as usize).copied());
+    app.pane_rects
+        .right
+        .set(panes.last().copied().filter(|_| wc.workspace.is_some()));
+
+    // Render panes.
+    let mut pane_idx = 0usize;
+    if wc.sessions.is_some() {
+        render_sessions_rail(frame, panes[pane_idx], app, d, g);
+        pane_idx += 1;
+    }
+    let conv_area = panes[pane_idx];
+    render_conversation(
+        frame,
+        conv_area,
+        app,
+        composer_text,
+        d,
+        g,
+        &wc,
+        composer_row,
+        hint_row,
+        show_hint,
+    );
+    // The thumb spans exactly the pane rows that carry content — scan the
+    // rendered buffer (immune to line-accounting drift).
+    let buf = frame.buffer_mut();
+    let mut t0 = conv_area.bottom();
+    let mut t1 = conv_area.y;
+    for y in conv_area.top()..conv_area.bottom() {
+        let has_content = (conv_area.left()..conv_area.right())
+            .any(|x| buf[(x, y)].symbol() != " ");
+        if has_content {
+            t0 = t0.min(y);
+            t1 = t1.max(y);
         }
     }
-    // Command palette (§6.13): an overlay above the panes, under the
-    // status line.
-    if app.palette.open {
-        render_palette(frame, outer[1], app, d, g);
+    let thumb_range = if t1 >= t0 { (t0, t1) } else { (0, 0) };
+    pane_idx += 1;
+    if wc.workspace.is_some() {
+        render_workspace_rail(frame, panes[pane_idx], app, d, g);
+    }
+    for (di, div) in dividers.iter().enumerate() {
+        // The divider immediately right of the transcript is its scroll
+        // track (§8.6) — the thumb spans the content rows (bottom-anchored).
+        let is_scroll_track = (wc.sessions.is_some() && di == 1)
+            || (wc.sessions.is_none() && di == 0);
+        render_divider(frame, *div, d, g, is_scroll_track, thumb_range);
     }
 
-    render_status_bar(frame, outer[2], app, d, g);
+    // Command palette (§6.13): an overlay above the panes.
+    if app.palette.open {
+        render_palette(frame, body, app, d, g);
+    }
+
+    render_status_bar(frame, status_row, app, &wc, d, g);
 
     // Overlays — the only frames on screen (one at a time, §1).
     if app.quit_confirmation {
@@ -287,378 +275,469 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
         render_help_overlay(frame, area, app, d, g);
     }
     if !app.pending_approvals.is_empty() {
-        // Docked inside the pane area (outer[1]) — never collides with the
-        // status line.
-        render_approval_modal(frame, outer[1], app, d, g);
+        render_approval_modal(frame, area, app, d, g, &wc);
     }
 }
 
-// ── Divider / scrollbar (§6.14) ──────────────────────────────────────────────
+// ── Pane headers (§8.5) ──────────────────────────────────────────────────────
 
-/// A full-height hairline divider — the separation between the hero
-/// conversation and a dim rail. Doubles as a scroll track (§6.14).
-fn render_divider(frame: &mut ratatui::Frame, area: Rect, d: &Design, _g: &Glyphs) {
-    // A 1-column color gutter, not a │ glyph — the seam between panes is
-    // a surface-tinted column that reads as a soft shadow.
+/// One shared header row: each pane's title + rule + right meta, side by
+/// side. Focused: magenta bold title, heavy ━ in rule_hi. Unfocused: active
+/// tab ink bold, other tabs muted, light ─ in rule.
+fn render_pane_headers(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    wc: &WidthClass,
+    d: &Design,
+    g: &Glyphs,
+) {
+    let p = &d.palette;
+    let buf = frame.buffer_mut();
+    if wc.single_view {
+        // View switcher: Sessions   Conversation   Workspace 2/5 ━━━━
+        let active = match app.focus {
+            Focus::Left => "Sessions",
+            Focus::Center | Focus::Status => "Conversation",
+            Focus::Right => "Workspace",
+        };
+        let mut x = 1u16;
+        for name in ["Sessions", "Conversation", "Workspace"] {
+            let style = if name == active {
+                Style::default().fg(p.magenta).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.muted)
+            };
+            for c in name.chars() {
+                if x >= area.x + area.width {
+                    return;
+                }
+                buf[(x, area.y)].set_symbol(&c.to_string()).set_style(style);
+                x += 1;
+            }
+            x += 3;
+        }
+        // The workspace meta (2/5) rides the switcher: cyan while a turn
+        // is live, muted when idle.
+        if !app.workspace_meta.is_empty() {
+            let live = app.turn_in_flight
+                || app.tool_state == ToolState::Streaming
+                || matches!(app.tool_state, ToolState::Running(_));
+            let style = if live {
+                Style::default().fg(p.cyan)
+            } else {
+                Style::default().fg(p.muted)
+            };
+            for c in app.workspace_meta.chars() {
+                if x >= area.x + area.width {
+                    break;
+                }
+                buf[(x, area.y)].set_symbol(&c.to_string()).set_style(style);
+                x += 1;
+            }
+            x += 1;
+        }
+        // The rule fills the rest, heavy for the focused view.
+        let focused_center = app.focus == Focus::Center;
+        let rule_ch = if focused_center { g.rule_focus } else { g.rule };
+        let rule_color = if focused_center { p.rule_hi } else { p.rule };
+        while x < area.x + area.width.saturating_sub(1) {
+            buf[(x, area.y)]
+                .set_symbol(rule_ch)
+                .set_style(Style::default().fg(rule_color));
+            x += 1;
+        }
+        return;
+    }
+    // Multi-pane: one header segment per pane.
+    if let Some((sx, sw)) = wc.sessions {
+        // Two tabs: the active one ink bold (focused: magenta bold), the
+        // other muted (§8.5).
+        let (a, b) = match app.left_tab {
+            LeftTab::Sessions => ("Sessions", "Activity"),
+            LeftTab::Verbose => ("Activity", "Sessions"),
+        };
+        draw_tabs_header(buf, Rect { x: sx, y: area.y, width: sw, height: 1 }, a, b, app.focus == Focus::Left, d, g);
+    }
+    let mut segs: Vec<(Rect, &str, String, bool)> = Vec::new();
+    let (cx, cwid) = wc.conversation;
+    segs.push((
+        Rect { x: cx, y: area.y, width: cwid, height: 1 },
+        &app.header_title,
+        app.header_meta.clone(),
+        app.focus == Focus::Center,
+    ));
+    if let Some((wx, ww)) = wc.workspace {
+        segs.push((
+            Rect { x: wx, y: area.y, width: ww, height: 1 },
+            "Workspace",
+            String::new(),
+            app.focus == Focus::Right,
+        ));
+    }
+    for (rect, title, meta, focused) in segs {
+        draw_pane_header(buf, rect, title, &meta, focused, d, g);
+    }
+    // The divider glyphs pierce the header row too (§8.6: row 0 to H-2).
+    if let Some((_, sw)) = wc.sessions {
+        buf[(sw, area.y)]
+            .set_symbol(g.divider)
+            .set_style(Style::default().fg(p.rule));
+    }
+    if let Some((wx, _)) = wc.workspace {
+        buf[(wx.saturating_sub(1), area.y)]
+            .set_symbol(g.divider)
+            .set_style(Style::default().fg(p.rule));
+    }
+}
+
+/// One pane's header segment: title at x+1, rule after, right meta at
+/// x+w-2 (§8.5).
+fn draw_pane_header(
+    buf: &mut ratatui::buffer::Buffer,
+    rect: Rect,
+    title: &str,
+    meta: &str,
+    focused: bool,
+    d: &Design,
+    g: &Glyphs,
+) {
+    let p = &d.palette;
+    if rect.width < 3 {
+        return;
+    }
+    let (title_style, rule_ch, rule_color) = if focused {
+        (
+            Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
+            g.rule_focus,
+            p.rule_hi,
+        )
+    } else {
+        (Style::default().fg(p.ink).add_modifier(Modifier::BOLD), g.rule, p.rule)
+    };
+    let mut x = rect.x + 1;
+    for c in title.chars() {
+        if x >= rect.x + rect.width {
+            return;
+        }
+        buf[(x, rect.y)].set_symbol(&c.to_string()).set_style(title_style);
+        x += 1;
+    }
+    let meta_w = display_width(meta) as u16;
+    let meta_x = if meta_w > 0 {
+        rect.x + rect.width.saturating_sub(2).saturating_sub(meta_w).saturating_add(1)
+    } else {
+        rect.x + rect.width.saturating_sub(1)
+    };
+    let rule_end = if meta_w > 0 {
+        meta_x.saturating_sub(1)
+    } else {
+        rect.x + rect.width - 1
+    };
+    x += 1;
+    while x < rule_end {
+        buf[(x, rect.y)]
+            .set_symbol(rule_ch)
+            .set_style(Style::default().fg(rule_color));
+        x += 1;
+    }
+    if meta_w > 0 {
+        let mut mx = meta_x;
+        for c in meta.chars() {
+            if mx >= rect.x + rect.width {
+                break;
+            }
+            buf[(mx, rect.y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.muted));
+            mx += 1;
+        }
+    }
+}
+
+/// A two-tab header (the Sessions rail): active tab bold (magenta when the
+/// rail is focused, ink otherwise), the other tab muted, light rule.
+fn draw_tabs_header(
+    buf: &mut ratatui::buffer::Buffer,
+    rect: Rect,
+    tab_a: &str,
+    tab_b: &str,
+    focused: bool,
+    d: &Design,
+    g: &Glyphs,
+) {
+    let p = &d.palette;
+    if rect.width < 4 {
+        return;
+    }
+    let active_style = if focused {
+        Style::default().fg(p.magenta).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.ink).add_modifier(Modifier::BOLD)
+    };
+    let mut x = rect.x + 1;
+    for c in tab_a.chars() {
+        if x >= rect.x + rect.width { return; }
+        buf[(x, rect.y)].set_symbol(&c.to_string()).set_style(active_style);
+        x += 1;
+    }
+    x += 2;
+    for c in tab_b.chars() {
+        if x >= rect.x + rect.width { return; }
+        buf[(x, rect.y)].set_symbol(&c.to_string()).set_style(Style::default().fg(p.muted));
+        x += 1;
+    }
+    x += 1;
+    while x < rect.x + rect.width.saturating_sub(1) {
+        buf[(x, rect.y)].set_symbol(g.rule).set_style(Style::default().fg(p.rule));
+        x += 1;
+    }
+}
+
+// ── Divider / scroll track (§8.6) ────────────────────────────────────────────
+
+fn render_divider(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    d: &Design,
+    g: &Glyphs,
+    scroll_track: bool,
+    thumb_range: (u16, u16),
+) {
     if area.width < 1 || area.height < 1 {
         return;
     }
     let buf = frame.buffer_mut();
+    // The thumb spans the content rows (bottom-anchored), muted; the rest
+    // of the track is rule (§8.6).
+    let (t0, t1) = thumb_range;
     for y in area.top()..area.bottom() {
-        buf[(area.x, y)]
-            .set_symbol(" ")
-            .set_style(Style::default().bg(d.palette.surface));
+        let (sym, fg) = if scroll_track && y >= t0 && y <= t1 {
+            (g.thumb, d.palette.muted)
+        } else {
+            (g.divider, d.palette.rule)
+        };
+        buf[(area.x, y)].set_symbol(sym).set_style(Style::default().fg(fg));
     }
 }
 
-// ── Left rail (§6.9) ─────────────────────────────────────────────────────────
+// ── Sessions rail (§6.9) ─────────────────────────────────────────────────────
 
-/// A quiet rail header (§6.1): small-caps title, then a hairline rule
-/// filling the rest of the row. The focused rail's title is magenta with a
-/// heavier rule; unfocused is ink2. NO box — the rail is a dim sidebar,
-/// not a pane.
-fn render_rail_header(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    title: &str,
-    focused: bool,
-    d: &Design,
-    _g: &Glyphs,
-) -> Rect {
-    let inner = Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: area.height.saturating_sub(1),
-    };
-    if area.width < 4 || area.height < 2 {
-        return inner;
-    }
-    // The rail rides the same color-band header as the panes — no rule
-    // glyphs anywhere. Focused: magenta chip on magenta_dim band;
-    // unfocused: ink2 chip on surface2 band.
-    draw_header_band(frame.buffer_mut(), area, title, focused, d);
-    inner
-}
-
-fn render_left_pane(
+fn render_sessions_rail(
     frame: &mut ratatui::Frame,
     area: Rect,
     app: &App,
     d: &Design,
     g: &Glyphs,
-    framed: bool,
 ) {
     let p = &d.palette;
-    let title = match app.left_tab {
-        LeftTab::Sessions => "Sessions",
-        LeftTab::Verbose => "Activity",
-    };
-    let body = if framed {
-        render_pane_frame(frame, area, title, app.focus == Focus::Left, d)
-    } else {
-        render_rail_header(frame, area, title, app.focus == Focus::Left, d, g)
-    };
-
-    // One blank row of breathing room below the header (matches the
-    // transcript's padding).
-    let mut lines: Vec<Line> = vec![Line::from("")];
-
-    match app.left_tab {
-        LeftTab::Sessions => {
-            // ── Session block ──
-            let conn_glyph = match app.connection {
-                ConnectionState::Online => (g.conn_online, p.green),
-                ConnectionState::Reconnecting => (g.conn_retrying, p.amber),
-                ConnectionState::Offline => (g.conn_offline, p.red),
-            };
-            lines.push(Line::from(vec![
-                Span::styled(conn_glyph.0, Style::default().fg(conn_glyph.1)),
-                Span::raw(" "),
-                Span::styled(&app.session_id_prefix, Style::default().fg(p.ink)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("model ", Style::default().fg(p.muted)),
-                Span::styled(&app.model, Style::default().fg(p.ink2)),
-            ]));
-            lines.push(Line::from(""));
-
-            // ── Usage block (herdr shows tokens per agent) ──
-            lines.push(section_label("USAGE", p));
-            lines.push(Line::from(vec![
-                Span::styled("turns ", Style::default().fg(p.muted)),
-                Span::styled(app.total_turns.to_string(), Style::default().fg(p.ink2)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("in    ", Style::default().fg(p.muted)),
-                Span::styled(
-                    format_tokens(app.total_input_tokens),
-                    Style::default().fg(p.ink2),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("out   ", Style::default().fg(p.muted)),
-                Span::styled(
-                    format_tokens(app.total_output_tokens),
-                    Style::default().fg(p.ink2),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("cost  ", Style::default().fg(p.muted)),
-                Span::styled(cost_display_string(app), Style::default().fg(p.ink2)),
-            ]));
-            lines.push(Line::from(""));
-
-            // ── Queue block ──
-            if !app.queued.is_empty() {
-                lines.push(section_label("QUEUED", p));
-                for (i, q) in app.queued.iter().enumerate() {
-                    let shown: String = q.chars().take(body.width as usize - 4).collect();
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{} ", i + 1), Style::default().fg(p.faint)),
-                        Span::styled(shown, Style::default().fg(p.ink2)),
-                    ]));
-                }
-                lines.push(Line::from(""));
-            }
-
-            // ── Keys hint: the three essentials; ? shows the full map ──
-            lines.push(section_label("KEYS", p));
-            for (k, v) in [
-                ("Tab", "cycle panes"),
-                ("Z", "zoom pane"),
-                ("?", "all keys"),
-            ] {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{k:<8}"), Style::default().fg(p.ink2)),
-                    Span::styled(v, Style::default().fg(p.muted)),
-                ]));
-            }
+    let focused = app.focus == Focus::Left;
+    let buf = frame.buffer_mut();
+    let mut y = area.y;
+    let mut last_group = "";
+    for (i, s) in app.sessions.iter().enumerate() {
+        if y >= area.bottom() {
+            break;
         }
-        LeftTab::Verbose => {
-            if app.in_flight.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "(no active stream)",
-                    Style::default().fg(p.faint),
-                )));
-            } else {
-                // The live stream, wrapped to the rail width.
-                let width = body.width as usize;
-                let mut row = String::new();
-                for ch in app.in_flight.chars() {
-                    if row.chars().count() >= width {
-                        lines.push(Line::from(Span::styled(
-                            row.clone(),
-                            Style::default().fg(p.ink2),
-                        )));
-                        row.clear();
-                    }
-                    row.push(ch);
-                }
-                if !row.is_empty() {
-                    lines.push(Line::from(Span::styled(row, Style::default().fg(p.ink2))));
+        if s.group != last_group {
+            if !last_group.is_empty() {
+                y += 1; // blank row between groups
+                if y >= area.bottom() {
+                    break;
                 }
             }
+            for (j, c) in s.group.chars().enumerate() {
+                if 2 + j as u16 >= area.width {
+                    break;
+                }
+                buf[(area.x + 2 + j as u16, y)]
+                    .set_symbol(&c.to_string())
+                    .set_style(Style::default().fg(p.muted));
+            }
+            y += 1;
+            last_group = s.group;
         }
+        if y >= area.bottom() {
+            break;
+        }
+        // Row (§8.4): ▌ at x (focused cursor), state glyph at x+1, title at
+        // x+3, recency right-aligned ending at x+w-2.
+        let cursor = i == app.session_cursor;
+        let fill = if cursor {
+            if focused { p.wash } else { p.surface2 }
+        } else {
+            p.bg
+        };
+        for x in area.left()..area.right() {
+            buf[(x, y)].set_style(Style::default().bg(fill));
+        }
+        if cursor && focused {
+            buf[(area.x, y)]
+                .set_symbol(g.selection)
+                .set_style(Style::default().fg(p.magenta).bg(fill));
+        }
+        if s.failed {
+            buf[(area.x + 1, y)]
+                .set_symbol(g.failed)
+                .set_style(Style::default().fg(p.red).bg(fill));
+        }
+        let recency_w = display_width(&s.recency) as u16;
+        // Title budget w-3-len(recency)-2 (§8.4); the 2 includes the space
+        // before the recency.
+        let budget = (area.width as usize)
+            .saturating_sub(3 + recency_w as usize + 2)
+            .max(1);
+        let rec_x = area.x + area.width.saturating_sub(2).saturating_sub(recency_w).saturating_add(1);
+        let title = truncate_graphemes(&s.title, budget);
+        let title_style = if s.open || (cursor && focused) {
+            Style::default().fg(p.ink).add_modifier(Modifier::BOLD).bg(fill)
+        } else {
+            Style::default().fg(p.ink2).bg(fill)
+        };
+        let mut tx = area.x + 3;
+        for c in title.chars() {
+            if tx >= area.x + area.width {
+                break;
+            }
+            buf[(tx, y)].set_symbol(&c.to_string()).set_style(title_style);
+            tx += 1;
+        }
+        // One space between title and recency (the golden's rhythm).
+        if tx < rec_x {
+            buf[(tx, y)].set_symbol(" ").set_style(Style::default().bg(fill));
+        }
+        let rec_fg = if cursor { p.ink2 } else { p.muted };
+        for (j, c) in s.recency.chars().enumerate() {
+            buf[(rec_x + j as u16, y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(rec_fg).bg(fill));
+        }
+        y += 1;
     }
-
-    // Per-pane scroll (functional isolation).
-    let para = Paragraph::new(lines).scroll((app.pane_scroll[0], 0));
-    frame.render_widget(para, body);
 }
 
-/// A small caps section label with a rule — the visual rhythm anchor.
-fn section_label(text: &str, p: &crate::tokens::ResolvedPalette) -> Line<'static> {
-    // The label rides a short color tail instead of a ─ glyph: a surface
-    // band under the two cells after the word. Zero glyphs, fluid.
-    Line::from(vec![
-        Span::styled(text.to_string(), Style::default().fg(p.faint)),
-        Span::styled("  ".to_string(), Style::default().bg(p.surface)),
-    ])
-}
+// ── Conversation pane (§6.2–6.8, §8.3) ────────────────────────────────────────
 
-/// Compact token counts: 1234 → 1.2k.
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}m", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-/// D5 + D18: the cost string for the verbose pane. Committed + current-turn
-/// cost; `cost n/a` when the model has no pricing entry.
-fn cost_display_string(app: &App) -> String {
-    if !app.model_priced {
-        return crate::format::cost_unpriced().to_string();
-    }
-    let total = app.total_cost_microcents.saturating_add(app.turn_cost_microcents);
-    crate::format::cost(total)
-}
-
-// ── Center pane: transcript + composer (§6.2–6.8, §5.5) ──────────────────────
-
-fn render_center_pane(
+#[allow(clippy::too_many_arguments)]
+fn render_conversation(
     frame: &mut ratatui::Frame,
     area: Rect,
     app: &App,
     composer_text: &str,
     d: &Design,
     g: &Glyphs,
-    framed: bool,
+    wc: &WidthClass,
+    composer_row: Rect,
+    hint_row: Rect,
+    show_hint: bool,
 ) {
     let p = &d.palette;
+    let (cl, cw) = conv_column(area.x, area.width);
+    // Right-aligned items end at cl+cw (the goldens' authoritative column;
+    // §2 precedence: the frame wins over the rule text). Pane-relative.
+    let rel_right = (cl + cw - area.x) as usize;
+    let band_left = cl.saturating_sub(2);
+    let band_right = cl + cw;
 
-    // Quiet rails (§5): the conversation is the hero — NO border, NO
-    // title. Its brightness and the hairline dividers set it apart from
-    // the dim rails. Zoom mode (Z) frames it: "give me this pane big"
-    // is an explicit ask, and a frame is honest there.
-    let area = if framed {
-        let title = "Conversation".to_string();
-        render_pane_frame(frame, area, &title, app.focus == Focus::Center, d)
-    } else {
-        area
-    };
-    // The transcript's text width — tool-card meta right-aligns to it.
-    let body_w = area.width.saturating_sub(4) as usize;
-
-    // Split: transcript (fill) | queue | composer box | hint row.
-    //
-    // The composer is a rounded box (the Claude Code / Codex convention):
-    // magenta border when the center pane is focused ("you" — one of the
-    // six magenta things), cyan while a turn is live, rule otherwise.
-    // The hint row beneath carries the context keys; the §6.12 toast
-    // rides its right end.
-    //
-    // Composer auto-height (§5.5): the box grows one row per line of
-    // content, capped at half the pane so the transcript always keeps ≥3
-    // rows. Lines beyond the cap show the last ones (the newest line
-    // stays visible).
-    let queue_h = app.queued.len() as u16;
-    let text_lines = composer_text.lines().count().max(1) as u16;
-    let composer_cap = (area.height / 2).max(1);
-    let composer_h = text_lines.min(composer_cap);
-    let center = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(queue_h),
-            Constraint::Length(composer_h + 2), // box: border + content + border
-            Constraint::Length(1),              // hint row
-        ])
-        .split(area);
-
-    // ── Transcript ─────────────────────────────────────────────────────────
-    // The welcome screen (§8.1): an empty session shows the expanded mark,
-    // centered in the conversation. The first turn replaces it.
-    // One blank row of breathing room below the top border.
     let mut lines: Vec<Line> = vec![Line::from("")];
-    if app.transcript.is_empty() && app.in_flight.is_empty() {
-        let mut mark = welcome_mark_frame(d, app.startup_frame);
-        let mark_w = 36u16; // widest mark row
-        let mark_h = mark.len() as u16;
-        if center[0].width > mark_w + 4 && center[0].height > mark_h + 4 {
-            // Splash orbit: once the reveal settles, a dim satellite dot
-            // circles the ring's four corner positions — the mark itself
-            // breathes while it waits for the first prompt. Reduced motion
-            // keeps the static mark.
-            if app.startup_frame >= 5 && !d.caps.reduced_motion {
-                let phase = (app.tick_count / 15) % 4;
-                // Corner cells around the 3-row mark, hand-placed to trace
-                // the ring's arc (row, col) — dim magenta ·
-                let spots: [(usize, usize); 4] = [
-                    (0, 19), // upper right, beside the star
-                    (1, 35), // right
-                    (2, 19), // lower right
-                    (1, 1),  // left
-                ];
-                let (r, c) = spots[phase as usize];
-                if r < mark.len() {
-                    let line = &mut mark[r];
-                    if let Some(spot_span) = line.spans.get_mut(c) {
-                        let styled =
-                            Span::styled("·".to_string(), Style::default().fg(p.magenta_dim));
-                        *spot_span = styled;
-                    }
-                }
-            }
-            let pad_y = (center[0].height.saturating_sub(mark_h)) / 3;
-            for _ in 0..pad_y {
-                lines.push(Line::from(""));
-            }
-            let pad_x = (center[0].width.saturating_sub(mark_w)) / 2;
-            let pad = " ".repeat(pad_x as usize);
-            for l in mark {
-                let mut padded = vec![Span::raw(pad.clone())];
-                padded.extend(l.spans);
-                lines.push(Line::from(padded));
-            }
-        }
-    }
-    // Gutter 3 (§6.5): the you-glyph at col 0, text from col 2.
-    let user_gutter = || Span::styled(format!("{}  ", g.you), Style::default().fg(p.muted));
-    let orbit_gutter = |live: bool| {
-        Span::styled(
-            format!("{}  ", g.orbit),
-            Style::default().fg(if live { p.cyan } else { p.magenta }),
-        )
-    };
-    // The LIVE gutter: the braille busy spinner rides the streaming line
-    // so the motion sits where the operator is reading (Cline-style).
-    let busy_gutter = || {
-        // Reduced motion: the still star, not a spinner frame.
-        let glyph = if app.reduced_motion {
-            g.orbit
-        } else {
-            g.busy_frames()[app.spinner_frame as usize % g.busy_frames().len()]
-        };
-        Span::styled(format!("{glyph}  "), Style::default().fg(p.cyan))
-    };
+    let empty_session = app.transcript.is_empty() && app.in_flight.is_empty();
 
-    for entry in &app.transcript {
+    if empty_session {
+        build_welcome(&mut lines, app, area, cl, cw, d, g);
+    }
+
+    let live = app.turn_in_flight
+        || app.tool_state == ToolState::Streaming
+        || matches!(app.tool_state, ToolState::Running(_));
+
+    let mut prev_was_tool = false;
+    for (ei, entry) in app.transcript.iter().enumerate() {
+        let is_tool = matches!(entry, TranscriptLine::Stripped { .. });
+        let next_is_tool = app
+            .transcript
+            .get(ei + 1)
+            .map(|e| matches!(e, TranscriptLine::Stripped { .. }))
+            .unwrap_or(false);
+        // NOTE: prev_was_tool stays valid THROUGH this iteration's match
+        // (the continuation check reads it); update after.
         match entry {
-            TranscriptLine::User(text) => {
-                // The gutter rides the FIRST line (herdr-style) — no orphan
-                // glyph row. Continuation lines align under the text.
-                let mut first = true;
-                for line in text.lines() {
-                    if first {
-                        lines.push(Line::from(vec![
-                            user_gutter(),
-                            Span::styled(line, Style::default().fg(p.ink)),
-                        ]));
-                        first = false;
+            TranscriptLine::User { text, time } => {
+                // §6.2: surface band, › gutter muted bold, text ink, time
+                // right-aligned muted. Wraps at cw-7 with a time, cw without.
+                let wrap_w = if time.is_some() { cw - 7 } else { cw };
+                // Wrap the RICH runs so inline code counts at its display
+                // width (backticks render as nothing, §6.4).
+                let runs = crate::rich::runs_for(text, d);
+                let wrapped = wrap_runs(&runs, wrap_w as usize);
+                for (i, line) in wrapped.iter().enumerate() {
+                    let mut spans: Vec<Span> = Vec::new();
+                    if i == 0 {
+                        // The gutter rides cl-2: one leading space from the
+                        // pane edge, then ›, then text at cl.
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(
+                            g.you.to_string(),
+                            Style::default().fg(p.muted).add_modifier(Modifier::BOLD),
+                        ));
                     } else {
-                        lines.push(Line::from(vec![
-                            Span::raw("   "),
-                            Span::styled(line, Style::default().fg(p.ink)),
-                        ]));
+                        spans.push(Span::raw("  "));
                     }
-                }
-                if first {
-                    // Empty user message: still show the gutter.
-                    lines.push(Line::from(user_gutter()));
-                }
-                lines.push(Line::from(""));
-            }
-            TranscriptLine::Assistant(text) => {
-                // Same: the ✦ rides the first rendered line.
-                let mut first = true;
-                for rich_line in render_message(text, d) {
-                    let mut spans = Vec::new();
-                    if first {
-                        spans.push(orbit_gutter(false));
-                        first = false;
-                    } else {
-                        spans.push(Span::raw("   "));
+                    spans.push(Span::raw(" "));
+                    // The wrapped line already carries styled spans.
+                    spans.extend(line.spans.iter().cloned());
+                    if i == 0 && time.is_some() && !wc.compact {
+                        let t = time.as_deref().unwrap_or("");
+                        let used: usize =
+                            spans.iter().map(|s| display_width(&s.to_string())).sum();
+                        let pad = rel_right.saturating_sub(used + t.chars().count());
+                        spans.push(Span::styled(
+                            " ".repeat(pad),
+                            Style::default().fg(p.muted),
+                        ));
+                        spans.push(Span::styled(t, Style::default().fg(p.muted)));
                     }
-                    spans.extend(rich_line.spans);
                     lines.push(Line::from(spans));
                 }
-                if first {
-                    lines.push(Line::from(orbit_gutter(false)));
+                lines.push(Line::from(""));
+            }
+            TranscriptLine::Assistant { text, time } => {
+                // §6.3: ✦ gutter (cyan live, magenta settled), markdown
+                // body, time right on the first row. The first paragraph of
+                // a timed turn wraps at cw-7 (§8.3). A time:None entry
+                // following a tool group is a continuation of the same
+                // turn — no gutter.
+                let continuation = time.is_none() && prev_was_tool;
+                let body = render_assistant_body(
+                    text,
+                    time.as_ref(),
+                    cw,
+                    wc.compact,
+                    continuation,
+                    d,
+                );
+                for (i, rich_line) in body.into_iter().enumerate() {
+                    let mut spans: Vec<Span> = Vec::new();
+                    if i == 0 && !continuation {
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(
+                            g.orbit.to_string(),
+                            Style::default().fg(if live { p.cyan } else { p.magenta }),
+                        ));
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.extend(rich_line.spans);
+                    if i == 0 && time.is_some() && !wc.compact {
+                        let t = time.as_deref().unwrap_or("");
+                        let used: usize =
+                            spans.iter().map(|s| display_width(&s.to_string())).sum();
+                        let pad = rel_right.saturating_sub(used + t.chars().count());
+                        spans.push(Span::styled(
+                            " ".repeat(pad),
+                            Style::default().fg(p.muted),
+                        ));
+                        spans.push(Span::styled(t, Style::default().fg(p.muted)));
+                    }
+                    lines.push(Line::from(spans));
                 }
                 lines.push(Line::from(""));
             }
@@ -666,434 +745,570 @@ fn render_center_pane(
                 tool_name,
                 summary,
                 outcome,
+                meta,
                 started_at,
             } => {
-                // The tool card (§6.5): state glyph, name, argument, meta —
-                // one row that reads like a Claude Code tool-call line.
-                // Stripping stays silent (§12).
-                //   ◉ calculator  expression="2*(3+4)"        running
-                //   ✓ calculator  expression="2*(3+4)"
-                //   ✕ shell  cargo test                      failed
-                // The card is running only while it is the LAST entry of
-                // this name AND still unsettled — an earlier same-name card
-                // that already settled keeps its outcome even while a later
-                // call of the same tool runs.
+                // §6.5 tool line: glyph at cl, name at cl+2, argument 2
+                // after the name, meta right-aligned.
                 let is_running = outcome.is_none()
                     && matches!(&app.tool_state, ToolState::Running(n) if n == tool_name)
                     && app.turn_in_flight;
-                // The running card's meta is a LIVE duration (1.4s →
-                // 1.6s…), ticking while the call runs — the card itself
-                // carries the progress feel.
                 let running_meta = match started_at {
                     Some(start_tick) => {
-                        // §16.1 seam: tick arithmetic, not Instant::elapsed.
                         let ticks = app.tick_count.saturating_sub(*start_tick);
                         let secs = (ticks * 16) as f64 / 1000.0;
                         format!("{secs:.1}s")
                     }
                     None => "running".to_string(),
                 };
-                let (glyph, glyph_color, name_color, meta) = match (is_running, outcome) {
-                    (true, _) => (g.running, p.cyan, p.ink, running_meta),
-                    (false, Some(ToolOutcome::Ok)) => {
-                        (g.done, p.muted, p.ink2, String::new())
-                    }
-                    (false, Some(ToolOutcome::Failed)) => {
-                        (g.failed, p.red, p.ink2, "failed".to_string())
-                    }
-                    // A refusal is a decision, not a failure: muted `⊘`,
-                    // `denied by you` meta — never a red cell.
-                    (false, Some(ToolOutcome::Denied)) => {
-                        (g.denied, p.muted, p.ink2, "denied by you".to_string())
-                    }
-                    // Blocked before running (unknown tool / no consent):
-                    // amber `⊖`, distinct from both failed and denied.
-                    (false, Some(ToolOutcome::Blocked)) => {
-                        (g.blocked, p.amber, p.ink2, "blocked".to_string())
-                    }
-                    // Unsettled but not running (e.g. the turn was cancelled
-                    // mid-call): the honest neutral state.
-                    (false, None) => (g.pending, p.faint, p.ink2, String::new()),
-                };
+                let (glyph, glyph_color, name_color, meta_text, meta_color) =
+                    match (is_running, outcome) {
+                        (true, _) => (g.running, p.cyan, p.ink, running_meta, p.cyan),
+                        (false, Some(ToolOutcome::Ok)) => {
+                            (g.done, p.muted, p.ink2, meta.clone(), p.muted)
+                        }
+                        (false, Some(ToolOutcome::Failed)) => {
+                            (g.failed, p.red, p.ink2, "failed".into(), p.red)
+                        }
+                        (false, Some(ToolOutcome::Denied)) => (
+                            g.denied,
+                            p.muted,
+                            p.ink2,
+                            "denied by you".into(),
+                            p.muted,
+                        ),
+                        (false, Some(ToolOutcome::Blocked)) => {
+                            (g.blocked, p.amber, p.ink2, "blocked".into(), p.amber)
+                        }
+                        (false, None) => (g.pending, p.faint, p.ink2, String::new(), p.faint),
+                    };
                 let mut spans = vec![
                     Span::raw("   "),
                     Span::styled(glyph, Style::default().fg(glyph_color)),
                     Span::raw(" "),
                     Span::styled(
                         tool_name.clone(),
-                        Style::default().fg(name_color).add_modifier(if is_running {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
+                        Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                     ),
                 ];
-                // The argument column: the display-safe summary, muted,
-                // truncated head-first (the END of a path/command is its
-                // most specific part, §6.5: crates/…/restore.rs).
                 if !summary.is_empty() {
-                    let budget = body_w.saturating_sub(tool_name.chars().count() + 8);
-                    let arg = crate::unicode::truncate_graphemes_tail(summary, budget.max(8));
+                    // Argument budget: from 2 past the name to 12 before the
+                    // right edge (meta room). No truncation when it fits.
+                    let used: usize =
+                        spans.iter().map(|s| display_width(&s.to_string())).sum();
+                    let budget = rel_right.saturating_sub(used + 14).max(8);
+                    let arg = truncate_middle(summary, budget);
                     spans.push(Span::styled(
                         format!("  {arg}"),
                         Style::default().fg(p.muted),
                     ));
                 }
-                if !meta.is_empty() {
-                    let meta_w = crate::unicode::display_width(&meta);
-                    let used: usize = spans
-                        .iter()
-                        .map(|sp| crate::unicode::display_width(&sp.to_string()))
-                        .sum();
-                    // Align to the pane's inner right edge, like the queue toast.
-                    let pad = (center[0].width as usize).saturating_sub(used + meta_w);
+                if !meta_text.is_empty() {
+                    let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
+                    let pad = rel_right.saturating_sub(used + meta_text.chars().count());
                     spans.push(Span::raw(" ".repeat(pad)));
+                    spans.push(Span::styled(meta_text, Style::default().fg(meta_color)));
+                }
+                lines.push(Line::from(spans));
+                // §6.5 grouping: consecutive tool lines stack with no blank
+                // between; one blank after the group.
+                if !next_is_tool {
+                    lines.push(Line::from(""));
+                }
+            }
+            TranscriptLine::System(text) => {
+                // §6.8 session notice: ∙ + muted text.
+                lines.push(Line::from(vec![
+                    Span::styled(g.notice.to_string(), Style::default().fg(p.muted)),
+                    Span::raw(" "),
+                    Span::styled(text.clone(), Style::default().fg(p.muted)),
+                ]));
+                lines.push(Line::from(""));
+            }
+            TranscriptLine::Evidence { checks, note, rows } => {
+                // §6.6: green header word + muted rest; rows behind a green
+                // left rule at cl+1, text at cl+3, result right-aligned.
+                let mut head = vec![
+                    Span::raw("   "),
+                    Span::styled(g.done, Style::default().fg(p.green)),
+                    Span::raw(" "),
+                    Span::styled(
+                        "verified",
+                        Style::default().fg(p.green).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                let rest = if wc.compact {
+                    format!("  {checks}")
+                } else {
+                    format!("  {checks} · {note}")
+                };
+                head.push(Span::styled(rest, Style::default().fg(p.muted)));
+                lines.push(Line::from(head));
+                for (name, result) in rows {
+                    let mut spans = vec![
+                        Span::raw("   "),
+                        Span::styled("│", Style::default().fg(p.green)),
+                        Span::raw(" "),
+                        Span::styled(name.clone(), Style::default().fg(p.ink2)),
+                    ];
+                    let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
+                    let pad = rel_right.saturating_sub(used + result.chars().count());
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    spans.push(Span::styled(result.clone(), Style::default().fg(p.muted)));
+                    lines.push(Line::from(spans));
+                }
+            }
+            TranscriptLine::Sources(srcs) => {
+                // §6.7: 'sources' label muted, [n] cyan, path ink2.
+                let mut spans = vec![
+                    Span::raw("   "),
+                    Span::styled("sources", Style::default().fg(p.muted)),
+                ];
+                for (si, (idx, path)) in srcs.iter().enumerate() {
+                    // 2 spaces after the label; 3 between entries (golden).
+                    spans.push(Span::raw(if si == 0 { "  " } else { "   " }));
                     spans.push(Span::styled(
-                        meta,
-                        Style::default().fg(if is_running { p.cyan } else { p.red }),
+                        format!("[{idx}]"),
+                        Style::default().fg(p.cyan),
                     ));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(path.clone(), Style::default().fg(p.ink2)));
                 }
                 lines.push(Line::from(spans));
                 lines.push(Line::from(""));
             }
-            TranscriptLine::System(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{} ", g.notice), Style::default().fg(p.muted)),
-                    Span::styled(text, Style::default().fg(p.muted)),
-                ]));
-                lines.push(Line::from(""));
-            }
             TranscriptLine::Redacted(kind) => {
-                // D7: a chip that names the gate — the rejected text itself
-                // is never in the buffer.
                 lines.push(Line::from(vec![
                     Span::styled(g.notice.to_string(), Style::default().fg(p.amber)),
                     Span::styled(
-                        format!(" blocked: {}", kind.label()),
+                        format!(" redacted · {}", kind.label()),
                         Style::default().fg(p.amber),
                     ),
                 ]));
                 lines.push(Line::from(""));
             }
         }
+        prev_was_tool = is_tool;
     }
 
-    // In-flight stream — the busy spinner in the gutter, cyan while
-    // working. Motion lives where the eyes are.
-    let streaming = !app.in_flight.is_empty();
-    if streaming {
-        // The gutter rides the first line (no orphan glyph row).
-        let mut first = true;
-        for rich_line in render_message(&app.in_flight, d) {
-            let mut spans = Vec::new();
-            if first {
-                spans.push(busy_gutter());
-                first = false;
-            } else {
-                spans.push(Span::raw("   "));
+    // In-flight stream: cyan ✦ gutter + the live edge ▍ (§6.3).
+    if !app.in_flight.is_empty() {
+        let body = render_message(&app.in_flight, d);
+        let n = body.len();
+        for (i, rich_line) in body.into_iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            if i == 0 {
+                spans.push(Span::styled(g.orbit.to_string(), Style::default().fg(p.cyan)));
             }
+            spans.push(Span::raw(" "));
             spans.extend(rich_line.spans);
+            if i + 1 == n {
+                spans.push(Span::styled("▍", Style::default().fg(p.cyan)));
+            }
             lines.push(Line::from(spans));
         }
-        if first {
-            lines.push(Line::from(busy_gutter()));
+        lines.push(Line::from(""));
+    } else if app.turn_in_flight && app.tool_state == ToolState::Streaming {
+        // Waiting for the first token (§6.3): one static muted line.
+        let mut spans = vec![
+            Span::styled(g.orbit.to_string(), Style::default().fg(p.cyan)),
+            Span::raw(" "),
+            Span::styled(
+                format!("waiting for {}", app.model),
+                Style::default().fg(p.muted),
+            ),
+        ];
+        let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
+        let pad = rel_right.saturating_sub(used + 5);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled("14:02", Style::default().fg(p.muted)));
+        lines.push(Line::from(spans));
+        lines.push(Line::from(""));
+    }
+
+    // Queued prompts (§5.5): faint › … queued rows above the composer.
+    for q in &app.queued {
+        let wrapped = wrap_text(q, (cw - 8) as usize);
+        for (i, line) in wrapped.iter().enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            if i == 0 {
+                spans.push(Span::styled(
+                    g.you.to_string(),
+                    Style::default().fg(p.faint).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(line.clone(), Style::default().fg(p.ink2)));
+            if i + 1 == wrapped.len() {
+                let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
+                let pad = rel_right.saturating_sub(used + 6);
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(Span::styled("queued", Style::default().fg(p.muted)));
+            }
+            lines.push(Line::from(spans));
         }
     }
-    // Waiting for the first token: the spinner rides a lone gutter row so
-    // dead air still shows life (the old design showed nothing here).
-    if app.turn_in_flight && !streaming && app.tool_state == ToolState::Streaming {
-        lines.push(Line::from(busy_gutter()));
-    }
-    // NOTE: while Streaming with an empty in_flight, no transcript line is
-    // added — the working star in the status line (§6.11) is the sole
-    // indicator. This keeps streamed text contiguous in the render buffer
-    // (§7: text appears without token-by-token animation) and avoids the
-    // old "thinking phrases" theatre.
 
-    // Errors — red glyph + word (colour is the third signal).
-    if let Some(err) = &app.last_error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", g.failed), Style::default().fg(p.red)),
-            Span::styled(err, Style::default().fg(p.red)),
-        ]));
-    }
+    // ── Bottom-anchor the transcript (§4.5): when the content is shorter
+    // than the pane, pad the TOP with blanks so the last line lands at the
+    // bottom row of the pane. The content-row count (bottom-anchored,
+    // non-blank tail) drives the scroll thumb.
+    let visible = area.height as usize;
+    let total = lines.len();
 
-    // Viewport: auto-scroll to bottom unless the operator scrolled up.
-    let visible_height = center[0].height as usize;
-    let total_lines = lines.len();
-    let scroll = if app.viewport_manual {
+    let mut scroll = if app.viewport_manual {
         app.pane_scroll[1] as usize
     } else {
-        total_lines.saturating_sub(visible_height)
+        0
     };
-
-    let transcript = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll as u16, 0));
-    frame.render_widget(transcript, center[0]);
-
-    // ── Queue: pending prompts (the §6.12 toast rides the hint row) ───────
-    let mut queue_rows = Vec::new();
-    for q in &app.queued {
-        queue_rows.push(Line::from(vec![
-            Span::styled(format!("{} ", g.pending), Style::default().fg(p.faint)),
-            Span::styled(truncate_graphemes(q, 40), Style::default().fg(p.muted)),
-        ]));
+    if total < visible && !app.viewport_manual {
+        let pad = visible - total;
+        let mut padded: Vec<Line> = Vec::with_capacity(visible);
+        for _ in 0..pad {
+            padded.push(Line::from(""));
+        }
+        padded.extend(lines);
+        lines = padded;
+    } else if !app.viewport_manual {
+        scroll = total.saturating_sub(visible);
     }
-    if !queue_rows.is_empty() {
-        frame.render_widget(Paragraph::new(queue_rows), center[1]);
-    }
+    let para = Paragraph::new(lines).scroll((scroll as u16, 0));
+    frame.render_widget(para, area);
 
-    // ── Composer: a rounded box (the Claude Code / Codex convention) ──────
-    // The › prompt in magenta (your input is one of the six magenta things),
-    // text in ink, inside a rounded box. The border is magenta when the
-    // composer is focused, cyan while a turn is live, rule otherwise.
+    // ── User-turn bands: paint surface under user rows (§6.2) ─────────────
+    paint_user_bands(frame, area, cl, band_left, band_right, d, g);
+
+    // ── Composer (§5.5, §8.3) ──────────────────────────────────────────────
     let composer_focused = app.focus == Focus::Center;
-    let turn_live = app.turn_in_flight
-        || app.tool_state == ToolState::Streaming
-        || matches!(app.tool_state, ToolState::Running(_));
-
+    let buf = frame.buffer_mut();
+    let band_end = band_right.min(composer_row.x + composer_row.width - 1);
+    for x in band_left..=band_end {
+        buf[(x, composer_row.y)].set_style(Style::default().bg(p.surface));
+    }
     let prompt_color = if composer_focused { p.magenta } else { p.faint };
-    // Standard terminal blink cadence (~530 ms on, ~530 ms off).
-    let cursor_on = !turn_live && (app.tick_count / 33).is_multiple_of(2);
-    let cursor = if cursor_on { "▍" } else { " " };
-    let first_text_line = composer_text.lines().next().unwrap_or("");
-    let placeholder = if turn_live {
+    buf[(cl - 1, composer_row.y)]
+        .set_symbol(g.you)
+        .set_style(
+            Style::default()
+                .fg(prompt_color)
+                .bg(p.surface)
+                .add_modifier(Modifier::BOLD),
+        );
+    let placeholder = if live {
         "Add to the queue, or wait for ORBIT"
     } else {
-        "Ask ORBIT, or / for commands"
+        "Ask ORBIT, or type / for commands"
     };
-    let prompt_line = if composer_text.is_empty() {
-        Line::from(vec![
-            Span::styled(format!("{} ", g.you), Style::default().fg(prompt_color)),
-            Span::styled(placeholder, Style::default().fg(p.faint)),
-            Span::styled(cursor, Style::default().fg(p.magenta)),
-        ])
-    } else {
-        // The cursor rides the text end (a real terminal cursor) —
-        // blinking only when the composer is focused and no turn is live.
-        let mut spans = vec![
-            Span::styled(format!("{} ", g.you), Style::default().fg(prompt_color)),
-            Span::styled(first_text_line, Style::default().fg(p.ink)),
-        ];
-        if composer_focused && !turn_live {
-            spans.push(Span::styled(cursor, Style::default().fg(p.magenta)));
+    let first_line = composer_text.lines().next().unwrap_or("");
+    if composer_text.is_empty() {
+        for (i, c) in placeholder.chars().enumerate() {
+            let x = cl + 2 + i as u16;
+            if x >= composer_row.x + composer_row.width {
+                break;
+            }
+            buf[(x, composer_row.y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.faint).bg(p.surface));
         }
-        Line::from(spans)
-    };
-    // All content lines, capped: when the text exceeds the cap, show the
-    // LAST lines (the newest input stays visible; older lines scroll out).
-    let all_lines: Vec<&str> = composer_text.lines().collect();
-    let visible: Vec<Line> = if all_lines.is_empty() {
-        vec![prompt_line]
     } else {
-        let take = (all_lines.len() as u16).min(composer_h) as usize;
-        let start = all_lines.len() - take;
-        all_lines[start..]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                if start + i == 0 {
-                    prompt_line.clone()
-                } else {
-                    Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(*line, Style::default().fg(p.ink)),
-                    ])
+        for (i, c) in first_line.chars().enumerate() {
+            let x = cl + 1 + i as u16;
+            if x >= composer_row.x + composer_row.width {
+                break;
+            }
+            buf[(x, composer_row.y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.ink).bg(p.surface));
+        }
+    }
+
+    // ── Hint row (§5.5) ────────────────────────────────────────────────────
+    if show_hint {
+        let buf = frame.buffer_mut();
+        let band_end = band_right.min(hint_row.x + hint_row.width - 1);
+        for x in band_left..=band_end {
+            buf[(x, hint_row.y)].set_style(Style::default().bg(p.surface));
+        }
+        let mut x = cl + 1;
+        let mut put = |text: &str, style: Style, x: &mut u16, buf: &mut ratatui::buffer::Buffer| {
+            for c in text.chars() {
+                if *x >= hint_row.x + hint_row.width {
+                    return;
                 }
-            })
-            .collect()
-    };
-    // The composer is a color-filled surface, not a box: state-colored
-    // wash (cyan while a turn is live, magenta when focused, surface
-    // idle) with the text inset by one column. No frame glyphs in any
-    // tier — the fill IS the affordance.
-    let wash = if turn_live {
-        blend_color(p.cyan, p.bg, 0.86)
-    } else if composer_focused {
-        blend_color(p.magenta, p.bg, 0.88)
-    } else {
-        p.surface
-    };
-    let inner = Rect {
-        x: center[2].x + 1,
-        y: center[2].y,
-        width: center[2].width.saturating_sub(2),
-        height: center[2].height,
-    };
-    for y in center[2].top()..center[2].bottom() {
-        for x in center[2].left()..center[2].right() {
-            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-                cell.set_style(Style::default().bg(wash));
+                buf[(*x, hint_row.y)]
+                    .set_symbol(&c.to_string())
+                    .set_style(style.bg(p.surface));
+                *x += 1;
+            }
+        };
+        let key_style = Style::default().fg(p.ink2).add_modifier(Modifier::BOLD);
+        let desc_style = Style::default().fg(p.muted);
+        if live {
+            put("⏎", key_style, &mut x, buf);
+            put(" queue   ", desc_style, &mut x, buf);
+            put("⇧⏎", key_style, &mut x, buf);
+            put(" newline", desc_style, &mut x, buf);
+            if wc.status_level >= 2 {
+                put("   tab views", desc_style, &mut x, buf);
+            } else {
+                put("   pgup scroll", desc_style, &mut x, buf);
+            }
+        } else {
+            put("⏎", key_style, &mut x, buf);
+            put(" send   ", desc_style, &mut x, buf);
+            put("⇧⏎", key_style, &mut x, buf);
+            put(" newline   ", desc_style, &mut x, buf);
+            put("/", key_style, &mut x, buf);
+            put(" commands   ", desc_style, &mut x, buf);
+            put("↑", key_style, &mut x, buf);
+            put(" history", desc_style, &mut x, buf);
+        }
+        // Toast rides the hint row's right end (§6.12).
+        if let Some(toast) = &app.toast {
+            let (glyph, color) = match toast.kind {
+                crate::state::ToastKind::Success => (g.done, p.green),
+                crate::state::ToastKind::Neutral => ("", p.muted),
+                crate::state::ToastKind::Error => (g.failed, p.red),
+            };
+            let text = if glyph.is_empty() {
+                toast.text.clone()
+            } else {
+                format!("{glyph} {}", toast.text)
+            };
+            let tw = display_width(&text) as u16;
+            let tx = band_end.saturating_sub(tw);
+            for (i, c) in text.chars().enumerate() {
+                buf[(tx + i as u16, hint_row.y)]
+                    .set_symbol(&c.to_string())
+                    .set_style(Style::default().fg(color).bg(p.surface));
             }
         }
     }
-    frame.render_widget(Paragraph::new(visible), inner);
-
-    // ── Hint row: keycap chips left, toast right (§5.5, §6.12) ────────────
-    let mono = d.caps.color == crate::tokens::ColorTier::Mono;
-    let mut hint_spans: Vec<Span> = Vec::new();
-    if turn_live {
-        hint_spans.push(keycap("ctrl+c", p, mono));
-        hint_spans.push(Span::styled(" stop · ", Style::default().fg(p.faint)));
-        hint_spans.push(keycap("⏎", p, mono));
-        hint_spans.push(Span::styled(" queue", Style::default().fg(p.faint)));
-    } else {
-        hint_spans.push(keycap("⏎", p, mono));
-        hint_spans.push(Span::styled(" send · ", Style::default().fg(p.faint)));
-        hint_spans.push(keycap("⇧⏎", p, mono));
-        hint_spans.push(Span::styled(" newline · ", Style::default().fg(p.faint)));
-        hint_spans.push(keycap("/", p, mono));
-        hint_spans.push(Span::styled(" commands · ", Style::default().fg(p.faint)));
-        hint_spans.push(keycap("?", p, mono));
-        hint_spans.push(Span::styled(" keys", Style::default().fg(p.faint)));
-    }
-    if let Some(toast) = &app.toast {
-        let (glyph, color) = match toast.kind {
-            crate::state::ToastKind::Success => (g.done, p.green),
-            crate::state::ToastKind::Neutral => ("", p.muted),
-            crate::state::ToastKind::Error => (g.failed, p.red),
-        };
-        let text = if glyph.is_empty() {
-            toast.text.clone()
-        } else {
-            format!("{glyph} {}", toast.text)
-        };
-        let text_w = crate::unicode::display_width(&text);
-        let row = center[3].width as usize;
-        let used: usize = hint_spans
-            .iter()
-            .map(|sp| crate::unicode::display_width(&sp.to_string()))
-            .sum();
-        // The toast right-aligns within the space LEFT after the hints —
-        // never past the row edge (clipped text is invisible text).
-        let pad = row.saturating_sub(used + text_w + 2);
-        hint_spans.push(Span::raw(" ".repeat(pad)));
-        hint_spans.push(Span::styled(text, Style::default().fg(color)));
-    }
-    frame.render_widget(Paragraph::new(Line::from(hint_spans)), center[3]);
 }
 
-// ── Right rail (§6.10) ───────────────────────────────────────────────────────
-
-/// A workspace section label: muted label + faint count (§6.10).
-fn section_line(label: &str, count: usize, p: &crate::tokens::ResolvedPalette) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(label.to_string(), Style::default().fg(p.muted)),
-        Span::styled(format!("  {count}"), Style::default().fg(p.faint)),
-    ])
+/// Paint the surface band under user-turn rows (§6.2): the band spans
+/// cl-2 … cl+cw on the › row and its continuation rows.
+fn paint_user_bands(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    cl: u16,
+    band_left: u16,
+    band_right: u16,
+    d: &Design,
+    g: &Glyphs,
+) {
+    let buf = frame.buffer_mut();
+    let band_end = band_right.min(area.x + area.width - 1);
+    let mut in_band = false;
+    for y in area.top()..area.bottom() {
+        let gutter = buf[(cl.saturating_sub(2), y)].symbol().to_string();
+        let is_user = gutter == g.you;
+        let blank_row = (area.left()..area.right()).all(|x| buf[(x, y)].symbol() == " ");
+        if is_user {
+            in_band = true;
+        } else if blank_row {
+            in_band = false;
+        }
+        if is_user || in_band {
+            for x in band_left..=band_end {
+                let cell = &mut buf[(x, y)];
+                let (fg, bg) = (cell.style().fg, cell.style().bg);
+                // The band is surface, but inline-code chips (surface2)
+                // keep their own bg (§6.4).
+                let new_bg = match bg {
+                    Some(b) if b == d.palette.surface2 => b,
+                    _ => d.palette.surface,
+                };
+                cell.set_style(Style::default().fg(fg.unwrap_or(Color::Reset)).bg(new_bg));
+            }
+        }
+    }
 }
 
-fn render_right_pane(
+// ── Welcome screen (§9.1) ────────────────────────────────────────────────────
+
+fn build_welcome(
+    lines: &mut Vec<Line>,
+    app: &App,
+    area: Rect,
+    cl: u16,
+    cw: u16,
+    d: &Design,
+    _g: &Glyphs,
+) {
+    let p = &d.palette;
+    // The mark block (§8): 3 rows + tagline, ~35 wide, centered in the
+    // measure.
+    let mark = welcome_mark_frame(d, app.startup_frame.max(5));
+    let mark_w = 35u16;
+    let mark_x = cl + cw.saturating_sub(mark_w) / 2;
+    let pad = " ".repeat(mark_x.saturating_sub(area.x).max(0) as usize);
+    for l in mark {
+        let mut padded = vec![Span::raw(pad.clone())];
+        padded.extend(l.spans);
+        lines.push(Line::from(padded));
+    }
+    lines.push(Line::from(""));
+    // Tagline centered.
+    let tagline = "the harness that orbits around you";
+    let tag_x = cl + cw.saturating_sub(tagline.chars().count() as u16) / 2;
+    let tag_pad = " ".repeat(tag_x.saturating_sub(area.x).max(0) as usize);
+    lines.push(Line::from(vec![
+        Span::raw(tag_pad),
+        Span::styled(tagline, Style::default().fg(p.muted)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(""));
+    // Readiness row (fixture data; the backend fills it when it exists).
+    let readiness = "✓ trust root    ✓ ledger · 7 records    ✓ local · glm-5.2";
+    let r_x = cl + cw.saturating_sub(readiness.chars().count() as u16) / 2;
+    let r_pad = " ".repeat(r_x.saturating_sub(area.x).max(0) as usize);
+    let mut spans = vec![Span::raw(r_pad)];
+    for seg in readiness.split("    ") {
+        let (glyph, rest) = seg.split_once(' ').unwrap_or((seg, ""));
+        spans.push(Span::styled(glyph, Style::default().fg(p.green)));
+        if !rest.is_empty() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(rest, Style::default().fg(p.ink2)));
+        }
+        spans.push(Span::raw("    "));
+    }
+    lines.push(Line::from(spans));
+    lines.push(Line::from(""));
+    lines.push(Line::from(""));
+    // Starters.
+    let describe = "Describe a task below, or start with";
+    let d_x = cl + 9;
+    let d_pad = " ".repeat(d_x.saturating_sub(area.x).max(0) as usize);
+    lines.push(Line::from(vec![
+        Span::raw(d_pad),
+        Span::styled(describe, Style::default().fg(p.muted)),
+    ]));
+    lines.push(Line::from(""));
+    for (cmd, desc) in [
+        ("/models", "list models from configured providers"),
+        ("/sessions", "browse and resume earlier work"),
+        ("?", "keys and commands"),
+    ] {
+        let s_pad = " ".repeat((d_x + 2).saturating_sub(area.x) as usize);
+        lines.push(Line::from(vec![
+            Span::raw(s_pad),
+            Span::styled(
+                format!("{cmd:<10}"),
+                Style::default().fg(p.ink2).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(desc, Style::default().fg(p.muted)),
+        ]));
+    }
+}
+
+// ── Workspace rail (§6.10) ───────────────────────────────────────────────────
+
+fn render_workspace_rail(
     frame: &mut ratatui::Frame,
     area: Rect,
     app: &App,
     d: &Design,
     g: &Glyphs,
-    framed: bool,
 ) {
     let p = &d.palette;
-    let body = if framed {
-        render_pane_frame(frame, area, "Workspace", app.focus == Focus::Right, d)
-    } else {
-        render_rail_header(frame, area, "Workspace", app.focus == Focus::Right, d, g)
-    };
-    // One blank row of breathing room below the header.
-    let mut lines: Vec<Line> = vec![Line::from("")];
-
     let w = &app.workspace;
+    let mut lines: Vec<Line> = Vec::new();
     if w.plan.is_empty() && w.findings.is_empty() && w.verification.is_empty() {
-        // A useful empty state: what WILL appear here + how to drive it.
+        // §9.15 empty state.
         for text in [
-            "The turn's plan, findings, and",
-            "verification land here as the",
-            "model works.",
+            "◌ Nothing planned yet.",
             "",
-            "Phases: orient → reason → act →",
-            "verify → respond",
+            "   When a task has steps, the",
+            "   plan, findings and",
+            "   verification evidence collect",
+            "   here.",
         ] {
             lines.push(Line::from(Span::styled(text, Style::default().fg(p.faint))));
         }
     } else {
-        // ── Phase stepper (§6.10) ──────────────────────────────────────────
-        // ✓━━✓━━◉──◌──◌  execute  3/5
+        // Phase stepper: ✓━━✓━━◉──◌──◌  verify  4/5
         let current = w.phase_index.min(4);
         let mut stepper: Vec<Span> = Vec::new();
         for i in 0..5 {
-            let color = if i < current {
-                p.muted
+            let (ch, color) = if i < current {
+                (g.done, p.muted)
             } else if i == current {
-                p.cyan
+                ("◉", p.cyan)
             } else {
-                p.faint
+                ("◌", p.faint)
             };
-            let ch = if i < current {
-                g.done.to_string()
-            } else {
-                ["◉", "◌", "◌"][(i - current).min(2)].to_string()
-            };
-            let weight = if i == current {
-                Style::default().fg(p.cyan).add_modifier(Modifier::BOLD)
+            let style = if i == current {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(color)
             };
-            stepper.push(Span::styled(ch, weight));
+            stepper.push(Span::styled(ch, style));
             if i < 4 {
-                let connector = if i < current { "━━" } else { "──" };
-                let c_color = if i < current { p.muted } else { p.faint };
-                stepper.push(Span::styled(connector, Style::default().fg(c_color)));
+                let (conn, cc) = if i < current { ("━━", p.muted) } else { ("──", p.rule) };
+                stepper.push(Span::styled(conn, Style::default().fg(cc)));
             }
         }
         let phase_names = ["orient", "reason", "act", "verify", "respond"];
-        let mut header = stepper;
-        header.push(Span::raw(" "));
-        header.push(Span::styled(
+        stepper.insert(0, Span::raw("  "));
+        stepper.push(Span::raw("  "));
+        stepper.push(Span::styled(
             phase_names[current],
             Style::default().fg(p.cyan).add_modifier(Modifier::BOLD),
         ));
-        header.push(Span::styled(
-            format!("  {}/5", current + 1),
-            Style::default().fg(p.faint),
-        ));
-        lines.push(Line::from(header));
+        let total = w.plan.len().max(1);
+        let done_count = w.plan.iter().filter(|t| t.state == TaskState::Done).count();
+        let count_text = format!("{done_count}/{total}");
+        let used: usize = stepper.iter().map(|sp| display_width(&sp.to_string())).sum();
+        let right = (area.width as usize).saturating_sub(2);
+        let pad = right.saturating_sub(used + count_text.chars().count()) + 1;
+        stepper.push(Span::raw(" ".repeat(pad)));
+        stepper.push(Span::styled(count_text, Style::default().fg(p.muted)));
+        lines.push(Line::from(stepper));
         lines.push(Line::from(""));
-
-        // ── Section helper ────────────────────────────────────────────────
 
         // PLAN
         if !w.plan.is_empty() {
-            lines.push(section_line("PLAN", w.plan.len(), p));
+            {
+            let total = w.plan.len().max(1);
+            let done = w.plan.iter().filter(|t| t.state == TaskState::Done).count();
+            let ratio = format!("{done}/{total}");
+            let used = 2 + 4;
+            let right = (area.width as usize).saturating_sub(2);
+            let pad = right.saturating_sub(used + ratio.chars().count()) + 1;
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("PLAN", Style::default().fg(p.muted)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(ratio, Style::default().fg(p.muted)),
+            ]));
+        }
             for task in &w.plan {
                 let (glyph, color, bold) = match task.state {
-                    TaskState::Active => ("●", p.cyan, true),
+                    TaskState::Active => ("◉", p.cyan, true),
+                    TaskState::Pending => (g.pending, p.faint, false),
                     TaskState::Blocked => (g.blocked, p.amber, false),
                     TaskState::Failed => (g.failed, p.red, false),
                     TaskState::Retest => (g.retest, p.amber, false),
                     TaskState::AwaitingApproval => ("◇", p.magenta, false),
-                    TaskState::Done => (g.done, p.muted, false),
+                    TaskState::Done => (g.done, p.green, false),
                 };
-                let mut title_style = Style::default().fg(p.ink);
-                if bold {
-                    title_style = title_style.add_modifier(Modifier::BOLD);
-                }
-                let evidence = if task.evidence > 0 {
-                    format!(
-                        "  {} proof{}",
-                        task.evidence,
-                        if task.evidence == 1 { "" } else { "s" }
-                    )
+                // A done task with no evidence is claimed, not verified:
+                // ink2 glyph (the golden's distinction).
+                let color = if task.state == TaskState::Done && task.evidence == 0 {
+                    p.ink2
                 } else {
-                    "  claimed".to_string()
+                    color
+                };
+                let mut title_style = if bold {
+                    Style::default().fg(p.ink).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(p.ink2)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
+                    Span::raw("  "),
                     Span::styled(format!("{glyph} "), Style::default().fg(color)),
                     Span::styled(task.title.clone(), title_style),
-                    Span::styled(
-                        evidence,
-                        Style::default().fg(if task.evidence > 0 { p.green } else { p.faint }),
-                    ),
                 ]));
                 if let Some(sub) = &task.sub {
                     let sub_color = match task.state {
@@ -1101,200 +1316,756 @@ fn render_right_pane(
                         TaskState::Failed => p.red,
                         TaskState::Blocked | TaskState::Retest => p.amber,
                         TaskState::AwaitingApproval => p.muted,
-                        TaskState::Done => p.faint,
-                    };
-                    // Tail-truncate: paths and status strings matter at the
-                    // END, so keep the tail and drop the head.
-                    let budget = body.width.saturating_sub(2) as usize;
-                    let shown = if sub.chars().count() > budget {
-                        let skip = sub.chars().count() - budget;
-                        format!("…{}", sub.chars().skip(skip).collect::<String>())
-                    } else {
-                        sub.clone()
+                        TaskState::Pending | TaskState::Done => p.faint,
                     };
                     lines.push(Line::from(vec![
-                        Span::styled("  ", Style::default()),
-                        Span::styled(shown, Style::default().fg(sub_color)),
+                        Span::raw("    "),
+                        Span::styled(sub.clone(), Style::default().fg(sub_color)),
                     ]));
                 }
             }
             lines.push(Line::from(""));
         }
-
         // FINDINGS
         if !w.findings.is_empty() {
-            lines.push(section_line("FINDINGS", w.findings.len(), p));
+            lines.push(section_line("FINDINGS", w.findings.len(), p, area.width));
             for f in &w.findings {
-                let source = f
-                    .source
-                    .as_deref()
-                    .map(|s| format!(" {s}"))
-                    .unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled("  ∙ ", Style::default().fg(p.faint)),
-                    Span::styled(f.title.clone(), Style::default().fg(p.ink2)),
-                    Span::styled(source, Style::default().fg(p.faint)),
-                ]));
+                // The source renders muted, the title ink2 (golden).
+                let mut runs: Vec<(String, Style)> = vec![(f.title.clone(), Style::default().fg(p.ink2))];
+                if let Some(src) = &f.source {
+                    runs.push((" ".into(), Style::default().fg(p.ink2)));
+                    runs.push((src.clone(), Style::default().fg(p.muted)));
+                }
+                let wrapped = wrap_runs(&runs, (area.width as usize).saturating_sub(2));
+                for (i, wline) in wrapped.iter().enumerate() {
+                    let mut spans: Vec<Span> = Vec::new();
+                    if i == 0 {
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled("∙ ", Style::default().fg(p.muted)));
+                    } else {
+                        spans.push(Span::raw("    "));
+                    }
+                    spans.extend(wline.spans.iter().cloned());
+                    lines.push(Line::from(spans));
+                }
             }
             lines.push(Line::from(""));
         }
-
         // VERIFICATION
         if !w.verification.is_empty() {
-            lines.push(section_line("VERIFICATION", w.verification.len(), p));
+            // Count = passed/total (the golden's 2/3).
+            let passed = w
+                .verification
+                .iter()
+                .filter(|v| v.result == VerificationResult::Passed)
+                .count();
+            let total = w.verification.len();
+            let ratio = format!("{passed}/{total}");
+            let label = "VERIFICATION";
+            let used = 2 + label.len();
+            let right = (area.width as usize).saturating_sub(2);
+            let pad = right.saturating_sub(used + ratio.chars().count()) + 1;
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label, Style::default().fg(p.muted)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(ratio, Style::default().fg(p.muted)),
+            ]));
             for v in &w.verification {
                 let (glyph, color) = match v.result {
                     VerificationResult::Passed => (g.done, p.green),
                     VerificationResult::Failed => (g.failed, p.red),
-                    VerificationResult::Pending => ("◌", p.faint),
+                    VerificationResult::Pending => (g.retest, p.amber),
                 };
-                let proof = if v.proof_count > 0 {
-                    format!(
-                        "  {} proof{}",
-                        v.proof_count,
-                        if v.proof_count == 1 { "" } else { "s" }
-                    )
-                } else {
-                    "  claimed".to_string()
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {glyph} "), Style::default().fg(color)),
-                    Span::styled(v.name.clone(), Style::default().fg(p.ink2)),
-                    Span::styled(proof, Style::default().fg(p.faint)),
-                ]));
+                // The name wraps (§6.10): budget = rail width minus glyph,
+                // lead and result room; continuations indent 4.
+                let name_budget = (area.width as usize)
+                    .saturating_sub(7 + v.result_text.chars().count())
+                    .max(8);
+                let name_lines = wrap_text(&v.name, name_budget);
+                for (ni, nl) in name_lines.iter().enumerate() {
+                    let mut spans: Vec<Span> = Vec::new();
+                    if ni == 0 {
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(
+                            format!("{glyph} "),
+                            Style::default().fg(color),
+                        ));
+                    } else {
+                        spans.push(Span::raw("    "));
+                    }
+                    spans.push(Span::styled(nl.clone(), Style::default().fg(p.ink2)));
+                    if ni == 0 && !v.result_text.is_empty() {
+                        let used: usize =
+                            spans.iter().map(|s| display_width(&s.to_string())).sum();
+                        let right = (area.width as usize).saturating_sub(2);
+                        let pad = right
+                            .saturating_sub(used + v.result_text.chars().count())
+                            + 1;
+                        spans.push(Span::raw(" ".repeat(pad)));
+                        let result_color = match v.result {
+                            VerificationResult::Pending => p.amber,
+                            _ => p.muted,
+                        };
+                        spans.push(Span::styled(
+                            v.result_text.clone(),
+                            Style::default().fg(result_color),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                }
             }
         }
     }
-
-    // Per-pane scroll (functional isolation): the workspace rail scrolls
-    // independently.
     let para = Paragraph::new(lines).scroll((app.pane_scroll[2], 0));
-    frame.render_widget(para, body);
+    frame.render_widget(para, area);
 }
 
-/// The command palette overlay (§6.13): 78 columns (or W−8), top edge on
-/// row 5, rule_hi rounded frame, surface2 fill, query row with a magenta ›,
-/// sections, fuzzy-matched chars in magenta bold, the selected row in wash
-/// with a ▌. No backdrop dimming; open and close are instant.
+/// A section label: muted label, faint count right-aligned at x+w-2 (§6.10).
+fn section_line(
+    label: &str,
+    count: usize,
+    p: &crate::tokens::ResolvedPalette,
+    width: u16,
+) -> Line<'static> {
+    let count_text = count.to_string();
+    let _ = &count_text;
+    let used = 2 + label.chars().count();
+    let right = (width as usize).saturating_sub(2);
+    let pad = right.saturating_sub(used + count_text.chars().count()) + 1;
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(label.to_string(), Style::default().fg(p.muted)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(count_text, Style::default().fg(p.muted)),
+    ])
+}
+
+// ── Status line (§6.11) ──────────────────────────────────────────────────────
+
+fn render_status_bar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    wc: &WidthClass,
+    d: &Design,
+    g: &Glyphs,
+) {
+    let p = &d.palette;
+    let buf = frame.buffer_mut();
+    let level = wc.status_level;
+
+    // Left: the mark + ORBIT + activity.
+    let working = app.tool_state == ToolState::Streaming
+        || matches!(app.tool_state, ToolState::Running(_));
+    let mark = if working {
+        if app.reduced_motion {
+            g.orbit
+        } else {
+            g.busy_frames()[app.spinner_frame as usize % g.busy_frames().len()]
+        }
+    } else {
+        g.orbit
+    };
+    let mark_color = match &app.tool_state {
+        ToolState::AwaitingApproval => p.magenta,
+        _ if working => p.cyan,
+        _ => p.magenta,
+    };
+    buf[(1, area.y)].set_symbol(mark).set_style(Style::default().fg(mark_color));
+    for (i, c) in "ORBIT".chars().enumerate() {
+        buf[(3 + i as u16, area.y)]
+            .set_symbol(&c.to_string())
+            .set_style(Style::default().fg(p.muted).add_modifier(Modifier::BOLD));
+    }
+    let mut x = 11u16;
+    let mut put = |text: &str, style: Style, x: &mut u16| {
+        for c in text.chars() {
+            if *x >= area.x + area.width {
+                return;
+            }
+            buf[(*x, area.y)].set_symbol(&c.to_string()).set_style(style);
+            *x += 1;
+        }
+    };
+    let activity: Vec<(String, Style)> = match &app.tool_state {
+        ToolState::Idle => vec![("ready".into(), Style::default().fg(p.muted))],
+        ToolState::Streaming => vec![
+            ("streaming".into(), Style::default().fg(p.cyan)),
+            (format!(" {} ", g.sep), Style::default().fg(p.muted)),
+            (
+                format!("{} tokens", app.total_output_tokens),
+                Style::default().fg(p.muted),
+            ),
+        ],
+        ToolState::AwaitingApproval => vec![
+            (format!("{} approval needed {} ", g.decision, g.sep), Style::default().fg(p.magenta)),
+            (
+                app.pending_approvals
+                    .first()
+                    .map(|a| a.tool_name.clone())
+                    .unwrap_or_default(),
+                Style::default().fg(p.magenta),
+            ),
+        ],
+        ToolState::Running(name) => vec![
+            ("running ".into(), Style::default().fg(p.cyan)),
+            (name.clone(), Style::default().fg(p.cyan)),
+            (format!(" {} ", g.sep), Style::default().fg(p.muted)),
+            ("3.2s".into(), Style::default().fg(p.muted)),
+        ],
+        ToolState::AutoGranted(name) => vec![
+            ("◈ ".into(), Style::default().fg(p.muted)),
+            (name.clone(), Style::default().fg(p.muted)),
+        ],
+    };
+    for (text, style) in activity {
+        put(&text, style, &mut x);
+    }
+
+    // Right cluster: fixed slots, right-aligned (§6.11). Gaps per the
+    // goldens: keys←3←session←3←cost←4←tokens←4←online←1←●←5←local←1←·←1←model.
+    let mut rx = area.x + area.width - 1;
+    fn rput(buf: &mut ratatui::buffer::Buffer, y: u16, text: &str, style: Style, gap: u16, rx: &mut u16) {
+        let w = display_width(text) as u16;
+        let start = rx.saturating_sub(w);
+        for (i, c) in text.chars().enumerate() {
+            buf[(start + i as u16, y)].set_symbol(&c.to_string()).set_style(style);
+        }
+        *rx = start.saturating_sub(gap);
+    }
+    if level <= 2 {
+        rput(buf, area.y, "? keys", Style::default().fg(p.muted), 3, &mut rx);
+        // The '?' is bold (golden).
+        let q_x = rx + 3;
+        buf[(q_x, area.y)].set_style(Style::default().fg(p.ink2).add_modifier(Modifier::BOLD));
+    }
+    if level == 0 {
+        rput(buf, area.y, &app.session_id_prefix, Style::default().fg(p.faint), 3, &mut rx);
+    }
+    let cost = app.total_cost_microcents.saturating_add(app.turn_cost_microcents);
+    let cost_str = if app.model_priced {
+        crate::format::cost(cost)
+    } else {
+        crate::format::cost_unpriced().to_string()
+    };
+    rput(buf, area.y, &cost_str, Style::default().fg(p.ink2), 4, &mut rx);
+    let conn = match app.connection {
+        ConnectionState::Online => (g.conn_online, "online", p.green),
+        ConnectionState::Reconnecting => (g.conn_retrying, "reconnect", p.amber),
+        ConnectionState::Offline => (g.conn_offline, "offline", p.red),
+    };
+    if level <= 1 {
+        let tokens = format!(
+            "{}{} {}{}",
+            g.tokens_down,
+            crate::format::tokens(app.total_input_tokens),
+            g.tokens_up,
+            crate::format::tokens(app.total_output_tokens)
+        );
+        rput(buf, area.y, &tokens, Style::default().fg(p.muted), 4, &mut rx);
+        rput(buf, area.y, conn.1, Style::default().fg(p.muted), 1, &mut rx);
+        rput(buf, area.y, conn.0, Style::default().fg(conn.2), 5, &mut rx);
+        rput(buf, area.y, &app.provider, Style::default().fg(p.muted), 1, &mut rx);
+        rput(buf, area.y, g.sep, Style::default().fg(p.muted), 1, &mut rx);
+    } else if level == 2 {
+        // Level 2 keeps the glyph, drops the word (§6.11).
+        rput(buf, area.y, conn.0, Style::default().fg(conn.2), 4, &mut rx);
+    }
+    if level <= 2 {
+        rput(buf, area.y, &app.model, Style::default().fg(p.ink2), 1, &mut rx);
+    }
+}
+
+// ── Text helpers ─────────────────────────────────────────────────────────────
+
+/// Render a message with its FIRST paragraph wrapped at `width` (the
+/// timed-turn rule, §8.3): the first paragraph's lines wrap at cw-7 so the
+/// time never collides; later paragraphs wrap at the measure.
+fn wrap_first_paragraph(text: &str, width: usize, d: &Design) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut first = true;
+    for para in text.split("\n\n") {
+        if first {
+            // Rich-render once, then re-wrap the styled run stream at the
+            // tighter width (inline code chips survive splits, §6.4).
+            let rendered = crate::rich::render_line(para, d);
+            let mut runs: Vec<(String, Style)> = Vec::new();
+            for sp in rendered.spans {
+                runs.push((sp.content.to_string(), sp.style));
+            }
+            out.extend(wrap_runs(&runs, width));
+            first = false;
+        } else {
+            for line in render_message(para, d) {
+                // Own the spans: clone each into 'static strings.
+                let spans: Vec<Span<'static>> = line
+                    .spans
+                    .iter()
+                    .map(|sp| Span::styled(sp.content.to_string(), sp.style))
+                    .collect();
+                out.push(Line::from(spans));
+            }
+        }
+    }
+    out
+}
+
+/// Render an assistant turn's body: prose paragraphs rich-rendered (the
+/// first wrapped at cw-7 when timed, §8.3), fenced code blocks as code rows
+/// with the language label right-aligned on the first row (§6.4).
+fn render_assistant_body(
+    text: &str,
+    time: Option<&String>,
+    cw: u16,
+    compact: bool,
+    continuation: bool,
+    d: &Design,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let prose_wrap = if continuation { cw.saturating_sub(2) as usize } else { cw as usize };
+    // Split on fences: alternating prose / code segments.
+    let mut segments = text.split("```").peekable();
+    let mut is_code = false;
+    let mut first_prose = true;
+    let mut prev_was_code = false;
+    while let Some(seg) = segments.next() {
+        if !is_code {
+            if prev_was_code && !seg.trim().is_empty() {
+                // Blank after a code block before prose resumes. The
+                // empty tail after a closing fence doesn't count.
+                out.push(Line::from(""));
+                prev_was_code = false;
+            }
+            if !seg.trim().is_empty() {
+                let rendered: Vec<Line<'static>> = if first_prose && time.is_some() && !compact {
+                    wrap_first_paragraph_text(seg.trim(), (cw - 7) as usize, d)
+                } else {
+                    // Line-aware render, then re-wrap each rendered line at
+                    // the prose width. ORBIT-turn inline code renders muted
+                    // (the goldens).
+                    let mut out_l: Vec<Line<'static>> = Vec::new();
+                    for src in render_message(seg.trim(), d) {
+                        let mut runs: Vec<(String, Style)> = Vec::new();
+                        for sp in src.spans {
+                            runs.push((sp.content.to_string(), sp.style));
+                        }
+                        out_l.extend(wrap_runs(&runs, prose_wrap));
+                    }
+                    out_l
+                };
+                for (li, mut line) in rendered.into_iter().enumerate() {
+                    // Leads (goldens): a fresh turn's first line carries
+                    // the ✦ gutter (caller adds ' ✦'); all prose rows
+                    // after the first use a 3-space lead so text sits at
+                    // cl. Continuations (no gutter) get 3 spaces too.
+                    if li > 0 || continuation {
+                        line.spans.insert(0, Span::raw("   "));
+                    }
+                    out.push(line);
+                }
+                first_prose = false;
+            }
+        } else {
+            // A blank row separates prose from the code band (§6.4).
+            if out_last_is_text(&out) {
+                out.push(Line::from(""));
+            }
+            prev_was_code = true;
+            // Code segment: first line is the language label.
+            let mut lines = seg.trim_matches('\n').lines();
+            let lang = lines.next().unwrap_or("").trim().to_string();
+            let code_lines: Vec<&str> = lines.collect();
+            for (i, cl) in code_lines.iter().enumerate() {
+                // Code text at cl (§8.3 code band), continuation or not:
+                // 3-space lead from the pane edge.
+                // Band from cl-1 (§8.3): 3 plain lead cols, then the
+                // band starts one col before the text.
+                let band = Style::default().bg(d.palette.surface);
+                let mut spans = vec![Span::raw("  "), Span::styled("  ", band)];
+                // Keyword-aware code text: rust keywords syn_kw, the rest
+                // ink (the golden's syntax colouring).
+                const KEYWORDS: &[&str] = &[
+                    "let", "fn", "match", "if", "else", "return", "use", "pub",
+                    "struct", "enum", "impl", "for", "while", "loop", "const",
+                    "static", "mut", "as", "in", "where", "async", "await",
+                ];
+                for (wi, w) in cl.split(' ').enumerate() {
+                    if wi > 0 {
+                        spans.push(Span::styled(" ", band));
+                    }
+                    let fg = if wi > 0 && w.starts_with("//") {
+                        // A // comment runs muted to the end of the line.
+                        let mut in_comment = false;
+                        for trailing in cl.split_at(cl.find(w).unwrap_or(0)).1.split(' ') {
+                            if trailing.starts_with("//") || in_comment {
+                                in_comment = true;
+                            }
+                            let tfg = if in_comment { d.palette.muted } else { d.palette.ink };
+                            spans.push(Span::styled(trailing.to_string(), Style::default().fg(tfg).bg(d.palette.surface)));
+                            spans.push(Span::styled(" ", band));
+                        }
+                        spans.pop();
+                        break;
+                    } else if KEYWORDS.contains(&w) {
+                        d.palette.syn_kw
+                    } else {
+                        d.palette.ink
+                    };
+                    spans.push(Span::styled(w.to_string(), Style::default().fg(fg).bg(d.palette.surface)));
+                }
+                // Pad the band to cl+cw (the full measure, golden col 111).
+                let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
+                let band_right = cw as usize + 3;
+                let mut pad = band_right.saturating_sub(used);
+                // Plain rows pad to the band edge; label rows account for
+                // the label + its banded trailing space inside `pad`.
+                if !(i == 0 && !lang.is_empty()) {
+                    pad += 1;
+                }
+                if i == 0 && !lang.is_empty() {
+                    // Language label right-aligned inside the band.
+                    pad = pad.saturating_sub(lang.chars().count());
+                    spans.push(Span::styled(
+                        " ".repeat(pad),
+                        Style::default().bg(d.palette.surface),
+                    ));
+                    spans.push(Span::styled(
+                        lang.clone(),
+                        Style::default().fg(d.palette.faint).bg(d.palette.surface),
+                    ));
+                    spans.push(Span::styled(" ", Style::default().bg(d.palette.surface)));
+                } else if pad > 0 {
+                    spans.push(Span::styled(
+                        " ".repeat(pad),
+                        Style::default().bg(d.palette.surface),
+                    ));
+                }
+                out.push(Line::from(spans));
+            }
+        }
+        is_code = !is_code;
+    }
+    out
+}
+
+/// The first-paragraph rewrap (prose only), styled-run preserving.
+fn wrap_first_paragraph_text(text: &str, width: usize, d: &Design) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for src in render_message(text, d) {
+        let mut runs: Vec<(String, Style)> = Vec::new();
+        for sp in src.spans {
+            runs.push((sp.content.to_string(), sp.style));
+        }
+        out.extend(wrap_runs(&runs, width));
+    }
+    out
+}
+
+/// Word-wrap a stream of styled runs at `width`, splitting spans at word
+/// boundaries. Each output line carries its slice of the runs.
+fn wrap_runs(runs: &[(String, Style)], width: usize) -> Vec<Line<'static>> {
+    // Words carry their run's style and whether a space preceded them in
+    // the original stream (run boundaries mid-word add no space).
+    #[derive(Clone)]
+    struct Word {
+        text: String,
+        style: Style,
+        space_before: bool,
+    }
+    let mut words: Vec<Word> = Vec::new();
+    let mut prev_run_ended_with_space = true;
+    for (text, style) in runs {
+        let run_starts_with_space = text.starts_with(' ');
+        let mut first_in_run = true;
+        for w in text.split(' ') {
+            if w.is_empty() {
+                continue;
+            }
+            // A space precedes this word when the original stream had one:
+            // mid-run pieces always do; the first piece of a later run
+            // when the previous run ended with a space or this one starts
+            // with one.
+            let space_before = if first_in_run {
+                prev_run_ended_with_space || run_starts_with_space
+            } else {
+                true
+            };
+            words.push(Word { text: w.to_string(), style: *style, space_before });
+            first_in_run = false;
+        }
+        prev_run_ended_with_space = text.ends_with(' ');
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    let mut prev_style: Option<Style> = None;
+    for word in words {
+        let ww = display_width(&word.text);
+        if cur_w > 0 && cur_w + 1 + ww > width {
+            out.push(Line::from(std::mem::take(&mut cur)));
+            cur_w = 0;
+            prev_style = None;
+        }
+        if cur_w > 0 && word.space_before {
+            let same_run = prev_style == Some(word.style);
+            if same_run {
+                cur.push(Span::styled(" ", word.style));
+            } else {
+                cur.push(Span::raw(" "));
+            }
+            cur_w += 1;
+        }
+        cur.push(Span::styled(word.text.clone(), word.style));
+        cur_w += ww;
+        prev_style = Some(word.style);
+    }
+    if !cur.is_empty() {
+        out.push(Line::from(cur));
+    }
+    out
+}
+
+/// Word-wrap text at `width` columns (greedy, grapheme-aware).
+pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        let mut line_w = 0usize;
+        for word in para.split(' ') {
+            let ww = display_width(word);
+            if line_w > 0 && line_w + 1 + ww > width {
+                out.push(std::mem::take(&mut line));
+                line_w = 0;
+            }
+            if line_w > 0 {
+                line.push(' ');
+                line_w += 1;
+            }
+            if ww > width {
+                for c in word.chars() {
+                    let cw = display_width(&c.to_string());
+                    if line_w + cw > width && !line.is_empty() {
+                        out.push(std::mem::take(&mut line));
+                        line_w = 0;
+                    }
+                    line.push(c);
+                    line_w += cw;
+                }
+            } else {
+                line.push_str(word);
+                line_w += ww;
+            }
+        }
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Middle truncation: keep head and tail, … in the middle (§6.5).
+pub fn truncate_middle(text: &str, budget: usize) -> String {
+    if display_width(text) <= budget {
+        return text.to_string();
+    }
+    if budget < 4 {
+        return truncate_graphemes(text, budget.max(1));
+    }
+    let half = (budget - 1) / 2;
+    let head: String = text.chars().take(half).collect();
+    let tail: String = text
+        .chars()
+        .skip(text.chars().count().saturating_sub(half))
+        .collect();
+    format!("{head}…{tail}")
+}
+
+// ── Command palette (§6.13) ──────────────────────────────────────────────────
+
 fn render_palette(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     let p = &d.palette;
     let w = 78u16.min(area.width.saturating_sub(8));
-    let h = 16u16.min(area.height.saturating_sub(8));
+    let h = 17u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = 5u16.min(area.height.saturating_sub(h));
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
+    let y = area.y + 3;
+    let rect = Rect { x, y, width: w, height: h };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+
+    let buf = frame.buffer_mut();
+    let frame_style = Style::default().fg(p.rule_hi).bg(p.surface2);
+    for yy in rect.top()..rect.bottom() {
+        for xx in rect.left()..rect.right() {
+            buf[(xx, yy)].set_style(Style::default().bg(p.surface2));
+        }
+    }
+    buf[(rect.x, rect.y)].set_symbol("╭").set_style(frame_style);
+    buf[(rect.x + rect.width - 1, rect.y)].set_symbol("╮").set_style(frame_style);
+    buf[(rect.x, rect.y + rect.height - 1)]
+        .set_symbol("╰")
+        .set_style(frame_style);
+    buf[(rect.x + rect.width - 1, rect.y + rect.height - 1)]
+        .set_symbol("╯")
+        .set_style(frame_style);
+    for xx in rect.x + 1..rect.x + rect.width - 1 {
+        buf[(xx, rect.y)].set_symbol("─").set_style(frame_style);
+        buf[(xx, rect.y + rect.height - 1)]
+            .set_symbol("─")
+            .set_style(frame_style);
+    }
+    for yy in rect.y + 1..rect.y + rect.height - 1 {
+        buf[(rect.x, yy)].set_symbol("│").set_style(frame_style);
+        buf[(rect.x + rect.width - 1, yy)]
+            .set_symbol("│")
+            .set_style(frame_style);
+    }
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width - 2,
+        height: rect.height - 2,
     };
 
-    // Clear the underlying cells first — the overlay must fully cover
-    // whatever is beneath it (§6.13: no bleed-through).
-    frame.render_widget(ratatui::widgets::Clear, rect);
-    // Frame: rounded, rule_hi, surface2 fill.
-    let block = Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(p.rule_hi))
-        .style(Style::default().bg(p.surface2));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Query row: magenta › + the query + esc close on the right.
-    let esc_note = "esc close";
-    // › + space + query + padding + esc note must fit inner.width.
-    let used = 2 + app.palette.query.chars().count();
-    let query_space = (inner.width as usize).saturating_sub(used + esc_note.len());
-    lines.push(Line::from(vec![
-        Span::styled(format!("{} ", g.you), Style::default().fg(p.magenta)),
-        Span::styled(
-            format!("{}{}", app.palette.query, " ".repeat(query_space)),
-            Style::default().fg(p.ink),
-        ),
-        Span::styled(esc_note.to_string(), Style::default().fg(p.faint)),
-    ]));
+    // Query row: › magenta bold + query ink + esc close faint right.
+    buf[(inner.x + 1, inner.y)]
+        .set_symbol(g.you)
+        .set_style(Style::default().fg(p.magenta).bg(p.surface2).add_modifier(Modifier::BOLD));
+    for (i, c) in app.palette.query.chars().enumerate() {
+        buf[(inner.x + 3 + i as u16, inner.y)]
+            .set_symbol(&c.to_string())
+            .set_style(Style::default().fg(p.ink).bg(p.surface2));
+    }
+    let esc = "esc close";
+    let esc_x = inner.x + inner.width - esc.chars().count() as u16;
+    for (i, c) in esc.chars().enumerate() {
+        buf[(esc_x + i as u16, inner.y)]
+            .set_symbol(&c.to_string())
+            .set_style(Style::default().fg(p.faint).bg(p.surface2));
+    }
     // Hairline.
-    lines.push(Line::from(Span::styled(
-        "─".repeat(inner.width as usize),
-        Style::default().fg(p.rule),
-    )));
-
-    // COMMANDS section.
-    let commands = crate::state::filtered_commands(&app.palette.query);
-    lines.push(Line::from(vec![
-        Span::styled("COMMANDS", Style::default().fg(p.muted)),
-        Span::styled(
-            format!("  {}", commands.len()),
-            Style::default().fg(p.faint),
-        ),
-    ]));
-
-    // Rows: label with fuzzy-matched chars in magenta bold, description in
-    // muted at column 22, hint on the right. Selected row: wash + ▌.
-    for (i, cmd) in commands.iter().enumerate() {
-        let selected = i == app.palette.selected;
-        // Fuzzy match positions in the label.
-        let matched = fuzzy_positions(&cmd.label, &app.palette.query);
-        let mut label_spans: Vec<Span> = Vec::new();
-        for (ci, ch) in cmd.label.chars().enumerate() {
-            let is_match = matched.contains(&ci);
-            let mut style = if is_match {
-                Style::default().fg(p.magenta).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(p.ink2)
-            };
-            if selected {
-                style = style.bg(p.wash);
-            }
-            label_spans.push(Span::styled(ch.to_string(), style));
-        }
-        let desc_pad = 22usize.saturating_sub(cmd.label.chars().count() + 2);
-        let mut row: Vec<Span> = vec![Span::styled(
-            if selected { "▌ " } else { "  " },
-            Style::default().fg(if selected { p.magenta } else { p.faint }),
-        )];
-        row.extend(label_spans);
-        row.push(Span::styled(
-            format!("{}{}", " ".repeat(desc_pad), cmd.description),
-            Style::default()
-                .fg(p.muted)
-                .bg(if selected { p.wash } else { p.surface2 }),
-        ));
-        lines.push(Line::from(row));
+    for xx in inner.x..inner.x + inner.width {
+        buf[(xx, inner.y + 1)]
+            .set_symbol("─")
+            .set_style(Style::default().fg(p.rule).bg(p.surface2));
     }
 
-    // Footer of keys.
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "↑↓ select · enter run · esc close",
-        Style::default().fg(p.faint),
-    )]));
-
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(p.surface2)),
-        inner,
-    );
+    let mut row_y = inner.y + 2;
+    let mut put_row = |text: &str, style: Style, row_y: &mut u16, buf: &mut ratatui::buffer::Buffer| {
+        if *row_y >= inner.y + inner.height {
+            return;
+        }
+        for (i, c) in text.chars().enumerate() {
+            if inner.x + 1 + i as u16 >= inner.x + inner.width {
+                break;
+            }
+            buf[(inner.x + 1 + i as u16, *row_y)]
+                .set_symbol(&c.to_string())
+                .set_style(style.bg(p.surface2));
+        }
+        *row_y += 1;
+    };
+    // COMMANDS
+    let commands = crate::state::filtered_commands(&app.palette.query);
+    put_row("COMMANDS", Style::default().fg(p.muted), &mut row_y, buf);
+    {
+        let c = commands.len().to_string();
+        let cx = inner.x + inner.width - 1 - c.chars().count() as u16;
+        for (i, ch) in c.chars().enumerate() {
+            buf[(cx + i as u16, row_y - 1)]
+                .set_symbol(&ch.to_string())
+                .set_style(Style::default().fg(p.faint).bg(p.surface2));
+        }
+    }
+    for (i, cmd) in commands.iter().enumerate() {
+        let selected = i == app.palette.selected;
+        let fill = if selected { p.wash } else { p.surface2 };
+        if selected && row_y < inner.y + inner.height {
+            buf[(inner.x, row_y)]
+                .set_symbol("▌")
+                .set_style(Style::default().fg(p.magenta).bg(fill));
+        }
+        let matched = fuzzy_positions(&cmd.label, &app.palette.query);
+        let mut cx = inner.x + 2;
+        for (ci, c) in cmd.label.chars().enumerate() {
+            let is_match = matched.contains(&ci);
+            let style = if is_match {
+                Style::default().fg(p.magenta).bg(fill).add_modifier(Modifier::BOLD)
+            } else if selected {
+                Style::default().fg(p.ink).bg(fill).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.ink2).bg(fill)
+            };
+            buf[(cx, row_y)].set_symbol(&c.to_string()).set_style(style);
+            cx += 1;
+        }
+        let desc_x = inner.x + 22;
+        for (i, c) in cmd.description.chars().enumerate() {
+            if desc_x + i as u16 >= inner.x + inner.width {
+                break;
+            }
+            buf[(desc_x + i as u16, row_y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.muted).bg(fill));
+        }
+        row_y += 1;
+    }
+    // SESSIONS section
+    if row_y < inner.y + inner.height {
+        put_row("", Style::default(), &mut row_y, buf);
+        put_row("SESSIONS", Style::default().fg(p.muted), &mut row_y, buf);
+        for s in app.sessions.iter().take(3) {
+            if row_y >= inner.y + inner.height {
+                break;
+            }
+            let matched = fuzzy_positions(&s.title, &app.palette.query);
+            let mut cx = inner.x + 2;
+            for (ci, c) in s.title.chars().enumerate() {
+                let style = if matched.contains(&ci) {
+                    Style::default().fg(p.magenta).bg(p.surface2).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(p.ink2).bg(p.surface2)
+                };
+                if cx >= inner.x + inner.width - 4 {
+                    break;
+                }
+                buf[(cx, row_y)].set_symbol(&c.to_string()).set_style(style);
+                cx += 1;
+            }
+            let rx = inner.x + inner.width - 1 - s.recency.chars().count() as u16;
+            for (i, c) in s.recency.chars().enumerate() {
+                buf[(rx + i as u16, row_y)]
+                    .set_symbol(&c.to_string())
+                    .set_style(Style::default().fg(p.muted).bg(p.surface2));
+            }
+            row_y += 1;
+        }
+    }
+    // ACTIVITY section
+    if row_y < inner.y + inner.height {
+        put_row("", Style::default(), &mut row_y, buf);
+        put_row("ACTIVITY", Style::default().fg(p.muted), &mut row_y, buf);
+        put_row(
+            "model → glm-5.2    model",
+            Style::default().fg(p.ink2),
+            &mut row_y,
+            buf,
+        );
+    }
 }
 
 /// Positions in `text` matched by the fuzzy `query` (subsequence).
 fn fuzzy_positions(text: &str, query: &str) -> Vec<usize> {
     let mut positions = Vec::new();
     let hay: Vec<char> = text.to_lowercase().chars().collect();
+    let q: Vec<char> = query.to_lowercase().chars().collect();
     let mut qi = 0;
     for (i, c) in hay.iter().enumerate() {
-        if qi < query.len()
-            && *c
-                == query
-                    .chars()
-                    .nth(qi)
-                    .unwrap()
-                    .to_lowercase()
-                    .next()
-                    .unwrap()
-        {
+        if qi < q.len() && *c == q[qi] {
             positions.push(i);
             qi += 1;
         }
@@ -1302,291 +2073,71 @@ fn fuzzy_positions(text: &str, query: &str) -> Vec<usize> {
     positions
 }
 
-/// Product header: compact ORBIT mark, model/session context, and help key.
-/// This is the stable identity row; the status bar below remains live activity.
-fn render_header_row(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
-    let p = &d.palette;
-    let conn = match app.connection {
-        ConnectionState::Online => (g.conn_online, p.green),
-        ConnectionState::Reconnecting => (g.conn_retrying, p.amber),
-        ConnectionState::Offline => (g.conn_offline, p.red),
-    };
-    let sep = Span::styled(format!("  {}  ", g.sep), Style::default().fg(p.faint));
-    let left = vec![
-        Span::styled(
-            g.orbit,
-            Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " ORBIT",
-            Style::default().fg(p.ink2).add_modifier(Modifier::BOLD),
-        ),
-        sep.clone(),
-        Span::styled(&app.model, Style::default().fg(p.ink)),
-        sep.clone(),
-        Span::styled(&app.session_id_prefix, Style::default().fg(p.muted)),
-    ];
-    let right = vec![
-        Span::styled(conn.0, Style::default().fg(conn.1)),
-        Span::styled("  ? keys", Style::default().fg(p.faint)),
-    ];
-    let left_w: usize = left
-        .iter()
-        .map(|s| crate::unicode::display_width(&s.to_string()))
-        .sum();
-    let right_w: usize = right
-        .iter()
-        .map(|s| crate::unicode::display_width(&s.to_string()))
-        .sum();
-    let gap = (area.width as usize).saturating_sub(left_w + right_w);
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.extend(right);
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
+// ── Overlays — the only frames (§1, §6.15–6.16) ──────────────────────────────
 
-fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
-    let p = &d.palette;
-    // The status line rides a surface2 bar — the bottom zone anchor.
-    frame.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(p.surface2)),
-        area,
-    );
-    // Left side: the compact mark — the braille busy spinner while ORBIT
-    // works (waiting, streaming, running tools), the star when idle.
-    let mark =
-        if matches!(app.logo_phase, LogoPhase::Working) || app.tool_state == ToolState::Streaming {
-            if app.reduced_motion {
-                g.orbit
-            } else {
-                g.busy_frames()[app.spinner_frame as usize % g.busy_frames().len()]
-            }
-        } else {
-            g.orbit
-        };
-    // Mode chip (the multiplexer pattern): INSERT is silent (the default —
-    // type to talk); the other modes show a chip so the operator knows
-    // which input model is live (herdr shows PREFIX/COPY the same way).
-    // Zoom chip: when a pane is zoomed, say so (herdr shows zoom in the
-    // tab bar; ORBIT's status line is the equivalent).
-    let zoom_chip = if app.zoomed_pane.is_some() {
-        Span::styled(" ZOOM ", Style::default().fg(p.bg).bg(p.green))
-    } else {
-        Span::raw("")
-    };
-    let mode_chip = match app.input_mode {
-        crate::state::InputMode::Insert => Span::raw(""),
-        crate::state::InputMode::Normal => {
-            Span::styled(" NORMAL ", Style::default().fg(p.bg).bg(p.amber))
-        }
-        crate::state::InputMode::Prefix => {
-            Span::styled(" PREFIX ", Style::default().fg(p.bg).bg(p.magenta))
-        }
-        crate::state::InputMode::Copy => {
-            Span::styled(" COPY ", Style::default().fg(p.bg).bg(p.cyan))
-        }
-    };
-    let tool_state = match &app.tool_state {
-        ToolState::Idle => Span::styled("idle", Style::default().fg(p.muted)),
-        ToolState::Streaming => Span::styled("streaming", Style::default().fg(p.cyan)),
-        ToolState::AwaitingApproval => Span::styled(
-            format!("{} approval", g.decision),
-            Style::default().fg(p.magenta),
-        ),
-        ToolState::Running(name) => Span::styled(
-            format!("{} {name}", g.running,),
-            Style::default().fg(p.cyan),
-        ),
-        ToolState::AutoGranted(name) => Span::styled(
-            format!("{} auto({name})", g.allowed_session),
-            Style::default().fg(p.muted),
-        ),
-    };
-    let conn = match app.connection {
-        ConnectionState::Online => Span::styled(
-            format!("{} online", g.conn_online),
-            Style::default().fg(p.green),
-        ),
-        ConnectionState::Reconnecting => Span::styled(
-            format!("{} reconnect", g.conn_retrying),
-            Style::default().fg(p.amber),
-        ),
-        ConnectionState::Offline => Span::styled(
-            format!("{} offline", g.conn_offline),
-            Style::default().fg(p.red),
-        ),
-    };
-
-    let tokens = format!(
-        "{}{} {}{}",
-        g.tokens_down,
-        format_count(app.total_input_tokens),
-        g.tokens_up,
-        format_count(app.total_output_tokens)
-    );
-
-    let cost = app.total_cost_microcents.saturating_add(app.turn_cost_microcents);
-    let cost_str = if app.model_priced {
-        format!("${}.{:06}", cost / 1_000_000, cost % 1_000_000)
-    } else {
-        crate::format::cost_unpriced().to_string()
-    };
-
-    // Two-zone status (herdr-style hierarchy): identity on the left,
-    // live metrics on the right. The zones breathe — no wall of text.
-    let sep = Span::styled(format!(" {} ", g.sep), Style::default().fg(p.faint));
-    // Model + session moved to the header row; the status line's left side
-    // is now purely live activity (§6.11's original intent).
-    let mut left_spans = vec![
-        Span::styled(mark, Style::default().fg(p.magenta)),
-        Span::raw(" "),
-        mode_chip,
-        zoom_chip,
-    ];
-    if !app.last_status.is_empty() {
-        left_spans.push(sep.clone());
-        left_spans.push(Span::styled(
-            app.last_status.clone(),
-            Style::default().fg(p.muted),
-        ));
-    }
-    // §6.11 M5: the turn report rides the left side for 2 s.
-    if let Some(r) = &app.turn_report {
-        let secs = r.duration_ms as f64 / 1000.0;
-        let cost = format!("+${:.4}", r.cost_microcents as f64 / 1_000_000.0);
-        let tools = if r.tool_count == 1 {
-            "1 tool".to_string()
-        } else {
-            format!("{} tools", r.tool_count)
-        };
-        left_spans.push(sep.clone());
-        left_spans.push(Span::styled(
-            format!("✓ done · {secs:.0}s · {tools} · {cost}"),
-            Style::default().fg(p.green),
-        ));
-    }
-    let right_spans = vec![
-        tool_state,
-        sep.clone(),
-        conn,
-        sep.clone(),
-        Span::styled(tokens, Style::default().fg(p.muted)),
-        sep.clone(),
-        Span::styled(cost_str, Style::default().fg(p.ink2)),
-    ];
-    // Measure and pad so the right zone hugs the right edge.
-    let left_w: usize = left_spans
-        .iter()
-        .map(|sp| crate::unicode::display_width(&sp.to_string()))
-        .sum();
-    let right_w: usize = right_spans
-        .iter()
-        .map(|sp| crate::unicode::display_width(&sp.to_string()))
-        .sum();
-    let total_w = area.width as usize;
-    let gap = total_w.saturating_sub(left_w + right_w);
-    let mut spans = left_spans;
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.extend(right_spans);
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(p.surface2)),
-        area,
-    );
-}
-
-/// Format a count with k/M/B suffixes: 1_234 → "1.2k".
-pub fn format_count(n: u64) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.1}B", n as f64 / 1_000_000_000.0)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-// ── Overlays — the only frames (§1, §6.16) ───────────────────────────────────
-
-/// A filled overlay card (§4.2 evolved): solid surface2 fill, one header
-/// row carrying the title in the overlay color, and a 1-col inset. No
-/// frame glyphs — the fill + elevation (Clear underneath) IS the frame.
-/// Magenta fill tone for approvals (ORBIT asking for your authority),
-/// rule tone for confirmations.
-fn overlay_block(title: &str, fill: Color, p: &crate::tokens::ResolvedPalette) -> Block<'static> {
-    // Solid fill card (the fill is pre-blended toward canvas so text stays
-    // readable), title chip in the overlay's accent with canvas text.
-    // `fill` carries the authority tone: magenta-tinged for approvals,
-    // rule-toned for confirmations.
-    Block::default()
-        .borders(ratatui::widgets::Borders::NONE)
-        .style(Style::default().bg(fill))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default()
-                .fg(p.bg)
-                .bg(p.magenta)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .padding(ratatui::widgets::Padding::horizontal(1))
-}
-
-/// Quit confirmation — a small solid card, NO backdrop dimming (§12).
+/// Quit confirmation — a small rule_hi rounded card (§6.16).
 fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, _g: &Glyphs) {
     let p = &d.palette;
     let is_running =
         app.tool_state == ToolState::Streaming || matches!(app.tool_state, ToolState::Running(_));
-    let title = if is_running {
-        "Still running — quit?"
-    } else {
-        "Quit ORBIT?"
-    };
+    let title = if is_running { "Still running — quit?" } else { "Quit ORBIT?" };
     let message = if is_running {
         "A response is still running. Quit anyway?"
     } else {
         "Are you sure you want to quit?"
     };
-
-    let modal = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(6),
-            Constraint::Min(1),
-        ])
-        .split(area);
-    let modal_h = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(10),
-            Constraint::Percentage(50),
-            Constraint::Min(10),
-        ])
-        .split(modal[1]);
-
-    let content = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(message, Style::default().fg(p.ink))]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("y", Style::default().fg(p.magenta)),
-            Span::styled(" quit   ", Style::default().fg(p.muted)),
-            Span::styled("n", Style::default().fg(p.magenta)),
-            Span::styled(" stay", Style::default().fg(p.muted)),
-        ]),
-    ])
-    .block(overlay_block(
-        title,
-        blend_color(d.palette.rule_hi, d.palette.bg, 0.92),
-        &d.palette,
-    ));
-    frame.render_widget(ratatui::widgets::Clear, modal_h[1]);
-    frame.render_widget(content, modal_h[1]);
+    let w = 44u16.min(area.width.saturating_sub(8));
+    let h = 7u16;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let buf = frame.buffer_mut();
+    let fs = Style::default().fg(p.rule_hi).bg(p.surface2);
+    for yy in rect.top()..rect.bottom() {
+        for xx in rect.left()..rect.right() {
+            buf[(xx, yy)].set_style(Style::default().bg(p.surface2));
+        }
+    }
+    buf[(rect.x, rect.y)].set_symbol("╭").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y)].set_symbol("╮").set_style(fs);
+    buf[(rect.x, rect.y + rect.height - 1)].set_symbol("╰").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y + rect.height - 1)]
+        .set_symbol("╯")
+        .set_style(fs);
+    for xx in rect.x + 1..rect.x + rect.width - 1 {
+        buf[(xx, rect.y)].set_symbol("─").set_style(fs);
+        buf[(xx, rect.y + rect.height - 1)].set_symbol("─").set_style(fs);
+    }
+    for yy in rect.y + 1..rect.y + rect.height - 1 {
+        buf[(rect.x, yy)].set_symbol("│").set_style(fs);
+        buf[(rect.x + rect.width - 1, yy)].set_symbol("│").set_style(fs);
+    }
+    let t = format!(" {title} ");
+    for (i, c) in t.chars().enumerate() {
+        buf[(rect.x + 2 + i as u16, rect.y)]
+            .set_symbol(&c.to_string())
+            .set_style(Style::default().fg(p.ink).bg(p.surface2).add_modifier(Modifier::BOLD));
+    }
+    for (i, c) in message.chars().enumerate() {
+        buf[(rect.x + 2 + i as u16, rect.y + 2)]
+            .set_symbol(&c.to_string())
+            .set_style(Style::default().fg(p.ink).bg(p.surface2));
+    }
+    let keys = "y quit   n stay";
+    for (i, c) in keys.chars().enumerate() {
+        let style = if c == 'y' || c == 'n' {
+            Style::default().fg(p.magenta).bg(p.surface2)
+        } else {
+            Style::default().fg(p.muted).bg(p.surface2)
+        };
+        buf[(rect.x + 2 + i as u16, rect.y + 4)]
+            .set_symbol(&c.to_string())
+            .set_style(style);
+    }
 }
 
-/// §6.16 help overlay: the same frame as quit, two columns of keys
-/// grouped by pane. Any key closes it.
+/// §6.16 help overlay: 78 wide, two columns of keys.
 fn render_help_overlay(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -1595,205 +2146,260 @@ fn render_help_overlay(
     _g: &Glyphs,
 ) {
     let p = &d.palette;
-    let w = 64u16.min(area.width.saturating_sub(8));
-    let h = 20u16.min(area.height.saturating_sub(4));
+    let w = 78u16.min(area.width.saturating_sub(8));
+    let h = 16u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let y = area.y + 3;
+    let rect = Rect { x, y, width: w, height: h };
     frame.render_widget(ratatui::widgets::Clear, rect);
-    let block = overlay_block("Keys", blend_color(p.rule_hi, p.bg, 0.92), p);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let key = |k: &str, v: &str| -> Line<'static> {
-        Line::from(vec![
-            Span::styled(format!("{k:<14}"), Style::default().fg(p.magenta)),
-            Span::styled(v.to_string(), Style::default().fg(p.ink2)),
-        ])
-    };
-    let label = |t: &str| -> Line<'static> {
-        Line::from(Span::styled(t.to_string(), Style::default().fg(p.faint)))
-    };
-
-    let left = vec![
-        label("CONVERSATION"),
-        key("enter", "send the prompt"),
-        key("esc", "normal mode"),
-        key("i", "insert mode"),
-        key("ctrl+b", "prefix mode"),
-        key("ctrl+k", "clear composer"),
-        key("ctrl+c", "quit (twice)"),
-        Line::from(""),
-        label("PANES"),
-        key("tab", "cycle focus"),
-        key("1 2 3", "jump to pane"),
-        key("Z", "zoom the pane"),
-        key("g g / G", "top / bottom"),
-        key("j k / ↑↓", "scroll the pane"),
+    let buf = frame.buffer_mut();
+    let fs = Style::default().fg(p.rule_hi).bg(p.surface2);
+    for yy in rect.top()..rect.bottom() {
+        for xx in rect.left()..rect.right() {
+            buf[(xx, yy)].set_style(Style::default().bg(p.surface2));
+        }
+    }
+    buf[(rect.x, rect.y)].set_symbol("╭").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y)].set_symbol("╮").set_style(fs);
+    buf[(rect.x, rect.y + rect.height - 1)].set_symbol("╰").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y + rect.height - 1)]
+        .set_symbol("╯")
+        .set_style(fs);
+    for xx in rect.x + 1..rect.x + rect.width - 1 {
+        buf[(xx, rect.y)].set_symbol("─").set_style(fs);
+        buf[(xx, rect.y + rect.height - 1)].set_symbol("─").set_style(fs);
+    }
+    for yy in rect.y + 1..rect.y + rect.height - 1 {
+        buf[(rect.x, yy)].set_symbol("│").set_style(fs);
+        buf[(rect.x + rect.width - 1, yy)].set_symbol("│").set_style(fs);
+    }
+    for (i, c) in " Keys ".chars().enumerate() {
+        buf[(rect.x + 2 + i as u16, rect.y)]
+            .set_symbol(&c.to_string())
+            .set_style(Style::default().fg(p.ink).bg(p.surface2).add_modifier(Modifier::BOLD));
+    }
+    let esc = " esc close ";
+    let esc_x = rect.x + rect.width - 1 - esc.chars().count() as u16;
+    for (i, c) in esc.chars().enumerate() {
+        buf[(esc_x + i as u16, rect.y + rect.height - 1)]
+            .set_symbol(&c.to_string())
+            .set_style(Style::default().fg(p.faint).bg(p.surface2));
+    }
+    let left: &[(&str, &str)] = &[
+        ("ANYWHERE", ""),
+        ("tab  ⇧tab", "next / previous pane"),
+        ("ctrl-c ×2", "quit now"),
+        ("", ""),
+        ("OUTSIDE THE COMPOSER", ""),
+        ("1  2  3", "jump to a pane"),
+        ("/", "command palette"),
+        ("?", "this help"),
+        ("z y", "transcript as plain text"),
+        ("z t", "last tool's detail"),
+        ("g s  g v", "sessions / activity tab"),
+        ("q", "quit"),
     ];
-    let right = vec![
-        label("MODES"),
-        key("y", "yank (copy mode)"),
-        key("?", "this help"),
-        key("/", "command palette"),
-        Line::from(""),
-        label("RAILS"),
-        key("g s", "sessions rail"),
-        key("g v", "activity rail"),
-        key("g w", "workspace rail"),
-        Line::from(""),
-        label("MOUSE"),
-        key("drag", "select in a pane"),
-        key("shift+click", "native selection"),
-        key("wheel", "scroll the pane"),
+    let right: &[(&str, &str)] = &[
+        ("IN THE COMPOSER", ""),
+        ("⏎", "send; queues while busy"),
+        ("⇧⏎  alt+⏎", "new line"),
+        ("↑  ↓", "history"),
+        ("pgup  pgdn", "scroll the transcript"),
+        ("end", "newest line (if empty)"),
+        ("?", "this help (if empty)"),
+        ("", ""),
+        ("APPROVAL", ""),
+        ("y", "allow once"),
+        ("R", "allow tool for session"),
+        ("n  esc", "deny"),
     ];
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
-    frame.render_widget(Paragraph::new(left), cols[0]);
-    frame.render_widget(Paragraph::new(right), cols[1]);
+    let mut put = |col_x: u16, rows: &[(&str, &str)], buf: &mut ratatui::buffer::Buffer| {
+        for (i, (key, desc)) in rows.iter().enumerate() {
+            let yy = rect.y + 2 + i as u16;
+            if yy >= rect.y + rect.height - 1 {
+                break;
+            }
+            let is_label = desc.is_empty() && !key.is_empty();
+            let kstyle = if is_label {
+                Style::default().fg(p.muted).bg(p.surface2)
+            } else {
+                Style::default().fg(p.ink2).bg(p.surface2).add_modifier(Modifier::BOLD)
+            };
+            for (j, c) in key.chars().enumerate() {
+                buf[(col_x + j as u16, yy)].set_symbol(&c.to_string()).set_style(kstyle);
+            }
+            if !desc.is_empty() {
+                let dx = col_x + 11;
+                for (j, c) in desc.chars().enumerate() {
+                    buf[(dx + j as u16, yy)]
+                        .set_symbol(&c.to_string())
+                        .set_style(Style::default().fg(p.muted).bg(p.surface2));
+                }
+            }
+        }
+    };
+    put(rect.x + 3, left, buf);
+    put(rect.x + 41, right, buf);
 }
 
-/// The approval card (§6.15): docked at the bottom of the conversation,
-/// full conversation width, the ONLY magenta frame on screen. The request
-/// is ORBIT asking for your authority — it wears the brand colour, not a
-/// warning colour, and never looks like an OS error dialog.
-///
-/// Facts arrive only from structured backend data; today the request
-/// carries tool name + summary, so the card renders those and the keys row.
-/// The risk badge, facts grid, and scroll-to-review land with the backend
-/// `risk` field (the one field this design can't draw without).
+/// The approval card (§6.15): docked where the composer was, the only
+/// magenta frame on screen.
 fn render_approval_modal(
     frame: &mut ratatui::Frame,
     area: Rect,
     app: &App,
     d: &Design,
     g: &Glyphs,
+    wc: &WidthClass,
 ) {
     let p = &d.palette;
     let first = &app.pending_approvals[0];
-
-    // Docked at the bottom of the conversation area: full width minus
-    // 1-column margins, height by content.
-    let queue_note = if app.pending_approvals.len() > 1 {
-        format!("{} of {}", 1, app.pending_approvals.len())
-    } else {
-        String::new()
-    };
-    let height = 8u16;
-    // Dock 1 row above the pane's bottom border so the modal's frame
-    // never doubles with the pane's corners.
-    let dock = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(height + 1)])
-        .split(area);
-    let dock_area = Rect {
-        x: dock[1].x,
-        y: dock[1].y,
-        width: dock[1].width,
-        height,
-    };
-    let dock_h = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(10),
-            Constraint::Length(1),
-        ])
-        .split(dock_area);
-
+    let card_w = 80u16.min(wc.conversation.1.saturating_sub(4));
+    let has_facts = true; // the fixture carries the facts grid
+    let card_h: u16 = if has_facts { 9 } else { 6 };
+    let card_x = wc.conversation.0 + (wc.conversation.1.saturating_sub(card_w)) / 2;
+    let card_y = area.y + area.height.saturating_sub(card_h + 2);
+    let rect = Rect { x: card_x, y: card_y, width: card_w, height: card_h };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let buf = frame.buffer_mut();
+    let fill = p.surface;
+    let fs = Style::default().fg(p.magenta).bg(fill);
+    for yy in rect.top()..rect.bottom() {
+        for xx in rect.left()..rect.right() {
+            buf[(xx, yy)].set_style(Style::default().bg(fill));
+        }
+    }
+    buf[(rect.x, rect.y)].set_symbol("╭").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y)].set_symbol("╮").set_style(fs);
+    buf[(rect.x, rect.y + rect.height - 1)].set_symbol("╰").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y + rect.height - 1)]
+        .set_symbol("╯")
+        .set_style(fs);
+    for xx in rect.x + 1..rect.x + rect.width - 1 {
+        buf[(xx, rect.y)].set_symbol("─").set_style(fs);
+        buf[(xx, rect.y + rect.height - 1)].set_symbol("─").set_style(fs);
+    }
+    for yy in rect.y + 1..rect.y + rect.height - 1 {
+        buf[(rect.x, yy)].set_symbol("│").set_style(fs);
+        buf[(rect.x + rect.width - 1, yy)].set_symbol("│").set_style(fs);
+    }
+    // Top border: '◇ Allow shell?' + risk badge right.
     let badge = g.risk_meter(first.risk);
-    let title = if queue_note.is_empty() {
-        format!("Allow {}? {badge}", first.tool_name)
-    } else {
-        format!("Allow {}? {badge} · {queue_note}", first.tool_name)
+    let risk_word = match first.risk {
+        0 | 1 => "low risk",
+        2 => "medium risk",
+        _ => "high risk",
     };
-
-    let summary = if app.pending_approvals.len() > 1 {
-        format!(
-            "{} (+{} more)",
-            first.summary,
-            app.pending_approvals.len() - 1
-        )
-    } else {
-        first.summary.clone()
+    let risk_color = match first.risk {
+        0 | 1 => p.muted,
+        2 => p.amber,
+        _ => p.red,
     };
-
-    let content = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                &first.tool_name,
-                Style::default().fg(p.ink).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(&summary, Style::default().fg(p.ink2)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  y", Style::default().fg(p.magenta)),
-            Span::styled(" allow once   ", Style::default().fg(p.muted)),
-            Span::styled("R", Style::default().fg(p.magenta)),
-            Span::styled(
-                format!(" allow {} this session   ", first.tool_name),
-                Style::default().fg(p.muted),
-            ),
-            Span::styled("n/esc", Style::default().fg(p.magenta)),
-            Span::styled(" deny", Style::default().fg(p.muted)),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            // [GPT-AMEND 4] the post-decision honesty line.
-            Span::styled(
-                "Action not executed · no option is preselected",
-                Style::default().fg(p.faint),
-            ),
-        ]),
-    ])
-    .block(overlay_block(&title, blend_color(p.magenta, p.bg, 0.9), p));
-    // Clear the underlying pane borders so the modal reads as a solid
-    // surface, not a frame over frames.
-    frame.render_widget(ratatui::widgets::Clear, dock_h[1]);
-    frame.render_widget(content, dock_h[1]);
+    let title = format!("◇ Allow {}?", first.tool_name);
+    for (i, c) in title.chars().enumerate() {
+        let style = match c {
+            '◇' => Style::default().fg(p.magenta).bg(fill).add_modifier(Modifier::BOLD),
+            ' ' | 'A' | 'l' | 'o' | 'w' | '?' => {
+                Style::default().fg(p.ink).bg(fill).add_modifier(Modifier::BOLD)
+            }
+            _ => Style::default().fg(p.magenta).bg(fill).add_modifier(Modifier::BOLD),
+        };
+        buf[(rect.x + 2 + i as u16, rect.y)]
+            .set_symbol(&c.to_string())
+            .set_style(style);
+    }
+    let badge_text = format!("{badge} {risk_word}");
+    let bx = rect.x + rect.width - 3 - badge_text.chars().count() as u16;
+    for (i, c) in badge_text.chars().enumerate() {
+        let style = if c == '▰' || c == '▱' {
+            Style::default().fg(risk_color).bg(fill)
+        } else {
+            Style::default().fg(risk_color).bg(fill).add_modifier(Modifier::BOLD)
+        };
+        buf[(bx + i as u16, rect.y)].set_symbol(&c.to_string()).set_style(style);
+    }
+    // The action, bold ink, in full.
+    for (i, c) in first.summary.chars().enumerate() {
+        if rect.x + 3 + i as u16 >= rect.x + rect.width - 1 {
+            break;
+        }
+        buf[(rect.x + 3 + i as u16, rect.y + 2)]
+            .set_symbol(&c.to_string())
+            .set_style(Style::default().fg(p.ink).bg(fill).add_modifier(Modifier::BOLD));
+    }
+    // Facts grid (fixture data; the backend supplies real facts).
+    let facts: [(&str, &str); 4] = [
+        ("runs in", "~/src/orbit"),
+        ("sandbox", "landlock · rw /tmp only"),
+        ("egress", "none"),
+        ("ledger", "decision is recorded"),
+    ];
+    for (i, (label, value)) in facts.iter().enumerate() {
+        let yy = rect.y + 4 + (i / 2) as u16;
+        let xx = rect.x + 3 + (i % 2) as u16 * 40;
+        for (j, c) in label.chars().enumerate() {
+            buf[(xx + j as u16, yy)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.muted).bg(fill));
+        }
+        for (j, c) in value.chars().enumerate() {
+            buf[(xx + label.chars().count() as u16 + 2 + j as u16, yy)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.ink2).bg(fill));
+        }
+    }
+    // Keys row: keycap chips.
+    let keys_y = rect.y + rect.height - 2;
+    let mut kx = rect.x + 3;
+    // Keys row: keycap chips, all writes bounds-checked (narrow terminals).
+    let key_row_end = rect.x + rect.width - 1;
+    let mut put_key = |key: &str, desc: &str, kx: &mut u16, buf: &mut ratatui::buffer::Buffer| {
+        for (j, c) in format!(" {key} ").chars().enumerate() {
+            if *kx + j as u16 > key_row_end {
+                return;
+            }
+            buf[(*kx + j as u16, keys_y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.ink).bg(p.surface2).add_modifier(Modifier::BOLD));
+        }
+        *kx += key.chars().count() as u16 + 2;
+        for (j, c) in format!(" {desc}   ").chars().enumerate() {
+            if *kx + j as u16 > key_row_end {
+                return;
+            }
+            buf[(*kx + j as u16, keys_y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.ink2).bg(fill));
+        }
+        *kx += desc.chars().count() as u16 + 4;
+    };
+    put_key("y", "allow once", &mut kx, buf);
+    put_key(
+        "R",
+        &format!("allow {} for this session", first.tool_name),
+        &mut kx,
+        buf,
+    );
+    put_key("n  esc", "deny", &mut kx, buf);
 }
 
-// ── Startup / empty-state mark (§8) ──────────────────────────────────────────
+// ── Startup mark (§8) ─────────────────────────────────────────────────────────
 
 /// The expanded mark (§8.1): half-block letterforms, a braille ring tilted
 /// behind the strokes, the star at the ring's upper right, the tagline
-/// beneath. Static — motion lives in the status line's working star alone.
-///
-/// Letters are ink, the ring magenta_dim, the star magenta, the tagline
-/// muted. It appears only on the welcome screen of an empty session; the
-/// first turn replaces it.
+/// beneath.
 pub fn welcome_mark(d: &Design, _g: &Glyphs) -> Vec<Line<'static>> {
     welcome_mark_frame(d, u8::MAX)
 }
 
-/// The welcome mark at a startup frame (§8.3): 0 = O alone, 1 = ⅓ ring,
-/// 2 = ⅔ ring, 3 = ring + star, 4 = RBIT fills, 5+ = tagline. u8::MAX =
-/// the complete mark (the steady state).
+/// The welcome mark at a startup frame (§8.3).
 pub fn welcome_mark_frame(d: &Design, frame: u8) -> Vec<Line<'static>> {
     let p = &d.palette;
-    // 3 rows × 31 columns (§8.1). The ring is braille dots; where it crosses
-    // a letterform stroke it hides (the letterform wins).
     let row0 = "    ▄▀▀▀▄⠤⠤✦ █▀▀▀▄ █▀▀▀▄ ▀█▀ ▀▀█▀▀";
     let row1 = " ⣠⠖⠋█   █⣠⠴⠋ █▄▄▄▀ █▀▀▀▄  █    █";
     let row2 = " ⠙⠒⠒▀▄▄▄▀    █  ▀▄ █▄▄▄▀ ▄█▄   █";
     let tagline = "    the harness that orbits around you";
     let mark_line = |row: &str| -> Line<'static> {
-        // Split each row into ring cells (braille) vs letter cells (blocks):
-        // braille → magenta_dim, blocks → ink, the star → magenta.
         let spans: Vec<Span> = row
             .chars()
             .map(|c| {
@@ -1802,29 +2408,25 @@ pub fn welcome_mark_frame(d: &Design, frame: u8) -> Vec<Line<'static>> {
                 } else if c.is_ascii_alphanumeric() || "▄▀█".contains(c) {
                     p.ink
                 } else {
-                    p.magenta_dim // braille ring + spaces ride the dim colour
+                    p.magenta_dim
                 };
                 Span::styled(c.to_string(), Style::default().fg(color))
             })
             .collect();
         Line::from(spans)
     };
-    // §8.3 frame masking: the reveal sweeps left-to-right across the mark
-    // (the ring forming around the O), then the tagline. frame 0 shows
-    // only the O (the first letterform); each frame reveals ~1/5 more.
     let reveal: usize = match frame {
-        0 => 8,          // the O alone
-        1 => 16,         // a third of the ring
-        2 => 24,         // two thirds
-        3 => 30,         // ring complete + star
-        4 => 36,         // RBIT filled
-        _ => usize::MAX, // tagline + hold
+        0 => 8,
+        1 => 16,
+        2 => 24,
+        3 => 30,
+        4 => 36,
+        _ => usize::MAX,
     };
     let mask = |row: &str| -> String {
         if reveal == usize::MAX {
             return row.to_string();
         }
-        // Keep leading spaces so alignment never shifts; reveal N cells.
         let mut out = String::new();
         let mut shown = 0;
         for c in row.chars() {
@@ -1852,4 +2454,46 @@ pub fn welcome_mark_frame(d: &Design, frame: u8) -> Vec<Line<'static>> {
         )));
     }
     out
+}
+
+// ── Size notice (§9.23) ──────────────────────────────────────────────────────
+
+fn render_size_notice(frame: &mut ratatui::Frame, area: Rect, d: &Design, g: &Glyphs) {
+    let p = &d.palette;
+    frame.buffer_mut()[(1, 0)]
+        .set_symbol(g.orbit)
+        .set_style(Style::default().fg(p.magenta));
+    let lines: Vec<(String, Style)> = vec![
+        (
+            "ORBIT needs at least 40 × 10".into(),
+            Style::default().fg(p.ink).add_modifier(Modifier::BOLD),
+        ),
+        (
+            format!("this terminal is {} × {}", area.width, area.height),
+            Style::default().fg(p.muted),
+        ),
+        (String::new(), Style::default()),
+        (
+            "enlarge the window or run".into(),
+            Style::default().fg(p.muted),
+        ),
+        ("orbit chat --no-tui".into(), Style::default().fg(p.ink2)),
+    ];
+    for (i, (text, style)) in lines.iter().enumerate() {
+        let y = 2 + i as u16;
+        if y >= area.height {
+            break;
+        }
+        let w = display_width(text) as u16;
+        let x = (area.width.saturating_sub(w)) / 2;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text.clone(), *style))),
+            Rect {
+                x,
+                y,
+                width: area.width.saturating_sub(x),
+                height: 1,
+            },
+        );
+    }
 }

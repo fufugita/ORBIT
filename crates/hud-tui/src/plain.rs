@@ -25,12 +25,12 @@ pub fn transcript_lines(app: &App, now: &str) -> Vec<String> {
     let mut out = Vec::new();
     for entry in &app.transcript {
         match entry {
-            TranscriptLine::User(text) => {
+            TranscriptLine::User { text, .. } => {
                 for line in text.lines() {
                     out.push(format!("{now} you: {line}"));
                 }
             }
-            TranscriptLine::Assistant(text) => {
+            TranscriptLine::Assistant { text, .. } => {
                 for line in text.lines() {
                     out.push(format!("{now} orbit: {line}"));
                 }
@@ -50,6 +50,20 @@ pub fn transcript_lines(app: &App, now: &str) -> Vec<String> {
             TranscriptLine::Redacted(kind) => {
                 // D7: chip in plain words (screen-reader safe, no glyphs).
                 out.push(format!("{now} redacted: {}", kind.label()));
+            }
+            TranscriptLine::Evidence { checks, note, rows } => {
+                out.push(format!("{now} verified {checks} {note}"));
+                for (name, result) in rows {
+                    out.push(format!("{now} {name}: {result}"));
+                }
+            }
+            TranscriptLine::Sources(srcs) => {
+                let list = srcs
+                    .iter()
+                    .map(|(i, p)| format!("[{i}] {p}"))
+                    .collect::<Vec<_>>()
+                    .join("   ");
+                out.push(format!("{now} sources {list}"));
             }
         }
     }
@@ -113,9 +127,9 @@ mod tests {
     #[test]
     fn plain_lines_have_timestamps_and_words() {
         let mut app = App::new();
-        app.transcript.push(TranscriptLine::User("hello".into()));
+        app.transcript.push(TranscriptLine::User { text: "hello".into(), time: None });
         app.transcript
-            .push(TranscriptLine::Assistant("hi there".into()));
+            .push(TranscriptLine::Assistant { text: "hi there".into(), time: None });
         let lines = transcript_lines(&app, "14:02");
         assert_eq!(lines[0], "14:02 you: hello");
         assert_eq!(lines[1], "14:02 orbit: hi there");

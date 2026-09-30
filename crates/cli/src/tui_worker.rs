@@ -265,7 +265,7 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
     msgs.iter()
         .filter_map(|msg| {
             match msg.role {
-                ChatRole::User => Some(TranscriptLine::User(msg.content.clone())),
+                ChatRole::User => Some(TranscriptLine::User { text: msg.content.clone(), time: None }),
                 ChatRole::Assistant => {
                     if let Some(calls) = &msg.tool_calls {
                         // Tool-calling round: emit one Stripped line per tool call.
@@ -288,12 +288,13 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                                 // transcript; settled-neutral is honest.
                                 summary: String::new(),
                                 outcome: Some(orbit_hud_tui::state::ToolOutcome::Ok),
+                                meta: String::new(),
                                 // Restored calls have no live duration.
                                 started_at: None,
                             })
                         }
                     } else if !msg.content.is_empty() {
-                        Some(TranscriptLine::Assistant(msg.content.clone()))
+                        Some(TranscriptLine::Assistant { text: msg.content.clone(), time: None })
                     } else {
                         None
                     }
