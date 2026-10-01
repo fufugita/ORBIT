@@ -242,14 +242,16 @@ fn golden_idle_wide_150x44() {
 fn golden_idle_narrow_80x30() {
     let buf = render_buf(&idle_app(), &design(), 80, 30);
     let text = buf_text(&buf);
-    // Narrow (§8.2): single view — the switcher header, the conversation,
-    // status level 2 (no 'online' word, just the ● glyph).
-    assert!(text.contains("Sessions"), "switcher tab");
-    assert!(text.contains("Workspace"), "switcher tab");
+    // Narrow (§8.2): single view — one boxed Conversation pane (herdr-style
+    // isolation holds at every width), status level 2 (no 'online' word,
+    // just the ● glyph).
+    assert!(text.contains("Conversation"), "boxed pane title");
     assert!(text.contains("What is 2*(3+4)?"), "user turn");
     assert!(text.contains("Ask ORBIT, or type / for commands"));
     // Level 2 keeps the connection glyph but drops the word.
     assert!(text.contains("●"), "connection glyph");
+    // The box: corners on row 0 and the last body row.
+    assert!(text.lines().next().unwrap().starts_with("╭ Conversation"), "top border");
 }
 
 #[test]
@@ -288,10 +290,10 @@ fn golden_activity_tab_replaces_sessions_rail() {
     let text = buf_text(&buf);
     assert!(text.contains("Activity"), "Activity tab header");
     assert!(text.contains("14:04:39"), "event time stamp");
-    // §8.4: text at x+18 end-truncated at x+w-1 — the 30-col rail gives an
-    // 11-char budget, so the model row truncates with an ellipsis.
-    assert!(text.contains("glm-5.2 vi…"), "model event text (truncated)");
-    assert!(text.contains("shell · ok"), "tool event text");
+    // §8.4: text at x+18 end-truncated at x+w-1 — the 30-col rail minus the
+    // box borders gives a 9-char budget, so longer rows truncate.
+    assert!(text.contains("glm-5.2 …"), "model event text (truncated)");
+    assert!(text.contains("shell · …"), "tool event text (truncated)");
     assert!(text.contains("E0408"), "error event text");
     // The sessions list is NOT rendered while the Activity tab is open.
     assert!(!text.contains("Approval surface polish"), "sessions rows hidden");
@@ -574,13 +576,13 @@ fn golden_command_palette() {
 // ── Design invariants (§13.5) ────────────────────────────────────────────────
 
 /// invariant_one_frame_max: at most one OVERLAY frame (modal) at a time
-/// (§1). The pane borders and the composer box are the layout, not
+/// (§1). The pane boxes are the layout (herdr-style isolation), not
 /// overlays — they're exempt. A modal (quit confirmation, approval) draws
 /// its own frame; two modals at once would violate the one-frame rule.
 #[test]
 fn invariant_one_frame_max() {
     let d = design();
-    // The pane layout: 3 panes × 4 corners = 12 baseline.
+    // The pane layout: 3 boxed panes × 4 corners = 12 baseline.
     let base = render_buf(&idle_app(), &d, 150, 44);
     let base_corners: usize = base
         .content()
@@ -589,8 +591,7 @@ fn invariant_one_frame_max() {
             c.symbol() == "╭" || c.symbol() == "╮" || c.symbol() == "╰" || c.symbol() == "╯"
         })
         .count();
-    // Fluid chrome: no frame glyphs exist anywhere — corners must be 0.
-    assert_eq!(base_corners, 0, "no frame glyphs in the base layout");
+    assert_eq!(base_corners, 12, "three boxed panes = 12 corners");
 
     // With a modal open, the modal adds exactly one frame (+4 corners).
     for app in [approval_app()] {
@@ -787,4 +788,60 @@ fn invariant_magenta_closed_list() {
         magenta_cells <= 640,
         "approval frame has {magenta_cells} magenta cells — beyond frame + title + keys + border"
     );
+}
+
+// ── herdr panel isolation (§8 boxed panes) ───────────────────────────────────
+
+/// The focused pane's border is magenta; the unfocused panes' borders are
+/// muted. Exactly one pane carries the accent at any moment — that is the
+/// isolation contract (herdr render_pane_borders).
+#[test]
+fn invariant_pane_isolation_single_accent() {
+    let d = design();
+    let magenta = d.palette.magenta;
+    let muted = d.palette.muted;
+
+    for focus in [Focus::Left, Focus::Center, Focus::Right] {
+        let mut app = idle_app();
+        app.focus = focus;
+        let buf = render_buf(&app, &d, 150, 44);
+
+        // Pane rects (the render records them for the hit-test).
+        let rects = [
+            app.pane_rects.left.get(),
+            app.pane_rects.center.get(),
+            app.pane_rects.right.get(),
+        ];
+        let mut accented = 0;
+        for (i, r) in rects.iter().enumerate() {
+            let Some(r) = r else { continue };
+            if r.width < 3 || r.height < 3 {
+                continue;
+            }
+            // The top border row of the pane: every border cell's fg.
+            let top: Vec<_> = (r.x..r.x + r.width)
+                .map(|x| buf[(x, r.y)].fg)
+                .collect();
+            let is_magenta = top.iter().any(|c| *c == magenta);
+            let is_muted = top.iter().any(|c| *c == muted);
+            let expected_focused = match focus {
+                Focus::Left => i == 0,
+                Focus::Center => i == 1,
+                Focus::Right => i == 2,
+                Focus::Status => false,
+            };
+            assert_eq!(
+                is_magenta, expected_focused,
+                "pane {i} accent state wrong for focus {focus:?}"
+            );
+            // Unfocused panes draw their border in the muted rule colour.
+            if !expected_focused {
+                assert!(is_muted, "pane {i} border should be muted for focus {focus:?}");
+            }
+            if is_magenta {
+                accented += 1;
+            }
+        }
+        assert_eq!(accented, 1, "exactly one accented pane for focus {focus:?}");
+    }
 }

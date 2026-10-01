@@ -144,68 +144,33 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
 
     let wc = width_class(area.width);
 
-    // Vertical (§8.1): header | air | body | air | composer | hint | status.
-    let show_hint = area.height >= 16 && !wc.tight;
-    let show_header = area.height >= 12 || !wc.single_view;
-    let mut constraints = Vec::new();
-    if show_header {
-        constraints.push(Constraint::Length(1));
-    }
-    constraints.push(Constraint::Length(1)); // air
-    constraints.push(Constraint::Min(4)); // body
-    constraints.push(Constraint::Length(1)); // air above composer
-    constraints.push(Constraint::Length(1)); // composer input
-    if show_hint {
-        constraints.push(Constraint::Length(1)); // hint row
-    }
-    constraints.push(Constraint::Length(1)); // status
-    let rows = Layout::default()
+    // Vertical: body (fill) | status (1). The composer and hint row live
+    // INSIDE the conversation pane's box (herdr-style: the pane owns its
+    // full surface; the status line is the only full-width chrome).
+    let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(area);
-    let mut i = 0usize;
-    if show_header {
-        render_pane_headers(frame, rows[i], app, &wc, d, g);
-        i += 1;
-    }
-    i += 1; // air
-    let body = rows[i];
-    i += 1;
-    i += 1; // air above composer
-    let composer_row = rows[i];
-    i += 1;
-    let hint_row = if show_hint {
-        let r = rows[i];
-        i += 1;
-        r
-    } else {
-        Rect::new(0, 0, 0, 0)
-    };
-    let status_row = rows[i];
+    let body = outer[0];
+    let status_row = outer[1];
 
-    // Horizontal split of the body into panes. The dividers run from below
-    // the header to above the status line (§8.6: row 0 to H-2 — including
-    // the air rows), so compute them against the full span.
-    let div_top = if show_header { area.y + 1 } else { area.y };
-    let div_bottom = status_row.y; // exclusive
+    // Horizontal split into boxed panes with 1-col gaps (herdr-style: the
+    // pane borders ARE the separation — no divider columns).
     let mut panes: Vec<Rect> = Vec::new();
-    let mut dividers: Vec<Rect> = Vec::new();
     let mut x = body.x;
     if let Some((_, sw)) = wc.sessions {
         panes.push(Rect { x, y: body.y, width: sw, height: body.height });
-        x += sw;
-        dividers.push(Rect { x, y: div_top, width: 1, height: div_bottom.saturating_sub(div_top) });
-        x += 1;
+        x += sw + 1; // pane + gap
     }
     let (_, cw) = wc.conversation;
     panes.push(Rect { x, y: body.y, width: cw, height: body.height });
     x += cw;
     if let Some((_, ww)) = wc.workspace {
-        dividers.push(Rect { x, y: div_top, width: 1, height: div_bottom.saturating_sub(div_top) });
-        x += 1;
+        x += 1; // gap
         panes.push(Rect { x, y: body.y, width: ww, height: body.height });
     }
-    // Record pane rects for the mouse hit-test.
+    // Record pane rects for the mouse hit-test (the OUTER rect — the
+    // hit-test insets by the border itself).
     app.pane_rects.left.set(panes.first().copied().filter(|_| wc.sessions.is_some()));
     app.pane_rects
         .center
@@ -214,16 +179,52 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
         .right
         .set(panes.last().copied().filter(|_| wc.workspace.is_some()));
 
-    // Render panes.
+    // Pane titles: the left pane's title follows its tab; the center is the
+    // conversation; the right is the workspace.
+    let left_title = match app.left_tab {
+        LeftTab::Sessions => "Sessions",
+        LeftTab::Verbose => "Activity",
+    };
+    let center_title = if app.header_title.is_empty() {
+        "Conversation"
+    } else {
+        app.header_title.as_str()
+    };
+
+    // Draw each pane: box border + title, then the content in the inner rect.
     let mut pane_idx = 0usize;
+    let mut sessions_inner = Rect::new(0, 0, 0, 0);
     if wc.sessions.is_some() {
-        render_sessions_rail(frame, panes[pane_idx], app, d, g);
+        let r = panes[pane_idx];
+        sessions_inner = draw_pane_box(frame, r, left_title, app.focus == Focus::Left, d, g);
+        render_sessions_rail(frame, sessions_inner, app, d, g);
         pane_idx += 1;
     }
-    let conv_area = panes[pane_idx];
+    let conv_outer = panes[pane_idx];
+    let conv_inner = draw_pane_box(
+        frame,
+        conv_outer,
+        center_title,
+        app.focus == Focus::Center,
+        d,
+        g,
+    );
+    // The conversation pane's inner area splits: transcript (fill) |
+    // composer (1) | hint (1, when shown).
+    let show_hint = area.height >= 16 && !wc.tight;
+    let inner_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1), // composer
+            Constraint::Length(if show_hint { 1 } else { 0 }), // hint
+        ])
+        .split(conv_inner);
+    let composer_row = inner_rows[1];
+    let hint_row = inner_rows[2];
     render_conversation(
         frame,
-        conv_area,
+        inner_rows[0],
         app,
         composer_text,
         d,
@@ -233,30 +234,11 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
         hint_row,
         show_hint,
     );
-    // The thumb spans exactly the pane rows that carry content — scan the
-    // rendered buffer (immune to line-accounting drift).
-    let buf = frame.buffer_mut();
-    let mut t0 = conv_area.bottom();
-    let mut t1 = conv_area.y;
-    for y in conv_area.top()..conv_area.bottom() {
-        let has_content = (conv_area.left()..conv_area.right())
-            .any(|x| buf[(x, y)].symbol() != " ");
-        if has_content {
-            t0 = t0.min(y);
-            t1 = t1.max(y);
-        }
-    }
-    let thumb_range = if t1 >= t0 { (t0, t1) } else { (0, 0) };
     pane_idx += 1;
     if wc.workspace.is_some() {
-        render_workspace_rail(frame, panes[pane_idx], app, d, g);
-    }
-    for (di, div) in dividers.iter().enumerate() {
-        // The divider immediately right of the transcript is its scroll
-        // track (§8.6) — the thumb spans the content rows (bottom-anchored).
-        let is_scroll_track = (wc.sessions.is_some() && di == 1)
-            || (wc.sessions.is_none() && di == 0);
-        render_divider(frame, *div, d, g, is_scroll_track, thumb_range);
+        let r = panes[pane_idx];
+        let inner = draw_pane_box(frame, r, "Workspace", app.focus == Focus::Right, d, g);
+        render_workspace_rail(frame, inner, app, d, g);
     }
 
     // Command palette (§6.13): an overlay above the panes.
@@ -275,6 +257,76 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     }
     if !app.pending_approvals.is_empty() {
         render_approval_modal(frame, area, app, d, g, &wc);
+    }
+}
+
+// ── Pane boxes (herdr-style isolation) ───────────────────────────────────────
+
+/// Draw a full box border around a pane with the title riding the top edge
+/// (herdr `render_pane_borders`): focused = magenta accent + bold title,
+/// unfocused = muted rule colour. Returns the inner content rect.
+fn draw_pane_box(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    focused: bool,
+    d: &Design,
+    g: &Glyphs,
+) -> Rect {
+    let p = &d.palette;
+    if area.width < 3 || area.height < 3 {
+        return area;
+    }
+    let (border_color, title_style) = if focused {
+        (
+            p.magenta,
+            Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (p.muted, Style::default().fg(p.ink2))
+    };
+    let buf = frame.buffer_mut();
+    let bs = Style::default().fg(border_color);
+    // Corners.
+    buf[(area.x, area.y)].set_symbol(g.corner_tl()).set_style(bs);
+    buf[(area.x + area.width - 1, area.y)]
+        .set_symbol(g.corner_tr())
+        .set_style(bs);
+    buf[(area.x, area.y + area.height - 1)]
+        .set_symbol(g.corner_bl())
+        .set_style(bs);
+    buf[(area.x + area.width - 1, area.y + area.height - 1)]
+        .set_symbol(g.corner_br())
+        .set_style(bs);
+    // Top and bottom edges.
+    for x in area.x + 1..area.x + area.width - 1 {
+        buf[(x, area.y)].set_symbol(g.border_h()).set_style(bs);
+        buf[(x, area.y + area.height - 1)]
+            .set_symbol(g.border_h())
+            .set_style(bs);
+    }
+    // Left and right edges.
+    for y in area.y + 1..area.y + area.height - 1 {
+        buf[(area.x, y)].set_symbol(g.border_v()).set_style(bs);
+        buf[(area.x + area.width - 1, y)]
+            .set_symbol(g.border_v())
+            .set_style(bs);
+    }
+    // Title rides the top border: " Title " starting at x+1, truncated to
+    // the pane width (herdr pane_border_title).
+    let title_text = format!(" {title} ");
+    let max_w = (area.width as usize).saturating_sub(2);
+    let shown: String = title_text.chars().take(max_w).collect();
+    for (i, c) in shown.chars().enumerate() {
+        buf[(area.x + 1 + i as u16, area.y)]
+            .set_symbol(&c.to_string())
+            .set_style(title_style);
+    }
+    Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
     }
 }
 

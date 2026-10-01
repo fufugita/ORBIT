@@ -396,10 +396,104 @@ pub fn wide_idle_app() -> App {
 
 #[test]
 fn golden_wide_idle() {
-    let g = load_golden("wide_idle");
     let d = tc_design();
     let app = wide_idle_app();
     let buf = render_buf(&app, &d, 150, 44);
+    // Regen mode: ORBIT_GOLDEN_REGEN=1 rewrites the fixture from the
+    // current renderer — a deliberate act when the design changes, not
+    // silent drift. The test then passes trivially this run.
+    if std::env::var("ORBIT_GOLDEN_REGEN").is_ok() {
+        write_golden("wide_idle", &buf, &d.palette);
+        return;
+    }
+    let g = load_golden("wide_idle");
     let diff = compare(&g, &buf, &d.palette);
     assert!(diff.is_none(), "{}", diff.unwrap_or_default());
+}
+
+/// Write a golden fixture (text + style runs) from a rendered buffer.
+/// The style runs use the same [start, end, fg, bg, flags] shape the
+/// comparator reads, with token names via color_token.
+pub fn write_golden(
+    name: &str,
+    buf: &ratatui::buffer::Buffer,
+    p: &orbit_hud_tui::tokens::ResolvedPalette,
+) {
+    std::fs::write(
+        format!("tests/golden/{name}.txt"),
+        buf_text(buf).join("\n") + "\n",
+    )
+    .unwrap();
+    let area = buf.area;
+    let mut runs: Vec<Vec<[serde_json::Value; 5]>> = Vec::new();
+    for y in area.top()..area.bottom() {
+        let mut row: Vec<[serde_json::Value; 5]> = Vec::new();
+        let mut x = area.left();
+        while x < area.right() {
+            let cell = &buf[(x, y)];
+            let fg = color_token(p, cell.style().fg).unwrap_or("");
+            let bg = color_token(p, cell.style().bg).unwrap_or("");
+            let mut flags = String::new();
+            if cell
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+            {
+                flags.push('b');
+            }
+            if cell
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+            {
+                flags.push('u');
+            }
+            let start = x;
+            while x < area.right() {
+                let c = &buf[(x, y)];
+                let nfg = color_token(p, c.style().fg).unwrap_or("");
+                let nbg = color_token(p, c.style().bg).unwrap_or("");
+                let mut nflags = String::new();
+                if c
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+                {
+                    nflags.push('b');
+                }
+                if c
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+                {
+                    nflags.push('u');
+                }
+                if nfg != fg || nbg != bg || nflags != flags {
+                    break;
+                }
+                x += 1;
+            }
+            let end = x - 1;
+            row.push([
+                serde_json::json!(start),
+                serde_json::json!(end),
+                serde_json::json!(fg),
+                serde_json::json!(bg),
+                serde_json::json!(flags),
+            ]);
+        }
+        runs.push(row);
+    }
+    let doc = serde_json::json!({
+        "name": name,
+        "cols": area.width,
+        "rows": area.height,
+        "cursor": [0, 0],
+        "runs": runs,
+    });
+    std::fs::write(
+        format!("tests/golden/{name}.styles.json"),
+        serde_json::to_string_pretty(&doc).unwrap(),
+    )
+    .unwrap();
 }
