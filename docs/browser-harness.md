@@ -1,7 +1,11 @@
 # ORBIT Browser Harness — Architecture
 
-> Status: **design**. Implementation is the next milestone after the TUI ships.
-> The Rust core is the single source of truth; the browser is a thin view.
+> Status: **implemented** (crates/web + `orbit web`). The Rust core is the
+> single source of truth; the browser is a thin view.
+>
+> Verified: `scripts/web_harness_test.py` — 13/13 (SPA, SSE identity, WS
+> actions, streaming, approval, persistence, resume) against the mock
+> provider, plus 6 router unit tests in crates/web/tests/.
 
 ## Goal
 
@@ -138,8 +142,11 @@ is shared verbatim — only the transport changes.
    - `logo.svg` — animated orbital logo
 3. **`orbit web`** — new CLI command. Starts the bridge server and opens the
    browser (or prints the URL). Flags: `--port`, `--bind`, `--no-browser`.
-4. **PTY test** — extend `scripts/pty_tui_test.py` to test the browser harness
-   via headless browser (Playwright) or curl + WebSocket client.
+4. **E2E test** — `scripts/web_harness_test.py` (stdlib-only: raw-socket WS
+   client + SSE reader) exercises the live server end-to-end. The harness
+   modules (run_turn, tool runtime, sessions) were extracted from the cli
+   binary into `orbit-cli`'s lib so the web crate reuses them verbatim —
+   the same code path the TUI and Go bridge drive.
 
 ## What stays untouched
 

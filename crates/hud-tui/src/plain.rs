@@ -127,9 +127,14 @@ mod tests {
     #[test]
     fn plain_lines_have_timestamps_and_words() {
         let mut app = App::new();
-        app.transcript.push(TranscriptLine::User { text: "hello".into(), time: None });
-        app.transcript
-            .push(TranscriptLine::Assistant { text: "hi there".into(), time: None });
+        app.transcript.push(TranscriptLine::User {
+            text: "hello".into(),
+            time: None,
+        });
+        app.transcript.push(TranscriptLine::Assistant {
+            text: "hi there".into(),
+            time: None,
+        });
         let lines = transcript_lines(&app, "14:02");
         assert_eq!(lines[0], "14:02 you: hello");
         assert_eq!(lines[1], "14:02 orbit: hi there");

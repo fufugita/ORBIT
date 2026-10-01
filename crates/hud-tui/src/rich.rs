@@ -115,7 +115,10 @@ pub fn render_line<'a>(text: &'a str, d: &Design) -> Line<'a> {
 pub enum CodeStyle {
     /// surface2 chip with ink text (§6.4, user turns).
     Chip,
-    /// Muted plain text (ORBIT turns, per the goldens).
+    /// Muted plain text (ORBIT turns, per the goldens). Reserved by the
+    /// golden set; the current renderer routes ORBIT turns through Chip —
+    /// the variant stays so the mode switch is a one-line change.
+    #[allow(dead_code)]
     Muted,
 }
 
@@ -185,7 +188,11 @@ fn push_text_span_mode(
 }
 
 /// Plain (non-code) text: emphasis + citation handling.
-fn push_plain_span(spans: &mut Vec<Span<'static>>, text: String, p: &crate::tokens::ResolvedPalette) {
+fn push_plain_span(
+    spans: &mut Vec<Span<'static>>,
+    text: String,
+    p: &crate::tokens::ResolvedPalette,
+) {
     // Citations [n] render cyan (§6.7).
     if text.contains('[') {
         let mut rest = text.as_str();
@@ -213,7 +220,11 @@ fn push_plain_span(spans: &mut Vec<Span<'static>>, text: String, p: &crate::toke
 }
 
 /// Emphasis only (no citations).
-fn push_emphasis_span(spans: &mut Vec<Span<'static>>, text: String, p: &crate::tokens::ResolvedPalette) {
+fn push_emphasis_span(
+    spans: &mut Vec<Span<'static>>,
+    text: String,
+    p: &crate::tokens::ResolvedPalette,
+) {
     if text.contains("**") {
         let parts: Vec<&str> = text.split("**").collect();
         for (i, part) in parts.iter().enumerate() {
@@ -429,9 +440,7 @@ fn push_text_span(
         // the backticks — handled by the caller). Multi-word code chips
         // per word: the spaces between stay plain (golden).
         let style = match p.tier {
-            ColorTier::TrueColor | ColorTier::T256 => {
-                Style::default().fg(p.ink).bg(p.surface2)
-            }
+            ColorTier::TrueColor | ColorTier::T256 => Style::default().fg(p.ink).bg(p.surface2),
             ColorTier::Ansi16 => Style::default().fg(p.cyan),
             ColorTier::Mono => Style::default().fg(p.ink),
         };

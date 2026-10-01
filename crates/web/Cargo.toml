@@ -1,0 +1,39 @@
+# ORBIT orbit-web — browser harness bridge (DR-20 §browser, docs/browser-harness.md)
+# PURPOSE: axum server that projects the SAME harness (run_turn + tool runtime +
+#          sessions) to a browser via WebSocket (actions) + SSE (events).
+# The Rust core is the single source of truth; the browser is a thin view.
+
+[package]
+name = "orbit-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Browser harness bridge: axum + SSE/WS projection of the Rust core"
+
+[lib]
+name = "orbit_web"
+path = "src/lib.rs"
+
+[dependencies]
+orbit-cli = { path = "../cli" }
+orbit-gateway = { path = "../gateway" }
+orbit-adapter = { path = "../adapter" }
+orbit-provider-http = { path = "../provider-http" }
+orbit-hud = { path = "../hud" }
+orbit-hud-tui = { path = "../hud-tui" }
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+rust-embed.workspace = true
+mime_guess = "2"
+
+[[bin]]
+name = "orbit-web"
+path = "src/main.rs"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"

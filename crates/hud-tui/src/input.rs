@@ -42,7 +42,7 @@ pub enum KeyAction {
 }
 
 /// Two-state leader-key parser.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct KeyParser {
     /// `Some('g')` or `Some('z')` when waiting for the second key of a chord.
     pending_leader: Option<char>,
@@ -56,15 +56,6 @@ pub struct KeyParser {
 /// D14: a pending leader expires after 1 s (herdr/tmux feel — chords are
 /// fast; anything slower is typing, not a chord).
 pub const LEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
-impl Default for KeyParser {
-    fn default() -> Self {
-        Self {
-            pending_leader: None,
-            leader_set_at: None,
-        }
-    }
-}
 
 impl KeyParser {
     pub fn new() -> Self {
@@ -296,8 +287,9 @@ mod tests {
     fn stale_leader_expires_and_key_is_fresh() {
         let mut p = KeyParser::new();
         assert!(p.parse(&key('g')).is_none()); // leader set
-        // Age the leader past the timeout.
-        p.leader_set_at = Some(std::time::Instant::now() - LEADER_TIMEOUT - std::time::Duration::from_millis(50));
+                                               // Age the leader past the timeout.
+        p.leader_set_at =
+            Some(std::time::Instant::now() - LEADER_TIMEOUT - std::time::Duration::from_millis(50));
         // `s` now must be a FRESH key (Unknown), not the g+s chord.
         assert_eq!(p.parse(&key('s')), Some(KeyAction::Unknown));
         assert!(!p.has_pending_leader());

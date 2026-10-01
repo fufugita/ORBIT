@@ -143,6 +143,7 @@ impl Drop for BridgeGuard {
             // SIGTERM first: the Go child restores the TTY in its cleanup.
             #[cfg(unix)]
             {
+                #[allow(unsafe_code)]
                 let _ = unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGTERM) };
                 for _ in 0..50 {
                     match c.try_wait() {

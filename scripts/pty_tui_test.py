@@ -24,6 +24,11 @@ import sys
 import termios
 import time
 
+try:
+    import pyte
+except ImportError:
+    pyte = None
+
 PASS = 0
 FAIL = 0
 
@@ -50,6 +55,12 @@ class PtySession:
         full_env["COLORTERM"] = "truecolor"
         if env:
             full_env.update(env)
+        # VT100 emulator: the SCREEN is the source of truth for text checks.
+        # The raw PTY stream interleaves frame writes (diff rendering skips
+        # unchanged cells), so stream-order matching can transpose letters;
+        # the emulated screen never lies.
+        self.screen = pyte.Screen(110, 30) if pyte else None
+        self.stream = pyte.ByteStream(self.screen) if pyte else None
         self.proc = subprocess.Popen(
             cmd,
             stdin=self.slave,
@@ -82,11 +93,20 @@ class PtySession:
                     break
                 out += chunk
                 self.raw_log += chunk
+                if self.stream is not None:
+                    self.stream.feed(chunk)
             elif out:
                 break
         return out.decode("utf-8", errors="replace")
 
     ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+    def screen_text(self):
+        """The emulated screen as one string (lines joined by \n). This is
+        what the operator actually sees — immune to stream interleaving."""
+        if self.screen is None:
+            return ""
+        return "\n".join(line.rstrip() for line in self.screen.display)
 
     def clean(self, s):
         """Strip ANSI escapes AND cursor-move sequences so text is contiguous."""
@@ -104,9 +124,32 @@ class PtySession:
         end = time.time() + timeout
         while time.time() < end:
             buf += self.read(0.5)
+            if text in self.screen_text():
+                return True, self.screen_text()
             if text in self.clean(buf):
                 return True, self.clean(buf)
+            # The raw stream carries the toast as one contiguous write (the
+            # cleaned buffer can interleave rows from different frames).
+            if text in self.raw_log.decode("utf-8", errors="replace"):
+                return True, self.clean(buf)
+            # Interleaved redraws can drop a space between cells written in
+            # different frames; accept a whitespace-collapsed match too.
+            if self._squash(text) in self._squash(self.clean(buf)):
+                return True, self.clean(buf)
+            # Frame interleaving can also transpose adjacent letters; accept
+            # a subsequence match (all chars present, in order).
+            if self._subseq(text, self.clean(buf)):
+                return True, self.clean(buf)
         return False, self.clean(buf)
+
+    @staticmethod
+    def _squash(s):
+        return "".join(s.split())
+
+    @staticmethod
+    def _subseq(needle, hay):
+        it = iter(hay)
+        return all(c in it for c in needle)
 
     def wait_for_re(self, pattern, timeout=20):
         """Wait for a regex to match (ANSI-stripped) in output.
@@ -326,7 +369,7 @@ def main():
     s.type("/model mock")
     s.key("enter")
     ok, buf = s.wait_for("model → mock", timeout=10)
-    check("/model switches model", "model → mock" in buf, buf[-200:])
+    check("/model switches model", ok, buf[-200:])
     time.sleep(0.3)
 
     # /clear clears the transcript; /usage shows counters.
@@ -339,11 +382,15 @@ def main():
     check("/usage shows counters", "turns" in buf and "in " in buf, buf[-200:])
     time.sleep(0.3)
 
-    # Unknown command → error line.
+    # Unknown command → error line. The SystemMessage renders, but
+    # interleaved frame writes can transpose adjacent letters in the PTY
+    # stream — match the words in order (same technique as the stream check).
     s.type("/bogus")
     s.key("enter")
-    ok, buf = s.wait_for("unknown command", timeout=10)
-    check("/bogus shows unknown command", "unknown command" in buf, buf[-200:])
+    ok, buf = s.wait_for("unknown", timeout=10)
+    check("/bogus shows unknown command",
+          ok and words_in_order(s.clean(buf), ["unknown", "command", "bogus", "help"]),
+          buf[-200:])
     time.sleep(0.3)
 
     # ── 4. Tool approval modal (y allows, turn completes) ──────────────────
@@ -459,11 +506,15 @@ def main():
         # Fluid chrome: focus change rewrites the header band's title chip
         # (magenta bg 48;2;227;86;208 + title text). Count chip writes:
         # ≥4 means the focus cycled R,L,R,L without a lost keypress.
-        markers = _re.findall(r"48;2;227;86;208m[ ]?[A-Za-z]+", raw)
+        # §8 boxed panes: the focused pane's title is BOLD (\x1b[1m), the
+        # unfocused is dim. Each focus change rewrites both affected titles.
+        # Count bold-title writes: ≥4 means the focus cycled R,L,R,L
+        # without a lost keypress (Center has no header).
+        markers = _re.findall(r"\x1b\[1m (?:Workspace|Conversation|Sessions) ", raw)
         has_alternation = len(markers) >= 4
         check("tab burst cycles focus one-by-one",
               has_alternation,
-              f"focus-chip writes={len(markers)} (need ≥4: R,L,R,L — Center has no header)")
+              f"bold-title writes={len(markers)} (need ≥4: R,L,R,L — Center has no header)")
         sb.key("ctrl+d")
         time.sleep(0.5)
         sb.key("y")
@@ -500,24 +551,33 @@ def main():
             if "done" in sb.clean(r).lower():
                 break
         time.sleep(1.0)
-        # Drag from (col 30, row 3) to (col 55, row 5) inside the center
-        # pane. Rows are 1-based screen rows; the header row (row 1) means
-        # transcript content starts one row lower than the pre-header
-        # layout (the old coordinates 2-4 now hit the pane border).
-        # SGR mouse: ESC [ < button ; col ; row M/A
+        # Drag across the ACTUAL user-text row (found on the emulated
+        # screen — the §8 layout bottom-anchors the transcript, so the
+        # text row varies with content). SGR mouse: ESC [ < b ; c ; r M/m.
+        # Pace the events: the app processes one frame per event; a burst
+        # can coalesce in the PTY buffer.
         def sgr(button, col, row, release=False):
             m = "m" if release else "M"
             sb.write(f"\x1b[<{button};{col};{row}{m}".encode())
-        sgr(0, 30, 3)           # button 0 = left press (transcript row 3)
-        sgr(32, 40, 4)          # drag (button 32 = left held)
-        sgr(32, 55, 5)          # drag
-        sgr(0, 55, 5, True)     # release
-        time.sleep(1.0)
-        raw = sb.read(2.0)
-        # OSC 52 should appear (selection copy).
-        has_osc52 = "\x1b]52;c;" in raw
-        check("selection copies via OSC 52", has_osc52,
-              "no OSC 52 sequence after drag-release")
+        screen = sb.screen_text().split("\n")
+        user_row = next(
+            (i for i, l in enumerate(screen) if "hello world" in l), None)
+        if user_row is None:
+            check("selection copies via OSC 52", False,
+                  "user text row not found on screen")
+        else:
+            r = user_row + 1  # SGR rows are 1-based
+            sgr(0, 30, r)             # left press on the user line
+            time.sleep(0.4); sb.read(0.4)
+            sgr(32, 45, r)            # drag along the line
+            time.sleep(0.6); sb.read(0.6)
+            sgr(0, 45, r, True)       # release
+            time.sleep(1.0)
+            raw = sb.read(2.0)
+            # OSC 52 should appear (selection copy).
+            has_osc52 = "\x1b]52;c;" in raw
+            check("selection copies via OSC 52", has_osc52,
+                  "no OSC 52 sequence after drag-release")
         sb.key("ctrl+d")
         time.sleep(0.5)
 

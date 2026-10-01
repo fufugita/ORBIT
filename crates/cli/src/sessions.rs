@@ -56,7 +56,7 @@ impl SessionFile {
             input_tokens,
             output_tokens,
             cost_microcents,
-            updated_at: orbit_cli::timestamp_now(),
+            updated_at: crate::timestamp_now(),
         }
     }
 }

@@ -26,8 +26,10 @@ fn main() {
     app.total_input_tokens = 1234;
     app.total_output_tokens = 567;
     app.total_cost_microcents = 2500;
-    app.transcript
-        .push(TranscriptLine::User { text: "What is 2*(3+4)?".into(), time: None });
+    app.transcript.push(TranscriptLine::User {
+        text: "What is 2*(3+4)?".into(),
+        time: None,
+    });
     app.transcript.push(TranscriptLine::Assistant { text: (
         "Let me compute that.\n## Result\nThe answer is **14**.\n- computed via `calculator`\n- pure data, no shell"
             .into()), time: None });

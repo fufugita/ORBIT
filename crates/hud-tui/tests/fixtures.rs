@@ -10,8 +10,7 @@
 
 use orbit_hud_tui::render::render;
 use orbit_hud_tui::state::{
-    App, ComposerState, ConnectionState, Focus, LogoPhase, PendingApproval, Task, TaskState,
-    ToolOutcome, ToolState, TranscriptLine,
+    App, ConnectionState, Focus, Task, TaskState, ToolOutcome, TranscriptLine,
 };
 use orbit_hud_tui::tokens::{Design, Theme};
 use ratatui::style::Color;
@@ -124,9 +123,7 @@ pub fn load_golden(name: &str) -> Golden {
                 row.as_array()
                     .unwrap()
                     .iter()
-                    .map(|r| {
-                        serde_json::from_value::<[serde_json::Value; 5]>(r.clone()).unwrap()
-                    })
+                    .map(|r| serde_json::from_value::<[serde_json::Value; 5]>(r.clone()).unwrap())
                     .collect()
             })
             .collect();
@@ -167,7 +164,10 @@ pub fn buf_text(buf: &ratatui::buffer::Buffer) -> Vec<String> {
 }
 
 /// Map a palette color back to its token name (the reverse of resolve()).
-fn color_token(p: &orbit_hud_tui::tokens::ResolvedPalette, c: Option<Color>) -> Option<&'static str> {
+fn color_token(
+    p: &orbit_hud_tui::tokens::ResolvedPalette,
+    c: Option<Color>,
+) -> Option<&'static str> {
     let c = c?;
     let pairs: [(Color, &'static str); 21] = [
         (p.bg, "bg"),
@@ -201,7 +201,11 @@ fn color_token(p: &orbit_hud_tui::tokens::ResolvedPalette, c: Option<Color>) -> 
 
 /// Compare a rendered buffer with a golden fixture. Returns a human-readable
 /// diff of the first mismatches (None = identical).
-pub fn compare(golden: &Golden, buf: &ratatui::buffer::Buffer, p: &orbit_hud_tui::tokens::ResolvedPalette) -> Option<String> {
+pub fn compare(
+    golden: &Golden,
+    buf: &ratatui::buffer::Buffer,
+    p: &orbit_hud_tui::tokens::ResolvedPalette,
+) -> Option<String> {
     let ours = buf_text(buf);
     let theirs: Vec<&str> = golden.text.lines().collect();
     let mut diffs = Vec::new();
@@ -294,10 +298,13 @@ pub fn compare(golden: &Golden, buf: &ratatui::buffer::Buffer, p: &orbit_hud_tui
 /// The goldens are authored in truecolor (Appendix B: "true colour,
 /// Unicode glyphs"). Force the tier — the test env has no COLORTERM.
 fn tc_design() -> Design {
-    Design::resolve(
-        &Theme::default(),
-        &|k| if k == "COLORTERM" { Some("truecolor".into()) } else { None },
-    )
+    Design::resolve(&Theme::default(), &|k| {
+        if k == "COLORTERM" {
+            Some("truecolor".into())
+        } else {
+            None
+        }
+    })
 }
 
 #[test]
@@ -332,16 +339,41 @@ pub fn wide_idle_app() -> App {
             open: *recency == "now",
         });
     }
-    
+
     // The idle workspace (B3): verify 4/5.
     app.workspace = orbit_hud_tui::state::Workspace {
         phase_index: 3, // verify
         plan: vec![
-            Task { title: "Reproduce restore failure".into(), state: TaskState::Done, sub: None, evidence: 1 },
-            Task { title: "Find where the chain resets".into(), state: TaskState::Done, sub: None, evidence: 0 },
-            Task { title: "Seed chain from exported head".into(), state: TaskState::Done, sub: None, evidence: 1 },
-            Task { title: "Add restore_preserves_head".into(), state: TaskState::Done, sub: None, evidence: 1 },
-            Task { title: "Run clean-machine e2e".into(), state: TaskState::Pending, sub: None, evidence: 0 },
+            Task {
+                title: "Reproduce restore failure".into(),
+                state: TaskState::Done,
+                sub: None,
+                evidence: 1,
+            },
+            Task {
+                title: "Find where the chain resets".into(),
+                state: TaskState::Done,
+                sub: None,
+                evidence: 0,
+            },
+            Task {
+                title: "Seed chain from exported head".into(),
+                state: TaskState::Done,
+                sub: None,
+                evidence: 1,
+            },
+            Task {
+                title: "Add restore_preserves_head".into(),
+                state: TaskState::Done,
+                sub: None,
+                evidence: 1,
+            },
+            Task {
+                title: "Run clean-machine e2e".into(),
+                state: TaskState::Pending,
+                sub: None,
+                evidence: 0,
+            },
         ],
         findings: vec![
             orbit_hud_tui::state::Finding {
@@ -380,15 +412,33 @@ pub fn wide_idle_app() -> App {
         text: "Done. Restore now seeds the chain from the exported head, and `restore_preserves_head` covers the regression.".into(),
         time: Some("14:09".into()),
     });
-    app.transcript.push(tool_meta("edit_file", "crates/export/src/restore.rs", ToolOutcome::Ok, "+9 −3 · 0.1s"));
-    app.transcript.push(tool_meta("shell", "cargo test -p orbit-export", ToolOutcome::Ok, "48 passed · 3.9s"));
-    app.transcript.push(tool_meta("shell", "orbit verify-ledger --home /tmp/orbit-restored", ToolOutcome::Ok, "7 records · 0.4s"));
+    app.transcript.push(tool_meta(
+        "edit_file",
+        "crates/export/src/restore.rs",
+        ToolOutcome::Ok,
+        "+9 −3 · 0.1s",
+    ));
+    app.transcript.push(tool_meta(
+        "shell",
+        "cargo test -p orbit-export",
+        ToolOutcome::Ok,
+        "48 passed · 3.9s",
+    ));
+    app.transcript.push(tool_meta(
+        "shell",
+        "orbit verify-ledger --home /tmp/orbit-restored",
+        ToolOutcome::Ok,
+        "7 records · 0.4s",
+    ));
     app.transcript.push(TranscriptLine::Evidence {
         checks: "2 checks".into(),
         note: "retest attestation recorded".into(),
         rows: vec![
             ("cargo test -p orbit-export".into(), "48 passed".into()),
-            ("orbit verify-ledger".into(), "7 records · head 0913…a0c3".into()),
+            (
+                "orbit verify-ledger".into(),
+                "7 records · head 0913…a0c3".into(),
+            ),
         ],
     });
     app
@@ -454,15 +504,13 @@ pub fn write_golden(
                 let nfg = color_token(p, c.style().fg).unwrap_or("");
                 let nbg = color_token(p, c.style().bg).unwrap_or("");
                 let mut nflags = String::new();
-                if c
-                    .style()
+                if c.style()
                     .add_modifier
                     .contains(ratatui::style::Modifier::BOLD)
                 {
                     nflags.push('b');
                 }
-                if c
-                    .style()
+                if c.style()
                     .add_modifier
                     .contains(ratatui::style::Modifier::UNDERLINED)
                 {

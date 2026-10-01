@@ -22,6 +22,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
 
 // ── Width classes (§8.2) ─────────────────────────────────────────────────────
 
@@ -159,19 +160,36 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
     let mut panes: Vec<Rect> = Vec::new();
     let mut x = body.x;
     if let Some((_, sw)) = wc.sessions {
-        panes.push(Rect { x, y: body.y, width: sw, height: body.height });
+        panes.push(Rect {
+            x,
+            y: body.y,
+            width: sw,
+            height: body.height,
+        });
         x += sw + 1; // pane + gap
     }
     let (_, cw) = wc.conversation;
-    panes.push(Rect { x, y: body.y, width: cw, height: body.height });
+    panes.push(Rect {
+        x,
+        y: body.y,
+        width: cw,
+        height: body.height,
+    });
     x += cw;
     if let Some((_, ww)) = wc.workspace {
         x += 1; // gap
-        panes.push(Rect { x, y: body.y, width: ww, height: body.height });
+        panes.push(Rect {
+            x,
+            y: body.y,
+            width: ww,
+            height: body.height,
+        });
     }
     // Record pane rects for the mouse hit-test (the OUTER rect — the
     // hit-test insets by the border itself).
-    app.pane_rects.left.set(panes.first().copied().filter(|_| wc.sessions.is_some()));
+    app.pane_rects
+        .left
+        .set(panes.first().copied().filter(|_| wc.sessions.is_some()));
     app.pane_rects
         .center
         .set(panes.get(wc.sessions.is_some() as usize).copied());
@@ -193,10 +211,9 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
 
     // Draw each pane: box border + title, then the content in the inner rect.
     let mut pane_idx = 0usize;
-    let mut sessions_inner = Rect::new(0, 0, 0, 0);
     if wc.sessions.is_some() {
         let r = panes[pane_idx];
-        sessions_inner = draw_pane_box(frame, r, left_title, app.focus == Focus::Left, d, g);
+        let sessions_inner = draw_pane_box(frame, r, left_title, app.focus == Focus::Left, d, g);
         render_sessions_rail(frame, sessions_inner, app, d, g);
         pane_idx += 1;
     }
@@ -216,7 +233,7 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, composer_text: &str, d: &De
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
-            Constraint::Length(1), // composer
+            Constraint::Length(1),                             // composer
             Constraint::Length(if show_hint { 1 } else { 0 }), // hint
         ])
         .split(conv_inner);
@@ -288,7 +305,9 @@ fn draw_pane_box(
     let buf = frame.buffer_mut();
     let bs = Style::default().fg(border_color);
     // Corners.
-    buf[(area.x, area.y)].set_symbol(g.corner_tl()).set_style(bs);
+    buf[(area.x, area.y)]
+        .set_symbol(g.corner_tl())
+        .set_style(bs);
     buf[(area.x + area.width - 1, area.y)]
         .set_symbol(g.corner_tr())
         .set_style(bs);
@@ -332,255 +351,11 @@ fn draw_pane_box(
 
 // ── Pane headers (§8.5) ──────────────────────────────────────────────────────
 
-/// One shared header row: each pane's title + rule + right meta, side by
-/// side. Focused: magenta bold title, heavy ━ in rule_hi. Unfocused: active
-/// tab ink bold, other tabs muted, light ─ in rule.
-fn render_pane_headers(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    app: &App,
-    wc: &WidthClass,
-    d: &Design,
-    g: &Glyphs,
-) {
-    let p = &d.palette;
-    let buf = frame.buffer_mut();
-    if wc.single_view {
-        // View switcher: Sessions   Conversation   Workspace 2/5 ━━━━
-        let active = match app.focus {
-            Focus::Left => "Sessions",
-            Focus::Center | Focus::Status => "Conversation",
-            Focus::Right => "Workspace",
-        };
-        let mut x = 1u16;
-        for name in ["Sessions", "Conversation", "Workspace"] {
-            let style = if name == active {
-                Style::default().fg(p.magenta).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(p.muted)
-            };
-            for c in name.chars() {
-                if x >= area.x + area.width {
-                    return;
-                }
-                buf[(x, area.y)].set_symbol(&c.to_string()).set_style(style);
-                x += 1;
-            }
-            x += 3;
-        }
-        // The workspace meta (2/5) rides the switcher: cyan while a turn
-        // is live, muted when idle.
-        if !app.workspace_meta.is_empty() {
-            let live = app.turn_in_flight
-                || app.tool_state == ToolState::Streaming
-                || matches!(app.tool_state, ToolState::Running(_));
-            let style = if live {
-                Style::default().fg(p.cyan)
-            } else {
-                Style::default().fg(p.muted)
-            };
-            for c in app.workspace_meta.chars() {
-                if x >= area.x + area.width {
-                    break;
-                }
-                buf[(x, area.y)].set_symbol(&c.to_string()).set_style(style);
-                x += 1;
-            }
-            x += 1;
-        }
-        // The rule fills the rest, heavy for the focused view.
-        let focused_center = app.focus == Focus::Center;
-        let rule_ch = if focused_center { g.rule_focus } else { g.rule };
-        let rule_color = if focused_center { p.rule_hi } else { p.rule };
-        while x < area.x + area.width.saturating_sub(1) {
-            buf[(x, area.y)]
-                .set_symbol(rule_ch)
-                .set_style(Style::default().fg(rule_color));
-            x += 1;
-        }
-        return;
-    }
-    // Multi-pane: one header segment per pane.
-    if let Some((sx, sw)) = wc.sessions {
-        // Two tabs: the active one ink bold (focused: magenta bold), the
-        // other muted (§8.5).
-        let (a, b) = match app.left_tab {
-            LeftTab::Sessions => ("Sessions", "Activity"),
-            LeftTab::Verbose => ("Activity", "Sessions"),
-        };
-        draw_tabs_header(buf, Rect { x: sx, y: area.y, width: sw, height: 1 }, a, b, app.focus == Focus::Left, d, g);
-    }
-    let mut segs: Vec<(Rect, &str, String, bool)> = Vec::new();
-    let (cx, cwid) = wc.conversation;
-    segs.push((
-        Rect { x: cx, y: area.y, width: cwid, height: 1 },
-        &app.header_title,
-        app.header_meta.clone(),
-        app.focus == Focus::Center,
-    ));
-    if let Some((wx, ww)) = wc.workspace {
-        segs.push((
-            Rect { x: wx, y: area.y, width: ww, height: 1 },
-            "Workspace",
-            String::new(),
-            app.focus == Focus::Right,
-        ));
-    }
-    for (rect, title, meta, focused) in segs {
-        draw_pane_header(buf, rect, title, &meta, focused, d, g);
-    }
-    // The divider glyphs pierce the header row too (§8.6: row 0 to H-2).
-    if let Some((_, sw)) = wc.sessions {
-        buf[(sw, area.y)]
-            .set_symbol(g.divider)
-            .set_style(Style::default().fg(p.rule));
-    }
-    if let Some((wx, _)) = wc.workspace {
-        buf[(wx.saturating_sub(1), area.y)]
-            .set_symbol(g.divider)
-            .set_style(Style::default().fg(p.rule));
-    }
-}
-
-/// One pane's header segment: title at x+1, rule after, right meta at
-/// x+w-2 (§8.5).
-fn draw_pane_header(
-    buf: &mut ratatui::buffer::Buffer,
-    rect: Rect,
-    title: &str,
-    meta: &str,
-    focused: bool,
-    d: &Design,
-    g: &Glyphs,
-) {
-    let p = &d.palette;
-    if rect.width < 3 {
-        return;
-    }
-    let (title_style, rule_ch, rule_color) = if focused {
-        (
-            Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
-            g.rule_focus,
-            p.rule_hi,
-        )
-    } else {
-        (Style::default().fg(p.ink).add_modifier(Modifier::BOLD), g.rule, p.rule)
-    };
-    let mut x = rect.x + 1;
-    for c in title.chars() {
-        if x >= rect.x + rect.width {
-            return;
-        }
-        buf[(x, rect.y)].set_symbol(&c.to_string()).set_style(title_style);
-        x += 1;
-    }
-    let meta_w = display_width(meta) as u16;
-    let meta_x = if meta_w > 0 {
-        rect.x + rect.width.saturating_sub(2).saturating_sub(meta_w).saturating_add(1)
-    } else {
-        rect.x + rect.width.saturating_sub(1)
-    };
-    let rule_end = if meta_w > 0 {
-        meta_x.saturating_sub(1)
-    } else {
-        rect.x + rect.width - 1
-    };
-    x += 1;
-    while x < rule_end {
-        buf[(x, rect.y)]
-            .set_symbol(rule_ch)
-            .set_style(Style::default().fg(rule_color));
-        x += 1;
-    }
-    if meta_w > 0 {
-        let mut mx = meta_x;
-        for c in meta.chars() {
-            if mx >= rect.x + rect.width {
-                break;
-            }
-            buf[(mx, rect.y)]
-                .set_symbol(&c.to_string())
-                .set_style(Style::default().fg(p.muted));
-            mx += 1;
-        }
-    }
-}
-
-/// A two-tab header (the Sessions rail): active tab bold (magenta when the
-/// rail is focused, ink otherwise), the other tab muted, light rule.
-fn draw_tabs_header(
-    buf: &mut ratatui::buffer::Buffer,
-    rect: Rect,
-    tab_a: &str,
-    tab_b: &str,
-    focused: bool,
-    d: &Design,
-    g: &Glyphs,
-) {
-    let p = &d.palette;
-    if rect.width < 4 {
-        return;
-    }
-    let active_style = if focused {
-        Style::default().fg(p.magenta).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(p.ink).add_modifier(Modifier::BOLD)
-    };
-    let mut x = rect.x + 1;
-    for c in tab_a.chars() {
-        if x >= rect.x + rect.width { return; }
-        buf[(x, rect.y)].set_symbol(&c.to_string()).set_style(active_style);
-        x += 1;
-    }
-    x += 2;
-    for c in tab_b.chars() {
-        if x >= rect.x + rect.width { return; }
-        buf[(x, rect.y)].set_symbol(&c.to_string()).set_style(Style::default().fg(p.muted));
-        x += 1;
-    }
-    x += 1;
-    while x < rect.x + rect.width.saturating_sub(1) {
-        buf[(x, rect.y)].set_symbol(g.rule).set_style(Style::default().fg(p.rule));
-        x += 1;
-    }
-}
-
 // ── Divider / scroll track (§8.6) ────────────────────────────────────────────
-
-fn render_divider(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    d: &Design,
-    g: &Glyphs,
-    scroll_track: bool,
-    thumb_range: (u16, u16),
-) {
-    if area.width < 1 || area.height < 1 {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    // The thumb spans the content rows (bottom-anchored), muted; the rest
-    // of the track is rule (§8.6).
-    let (t0, t1) = thumb_range;
-    for y in area.top()..area.bottom() {
-        let (sym, fg) = if scroll_track && y >= t0 && y <= t1 {
-            (g.thumb, d.palette.muted)
-        } else {
-            (g.divider, d.palette.rule)
-        };
-        buf[(area.x, y)].set_symbol(sym).set_style(Style::default().fg(fg));
-    }
-}
 
 // ── Sessions rail (§6.9) ─────────────────────────────────────────────────────
 
-fn render_sessions_rail(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    app: &App,
-    d: &Design,
-    g: &Glyphs,
-) {
+fn render_sessions_rail(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design, g: &Glyphs) {
     // The Activity tab renders the structured event rail instead (§9.16).
     if app.left_tab == LeftTab::Verbose {
         render_activity_rail(frame, area, app, d);
@@ -620,7 +395,11 @@ fn render_sessions_rail(
         // x+3, recency right-aligned ending at x+w-2.
         let cursor = i == app.session_cursor;
         let fill = if cursor {
-            if focused { p.wash } else { p.surface2 }
+            if focused {
+                p.wash
+            } else {
+                p.surface2
+            }
         } else {
             p.bg
         };
@@ -643,10 +422,18 @@ fn render_sessions_rail(
         let budget = (area.width as usize)
             .saturating_sub(3 + recency_w as usize + 2)
             .max(1);
-        let rec_x = area.x + area.width.saturating_sub(2).saturating_sub(recency_w).saturating_add(1);
+        let rec_x = area.x
+            + area
+                .width
+                .saturating_sub(2)
+                .saturating_sub(recency_w)
+                .saturating_add(1);
         let title = truncate_graphemes(&s.title, budget);
         let title_style = if s.open || (cursor && focused) {
-            Style::default().fg(p.ink).add_modifier(Modifier::BOLD).bg(fill)
+            Style::default()
+                .fg(p.ink)
+                .add_modifier(Modifier::BOLD)
+                .bg(fill)
         } else {
             Style::default().fg(p.ink2).bg(fill)
         };
@@ -655,12 +442,16 @@ fn render_sessions_rail(
             if tx >= area.x + area.width {
                 break;
             }
-            buf[(tx, y)].set_symbol(&c.to_string()).set_style(title_style);
+            buf[(tx, y)]
+                .set_symbol(&c.to_string())
+                .set_style(title_style);
             tx += 1;
         }
         // One space between title and recency (the golden's rhythm).
         if tx < rec_x {
-            buf[(tx, y)].set_symbol(" ").set_style(Style::default().bg(fill));
+            buf[(tx, y)]
+                .set_symbol(" ")
+                .set_style(Style::default().bg(fill));
         }
         let rec_fg = if cursor { p.ink2 } else { p.muted };
         for (j, c) in s.recency.chars().enumerate() {
@@ -678,12 +469,7 @@ fn render_sessions_rail(
 /// kind at x+11 (muted), text at x+18 end-truncated at x+w-1. Warnings
 /// amber, errors red, everything else ink2. The rail follows the newest
 /// entry unless the operator scrolled (pane_scroll[0]).
-fn render_activity_rail(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    app: &App,
-    d: &Design,
-) {
+fn render_activity_rail(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design) {
     let p = &d.palette;
     let buf = frame.buffer_mut();
     if area.width < 20 || area.height < 1 {
@@ -829,13 +615,9 @@ fn render_conversation(
                     spans.extend(line.spans.iter().cloned());
                     if i == 0 && time.is_some() && !wc.compact {
                         let t = time.as_deref().unwrap_or("");
-                        let used: usize =
-                            spans.iter().map(|s| display_width(&s.to_string())).sum();
+                        let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
                         let pad = rel_right.saturating_sub(used + t.chars().count());
-                        spans.push(Span::styled(
-                            " ".repeat(pad),
-                            Style::default().fg(p.muted),
-                        ));
+                        spans.push(Span::styled(" ".repeat(pad), Style::default().fg(p.muted)));
                         spans.push(Span::styled(t, Style::default().fg(p.muted)));
                     }
                     lines.push(Line::from(spans));
@@ -849,14 +631,8 @@ fn render_conversation(
                 // following a tool group is a continuation of the same
                 // turn — no gutter.
                 let continuation = time.is_none() && prev_was_tool;
-                let body = render_assistant_body(
-                    text,
-                    time.as_ref(),
-                    cw,
-                    wc.compact,
-                    continuation,
-                    d,
-                );
+                let body =
+                    render_assistant_body(text, time.as_ref(), cw, wc.compact, continuation, d);
                 for (i, rich_line) in body.into_iter().enumerate() {
                     let mut spans: Vec<Span> = Vec::new();
                     if i == 0 && !continuation {
@@ -870,13 +646,9 @@ fn render_conversation(
                     spans.extend(rich_line.spans);
                     if i == 0 && time.is_some() && !wc.compact {
                         let t = time.as_deref().unwrap_or("");
-                        let used: usize =
-                            spans.iter().map(|s| display_width(&s.to_string())).sum();
+                        let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
                         let pad = rel_right.saturating_sub(used + t.chars().count());
-                        spans.push(Span::styled(
-                            " ".repeat(pad),
-                            Style::default().fg(p.muted),
-                        ));
+                        spans.push(Span::styled(" ".repeat(pad), Style::default().fg(p.muted)));
                         spans.push(Span::styled(t, Style::default().fg(p.muted)));
                     }
                     lines.push(Line::from(spans));
@@ -912,13 +684,9 @@ fn render_conversation(
                         (false, Some(ToolOutcome::Failed)) => {
                             (g.failed, p.red, p.ink2, "failed".into(), p.red)
                         }
-                        (false, Some(ToolOutcome::Denied)) => (
-                            g.denied,
-                            p.muted,
-                            p.ink2,
-                            "denied by you".into(),
-                            p.muted,
-                        ),
+                        (false, Some(ToolOutcome::Denied)) => {
+                            (g.denied, p.muted, p.ink2, "denied by you".into(), p.muted)
+                        }
                         (false, Some(ToolOutcome::Blocked)) => {
                             (g.blocked, p.amber, p.ink2, "blocked".into(), p.amber)
                         }
@@ -936,8 +704,7 @@ fn render_conversation(
                 if !summary.is_empty() {
                     // Argument budget: from 2 past the name to 12 before the
                     // right edge (meta room). No truncation when it fits.
-                    let used: usize =
-                        spans.iter().map(|s| display_width(&s.to_string())).sum();
+                    let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
                     let budget = rel_right.saturating_sub(used + 14).max(8);
                     let arg = truncate_middle(summary, budget);
                     spans.push(Span::styled(
@@ -1040,7 +807,10 @@ fn render_conversation(
         for (i, rich_line) in body.into_iter().enumerate() {
             let mut spans: Vec<Span> = Vec::new();
             if i == 0 {
-                spans.push(Span::styled(g.orbit.to_string(), Style::default().fg(p.cyan)));
+                spans.push(Span::styled(
+                    g.orbit.to_string(),
+                    Style::default().fg(p.cyan),
+                ));
             }
             spans.push(Span::raw(" "));
             spans.extend(rich_line.spans);
@@ -1114,8 +884,49 @@ fn render_conversation(
     } else if !app.viewport_manual {
         scroll = total.saturating_sub(visible);
     }
+    // ── Selection rows = rendered rows (§6.9) ─────────────────────────────
+    // The mouse hit-test yields pane-local rows in RENDER space (blank
+    // top-padding + wrapped transcript lines). pane_lines for the Center
+    // pane must be the same rendered rows or extract() indexes text the
+    // operator never saw. Record the rendered text here, after padding,
+    // so the two can never drift.
+    {
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        app.rendered_center_lines.replace(rendered);
+    }
     let para = Paragraph::new(lines).scroll((scroll as u16, 0));
     frame.render_widget(para, area);
+
+    // ── Selection highlight (§6.9) ────────────────────────────────────────
+    // The selection state is pane-local (row 0 = the pane's first content
+    // row). Overlay reverse-video on the covered cells so the operator sees
+    // what a drag is capturing; the OSC 52 copy on mouse-up uses the same
+    // coordinates, so the highlight and the clipboard always agree.
+    if let Some(sel) = app.selection.as_ref() {
+        if sel.pane == Focus::Center && sel.is_visible() {
+            let buf = frame.buffer_mut();
+            for row in area.y..area.bottom() {
+                let pane_row = row - area.y;
+                for col in area.x..area.right() {
+                    let pane_col = col - area.x;
+                    if sel.contains(pane_row, pane_col) {
+                        let cell = &mut buf[(col, row)];
+                        let fg = cell.fg;
+                        cell.set_fg(cell.bg).set_bg(fg);
+                    }
+                }
+            }
+        }
+    }
 
     // ── User-turn bands: paint surface under user rows (§6.2) ─────────────
     paint_user_bands(frame, area, cl, band_left, band_right, d, g);
@@ -1128,14 +939,12 @@ fn render_conversation(
         buf[(x, composer_row.y)].set_style(Style::default().bg(p.surface));
     }
     let prompt_color = if composer_focused { p.magenta } else { p.faint };
-    buf[(cl - 1, composer_row.y)]
-        .set_symbol(g.you)
-        .set_style(
-            Style::default()
-                .fg(prompt_color)
-                .bg(p.surface)
-                .add_modifier(Modifier::BOLD),
-        );
+    buf[(cl - 1, composer_row.y)].set_symbol(g.you).set_style(
+        Style::default()
+            .fg(prompt_color)
+            .bg(p.surface)
+            .add_modifier(Modifier::BOLD),
+    );
     let placeholder = if live {
         "Add to the queue, or wait for ORBIT"
     } else {
@@ -1219,10 +1028,24 @@ fn render_conversation(
             };
             let tw = display_width(&text) as u16;
             let tx = band_end.saturating_sub(tw);
-            for (i, c) in text.chars().enumerate() {
-                buf[(tx + i as u16, hint_row.y)]
-                    .set_symbol(&c.to_string())
-                    .set_style(Style::default().fg(color).bg(p.surface));
+            // Truncate to the band (§6.12): a toast wider than the band
+            // right-aligns and clips its LEFT side, never spilling past
+            // band_end. Grapheme-aware: advance by display width, not char
+            // index, so wide glyphs don't drift.
+            let mut x = tx;
+            for c in text.graphemes(true) {
+                if x > band_end {
+                    break;
+                }
+                let w = crate::unicode::grapheme_width(c) as u16;
+                buf[(x, hint_row.y)]
+                    .set_symbol(c)
+                    // surface2 (not surface): the toast is an overlay, and a
+                    // distinct bg guarantees the diff rewrites every cell —
+                    // identical cells under the old hint text would otherwise
+                    // never reach the terminal stream.
+                    .set_style(Style::default().fg(color).bg(p.surface2));
+                x += w.max(1);
             }
         }
     }
@@ -1284,7 +1107,7 @@ fn build_welcome(
     let mark = welcome_mark_frame(d, app.startup_frame.max(5));
     let mark_w = 35u16;
     let mark_x = cl + cw.saturating_sub(mark_w) / 2;
-    let pad = " ".repeat(mark_x.saturating_sub(area.x).max(0) as usize);
+    let pad = " ".repeat(mark_x.saturating_sub(area.x) as usize);
     for l in mark {
         let mut padded = vec![Span::raw(pad.clone())];
         padded.extend(l.spans);
@@ -1294,7 +1117,7 @@ fn build_welcome(
     // Tagline centered.
     let tagline = "the harness that orbits around you";
     let tag_x = cl + cw.saturating_sub(tagline.chars().count() as u16) / 2;
-    let tag_pad = " ".repeat(tag_x.saturating_sub(area.x).max(0) as usize);
+    let tag_pad = " ".repeat(tag_x.saturating_sub(area.x) as usize);
     lines.push(Line::from(vec![
         Span::raw(tag_pad),
         Span::styled(tagline, Style::default().fg(p.muted)),
@@ -1304,7 +1127,7 @@ fn build_welcome(
     // Readiness row (fixture data; the backend fills it when it exists).
     let readiness = "✓ trust root    ✓ ledger · 7 records    ✓ local · glm-5.2";
     let r_x = cl + cw.saturating_sub(readiness.chars().count() as u16) / 2;
-    let r_pad = " ".repeat(r_x.saturating_sub(area.x).max(0) as usize);
+    let r_pad = " ".repeat(r_x.saturating_sub(area.x) as usize);
     let mut spans = vec![Span::raw(r_pad)];
     for seg in readiness.split("    ") {
         let (glyph, rest) = seg.split_once(' ').unwrap_or((seg, ""));
@@ -1321,7 +1144,7 @@ fn build_welcome(
     // Starters.
     let describe = "Describe a task below, or start with";
     let d_x = cl + 9;
-    let d_pad = " ".repeat(d_x.saturating_sub(area.x).max(0) as usize);
+    let d_pad = " ".repeat(d_x.saturating_sub(area.x) as usize);
     lines.push(Line::from(vec![
         Span::raw(d_pad),
         Span::styled(describe, Style::default().fg(p.muted)),
@@ -1387,7 +1210,11 @@ fn render_workspace_rail(
             };
             stepper.push(Span::styled(ch, style));
             if i < 4 {
-                let (conn, cc) = if i < current { ("━━", p.muted) } else { ("──", p.rule) };
+                let (conn, cc) = if i < current {
+                    ("━━", p.muted)
+                } else {
+                    ("──", p.rule)
+                };
                 stepper.push(Span::styled(conn, Style::default().fg(cc)));
             }
         }
@@ -1401,7 +1228,10 @@ fn render_workspace_rail(
         let total = w.plan.len().max(1);
         let done_count = w.plan.iter().filter(|t| t.state == TaskState::Done).count();
         let count_text = format!("{done_count}/{total}");
-        let used: usize = stepper.iter().map(|sp| display_width(&sp.to_string())).sum();
+        let used: usize = stepper
+            .iter()
+            .map(|sp| display_width(&sp.to_string()))
+            .sum();
         let right = (area.width as usize).saturating_sub(2);
         let pad = right.saturating_sub(used + count_text.chars().count()) + 1;
         stepper.push(Span::raw(" ".repeat(pad)));
@@ -1412,19 +1242,19 @@ fn render_workspace_rail(
         // PLAN
         if !w.plan.is_empty() {
             {
-            let total = w.plan.len().max(1);
-            let done = w.plan.iter().filter(|t| t.state == TaskState::Done).count();
-            let ratio = format!("{done}/{total}");
-            let used = 2 + 4;
-            let right = (area.width as usize).saturating_sub(2);
-            let pad = right.saturating_sub(used + ratio.chars().count()) + 1;
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("PLAN", Style::default().fg(p.muted)),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(ratio, Style::default().fg(p.muted)),
-            ]));
-        }
+                let total = w.plan.len().max(1);
+                let done = w.plan.iter().filter(|t| t.state == TaskState::Done).count();
+                let ratio = format!("{done}/{total}");
+                let used = 2 + 4;
+                let right = (area.width as usize).saturating_sub(2);
+                let pad = right.saturating_sub(used + ratio.chars().count()) + 1;
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("PLAN", Style::default().fg(p.muted)),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(ratio, Style::default().fg(p.muted)),
+                ]));
+            }
             for task in &w.plan {
                 let (glyph, color, bold) = match task.state {
                     TaskState::Active => ("◉", p.cyan, true),
@@ -1473,7 +1303,8 @@ fn render_workspace_rail(
             lines.push(section_line("FINDINGS", w.findings.len(), p, area.width));
             for f in &w.findings {
                 // The source renders muted, the title ink2 (golden).
-                let mut runs: Vec<(String, Style)> = vec![(f.title.clone(), Style::default().fg(p.ink2))];
+                let mut runs: Vec<(String, Style)> =
+                    vec![(f.title.clone(), Style::default().fg(p.ink2))];
                 if let Some(src) = &f.source {
                     runs.push((" ".into(), Style::default().fg(p.ink2)));
                     runs.push((src.clone(), Style::default().fg(p.muted)));
@@ -1538,12 +1369,9 @@ fn render_workspace_rail(
                     }
                     spans.push(Span::styled(nl.clone(), Style::default().fg(p.ink2)));
                     if ni == 0 && !v.result_text.is_empty() {
-                        let used: usize =
-                            spans.iter().map(|s| display_width(&s.to_string())).sum();
+                        let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
                         let right = (area.width as usize).saturating_sub(2);
-                        let pad = right
-                            .saturating_sub(used + v.result_text.chars().count())
-                            + 1;
+                        let pad = right.saturating_sub(used + v.result_text.chars().count()) + 1;
                         spans.push(Span::raw(" ".repeat(pad)));
                         let result_color = match v.result {
                             VerificationResult::Pending => p.amber,
@@ -1598,8 +1426,8 @@ fn render_status_bar(
     let level = wc.status_level;
 
     // Left: the mark + ORBIT + activity.
-    let working = app.tool_state == ToolState::Streaming
-        || matches!(app.tool_state, ToolState::Running(_));
+    let working =
+        app.tool_state == ToolState::Streaming || matches!(app.tool_state, ToolState::Running(_));
     let mark = if working {
         if app.reduced_motion {
             g.orbit
@@ -1614,7 +1442,9 @@ fn render_status_bar(
         _ if working => p.cyan,
         _ => p.magenta,
     };
-    buf[(1, area.y)].set_symbol(mark).set_style(Style::default().fg(mark_color));
+    buf[(1, area.y)]
+        .set_symbol(mark)
+        .set_style(Style::default().fg(mark_color));
     for (i, c) in "ORBIT".chars().enumerate() {
         buf[(3 + i as u16, area.y)]
             .set_symbol(&c.to_string())
@@ -1626,7 +1456,9 @@ fn render_status_bar(
             if *x >= area.x + area.width {
                 return;
             }
-            buf[(*x, area.y)].set_symbol(&c.to_string()).set_style(style);
+            buf[(*x, area.y)]
+                .set_symbol(&c.to_string())
+                .set_style(style);
             *x += 1;
         }
     };
@@ -1641,7 +1473,10 @@ fn render_status_bar(
             ),
         ],
         ToolState::AwaitingApproval => vec![
-            (format!("{} approval needed {} ", g.decision, g.sep), Style::default().fg(p.magenta)),
+            (
+                format!("{} approval needed {} ", g.decision, g.sep),
+                Style::default().fg(p.magenta),
+            ),
             (
                 app.pending_approvals
                     .first()
@@ -1668,30 +1503,62 @@ fn render_status_bar(
     // Right cluster: fixed slots, right-aligned (§6.11). Gaps per the
     // goldens: keys←3←session←3←cost←4←tokens←4←online←1←●←5←local←1←·←1←model.
     let mut rx = area.x + area.width - 1;
-    fn rput(buf: &mut ratatui::buffer::Buffer, y: u16, text: &str, style: Style, gap: u16, rx: &mut u16) {
+    fn rput(
+        buf: &mut ratatui::buffer::Buffer,
+        y: u16,
+        text: &str,
+        style: Style,
+        gap: u16,
+        rx: &mut u16,
+    ) {
         let w = display_width(text) as u16;
         let start = rx.saturating_sub(w);
         for (i, c) in text.chars().enumerate() {
-            buf[(start + i as u16, y)].set_symbol(&c.to_string()).set_style(style);
+            buf[(start + i as u16, y)]
+                .set_symbol(&c.to_string())
+                .set_style(style);
         }
         *rx = start.saturating_sub(gap);
     }
     if level <= 2 {
-        rput(buf, area.y, "? keys", Style::default().fg(p.muted), 3, &mut rx);
+        rput(
+            buf,
+            area.y,
+            "? keys",
+            Style::default().fg(p.muted),
+            3,
+            &mut rx,
+        );
         // The '?' is bold (golden).
         let q_x = rx + 3;
         buf[(q_x, area.y)].set_style(Style::default().fg(p.ink2).add_modifier(Modifier::BOLD));
     }
     if level == 0 {
-        rput(buf, area.y, &app.session_id_prefix, Style::default().fg(p.faint), 3, &mut rx);
+        rput(
+            buf,
+            area.y,
+            &app.session_id_prefix,
+            Style::default().fg(p.faint),
+            3,
+            &mut rx,
+        );
     }
-    let cost = app.total_cost_microcents.saturating_add(app.turn_cost_microcents);
+    let cost = app
+        .total_cost_microcents
+        .saturating_add(app.turn_cost_microcents);
     let cost_str = if app.model_priced {
         crate::format::cost(cost)
     } else {
         crate::format::cost_unpriced().to_string()
     };
-    rput(buf, area.y, &cost_str, Style::default().fg(p.ink2), 4, &mut rx);
+    rput(
+        buf,
+        area.y,
+        &cost_str,
+        Style::default().fg(p.ink2),
+        4,
+        &mut rx,
+    );
     let conn = match app.connection {
         ConnectionState::Online => (g.conn_online, "online", p.green),
         ConnectionState::Reconnecting => (g.conn_retrying, "reconnect", p.amber),
@@ -1705,53 +1572,49 @@ fn render_status_bar(
             g.tokens_up,
             crate::format::tokens(app.total_output_tokens)
         );
-        rput(buf, area.y, &tokens, Style::default().fg(p.muted), 4, &mut rx);
-        rput(buf, area.y, conn.1, Style::default().fg(p.muted), 1, &mut rx);
+        rput(
+            buf,
+            area.y,
+            &tokens,
+            Style::default().fg(p.muted),
+            4,
+            &mut rx,
+        );
+        rput(
+            buf,
+            area.y,
+            conn.1,
+            Style::default().fg(p.muted),
+            1,
+            &mut rx,
+        );
         rput(buf, area.y, conn.0, Style::default().fg(conn.2), 5, &mut rx);
-        rput(buf, area.y, &app.provider, Style::default().fg(p.muted), 1, &mut rx);
+        rput(
+            buf,
+            area.y,
+            &app.provider,
+            Style::default().fg(p.muted),
+            1,
+            &mut rx,
+        );
         rput(buf, area.y, g.sep, Style::default().fg(p.muted), 1, &mut rx);
     } else if level == 2 {
         // Level 2 keeps the glyph, drops the word (§6.11).
         rput(buf, area.y, conn.0, Style::default().fg(conn.2), 4, &mut rx);
     }
     if level <= 2 {
-        rput(buf, area.y, &app.model, Style::default().fg(p.ink2), 1, &mut rx);
+        rput(
+            buf,
+            area.y,
+            &app.model,
+            Style::default().fg(p.ink2),
+            1,
+            &mut rx,
+        );
     }
 }
 
 // ── Text helpers ─────────────────────────────────────────────────────────────
-
-/// Render a message with its FIRST paragraph wrapped at `width` (the
-/// timed-turn rule, §8.3): the first paragraph's lines wrap at cw-7 so the
-/// time never collides; later paragraphs wrap at the measure.
-fn wrap_first_paragraph(text: &str, width: usize, d: &Design) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut first = true;
-    for para in text.split("\n\n") {
-        if first {
-            // Rich-render once, then re-wrap the styled run stream at the
-            // tighter width (inline code chips survive splits, §6.4).
-            let rendered = crate::rich::render_line(para, d);
-            let mut runs: Vec<(String, Style)> = Vec::new();
-            for sp in rendered.spans {
-                runs.push((sp.content.to_string(), sp.style));
-            }
-            out.extend(wrap_runs(&runs, width));
-            first = false;
-        } else {
-            for line in render_message(para, d) {
-                // Own the spans: clone each into 'static strings.
-                let spans: Vec<Span<'static>> = line
-                    .spans
-                    .iter()
-                    .map(|sp| Span::styled(sp.content.to_string(), sp.style))
-                    .collect();
-                out.push(Line::from(spans));
-            }
-        }
-    }
-    out
-}
 
 /// Render an assistant turn's body: prose paragraphs rich-rendered (the
 /// first wrapped at cw-7 when timed, §8.3), fenced code blocks as code rows
@@ -1765,13 +1628,17 @@ fn render_assistant_body(
     d: &Design,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    let prose_wrap = if continuation { cw.saturating_sub(2) as usize } else { cw as usize };
+    let prose_wrap = if continuation {
+        cw.saturating_sub(2) as usize
+    } else {
+        cw as usize
+    };
     // Split on fences: alternating prose / code segments.
-    let mut segments = text.split("```").peekable();
+    let segments = text.split("```").peekable();
     let mut is_code = false;
     let mut first_prose = true;
     let mut prev_was_code = false;
-    while let Some(seg) = segments.next() {
+    for seg in segments {
         if !is_code {
             if prev_was_code && !seg.trim().is_empty() {
                 // Blank after a code block before prose resumes. The
@@ -1828,9 +1695,9 @@ fn render_assistant_body(
                 // Keyword-aware code text: rust keywords syn_kw, the rest
                 // ink (the golden's syntax colouring).
                 const KEYWORDS: &[&str] = &[
-                    "let", "fn", "match", "if", "else", "return", "use", "pub",
-                    "struct", "enum", "impl", "for", "while", "loop", "const",
-                    "static", "mut", "as", "in", "where", "async", "await",
+                    "let", "fn", "match", "if", "else", "return", "use", "pub", "struct", "enum",
+                    "impl", "for", "while", "loop", "const", "static", "mut", "as", "in", "where",
+                    "async", "await",
                 ];
                 for (wi, w) in cl.split(' ').enumerate() {
                     if wi > 0 {
@@ -1843,8 +1710,15 @@ fn render_assistant_body(
                             if trailing.starts_with("//") || in_comment {
                                 in_comment = true;
                             }
-                            let tfg = if in_comment { d.palette.muted } else { d.palette.ink };
-                            spans.push(Span::styled(trailing.to_string(), Style::default().fg(tfg).bg(d.palette.surface)));
+                            let tfg = if in_comment {
+                                d.palette.muted
+                            } else {
+                                d.palette.ink
+                            };
+                            spans.push(Span::styled(
+                                trailing.to_string(),
+                                Style::default().fg(tfg).bg(d.palette.surface),
+                            ));
                             spans.push(Span::styled(" ", band));
                         }
                         spans.pop();
@@ -1854,7 +1728,10 @@ fn render_assistant_body(
                     } else {
                         d.palette.ink
                     };
-                    spans.push(Span::styled(w.to_string(), Style::default().fg(fg).bg(d.palette.surface)));
+                    spans.push(Span::styled(
+                        w.to_string(),
+                        Style::default().fg(fg).bg(d.palette.surface),
+                    ));
                 }
                 // Pad the band to cl+cw (the full measure, golden col 111).
                 let used: usize = spans.iter().map(|s| display_width(&s.to_string())).sum();
@@ -1862,7 +1739,7 @@ fn render_assistant_body(
                 let mut pad = band_right.saturating_sub(used);
                 // Plain rows pad to the band edge; label rows account for
                 // the label + its banded trailing space inside `pad`.
-                if !(i == 0 && !lang.is_empty()) {
+                if i != 0 || lang.is_empty() {
                     pad += 1;
                 }
                 if i == 0 && !lang.is_empty() {
@@ -1933,7 +1810,11 @@ fn wrap_runs(runs: &[(String, Style)], width: usize) -> Vec<Line<'static>> {
             } else {
                 true
             };
-            words.push(Word { text: w.to_string(), style: *style, space_before });
+            words.push(Word {
+                text: w.to_string(),
+                style: *style,
+                space_before,
+            });
             first_in_run = false;
         }
         prev_run_ended_with_space = text.ends_with(' ');
@@ -2036,7 +1917,12 @@ fn render_palette(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design,
     let h = 17u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + 3;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(ratatui::widgets::Clear, rect);
 
     let buf = frame.buffer_mut();
@@ -2047,7 +1933,9 @@ fn render_palette(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design,
         }
     }
     buf[(rect.x, rect.y)].set_symbol("╭").set_style(frame_style);
-    buf[(rect.x + rect.width - 1, rect.y)].set_symbol("╮").set_style(frame_style);
+    buf[(rect.x + rect.width - 1, rect.y)]
+        .set_symbol("╮")
+        .set_style(frame_style);
     buf[(rect.x, rect.y + rect.height - 1)]
         .set_symbol("╰")
         .set_style(frame_style);
@@ -2074,9 +1962,12 @@ fn render_palette(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design,
     };
 
     // Query row: › magenta bold + query ink + esc close faint right.
-    buf[(inner.x + 1, inner.y)]
-        .set_symbol(g.you)
-        .set_style(Style::default().fg(p.magenta).bg(p.surface2).add_modifier(Modifier::BOLD));
+    buf[(inner.x + 1, inner.y)].set_symbol(g.you).set_style(
+        Style::default()
+            .fg(p.magenta)
+            .bg(p.surface2)
+            .add_modifier(Modifier::BOLD),
+    );
     for (i, c) in app.palette.query.chars().enumerate() {
         buf[(inner.x + 3 + i as u16, inner.y)]
             .set_symbol(&c.to_string())
@@ -2136,9 +2027,15 @@ fn render_palette(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design,
         for (ci, c) in cmd.label.chars().enumerate() {
             let is_match = matched.contains(&ci);
             let style = if is_match {
-                Style::default().fg(p.magenta).bg(fill).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(p.magenta)
+                    .bg(fill)
+                    .add_modifier(Modifier::BOLD)
             } else if selected {
-                Style::default().fg(p.ink).bg(fill).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(p.ink)
+                    .bg(fill)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(p.ink2).bg(fill)
             };
@@ -2168,7 +2065,10 @@ fn render_palette(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Design,
             let mut cx = inner.x + 2;
             for (ci, c) in s.title.chars().enumerate() {
                 let style = if matched.contains(&ci) {
-                    Style::default().fg(p.magenta).bg(p.surface2).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(p.magenta)
+                        .bg(p.surface2)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(p.ink2).bg(p.surface2)
                 };
@@ -2222,7 +2122,11 @@ fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
     let p = &d.palette;
     let is_running =
         app.tool_state == ToolState::Streaming || matches!(app.tool_state, ToolState::Running(_));
-    let title = if is_running { "Still running — quit?" } else { "Quit ORBIT?" };
+    let title = if is_running {
+        "Still running — quit?"
+    } else {
+        "Quit ORBIT?"
+    };
     let message = if is_running {
         "A response is still running. Quit anyway?"
     } else {
@@ -2232,7 +2136,12 @@ fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
     let h = 7u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(ratatui::widgets::Clear, rect);
     let buf = frame.buffer_mut();
     let fs = Style::default().fg(p.rule_hi).bg(p.surface2);
@@ -2242,24 +2151,37 @@ fn render_quit_modal(frame: &mut ratatui::Frame, area: Rect, app: &App, d: &Desi
         }
     }
     buf[(rect.x, rect.y)].set_symbol("╭").set_style(fs);
-    buf[(rect.x + rect.width - 1, rect.y)].set_symbol("╮").set_style(fs);
-    buf[(rect.x, rect.y + rect.height - 1)].set_symbol("╰").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y)]
+        .set_symbol("╮")
+        .set_style(fs);
+    buf[(rect.x, rect.y + rect.height - 1)]
+        .set_symbol("╰")
+        .set_style(fs);
     buf[(rect.x + rect.width - 1, rect.y + rect.height - 1)]
         .set_symbol("╯")
         .set_style(fs);
     for xx in rect.x + 1..rect.x + rect.width - 1 {
         buf[(xx, rect.y)].set_symbol("─").set_style(fs);
-        buf[(xx, rect.y + rect.height - 1)].set_symbol("─").set_style(fs);
+        buf[(xx, rect.y + rect.height - 1)]
+            .set_symbol("─")
+            .set_style(fs);
     }
     for yy in rect.y + 1..rect.y + rect.height - 1 {
         buf[(rect.x, yy)].set_symbol("│").set_style(fs);
-        buf[(rect.x + rect.width - 1, yy)].set_symbol("│").set_style(fs);
+        buf[(rect.x + rect.width - 1, yy)]
+            .set_symbol("│")
+            .set_style(fs);
     }
     let t = format!(" {title} ");
     for (i, c) in t.chars().enumerate() {
         buf[(rect.x + 2 + i as u16, rect.y)]
             .set_symbol(&c.to_string())
-            .set_style(Style::default().fg(p.ink).bg(p.surface2).add_modifier(Modifier::BOLD));
+            .set_style(
+                Style::default()
+                    .fg(p.ink)
+                    .bg(p.surface2)
+                    .add_modifier(Modifier::BOLD),
+            );
     }
     for (i, c) in message.chars().enumerate() {
         buf[(rect.x + 2 + i as u16, rect.y + 2)]
@@ -2292,7 +2214,12 @@ fn render_help_overlay(
     let h = 16u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + 3;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(ratatui::widgets::Clear, rect);
     let buf = frame.buffer_mut();
     let fs = Style::default().fg(p.rule_hi).bg(p.surface2);
@@ -2302,23 +2229,36 @@ fn render_help_overlay(
         }
     }
     buf[(rect.x, rect.y)].set_symbol("╭").set_style(fs);
-    buf[(rect.x + rect.width - 1, rect.y)].set_symbol("╮").set_style(fs);
-    buf[(rect.x, rect.y + rect.height - 1)].set_symbol("╰").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y)]
+        .set_symbol("╮")
+        .set_style(fs);
+    buf[(rect.x, rect.y + rect.height - 1)]
+        .set_symbol("╰")
+        .set_style(fs);
     buf[(rect.x + rect.width - 1, rect.y + rect.height - 1)]
         .set_symbol("╯")
         .set_style(fs);
     for xx in rect.x + 1..rect.x + rect.width - 1 {
         buf[(xx, rect.y)].set_symbol("─").set_style(fs);
-        buf[(xx, rect.y + rect.height - 1)].set_symbol("─").set_style(fs);
+        buf[(xx, rect.y + rect.height - 1)]
+            .set_symbol("─")
+            .set_style(fs);
     }
     for yy in rect.y + 1..rect.y + rect.height - 1 {
         buf[(rect.x, yy)].set_symbol("│").set_style(fs);
-        buf[(rect.x + rect.width - 1, yy)].set_symbol("│").set_style(fs);
+        buf[(rect.x + rect.width - 1, yy)]
+            .set_symbol("│")
+            .set_style(fs);
     }
     for (i, c) in " Keys ".chars().enumerate() {
         buf[(rect.x + 2 + i as u16, rect.y)]
             .set_symbol(&c.to_string())
-            .set_style(Style::default().fg(p.ink).bg(p.surface2).add_modifier(Modifier::BOLD));
+            .set_style(
+                Style::default()
+                    .fg(p.ink)
+                    .bg(p.surface2)
+                    .add_modifier(Modifier::BOLD),
+            );
     }
     let esc = " esc close ";
     let esc_x = rect.x + rect.width - 1 - esc.chars().count() as u16;
@@ -2365,10 +2305,15 @@ fn render_help_overlay(
             let kstyle = if is_label {
                 Style::default().fg(p.muted).bg(p.surface2)
             } else {
-                Style::default().fg(p.ink2).bg(p.surface2).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(p.ink2)
+                    .bg(p.surface2)
+                    .add_modifier(Modifier::BOLD)
             };
             for (j, c) in key.chars().enumerate() {
-                buf[(col_x + j as u16, yy)].set_symbol(&c.to_string()).set_style(kstyle);
+                buf[(col_x + j as u16, yy)]
+                    .set_symbol(&c.to_string())
+                    .set_style(kstyle);
             }
             if !desc.is_empty() {
                 let dx = col_x + 11;
@@ -2401,7 +2346,12 @@ fn render_approval_modal(
     let card_h: u16 = if has_facts { 9 } else { 6 };
     let card_x = wc.conversation.0 + (wc.conversation.1.saturating_sub(card_w)) / 2;
     let card_y = area.y + area.height.saturating_sub(card_h + 2);
-    let rect = Rect { x: card_x, y: card_y, width: card_w, height: card_h };
+    let rect = Rect {
+        x: card_x,
+        y: card_y,
+        width: card_w,
+        height: card_h,
+    };
     frame.render_widget(ratatui::widgets::Clear, rect);
     let buf = frame.buffer_mut();
     let fill = p.surface;
@@ -2412,18 +2362,26 @@ fn render_approval_modal(
         }
     }
     buf[(rect.x, rect.y)].set_symbol("╭").set_style(fs);
-    buf[(rect.x + rect.width - 1, rect.y)].set_symbol("╮").set_style(fs);
-    buf[(rect.x, rect.y + rect.height - 1)].set_symbol("╰").set_style(fs);
+    buf[(rect.x + rect.width - 1, rect.y)]
+        .set_symbol("╮")
+        .set_style(fs);
+    buf[(rect.x, rect.y + rect.height - 1)]
+        .set_symbol("╰")
+        .set_style(fs);
     buf[(rect.x + rect.width - 1, rect.y + rect.height - 1)]
         .set_symbol("╯")
         .set_style(fs);
     for xx in rect.x + 1..rect.x + rect.width - 1 {
         buf[(xx, rect.y)].set_symbol("─").set_style(fs);
-        buf[(xx, rect.y + rect.height - 1)].set_symbol("─").set_style(fs);
+        buf[(xx, rect.y + rect.height - 1)]
+            .set_symbol("─")
+            .set_style(fs);
     }
     for yy in rect.y + 1..rect.y + rect.height - 1 {
         buf[(rect.x, yy)].set_symbol("│").set_style(fs);
-        buf[(rect.x + rect.width - 1, yy)].set_symbol("│").set_style(fs);
+        buf[(rect.x + rect.width - 1, yy)]
+            .set_symbol("│")
+            .set_style(fs);
     }
     // Top border: '◇ Allow shell?' + risk badge right.
     let badge = g.risk_meter(first.risk);
@@ -2440,11 +2398,18 @@ fn render_approval_modal(
     let title = format!("◇ Allow {}?", first.tool_name);
     for (i, c) in title.chars().enumerate() {
         let style = match c {
-            '◇' => Style::default().fg(p.magenta).bg(fill).add_modifier(Modifier::BOLD),
-            ' ' | 'A' | 'l' | 'o' | 'w' | '?' => {
-                Style::default().fg(p.ink).bg(fill).add_modifier(Modifier::BOLD)
-            }
-            _ => Style::default().fg(p.magenta).bg(fill).add_modifier(Modifier::BOLD),
+            '◇' => Style::default()
+                .fg(p.magenta)
+                .bg(fill)
+                .add_modifier(Modifier::BOLD),
+            ' ' | 'A' | 'l' | 'o' | 'w' | '?' => Style::default()
+                .fg(p.ink)
+                .bg(fill)
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default()
+                .fg(p.magenta)
+                .bg(fill)
+                .add_modifier(Modifier::BOLD),
         };
         buf[(rect.x + 2 + i as u16, rect.y)]
             .set_symbol(&c.to_string())
@@ -2456,9 +2421,14 @@ fn render_approval_modal(
         let style = if c == '▰' || c == '▱' {
             Style::default().fg(risk_color).bg(fill)
         } else {
-            Style::default().fg(risk_color).bg(fill).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(risk_color)
+                .bg(fill)
+                .add_modifier(Modifier::BOLD)
         };
-        buf[(bx + i as u16, rect.y)].set_symbol(&c.to_string()).set_style(style);
+        buf[(bx + i as u16, rect.y)]
+            .set_symbol(&c.to_string())
+            .set_style(style);
     }
     // The action, bold ink, in full.
     for (i, c) in first.summary.chars().enumerate() {
@@ -2467,7 +2437,12 @@ fn render_approval_modal(
         }
         buf[(rect.x + 3 + i as u16, rect.y + 2)]
             .set_symbol(&c.to_string())
-            .set_style(Style::default().fg(p.ink).bg(fill).add_modifier(Modifier::BOLD));
+            .set_style(
+                Style::default()
+                    .fg(p.ink)
+                    .bg(fill)
+                    .add_modifier(Modifier::BOLD),
+            );
     }
     // Facts grid (fixture data; the backend supplies real facts).
     let facts: [(&str, &str); 4] = [
@@ -2502,7 +2477,12 @@ fn render_approval_modal(
             }
             buf[(*kx + j as u16, keys_y)]
                 .set_symbol(&c.to_string())
-                .set_style(Style::default().fg(p.ink).bg(p.surface2).add_modifier(Modifier::BOLD));
+                .set_style(
+                    Style::default()
+                        .fg(p.ink)
+                        .bg(p.surface2)
+                        .add_modifier(Modifier::BOLD),
+                );
         }
         *kx += key.chars().count() as u16 + 2;
         for (j, c) in format!(" {desc}   ").chars().enumerate() {

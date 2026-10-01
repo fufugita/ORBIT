@@ -9,12 +9,12 @@
 // Keys: y allow · n deny · q/Esc quit.
 
 // Re-use the test fixture data inline (tests/ isn't linkable from examples).
+use orbit_hud_tui::msg::Msg;
 use orbit_hud_tui::render::render;
 use orbit_hud_tui::state::{
     App, ApprovalDecision, ComposerState, ConnectionState, Focus, LeftTab, PendingApproval, Task,
     TaskState, ToolOutcome, ToolState, TranscriptLine,
 };
-use orbit_hud_tui::msg::Msg;
 
 include!("../tests/common/fixture_data.rs");
 use orbit_hud_tui::tokens::{Design, Theme};
@@ -42,11 +42,36 @@ fn main() -> io::Result<()> {
     app.workspace = orbit_hud_tui::state::Workspace {
         phase_index: 3, // verify
         plan: vec![
-            Task { title: "Reproduce restore failure".into(), state: TaskState::Done, sub: None, evidence: 1 },
-            Task { title: "Find where the chain resets".into(), state: TaskState::Done, sub: None, evidence: 0 },
-            Task { title: "Seed chain from exported head".into(), state: TaskState::Done, sub: None, evidence: 1 },
-            Task { title: "Add restore_preserves_head".into(), state: TaskState::Done, sub: None, evidence: 1 },
-            Task { title: "Run clean-machine e2e".into(), state: TaskState::Pending, sub: None, evidence: 0 },
+            Task {
+                title: "Reproduce restore failure".into(),
+                state: TaskState::Done,
+                sub: None,
+                evidence: 1,
+            },
+            Task {
+                title: "Find where the chain resets".into(),
+                state: TaskState::Done,
+                sub: None,
+                evidence: 0,
+            },
+            Task {
+                title: "Seed chain from exported head".into(),
+                state: TaskState::Done,
+                sub: None,
+                evidence: 1,
+            },
+            Task {
+                title: "Add restore_preserves_head".into(),
+                state: TaskState::Done,
+                sub: None,
+                evidence: 1,
+            },
+            Task {
+                title: "Run clean-machine e2e".into(),
+                state: TaskState::Pending,
+                sub: None,
+                evidence: 0,
+            },
         ],
         findings: vec![
             orbit_hud_tui::state::Finding {
@@ -94,7 +119,9 @@ fn main() -> io::Result<()> {
     loop {
         // ── scripted timeline (each tick ≈ 80 ms) ────────────────────────
         match tick {
-            0 => { app.composer_state = ComposerState::Blocked("thinking".into()); }
+            0 => {
+                app.composer_state = ComposerState::Blocked("thinking".into());
+            }
             40 => {
                 app.composer_state = ComposerState::Idle;
                 app.pending_approvals.push(PendingApproval {
@@ -105,7 +132,8 @@ fn main() -> io::Result<()> {
                 });
                 app.tool_state = ToolState::AwaitingApproval;
             }
-            95 => { // operator "allowed"
+            95 => {
+                // operator "allowed"
                 app.pending_approvals.clear();
                 app.tool_state = ToolState::Running("cargo test".into());
                 // §12: answering the card adds an Activity grant row.
@@ -156,11 +184,15 @@ fn main() -> io::Result<()> {
                             LeftTab::Sessions
                         };
                     }
-                    (crossterm::event::KeyCode::Char('y'), _) if !app.pending_approvals.is_empty() => {
+                    (crossterm::event::KeyCode::Char('y'), _)
+                        if !app.pending_approvals.is_empty() =>
+                    {
                         app.pending_approvals.clear();
                         app.tool_state = ToolState::Running("cargo test".into());
                     }
-                    (crossterm::event::KeyCode::Char('n'), _) if !app.pending_approvals.is_empty() => {
+                    (crossterm::event::KeyCode::Char('n'), _)
+                        if !app.pending_approvals.is_empty() =>
+                    {
                         app.pending_approvals.clear();
                         app.transcript.push(TranscriptLine::Stripped {
                             tool_name: "shell".into(),
@@ -176,7 +208,9 @@ fn main() -> io::Result<()> {
             }
         }
         tick += 1;
-        if tick > 170 { break; } // ~14s total
+        if tick > 170 {
+            break;
+        } // ~14s total
     }
     ratatui::restore();
     Ok(())

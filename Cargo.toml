@@ -24,6 +24,7 @@ members = [
   "crates/hud",
   "crates/hud-tui",
   "crates/cli",
+  "crates/web",
   "crates/orbit-core",
   "crates/orbit-api",
   "crates/orbit-ledger",
@@ -74,7 +75,7 @@ webpki-roots = "0.26"
 rustls-native-certs = "0.8"
 async-trait = "0.1"
 futures = "0.3"
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tokio-rustls = "0.26"
 rcgen = "0.13"
 

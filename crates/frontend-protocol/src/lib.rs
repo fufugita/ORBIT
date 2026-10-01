@@ -207,7 +207,8 @@ mod tests {
             }],
         };
         let ev = FrontendEvent::WorkspaceUpdate(ws.clone());
-        let back: FrontendEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        let back: FrontendEvent =
+            serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         assert_eq!(back, FrontendEvent::WorkspaceUpdate(ws));
     }
 }

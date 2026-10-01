@@ -173,7 +173,7 @@ pub fn execute_call(
     home: &Path,
     session_id: &str,
     decision_id: &str,
-    call: &super::PendingToolCall,
+    call: &crate::PendingToolCall,
     auto_tools: bool,
     interactive: bool,
     approval: &mut dyn ApprovalChannel,
@@ -283,7 +283,14 @@ pub fn execute_call(
         let output = tool_error(reason);
         // D9: a denial is not an error — audits must be able to tell an
         // operator refusal apart from a tool that ran and failed.
-        record_result(&mut writer, session_id, decision_id, call, "denied", &output)?;
+        record_result(
+            &mut writer,
+            session_id,
+            decision_id,
+            call,
+            "denied",
+            &output,
+        )?;
         return Ok(output);
     }
 
@@ -322,7 +329,7 @@ pub fn execute_call(
 }
 
 /// Display-safe summary of a tool call (name + argument keys only).
-fn safe_call_summary(call: &super::PendingToolCall) -> String {
+fn safe_call_summary(call: &crate::PendingToolCall) -> String {
     let args = crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
     crate::tools::safe_call_summary(&call.name, &args)
 }
@@ -331,7 +338,7 @@ fn record_result(
     writer: &mut LedgerWriter,
     session_id: &str,
     decision_id: &str,
-    call: &super::PendingToolCall,
+    call: &crate::PendingToolCall,
     status: &str,
     output: &str,
 ) -> Result<(), String> {
@@ -357,8 +364,8 @@ fn tool_error(msg: &str) -> String {
 mod tests {
     use super::*;
 
-    fn make_call(name: &str, args: &[u8]) -> super::super::PendingToolCall {
-        super::super::PendingToolCall {
+    fn make_call(name: &str, args: &[u8]) -> crate::PendingToolCall {
+        crate::PendingToolCall {
             index: 0,
             id: "call-1".into(),
             name: name.into(),

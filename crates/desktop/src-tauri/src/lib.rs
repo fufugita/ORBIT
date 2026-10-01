@@ -7,8 +7,8 @@
 //! crate is the single vocabulary — no ad-hoc payloads.
 
 use orbit_frontend_protocol::{FrontendAction, FrontendEvent};
-use tauri::{AppHandle, Emitter, State};
 use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, State};
 
 /// The desktop app's harness state — the same shapes the TUI keeps,
 /// driven by the same protocol events.

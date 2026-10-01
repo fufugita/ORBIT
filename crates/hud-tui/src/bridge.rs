@@ -284,10 +284,12 @@ impl CotStripper {
                 continue;
             }
             let tail = &hay[hay.len() - i..];
-            if COT_TAGS
-                .iter()
-                .any(|t| format!("<{t}>").to_lowercase().starts_with(&tail.to_lowercase()) && tail.starts_with('<'))
-            {
+            if COT_TAGS.iter().any(|t| {
+                format!("<{t}>")
+                    .to_lowercase()
+                    .starts_with(&tail.to_lowercase())
+                    && tail.starts_with('<')
+            }) {
                 hold = tail.to_string();
                 break;
             }
@@ -580,7 +582,11 @@ mod tests {
     #[test]
     fn emit_text_empty_after_strip_sends_nothing() {
         let (bus, sender) = Bus::new();
-        emit_text(&mut CotStripper::new(), &sender, b"<reasoning>all cot</reasoning>");
+        emit_text(
+            &mut CotStripper::new(),
+            &sender,
+            b"<reasoning>all cot</reasoning>",
+        );
         let msgs = drain(&bus);
         assert!(msgs.is_empty());
     }
@@ -639,4 +645,3 @@ mod tests {
         }
     }
 }
-

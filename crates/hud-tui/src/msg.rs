@@ -82,9 +82,7 @@ pub enum Msg {
     CostUpdated(u64),
     /// The bridge rejected a text chunk (D7) — never renders the text.
     /// `kind` names the gate that rejected it for the chip label.
-    Redacted {
-        kind: crate::state::RedactionKind,
-    },
+    Redacted { kind: crate::state::RedactionKind },
     /// Initialize status-bar identity before the first render.
     Identity {
         model: String,

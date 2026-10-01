@@ -51,11 +51,16 @@ fn idle_app() -> App {
     app.total_input_tokens = 1234;
     app.total_output_tokens = 567;
     app.total_cost_microcents = 2500;
-    app.transcript
-        .push(TranscriptLine::User { text: "What is 2*(3+4)?".into(), time: None });
-    app.transcript.push(TranscriptLine::Assistant { text: (
-        "Let me compute that.\n## Result\nThe answer is **14**.\n- computed via `calculator`"
-            .into()), time: None });
+    app.transcript.push(TranscriptLine::User {
+        text: "What is 2*(3+4)?".into(),
+        time: None,
+    });
+    app.transcript.push(TranscriptLine::Assistant {
+        text:
+            ("Let me compute that.\n## Result\nThe answer is **14**.\n- computed via `calculator`"
+                .into()),
+        time: None,
+    });
     app
 }
 
@@ -204,17 +209,33 @@ fn preview_dump() {
         f.activity = act_activity_fixture();
         f.focus = focus;
         let buf = render_buf(&f, &design(), 150, 44);
-        std::fs::write(&format!("/tmp/preview-focus-{name}.txt"), buf_text(&buf)).unwrap();
+        std::fs::write(format!("/tmp/preview-focus-{name}.txt"), buf_text(&buf)).unwrap();
     }
 }
 
 /// Activity rows shared by the isolation preview frames.
 fn act_activity_fixture() -> Vec<ActivityRow> {
     vec![
-        ActivityRow { time: "14:04:39".into(), kind: "model", text: "glm-5.2 via local".into() },
-        ActivityRow { time: "14:04:52".into(), kind: "tool",  text: "shell · ok".into() },
-        ActivityRow { time: "14:04:58".into(), kind: "grant", text: "shell · once · you".into() },
-        ActivityRow { time: "14:05:01".into(), kind: "error", text: "E0408".into() },
+        ActivityRow {
+            time: "14:04:39".into(),
+            kind: "model",
+            text: "glm-5.2 via local".into(),
+        },
+        ActivityRow {
+            time: "14:04:52".into(),
+            kind: "tool",
+            text: "shell · ok".into(),
+        },
+        ActivityRow {
+            time: "14:04:58".into(),
+            kind: "grant",
+            text: "shell · once · you".into(),
+        },
+        ActivityRow {
+            time: "14:05:01".into(),
+            kind: "error",
+            text: "E0408".into(),
+        },
     ]
 }
 
@@ -251,7 +272,10 @@ fn golden_idle_narrow_80x30() {
     // Level 2 keeps the connection glyph but drops the word.
     assert!(text.contains("●"), "connection glyph");
     // The box: corners on row 0 and the last body row.
-    assert!(text.lines().next().unwrap().starts_with("╭ Conversation"), "top border");
+    assert!(
+        text.lines().next().unwrap().starts_with("╭ Conversation"),
+        "top border"
+    );
 }
 
 #[test]
@@ -296,7 +320,10 @@ fn golden_activity_tab_replaces_sessions_rail() {
     assert!(text.contains("shell · …"), "tool event text (truncated)");
     assert!(text.contains("E0408"), "error event text");
     // The sessions list is NOT rendered while the Activity tab is open.
-    assert!(!text.contains("Approval surface polish"), "sessions rows hidden");
+    assert!(
+        !text.contains("Approval surface polish"),
+        "sessions rows hidden"
+    );
 }
 
 /// Empty activity: one faint placeholder line, not a blank rail.
@@ -517,7 +544,7 @@ fn golden_workspace_pane() {
     // Task rows + sub-lines + evidence.
     assert!(text.contains("Fix refresh"), "task title");
     assert!(text.contains("reading crates"), "active sub-line");
-    
+
     // Findings + source.
     assert!(text.contains("fresh genesis"), "finding title");
     assert!(text.contains("restore.rs"), "finding source");
@@ -819,11 +846,9 @@ fn invariant_pane_isolation_single_accent() {
                 continue;
             }
             // The top border row of the pane: every border cell's fg.
-            let top: Vec<_> = (r.x..r.x + r.width)
-                .map(|x| buf[(x, r.y)].fg)
-                .collect();
-            let is_magenta = top.iter().any(|c| *c == magenta);
-            let is_muted = top.iter().any(|c| *c == muted);
+            let top: Vec<_> = (r.x..r.x + r.width).map(|x| buf[(x, r.y)].fg).collect();
+            let is_magenta = top.contains(&magenta);
+            let is_muted = top.contains(&muted);
             let expected_focused = match focus {
                 Focus::Left => i == 0,
                 Focus::Center => i == 1,
@@ -836,7 +861,10 @@ fn invariant_pane_isolation_single_accent() {
             );
             // Unfocused panes draw their border in the muted rule colour.
             if !expected_focused {
-                assert!(is_muted, "pane {i} border should be muted for focus {focus:?}");
+                assert!(
+                    is_muted,
+                    "pane {i} border should be muted for focus {focus:?}"
+                );
             }
             if is_magenta {
                 accented += 1;

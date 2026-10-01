@@ -192,36 +192,10 @@ impl App {
     /// own lines (a full impl would cache them at render time).
     pub fn pane_lines(&self, pane: Focus) -> Vec<String> {
         match pane {
-            Focus::Center => self
-                .transcript
-                .iter()
-                .map(|l| match l {
-                    crate::state::TranscriptLine::User { text: t, .. }
-                    | crate::state::TranscriptLine::Assistant { text: t, .. }
-                    | crate::state::TranscriptLine::System(t) => t.clone(),
-                    // D7: the chip line, as plain words.
-                    crate::state::TranscriptLine::Redacted(kind) => {
-                        format!("[blocked: {}]", kind.label())
-                    }
-                    crate::state::TranscriptLine::Evidence { checks, .. } => {
-                        format!("[verified] {checks}")
-                    }
-                    crate::state::TranscriptLine::Sources(srcs) => srcs
-                        .iter()
-                        .map(|(i, p)| format!("[{i}] {p}"))
-                        .collect::<Vec<_>>()
-                        .join("   "),
-                    crate::state::TranscriptLine::Stripped {
-                        tool_name, summary, ..
-                    } => {
-                        if summary.is_empty() {
-                            format!("[tool] {tool_name}")
-                        } else {
-                            format!("[tool] {tool_name} {summary}")
-                        }
-                    }
-                })
-                .collect(),
+            // §6.9: the Center pane's extractable lines are the RENDERED
+            // rows (wrapped + padded) — the same rows the selection
+            // coordinates index. Recorded by the renderer each frame.
+            Focus::Center => self.rendered_center_lines.borrow().clone(),
             _ => Vec::new(),
         }
     }
@@ -417,6 +391,9 @@ pub struct App {
     /// Last-rendered pane rects (screen coords) — the mouse hit-test
     /// boundary. Updated by the renderer each frame.
     pub pane_rects: PaneRects,
+    /// The Center pane's lines as last rendered (wrapped + padded), so
+    /// selection extract() uses the same rows the operator sees (§6.9).
+    pub rendered_center_lines: std::cell::RefCell<Vec<String>>,
     /// The active per-pane text selection (None = no selection).
     pub selection: Option<crate::selection::Selection>,
     /// A pending OSC 52 clipboard write — the terminal loop emits it once
@@ -702,6 +679,7 @@ impl App {
             input_mode: InputMode::Insert,
             zoomed_pane: None,
             pane_rects: PaneRects::default(),
+            rendered_center_lines: std::cell::RefCell::new(Vec::new()),
             selection: None,
             osc52_pending: None,
             last_status: String::new(),
@@ -900,8 +878,16 @@ impl App {
                 self.dirty.set(DirtyFlags::TRANSCRIPT);
             }
             Msg::Status(text) => {
-                self.last_status = text;
-                self.dirty.set(DirtyFlags::STATUS);
+                self.last_status = text.clone();
+                // §6.12: status lines ride the toast (3 s or next keypress).
+                // The §8 pane rewrite removed the old status strip, so this
+                // is the only visible surface for worker status messages.
+                self.toast = Some(Toast {
+                    text,
+                    kind: ToastKind::Neutral,
+                });
+                self.toast_emitted_at = Some(self.tick_count);
+                self.dirty.set(DirtyFlags::STATUS | DirtyFlags::LAYOUT);
             }
             Msg::ResponseFinished {
                 output,
@@ -919,8 +905,10 @@ impl App {
                 let has_in_flight = !self.in_flight.is_empty();
                 let has_output = !output.is_empty();
                 if has_in_flight {
-                    self.transcript
-                        .push(TranscriptLine::Assistant { text: self.in_flight.clone(), time: self.now_hhmm() });
+                    self.transcript.push(TranscriptLine::Assistant {
+                        text: self.in_flight.clone(),
+                        time: self.now_hhmm(),
+                    });
                     self.in_flight.clear();
                     // The settled line replaces the live one in place — same
                     // cells, different gutter color. The normal diff emits
@@ -928,7 +916,10 @@ impl App {
                     // caused a visible whole-screen flash on every turn.
                     self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::LAYOUT);
                 } else if has_output {
-                    self.transcript.push(TranscriptLine::Assistant { text: output, time: self.now_hhmm() });
+                    self.transcript.push(TranscriptLine::Assistant {
+                        text: output,
+                        time: self.now_hhmm(),
+                    });
                 }
                 self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
                 self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
@@ -990,7 +981,10 @@ impl App {
                 });
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
-            Msg::ToolCallFinished { name, outcome: outcome_of_call } => {
+            Msg::ToolCallFinished {
+                name,
+                outcome: outcome_of_call,
+            } => {
                 // Dismiss the FIRST pending approval that was resolved. The
                 // worker sends ApprovalRequested (with a real call_id) for
                 // each tool call, and handle_key resolves that exact call_id.
@@ -1027,10 +1021,7 @@ impl App {
                     ToolOutcome::Denied => "denied",
                     ToolOutcome::Blocked => "blocked",
                 };
-                self.push_activity(
-                    "tool",
-                    format!("{name} · {verdict}"),
-                );
+                self.push_activity("tool", format!("{name} · {verdict}"));
                 // Note: we never render model-supplied rationale; only status.
                 self.last_status = match outcome_of_call {
                     ToolOutcome::Ok => format!("tool {name}: ok"),
@@ -1064,7 +1055,10 @@ impl App {
                     // flag from a turn that raced its own finish.)
                     self.cancel_requested = false;
                     self.last_prompt = Some(text.clone());
-                    self.transcript.push(TranscriptLine::User { text, time: self.now_hhmm() });
+                    self.transcript.push(TranscriptLine::User {
+                        text,
+                        time: self.now_hhmm(),
+                    });
                     self.in_flight.clear();
                     self.tool_state = ToolState::Streaming;
                     self.turn_in_flight = true;
@@ -1341,10 +1335,7 @@ impl App {
                 self.model_priced = priced;
                 self.session_id = session_id;
                 // Activity `model` row (§9.16): `{model} via {provider}`.
-                self.push_activity(
-                    "model",
-                    format!("{} via {}", self.model, self.provider),
-                );
+                self.push_activity("model", format!("{} via {}", self.model, self.provider));
                 self.dirty
                     .set(DirtyFlags::SESSION_LIST | DirtyFlags::STATUS);
             }
@@ -2044,7 +2035,10 @@ mod tests {
     #[test]
     fn transcript_grows_on_user_and_assistant() {
         let mut app = App::new();
-        app.transcript.push(TranscriptLine::User { text: "hi".into(), time: None });
+        app.transcript.push(TranscriptLine::User {
+            text: "hi".into(),
+            time: None,
+        });
         app.reduce(Msg::TextDelta("hello!".into()));
         // Flush coalescer manually (bypass timing).
         if let Some(text) = app.coalescer.flush(app.tick_count) {
@@ -2058,7 +2052,10 @@ mod tests {
         });
         assert_eq!(app.transcript.len(), 2);
         assert!(matches!(app.transcript[0], TranscriptLine::User { .. }));
-        assert!(matches!(app.transcript[1], TranscriptLine::Assistant { .. }));
+        assert!(matches!(
+            app.transcript[1],
+            TranscriptLine::Assistant { .. }
+        ));
     }
 
     #[test]
@@ -2210,7 +2207,15 @@ mod tests {
             other => panic!("expected Redacted, got {other:?}"),
         }
         // The chip's plain rendering names the gate, never the text.
-        assert_eq!(app.pane_lines(Focus::Center), vec!["[blocked: credential]"]);
+        // (pane_lines now returns the RENDERED rows — a render-time cache —
+        // so assert on the transcript entry's plain form directly.)
+        let plain = match &app.transcript[0] {
+            TranscriptLine::Redacted(kind) => {
+                format!("[blocked: {}]", kind.label())
+            }
+            other => panic!("expected Redacted, got {other:?}"),
+        };
+        assert_eq!(plain, "[blocked: credential]");
     }
 
     // ── D18: unpriced models show cost n/a ─────────────────────────────
@@ -2230,7 +2235,7 @@ mod tests {
 
     #[test]
     fn identity_priced_default_true() {
-        let mut app = App::default();
+        let app = App::default();
         assert!(app.model_priced, "default assumes priced until told");
     }
 }

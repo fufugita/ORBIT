@@ -30,11 +30,12 @@ pub mod unicode;
 pub mod worker;
 
 pub use approval::{ApprovalRegistry, ApprovalResponse};
-pub use state::RedactionKind;
 pub use bridge::{
     emit_cost, emit_error, emit_response_finished, emit_status, emit_text, emit_tool_finished,
-    emit_tool_started, emit_turn_cost, emit_workspace, safe_text, strip_cot, CotStripper,
+    emit_tool_started, emit_turn_cost, emit_workspace, safe_text, sanitize_glyphs, strip_cot,
+    CotStripper,
 };
+pub use state::RedactionKind;
 pub use worker::{CommandSink, WorkerCommand, WorkerCtx, WorkerSpawner};
 
 use crossterm::event::{self, Event, KeyEvent};
@@ -374,8 +375,10 @@ fn event_loop(
                         cost_microcents,
                     });
                     if let Some(next) = app.take_next_queued() {
-                        app.transcript
-                            .push(crate::state::TranscriptLine::User { text: next.clone(), time: None });
+                        app.transcript.push(crate::state::TranscriptLine::User {
+                            text: next.clone(),
+                            time: None,
+                        });
                         let _ = command_sink.send(WorkerCommand::Prompt(next));
                     }
                     continue;
@@ -383,8 +386,10 @@ fn event_loop(
                 Msg::BackendError(err) => {
                     app.reduce(Msg::BackendError(err));
                     if let Some(next) = app.take_next_queued() {
-                        app.transcript
-                            .push(crate::state::TranscriptLine::User { text: next.clone(), time: None });
+                        app.transcript.push(crate::state::TranscriptLine::User {
+                            text: next.clone(),
+                            time: None,
+                        });
                         let _ = command_sink.send(WorkerCommand::Prompt(next));
                     }
                     continue;
@@ -454,9 +459,15 @@ fn event_loop(
 
         if event::poll(timeout).map_err(|e| format!("poll: {e}"))? {
             match event::read().map_err(|e| format!("read: {e}"))? {
-                Event::Key(key) => {
-                    handle_key(key, sender, &mut composer, key_parser, app, approvals, command_sink)
-                }
+                Event::Key(key) => handle_key(
+                    key,
+                    sender,
+                    &mut composer,
+                    key_parser,
+                    app,
+                    approvals,
+                    command_sink,
+                ),
                 Event::Paste(text) => {
                     // D12: bracketed paste — the whole block lands in the
                     // composer as one edit. Newlines are preserved (the
@@ -469,12 +480,7 @@ fn event_loop(
                     {
                         let clean: String = text
                             .chars()
-                            .filter(|c| {
-                                !c.is_control()
-                                    || *c == '\n'
-                                    || *c == '\r'
-                                    || *c == '\t'
-                            })
+                            .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
                             .collect();
                         composer.push_block(&clean);
                         sender.send(Msg::ComposerChanged);
@@ -597,7 +603,8 @@ impl Composer {
     /// to LF so pasted Windows text doesn't render stray glyphs.
     pub fn push_block(&mut self, block: &str) {
         if !block.is_empty() {
-            self.text.push_str(&block.replace("\r\n", "\n").replace('\r', "\n"));
+            self.text
+                .push_str(&block.replace("\r\n", "\n").replace('\r', "\n"));
         }
     }
     pub fn backspace_word(&mut self) {
@@ -766,7 +773,8 @@ fn handle_key(
                     "denied {denied} pending approval(s)"
                 )));
             }
-        } else if app.turn_in_flight && app.tool_state != crate::state::ToolState::AwaitingApproval {
+        } else if app.turn_in_flight && app.tool_state != crate::state::ToolState::AwaitingApproval
+        {
             sender.send(Msg::CancelTurn);
         } else {
             sender.send(Msg::CtrlC);

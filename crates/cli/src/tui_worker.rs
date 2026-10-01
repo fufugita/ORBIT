@@ -150,7 +150,13 @@ fn worker_main(
                 // completed, was cancelled by the operator, or errored. The
                 // reducer stamps a "cancelled" note when cancel_requested was
                 // set.
-                orbit_hud_tui::emit_response_finished(&ctx.sender, "", cum_input, cum_output, cum_cost);
+                orbit_hud_tui::emit_response_finished(
+                    &ctx.sender,
+                    "",
+                    cum_input,
+                    cum_output,
+                    cum_cost,
+                );
                 // D9 (§13.5 rule 5): save with CUMULATIVE totals — the
                 // resumed baseline plus every turn this run — so a
                 // save/resume/save cycle accumulates instead of
@@ -167,7 +173,10 @@ fn worker_main(
                     cum_cost,
                 );
                 if let Err(e) = crate::sessions::save_session(&config.home, &sf) {
-                    orbit_hud_tui::emit_error(&ctx.sender, &format!("warning: session not saved: {e}"));
+                    orbit_hud_tui::emit_error(
+                        &ctx.sender,
+                        &format!("warning: session not saved: {e}"),
+                    );
                 }
             }
             WorkerCommand::SetModel(model) => {
@@ -265,7 +274,10 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
     msgs.iter()
         .filter_map(|msg| {
             match msg.role {
-                ChatRole::User => Some(TranscriptLine::User { text: msg.content.clone(), time: None }),
+                ChatRole::User => Some(TranscriptLine::User {
+                    text: msg.content.clone(),
+                    time: None,
+                }),
                 ChatRole::Assistant => {
                     if let Some(calls) = &msg.tool_calls {
                         // Tool-calling round: emit one Stripped line per tool call.
@@ -294,7 +306,10 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                             })
                         }
                     } else if !msg.content.is_empty() {
-                        Some(TranscriptLine::Assistant { text: msg.content.clone(), time: None })
+                        Some(TranscriptLine::Assistant {
+                            text: msg.content.clone(),
+                            time: None,
+                        })
                     } else {
                         None
                     }
@@ -424,8 +439,10 @@ pub fn run_tui_turn(
     let mut turn_ok = false;
     // The workspace rail tracks the turn's phases (§6.10):
     // 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
-    let mut ws = orbit_hud_tui::state::Workspace::default();
-    ws.phase_index = 0;
+    let mut ws = orbit_hud_tui::state::Workspace {
+        phase_index: 0,
+        ..Default::default()
+    };
     orbit_hud_tui::emit_workspace(sender, ws.clone());
     for round in 0..8u32 {
         let outcome = crate::run_turn(
