@@ -159,7 +159,7 @@ sdk/
   python           Python SDK (parity)
   wit              WIT boundary shims
 conformance/       cross-language IR conformance corpus
-migrator/          Claude Workflow → ORBIT migration
+migrator/          legacy-workflow → ORBIT migration
 spec/              machine-readable error registry + traceability
 evidence/          release evidence bundle (v0.1)
 ```
@@ -227,7 +227,7 @@ CC0-1.0; anything else fails the check.
 ├── crates/            Rust workspace (22 crates)
 ├── sdk/               TypeScript + Python SDKs, WIT shims
 ├── conformance/       cross-language IR conformance corpus
-├── migrator/          Claude Workflow → ORBIT migration
+├── migrator/          legacy-workflow → ORBIT migration
 ├── spec/              error registry + traceability
 ├── evidence/          release evidence bundle
 ├── deploy/            mock provider deployment
