@@ -70,6 +70,7 @@ pub const COMMANDS: &[&str] = &[
     "restore",
     "version",
     "chat",
+    "web",
 ];
 
 /// v0.2-reserved subcommands (CLI-26: must not be silently added in v0.1).

@@ -93,7 +93,8 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "replay --dry  verify + emit a no-dispatch replay plan",
                 "export --to   encrypt an age bundle",
                 "restore       restore into a fresh namespace",
-                "version       release evidence (claims + hashes)"
+                "version       release evidence (claims + hashes)",
+                "web           start the browser harness (orbit-web bridge)"
             ]
         })),
         other => Err(("ORBIT-E1101", format!("unsupported command {other}"))),
