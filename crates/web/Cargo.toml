@@ -17,6 +17,8 @@ path = "src/lib.rs"
 
 [dependencies]
 orbit-cli = { path = "../cli" }
+orbit-engine = { path = "../engine" }
+orbit-frontend-protocol = { path = "../frontend-protocol" }
 orbit-gateway = { path = "../gateway" }
 orbit-adapter = { path = "../adapter" }
 orbit-provider-http = { path = "../provider-http" }
@@ -29,6 +31,7 @@ serde_json.workspace = true
 futures.workspace = true
 rust-embed.workspace = true
 mime_guess = "2"
+ulid = "1"
 
 [[bin]]
 name = "orbit-web"

@@ -2443,7 +2443,9 @@ dependencies = [
  "libc",
  "orbit-adapter",
  "orbit-egress",
+ "orbit-engine",
  "orbit-export",
+ "orbit-frontend-protocol",
  "orbit-gateway",
  "orbit-hud",
  "orbit-hud-tui",
@@ -2512,6 +2514,26 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "orbit-engine"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "orbit-adapter",
+ "orbit-egress",
+ "orbit-frontend-protocol",
+ "orbit-gateway",
+ "orbit-ledger",
+ "orbit-mock-provider",
+ "orbit-provider-http",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "ulid",
+ "url",
 ]
 
 [[package]]
@@ -2804,6 +2826,8 @@ dependencies = [
  "mime_guess",
  "orbit-adapter",
  "orbit-cli",
+ "orbit-engine",
+ "orbit-frontend-protocol",
  "orbit-gateway",
  "orbit-hud",
  "orbit-hud-tui",
@@ -2813,6 +2837,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower 0.4.13",
+ "ulid",
 ]
 
 [[package]]
@@ -4237,7 +4262,9 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

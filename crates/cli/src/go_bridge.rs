@@ -10,7 +10,7 @@
 //! Go → Rust (actions): `prompt`, `cancel`, `approve`, `quit`
 
 use crate::tui_worker::TuiTurnConfig;
-use orbit_adapter::types::{ChatMessage, ChatRole, ProviderEventKind, ProviderStreamEvent};
+use orbit_adapter::types::ChatMessage;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -377,126 +377,185 @@ fn run_protocol_turn(
     action_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<serde_json::Value>>>,
     cancel: &orbit_provider_http::CancelToken,
 ) -> Result<(bool, u64, u64, u64, String), String> {
-    let mut input_tokens = 0u64;
-    let mut output_tokens = 0u64;
-    let mut cost = 0u64;
     let mut final_output = String::new();
-
-    let mut observer = |ev: &ProviderStreamEvent| {
-        if let ProviderEventKind::TextDelta { bytes } = &ev.event {
-            let text = String::from_utf8_lossy(bytes).into_owned();
-            final_output.push_str(&text);
-            emit(
-                stream,
-                &serde_json::json!({
-                    "type": "delta",
-                    "text": text,
-                }),
-            );
-        }
-    };
 
     let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
     let provider = cfg.provider_for_model(&config.model);
     let pricing = cfg.pricing_for_model(&config.model);
     let provider_id = provider
         .map(|p| p.name.as_str())
-        .unwrap_or(config.provider_id.as_str());
-    let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&config.gate);
+        .unwrap_or(config.provider_id.as_str())
+        .to_string();
+    let resolved_gate = provider
+        .map(|p| p.url.as_str())
+        .unwrap_or(config.gate.as_str())
+        .to_string();
     let credential_env = provider.and_then(|p| p.env.as_deref());
 
-    transcript.push(ChatMessage {
-        role: ChatRole::User,
-        content: prompt.to_string(),
-        tool_calls: None,
-        tool_call_id: None,
-        tool_result: None,
-    });
+    // Phase 2: the loop is the ENGINE's — the Go bridge supplies only
+    // the event adapter (JSON lines to the Go child) and the tool
+    // executor (GoApprovalChannel). The old 8-round copy is gone.
+    let turn_config = crate::engine_turn_config(
+        &config.home,
+        &provider_id,
+        &resolved_gate,
+        &config.model,
+        credential_env,
+        pricing,
+    );
 
-    let mut turn_ok = false;
-    for round in 0..8u32 {
-        let outcome = crate::run_turn(
-            &config.home,
-            provider_id,
-            resolved_gate,
-            &config.model,
-            credential_env,
-            pricing,
-            prompt,
-            Some(transcript.clone()),
-            Some(&mut observer),
-            cancel.clone(),
-        );
-        let o = match outcome {
-            Ok(o) => o,
-            Err((code, msg)) => {
+    let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
+        use orbit_frontend_protocol::FrontendEvent as E;
+        match ev {
+            E::TextDelta { text } => {
+                final_output.push_str(&text);
                 emit(
                     stream,
-                    &serde_json::json!({ "type": "error", "message": format!("{code}: {msg}") }),
+                    &serde_json::json!({
+                        "type": "delta",
+                        "text": text,
+                    }),
                 );
-                return Ok((false, input_tokens, output_tokens, cost, final_output));
             }
-        };
-        input_tokens += o.input_tokens;
-        output_tokens += o.output_tokens;
-        cost += o.cost_microcents;
-        emit(
-            stream,
-            &serde_json::json!({
-                "type": "cost",
-                "microcents": cost,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-            }),
-        );
-
-        if o.tool_calls.is_empty() {
-            transcript.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: o.output.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-                tool_result: None,
-            });
-            turn_ok = true;
-            break;
+            E::CostUpdated { total_microcents } => {
+                emit(
+                    stream,
+                    &serde_json::json!({
+                        "type": "cost",
+                        "microcents": total_microcents,
+                    }),
+                );
+            }
+            E::ToolStarted { name, summary } => {
+                emit(
+                    stream,
+                    &serde_json::json!({
+                        "type": "tool_call_started",
+                        "name": name,
+                        "summary": summary,
+                    }),
+                );
+            }
+            E::OutputTruncated { .. } => {
+                emit(
+                    stream,
+                    &serde_json::json!({ "type": "error", "message": "reply cut off by the output-token limit" }),
+                );
+            }
+            E::Retrying {
+                attempt,
+                retry_in_ms,
+                reason,
+            } => {
+                emit(
+                    stream,
+                    &serde_json::json!({ "type": "status", "text": format!("retry {attempt} in {retry_in_ms}ms — {reason}") }),
+                );
+            }
+            E::Error { message } => {
+                emit(
+                    stream,
+                    &serde_json::json!({ "type": "error", "message": message }),
+                );
+            }
+            E::Status { text } => {
+                emit(
+                    stream,
+                    &serde_json::json!({ "type": "status", "text": text }),
+                );
+            }
+            _ => {}
         }
+    };
 
-        if o.tool_calls.len() > 16 {
-            emit(
-                stream,
-                &serde_json::json!({ "type": "error", "message": "ORBIT-E0200: too many tools" }),
-            );
-            break;
+    let mut executor = GoToolExecutor {
+        home: config.home.clone(),
+        session_id: config.session_id.clone(),
+        auto_tools: config.auto_tools,
+        stream: stream.clone(),
+        action_rx: action_rx.clone(),
+        auto_grants: crate::tool_runtime::AutoGrants::new(),
+    };
+
+    let options = orbit_engine::TurnOptions {
+        tools: crate::tools::tool_definitions(),
+        request_stem: "orbit-go".into(),
+        ..Default::default()
+    };
+
+    let report = orbit_engine::run_turn(
+        &config.home,
+        &turn_config,
+        &options,
+        prompt,
+        transcript,
+        &mut executor,
+        cancel,
+        &mut events,
+    );
+
+    match report {
+        Ok(r) => {
+            if r.ok {
+                let sf = crate::sessions::SessionFile::from_chat(
+                    &config.session_id,
+                    &config.model,
+                    &config.gate,
+                    &config.provider_id,
+                    transcript,
+                    0,
+                    r.input_tokens,
+                    r.output_tokens,
+                    r.cost_microcents,
+                );
+                if let Err(e) = crate::sessions::save_session(&config.home, &sf) {
+                    emit(
+                        stream,
+                        &serde_json::json!({ "type": "error", "message": format!("session not saved: {e}") }),
+                    );
+                }
+            }
+            Ok((
+                r.ok,
+                r.input_tokens,
+                r.output_tokens,
+                r.cost_microcents,
+                final_output,
+            ))
         }
+        Err(e) => {
+            // The engine already emitted the error via events.
+            let _ = e;
+            Ok((false, 0, 0, 0, final_output))
+        }
+    }
+}
 
-        let assistant_calls: Vec<orbit_adapter::types::ToolCallMessage> = o
-            .tool_calls
-            .iter()
-            .map(|tc| orbit_adapter::types::ToolCallMessage {
-                id: tc.id.clone(),
-                name: tc.name.clone(),
-                arguments: String::from_utf8_lossy(&tc.arguments).into_owned(),
-            })
-            .collect();
-        transcript.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: o.output.clone(),
-            tool_calls: Some(assistant_calls),
-            tool_call_id: None,
-            tool_result: None,
-        });
+/// The Go bridge's tool executor: bridges the engine's `ToolExecutor`
+/// trait to the GoApprovalChannel (JSON over the Unix socket) and
+/// per-turn grants.
+struct GoToolExecutor {
+    home: std::path::PathBuf,
+    session_id: String,
+    auto_tools: bool,
+    stream: std::sync::Arc<std::sync::Mutex<UnixStream>>,
+    action_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<serde_json::Value>>>,
+    auto_grants: crate::tool_runtime::AutoGrants,
+}
 
-        let mut approval_channel = GoApprovalChannel {
-            rx: action_rx.clone(),
-        };
-        let mut auto_grants = crate::tool_runtime::AutoGrants::new();
-        for call in &o.tool_calls {
+impl orbit_engine::ToolExecutor for GoToolExecutor {
+    fn execute(
+        &mut self,
+        calls: &[orbit_engine::PendingToolCall],
+        _round: u32,
+    ) -> Vec<orbit_engine::ToolRoundResult> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
             let args =
                 crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
             let summary = crate::tools::safe_call_summary(&call.name, &args);
             emit(
-                stream,
+                &self.stream,
                 &serde_json::json!({
                     "type": "tool_call_started",
                     "call_id": call.id,
@@ -505,21 +564,26 @@ fn run_protocol_turn(
                 }),
             );
 
-            let decision_id = format!("tool-round-{round}-{}", call.index);
+            // Per-call ULID decision ids (defect fix: the old
+            // `tool-round-{round}-{index}` ids repeated every turn).
+            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+            let mut approval_channel = GoApprovalChannel {
+                rx: self.action_rx.clone(),
+            };
             let result = crate::tool_runtime::execute_call(
-                &config.home,
-                &config.session_id,
+                &self.home,
+                &self.session_id,
                 &decision_id,
                 call,
-                config.auto_tools,
+                self.auto_tools,
                 true,
                 &mut approval_channel,
-                &mut auto_grants,
+                &mut self.auto_grants,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
             let ok = result.contains("\"ok\":true");
             emit(
-                stream,
+                &self.stream,
                 &serde_json::json!({
                     "type": "tool_call_finished",
                     "call_id": call.id,
@@ -527,40 +591,11 @@ fn run_protocol_turn(
                     "ok": ok,
                 }),
             );
-            transcript.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: result.clone(),
-                tool_calls: None,
-                tool_call_id: Some(call.id.clone()),
-                tool_result: Some(result),
+            results.push(orbit_engine::ToolRoundResult {
+                call_id: call.id.clone(),
+                content: result,
             });
         }
+        results
     }
-
-    if !turn_ok {
-        emit(
-            stream,
-            &serde_json::json!({ "type": "error", "message": "ORBIT-E0406: tool loop ended" }),
-        );
-    } else {
-        let sf = crate::sessions::SessionFile::from_chat(
-            &config.session_id,
-            &config.model,
-            &config.gate,
-            &config.provider_id,
-            transcript,
-            0,
-            input_tokens,
-            output_tokens,
-            cost,
-        );
-        if let Err(e) = crate::sessions::save_session(&config.home, &sf) {
-            emit(
-                stream,
-                &serde_json::json!({ "type": "error", "message": format!("session not saved: {e}") }),
-            );
-        }
-    }
-
-    Ok((turn_ok, input_tokens, output_tokens, cost, final_output))
 }

@@ -1,0 +1,26 @@
+[package]
+name = "orbit-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orbit-adapter = { path = "../adapter" }
+orbit-provider-http = { path = "../provider-http" }
+orbit-gateway = { path = "../gateway" }
+orbit-egress = { path = "../egress" }
+orbit-ledger = { path = "../ledger" }
+orbit-frontend-protocol = { path = "../frontend-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ulid.workspace = true
+tokio.workspace = true
+url = "2"
+
+[dev-dependencies]
+orbit-mock-provider = { path = "../mock-provider" }
+tokio = { version = "1", features = ["full"] }
+sha2.workspace = true
+hex.workspace = true

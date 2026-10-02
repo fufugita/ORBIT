@@ -7,7 +7,7 @@
 //! This is the TUI-specific counterpart to the REPL loop — the REPL's inline
 //! logic in `cmd_chat` is untouched.
 
-use orbit_adapter::types::{ChatMessage, ChatRole, ProviderEventKind, ProviderStreamEvent};
+use orbit_adapter::types::{ChatMessage, ChatRole};
 use orbit_hud_tui::bus::BusSender;
 use orbit_hud_tui::msg::Msg;
 use orbit_hud_tui::state::TranscriptLine;
@@ -764,6 +764,11 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
 /// Run one user turn against the gateway, streaming through the TUI bridge.
 /// Returns (turn_ok, input_tokens, output_tokens, cost_microcents).
 /// `cancel` is the per-turn token the TUI fires on Ctrl+C-mid-stream.
+///
+/// Phase 2: the loop is the ENGINE's (`orbit_engine::run_turn`) — this
+/// front-end supplies only the TUI event adapter (FrontendEvent → Msg)
+/// and the tool executor (approvals, grants, plan-mode denial). The
+/// old 8-round copy of the loop is gone.
 #[allow(clippy::too_many_arguments)]
 pub fn run_tui_turn(
     config: &TuiTurnConfig,
@@ -779,41 +784,29 @@ pub fn run_tui_turn(
     mods_directive: &str,
     plan_mode: bool,
 ) -> Result<(bool, u64, u64, u64, String), String> {
-    let mut input_tokens = 0u64;
-    let mut output_tokens = 0u64;
-    let mut cost = 0u64;
-
-    // Observer: map stream events to TUI messages via the bridge. The CoT
-    // stripper is owned by this closure — one per turn — so a `<think>` tag
-    // split across deltas is still caught (D6).
-    let mut cot = orbit_hud_tui::CotStripper::new();
-    let mut observer = |ev: &ProviderStreamEvent| {
-        if let ProviderEventKind::TextDelta { bytes } = &ev.event {
-            orbit_hud_tui::emit_text(&mut cot, sender, bytes);
-        }
-    };
-
     // Resolve provider / pricing from config (same as REPL).
     let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
     let provider = cfg.provider_for_model(&config.model);
     let pricing = cfg.pricing_for_model(&config.model);
     let provider_id = provider
         .map(|p| p.name.as_str())
-        .unwrap_or(config.provider_id.as_str());
-    let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&config.gate);
+        .unwrap_or(config.provider_id.as_str())
+        .to_string();
+    let resolved_gate = provider
+        .map(|p| p.url.as_str())
+        .unwrap_or(config.gate.as_str())
+        .to_string();
     let credential_env = provider.and_then(|p| p.env.as_deref());
 
-    // Build the transcript for this user turn.
-    transcript.push(ChatMessage {
-        role: ChatRole::User,
-        content: prompt.to_string(),
-        tool_calls: None,
-        tool_call_id: None,
-        tool_result: None,
-    });
+    let turn_config = crate::engine_turn_config(
+        &config.home,
+        &provider_id,
+        &resolved_gate,
+        &config.model,
+        credential_env,
+        pricing,
+    );
 
-    let mut turn_ok = false;
-    let mut final_text = String::new();
     // The workspace rail tracks the turn's phases (§6.10):
     // 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
     let mut ws = orbit_hud_tui::state::Workspace {
@@ -821,187 +814,205 @@ pub fn run_tui_turn(
         ..Default::default()
     };
     orbit_hud_tui::emit_workspace(sender, ws.clone());
-    for round in 0..8u32 {
-        // Mods directive: a System message at the FRONT of the provider
-        // transcript (never persisted to the session file — it's rebuilt
-        // from the enabled set every turn).
-        let mut wire_transcript = transcript.clone();
-        if !mods_directive.is_empty() {
-            wire_transcript.insert(
-                0,
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: mods_directive.to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    tool_result: None,
-                },
-            );
-        }
-        let outcome = crate::run_turn(
-            &config.home,
-            provider_id,
-            resolved_gate,
-            &config.model,
-            credential_env,
-            pricing,
-            prompt,
-            Some(wire_transcript),
-            Some(&mut observer),
-            cancel.clone(),
-        );
-        let o = match outcome {
-            Ok(o) => o,
-            Err((code, msg)) => {
-                orbit_hud_tui::emit_error(sender, &format!("{code}: {msg}"));
-                return Ok((false, input_tokens, output_tokens, cost, String::new()));
+
+    // Event adapter: FrontendEvent → TUI Msg. The CoT stripper is owned
+    // by this closure — one per turn — so a `<think>` tag split across
+    // deltas is still caught (D6).
+    let mut cot = orbit_hud_tui::CotStripper::new();
+    let mut first_round_seen = false;
+    let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
+        use orbit_frontend_protocol::FrontendEvent as E;
+        match ev {
+            E::TextDelta { text } => {
+                orbit_hud_tui::emit_text(&mut cot, sender, text.as_bytes());
             }
-        };
-        input_tokens += o.input_tokens;
-        output_tokens += o.output_tokens;
-        cost += o.cost_microcents;
-        // D5: report the TURN's running cost; the committed total is only
-        // touched by ResponseFinished (which carries the final number).
-        orbit_hud_tui::emit_turn_cost(sender, cost);
-        // The model is reasoning (round 0) or responding (later rounds).
-        if round == 0 {
-            ws.phase_index = 1;
-            orbit_hud_tui::emit_workspace(sender, ws.clone());
+            E::RoundStarted { round } => {
+                if round == 0 {
+                    ws.phase_index = 1; // reason
+                    orbit_hud_tui::emit_workspace(sender, ws.clone());
+                    first_round_seen = true;
+                }
+            }
+            E::ToolStarted { name, summary } => {
+                if !first_round_seen {
+                    // Engine events can arrive before the first round
+                    // completes; keep the rail honest.
+                    ws.phase_index = 2; // act
+                    orbit_hud_tui::emit_workspace(sender, ws.clone());
+                }
+                orbit_hud_tui::emit_tool_started(sender, &name, &summary);
+            }
+            E::CostUpdated { total_microcents } => {
+                // D5: report the TURN's running cost; the committed total
+                // is only touched by ResponseFinished.
+                orbit_hud_tui::emit_turn_cost(sender, total_microcents);
+            }
+            E::OutputTruncated { .. } => {
+                orbit_hud_tui::emit_status(sender, "reply cut off by the output-token limit");
+            }
+            E::Retrying {
+                attempt,
+                retry_in_ms,
+                reason,
+            } => {
+                orbit_hud_tui::emit_status(
+                    sender,
+                    &format!("retry {attempt} in {retry_in_ms}ms — {reason}"),
+                );
+            }
+            E::Error { message } => {
+                orbit_hud_tui::emit_error(sender, &message);
+            }
+            E::Status { text } => {
+                orbit_hud_tui::emit_status(sender, &text);
+            }
+            E::TurnEnded { .. } => {
+                ws.phase_index = 4; // respond
+                orbit_hud_tui::emit_workspace(sender, ws.clone());
+            }
+            _ => {}
         }
+    };
 
-        if o.tool_calls.is_empty() {
-            // Normal text terminal: the respond phase.
-            ws.phase_index = 4;
-            orbit_hud_tui::emit_workspace(sender, ws.clone());
-            transcript.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: o.output.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-                tool_result: None,
-            });
-            turn_ok = true;
-            final_text = o.output.clone();
-            break;
+    let mut executor = TuiToolExecutor {
+        home: config.home.clone(),
+        session_id: config.session_id.clone(),
+        auto_tools: config.auto_tools,
+        plan_mode,
+        sender: sender.clone(),
+        approvals: approvals.clone(),
+        auto_grants: std::mem::take(auto_grants),
+    };
+
+    let options = orbit_engine::TurnOptions {
+        tools: crate::tools::tool_definitions(),
+        system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
+        request_stem: "orbit-tui".into(),
+        ..Default::default()
+    };
+
+    let report = orbit_engine::run_turn(
+        &config.home,
+        &turn_config,
+        &options,
+        prompt,
+        transcript,
+        &mut executor,
+        cancel,
+        &mut events,
+    );
+
+    // Restore the grants into the caller's slot (the executor borrowed
+    // them for the turn).
+    *auto_grants = executor.auto_grants;
+
+    match report {
+        Ok(r) => Ok((
+            r.ok,
+            r.input_tokens,
+            r.output_tokens,
+            r.cost_microcents,
+            r.final_text,
+        )),
+        Err(e) => {
+            orbit_hud_tui::emit_error(sender, &e);
+            Ok((false, 0, 0, 0, String::new()))
         }
+    }
+}
 
-        if o.tool_calls.len() > 16 {
-            orbit_hud_tui::emit_error(
-                sender,
-                "ORBIT-E0200: provider requested more than 16 tools in one round",
-            );
-            break;
-        }
+/// The TUI's tool executor: bridges the engine's `ToolExecutor` trait
+/// to the TUI's approval channel, session grants and plan-mode denial.
+struct TuiToolExecutor {
+    home: std::path::PathBuf,
+    session_id: String,
+    auto_tools: bool,
+    plan_mode: bool,
+    sender: BusSender,
+    approvals: ApprovalRegistry,
+    auto_grants: crate::tool_runtime::AutoGrants,
+}
 
-        // Append the assistant tool-call message.
-        let assistant_calls: Vec<orbit_adapter::types::ToolCallMessage> = o
-            .tool_calls
-            .iter()
-            .map(|tc| orbit_adapter::types::ToolCallMessage {
-                id: tc.id.clone(),
-                name: tc.name.clone(),
-                arguments: String::from_utf8_lossy(&tc.arguments).into_owned(),
-            })
-            .collect();
-        transcript.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: o.output.clone(),
-            tool_calls: Some(assistant_calls),
-            tool_call_id: None,
-            tool_result: None,
-        });
-
-        // Tools are running: the act phase.
-        ws.phase_index = 2;
-        orbit_hud_tui::emit_workspace(sender, ws.clone());
+impl orbit_engine::ToolExecutor for TuiToolExecutor {
+    fn execute(
+        &mut self,
+        calls: &[orbit_engine::PendingToolCall],
+        _round: u32,
+    ) -> Vec<orbit_engine::ToolRoundResult> {
         // Plan mode: read-only tools run (the model researches while
         // planning); everything else is denied with a notice — no
         // prompt, no execution. Read-only classification is
         // backend-authoritative (tools::is_read_only).
-        if plan_mode {
-            // Split the calls: read-only tools execute normally (the
-            // model researches while planning); the rest are denied
-            // with a notice. Read-only classification is
-            // backend-authoritative (tools::is_read_only).
-            let blocked: Vec<&_> = o
-                .tool_calls
+        if self.plan_mode {
+            let blocked: Vec<&_> = calls
                 .iter()
                 .filter(|c| !crate::tools::is_read_only(&c.name))
                 .collect();
-            for call in &blocked {
-                let args = crate::tools::parse_arguments(&call.arguments)
-                    .unwrap_or(serde_json::Value::Null);
-                let summary = crate::tools::safe_call_summary(&call.name, &args);
-                orbit_hud_tui::emit_tool_started(sender, &call.name, &summary);
-                let result = r#"{"ok":false,"error":"plan mode: read-only — this tool is blocked until the plan is approved"}"#;
-                orbit_hud_tui::emit_tool_finished(
-                    sender,
-                    &call.name,
-                    orbit_hud_tui::state::ToolOutcome::Denied,
-                );
-                transcript.push(ChatMessage {
-                    role: ChatRole::Tool,
-                    content: result.to_string(),
-                    tool_calls: None,
-                    tool_call_id: Some(call.id.clone()),
-                    tool_result: Some(result.to_string()),
-                });
-            }
-            // If every call was read-only, fall through to normal
-            // execution for them; otherwise the denied results above
-            // feed the next round.
             if !blocked.is_empty() {
-                continue;
+                let mut results = Vec::with_capacity(calls.len());
+                for call in calls {
+                    if crate::tools::is_read_only(&call.name) {
+                        results.push(self.run_one(call));
+                    } else {
+                        let args = crate::tools::parse_arguments(&call.arguments)
+                            .unwrap_or(serde_json::Value::Null);
+                        let summary = crate::tools::safe_call_summary(&call.name, &args);
+                        orbit_hud_tui::emit_tool_started(&self.sender, &call.name, &summary);
+                        orbit_hud_tui::emit_tool_finished(
+                            &self.sender,
+                            &call.name,
+                            orbit_hud_tui::state::ToolOutcome::Denied,
+                        );
+                        results.push(orbit_engine::ToolRoundResult {
+                            call_id: call.id.clone(),
+                            content: r#"{"ok":false,"error":"plan mode: read-only — this tool is blocked until the plan is approved"}"#.into(),
+                        });
+                    }
+                }
+                return results;
             }
         }
-        // Execute each tool call via the TUI approval channel.
-        let mut approval_channel = TuiApprovalChannel::new(sender.clone(), approvals.clone());
-        for call in &o.tool_calls {
-            // Display-safe summary first.
-            let args =
-                crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
-            let summary = crate::tools::safe_call_summary(&call.name, &args);
-            orbit_hud_tui::emit_tool_started(sender, &call.name, &summary);
 
-            // Defect fix: the old `tool-round-{round}-{index}` id repeated every
-            // turn (tool-round-0-0 again and again), so ledger records
-            // could not be tied to their turn. Each call now gets a
-            // fresh ULID — globally unique, sortable.
-            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-            let result = crate::tool_runtime::execute_call(
-                &config.home,
-                &config.session_id,
-                &decision_id,
-                call,
-                config.auto_tools,
-                true,
-                &mut approval_channel,
-                auto_grants,
-            )
-            .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
-            // Classify the result into a ToolOutcome: a refusal must render
-            // as `⊘ denied by you`, not a red `✕ failed` (§11.5 rule 4).
-            // execute_call's denial paths return ok:false with these exact
-            // error strings (tool_runtime.rs:243-251), so match on them.
-            let outcome = classify_tool_result(&result);
-            orbit_hud_tui::emit_tool_finished(sender, &call.name, outcome);
-            transcript.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: result.clone(),
-                tool_calls: None,
-                tool_call_id: Some(call.id.clone()),
-                tool_result: Some(result),
-            });
+        let mut results = Vec::with_capacity(calls.len());
+        for c in calls {
+            results.push(self.run_one(c));
         }
-        // The next provider round receives the assistant call + tool results.
+        results
     }
+}
 
-    if !turn_ok {
-        orbit_hud_tui::emit_error(
-            sender,
-            "ORBIT-E0406: tool loop ended without a final assistant response",
-        );
+impl TuiToolExecutor {
+    fn run_one(&mut self, call: &orbit_engine::PendingToolCall) -> orbit_engine::ToolRoundResult {
+        // Display-safe summary first.
+        let args =
+            crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
+        let summary = crate::tools::safe_call_summary(&call.name, &args);
+        orbit_hud_tui::emit_tool_started(&self.sender, &call.name, &summary);
+
+        // Per-call ULID decision ids (defect fix: the old
+        // `tool-round-{round}-{index}` ids repeated every turn, so
+        // ledger records could not be tied to their turn).
+        let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+        let mut approval_channel =
+            TuiApprovalChannel::new(self.sender.clone(), self.approvals.clone());
+        let result = crate::tool_runtime::execute_call(
+            &self.home,
+            &self.session_id,
+            &decision_id,
+            call,
+            self.auto_tools,
+            true,
+            &mut approval_channel,
+            &mut self.auto_grants,
+        )
+        .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+        // Classify the result into a ToolOutcome: a refusal must render
+        // as `⊘ denied by you`, not a red `✕ failed` (§11.5 rule 4).
+        let outcome = classify_tool_result(&result);
+        orbit_hud_tui::emit_tool_finished(&self.sender, &call.name, outcome);
+        orbit_engine::ToolRoundResult {
+            call_id: call.id.clone(),
+            content: result,
+        }
     }
-
-    Ok((turn_ok, input_tokens, output_tokens, cost, final_text))
 }

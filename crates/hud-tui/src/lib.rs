@@ -940,6 +940,7 @@ pub const SLASH_NAMES: &[&str] = &[
 /// - A lone `/word` prefix completes against SLASH_COMMANDS.
 /// - Otherwise the last word is treated as a file path and completed
 ///   against the filesystem (relative to cwd).
+///
 /// Returns the full replacement text, or None when nothing matches.
 fn complete_composer(text: &str) -> Option<String> {
     let (head, tail) = match text.rfind(char::is_whitespace) {
@@ -1177,7 +1178,7 @@ fn expand_file_mentions(text: &str) -> String {
                         .and_then(|e| e.to_str())
                         .unwrap_or("");
                     let mut block = String::new();
-                    block.push_str("@");
+                    block.push('@');
                     block.push_str(&candidate);
                     block.push_str("\n```");
                     block.push_str(lang);

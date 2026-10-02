@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use orbit_cli::{config, go_bridge, run_turn, sessions, tool_runtime, tools, tui_worker};
+use orbit_cli::{config, go_bridge, sessions, tool_runtime, tools, tui_worker};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,6 +34,13 @@ fn main() {
         || (!first_is_command && args[0] != "--help" && args[0] != "-h" && args[0] != "--version");
     if args.first().map(|a| a == "web").unwrap_or(false) {
         let code = cmd_web(&args[1..]);
+        std::process::exit(code);
+    }
+    // `orbit -p "<prompt>"` — headless one-shot with tools (roadmap
+    // phase 2). Streams the engine's events as JSON lines; never asks
+    // (dontAsk default: anything no allow rule covers is denied).
+    if args.first().map(|a| a == "-p").unwrap_or(false) {
+        let code = cmd_headless(&args[1..]);
         std::process::exit(code);
     }
     if wants_chat {
@@ -648,6 +655,185 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     }))
 }
 
+/// `orbit -p "<prompt>"` — headless one-shot with tools.
+///
+/// Runs one turn through the engine and prints the event stream. With
+/// no terminal to answer a prompt, tool calls run under `dontAsk`:
+/// anything no allow rule covers is denied and reported (never a hang).
+/// `--output-format text` prints the final text only (default);
+/// `stream-json` emits each `FrontendEvent` as one JSON object per
+/// line; `json` prints the final summary object.
+///
+/// Exit codes: 0 done, 1 turn failed, 2 stopped by a permission
+/// denial, 3 hit `--max-turns`, 130 interrupted.
+fn cmd_headless(args: &[String]) -> i32 {
+    let home = orbit_home(args)
+        .or_else(|| std::env::var("ORBIT_HOME").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(".orbit"));
+    let prompt = args.first().map(String::as_str).unwrap_or("");
+    if prompt.is_empty() {
+        eprintln!("ORBIT-E1101: -p requires a prompt");
+        return 1;
+    }
+    if let Err((code, msg)) = ensure_initialized(&home) {
+        eprintln!("{code}: {msg}");
+        return 1;
+    }
+    let gate = value_after(args, "--gate")
+        .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:4001".into());
+    let model = match value_after(args, "--model").or_else(|| std::env::var("ORBIT_MODEL").ok()) {
+        Some(m) => m,
+        None => {
+            eprintln!("ORBIT-E1101: -p requires --model or ORBIT_MODEL");
+            return 1;
+        }
+    };
+    let format = value_after(args, "--output-format").unwrap_or_else(|| "text".into());
+    let max_rounds: u32 = value_after(args, "--max-turns")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(orbit_engine::DEFAULT_MAX_ROUNDS);
+    let auto_tools = false; // dontAsk: no allow rule, no execution
+
+    let cfg = match config::ProvidersConfig::load(&home) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ORBIT-E1106: {e}");
+            return 1;
+        }
+    };
+    let provider = value_after(args, "--provider")
+        .and_then(|name| cfg.provider.iter().find(|p| p.name == name))
+        .or_else(|| cfg.provider_for_model(&model));
+    let provider_id = provider
+        .map(|p| p.name.as_str())
+        .unwrap_or("configured-gateway")
+        .to_string();
+    let resolved_gate = provider
+        .map(|p| p.url.as_str())
+        .unwrap_or(gate.as_str())
+        .to_string();
+    let credential_env = provider.and_then(|p| p.env.as_deref());
+    let pricing = cfg.pricing_for_model(&model);
+
+    let turn_config = orbit_cli::engine_turn_config(
+        &home,
+        &provider_id,
+        &resolved_gate,
+        &model,
+        credential_env,
+        pricing,
+    );
+
+    let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
+    let mut executor = HeadlessToolExecutor {
+        home: home.clone(),
+        session_id: format!("p-{}", ulid::Ulid::new()),
+        auto_tools,
+    };
+
+    use std::io::Write;
+    let stream_json = format == "stream-json";
+    let json_out = format == "json";
+    let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
+        if stream_json {
+            println!("{}", serde_json::to_string(&ev).unwrap_or_default());
+            let _ = std::io::stdout().flush();
+        }
+    };
+    let options = orbit_engine::TurnOptions {
+        tools: tools::tool_definitions(),
+        max_rounds,
+        request_stem: "orbit-p".into(),
+        ..Default::default()
+    };
+    let report = orbit_engine::run_turn(
+        &home,
+        &turn_config,
+        &options,
+        prompt,
+        &mut transcript,
+        &mut executor,
+        &orbit_provider_http::CancelToken::new(),
+        &mut events,
+    );
+
+    match report {
+        Ok(r) => {
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": "orbit.cli/v1",
+                        "command": "p",
+                        "status": if r.ok { "ok" } else { "stopped" },
+                        "final_text": r.final_text,
+                        "rounds": r.rounds,
+                        "usage": {
+                            "input_tokens": r.input_tokens,
+                            "output_tokens": r.output_tokens,
+                        },
+                        "cost_microcents": r.cost_microcents,
+                    })
+                );
+            } else if !stream_json {
+                // text: the final reply only.
+                println!("{}", r.final_text);
+            }
+            if r.ok {
+                0
+            } else if r.rounds >= max_rounds {
+                3
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// The headless tool executor: `dontAsk` — every call that no allow
+/// rule covers is denied and reported, never a prompt (a headless run
+/// must never hang). Interactivity off: execute_call's non-interactive
+/// path already denies uncovered tools with a reportable result.
+struct HeadlessToolExecutor {
+    home: std::path::PathBuf,
+    session_id: String,
+    auto_tools: bool,
+}
+
+impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
+    fn execute(
+        &mut self,
+        calls: &[orbit_engine::PendingToolCall],
+        _round: u32,
+    ) -> Vec<orbit_engine::ToolRoundResult> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+            let result = tool_runtime::execute_call(
+                &self.home,
+                &self.session_id,
+                &decision_id,
+                call,
+                self.auto_tools,
+                false, // non-interactive: dontAsk semantics
+                &mut tool_runtime::StdApprovalChannel::new(false),
+                &mut tool_runtime::AutoGrants::new(),
+            )
+            .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+            results.push(orbit_engine::ToolRoundResult {
+                call_id: call.id.clone(),
+                content: result,
+            });
+        }
+        results
+    }
+}
+
 /// The interactive REPL — the "harness" (bare `orbit` or `orbit chat`).
 ///
 /// Each prompt runs the full four-gate async dispatch pipeline (same as
@@ -890,16 +1076,6 @@ fn cmd_chat(args: &[String]) -> i32 {
         // per line, words not glyphs. Same grammar as copy mode and non-TTY.
         println!("{} you: {}", hhmm_now(), trimmed);
 
-        // Build the transcript for THIS user turn. A user turn may contain
-        // multiple provider rounds when the model calls tools.
-        transcript.push(orbit_adapter::types::ChatMessage {
-            role: orbit_adapter::types::ChatRole::User,
-            content: trimmed.clone(),
-            tool_calls: None,
-            tool_call_id: None,
-            tool_result: None,
-        });
-
         // Resolve the provider for the current model (config overrides the
         // default gate). `credential_env` names the env var holding the token.
         let provider = value_after(args, "--provider")
@@ -907,18 +1083,16 @@ fn cmd_chat(args: &[String]) -> i32 {
             .or_else(|| cfg.provider_for_model(&model));
         let provider_id = provider
             .map(|p| p.name.as_str())
-            .unwrap_or("configured-gateway");
-        let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
+            .unwrap_or("configured-gateway")
+            .to_string();
+        let resolved_gate = provider
+            .map(|p| p.url.as_str())
+            .unwrap_or(gate.as_str())
+            .to_string();
         let credential_env = provider.and_then(|p| p.env.as_deref());
         let pricing = cfg.pricing_for_model(&model);
         let auto_tools = args.iter().any(|a| a == "--auto-tools");
         let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-
-        // Approval channel + session-scoped R-grants (DR-20 §2.6/§2.7).
-        // The REPL uses StdApprovalChannel (blocking stdin); the TUI injects
-        // its own TuiApprovalChannel that posts to the event bus.
-        let mut approval_channel = tool_runtime::StdApprovalChannel::new(interactive);
-        let mut auto_grants = tool_runtime::AutoGrants::new();
 
         render_hud(
             &hud,
@@ -927,151 +1101,119 @@ fn cmd_chat(args: &[String]) -> i32 {
             },
         );
 
-        let mut turn_ok = false;
-        for round in 0..8u32 {
-            // Live observer: print TextDeltas as they stream in, prefixed
-            // with the plain-grammar stamp on the first delta.
-            let mut stamped = false;
-            let mut observer = |ev: &orbit_adapter::types::ProviderStreamEvent| {
-                if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &ev.event {
-                    let s = String::from_utf8_lossy(bytes).into_owned();
+        // Phase 2: the loop is the ENGINE's — the REPL supplies only the
+        // event adapter (stdout) and the tool executor (StdApprovalChannel,
+        // session grants). The old 8-round copy of the loop is gone.
+        let turn_config = orbit_cli::engine_turn_config(
+            &home,
+            &provider_id,
+            &resolved_gate,
+            &model,
+            credential_env,
+            pricing,
+        );
+        let mut executor = ReplToolExecutor {
+            home: home.clone(),
+            session_id: session.clone(),
+            model: model.clone(),
+            provider_id: provider_id.clone(),
+            turns,
+            total_input,
+            total_output,
+            auto_tools,
+            interactive,
+            approval_channel: tool_runtime::StdApprovalChannel::new(interactive),
+            auto_grants: tool_runtime::AutoGrants::new(),
+        };
+        let mut stamped = false;
+        let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
+            use orbit_frontend_protocol::FrontendEvent as E;
+            match ev {
+                E::TextDelta { text } => {
                     if !stamped {
                         stamped = true;
                         print!("{} orbit: ", hhmm_now());
                     }
-                    print!("{s}");
+                    print!("{text}");
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
                 }
-            };
-            let outcome = run_turn(
-                &home,
-                provider_id,
-                resolved_gate,
-                &model,
-                credential_env,
-                pricing,
-                &trimmed,
-                Some(transcript.clone()),
-                Some(&mut observer),
-                orbit_provider_http::CancelToken::new(),
-            );
-            println!();
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-
-            let o = match outcome {
-                Ok(o) => o,
-                Err((code, msg)) => {
-                    eprintln!("{code}: {msg}");
-                    break;
+                E::CostUpdated { total_microcents } => {
+                    render_hud(
+                        &hud,
+                        &orbit_hud::HudEvent::CostBar {
+                            cost_microcents: total_microcents,
+                        },
+                    );
                 }
-            };
-            total_input += o.input_tokens;
-            total_output += o.output_tokens;
-            total_cost += o.cost_microcents;
-            render_hud(
-                &hud,
-                &orbit_hud::HudEvent::CostBar {
-                    cost_microcents: o.cost_microcents,
-                },
-            );
-
-            if o.tool_calls.is_empty() {
-                // Normal text terminal — append assistant reply and finish the
-                // user turn. `finish_reason` is retained in TurnOutcome for
-                // evidence/debugging but not exposed to the transcript.
-                let _finish_reason = &o.finish_reason;
-                transcript.push(orbit_adapter::types::ChatMessage {
-                    role: orbit_adapter::types::ChatRole::Assistant,
-                    content: o.output,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    tool_result: None,
-                });
-                turn_ok = true;
-                break;
+                E::OutputTruncated { .. } => {
+                    eprintln!("reply cut off by the output-token limit");
+                }
+                E::Retrying {
+                    attempt,
+                    retry_in_ms,
+                    reason,
+                } => {
+                    eprintln!("retry {attempt} in {retry_in_ms}ms — {reason}");
+                }
+                E::Error { message } => {
+                    eprintln!("{message}");
+                }
+                E::Status { text } => {
+                    eprintln!("{text}");
+                }
+                _ => {}
             }
+        };
+        let options = orbit_engine::TurnOptions {
+            tools: tools::tool_definitions(),
+            request_stem: "orbit-repl".into(),
+            ..Default::default()
+        };
+        let report = orbit_engine::run_turn(
+            &home,
+            &turn_config,
+            &options,
+            &trimmed,
+            &mut transcript,
+            &mut executor,
+            &orbit_provider_http::CancelToken::new(),
+            &mut events,
+        );
 
-            if o.tool_calls.len() > 16 {
-                eprintln!("ORBIT-E0200: provider requested more than 16 tools in one round");
-                break;
-            }
-
-            // Append the assistant tool-call message, then each tool result.
-            let assistant_calls: Vec<orbit_adapter::types::ToolCallMessage> = o
-                .tool_calls
-                .iter()
-                .map(|tc| orbit_adapter::types::ToolCallMessage {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    arguments: String::from_utf8_lossy(&tc.arguments).into_owned(),
-                })
-                .collect();
-            transcript.push(orbit_adapter::types::ChatMessage {
-                role: orbit_adapter::types::ChatRole::Assistant,
-                content: o.output,
-                tool_calls: Some(assistant_calls),
-                tool_call_id: None,
-                tool_result: None,
-            });
-
-            for call in &o.tool_calls {
-                // Update the read-only current_session snapshot before execution.
-                tools::SESSION_SNAPSHOT.with(|s| {
-                    *s.borrow_mut() = tools::SessionSnapshot {
-                        session_id: session.clone(),
-                        model: model.clone(),
-                        provider: provider_id.to_string(),
-                        turns,
-                        input_tokens: total_input,
-                        output_tokens: total_output,
-                    };
-                });
-                // Defect fix: the old `tool-round-{round}-{index}` id repeated every
-                // turn (tool-round-0-0 again and again), so ledger records
-                // could not be tied to their turn. Each call now gets a
-                // fresh ULID — globally unique, sortable.
-                let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-                let result = tool_runtime::execute_call(
-                    &home,
+        match report {
+            Ok(r) if r.ok => {
+                println!();
+                total_input += r.input_tokens;
+                total_output += r.output_tokens;
+                total_cost += r.cost_microcents;
+                turns += 1;
+                let sf = sessions::SessionFile::from_chat(
                     &session,
-                    &decision_id,
-                    call,
-                    auto_tools,
-                    interactive,
-                    &mut approval_channel,
-                    &mut auto_grants,
-                )
-                .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
-                transcript.push(orbit_adapter::types::ChatMessage {
-                    role: orbit_adapter::types::ChatRole::Tool,
-                    content: result.clone(),
-                    tool_calls: None,
-                    tool_call_id: Some(call.id.clone()),
-                    tool_result: Some(result),
-                });
+                    &model,
+                    &resolved_gate,
+                    &provider_id,
+                    &transcript,
+                    turns,
+                    total_input,
+                    total_output,
+                    total_cost,
+                );
+                if let Err(e) = sessions::save_session(&home, &sf) {
+                    eprintln!("warning: session not saved: {e}");
+                }
             }
-            // The next provider round receives the assistant call + tool results.
-        }
-
-        if !turn_ok {
-            eprintln!("ORBIT-E0406: tool loop ended without a final assistant response");
-        } else {
-            turns += 1;
-            let sf = sessions::SessionFile::from_chat(
-                &session,
-                &model,
-                resolved_gate,
-                provider_id,
-                &transcript,
-                turns,
-                total_input,
-                total_output,
-                total_cost,
-            );
-            if let Err(e) = sessions::save_session(&home, &sf) {
-                eprintln!("warning: session not saved: {e}");
+            Ok(r) => {
+                println!();
+                total_input += r.input_tokens;
+                total_output += r.output_tokens;
+                total_cost += r.cost_microcents;
+                if r.interrupted {
+                    eprintln!("turn cancelled");
+                }
+            }
+            Err(_) => {
+                // The engine already emitted the error via events.
             }
         }
     }
@@ -1093,6 +1235,66 @@ fn cmd_chat(args: &[String]) -> i32 {
         })
     );
     0
+}
+
+/// The REPL's tool executor: bridges the engine's `ToolExecutor` trait
+/// to the REPL's StdApprovalChannel (blocking stdin) and session grants.
+/// The TUI injects its own executor (TuiApprovalChannel via the bus).
+struct ReplToolExecutor {
+    home: std::path::PathBuf,
+    session_id: String,
+    model: String,
+    provider_id: String,
+    turns: u64,
+    total_input: u64,
+    total_output: u64,
+    auto_tools: bool,
+    interactive: bool,
+    approval_channel: tool_runtime::StdApprovalChannel,
+    auto_grants: tool_runtime::AutoGrants,
+}
+
+impl orbit_engine::ToolExecutor for ReplToolExecutor {
+    fn execute(
+        &mut self,
+        calls: &[orbit_engine::PendingToolCall],
+        _round: u32,
+    ) -> Vec<orbit_engine::ToolRoundResult> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            // Update the read-only current_session snapshot before execution.
+            tools::SESSION_SNAPSHOT.with(|s| {
+                *s.borrow_mut() = tools::SessionSnapshot {
+                    session_id: self.session_id.clone(),
+                    model: self.model.clone(),
+                    provider: self.provider_id.clone(),
+                    turns: self.turns,
+                    input_tokens: self.total_input,
+                    output_tokens: self.total_output,
+                };
+            });
+            // Per-call ULID decision ids (defect fix: the old
+            // `tool-round-{round}-{index}` ids repeated every turn, so
+            // ledger records could not be tied to their turn).
+            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+            let result = tool_runtime::execute_call(
+                &self.home,
+                &self.session_id,
+                &decision_id,
+                call,
+                self.auto_tools,
+                self.interactive,
+                &mut self.approval_channel,
+                &mut self.auto_grants,
+            )
+            .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+            results.push(orbit_engine::ToolRoundResult {
+                call_id: call.id.clone(),
+                content: result,
+            });
+        }
+        results
+    }
 }
 
 /// `orbit models` — list every declared model across all configured providers.

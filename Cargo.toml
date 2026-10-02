@@ -12,6 +12,7 @@ resolver = "2"
 exclude = ["fuzz", "crates/desktop/src-tauri"]
 members = [
   "crates/frontend-protocol",
+  "crates/engine",
   "crates/reactor",
   "crates/sandbox",
   "crates/context",

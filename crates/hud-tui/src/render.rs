@@ -1223,7 +1223,7 @@ fn build_welcome(
     // Readiness row: every value computed at startup by the harness
     // (trust root, ledger segment count, provider · model). Empty → no
     // row. The old fixture line ("✓ ledger · 7 records · glm-5.2")
-    /// was invented and is gone.
+    // was invented and is gone.
     if !app.readiness.is_empty() {
         let text = app
             .readiness

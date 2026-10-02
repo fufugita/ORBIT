@@ -5,7 +5,7 @@
 //! the session after every turn. Events broadcast to all SSE peers.
 
 use crate::{make_channels, router, BridgeState, WebApprovalChannel};
-use orbit_adapter::types::{ChatMessage, ChatRole, ProviderEventKind, ProviderStreamEvent};
+use orbit_adapter::types::{ChatMessage, ChatRole};
 use orbit_cli::tui_worker::TuiTurnConfig;
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -264,133 +264,153 @@ fn run_web_turn(
     cancel: &orbit_provider_http::CancelToken,
     auto_grants: &mut orbit_cli::tool_runtime::AutoGrants,
 ) -> Result<(bool, u64, u64, u64), String> {
-    let mut input_tokens = 0u64;
-    let mut output_tokens = 0u64;
-    let mut cost = 0u64;
-
-    // Same bridge as the TUI: CoT stripper (D6) + glyph sanitize + display_safe
-    // (H-3). The browser never sees raw reasoning or unsafe bytes.
-    let mut cot = orbit_hud_tui::CotStripper::new();
-    let mut observer = |ev: &ProviderStreamEvent| {
-        if let ProviderEventKind::TextDelta { bytes } = &ev.event {
-            let raw = match std::str::from_utf8(bytes) {
-                Ok(s) => s.to_string(),
-                Err(_) => {
-                    state.emit("redacted", serde_json::json!({ "kind": "invalid_utf8" }));
-                    return;
-                }
-            };
-            let stripped = cot.push(&raw);
-            let sanitized = orbit_hud_tui::sanitize_glyphs(&stripped);
-            // D7: probe, don't coerce — a rejected chunk emits the chip
-            // naming the gate, never the text.
-            if !orbit_hud_tui::safe_text_probe(&sanitized) {
-                state.emit("redacted", serde_json::json!({ "kind": "display_gate" }));
-                return;
-            }
-            state.emit("delta", serde_json::json!({ "text": sanitized }));
-        }
-    };
-
     let cfg = orbit_cli::config::ProvidersConfig::load(&config.home).unwrap_or_default();
     let provider = cfg.provider_for_model(&config.model);
     let pricing = cfg.pricing_for_model(&config.model);
     let provider_id = provider
         .map(|p| p.name.as_str())
-        .unwrap_or(config.provider_id.as_str());
-    let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&config.gate);
+        .unwrap_or(config.provider_id.as_str())
+        .to_string();
+    let resolved_gate = provider
+        .map(|p| p.url.as_str())
+        .unwrap_or(config.gate.as_str())
+        .to_string();
     let credential_env = provider.and_then(|p| p.env.as_deref());
 
-    transcript.push(ChatMessage {
-        role: ChatRole::User,
-        content: prompt.to_string(),
-        tool_calls: None,
-        tool_call_id: None,
-        tool_result: None,
-    });
+    // Phase 2: the loop is the ENGINE's — the web bridge supplies only
+    // the event adapter (SSE events, display-safe) and the tool executor
+    // (WebApprovalChannel). The old 8-round copy of the loop is gone.
+    let turn_config = orbit_cli::engine_turn_config(
+        &config.home,
+        &provider_id,
+        &resolved_gate,
+        &config.model,
+        credential_env,
+        pricing,
+    );
 
-    let mut turn_ok = false;
-    for round in 0..8u32 {
-        let outcome = orbit_cli::run_turn(
-            &config.home,
-            provider_id,
-            resolved_gate,
-            &config.model,
-            credential_env,
-            pricing,
-            prompt,
-            Some(transcript.clone()),
-            Some(&mut observer),
-            cancel.clone(),
-        );
-        let o = match outcome {
-            Ok(o) => o,
-            Err((code, msg)) => {
+    // Event adapter: FrontendEvent → SSE. Same bridge as before: CoT
+    // stripper (D6) + glyph sanitize + display_safe (H-3). The browser
+    // never sees raw reasoning or unsafe bytes.
+    let mut cot = orbit_hud_tui::CotStripper::new();
+    let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
+        use orbit_frontend_protocol::FrontendEvent as E;
+        match ev {
+            E::TextDelta { text } => {
+                let stripped = cot.push(&text);
+                let sanitized = orbit_hud_tui::sanitize_glyphs(&stripped);
+                // D7: probe, don't coerce — a rejected chunk emits the chip
+                // naming the gate, never the text.
+                if !orbit_hud_tui::safe_text_probe(&sanitized) {
+                    state.emit("redacted", serde_json::json!({ "kind": "display_gate" }));
+                    return;
+                }
+                state.emit("delta", serde_json::json!({ "text": sanitized }));
+            }
+            E::CostUpdated { total_microcents } => {
+                state.emit(
+                    "cost",
+                    serde_json::json!({
+                        "microcents": total_microcents,
+                    }),
+                );
+            }
+            E::ToolStarted { name, summary } => {
+                state.emit(
+                    "tool_call_started",
+                    serde_json::json!({
+                        "name": name,
+                        "summary": summary,
+                    }),
+                );
+            }
+            E::OutputTruncated { .. } => {
                 state.emit(
                     "error",
-                    serde_json::json!({ "message": format!("{code}: {msg}") }),
+                    serde_json::json!({ "message": "reply cut off by the output-token limit" }),
                 );
-                return Ok((false, input_tokens, output_tokens, cost));
             }
-        };
-        input_tokens += o.input_tokens;
-        output_tokens += o.output_tokens;
-        cost += o.cost_microcents;
-        state.emit(
-            "cost",
-            serde_json::json!({
-                "microcents": cost,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-            }),
-        );
-
-        if o.tool_calls.is_empty() {
-            transcript.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: o.output.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-                tool_result: None,
-            });
-            turn_ok = true;
-            break;
+            E::Retrying {
+                attempt,
+                retry_in_ms,
+                reason,
+            } => {
+                state.emit(
+                    "status",
+                    serde_json::json!({ "text": format!("retry {attempt} in {retry_in_ms}ms — {reason}") }),
+                );
+            }
+            E::Error { message } => {
+                state.emit("error", serde_json::json!({ "message": message }));
+            }
+            E::Status { text } => {
+                state.emit("status", serde_json::json!({ "text": text }));
+            }
+            _ => {}
         }
+    };
 
-        if o.tool_calls.len() > 16 {
-            state.emit(
-                "error",
-                serde_json::json!({ "message": "ORBIT-E0200: provider requested more than 16 tools in one round" }),
-            );
-            break;
+    let mut executor = WebToolExecutor {
+        home: config.home.clone(),
+        session_id: config.session_id.clone(),
+        auto_tools: config.auto_tools,
+        state: state.clone(),
+        action_rx: action_rx.clone(),
+        auto_grants: std::mem::take(auto_grants),
+    };
+
+    let options = orbit_engine::TurnOptions {
+        tools: orbit_cli::tools::tool_definitions(),
+        request_stem: "orbit-web".into(),
+        ..Default::default()
+    };
+
+    let report = orbit_engine::run_turn(
+        &config.home,
+        &turn_config,
+        &options,
+        prompt,
+        transcript,
+        &mut executor,
+        cancel,
+        &mut events,
+    );
+
+    // Restore the grants into the caller's slot.
+    *auto_grants = executor.auto_grants;
+
+    match report {
+        Ok(r) => Ok((r.ok, r.input_tokens, r.output_tokens, r.cost_microcents)),
+        Err(e) => {
+            state.emit("error", serde_json::json!({ "message": e }));
+            Ok((false, 0, 0, 0))
         }
+    }
+}
 
-        let assistant_calls: Vec<orbit_adapter::types::ToolCallMessage> = o
-            .tool_calls
-            .iter()
-            .map(|tc| orbit_adapter::types::ToolCallMessage {
-                id: tc.id.clone(),
-                name: tc.name.clone(),
-                arguments: String::from_utf8_lossy(&tc.arguments).into_owned(),
-            })
-            .collect();
-        transcript.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: o.output.clone(),
-            tool_calls: Some(assistant_calls),
-            tool_call_id: None,
-            tool_result: None,
-        });
+/// The web bridge's tool executor: bridges the engine's `ToolExecutor`
+/// trait to the WebApprovalChannel (SSE approval cards) and session grants.
+struct WebToolExecutor {
+    home: std::path::PathBuf,
+    session_id: String,
+    auto_tools: bool,
+    state: BridgeState,
+    action_rx: Arc<Mutex<mpsc::Receiver<serde_json::Value>>>,
+    auto_grants: orbit_cli::tool_runtime::AutoGrants,
+}
 
-        let mut approval_channel = WebApprovalChannel {
-            action_rx: action_rx.clone(),
-            state: state.clone(),
-        };
-        for call in &o.tool_calls {
+impl orbit_engine::ToolExecutor for WebToolExecutor {
+    fn execute(
+        &mut self,
+        calls: &[orbit_engine::PendingToolCall],
+        _round: u32,
+    ) -> Vec<orbit_engine::ToolRoundResult> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
             let args = orbit_cli::tools::parse_arguments(&call.arguments)
                 .unwrap_or(serde_json::Value::Null);
             let summary = orbit_cli::tools::safe_call_summary(&call.name, &args);
-            state.emit(
+            self.state.emit(
                 "tool_call_started",
                 serde_json::json!({
                     "call_id": call.id,
@@ -398,20 +418,26 @@ fn run_web_turn(
                     "summary": summary,
                 }),
             );
-            let decision_id = format!("tool-round-{round}-{}", call.index);
+            // Per-call ULID decision ids (defect fix: the old
+            // `tool-round-{round}-{index}` ids repeated every turn).
+            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+            let mut approval_channel = WebApprovalChannel {
+                action_rx: self.action_rx.clone(),
+                state: self.state.clone(),
+            };
             let result = orbit_cli::tool_runtime::execute_call(
-                &config.home,
-                &config.session_id,
+                &self.home,
+                &self.session_id,
                 &decision_id,
                 call,
-                config.auto_tools,
+                self.auto_tools,
                 true,
                 &mut approval_channel,
-                auto_grants,
+                &mut self.auto_grants,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
             let ok = result.contains("\"ok\":true");
-            state.emit(
+            self.state.emit(
                 "tool_call_finished",
                 serde_json::json!({
                     "call_id": call.id,
@@ -419,24 +445,13 @@ fn run_web_turn(
                     "ok": ok,
                 }),
             );
-            transcript.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: result.clone(),
-                tool_calls: None,
-                tool_call_id: Some(call.id.clone()),
-                tool_result: Some(result),
+            results.push(orbit_engine::ToolRoundResult {
+                call_id: call.id.clone(),
+                content: result,
             });
         }
+        results
     }
-
-    if !turn_ok {
-        state.emit(
-            "error",
-            serde_json::json!({ "message": "ORBIT-E0406: tool loop ended without a final assistant response" }),
-        );
-    }
-
-    Ok((turn_ok, input_tokens, output_tokens, cost))
 }
 
 /// Transcript entry for the `resume` event, curated like the TUI's

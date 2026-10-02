@@ -197,16 +197,15 @@ fn redact_line(line: &str) -> String {
         ("xoxb-", "slack token"),
         ("xoxp-", "slack token"),
     ] {
-        while let Some(pos) = line.find(prefix) {
+        // One redaction per format per line is enough.
+        if let Some(pos) = line.find(prefix) {
             let end = line[pos..]
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
                 .map(|i| pos + i)
                 .unwrap_or(line.len());
-            if end - pos < prefix.len() + 16 {
-                break; // too short to be a real token; stop scanning
+            if end - pos >= prefix.len() + 16 {
+                line = format!("{}[redacted:{}]{}", &line[..pos], what, &line[end..]);
             }
-            line = format!("{}[redacted:{}]{}", &line[..pos], what, &line[end..]);
-            break; // one redaction per format per line is enough
         }
     }
     // High-entropy assignments: KEY = <long value> → KEY = [redacted]
