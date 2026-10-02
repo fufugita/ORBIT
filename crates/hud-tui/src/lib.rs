@@ -634,6 +634,7 @@ fn event_loop(
                         }
                         composer.push_block(&clean);
                         sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
                     }
                 }
                 Event::Mouse(me) => {
@@ -759,6 +760,11 @@ impl Composer {
     pub fn text_mut(&mut self) -> &mut String {
         &mut self.text
     }
+    /// Set the draft to an exact string (hint acceptance).
+    pub fn set_text(&mut self, s: &str) {
+        self.text.clear();
+        self.text.push_str(s);
+    }
     pub fn push(&mut self, ch: char) {
         self.text.push(ch);
     }
@@ -857,7 +863,32 @@ impl Composer {
 }
 
 /// Slash-command registry for Tab completion + the palette.
-const SLASH_COMMANDS: &[&str] = &[
+/// Slash-command registry with descriptions — drives Tab completion AND
+/// the live hint dropdown (Claude Code parity).
+pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "list commands and keys"),
+    ("/model", "switch the active model"),
+    ("/models", "list models from configured providers"),
+    ("/clear", "clear the transcript view"),
+    ("/usage", "session token/cost usage"),
+    ("/sessions", "list saved sessions"),
+    ("/resume", "resume a saved session"),
+    ("/cancel", "cancel the in-flight turn"),
+    ("/history", "input history (use arrow keys)"),
+    ("/compact", "summarize + shrink the context window"),
+    ("/undo", "rewind the last exchange"),
+    ("/queue", "show/clear queued prompts"),
+    ("/status", "session/model/connection snapshot"),
+    ("/cost", "per-turn and cumulative cost"),
+    ("/export", "export transcript to markdown"),
+    ("/mods", "list installed mods (or refresh)"),
+    ("/mod", "toggle a mod by name"),
+    ("/quit", "exit ORBIT"),
+    ("/exit", "exit ORBIT"),
+];
+
+/// Plain-name list (Tab completion keeps its old shape).
+pub const SLASH_NAMES: &[&str] = &[
     "/help", "/model", "/models", "/clear", "/usage", "/sessions", "/resume", "/cancel",
     "/history", "/compact", "/undo", "/queue", "/status", "/cost", "/export", "/mods", "/mod",
     "/quit", "/exit",
@@ -875,7 +906,7 @@ fn complete_composer(text: &str) -> Option<String> {
     };
     // Slash command completion only when the command is the whole input.
     if head.is_empty() && tail.starts_with('/') {
-        let matches: Vec<&str> = SLASH_COMMANDS
+        let matches: Vec<&str> = SLASH_NAMES
             .iter()
             .copied()
             .filter(|c| c.starts_with(tail))
@@ -1227,6 +1258,7 @@ fn handle_key(
         } else if !composer.text().is_empty() {
             composer.clear_stash();
             sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
             sender.send(Msg::SystemMessage("input cleared (Esc restores)".into()));
         } else {
             sender.send(Msg::CtrlC);
@@ -1420,6 +1452,7 @@ fn handle_key(
                 if let Some(restored) = composer.take_cleared() {
                     let _ = restored;
                     sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
                     return;
                 }
                 sender.send(Msg::InputModeChanged(crate::state::InputMode::Normal));
@@ -1430,6 +1463,7 @@ fn handle_key(
             // the operator has a beat before the mode flips.
             composer.clear_stash();
             sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
             return;
         }
         KeyCode::Char('i') | KeyCode::Enter
@@ -1439,6 +1473,44 @@ fn handle_key(
             return;
         }
         _ => {}
+    }
+
+    // Live slash-hint navigation (Claude Code parity): while the hint
+    // dropdown is open, ↑/↓ move the selection and Tab/Enter accept the
+    // selected command into the composer.
+    if app.slash_hints.open && !app.slash_hints.items.is_empty() {
+        let n = app.slash_hints.items.len();
+        match key.code {
+            KeyCode::Up => {
+                let sel = app.slash_hints.selected;
+                let next = if sel == 0 { n - 1 } else { sel - 1 };
+                sender.send(Msg::SlashHintSelect(next));
+                return;
+            }
+            KeyCode::Down => {
+                let sel = app.slash_hints.selected;
+                let next = (sel + 1) % n;
+                sender.send(Msg::SlashHintSelect(next));
+                return;
+            }
+            KeyCode::Tab => {
+                let idx = app.slash_hints.selected.min(n - 1);
+                let cmd = app.slash_hints.items[idx].0.clone();
+                composer.set_text(&format!("{cmd} "));
+                sender.send(Msg::ComposerChanged);
+                sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+                return;
+            }
+            KeyCode::Enter => {
+                let idx = app.slash_hints.selected.min(n - 1);
+                let cmd = app.slash_hints.items[idx].0.clone();
+                composer.set_text(&format!("{cmd} "));
+                sender.send(Msg::ComposerChanged);
+                sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+                return;
+            }
+            _ => {}
+        }
     }
 
     // Tab (Claude Code QOL): with the composer focused, INSERT mode, and
@@ -1452,6 +1524,7 @@ fn handle_key(
         if let Some(replacement) = complete_composer(composer.text()) {
             *composer.text_mut() = replacement;
             sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
             return;
         }
         // No completion found — fall through to focus navigation.
@@ -1470,6 +1543,7 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
         composer.newline();
         sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
         return;
     }
 
@@ -1496,6 +1570,7 @@ fn handle_key(
             }
         }
         sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
         return;
     }
 
@@ -1507,6 +1582,7 @@ fn handle_key(
             composer.pop();
         }
         sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
         return;
     }
 
@@ -1520,12 +1596,14 @@ fn handle_key(
             KeyCode::Up if !composer.text().contains('\n') => {
                 if composer.history_prev() {
                     sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
                 }
                 return;
             }
             KeyCode::Down if !composer.text().contains('\n') => {
                 if composer.history_next() {
                     sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
                 }
                 return;
             }
@@ -1537,6 +1615,7 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
         composer.clear();
         sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
         return;
     }
 
@@ -1551,6 +1630,7 @@ fn handle_key(
         if let KeyCode::Char(c) = key.code {
             composer.push(c);
             sender.send(Msg::ComposerChanged);
+        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
             return;
         }
     }

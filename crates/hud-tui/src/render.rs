@@ -973,6 +973,57 @@ fn render_conversation(
         }
     }
 
+    // ── Slash-hint dropdown (Claude Code parity) ──────────────────────────
+    // A live menu above the composer while the operator types a partial
+    // `/command`: matched commands with one-line descriptions; ↑/↓ pick,
+    // Tab/Enter accept. Rendered bottom-up into the transcript area.
+    if app.slash_hints.open && !app.slash_hints.items.is_empty() {
+        let items = &app.slash_hints.items;
+        let visible = items.len().min(6) as u16;
+        let sel = app.slash_hints.selected.min(items.len() - 1);
+        let width = composer_row.width.saturating_sub(2).max(20);
+        let x = composer_row.x + 1;
+        // Rows stack upward from just above the composer.
+        for (i, (cmd, desc)) in items.iter().take(visible as usize).enumerate() {
+            let row_y = composer_row.y.saturating_sub(1 + i as u16);
+            let buf = frame.buffer_mut();
+            for xx in x..x + width {
+                if xx >= composer_row.x + composer_row.width {
+                    break;
+                }
+                buf[(xx, row_y)].set_style(Style::default().bg(p.surface2));
+            }
+            let is_sel = i == sel;
+            let (cs, ds) = if is_sel {
+                (
+                    Style::default().fg(p.cyan).bg(p.surface2).add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.ink).bg(p.surface2),
+                )
+            } else {
+                (
+                    Style::default().fg(p.magenta).bg(p.surface2),
+                    Style::default().fg(p.faint).bg(p.surface2),
+                )
+            };
+            let marker = if is_sel { "▸ " } else { "  " };
+            let mut cx = x;
+            for c in marker.chars().chain(cmd.chars()).chain(" — ".chars()) {
+                if cx >= x + width {
+                    break;
+                }
+                buf[(cx, row_y)].set_symbol(&c.to_string()).set_style(cs);
+                cx += 1;
+            }
+            for c in desc.chars() {
+                if cx >= x + width {
+                    break;
+                }
+                buf[(cx, row_y)].set_symbol(&c.to_string()).set_style(ds);
+                cx += 1;
+            }
+        }
+    }
+
     // ── Hint row (§5.5) ────────────────────────────────────────────────────
     if show_hint {
         let buf = frame.buffer_mut();

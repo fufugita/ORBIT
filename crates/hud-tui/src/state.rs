@@ -246,6 +246,19 @@ pub struct PaletteCommand {
     pub hint: String,
 }
 
+/// Live slash-command autocomplete state (rendered as a dropdown above
+/// the composer). Derived from the composer text whenever it starts with
+/// `/` and contains no space yet.
+#[derive(Debug, Default, Clone)]
+pub struct SlashHints {
+    /// Hints are visible (composer is a partial `/command`).
+    pub open: bool,
+    /// Matching (command, description) pairs, best-first.
+    pub items: Vec<(String, String)>,
+    /// Selected row (0 = first). Arrow keys move; Tab/Enter accepts.
+    pub selected: usize,
+}
+
 /// Fuzzy-filter the palette commands by the query: a simple subsequence
 /// match (each query char appears in order). Case-insensitive.
 pub fn filtered_commands(query: &str) -> Vec<PaletteCommand> {
@@ -435,6 +448,12 @@ pub struct App {
     pub toast_emitted_at: Option<u64>,
     /// Composer state (DR-21 §3.4) — left glyph + border color.
     pub composer_state: ComposerState,
+    /// Live slash-command autocomplete (Claude Code parity): while the
+    /// composer starts with `/` and is mid-word, a hint dropdown lists
+    /// matching commands + descriptions. The state is derived from the
+    /// composer text on every ComposerChanged — kept here so the
+    /// renderer and key handler can see it without recomputing.
+    pub slash_hints: SlashHints,
     /// Queued prompts: typed while a turn is in flight. Drained one at a
     /// time when a turn ends (ResponseFinished or CancelTurn). Rendered as
     /// dimmed `⏳` lines above the composer.
@@ -699,6 +718,7 @@ impl App {
             toast: None,
             toast_emitted_at: None,
             composer_state: ComposerState::Idle,
+            slash_hints: SlashHints::default(),
             queued: Vec::new(),
             sessions: Vec::new(),
             header_title: String::new(),
@@ -1344,6 +1364,37 @@ impl App {
                 if self.composer_state == ComposerState::Idle {
                     self.composer_state = ComposerState::Typing;
                 }
+            }
+            Msg::SlashHintSelect(idx) => {
+                if idx < self.slash_hints.items.len() {
+                    self.slash_hints.selected = idx;
+                    self.dirty.set(DirtyFlags::LAYOUT);
+                }
+            }
+            Msg::ComposerTextChanged(text) => {
+                // Live slash-hint dropdown (Claude Code parity): open while
+                // the composer is a partial `/command` (leading slash, no
+                // space yet, not exactly a known command). Selection resets
+                // on every text change — the list may have reordered.
+                let partial = text.starts_with('/')
+                    && !text.contains(char::is_whitespace)
+                    && text.len() > 1
+                    && !crate::SLASH_NAMES.contains(&text.as_str());
+                if partial {
+                    let items: Vec<(String, String)> = crate::SLASH_COMMANDS
+                        .iter()
+                        .filter(|(c, _)| c.starts_with(text.as_str()))
+                        .map(|(c, d)| (c.to_string(), d.to_string()))
+                        .collect();
+                    self.slash_hints.open = !items.is_empty();
+                    self.slash_hints.items = items;
+                    self.slash_hints.selected = 0;
+                } else {
+                    self.slash_hints.open = false;
+                    self.slash_hints.items.clear();
+                    self.slash_hints.selected = 0;
+                }
+                self.dirty.set(DirtyFlags::LAYOUT);
             }
             Msg::SlashCommand(_) => {
                 // The event loop parses and dispatches /commands; the

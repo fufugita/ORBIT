@@ -98,6 +98,11 @@ pub enum Msg {
     /// Composer's text changed — force a re-render so the composer box updates
     /// every keystroke (the text lives in the event loop, not the App).
     ComposerChanged,
+    /// Composer text snapshot — the reducer derives the live
+    /// slash-hint dropdown from it (open/matches/selection).
+    ComposerTextChanged(String),
+    /// Move the slash-hint dropdown selection.
+    SlashHintSelect(usize),
     /// Ctrl+C pressed — first press shows "press again to quit", second quits.
     /// While a turn is streaming, the first press cancels the turn instead.
     CtrlC,
