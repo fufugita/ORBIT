@@ -518,6 +518,53 @@ fn worker_main(
                     }
                 }
             }
+            WorkerCommand::Permissions(arg) => {
+                let sub = arg.split_whitespace().next().unwrap_or("");
+                let tool = arg.split_whitespace().nth(1).unwrap_or("");
+                match crate::permissions::PermissionRules::load(&config.home) {
+                    Err(e) => {
+                        ctx.sender.send(Msg::SystemMessage(format!("permissions.toml: {e}")));
+                    }
+                    Ok(mut rules) => match (sub, tool) {
+                        ("allow", t) if !t.is_empty() => {
+                            let msg = rules
+                                .allow_tool(&config.home, t)
+                                .map(|_| format!("allow rule added: {t}"))
+                                .unwrap_or_else(|e| format!("error: {e}"));
+                            ctx.sender.send(Msg::SystemMessage(msg));
+                        }
+                        ("deny", t) if !t.is_empty() => {
+                            let msg = rules
+                                .deny_tool(&config.home, t)
+                                .map(|_| format!("deny rule added: {t}"))
+                                .unwrap_or_else(|e| format!("error: {e}"));
+                            ctx.sender.send(Msg::SystemMessage(msg));
+                        }
+                        ("reset", t) if !t.is_empty() => {
+                            let msg = rules
+                                .reset_tool(&config.home, t)
+                                .map(|_| format!("rules cleared: {t}"))
+                                .unwrap_or_else(|e| format!("error: {e}"));
+                            ctx.sender.send(Msg::SystemMessage(msg));
+                        }
+                        ("", _) => {
+                            let allow: Vec<String> =
+                                rules.allow.tools.iter().cloned().collect();
+                            let deny: Vec<String> = rules.deny.tools.iter().cloned().collect();
+                            ctx.sender.send(Msg::SystemMessage(format!(
+                                "allow: [{}] · deny: [{}] · usage: /permissions allow|deny|reset <tool>",
+                                allow.join(", "),
+                                deny.join(", ")
+                            )));
+                        }
+                        _ => {
+                            ctx.sender.send(Msg::SystemMessage(
+                                "usage: /permissions [allow|deny|reset <tool>]".into(),
+                            ));
+                        }
+                    },
+                }
+            }
             WorkerCommand::ModCommand(mod_name, cmd_name) => {
                 // A mod command runs its body as a normal prompt turn.
                 let body = mods
@@ -623,7 +670,9 @@ impl TuiApprovalChannel {
 fn classify_tool_result(result: &str) -> orbit_hud_tui::state::ToolOutcome {
     if result.contains("\"ok\":true") {
         orbit_hud_tui::state::ToolOutcome::Ok
-    } else if result.contains("operator denied") {
+    } else if result.contains("operator denied")
+        || result.contains("denied by persistent rule")
+    {
         orbit_hud_tui::state::ToolOutcome::Denied
     } else if result.contains("non-interactive tool call requires --auto-tools")
         || result.contains("unknown tool (deny-by-default)")

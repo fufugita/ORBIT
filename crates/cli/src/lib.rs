@@ -324,6 +324,7 @@ pub mod go_bridge;
 pub mod sessions;
 pub mod tool_runtime;
 pub mod mods;
+pub mod permissions;
 pub mod tools;
 pub mod tui_worker;
 

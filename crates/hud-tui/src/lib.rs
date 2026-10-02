@@ -277,6 +277,10 @@ fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSin
         "/undo" => {
             let _ = command_sink.send(WorkerCommand::Undo);
         }
+        "/permissions" => {
+            // Persistent rules live in orbit-cli; route through the worker.
+            let _ = command_sink.send(WorkerCommand::Permissions(arg.to_string()));
+        }
         "/queue" => {
             // Claude Code parity: show / manage queued prompts.
             if arg == "clear" {
@@ -881,6 +885,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/status", "session/model/connection snapshot"),
     ("/cost", "per-turn and cumulative cost"),
     ("/export", "export transcript to markdown"),
+    ("/permissions", "view or set persistent tool rules"),
     ("/mods", "list installed mods (or refresh)"),
     ("/mod", "toggle a mod by name"),
     ("/quit", "exit ORBIT"),
@@ -890,8 +895,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 /// Plain-name list (Tab completion keeps its old shape).
 pub const SLASH_NAMES: &[&str] = &[
     "/help", "/model", "/models", "/clear", "/usage", "/sessions", "/resume", "/cancel",
-    "/history", "/compact", "/undo", "/queue", "/status", "/cost", "/export", "/mods", "/mod",
-    "/quit", "/exit",
+    "/history", "/compact", "/undo", "/queue", "/status", "/cost", "/export", "/permissions",
+    "/mods", "/mod", "/quit", "/exit",
 ];
 
 /// Tab completion for the composer (Claude Code QOL):

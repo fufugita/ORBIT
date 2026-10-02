@@ -202,14 +202,30 @@ pub fn execute_call(
 
     // Determine the verdict:
     // 1. Unknown tool → always deny (fail-closed, even with --auto-tools / R).
-    // 2. --auto-tools → allow once (up-front consent for pure built-ins).
-    // 3. Session R-grant → allow once (session-scoped, per-tool).
-    // 4. Otherwise → ask the approval channel.
+    // 2. Persistent deny rule → deny, no prompt.
+    // 3. Persistent allow rule → allow once, no prompt (durable R-grant).
+    // 4. --auto-tools → allow once (up-front consent for pure built-ins).
+    // 5. Session R-grant → allow once (session-scoped, per-tool).
+    // 6. Otherwise → ask the approval channel.
     // Unknown tools always deny (fail-closed, even with --auto-tools / R).
-    // Auto-tools and session R-grants both auto-allow without asking.
+    // Persistent rules (permissions.toml) sit between unknown-tool denial
+    // and everything else — deny rules are a durable fail-closed, allow
+    // rules a durable consent. A malformed rules file degrades to ask
+    // (never silently allow).
+    let rules = crate::permissions::PermissionRules::load(home)
+        .unwrap_or_else(|e| {
+            eprintln!("warning: permissions.toml: {e} (falling back to ask)");
+            crate::permissions::PermissionRules::default()
+        });
+    let rule_verdict = rules.verdict(&call.name);
     let verdict = if !known {
         ApprovalVerdict::Deny
-    } else if auto_tools || grants.is_granted(&call.name) {
+    } else if rule_verdict == crate::permissions::RuleVerdict::Deny {
+        ApprovalVerdict::Deny
+    } else if rule_verdict == crate::permissions::RuleVerdict::Allow
+        || auto_tools
+        || grants.is_granted(&call.name)
+    {
         ApprovalVerdict::AllowOnce
     } else {
         approval.ask(
@@ -239,6 +255,10 @@ pub fn execute_call(
 
     let reason = if !known {
         "unknown tool (deny-by-default)"
+    } else if rule_verdict == crate::permissions::RuleVerdict::Deny {
+        "denied by persistent rule (permissions.toml)"
+    } else if rule_verdict == crate::permissions::RuleVerdict::Allow {
+        "allowed by persistent rule (permissions.toml)"
     } else if auto_tools {
         "allowed by --auto-tools up-front consent"
     } else if grants.is_granted(&call.name) && !matches!(verdict, ApprovalVerdict::Deny) {

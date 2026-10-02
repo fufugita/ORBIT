@@ -44,6 +44,10 @@ pub enum WorkerCommand {
     /// reply + any tool plumbing) from the working transcript, and emit
     /// the removed text so the operator can re-paste it.
     Undo,
+    /// `/permissions [allow|deny|reset <tool>]` — view/mutate the
+    /// persistent permission rules (CLI-side: the rules module lives in
+    /// orbit-cli, which the TUI crate can't depend on).
+    Permissions(String),
 }
 
 /// The sender end of the worker-command channel — held by the TUI's event
