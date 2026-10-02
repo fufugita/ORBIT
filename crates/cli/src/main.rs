@@ -246,6 +246,7 @@ fn add_configured_provider(
                 .as_ref()
                 .and_then(|p| p.get(i).copied())
                 .unwrap_or_default(),
+            max_output_tokens: None,
         })
         .collect();
     cfg.add_provider(orbit_cli::config::ProviderConfig {
@@ -784,6 +785,10 @@ fn cmd_chat(args: &[String]) -> i32 {
             if want_go_tui {
                 return go_bridge::run_go_tui(tui_config);
             }
+            // Welcome readiness reads the REAL active model/provider —
+            // set them for the in-process TUI before it computes the row.
+            std::env::set_var("ORBIT_ACTIVE_MODEL", &tui_config.model);
+            std::env::set_var("ORBIT_ACTIVE_PROVIDER", &tui_config.provider_id);
             return orbit_hud_tui::run(args, tui_worker::make_spawner(tui_config));
         }
     }
@@ -1023,7 +1028,11 @@ fn cmd_chat(args: &[String]) -> i32 {
                         output_tokens: total_output,
                     };
                 });
-                let decision_id = format!("tool-round-{round}-{}", call.index);
+                // Defect fix: the old `tool-round-{round}-{index}` id repeated every
+                // turn (tool-round-0-0 again and again), so ledger records
+                // could not be tied to their turn. Each call now gets a
+                // fresh ULID — globally unique, sortable.
+                let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
                 let result = tool_runtime::execute_call(
                     &home,
                     &session,

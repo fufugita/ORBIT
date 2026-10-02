@@ -122,7 +122,7 @@ fn main() {
         bind,
         port,
         token,
-            }));
+    }));
 }
 
 /// Session id without importing the whole gateway dep chain: ULID-shaped,

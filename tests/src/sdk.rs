@@ -48,9 +48,14 @@ fn sdk_redaction_no_prompt_bytes() {
 #[test]
 fn sdk_ledger_prompt_leak_fuzz() {
     // A battery of payloads never leaks through the display gate.
-    for p in ["prompt: x", "api_key", "chain_of_thought", "Bearer t"] {
-        assert!(orbit_hud::display_safe(p).is_err(), "{p} must be redacted");
+    // CoT/prompt markers still hard-reject; bare words and Bearer
+    // schemes pass (the value-based gate redacts real key VALUES, not
+    // vocabulary), and a real token value is redacted in place.
+    for p in ["prompt: x", "chain_of_thought"] {
+        assert!(orbit_hud::display_safe(p).is_err(), "{p} must be rejected");
     }
+    let out = orbit_hud::display_safe("Bearer sk-abc123def456ghi789jkl012mno").unwrap();
+    assert!(out.contains("[redacted:api token]"), "got: {out}");
 }
 
 #[test]

@@ -14,10 +14,14 @@ non-overridable compliance kernel.
 
 ## Status
 
-**Active development.** The v0.1 specification is frozen and all three
-release gates are satisfied: specification-frozen, implementation-complete,
-and audited release-ready. The v0.2 track (async provider adapters, WASI
-plugin runtime, terminal UI) is in progress on `main`.
+**Active development.** The v0.1 specification is frozen (12 Aug 2026).
+The v0.1 release-gate claims previously printed here ("implementation-
+complete", "audited release-ready") were not accurate: the capability
+gap analysis of 2 Oct 2026 found no working tools, one provider kind,
+and four copies of the agent loop. Development now follows the six-
+phase roadmap in `docs/roadmap/` — phase 1 (fix the honesty and
+privacy defects) is in progress. No roadmap gate has been passed yet;
+this section will name the last gate that has.
 
 | Track | State |
 |---|---|

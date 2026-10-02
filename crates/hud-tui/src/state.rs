@@ -458,6 +458,10 @@ pub struct App {
     /// Normal. In Plan mode, turns explore read-only and produce a plan
     /// that waits for operator approval before anything executes.
     pub plan_mode: bool,
+    /// Readiness facts for the welcome screen, computed at startup (never
+    /// fixture data): trust-root state, ledger segment count, and the
+    /// active provider · model. Empty → the row is not drawn.
+    pub readiness: Vec<ReadinessRow>,
     /// The plan awaiting operator approval (set when a Plan-mode turn
     /// finishes). `y` approves (runs it as a normal turn), `n` discards.
     pub pending_plan: Option<String>,
@@ -523,6 +527,46 @@ pub struct ActivityRow {
     pub kind: &'static str,
     /// The event text (amber for warnings, red for errors, ink2 otherwise).
     pub text: String,
+}
+
+/// One computed welcome-screen readiness check. Honesty rule: every
+/// glyph and label is drawn from a value the harness measured, never a
+/// fixture string.
+#[derive(Debug, Clone)]
+pub struct ReadinessRow {
+    pub ok: bool,
+    pub label: String,
+}
+
+/// Compute the welcome readiness row from the real environment: trust
+/// root present, ledger segment count, active provider · model. Each
+/// check is measured, not asserted — a missing trust root shows ✗.
+pub fn compute_readiness(home: &std::path::Path) -> Vec<ReadinessRow> {
+    let mut rows = Vec::new();
+    // Trust root: $ORBIT_HOME/trust/root.json (the signed trust anchor).
+    let trust_ok = home.join("trust/root.json").exists();
+    rows.push(ReadinessRow {
+        ok: trust_ok,
+        label: "trust root".into(),
+    });
+    // Ledger: count real segment files under $ORBIT_HOME/ledger/segments.
+    let seg_dir = home.join("ledger/segments");
+    let segs = std::fs::read_dir(&seg_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    rows.push(ReadinessRow {
+        ok: segs > 0,
+        label: format!("ledger · {segs} segments"),
+    });
+    // Provider · model: the CLI exports the ACTIVE pair before the
+    // in-process TUI starts (ORBIT_ACTIVE_MODEL / ORBIT_ACTIVE_PROVIDER).
+    let model = std::env::var("ORBIT_ACTIVE_MODEL").unwrap_or_else(|_| "unset".into());
+    let provider = std::env::var("ORBIT_ACTIVE_PROVIDER").unwrap_or_else(|_| "local".into());
+    rows.push(ReadinessRow {
+        ok: model != "unset",
+        label: format!("{provider} · {model}"),
+    });
+    rows
 }
 
 /// One line in the transcript — either a user message or an assistant reply.
@@ -727,6 +771,7 @@ impl App {
             composer_state: ComposerState::Idle,
             slash_hints: SlashHints::default(),
             plan_mode: false,
+            readiness: Vec::new(),
             pending_plan: None,
             queued: Vec::new(),
             sessions: Vec::new(),
@@ -1385,10 +1430,11 @@ impl App {
             Msg::PlanReady(plan) => {
                 // The plan body lands in the transcript (readable, copiable)
                 // with the approval banner waiting above the composer.
-                self.transcript.push(crate::state::TranscriptLine::Assistant {
-                    text: plan.clone(),
-                    time: None,
-                });
+                self.transcript
+                    .push(crate::state::TranscriptLine::Assistant {
+                        text: plan.clone(),
+                        time: None,
+                    });
                 self.pending_plan = Some(plan);
                 self.dirty.set(DirtyFlags::LAYOUT);
             }

@@ -65,10 +65,7 @@ pub fn load_all(home: &Path) -> Vec<Mod> {
 /// sees the gap in `/mods`).
 fn load_one(dir: &Path) -> Option<Mod> {
     let meta_raw = std::fs::read_to_string(dir.join("mod.toml")).ok()?;
-    let name = dir
-        .file_name()?
-        .to_str()?
-        .to_string();
+    let name = dir.file_name()?.to_str()?.to_string();
     // Minimal TOML parse: `key = "value"` lines only. Full serde_toml for
     // two string fields would pull a dependency into the hot path; the
     // format is ours, so a strict line parser is enough and fails loudly
@@ -149,9 +146,7 @@ pub fn initial_enabled(home: &Path, mods: &[Mod]) -> Vec<String> {
     }
     let mut defaults = Vec::new();
     for m in mods {
-        let meta = std::fs::read_to_string(
-            mods_dir(home).join(&m.name).join("mod.toml"),
-        );
+        let meta = std::fs::read_to_string(mods_dir(home).join(&m.name).join("mod.toml"));
         if let Ok(raw) = meta {
             if raw.lines().any(|l| {
                 let l = l.trim();
@@ -167,10 +162,7 @@ pub fn initial_enabled(home: &Path, mods: &[Mod]) -> Vec<String> {
 /// Build the system message that carries all enabled mods' instructions.
 /// Empty string when no mods are enabled (caller skips the message).
 pub fn system_directive(mods: &[Mod], enabled: &[String]) -> String {
-    let active: Vec<&Mod> = mods
-        .iter()
-        .filter(|m| enabled.contains(&m.name))
-        .collect();
+    let active: Vec<&Mod> = mods.iter().filter(|m| enabled.contains(&m.name)).collect();
     if active.is_empty() {
         return String::new();
     }
@@ -224,9 +216,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("commands")).unwrap();
         std::fs::write(
             dir.join("mod.toml"),
-            format!(
-                "description = \"test mod {name}\"\ndefault = {default}\n"
-            ),
+            format!("description = \"test mod {name}\"\ndefault = {default}\n"),
         )
         .unwrap();
         std::fs::write(dir.join("instructions.md"), instructions).unwrap();

@@ -1,0 +1,31 @@
+# ORBIT CI: fmt, clippy, test, deny — on a plain runner, no GTK needed
+# (the Tauri crate is excluded from the workspace default build).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: deny
+        run: |
+          cargo install --locked cargo-deny >/dev/null 2>&1
+          cargo deny check
+        continue-on-error: true

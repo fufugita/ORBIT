@@ -988,9 +988,12 @@ fn render_conversation(
             if cx >= composer_row.x + composer_row.width {
                 break;
             }
-            buf[(cx, row_y)]
-                .set_symbol(&c.to_string())
-                .set_style(Style::default().fg(p.cyan).bg(p.surface2).add_modifier(Modifier::BOLD));
+            buf[(cx, row_y)].set_symbol(&c.to_string()).set_style(
+                Style::default()
+                    .fg(p.cyan)
+                    .bg(p.surface2)
+                    .add_modifier(Modifier::BOLD),
+            );
             cx += 1;
         }
     }
@@ -1018,7 +1021,10 @@ fn render_conversation(
             let is_sel = i == sel;
             let (cs, ds) = if is_sel {
                 (
-                    Style::default().fg(p.cyan).bg(p.surface2).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(p.cyan)
+                        .bg(p.surface2)
+                        .add_modifier(Modifier::BOLD),
                     Style::default().fg(p.ink).bg(p.surface2),
                 )
             } else {
@@ -1058,17 +1064,18 @@ fn render_conversation(
         // single-row composer visibly holds more than the first line.
         let extra_lines = composer_text.lines().count().saturating_sub(1);
         if extra_lines > 0 {
-            let put2 = |text: &str, style: Style, x: &mut u16, buf: &mut ratatui::buffer::Buffer| {
-                for c in text.chars() {
-                    if *x >= hint_row.x + hint_row.width {
-                        return;
+            let put2 =
+                |text: &str, style: Style, x: &mut u16, buf: &mut ratatui::buffer::Buffer| {
+                    for c in text.chars() {
+                        if *x >= hint_row.x + hint_row.width {
+                            return;
+                        }
+                        buf[(*x, hint_row.y)]
+                            .set_symbol(&c.to_string())
+                            .set_style(style.bg(p.surface));
+                        *x += 1;
                     }
-                    buf[(*x, hint_row.y)]
-                        .set_symbol(&c.to_string())
-                        .set_style(style.bg(p.surface));
-                    *x += 1;
-                }
-            };
+                };
             put2(
                 &format!("+{extra_lines} lines   "),
                 Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
@@ -1209,31 +1216,35 @@ fn build_welcome(
         lines.push(Line::from(padded));
     }
     lines.push(Line::from(""));
-    // Tagline centered.
-    let tagline = "the harness that orbits around you";
-    let tag_x = cl + cw.saturating_sub(tagline.chars().count() as u16) / 2;
-    let tag_pad = " ".repeat(tag_x.saturating_sub(area.x) as usize);
-    lines.push(Line::from(vec![
-        Span::raw(tag_pad),
-        Span::styled(tagline, Style::default().fg(p.muted)),
-    ]));
+    // No second tagline here: welcome_mark_frame already carries it
+    // beneath the strokes. The old duplicate printed it twice.
     lines.push(Line::from(""));
     lines.push(Line::from(""));
-    // Readiness row (fixture data; the backend fills it when it exists).
-    let readiness = "✓ trust root    ✓ ledger · 7 records    ✓ local · glm-5.2";
-    let r_x = cl + cw.saturating_sub(readiness.chars().count() as u16) / 2;
-    let r_pad = " ".repeat(r_x.saturating_sub(area.x) as usize);
-    let mut spans = vec![Span::raw(r_pad)];
-    for seg in readiness.split("    ") {
-        let (glyph, rest) = seg.split_once(' ').unwrap_or((seg, ""));
-        spans.push(Span::styled(glyph, Style::default().fg(p.green)));
-        if !rest.is_empty() {
+    // Readiness row: every value computed at startup by the harness
+    // (trust root, ledger segment count, provider · model). Empty → no
+    // row. The old fixture line ("✓ ledger · 7 records · glm-5.2")
+    /// was invented and is gone.
+    if !app.readiness.is_empty() {
+        let text = app
+            .readiness
+            .iter()
+            .map(|r| format!("{} {}", if r.ok { "✓" } else { "✗" }, r.label))
+            .collect::<Vec<_>>()
+            .join("    ");
+        let r_x = cl + cw.saturating_sub(text.chars().count() as u16) / 2;
+        let r_pad = " ".repeat(r_x.saturating_sub(area.x) as usize);
+        let mut spans = vec![Span::raw(r_pad)];
+        for row in &app.readiness {
+            spans.push(Span::styled(
+                if row.ok { "✓" } else { "✗" },
+                Style::default().fg(if row.ok { p.green } else { p.red }),
+            ));
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(rest, Style::default().fg(p.ink2)));
+            spans.push(Span::styled(row.label.clone(), Style::default().fg(p.ink2)));
+            spans.push(Span::raw("    "));
         }
-        spans.push(Span::raw("    "));
+        lines.push(Line::from(spans));
     }
-    lines.push(Line::from(spans));
     lines.push(Line::from(""));
     lines.push(Line::from(""));
     // Starters.
@@ -1596,39 +1607,39 @@ fn render_status_bar(
         )]
     } else {
         match &app.tool_state {
-        ToolState::Idle => vec![("ready".into(), Style::default().fg(p.muted))],
-        ToolState::Streaming => vec![
-            ("streaming".into(), Style::default().fg(p.cyan)),
-            (format!(" {} ", g.sep), Style::default().fg(p.muted)),
-            (
-                format!("{} tokens", app.total_output_tokens),
-                Style::default().fg(p.muted),
-            ),
-        ],
-        ToolState::AwaitingApproval => vec![
-            (
-                format!("{} approval needed {} ", g.decision, g.sep),
-                Style::default().fg(p.magenta),
-            ),
-            (
-                app.pending_approvals
-                    .first()
-                    .map(|a| a.tool_name.clone())
-                    .unwrap_or_default(),
-                Style::default().fg(p.magenta),
-            ),
-        ],
-        ToolState::Running(name) => vec![
-            ("running ".into(), Style::default().fg(p.cyan)),
-            (name.clone(), Style::default().fg(p.cyan)),
-            (format!(" {} ", g.sep), Style::default().fg(p.muted)),
-            ("3.2s".into(), Style::default().fg(p.muted)),
-        ],
-        ToolState::AutoGranted(name) => vec![
-            ("◈ ".into(), Style::default().fg(p.muted)),
-            (name.clone(), Style::default().fg(p.muted)),
-        ],
-    }
+            ToolState::Idle => vec![("ready".into(), Style::default().fg(p.muted))],
+            ToolState::Streaming => vec![
+                ("streaming".into(), Style::default().fg(p.cyan)),
+                (format!(" {} ", g.sep), Style::default().fg(p.muted)),
+                (
+                    format!("{} tokens", app.total_output_tokens),
+                    Style::default().fg(p.muted),
+                ),
+            ],
+            ToolState::AwaitingApproval => vec![
+                (
+                    format!("{} approval needed {} ", g.decision, g.sep),
+                    Style::default().fg(p.magenta),
+                ),
+                (
+                    app.pending_approvals
+                        .first()
+                        .map(|a| a.tool_name.clone())
+                        .unwrap_or_default(),
+                    Style::default().fg(p.magenta),
+                ),
+            ],
+            ToolState::Running(name) => vec![
+                ("running ".into(), Style::default().fg(p.cyan)),
+                (name.clone(), Style::default().fg(p.cyan)),
+                (format!(" {} ", g.sep), Style::default().fg(p.muted)),
+                ("3.2s".into(), Style::default().fg(p.muted)),
+            ],
+            ToolState::AutoGranted(name) => vec![
+                ("◈ ".into(), Style::default().fg(p.muted)),
+                (name.clone(), Style::default().fg(p.muted)),
+            ],
+        }
     };
     for (text, style) in activity {
         put(&text, style, &mut x);
@@ -2476,7 +2487,13 @@ fn render_approval_modal(
     let p = &d.palette;
     let first = &app.pending_approvals[0];
     let card_w = 80u16.min(wc.conversation.1.saturating_sub(4));
-    let has_facts = true; // the fixture carries the facts grid
+    // Honesty rule: the card draws only facts carried by the request
+    // (tool name, action summary, backend-classified risk). The fixture
+    // facts grid — "runs in ~/src/orbit", "sandbox landlock · rw /tmp
+    // only" — was invented; it is gone until real tools supply real
+    // facts (working directory, applied sandbox profile, network
+    // policy) on the ApprovalRequest itself.
+    let has_facts = false;
     let card_h: u16 = if has_facts { 9 } else { 6 };
     let card_x = wc.conversation.0 + (wc.conversation.1.saturating_sub(card_w)) / 2;
     let card_y = area.y + area.height.saturating_sub(card_h + 2);

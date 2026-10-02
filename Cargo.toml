@@ -1,15 +1,18 @@
-# ORBIT v0.1 — Cargo workspace (scaffolded; crates are stubs until spec-frozen)
+# ORBIT — Cargo workspace.
 # Member crate list mirrors the accepted module map (DR-04..DR-14).
-# Do NOT implement product semantics before the DR-03 specification-frozen gate.
+# The specification froze 2026-08-12; implementation follows the
+# six-phase roadmap (docs/roadmap/).
 
 [workspace]
 resolver = "2"
-exclude = ["fuzz"]
+# The Tauri desktop crate needs GTK system libraries, so it breaks
+# `cargo test --workspace` on any machine (or CI runner) without them.
+# It is excluded from the default build; build it explicitly with
+# `cargo build -p orbit-desktop` on a machine with GTK.
+exclude = ["fuzz", "crates/desktop/src-tauri"]
 members = [
   "crates/frontend-protocol",
-  "crates/desktop/src-tauri",
   "crates/reactor",
-  "crates/capability",
   "crates/sandbox",
   "crates/context",
   "crates/gateway",

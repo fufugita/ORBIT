@@ -146,7 +146,12 @@ fn golden_orbit_letterform_4frames() {
 
 #[test]
 fn security_filter_no_secret_emission() {
-    assert!(display_safe("authorization: Bearer x").is_err());
+    // Value-based gate: the WORD "authorization" is ordinary content;
+    // a real token VALUE redacts in place.
+    let out = display_safe("authorization: Bearer x").unwrap();
+    assert_eq!(out, "authorization: Bearer x");
+    let out = display_safe("authorization: Bearer sk-abc123def456ghi789jkl").unwrap();
+    assert!(out.contains("[redacted:api token]"), "got: {out}");
 }
 
 #[test]
@@ -313,17 +318,25 @@ fn telemetry_default_off() {
 
 #[test]
 fn redaction_categories_comprehensive() {
-    // CLI-08: the display gate redacts the display-relevant categories:
-    // credentials, auth headers, prompt markers, URLs. A plain path is not
-    // secret-shaped and passes (path redaction is CLI-08's own layer).
-    assert!(display_safe("api_key").is_err());
-    assert!(display_safe("Authorization: Bearer x").is_err());
-    assert!(display_safe("https://api.openai.com").is_err());
+    // CLI-08: the display gate redacts secret VALUES (credential
+    // shapes, high-entropy assignments) and hard-rejects prompt
+    // markers. Words, auth schemes and URLs are ordinary content in a
+    // coding agent; a plain path passes untouched.
+    let out = display_safe("api_key").unwrap();
+    assert_eq!(out, "api_key");
+    let out = display_safe("Authorization: Bearer x").unwrap();
+    assert_eq!(out, "Authorization: Bearer x");
+    assert_eq!(
+        display_safe("https://api.openai.com").unwrap(),
+        "https://api.openai.com"
+    );
     assert!(display_safe("user_message: hi").is_err());
     assert!(
         display_safe("src/main.rs").is_ok(),
         "plain path is not a display secret"
     );
+    let out = display_safe("MY_SECRET = \"q7Xk2Lm9Rt4Zv8Bh3Jw6Yc1Df5GnUe2P\"").unwrap();
+    assert!(out.contains("[redacted"), "got: {out}");
 }
 
 #[test]

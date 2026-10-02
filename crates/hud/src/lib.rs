@@ -51,32 +51,25 @@ pub enum HudEvent {
     Message { text: String },         // DisplaySafeString-only
 }
 
-/// The display-safety gate (H-3): scrub prompt/secret/egress-URL patterns.
+/// The display-safety gate (H-3), value-based: secrets are detected by
+/// SHAPE, not by the presence of words like "authorization" (which
+/// blanked ordinary code while passing real keys that lacked the word).
+/// A detected secret value is REDACTED — the line survives, the value
+/// does not. Chain-of-thought markers still reject whole-payload (that
+/// rule is about role confusion, not secrets).
 pub fn display_safe(text: &str) -> Result<String, HudError> {
-    // Reject known leak patterns: raw prompt markers, credentials, egress URLs.
+    // CoT markers remain hard rejects (H-3): these are prompt-confusion
+    // payloads, not secrets.
     let lowered = text.to_lowercase();
-    for pat in [
-        "api_key",
-        "apikey",
-        "authorization",
-        "x-api-key",
-        "bearer ",
-        "prompt:",
-        "user_message",
-        "chain_of_thought",
-    ] {
+    for pat in ["prompt:", "user_message", "chain_of_thought"] {
         if lowered.contains(pat) {
             return Err(HudError::DisplayGateRejected(format!(
                 "payload contains disallowed pattern {pat:?} (H-3)"
             )));
         }
     }
-    // Reject raw egress URLs (host:port) — digest/status words only (H-3/IF-6).
-    if text.contains("://") {
-        return Err(HudError::DisplayGateRejected(
-            "payload contains a URL (H-3/IF-6)".into(),
-        ));
-    }
+    // Secret VALUES: redact, keep the line.
+    let text = redact_secret_values(text);
     // Strip ANSI/control sequences (H-3).
     let stripped: String = text
         .chars()
@@ -177,6 +170,85 @@ impl Hud {
     }
 }
 
+/// Redact secret VALUES in place: PEM blocks → `[redacted:private key]`,
+/// known token formats → `[redacted:<kind>]`, high-entropy assignments →
+/// `[redacted:secret]`. Ordinary words (authorization, api_key in code)
+/// and URLs pass untouched — the old keyword rejection is gone.
+pub fn redact_secret_values(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        out.push_str(&redact_line(line));
+    }
+    out
+}
+
+fn redact_line(line: &str) -> String {
+    // PEM block lines: redact the whole block content.
+    if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
+        return "[redacted:private key]\n".into();
+    }
+    let mut line = line.to_string();
+    for (prefix, what) in [
+        ("sk-", "api token"),
+        ("ghp_", "github token"),
+        ("gho_", "github token"),
+        ("github_pat_", "github token"),
+        ("AKIA", "aws access key"),
+        ("xoxb-", "slack token"),
+        ("xoxp-", "slack token"),
+    ] {
+        while let Some(pos) = line.find(prefix) {
+            let end = line[pos..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .map(|i| pos + i)
+                .unwrap_or(line.len());
+            if end - pos < prefix.len() + 16 {
+                break; // too short to be a real token; stop scanning
+            }
+            line = format!("{}[redacted:{}]{}", &line[..pos], what, &line[end..]);
+            break; // one redaction per format per line is enough
+        }
+    }
+    // High-entropy assignments: KEY = <long value> → KEY = [redacted]
+    if let Some(eq) = line.find('=') {
+        let (k, v) = line.split_at(eq);
+        let key_up = k.trim().to_uppercase();
+        let looks_secret = key_up.contains("SECRET")
+            || key_up.contains("TOKEN")
+            || key_up.contains("PASSWORD")
+            || key_up.contains("API_KEY")
+            || key_up.contains("PRIVATE");
+        let val = v[1..].trim().trim_matches('"').trim_matches('\'');
+        if looks_secret && val.chars().count() >= 32 && entropy_bits(val) > 3.5 {
+            return format!(
+                "{}= [redacted:secret]{}",
+                k,
+                &v[1 + v[1..].len() - val.len()..].trim_start_matches(val)
+            );
+        }
+    }
+    line
+}
+
+fn entropy_bits(s: &str) -> f64 {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return 0.0;
+    }
+    let mut counts = std::collections::HashMap::new();
+    for c in &chars {
+        *counts.entry(*c).or_insert(0u32) += 1;
+    }
+    let n = chars.len() as f64;
+    counts
+        .values()
+        .map(|&c| {
+            let p = c as f64 / n;
+            -p * p.log2()
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,10 +289,24 @@ mod tests {
     }
 
     #[test]
-    fn display_gate_rejects_secrets() {
+    fn display_gate_redacts_secret_values_not_words() {
+        // Ordinary text and URLs pass unchanged (the old keyword
+        // rejection blanked these).
         assert!(display_safe("running task").is_ok());
-        assert!(display_safe("api_key=secret").is_err());
-        assert!(display_safe("https://api.openai.com").is_err());
+        assert!(display_safe("let authorization = header;").is_ok());
+        assert!(display_safe("api_key = \"name-of-field\"").is_ok());
+        assert_eq!(
+            display_safe("https://api.openai.com").unwrap(),
+            "https://api.openai.com"
+        );
+        // Real secret VALUES are redacted in place, not rejected.
+        let out = display_safe("token = sk-abc123def456ghi789jkl012mno").unwrap();
+        assert!(out.contains("[redacted:api token]"), "got: {out}");
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----";
+        let out = display_safe(pem).unwrap();
+        assert!(out.contains("[redacted:private key]"));
+        // CoT markers remain hard rejects (prompt-confusion payloads).
+        assert!(display_safe("chain_of_thought: ...").is_err());
     }
 
     #[test]

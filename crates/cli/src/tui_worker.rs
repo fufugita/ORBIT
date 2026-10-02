@@ -354,8 +354,11 @@ fn worker_main(
                     }
                     if let Some(calls) = &m.tool_calls {
                         for c in calls {
-                            dump.push_str(&format!("
-  [tool {} {}]", c.name, c.arguments));
+                            dump.push_str(&format!(
+                                "
+  [tool {} {}]",
+                                c.name, c.arguments
+                            ));
                         }
                     }
                     dump.push('\n');
@@ -373,9 +376,12 @@ fn worker_main(
                 let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
                 let provider = cfg.provider_for_model(&config.model);
                 let pricing = cfg.pricing_for_model(&config.model);
-                let provider_id =
-                    provider.map(|p| p.name.as_str()).unwrap_or(config.provider_id.as_str());
-                let gate = provider.map(|p| p.url.as_str()).unwrap_or(config.gate.as_str());
+                let provider_id = provider
+                    .map(|p| p.name.as_str())
+                    .unwrap_or(config.provider_id.as_str());
+                let gate = provider
+                    .map(|p| p.url.as_str())
+                    .unwrap_or(config.gate.as_str());
                 let cred = provider.and_then(|p| p.env.as_deref());
                 let outcome = crate::run_turn_with_tools(
                     &config.home,
@@ -442,9 +448,8 @@ fn worker_main(
                         }
                     }
                     Ok(_) => {
-                        ctx.sender.send(Msg::SystemMessage(
-                            "compact failed: empty summary".into(),
-                        ));
+                        ctx.sender
+                            .send(Msg::SystemMessage("compact failed: empty summary".into()));
                     }
                     Err((code, msg)) => {
                         orbit_hud_tui::emit_error(&ctx.sender, &format!("{code}: {msg}"));
@@ -459,7 +464,11 @@ fn worker_main(
                     continue;
                 }
                 for m in &mods {
-                    let state = if mods_enabled.contains(&m.name) { "on" } else { "off" };
+                    let state = if mods_enabled.contains(&m.name) {
+                        "on"
+                    } else {
+                        "off"
+                    };
                     let cmds = if m.commands.is_empty() {
                         String::new()
                     } else {
@@ -475,7 +484,11 @@ fn worker_main(
                     ctx.sender.send(Msg::SystemMessage(format!(
                         "[{state}] {} — {}{cmds}",
                         m.name,
-                        if m.description.is_empty() { "(no description)" } else { &m.description }
+                        if m.description.is_empty() {
+                            "(no description)"
+                        } else {
+                            &m.description
+                        }
                     )));
                 }
             }
@@ -510,9 +523,7 @@ fn worker_main(
                 // Claude Code `/undo`: pop the last user message + every
                 // assistant/tool message after it. The session FILE keeps
                 // history; only the working context rewinds.
-                let last_user = transcript
-                    .iter()
-                    .rposition(|m| m.role == ChatRole::User);
+                let last_user = transcript.iter().rposition(|m| m.role == ChatRole::User);
                 match last_user {
                     Some(idx) => {
                         let removed: Vec<String> = transcript
@@ -565,7 +576,8 @@ fn worker_main(
                 let tool = arg.split_whitespace().nth(1).unwrap_or("");
                 match crate::permissions::PermissionRules::load(&config.home) {
                     Err(e) => {
-                        ctx.sender.send(Msg::SystemMessage(format!("permissions.toml: {e}")));
+                        ctx.sender
+                            .send(Msg::SystemMessage(format!("permissions.toml: {e}")));
                     }
                     Ok(mut rules) => match (sub, tool) {
                         ("allow", t) if !t.is_empty() => {
@@ -590,8 +602,7 @@ fn worker_main(
                             ctx.sender.send(Msg::SystemMessage(msg));
                         }
                         ("", _) => {
-                            let allow: Vec<String> =
-                                rules.allow.tools.iter().cloned().collect();
+                            let allow: Vec<String> = rules.allow.tools.iter().cloned().collect();
                             let deny: Vec<String> = rules.deny.tools.iter().cloned().collect();
                             ctx.sender.send(Msg::SystemMessage(format!(
                                 "allow: [{}] · deny: [{}] · usage: /permissions allow|deny|reset <tool>",
@@ -712,9 +723,7 @@ impl TuiApprovalChannel {
 fn classify_tool_result(result: &str) -> orbit_hud_tui::state::ToolOutcome {
     if result.contains("\"ok\":true") {
         orbit_hud_tui::state::ToolOutcome::Ok
-    } else if result.contains("operator denied")
-        || result.contains("denied by persistent rule")
-    {
+    } else if result.contains("operator denied") || result.contains("denied by persistent rule") {
         orbit_hud_tui::state::ToolOutcome::Denied
     } else if result.contains("non-interactive tool call requires --auto-tools")
         || result.contains("unknown tool (deny-by-default)")
@@ -905,15 +914,26 @@ pub fn run_tui_turn(
         // Tools are running: the act phase.
         ws.phase_index = 2;
         orbit_hud_tui::emit_workspace(sender, ws.clone());
-        // Plan mode: every tool call is denied read-only — no prompt, no
-        // execution. The model sees the notice and continues planning.
+        // Plan mode: read-only tools run (the model researches while
+        // planning); everything else is denied with a notice — no
+        // prompt, no execution. Read-only classification is
+        // backend-authoritative (tools::is_read_only).
         if plan_mode {
-            for call in &o.tool_calls {
+            // Split the calls: read-only tools execute normally (the
+            // model researches while planning); the rest are denied
+            // with a notice. Read-only classification is
+            // backend-authoritative (tools::is_read_only).
+            let blocked: Vec<&_> = o
+                .tool_calls
+                .iter()
+                .filter(|c| !crate::tools::is_read_only(&c.name))
+                .collect();
+            for call in &blocked {
                 let args = crate::tools::parse_arguments(&call.arguments)
                     .unwrap_or(serde_json::Value::Null);
                 let summary = crate::tools::safe_call_summary(&call.name, &args);
                 orbit_hud_tui::emit_tool_started(sender, &call.name, &summary);
-                let result = r#"{"ok":false,"error":"plan mode: read-only — tool calls are denied until the plan is approved"}"#;
+                let result = r#"{"ok":false,"error":"plan mode: read-only — this tool is blocked until the plan is approved"}"#;
                 orbit_hud_tui::emit_tool_finished(
                     sender,
                     &call.name,
@@ -927,7 +947,12 @@ pub fn run_tui_turn(
                     tool_result: Some(result.to_string()),
                 });
             }
-            continue;
+            // If every call was read-only, fall through to normal
+            // execution for them; otherwise the denied results above
+            // feed the next round.
+            if !blocked.is_empty() {
+                continue;
+            }
         }
         // Execute each tool call via the TUI approval channel.
         let mut approval_channel = TuiApprovalChannel::new(sender.clone(), approvals.clone());
@@ -938,7 +963,11 @@ pub fn run_tui_turn(
             let summary = crate::tools::safe_call_summary(&call.name, &args);
             orbit_hud_tui::emit_tool_started(sender, &call.name, &summary);
 
-            let decision_id = format!("tool-round-{round}-{}", call.index);
+            // Defect fix: the old `tool-round-{round}-{index}` id repeated every
+            // turn (tool-round-0-0 again and again), so ledger records
+            // could not be tied to their turn. Each call now gets a
+            // fresh ULID — globally unique, sortable.
+            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
             let result = crate::tool_runtime::execute_call(
                 &config.home,
                 &config.session_id,

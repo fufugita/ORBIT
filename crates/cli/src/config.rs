@@ -49,6 +49,11 @@ pub struct ModelEntry {
     pub label: Option<String>,
     #[serde(default)]
     pub pricing: Pricing,
+    /// Maximum output tokens the model accepts. When absent the harness
+    /// uses 32,000 — the old hard 2,048 cap silently truncated long
+    /// answers and file writes.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// One declared provider.
@@ -105,6 +110,14 @@ impl ProvidersConfig {
         self.provider
             .iter()
             .find(|p| p.models.iter().any(|m| m.id == model))
+    }
+
+    /// The declared max output tokens for a model id, if any.
+    pub fn max_output_tokens_for(&self, model: &str) -> Option<u32> {
+        self.provider
+            .iter()
+            .find_map(|p| p.models.iter().find(|m| m.id == model))
+            .and_then(|m| m.max_output_tokens)
     }
 
     /// The pricing block declared for a model id, if any.
@@ -332,6 +345,7 @@ output_per_million_microcents = 600000
                     output_per_million_microcents: 600_000,
                     ..Default::default()
                 },
+                max_output_tokens: None,
             }],
         })
         .unwrap();

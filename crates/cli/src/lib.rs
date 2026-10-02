@@ -321,10 +321,10 @@ pub fn timestamp_now() -> String {
 
 pub mod config;
 pub mod go_bridge;
-pub mod sessions;
-pub mod tool_runtime;
 pub mod mods;
 pub mod permissions;
+pub mod sessions;
+pub mod tool_runtime;
 pub mod tools;
 pub mod tui_worker;
 
@@ -491,7 +491,13 @@ pub fn run_turn_with_tools(
         sampling: orbit_adapter::types::SamplingParameters {
             temperature_milliunits: 700,
             top_p_millionths: 950_000,
-            max_output_tokens: 2048,
+            // Per-model output limit (defect fix: the old hard 2,048
+            // silently truncated long answers and file writes). Falls
+            // back to 32,000 when the model has no explicit limit.
+            max_output_tokens: crate::config::ProvidersConfig::load(home)
+                .ok()
+                .and_then(|c| c.max_output_tokens_for(model))
+                .unwrap_or(32_000) as u64,
         },
         output: orbit_adapter::types::OutputRequirements::Text,
         tools: tools.clone(),

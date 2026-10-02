@@ -485,13 +485,18 @@ mod tests {
     }
 
     #[test]
-    fn safe_text_redacts_secrets() {
-        assert_eq!(safe_text("api_key=secret"), "[redacted]");
+    fn safe_text_passes_words_and_urls() {
+        // Value-based gate: the WORD "api_key" and URLs are ordinary
+        // content (the old keyword rejection blanked them; real keys
+        // without the word passed).
+        assert_eq!(safe_text("api_key=secret"), "api_key=secret");
+        assert_eq!(safe_text("https://evil.com"), "https://evil.com");
     }
 
     #[test]
-    fn safe_text_redacts_urls() {
-        assert_eq!(safe_text("https://evil.com"), "[redacted]");
+    fn safe_text_redacts_real_secret_values() {
+        let out = safe_text("token = sk-abc123def456ghi789jkl012mno");
+        assert!(out.contains("[redacted:api token]"), "got: {out}");
     }
 
     #[test]
@@ -511,11 +516,16 @@ mod tests {
     }
 
     #[test]
-    fn emit_text_redacts_secrets() {
+    fn emit_text_redacts_cot_markers() {
         // D7: a rejected chunk emits a Redacted chip naming the gate — the
-        // text itself never reaches the bus.
+        // text itself never reaches the bus. CoT markers remain hard
+        // rejects; the word "api_key" alone no longer is one.
         let (bus, sender) = Bus::new();
-        emit_text(&mut CotStripper::new(), &sender, b"api_key=leaked");
+        emit_text(
+            &mut CotStripper::new(),
+            &sender,
+            b"chain_of_thought: leaked",
+        );
         let msgs = drain(&bus);
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {

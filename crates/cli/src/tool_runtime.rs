@@ -212,15 +212,12 @@ pub fn execute_call(
     // and everything else — deny rules are a durable fail-closed, allow
     // rules a durable consent. A malformed rules file degrades to ask
     // (never silently allow).
-    let rules = crate::permissions::PermissionRules::load(home)
-        .unwrap_or_else(|e| {
-            eprintln!("warning: permissions.toml: {e} (falling back to ask)");
-            crate::permissions::PermissionRules::default()
-        });
+    let rules = crate::permissions::PermissionRules::load(home).unwrap_or_else(|e| {
+        eprintln!("warning: permissions.toml: {e} (falling back to ask)");
+        crate::permissions::PermissionRules::default()
+    });
     let rule_verdict = rules.verdict(&call.name);
-    let verdict = if !known
-        || rule_verdict == crate::permissions::RuleVerdict::Deny
-    {
+    let verdict = if !known || rule_verdict == crate::permissions::RuleVerdict::Deny {
         ApprovalVerdict::Deny
     } else if rule_verdict == crate::permissions::RuleVerdict::Allow
         || auto_tools

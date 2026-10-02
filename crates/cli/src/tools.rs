@@ -320,6 +320,15 @@ pub fn parse_arguments(accumulated: &[u8]) -> Result<serde_json::Value, String> 
 }
 
 /// Validate a tool definition name against the built-in set (fail closed).
+/// Read-only classification (backend-authoritative). Read-only tools
+/// are parallel-safe AND allowed in plan mode — the model researches
+/// while planning. Every current built-in is a pure-data calculator;
+/// when write/shell tools land they classify false by default
+/// (fail toward caution, like `tool_risk`).
+pub fn is_read_only(name: &str) -> bool {
+    matches!(name, "calculator" | "current_session" | "list_models")
+}
+
 pub fn is_known_tool(name: &str) -> bool {
     builtin_tools().iter().any(|t| t.name == name)
 }

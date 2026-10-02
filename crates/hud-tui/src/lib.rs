@@ -22,6 +22,7 @@ pub mod msg;
 pub mod plain;
 pub mod render;
 mod rich;
+pub mod secret_scan;
 pub mod selection;
 pub mod state;
 mod terminal;
@@ -103,6 +104,11 @@ pub fn run(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
     let mut app = App::new();
     app.reduced_motion = design.caps.reduced_motion;
     app.bell_on_approval = design.caps.bell_on_approval;
+    // Welcome readiness: computed here, never fixture data. Trust root
+    // exists; ledger segment count is real; provider · model come from
+    // the worker's config via env (the spawner closure runs later, so
+    // read the same sources it will).
+    app.readiness = crate::state::compute_readiness(&home);
     let mut key_parser = KeyParser::new();
 
     // Initial size from the terminal.
@@ -317,7 +323,11 @@ fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSin
                 crate::state::ConnectionState::Reconnecting => "reconnecting",
                 crate::state::ConnectionState::Offline => "offline",
             };
-            let priced = if app.model_priced { "priced" } else { "unpriced" };
+            let priced = if app.model_priced {
+                "priced"
+            } else {
+                "unpriced"
+            };
             app.reduce(Msg::SystemMessage(format!(
                 "session {} · {} · model {} · {} · turns {} · in {} · out {} · ${:.4}",
                 app.session_id,
@@ -353,8 +363,7 @@ fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSin
         "/export" => {
             // Claude Code parity: dump the transcript to a file the operator
             // can keep. Default: markdown next to the session store.
-            let home = std::env::var("ORBIT_HOME")
-                .unwrap_or_else(|_| ".orbit".to_string());
+            let home = std::env::var("ORBIT_HOME").unwrap_or_else(|_| ".orbit".to_string());
             let dir = std::path::Path::new(&home).join("exports");
             let _ = std::fs::create_dir_all(&dir);
             let fname = format!("{}.md", app.session_id);
@@ -369,21 +378,14 @@ fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSin
                     crate::state::TranscriptLine::Assistant { text, .. } => {
                         ["## Assistant", text.as_str(), ""].join(NL)
                     }
-                    crate::state::TranscriptLine::System(t) => {
-                        ["> ", t.as_str()].join("")
-                    }
+                    crate::state::TranscriptLine::System(t) => ["> ", t.as_str()].join(""),
                     _ => String::new(),
                 })
                 .collect::<Vec<_>>()
                 .join(SEP);
             match std::fs::write(&path, body) {
-                Ok(()) => app.reduce(Msg::SystemMessage(format!(
-                    "exported → {}",
-                    path.display()
-                ))),
-                Err(e) => app.reduce(Msg::SystemMessage(format!(
-                    "export failed: {e}"
-                ))),
+                Ok(()) => app.reduce(Msg::SystemMessage(format!("exported → {}", path.display()))),
+                Err(e) => app.reduce(Msg::SystemMessage(format!("export failed: {e}"))),
             }
         }
         "/quit" | "/exit" => {
@@ -656,7 +658,7 @@ fn event_loop(
                         }
                         composer.push_block(&clean);
                         sender.send(Msg::ComposerChanged);
-        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+                        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
                     }
                 }
                 Event::Mouse(me) => {
@@ -912,9 +914,26 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 
 /// Plain-name list (Tab completion keeps its old shape).
 pub const SLASH_NAMES: &[&str] = &[
-    "/help", "/model", "/models", "/clear", "/usage", "/sessions", "/resume", "/cancel",
-    "/history", "/compact", "/undo", "/queue", "/status", "/cost", "/export", "/permissions",
-    "/mods", "/mod", "/quit", "/exit",
+    "/help",
+    "/model",
+    "/models",
+    "/clear",
+    "/usage",
+    "/sessions",
+    "/resume",
+    "/cancel",
+    "/history",
+    "/compact",
+    "/undo",
+    "/queue",
+    "/status",
+    "/cost",
+    "/export",
+    "/permissions",
+    "/mods",
+    "/mod",
+    "/quit",
+    "/exit",
 ];
 
 /// Tab completion for the composer (Claude Code QOL):
@@ -1021,42 +1040,52 @@ fn run_shell_passthrough(cmd: &str, sender: &BusSender) {
         return;
     }
     sender.send(Msg::SystemMessage(format!("$ {cmd}")));
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output();
-    match out {
-        Ok(o) => {
-            let code = o.status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&o.stdout).trim_end().to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).trim_end().to_string();
-            let mut block = stdout;
-            if !stderr.is_empty() {
-                if !block.is_empty() {
-                    block.push_str("  //  ");
+    // Run OFF the input thread: the UI stays live while the command
+    // works, and the result lands on the bus when it exits. (The old
+    // blocking .output() here froze every keypress until it returned.)
+    let sender2 = sender.clone();
+    let cmd2 = cmd.to_string();
+    std::thread::Builder::new()
+        .name("orbit-shell-passthrough".into())
+        .spawn(move || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd2)
+                .output();
+            match out {
+                Ok(o) => {
+                    let code = o.status.code().unwrap_or(-1);
+                    let stdout = String::from_utf8_lossy(&o.stdout).trim_end().to_string();
+                    let stderr = String::from_utf8_lossy(&o.stderr).trim_end().to_string();
+                    let mut block = stdout;
+                    if !stderr.is_empty() {
+                        if !block.is_empty() {
+                            block.push_str("  //  ");
+                        }
+                        block.push_str(&stderr);
+                    }
+                    if block.is_empty() {
+                        block = format!("(no output, exit {code})");
+                    }
+                    // Cap the block — a `find /` dump must not flood the transcript.
+                    const MAX: usize = 4000;
+                    let mut display = block;
+                    if display.chars().count() > MAX {
+                        let cut: String = display.chars().take(MAX).collect();
+                        let total = display.chars().count();
+                        display = format!("{cut}… (+{} chars)", total - MAX);
+                    }
+                    sender2.send(Msg::SystemMessage(display));
+                    if code != 0 {
+                        sender2.send(Msg::SystemMessage(format!("exit {code}")));
+                    }
                 }
-                block.push_str(&stderr);
+                Err(e) => {
+                    sender2.send(Msg::SystemMessage(format!("shell failed: {e}")));
+                }
             }
-            if block.is_empty() {
-                block = format!("(no output, exit {code})");
-            }
-            // Cap the block — a `find /` dump must not flood the transcript.
-            const MAX: usize = 4000;
-            let mut display = block;
-            if display.chars().count() > MAX {
-                let cut: String = display.chars().take(MAX).collect();
-                let total = display.chars().count();
-                display = format!("{cut}… (+{} chars)", total - MAX);
-            }
-            sender.send(Msg::SystemMessage(display));
-            if code != 0 {
-                sender.send(Msg::SystemMessage(format!("exit {code}")));
-            }
-        }
-        Err(e) => {
-            sender.send(Msg::SystemMessage(format!("shell failed: {e}")));
-        }
-    }
+        })
+        .ok();
 }
 
 /// Expand `@path` mentions in a prompt into inline file contents
@@ -1067,6 +1096,38 @@ fn run_shell_passthrough(cmd: &str, sender: &BusSender) {
 ///   ```
 /// Paths that don't read leave the mention untouched — the model (and the
 /// operator) sees the dangling reference rather than silent nothing.
+/// Deny-read list: paths whose contents must NEVER enter a prompt or a
+/// provider request, regardless of tool or permission (Claude Code has
+/// no such default; ORBIT's credential promise requires one).
+pub fn deny_read_reason(path: &str) -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let p = path.trim_start_matches(&format!("{home}/"));
+    let base = std::path::Path::new(p)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+    let deny_prefixes = [".ssh/", ".aws/", ".gnupg/", ".netrc"];
+    let env_like = base.starts_with(".env") || base == "credentials";
+    if deny_prefixes.iter().any(|d| p.starts_with(d)) || env_like {
+        return Some("credential path is on the deny-read list".into());
+    }
+    if p.contains("trust/") && p.contains(".orbit") {
+        return Some("trust material is never read".into());
+    }
+    None
+}
+
+/// Value-based secret scan of a file's CONTENTS (not its name): refuse
+/// expansion when the file carries a private key block or a high-entropy
+/// token. Keyword rejection blanked ordinary code; this looks for key
+/// SHAPES.
+pub fn secret_scan_reason_path(path: &str) -> Option<String> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return None; // unreadable files stay as dangling mentions
+    };
+    crate::secret_scan::scan_text(&body)
+}
+
 fn expand_file_mentions(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -1082,34 +1143,53 @@ fn expand_file_mentions(text: &str) -> String {
             rest = &after[1..];
             continue;
         }
-        let path_txt = candidate.strip_prefix("~/").map(|r| {
-            std::env::var("HOME").map(|h| format!("{h}/{r}")).unwrap_or(candidate.clone())
-        }).unwrap_or_else(|| candidate.clone());
-        match std::fs::read_to_string(&path_txt) {
-            Ok(mut body) => {
-                const MAX: usize = 10_000;
-                if body.chars().count() > MAX {
-                    let cut: String = body.chars().take(MAX).collect();
-                    let total = body.chars().count();
-                    body = format!("{cut}\u{2026} (+{} chars truncated)", total - MAX);
+        let path_txt = candidate
+            .strip_prefix("~/")
+            .map(|r| {
+                std::env::var("HOME")
+                    .map(|h| format!("{h}/{r}"))
+                    .unwrap_or(candidate.clone())
+            })
+            .unwrap_or_else(|| candidate.clone());
+        // Credential guard: the deny-read list every @mention must pass
+        // before its bytes enter a prompt. ORBIT's promise is that
+        // credentials never reach a provider — the mention itself stays
+        // visible (dangling, with the reason) so the operator sees why.
+        if let Some(reason) = deny_read_reason(&path_txt) {
+            out.push('@');
+            out.push_str(&candidate);
+            out.push_str(&format!(" [refused: {reason}]"));
+        } else if let Some(reason) = secret_scan_reason_path(&path_txt) {
+            out.push('@');
+            out.push_str(&candidate);
+            out.push_str(&format!(" [refused: {reason}]"));
+        } else {
+            match std::fs::read_to_string(&path_txt) {
+                Ok(mut body) => {
+                    const MAX: usize = 10_000;
+                    if body.chars().count() > MAX {
+                        let cut: String = body.chars().take(MAX).collect();
+                        let total = body.chars().count();
+                        body = format!("{cut}\u{2026} (+{} chars truncated)", total - MAX);
+                    }
+                    let lang = std::path::Path::new(&path_txt)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    let mut block = String::new();
+                    block.push_str("@");
+                    block.push_str(&candidate);
+                    block.push_str("\n```");
+                    block.push_str(lang);
+                    block.push('\n');
+                    block.push_str(body.trim_end());
+                    block.push_str("\n```");
+                    out.push_str(&block);
                 }
-                let lang = std::path::Path::new(&path_txt)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                let mut block = String::new();
-                block.push_str("@");
-                block.push_str(&candidate);
-                block.push_str("\n```");
-                block.push_str(lang);
-                block.push('\n');
-                block.push_str(body.trim_end());
-                block.push_str("\n```");
-                out.push_str(&block);
-            }
-            Err(_) => {
-                out.push('@');
-                out.push_str(&candidate);
+                Err(_) => {
+                    out.push('@');
+                    out.push_str(&candidate);
+                }
             }
         }
         let consumed = 1 + candidate.chars().count();
@@ -1299,7 +1379,7 @@ fn handle_key(
         } else if !composer.text().is_empty() {
             composer.clear_stash();
             sender.send(Msg::ComposerChanged);
-        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+            sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
             sender.send(Msg::SystemMessage("input cleared (Esc restores)".into()));
         } else {
             sender.send(Msg::CtrlC);
@@ -1493,7 +1573,7 @@ fn handle_key(
                 if let Some(restored) = composer.take_cleared() {
                     let _ = restored;
                     sender.send(Msg::ComposerChanged);
-        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+                    sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
                     return;
                 }
                 sender.send(Msg::InputModeChanged(crate::state::InputMode::Normal));
@@ -1504,7 +1584,7 @@ fn handle_key(
             // the operator has a beat before the mode flips.
             composer.clear_stash();
             sender.send(Msg::ComposerChanged);
-        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+            sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
             return;
         }
         KeyCode::Char('i') | KeyCode::Enter
@@ -1565,7 +1645,7 @@ fn handle_key(
         if let Some(replacement) = complete_composer(composer.text()) {
             *composer.text_mut() = replacement;
             sender.send(Msg::ComposerChanged);
-        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+            sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
             return;
         }
         // No completion found — fall through to focus navigation.
@@ -1638,21 +1718,20 @@ fn handle_key(
     // Input history (Claude Code QOL): ↑/↓ walk previously-submitted
     // prompts while the composer is focused in INSERT mode. The draft is
     // stashed on first ↑ and restored on ↓-past-the-end.
-    if app.focus == crate::state::Focus::Center
-        && app.input_mode == crate::state::InputMode::Insert
+    if app.focus == crate::state::Focus::Center && app.input_mode == crate::state::InputMode::Insert
     {
         match key.code {
             KeyCode::Up if !composer.text().contains('\n') => {
                 if composer.history_prev() {
                     sender.send(Msg::ComposerChanged);
-        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+                    sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
                 }
                 return;
             }
             KeyCode::Down if !composer.text().contains('\n') => {
                 if composer.history_next() {
                     sender.send(Msg::ComposerChanged);
-        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+                    sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
                 }
                 return;
             }
@@ -1679,7 +1758,7 @@ fn handle_key(
         if let KeyCode::Char(c) = key.code {
             composer.push(c);
             sender.send(Msg::ComposerChanged);
-        sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
+            sender.send(Msg::ComposerTextChanged(composer.text().to_string()));
             return;
         }
     }

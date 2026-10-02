@@ -1,6 +1,8 @@
 # ORBIT v0.1 — specification manifest
 # Generated 2026-08-12. Machine-readable summary of the frozen spec.
-# STATUS: specification-frozen YES (2026-08-12, founder sign-off). Implementation not started.
+# STATUS: specification-frozen YES (2026-08-12, founder sign-off).
+# Implementation follows the six-phase roadmap (docs/roadmap/); gate
+# status there is authoritative for implementation progress.
 
 orbit_version: 0.1.0
 schema: orbit.spec-manifest.v1

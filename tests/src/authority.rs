@@ -233,9 +233,13 @@ fn brand_tier_no_runtime_promote() {
 /// display_safe_string_scrub — the HUD gate scrubs prompt/secret/URL patterns.
 #[test]
 fn display_safe_string_scrub() {
+    // Value-based gate: words and URLs pass; real secret VALUES redact
+    // in place (the old keyword rejection is gone).
     assert!(orbit_hud::display_safe("task completed").is_ok());
-    assert!(orbit_hud::display_safe("api_key=123").is_err());
-    assert!(orbit_hud::display_safe("https://x.com").is_err());
+    assert!(orbit_hud::display_safe("api_key=123").is_ok());
+    assert!(orbit_hud::display_safe("https://x.com").is_ok());
+    let out = orbit_hud::display_safe("token = sk-abc123def456ghi789jkl012mno").unwrap();
+    assert!(out.contains("[redacted:api token]"), "got: {out}");
 }
 
 /// display_safety_no_prompt_bytes — prompt bytes never reach the HUD.
