@@ -32,8 +32,8 @@ pub mod worker;
 pub use approval::{ApprovalRegistry, ApprovalResponse};
 pub use bridge::{
     emit_cost, emit_error, emit_response_finished, emit_status, emit_text, emit_tool_finished,
-    emit_tool_started, emit_turn_cost, emit_workspace, safe_text, sanitize_glyphs, strip_cot,
-    CotStripper,
+    emit_tool_started, emit_turn_cost, emit_workspace, safe_text, safe_text_probe, sanitize_glyphs,
+    strip_cot, CotStripper,
 };
 pub use state::RedactionKind;
 pub use worker::{CommandSink, WorkerCommand, WorkerCtx, WorkerSpawner};
@@ -196,6 +196,10 @@ fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSin
     if trimmed.is_empty() {
         return;
     }
+    // Newline / section separators (kept out of format strings so no
+    // escaped literals lurk in the source).
+    const NL: &str = "\n";
+    const SEP: &str = "\n---\n\n";
 
     // Plain quit/exit (REPL parity — no leading slash needed).
     if trimmed == "quit" || trimmed == "exit" {
@@ -212,8 +216,16 @@ fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSin
     match name {
         "/help" => {
             app.reduce(Msg::SystemMessage(
-                "commands: exit, /help, /model <M>, /clear, /usage, /models, /sessions, /resume <id>, /cancel"
+                "commands: exit, /help, /model <M>, /clear, /usage, /models, /sessions, /resume <id>, /cancel, /history, /compact, /undo, /queue, /status, /cost, /export, /mods, /mod <name> — ! <cmd> runs shell — keys: ↑/↓ history, Ctrl+U clear line, Ctrl+W del word, Shift+Enter newline, Tab complete, z y copy transcript"
                     .into(),
+            ));
+        }
+        "/history" => {
+            // The composer's own history, mirrored into a system message
+            // (the event loop owns the composer; the reducer can't see it).
+            let _ = app; // history lives in the composer, shown on ↑/↓
+            app.reduce(Msg::SystemMessage(
+                "input history: use ↑ / ↓ in the composer".into(),
             ));
         }
         "/clear" => {
@@ -259,8 +271,136 @@ fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSin
                 app.reduce(Msg::SystemMessage("no turn in flight".into()));
             }
         }
+        "/compact" => {
+            let _ = command_sink.send(WorkerCommand::Compact);
+        }
+        "/undo" => {
+            let _ = command_sink.send(WorkerCommand::Undo);
+        }
+        "/queue" => {
+            // Claude Code parity: show / manage queued prompts.
+            if arg == "clear" {
+                let n = app.queued.len();
+                app.queued.clear();
+                app.reduce(Msg::SystemMessage(format!("cleared {n} queued prompt(s)")));
+            } else if app.queued.is_empty() {
+                app.reduce(Msg::SystemMessage("queue is empty".into()));
+            } else {
+                let snapshot: Vec<String> = app.queued.clone();
+                for (i, q) in snapshot.iter().enumerate() {
+                    app.reduce(Msg::SystemMessage(format!("queue[{}]: {}", i + 1, q)));
+                }
+            }
+        }
+        "/mods" => {
+            if arg == "refresh" {
+                let _ = command_sink.send(WorkerCommand::RefreshMods);
+            } else {
+                let _ = command_sink.send(WorkerCommand::ListInstalledMods);
+            }
+        }
+        "/mod" => {
+            if arg.is_empty() {
+                app.reduce(Msg::SystemMessage("usage: /mod <name>".into()));
+            } else {
+                let _ = command_sink.send(WorkerCommand::ToggleMod(arg.to_string()));
+            }
+        }
+        "/status" => {
+            // Claude Code parity: a one-glance session summary.
+            let conn = match app.connection {
+                crate::state::ConnectionState::Online => "online",
+                crate::state::ConnectionState::Reconnecting => "reconnecting",
+                crate::state::ConnectionState::Offline => "offline",
+            };
+            let priced = if app.model_priced { "priced" } else { "unpriced" };
+            app.reduce(Msg::SystemMessage(format!(
+                "session {} · {} · model {} · {} · turns {} · in {} · out {} · ${:.4}",
+                app.session_id,
+                conn,
+                app.model,
+                priced,
+                app.total_turns,
+                app.total_input_tokens,
+                app.total_output_tokens,
+                app.total_cost_microcents as f64 / 1_000_000.0,
+            )));
+        }
+        "/cost" => {
+            // Claude Code parity: per-turn + cumulative cost view.
+            let turn = app.turn_cost_microcents as f64 / 1_000_000.0;
+            let total = app.total_cost_microcents as f64 / 1_000_000.0;
+            let avg = if app.total_turns > 0 {
+                total / app.total_turns as f64
+            } else {
+                0.0
+            };
+            if app.turn_in_flight {
+                app.reduce(Msg::SystemMessage(format!(
+                    "turn (running): ${turn:.4} · session total: ${total:.4} · avg/turn: ${avg:.4}"
+                )));
+            } else {
+                app.reduce(Msg::SystemMessage(format!(
+                    "session total: ${total:.4} · {} turns · avg: ${avg:.4}",
+                    app.total_turns
+                )));
+            }
+        }
+        "/export" => {
+            // Claude Code parity: dump the transcript to a file the operator
+            // can keep. Default: markdown next to the session store.
+            let home = std::env::var("ORBIT_HOME")
+                .unwrap_or_else(|_| ".orbit".to_string());
+            let dir = std::path::Path::new(&home).join("exports");
+            let _ = std::fs::create_dir_all(&dir);
+            let fname = format!("{}.md", app.session_id);
+            let path = dir.join(&fname);
+            let body = app
+                .transcript
+                .iter()
+                .map(|l| match l {
+                    crate::state::TranscriptLine::User { text, .. } => {
+                        ["## User", text.as_str(), ""].join(NL)
+                    }
+                    crate::state::TranscriptLine::Assistant { text, .. } => {
+                        ["## Assistant", text.as_str(), ""].join(NL)
+                    }
+                    crate::state::TranscriptLine::System(t) => {
+                        ["> ", t.as_str()].join("")
+                    }
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join(SEP);
+            match std::fs::write(&path, body) {
+                Ok(()) => app.reduce(Msg::SystemMessage(format!(
+                    "exported → {}",
+                    path.display()
+                ))),
+                Err(e) => app.reduce(Msg::SystemMessage(format!(
+                    "export failed: {e}"
+                ))),
+            }
+        }
         "/quit" | "/exit" => {
             app.reduce(Msg::RequestQuit);
+        }
+        _ if trimmed.contains(':') && trimmed.starts_with('/') => {
+            // Mod-contributed command: /<mod>:<cmd>
+            let body = trimmed.trim_start_matches('/');
+            match body.split_once(':') {
+                Some((mod_name, cmd_name)) if !mod_name.is_empty() && !cmd_name.is_empty() => {
+                    let _ = command_sink.send(WorkerCommand::ModCommand(
+                        mod_name.to_string(),
+                        cmd_name.to_string(),
+                    ));
+                }
+                _ => {
+                    app.reduce(Msg::SystemMessage(format!(
+                        "unknown command: {trimmed}; try /help"
+                    )));
+                }
+            }
         }
         _ => {
             app.reduce(Msg::SystemMessage(format!(
@@ -475,13 +615,23 @@ fn event_loop(
                     // auto-submitted. Sanitize control chars that terminals
                     // can smuggle inside a paste (ESC, CSI leaders) — the
                     // paste is data, never key bindings.
-                    if app.focus == crate::state::Focus::Center
-                        && app.input_mode == crate::state::InputMode::Insert
-                    {
-                        let clean: String = text
-                            .chars()
-                            .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
-                            .collect();
+                    //
+                    // A paste is unambiguous intent to type: it lands from
+                    // ANY focus and ANY mode (Normal, palette open, workspace
+                    // pane). Pasting while in Normal mode re-enters Insert
+                    // and focuses the composer — silently dropping the paste
+                    // (the old behaviour) reads as "paste is broken".
+                    let clean: String = text
+                        .chars()
+                        .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
+                        .collect();
+                    if !clean.is_empty() {
+                        if app.focus != crate::state::Focus::Center {
+                            sender.send(Msg::KeyAction(KeyAction::FocusCenter));
+                        }
+                        if app.input_mode != crate::state::InputMode::Insert {
+                            sender.send(Msg::KeyAction(KeyAction::EnterInsert));
+                        }
                         composer.push_block(&clean);
                         sender.send(Msg::ComposerChanged);
                     }
@@ -517,7 +667,9 @@ fn hhmm_now() -> String {
 /// native text selection.
 fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(), String> {
     use crossterm::cursor::{Hide, Show};
-    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    };
     use crossterm::execute;
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -528,6 +680,7 @@ fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(),
         std::io::stdout(),
         Show,
         DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen
     )
     .map_err(|e| format!("leave alt screen: {e}"))?;
@@ -563,11 +716,15 @@ fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(),
     // Mouse capture (SGR mode): the app owns the mouse so selection can
     // be per-pane (the host terminal's native selection grabs across
     // pane borders — it doesn't know they exist).
+    // Bracketed paste must be RE-ENABLED — the copy-mode teardown disabled
+    // it, and the host terminal only sends paste sequences while the mode
+    // is on. Missing this was the "paste stops working after /copy" bug.
     execute!(
         std::io::stdout(),
         EnterAlternateScreen,
         Hide,
-        EnableMouseCapture
+        EnableMouseCapture,
+        EnableBracketedPaste
     )
     .map_err(|e| format!("enter alt screen: {e}"))?;
 
@@ -577,9 +734,18 @@ fn enter_copy_mode(guard: &mut terminal::TerminalGuard, app: &App) -> Result<(),
     Ok(())
 }
 /// `Enter` sends; `Shift+Enter` inserts a newline.
+/// Input history (Claude Code QOL): ↑/↓ walk previously-submitted prompts;
+/// the in-progress draft is stashed while browsing and restored on ↓-past-end.
 #[derive(Debug, Default)]
 pub struct Composer {
     text: String,
+    history: Vec<String>,
+    /// Index into history while browsing (None = not browsing).
+    history_pos: Option<usize>,
+    /// The draft being edited when ↑ first entered history.
+    draft: String,
+    /// A draft cleared by Esc/Ctrl+C — restorable by one more Esc.
+    cleared_stash: String,
 }
 
 impl Composer {
@@ -589,6 +755,10 @@ impl Composer {
     pub fn text(&self) -> &str {
         &self.text
     }
+    /// Replace the whole draft (Tab completion writes here).
+    pub fn text_mut(&mut self) -> &mut String {
+        &mut self.text
+    }
     pub fn push(&mut self, ch: char) {
         self.text.push(ch);
     }
@@ -597,6 +767,52 @@ impl Composer {
     }
     pub fn newline(&mut self) {
         self.text.push('\n');
+    }
+    /// Record the line being submitted into history (dedup vs the previous
+    /// entry — resubmitting `r` must not stack duplicates).
+    pub fn history_record(&mut self, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        if self.history.last().map(String::as_str) != Some(line) {
+            self.history.push(line.to_string());
+        }
+        self.history_pos = None;
+        self.draft.clear();
+    }
+    /// ↑ — step to the previous (older) history entry. True if the text
+    /// changed (a redraw is needed).
+    pub fn history_prev(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        let pos = match self.history_pos {
+            None => {
+                self.draft = self.text.clone();
+                self.history.len() - 1
+            }
+            Some(0) => return false, // already at the oldest entry
+            Some(p) => p - 1,
+        };
+        self.history_pos = Some(pos);
+        self.text = self.history[pos].clone();
+        true
+    }
+    /// ↓ — step to the next (newer) entry; past the end restores the draft.
+    pub fn history_next(&mut self) -> bool {
+        let Some(mut pos) = self.history_pos else {
+            return false;
+        };
+        if pos + 1 < self.history.len() {
+            pos += 1;
+            self.history_pos = Some(pos);
+            self.text = self.history[pos].clone();
+        } else {
+            // Past the newest → back to the stashed draft.
+            self.history_pos = None;
+            self.text = self.draft.clone();
+        }
+        true
     }
     /// D12: bracketed-paste insertion. The whole block lands as one edit
     /// (one undo unit, one ComposerChanged); CRLF/CR newlines normalize
@@ -618,9 +834,240 @@ impl Composer {
     pub fn clear(&mut self) {
         self.text.clear();
     }
+    /// Clear but stash the draft — one Esc restores it (undo-clear).
+    pub fn clear_stash(&mut self) {
+        self.cleared_stash = std::mem::take(&mut self.text);
+        self.history_pos = None;
+    }
+    /// Restore a stashed (just-cleared) draft. None if nothing to restore.
+    pub fn take_cleared(&mut self) -> Option<String> {
+        let stash = std::mem::take(&mut self.cleared_stash);
+        if stash.is_empty() {
+            None
+        } else {
+            self.text = stash.clone();
+            Some(stash)
+        }
+    }
     pub fn take(&mut self) -> String {
+        self.history_pos = None;
+        self.draft.clear();
         std::mem::take(&mut self.text)
     }
+}
+
+/// Slash-command registry for Tab completion + the palette.
+const SLASH_COMMANDS: &[&str] = &[
+    "/help", "/model", "/models", "/clear", "/usage", "/sessions", "/resume", "/cancel",
+    "/history", "/compact", "/undo", "/queue", "/status", "/cost", "/export", "/mods", "/mod",
+    "/quit", "/exit",
+];
+
+/// Tab completion for the composer (Claude Code QOL):
+/// - A lone `/word` prefix completes against SLASH_COMMANDS.
+/// - Otherwise the last word is treated as a file path and completed
+///   against the filesystem (relative to cwd).
+/// Returns the full replacement text, or None when nothing matches.
+fn complete_composer(text: &str) -> Option<String> {
+    let (head, tail) = match text.rfind(char::is_whitespace) {
+        Some(i) => (&text[..=i], &text[i + 1..]),
+        None => ("", text),
+    };
+    // Slash command completion only when the command is the whole input.
+    if head.is_empty() && tail.starts_with('/') {
+        let matches: Vec<&str> = SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|c| c.starts_with(tail))
+            .collect();
+        return match matches.as_slice() {
+            [] => None,
+            [only] => Some(format!("{only} ")),
+            // Multiple: complete to the shared prefix.
+            many => {
+                let mut prefix = many[0].to_string();
+                for c in &many[1..] {
+                    let shared = prefix
+                        .chars()
+                        .zip(c.chars())
+                        .take_while(|(a, b)| a == b)
+                        .map(|(a, _)| a)
+                        .collect::<String>();
+                    prefix = shared;
+                }
+                if prefix.len() > tail.len() {
+                    Some(prefix)
+                } else {
+                    None
+                }
+            }
+        };
+    }
+    // File-path completion: only when the fragment looks path-y (contains
+    // / or . or starts with ~). Avoids hijacking ordinary words.
+    if !(tail.contains('/') || tail.starts_with('.') || tail.starts_with('~')) {
+        return None;
+    }
+    let expanded = if let Some(rest) = tail.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/{rest}")
+    } else {
+        tail.to_string()
+    };
+    let (dir_part, file_part) = match expanded.rfind('/') {
+        Some(i) => (expanded[..=i].to_string(), &expanded[i + 1..]),
+        None => (String::from("./"), expanded.as_str()),
+    };
+    let dir = std::path::Path::new(&dir_part);
+    let mut best: Option<String> = None;
+    let mut multi = false;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(file_part) {
+                let full = if entry.path().is_dir() {
+                    format!("{dir_part}{name}/")
+                } else {
+                    format!("{dir_part}{name}")
+                };
+                match best.take() {
+                    None => best = Some(full),
+                    Some(prev) => {
+                        let shared: String = prev
+                            .chars()
+                            .zip(full.chars())
+                            .take_while(|(a, b)| a == b)
+                            .map(|(a, _)| a)
+                            .collect();
+                        best = Some(shared);
+                        multi = true;
+                    }
+                }
+            }
+        }
+    }
+    // A directory completion (trailing /) is always useful; a bare shared
+    // prefix only when it extends the fragment.
+    match best {
+        Some(b) if b.len() > tail.len() => Some(format!("{head}{b}")),
+        Some(b) if b.ends_with('/') => Some(format!("{head}{b}")),
+        _ if multi => None,
+        _ => None,
+    }
+}
+
+/// `! <cmd>` shell passthrough (Claude Code QOL): run the command with
+/// the shell, capture output, and append it to the transcript as a system
+/// block. The TUI stays live — output arrives after the process exits
+/// (long runners should be backgrounded by the operator).
+fn run_shell_passthrough(cmd: &str, sender: &BusSender) {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        sender.send(Msg::SystemMessage("usage: ! <shell command>".into()));
+        return;
+    }
+    sender.send(Msg::SystemMessage(format!("$ {cmd}")));
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output();
+    match out {
+        Ok(o) => {
+            let code = o.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&o.stdout).trim_end().to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).trim_end().to_string();
+            let mut block = stdout;
+            if !stderr.is_empty() {
+                if !block.is_empty() {
+                    block.push_str("  //  ");
+                }
+                block.push_str(&stderr);
+            }
+            if block.is_empty() {
+                block = format!("(no output, exit {code})");
+            }
+            // Cap the block — a `find /` dump must not flood the transcript.
+            const MAX: usize = 4000;
+            let mut display = block;
+            if display.chars().count() > MAX {
+                let cut: String = display.chars().take(MAX).collect();
+                let total = display.chars().count();
+                display = format!("{cut}… (+{} chars)", total - MAX);
+            }
+            sender.send(Msg::SystemMessage(display));
+            if code != 0 {
+                sender.send(Msg::SystemMessage(format!("exit {code}")));
+            }
+        }
+        Err(e) => {
+            sender.send(Msg::SystemMessage(format!("shell failed: {e}")));
+        }
+    }
+}
+
+/// Expand `@path` mentions in a prompt into inline file contents
+/// (Claude Code `@`-mention parity). Each mention becomes:
+///   @path
+///   ```<lang>
+///   <contents, capped at 10_000 chars>
+///   ```
+/// Paths that don't read leave the mention untouched — the model (and the
+/// operator) sees the dangling reference rather than silent nothing.
+fn expand_file_mentions(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        let (before, after) = rest.split_at(at);
+        out.push_str(before);
+        let candidate: String = after[1..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '@')
+            .collect();
+        if candidate.is_empty() {
+            out.push('@');
+            rest = &after[1..];
+            continue;
+        }
+        let path_txt = candidate.strip_prefix("~/").map(|r| {
+            std::env::var("HOME").map(|h| format!("{h}/{r}")).unwrap_or(candidate.clone())
+        }).unwrap_or_else(|| candidate.clone());
+        match std::fs::read_to_string(&path_txt) {
+            Ok(mut body) => {
+                const MAX: usize = 10_000;
+                if body.chars().count() > MAX {
+                    let cut: String = body.chars().take(MAX).collect();
+                    let total = body.chars().count();
+                    body = format!("{cut}\u{2026} (+{} chars truncated)", total - MAX);
+                }
+                let lang = std::path::Path::new(&path_txt)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let mut block = String::new();
+                block.push_str("@");
+                block.push_str(&candidate);
+                block.push_str("\n```");
+                block.push_str(lang);
+                block.push('\n');
+                block.push_str(body.trim_end());
+                block.push_str("\n```");
+                out.push_str(&block);
+            }
+            Err(_) => {
+                out.push('@');
+                out.push_str(&candidate);
+            }
+        }
+        let consumed = 1 + candidate.chars().count();
+        let skip: usize = after
+            .char_indices()
+            .nth(consumed)
+            .map(|(i, _)| i)
+            .unwrap_or(after.len());
+        rest = &after[skip..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// True if a character key should go into the composer (not the key parser):
@@ -760,10 +1207,11 @@ fn handle_key(
 
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    // Ctrl+C → deny pending approvals first (D8: the operator's interrupt
-    // intent applies to the modal in front of them — releasing the parked
-    // worker — not to the whole session). Then cancel the in-flight turn if
-    // streaming; otherwise the double-press-to-quit flow.
+    // Ctrl+C (Claude Code semantics, layered by what's in front of the
+    // operator): approvals pending → deny all; turn streaming → cancel it;
+    // composer has text → clear the draft (one press, no modal); otherwise
+    // a status hint — a second press within 2 s quits. No blocking modal:
+    // the operator can always select+copy text from the terminal.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if !app.pending_approvals.is_empty() {
             let denied = approvals.deny_all();
@@ -776,6 +1224,10 @@ fn handle_key(
         } else if app.turn_in_flight && app.tool_state != crate::state::ToolState::AwaitingApproval
         {
             sender.send(Msg::CancelTurn);
+        } else if !composer.text().is_empty() {
+            composer.clear_stash();
+            sender.send(Msg::ComposerChanged);
+            sender.send(Msg::SystemMessage("input cleared (Esc restores)".into()));
         } else {
             sender.send(Msg::CtrlC);
         }
@@ -963,11 +1415,20 @@ fn handle_key(
     match key.code {
         KeyCode::Esc if app.input_mode == crate::state::InputMode::Insert => {
             if composer.text.is_empty() {
+                // A just-cleared draft can be brought back with Esc once
+                // more (undo for the Ctrl+C clear — Claude Code parity).
+                if let Some(restored) = composer.take_cleared() {
+                    let _ = restored;
+                    sender.send(Msg::ComposerChanged);
+                    return;
+                }
                 sender.send(Msg::InputModeChanged(crate::state::InputMode::Normal));
                 return;
             }
-            // Text present: Esc clears the composer first (existing feel).
-            composer.clear();
+            // Text present: first Esc clears the draft (kept for one more
+            // Esc-press as undo); a second Esc drops to NORMAL. Staged so
+            // the operator has a beat before the mode flips.
+            composer.clear_stash();
             sender.send(Msg::ComposerChanged);
             return;
         }
@@ -978,6 +1439,22 @@ fn handle_key(
             return;
         }
         _ => {}
+    }
+
+    // Tab (Claude Code QOL): with the composer focused, INSERT mode, and
+    // text present, Tab COMPLETES (slash command or file path) — it only
+    // navigates focus when the composer is empty or unfocused.
+    if matches!(key.code, KeyCode::Tab)
+        && app.focus == crate::state::Focus::Center
+        && app.input_mode == crate::state::InputMode::Insert
+        && !composer.text().is_empty()
+    {
+        if let Some(replacement) = complete_composer(composer.text()) {
+            *composer.text_mut() = replacement;
+            sender.send(Msg::ComposerChanged);
+            return;
+        }
+        // No completion found — fall through to focus navigation.
     }
 
     // Focus navigation is global: Tab/BackTab must reach the key parser even
@@ -996,16 +1473,26 @@ fn handle_key(
         return;
     }
 
-    // Enter (no shift) sends the composer. A leading `/` (or bare quit/exit)
-    // is a command, not a prompt — the event loop parses it.
+    // Enter (no shift) sends the composer. A leading `/` (command), `!`
+    // (shell passthrough), or bare quit/exit — the event loop parses it.
     if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
         let text = composer.take();
+        composer.history_record(text.trim());
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            if trimmed.starts_with('/') || trimmed == "quit" || trimmed == "exit" {
+            if trimmed == "quit" || trimmed == "exit" {
+                sender.send(Msg::SlashCommand(text));
+            } else if let Some(shell_cmd) = trimmed.strip_prefix('!') {
+                run_shell_passthrough(shell_cmd, sender);
+            } else if trimmed.starts_with('/') {
                 sender.send(Msg::SlashCommand(text));
             } else {
-                sender.send(Msg::TextSubmitted(text));
+                // @file mention expansion (Claude Code QOL): each @path in
+                // the prompt is replaced by the file's contents in a fenced
+                // block (capped). Missing files leave the mention as-is so
+                // the operator sees what failed.
+                let expanded = expand_file_mentions(&text);
+                sender.send(Msg::TextSubmitted(expanded));
             }
         }
         sender.send(Msg::ComposerChanged);
@@ -1019,6 +1506,36 @@ fn handle_key(
         } else {
             composer.pop();
         }
+        sender.send(Msg::ComposerChanged);
+        return;
+    }
+
+    // Input history (Claude Code QOL): ↑/↓ walk previously-submitted
+    // prompts while the composer is focused in INSERT mode. The draft is
+    // stashed on first ↑ and restored on ↓-past-the-end.
+    if app.focus == crate::state::Focus::Center
+        && app.input_mode == crate::state::InputMode::Insert
+    {
+        match key.code {
+            KeyCode::Up if !composer.text().contains('\n') => {
+                if composer.history_prev() {
+                    sender.send(Msg::ComposerChanged);
+                }
+                return;
+            }
+            KeyCode::Down if !composer.text().contains('\n') => {
+                if composer.history_next() {
+                    sender.send(Msg::ComposerChanged);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Ctrl+U: kill to line start (readline QOL).
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        composer.clear();
         sender.send(Msg::ComposerChanged);
         return;
     }

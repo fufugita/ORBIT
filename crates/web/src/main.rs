@@ -35,9 +35,21 @@ fn main() {
     let gate = value_after(&args, "--gate")
         .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
         .unwrap_or_else(|| "http://127.0.0.1:4001".into());
+    // Model precedence: --model flag > ORBIT_MODEL > first configured
+    // model in providers.toml. Never hardcode an id: a default that
+    // matches no provider falls through to the generic gate URL, which
+    // 401s (or worse) on every turn.
+    let cfg_for_default = orbit_cli::config::ProvidersConfig::load(&home).unwrap_or_default();
     let model = value_after(&args, "--model")
         .or_else(|| std::env::var("ORBIT_MODEL").ok())
-        .unwrap_or_else(|| "glm-5.2".into());
+        .or_else(|| {
+            cfg_for_default
+                .all_models()
+                .into_iter()
+                .next()
+                .map(|(_, m)| m)
+        })
+        .unwrap_or_else(|| "mock-echo".into());
     let port: u16 = value_after(&args, "--port")
         .and_then(|p| p.parse().ok())
         .unwrap_or(4173);
@@ -110,8 +122,7 @@ fn main() {
         bind,
         port,
         token,
-        no_turn_thread: false,
-    }));
+            }));
 }
 
 /// Session id without importing the whole gateway dep chain: ULID-shaped,

@@ -79,6 +79,10 @@ fn worker_main(
     // not per provider round, and not per turn — so `R` means what its
     // label says. Reset on resume and on a new session.
     let mut auto_grants = crate::tool_runtime::AutoGrants::new();
+    // Mods (Claude-Mods parity): loaded once at boot, toggleable at
+    // runtime. The directive is rebuilt whenever the enabled set changes.
+    let mut mods = crate::mods::load_all(&config.home);
+    let mut mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
 
     // Send identity to the TUI so the status bar shows model/provider/session.
     // D18: priced=false makes the status bar show `cost n/a` for models
@@ -108,13 +112,23 @@ fn worker_main(
             turns: config.initial_turns,
         });
     }
-    while let Ok(cmd) = ctx.command_rx.recv() {
+    // Locally-queued commands (mod commands re-enter the Prompt flow).
+    let mut pending: Vec<WorkerCommand> = Vec::new();
+    loop {
+        let cmd = match pending.pop() {
+            Some(c) => c,
+            None => match ctx.command_rx.recv() {
+                Ok(c) => c,
+                Err(_) => break,
+            },
+        };
         match cmd {
             WorkerCommand::Prompt(prompt) => {
                 let token = orbit_provider_http::CancelToken::new();
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = Some(token.clone());
                 }
+                let directive = crate::mods::system_directive(&mods, &mods_enabled);
                 let (_ok, input, output, cost) = match run_tui_turn(
                     &config,
                     &mut transcript,
@@ -124,6 +138,7 @@ fn worker_main(
                     &token,
                     turns,
                     &mut auto_grants,
+                    &directive,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
@@ -259,6 +274,265 @@ fn worker_main(
                     Err(e) => {
                         ctx.sender
                             .send(Msg::SystemMessage(format!("cannot resume {id}: {e}")));
+                    }
+                }
+            }
+            WorkerCommand::Compact => {
+                // Claude Code `/compact`: fold the transcript into a single
+                // summary message via the provider, replacing the working
+                // transcript. The session FILE keeps the full history; only
+                // the in-memory context window shrinks. A no-op on an empty
+                // or single-message transcript.
+                let worth_compacting = transcript
+                    .iter()
+                    .filter(|m| matches!(m.role, ChatRole::User | ChatRole::Assistant))
+                    .count()
+                    >= 2;
+                if !worth_compacting {
+                    ctx.sender.send(Msg::SystemMessage(
+                        "nothing to compact yet (need at least one exchange)".into(),
+                    ));
+                    continue;
+                }
+                // Render the transcript as the model's own conversation,
+                // dropping tool plumbing (ids/results carry no context value
+                // at summary time; the file retains them).
+                let mut dump = String::new();
+                for m in &transcript {
+                    match m.role {
+                        ChatRole::User => {
+                            dump.push_str("USER: ");
+                            dump.push_str(&m.content);
+                        }
+                        ChatRole::Assistant => {
+                            dump.push_str("ASSISTANT: ");
+                            dump.push_str(&m.content);
+                        }
+                        _ => continue,
+                    }
+                    if let Some(calls) = &m.tool_calls {
+                        for c in calls {
+                            dump.push_str(&format!("
+  [tool {} {}]", c.name, c.arguments));
+                        }
+                    }
+                    dump.push('\n');
+                }
+                let prompt = format!(
+                    "Summarize the conversation below for handoff to a fresh context window. Preserve: the user's goal, decisions made, file paths and identifiers mentioned, open questions, and the next step. Reply with the summary only.
+
+{dump}"
+                );
+                ctx.sender.send(Msg::SystemMessage("compacting…".into()));
+                let token = orbit_provider_http::CancelToken::new();
+                if let Ok(mut guard) = cancel_slot.lock() {
+                    *guard = Some(token.clone());
+                }
+                let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
+                let provider = cfg.provider_for_model(&config.model);
+                let pricing = cfg.pricing_for_model(&config.model);
+                let provider_id =
+                    provider.map(|p| p.name.as_str()).unwrap_or(config.provider_id.as_str());
+                let gate = provider.map(|p| p.url.as_str()).unwrap_or(config.gate.as_str());
+                let cred = provider.and_then(|p| p.env.as_deref());
+                let outcome = crate::run_turn_with_tools(
+                    &config.home,
+                    provider_id,
+                    gate,
+                    &config.model,
+                    cred,
+                    pricing,
+                    &prompt,
+                    Some(vec![]),
+                    None,
+                    token.clone(),
+                    vec![],
+                );
+                if let Ok(mut guard) = cancel_slot.lock() {
+                    *guard = None;
+                }
+                match outcome {
+                    Ok(o) if !o.output.trim().is_empty() && o.tool_calls.is_empty() => {
+                        let before = transcript.len();
+                        // Replace the entire transcript with ONE summary
+                        // message. The model sees: summary + (next prompt).
+                        let summary = format!(
+                            "[context compacted from {before} messages]
+
+{}",
+                            o.output.trim()
+                        );
+                        transcript.clear();
+                        transcript.push(ChatMessage {
+                            role: ChatRole::User,
+                            content: summary,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            tool_result: None,
+                        });
+                        // Usage counts for the compaction request itself.
+                        cum_input = cum_input.saturating_add(o.input_tokens);
+                        cum_output = cum_output.saturating_add(o.output_tokens);
+                        cum_cost = cum_cost.saturating_add(o.cost_microcents);
+                        ctx.sender.send(Msg::SystemMessage(format!(
+                            "compacted {} messages → 1 (summary {} chars)",
+                            before,
+                            o.output.trim().chars().count()
+                        )));
+                        // Persist the compacted state so a resume doesn't
+                        // resurrect the full transcript.
+                        let sf = crate::sessions::SessionFile::from_chat(
+                            &config.session_id,
+                            &config.model,
+                            &config.gate,
+                            &config.provider_id,
+                            &transcript,
+                            turns,
+                            cum_input,
+                            cum_output,
+                            cum_cost,
+                        );
+                        if let Err(e) = crate::sessions::save_session(&config.home, &sf) {
+                            orbit_hud_tui::emit_error(
+                                &ctx.sender,
+                                &format!("warning: session not saved: {e}"),
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        ctx.sender.send(Msg::SystemMessage(
+                            "compact failed: empty summary".into(),
+                        ));
+                    }
+                    Err((code, msg)) => {
+                        orbit_hud_tui::emit_error(&ctx.sender, &format!("{code}: {msg}"));
+                    }
+                }
+            }
+            WorkerCommand::ListInstalledMods => {
+                if mods.is_empty() {
+                    ctx.sender.send(Msg::SystemMessage(
+                        "no mods installed — add $ORBIT_HOME/mods/<name>/instructions.md".into(),
+                    ));
+                    continue;
+                }
+                for m in &mods {
+                    let state = if mods_enabled.contains(&m.name) { "on" } else { "off" };
+                    let cmds = if m.commands.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " · commands: {}",
+                            m.commands
+                                .keys()
+                                .map(|c| format!("/{}:{}", m.name, c))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    };
+                    ctx.sender.send(Msg::SystemMessage(format!(
+                        "[{state}] {} — {}{cmds}",
+                        m.name,
+                        if m.description.is_empty() { "(no description)" } else { &m.description }
+                    )));
+                }
+            }
+            WorkerCommand::ToggleMod(name) => {
+                match crate::mods::toggle(&config.home, &mods, &name) {
+                    Ok(now_on) => {
+                        if now_on {
+                            mods_enabled.push(name.clone());
+                        } else {
+                            mods_enabled.retain(|n| n != &name);
+                        }
+                        ctx.sender.send(Msg::SystemMessage(format!(
+                            "mod {name}: {}",
+                            if now_on { "enabled" } else { "disabled" }
+                        )));
+                    }
+                    Err(e) => {
+                        ctx.sender.send(Msg::SystemMessage(e));
+                    }
+                }
+            }
+            WorkerCommand::RefreshMods => {
+                mods = crate::mods::load_all(&config.home);
+                mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
+                ctx.sender.send(Msg::SystemMessage(format!(
+                    "mods reloaded: {} installed, {} enabled",
+                    mods.len(),
+                    mods_enabled.len()
+                )));
+            }
+            WorkerCommand::Undo => {
+                // Claude Code `/undo`: pop the last user message + every
+                // assistant/tool message after it. The session FILE keeps
+                // history; only the working context rewinds.
+                let last_user = transcript
+                    .iter()
+                    .rposition(|m| m.role == ChatRole::User);
+                match last_user {
+                    Some(idx) => {
+                        let removed: Vec<String> = transcript
+                            .split_off(idx)
+                            .iter()
+                            .filter(|m| m.tool_result.is_none())
+                            .map(|m| m.content.clone())
+                            .filter(|c| !c.trim().is_empty())
+                            .collect();
+                        let removed_text = removed.join(" / ");
+                        // Persist the rewound state.
+                        let sf = crate::sessions::SessionFile::from_chat(
+                            &config.session_id,
+                            &config.model,
+                            &config.gate,
+                            &config.provider_id,
+                            &transcript,
+                            turns.saturating_sub(1),
+                            cum_input,
+                            cum_output,
+                            cum_cost,
+                        );
+                        match crate::sessions::save_session(&config.home, &sf) {
+                            Ok(()) => {
+                                ctx.sender.send(Msg::SystemMessage(format!(
+                                    "undid last exchange ({})",
+                                    if removed_text.is_empty() {
+                                        "no text".to_string()
+                                    } else {
+                                        removed_text
+                                    }
+                                )));
+                            }
+                            Err(e) => {
+                                orbit_hud_tui::emit_error(
+                                    &ctx.sender,
+                                    &format!("warning: session not saved: {e}"),
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        ctx.sender
+                            .send(Msg::SystemMessage("nothing to undo".into()));
+                    }
+                }
+            }
+            WorkerCommand::ModCommand(mod_name, cmd_name) => {
+                // A mod command runs its body as a normal prompt turn.
+                let body = mods
+                    .iter()
+                    .find(|m| m.name == mod_name)
+                    .and_then(|m| m.commands.get(&cmd_name))
+                    .cloned();
+                match body {
+                    Some(prompt) => {
+                        pending.push(WorkerCommand::Prompt(prompt));
+                    }
+                    None => {
+                        ctx.sender.send(Msg::SystemMessage(format!(
+                            "no command {cmd_name} in mod {mod_name}"
+                        )));
                     }
                 }
             }
@@ -402,6 +676,7 @@ pub fn run_tui_turn(
     // session saving (D9) — the turn itself no longer needs it.
     _turns: u64,
     auto_grants: &mut crate::tool_runtime::AutoGrants,
+    mods_directive: &str,
 ) -> Result<(bool, u64, u64, u64), String> {
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
@@ -445,6 +720,22 @@ pub fn run_tui_turn(
     };
     orbit_hud_tui::emit_workspace(sender, ws.clone());
     for round in 0..8u32 {
+        // Mods directive: a System message at the FRONT of the provider
+        // transcript (never persisted to the session file — it's rebuilt
+        // from the enabled set every turn).
+        let mut wire_transcript = transcript.clone();
+        if !mods_directive.is_empty() {
+            wire_transcript.insert(
+                0,
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: mods_directive.to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    tool_result: None,
+                },
+            );
+        }
         let outcome = crate::run_turn(
             &config.home,
             provider_id,
@@ -453,7 +744,7 @@ pub fn run_tui_turn(
             credential_env,
             pricing,
             prompt,
-            Some(transcript.clone()),
+            Some(wire_transcript),
             Some(&mut observer),
             cancel.clone(),
         );

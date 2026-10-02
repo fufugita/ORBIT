@@ -111,15 +111,26 @@ impl Selection {
             let Some(line) = lines.get(row as usize) else {
                 break;
             };
-            let chars: Vec<char> = line.chars().collect();
+            // Char-indexed, never byte-indexed: rendered lines carry
+            // multi-byte glyphs (the logo, box-drawing, CJK), and a byte
+            // slice at a char boundary-less offset panics. Map the char
+            // range to a byte range via char_indices.
+            let char_indices: Vec<(usize, char)> = line.char_indices().collect();
+            let nchars = char_indices.len();
             let start = if row == sr { sc as usize } else { 0 };
             let end = if row == er {
-                (ec as usize + 1).min(chars.len())
+                (ec as usize + 1).min(nchars)
             } else {
-                chars.len()
+                nchars
             };
-            if start < chars.len() {
-                out.push(&line[start.min(chars.len())..end.min(chars.len())]);
+            if start < nchars && start < end {
+                let byte_start = char_indices[start].0;
+                let byte_end = if end < nchars {
+                    char_indices[end].0
+                } else {
+                    line.len()
+                };
+                out.push(&line[byte_start..byte_end]);
             }
         }
         out

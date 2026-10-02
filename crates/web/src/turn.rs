@@ -20,8 +20,6 @@ pub struct BridgeConfig {
     pub port: u16,
     /// Bearer token required when binding non-loopback.
     pub token: Option<String>,
-    /// Don't spawn the turn thread (test mode: state only).
-    pub no_turn_thread: bool,
 }
 
 /// Run the web bridge until the turn thread exits (browser sends `quit`).
@@ -137,7 +135,7 @@ fn turn_loop(
                     Ok(x) => x,
                     Err(e) => {
                         state.emit("error", serde_json::json!({ "message": e }));
-                        state.emit("finished", serde_json::json!({ "cancelled": true }));
+                        state.emit("cancelled", serde_json::json!({}));
                         continue;
                     }
                 };
@@ -145,6 +143,11 @@ fn turn_loop(
                 cum_input = cum_input.saturating_add(input);
                 cum_output = cum_output.saturating_add(output);
                 cum_cost = cum_cost.saturating_add(cost);
+                // Doc protocol: `cancelled` is its own event, fired before
+                // `finished` so the client can stamp the turn either way.
+                if !ok {
+                    state.emit("cancelled", serde_json::json!({}));
+                }
                 state.emit(
                     "finished",
                     serde_json::json!({
@@ -152,7 +155,6 @@ fn turn_loop(
                         "output_tokens": cum_output,
                         "cost_microcents": cum_cost,
                         "turns": turns,
-                        "cancelled": !ok,
                     }),
                 );
                 // D9: cumulative save, same as the TUI worker.
@@ -222,7 +224,10 @@ fn turn_loop(
                         state.emit(
                             "transcript",
                             serde_json::json!({
-                                "messages": transcript.iter().map(msg_to_json).collect::<Vec<_>>(),
+                                // Curated like the TUI's resume path: tool
+                                // rounds collapse to a display-safe summary
+                                // line, tool-result JSON never renders.
+                                "messages": transcript.iter().filter_map(msg_to_json).collect::<Vec<_>>(),
                                 "turns": turns,
                                 "input_tokens": cum_input,
                                 "output_tokens": cum_output,
@@ -277,8 +282,13 @@ fn run_web_turn(
             };
             let stripped = cot.push(&raw);
             let sanitized = orbit_hud_tui::sanitize_glyphs(&stripped);
-            let clean = orbit_hud_tui::safe_text(&sanitized);
-            state.emit("delta", serde_json::json!({ "text": clean }));
+            // D7: probe, don't coerce — a rejected chunk emits the chip
+            // naming the gate, never the text.
+            if !orbit_hud_tui::safe_text_probe(&sanitized) {
+                state.emit("redacted", serde_json::json!({ "kind": "display_gate" }));
+                return;
+            }
+            state.emit("delta", serde_json::json!({ "text": sanitized }));
         }
     };
 
@@ -429,17 +439,37 @@ fn run_web_turn(
     Ok((turn_ok, input_tokens, output_tokens, cost))
 }
 
-/// Transcript entry for the `resume` event (display-safe: only roles and
-/// text, never raw tool-result bytes).
-fn msg_to_json(m: &ChatMessage) -> serde_json::Value {
-    serde_json::json!({
-        "role": match m.role {
-            ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
-            ChatRole::System => "system",
-            ChatRole::Tool => "tool",
-        },
-        // H-3: display-safe before it leaves Rust.
-        "text": orbit_hud_tui::safe_text(&m.content),
-    })
+/// Transcript entry for the `resume` event, curated like the TUI's
+/// `session_to_transcript_lines`: user/assistant text passes through
+/// display-safe; a tool-call round collapses to one summary line; tool
+/// results are dropped entirely (already in the assistant's context).
+fn msg_to_json(m: &ChatMessage) -> Option<serde_json::Value> {
+    match m.role {
+        ChatRole::User | ChatRole::System => Some(serde_json::json!({
+            "role": if m.role == ChatRole::User { "user" } else { "system" },
+            // H-3: display-safe before it leaves Rust.
+            "text": orbit_hud_tui::safe_text(&m.content),
+        })),
+        ChatRole::Assistant => {
+            if let Some(calls) = &m.tool_calls {
+                // Tool-calling round: one summary line per round (the TUI
+                // emits the first call's name; the content is the model's
+                // reasoning, which never renders — CoT defense, H-12).
+                calls.first().map(|c| {
+                    serde_json::json!({
+                        "role": "tool",
+                        "text": orbit_hud_tui::safe_text(&format!("[tool] {}", c.name)),
+                    })
+                })
+            } else if !m.content.is_empty() {
+                Some(serde_json::json!({
+                    "role": "assistant",
+                    "text": orbit_hud_tui::safe_text(&m.content),
+                }))
+            } else {
+                None
+            }
+        }
+        ChatRole::Tool => None,
+    }
 }

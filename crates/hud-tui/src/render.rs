@@ -981,6 +981,28 @@ fn render_conversation(
             buf[(x, hint_row.y)].set_style(Style::default().bg(p.surface));
         }
         let mut x = cl + 1;
+        // Multi-line composer (e.g. after a paste): show "+N lines" so the
+        // single-row composer visibly holds more than the first line.
+        let extra_lines = composer_text.lines().count().saturating_sub(1);
+        if extra_lines > 0 {
+            let put2 = |text: &str, style: Style, x: &mut u16, buf: &mut ratatui::buffer::Buffer| {
+                for c in text.chars() {
+                    if *x >= hint_row.x + hint_row.width {
+                        return;
+                    }
+                    buf[(*x, hint_row.y)]
+                        .set_symbol(&c.to_string())
+                        .set_style(style.bg(p.surface));
+                    *x += 1;
+                }
+            };
+            put2(
+                &format!("+{extra_lines} lines   "),
+                Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
+                &mut x,
+                buf,
+            );
+        }
         let put = |text: &str, style: Style, x: &mut u16, buf: &mut ratatui::buffer::Buffer| {
             for c in text.chars() {
                 if *x >= hint_row.x + hint_row.width {
@@ -1462,7 +1484,41 @@ fn render_status_bar(
             *x += 1;
         }
     };
-    let activity: Vec<(String, Style)> = match &app.tool_state {
+    // Claude Code QOL: the mode indicator ("-- INSERT --") so the operator
+    // always knows whether keys type text or run commands. Shown next to
+    // the ORBIT mark in the left cluster.
+    {
+        let mode_label = match app.input_mode {
+            crate::state::InputMode::Insert => "INSERT",
+            crate::state::InputMode::Normal => "NORMAL",
+            crate::state::InputMode::Prefix => "PREFIX",
+            _ => "",
+        };
+        // The composer only accepts text in INSERT + Center focus; reflect
+        // focus too so Tab-to-workspace doesn't silently eat keystrokes.
+        let focus_label = match app.focus {
+            crate::state::Focus::Center => "",
+            crate::state::Focus::Left => " (left)",
+            crate::state::Focus::Right => " (workspace)",
+            _ => "",
+        };
+        put(
+            &format!("-- {mode_label}{focus_label} --  "),
+            Style::default().fg(p.muted),
+            &mut x,
+        );
+    }
+    // last_status (Ctrl+C hint, cancels, errors, model switches) is set by
+    // the reducer but was never rendered — the double-Ctrl+C quit hint was
+    // invisible. When set, it takes the "ready" slot.
+    let transient_status = app.last_status.trim();
+    let activity: Vec<(String, Style)> = if !transient_status.is_empty() {
+        vec![(
+            transient_status.to_string(),
+            Style::default().fg(p.magenta).add_modifier(Modifier::BOLD),
+        )]
+    } else {
+        match &app.tool_state {
         ToolState::Idle => vec![("ready".into(), Style::default().fg(p.muted))],
         ToolState::Streaming => vec![
             ("streaming".into(), Style::default().fg(p.cyan)),
@@ -1495,6 +1551,7 @@ fn render_status_bar(
             ("◈ ".into(), Style::default().fg(p.muted)),
             (name.clone(), Style::default().fg(p.muted)),
         ],
+    }
     };
     for (text, style) in activity {
         put(&text, style, &mut x);

@@ -138,11 +138,21 @@ pub fn recover_head(segments_dir: &Path) -> Result<String, LedgerError> {
             };
             off += len;
             // Validate the chain link for this record.
-            if let Ok(self_hash) = validate_record(&record, &head) {
-                head = self_hash;
+            match validate_record(&record, &head) {
+                Ok(self_hash) => head = self_hash,
+                Err(e) => {
+                    // Fail closed: a mid-chain break must refuse the writer,
+                    // never be silently skipped. Skipping forks the file
+                    // chain — the next segment chains off the pre-break head
+                    // while the broken segment stays on disk, and strict
+                    // verify_ledger fails forever after (E0602 on every
+                    // turn). A torn TAIL (short frame) is still tolerated:
+                    // that's a crash mid-write, not a chain break.
+                    return Err(LedgerError::VerifyFailed(format!(
+                        "chain break at {path:?} offset {off}: {e} —                          the ledger is forked; repair before writing"
+                    )));
+                }
             }
-            // If validation fails, head is unchanged and we stop — the
-            // bad frame is the boundary; subsequent frames can't chain.
         }
     }
     Ok(head)

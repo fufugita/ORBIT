@@ -41,4 +41,4 @@
 │                            │ │  ›  Ask ORBIT, or type / for commands                                          │ │                                  │
 │                            │ │    ⏎ send   ⇧⏎ newline   / commands   ↑ history                                │ │                                  │
 ╰────────────────────────────╯ ╰────────────────────────────────────────────────────────────────────────────────╯ ╰──────────────────────────────────╯
- ✦ ORBIT   ready                                                          glm-5.2 · local     ● online    ↓18.2k ↑2.9k    $0.0214   01J8ZK4Q   ? keys
+ ✦ ORBIT   -- INSERT --  ready                                            glm-5.2 · local     ● online    ↓18.2k ↑2.9k    $0.0214   01J8ZK4Q   ? keys

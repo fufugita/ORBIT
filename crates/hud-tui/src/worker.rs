@@ -25,6 +25,25 @@ pub enum WorkerCommand {
     ListSessions,
     /// `/resume <id>` — load a saved session (transcript + counters).
     ResumeSession(String),
+    /// `/compact` — Claude Code parity: summarize the transcript into one
+    /// message via the provider, then REPLACE the working transcript with
+    /// that summary. Fresh context window, same session.
+    Compact,
+    /// `/mods` — list installed mods with enabled state (formatted here).
+    ListInstalledMods,
+    /// `/mod <name>` — toggle a mod; subsequent turns see (or drop) its
+    /// instructions.
+    ToggleMod(String),
+    /// `/mods refresh` — rescan `$ORBIT_HOME/mods/` (after the operator
+    /// edits or installs one mid-session).
+    RefreshMods,
+    /// A mod-contributed command `/name:cmd` — run the command's prompt
+    /// body as a normal turn.
+    ModCommand(String, String),
+    /// `/undo` — drop the last exchange (user prompt + its assistant
+    /// reply + any tool plumbing) from the working transcript, and emit
+    /// the removed text so the operator can re-paste it.
+    Undo,
 }
 
 /// The sender end of the worker-command channel — held by the TUI's event

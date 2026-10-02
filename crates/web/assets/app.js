@@ -48,8 +48,13 @@ function setStatus() {
 }
 
 function scrollDown() {
+  // Sticky scroll: only follow the stream when the operator is already at
+  // (or within 40px of) the bottom. A mid-drag selection or a manual
+  // scroll-up must never be yanked back down — the old unconditional
+  // scrollTop assignment made text selection impossible during streaming.
   const t = $("transcript");
-  t.scrollTop = t.scrollHeight;
+  const atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 40;
+  if (atBottom) t.scrollTop = t.scrollHeight;
 }
 
 function addMsg(role, text) {
@@ -270,6 +275,19 @@ function submit() {
   setStatus();
   send({ type: "prompt", text });
 }
+
+// Click-to-focus (TUI parity): a click in the chat pane focuses the
+// composer so typing always lands somewhere. Listen on 'click' (mouseup),
+// NEVER 'mousedown' — mousedown is when a text-selection drag STARTS, and
+// focusing the composer at that instant aborts the drag. A finished drag
+// has a Range selection at click time and is left alone; Ctrl+C then
+// copies it natively.
+$("chat-pane").addEventListener("click", (e) => {
+  if (e.target.closest("button, a, .tool-card")) return;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return; // user just selected text
+  $("composer").focus();
+});
 
 $("btn-send").onclick = submit;
 $("btn-cancel").onclick = () => send({ type: "cancel" });

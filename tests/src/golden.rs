@@ -69,7 +69,7 @@ fn cli_exit_codes_golden() {
 #[test]
 fn cli_command_tree_golden() {
     // The full command tree is pinned (DR-03 §3.2, all 15) + the interactive
-    // `chat` harness (promoted from v0.2-reserved in v0.2).
+    // `chat` harness + the `web` browser bridge.
     let expected = [
         "run",
         "plan",
@@ -87,6 +87,7 @@ fn cli_command_tree_golden() {
         "restore",
         "version",
         "chat",
+        "web",
     ];
     assert_eq!(orbit_cli::COMMANDS, expected.as_slice());
     // Remaining v0.2 commands are gated (CLI-26).

@@ -323,6 +323,7 @@ pub mod config;
 pub mod go_bridge;
 pub mod sessions;
 pub mod tool_runtime;
+pub mod mods;
 pub mod tools;
 pub mod tui_worker;
 
@@ -367,6 +368,38 @@ pub fn run_turn(
     messages: Option<Vec<orbit_adapter::types::ChatMessage>>,
     observer: orbit_provider_http::stream::StreamObserver<'_>,
     cancel: orbit_provider_http::CancelToken,
+) -> Result<TurnOutcome, (&'static str, String)> {
+    run_turn_with_tools(
+        home,
+        provider_id,
+        gate,
+        model,
+        credential_env,
+        pricing,
+        prompt,
+        messages,
+        observer,
+        cancel,
+        tools::tool_definitions(),
+    )
+}
+
+/// `run_turn` with an explicit tool set. `/compact` passes an EMPTY list:
+/// a summarization request must not advertise tools (a tool-happy model
+/// would answer with calls instead of the summary text).
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_with_tools(
+    home: &Path,
+    provider_id: &str,
+    gate: &str,
+    model: &str,
+    credential_env: Option<&str>,
+    pricing: Option<crate::config::Pricing>,
+    prompt: &str,
+    messages: Option<Vec<orbit_adapter::types::ChatMessage>>,
+    observer: orbit_provider_http::stream::StreamObserver<'_>,
+    cancel: orbit_provider_http::CancelToken,
+    tools: Vec<orbit_adapter::types::ToolDefinition>,
 ) -> Result<TurnOutcome, (&'static str, String)> {
     // Parse the gate URL; only http loopback or https is acceptable.
     let url = url::Url::parse(gate).map_err(|e| ("ORBIT-E0401", format!("bad gate url: {e}")))?;
@@ -460,11 +493,11 @@ pub fn run_turn(
             max_output_tokens: 2048,
         },
         output: orbit_adapter::types::OutputRequirements::Text,
-        tools: tools::tool_definitions(),
+        tools: tools.clone(),
         metadata: orbit_adapter::types::RequestMetadata {
             input_sha256: input_digest,
             input_bytes: prompt.len() as u64,
-            tools_count: tools::tool_definitions().len() as u32,
+            tools_count: tools.len() as u32,
         },
         connect_timeout_ms: 10_000,
         first_byte_timeout_ms: 30_000,

@@ -1404,15 +1404,19 @@ impl App {
                     self.dirty.set(DirtyFlags::STATUS);
                     return;
                 }
-                // Double Ctrl+C to quit: first press shows confirmation,
-                // second press within ~2 s (120 ticks at 16ms) actually quits.
+                // Double Ctrl+C to quit: the first press only updates the
+                // STATUS LINE ("press Ctrl+C again to exit") — no modal, no
+                // key interception — so native terminal text selection and
+                // copy still work. The second press within ~5 s (312 ticks
+                // at 16 ms) quits — wide enough to read the hint, act on
+                // it, and still bail out fast.
                 let ticks_since_last = self.tick_count.saturating_sub(self.last_ctrl_c_tick);
-                if self.ctrl_c_count == 1 && ticks_since_last < 120 {
+                if self.ctrl_c_count == 1 && ticks_since_last < 312 {
                     self.should_quit = true;
                 } else {
                     self.ctrl_c_count = 1;
                     self.last_ctrl_c_tick = self.tick_count;
-                    self.quit_confirmation = true;
+                    self.last_status = "press Ctrl+C again to exit".into();
                     self.dirty.set(DirtyFlags::STATUS);
                 }
             }
@@ -1682,8 +1686,9 @@ mod tests {
     #[test]
     fn signal_shutdown_wins_over_ctrl_c_grace_window() {
         let mut app = App::new();
-        app.reduce(Msg::CtrlC); // first press → modal
-        assert!(app.quit_confirmation);
+        app.reduce(Msg::CtrlC); // first press → status hint only
+        assert!(!app.quit_confirmation, "no modal — copy stays possible");
+        assert_eq!(app.last_status, "press Ctrl+C again to exit");
 
         app.reduce(Msg::SignalShutdown);
         assert!(app.should_quit);
