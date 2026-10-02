@@ -137,6 +137,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     tool_result: None,
+                    blocks: None,
                 },
                 ChatMessage {
                     role: ChatRole::Assistant,
@@ -144,6 +145,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     tool_result: None,
+                    blocks: None,
                 },
             ],
             1,
@@ -185,6 +187,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("call-1".into()),
             tool_result: Some("{\"ok\":true}".into()),
+            blocks: None,
         });
         let restored = s.to_transcript();
         assert_eq!(restored.len(), 3);

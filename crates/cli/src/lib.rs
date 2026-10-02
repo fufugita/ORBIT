@@ -349,14 +349,20 @@ pub fn engine_turn_config(
     credential_env: Option<&str>,
     pricing: Option<crate::config::Pricing>,
 ) -> orbit_engine::TurnConfig {
-    let max_output_tokens = crate::config::ProvidersConfig::load(home)
-        .ok()
-        .and_then(|c| c.max_output_tokens_for(model))
-        .unwrap_or(32_000) as u64;
+    let cfg = crate::config::ProvidersConfig::load(home).unwrap_or_default();
+    let max_output_tokens = cfg.max_output_tokens_for(model).unwrap_or(32_000) as u64;
+    // The provider kind selects the adapter (anthropic / ollama /
+    // openai-compatible). Resolved from the provider entry owning this
+    // model; the fallback chain covers a model with no declared owner.
+    let kind = cfg
+        .provider_for_model(model)
+        .map(|p| orbit_engine::dispatch::ProviderKind::from_config(&p.kind))
+        .unwrap_or_default();
     orbit_engine::TurnConfig {
         provider_id: provider_id.to_string(),
         gate: gate.to_string(),
         model: model.to_string(),
+        kind,
         credential_env: credential_env.map(str::to_string),
         pricing: pricing.map(std::convert::From::from),
         max_output_tokens,

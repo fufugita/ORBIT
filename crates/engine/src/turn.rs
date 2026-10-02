@@ -121,7 +121,10 @@ pub fn run_turn(
                     limit: config.max_output_tokens,
                 });
             }
-            transcript.push(assistant_message(o.output.clone()));
+            transcript.push(assistant_message_with_thinking(
+                o.output.clone(),
+                o.thinking.clone(),
+            ));
             report.final_text = o.output.clone();
             report.ok = true;
             events(FrontendEvent::ResponseFinished {
@@ -145,13 +148,11 @@ pub fn run_turn(
                 arguments: String::from_utf8_lossy(&tc.arguments).into_owned(),
             })
             .collect();
-        transcript.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: o.output.clone(),
-            tool_calls: Some(assistant_calls),
-            tool_call_id: None,
-            tool_result: None,
-        });
+        transcript.push(assistant_with_calls_and_thinking(
+            o.output.clone(),
+            assistant_calls,
+            o.thinking.clone(),
+        ));
 
         let results = executor.execute(&o.tool_calls, round);
         for r in results {
@@ -161,6 +162,7 @@ pub fn run_turn(
                 tool_calls: None,
                 tool_call_id: Some(r.call_id.clone()),
                 tool_result: Some(r.content),
+                blocks: None,
             });
         }
 
@@ -218,6 +220,7 @@ fn dispatch_with_retry(
                         tool_calls: None,
                         tool_call_id: None,
                         tool_result: None,
+                        blocks: None,
                     },
                 );
             }
@@ -284,6 +287,44 @@ fn is_retryable(code: &str) -> bool {
 // shim keeps the engine free of a circular dependency (cli → engine
 // for the loop; engine → cli's tools via this alias). In phase 3 the
 // tool runtime moves bodily into the engine and the shim inverts.
+
+/// An assistant message carrying replay-only thinking as an opaque block.
+/// The thinking JSON is stored verbatim; the adapter replays it unchanged.
+pub(crate) fn assistant_message_with_thinking(
+    text: String,
+    thinking: Option<String>,
+) -> ChatMessage {
+    let mut m = assistant_message(text);
+    if let Some(t) = thinking.filter(|t| !t.is_empty()) {
+        m.blocks = Some(vec![orbit_adapter::types::ContentBlock::Opaque {
+            json: serde_json::json!({ "type": "thinking", "thinking": t }).to_string(),
+        }]);
+    }
+    m
+}
+
+/// An assistant tool-call message with replay-only thinking attached.
+pub(crate) fn assistant_with_calls_and_thinking(
+    text: String,
+    calls: Vec<orbit_adapter::types::ToolCallMessage>,
+    thinking: Option<String>,
+) -> ChatMessage {
+    let mut m = ChatMessage {
+        role: ChatRole::Assistant,
+        content: text,
+        tool_calls: Some(calls),
+        tool_call_id: None,
+        tool_result: None,
+        blocks: None,
+    };
+    if let Some(t) = thinking.filter(|t| !t.is_empty()) {
+        m.blocks = Some(vec![orbit_adapter::types::ContentBlock::Opaque {
+            json: serde_json::json!({ "type": "thinking", "thinking": t }).to_string(),
+        }]);
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,6 +21,9 @@ impl OllamaHttpV1 {
         identity: AdapterIdentity,
         capabilities: ProviderCapabilities,
     ) -> Result<Self, AdapterError> {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
         Ok(Self {
             identity,
             capabilities,
@@ -70,10 +73,69 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
             "http://{}:{}/api/chat",
             request.route.endpoint_host, request.route.endpoint_port
         );
+        // Full conversation when present; else the single prompt. Ollama's
+        // chat API takes tool calls/results natively on messages.
+        let messages: serde_json::Value = match &request.messages {
+            Some(transcript) => transcript
+                .iter()
+                .filter_map(|m| {
+                    use orbit_adapter::types::ChatRole;
+                    match m.role {
+                        ChatRole::System => Some(serde_json::json!({
+                            "role": "system",
+                            "content": m.content,
+                        })),
+                        ChatRole::User => Some(serde_json::json!({
+                            "role": "user",
+                            "content": m.content,
+                        })),
+                        ChatRole::Assistant => {
+                            // Ollama carries tool calls natively on the
+                            // assistant message.
+                            let calls: Vec<serde_json::Value> = m
+                                .tool_calls
+                                .as_ref()
+                                .map(|tcs| {
+                                    tcs.iter()
+                                        .map(|tc| serde_json::json!({
+                                            "function": {
+                                                "name": tc.name,
+                                                "arguments": serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                                    .unwrap_or(serde_json::json!({})),
+                                            }
+                                        }))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !m.content.is_empty() || !calls.is_empty() {
+                                let mut msg = serde_json::json!({
+                                    "role": "assistant",
+                                    "content": m.content,
+                                });
+                                if !calls.is_empty() {
+                                    msg["tool_calls"] = serde_json::Value::Array(calls);
+                                }
+                                Some(msg)
+                            } else {
+                                None
+                            }
+                        }
+                        ChatRole::Tool => Some(serde_json::json!({
+                            "role": "tool",
+                            "content": m.tool_result.as_deref().unwrap_or(&m.content),
+                        })),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            None => serde_json::json!([
+                {"role":"user","content": String::from_utf8_lossy(request.input.expose()).into_owned()}
+            ]),
+        };
         let body = serde_json::json!({
             "model": request.route.expected_model,
             "stream": true,
-            "messages": [{"role":"user","content": String::from_utf8_lossy(request.input.expose()).into_owned()}],
+            "messages": messages,
             "options": {
                 "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
                 "top_p": request.sampling.top_p_millionths as f64 / 1_000_000.0,

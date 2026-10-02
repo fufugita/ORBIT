@@ -28,7 +28,7 @@
 pub mod dispatch;
 pub mod turn;
 
-pub use dispatch::{run_dispatch, PendingToolCall, TurnConfig, TurnOutcome};
+pub use dispatch::{run_dispatch, PendingToolCall, ProviderKind, TurnConfig, TurnOutcome};
 pub use turn::{run_turn, TurnOptions, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS};
 
 use orbit_adapter::types::ChatMessage;
@@ -76,6 +76,7 @@ pub fn user_message(text: impl Into<String>) -> ChatMessage {
         tool_calls: None,
         tool_call_id: None,
         tool_result: None,
+        blocks: None,
     }
 }
 
@@ -87,5 +88,6 @@ pub fn assistant_message(text: impl Into<String>) -> ChatMessage {
         tool_calls: None,
         tool_call_id: None,
         tool_result: None,
+        blocks: None,
     }
 }

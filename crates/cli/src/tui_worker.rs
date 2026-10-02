@@ -417,6 +417,7 @@ fn worker_main(
                             tool_calls: None,
                             tool_call_id: None,
                             tool_result: None,
+                            blocks: None,
                         });
                         // Usage counts for the compaction request itself.
                         cum_input = cum_input.saturating_add(o.input_tokens);

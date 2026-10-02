@@ -184,12 +184,71 @@ pub struct RequestMetadata {
     pub tools_count: u32,
 }
 
+/// One structured piece of a message's content (roadmap §Providers).
+///
+/// The block model is the structured truth for providers that speak it
+/// (Anthropic); `ChatMessage.content` stays as the flattened text every
+/// other consumer already reads. Adapters that support blocks map them
+/// to their own wire format; adapters that do not use `content` and
+/// drop the blocks (thinking never round-trips through OpenAI-compatible).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        /// Base64-encoded image bytes (the adapter adds source media type).
+        data: String,
+        #[serde(default = "default_image_media_type")]
+        media_type: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+    },
+    /// Opaque provider-native blocks (thinking, redacted thinking,
+    /// compaction) — stored and replayed unchanged, never displayed,
+    /// never sent to a provider that did not produce them.
+    Opaque {
+        /// The provider-native JSON, verbatim.
+        json: String,
+    },
+}
+
+fn default_image_media_type() -> String {
+    "image/png".into()
+}
+
+impl ContentBlock {
+    /// The flattened text of this block (empty for images and opaque).
+    pub fn text(&self) -> &str {
+        match self {
+            ContentBlock::Text { text } => text,
+            _ => "",
+        }
+    }
+}
+
 /// One turn of a multi-turn conversation transcript (DR-09 §3 extension).
 /// Roles mirror the OpenAI-compatible wire set: `system` | `user` | `assistant`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Structured content blocks (phase 2). `None` for every message the
+    /// pre-blocks code produced — old session files parse unchanged. When
+    /// present, providers that speak blocks use these and ignore `content`
+    /// (which still carries the flattened text for display and cost).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<Vec<ContentBlock>>,
     /// Tool-call metadata for assistant messages (tool-calling phase).
     /// `None` for plain user/system/assistant text messages (backwards-compatible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,6 +415,13 @@ pub enum ProviderEventKind {
         upstream_request_id: Option<String>,
     },
     TextDelta {
+        bytes: Vec<u8>,
+    },
+    /// A reasoning/thinking delta (Anthropic thinking blocks, others'
+    /// equivalents). Assembled into an opaque block for replay — never
+    /// surfaced as display text (CoT defense), never sent to a provider
+    /// that did not produce it.
+    ThinkingDelta {
         bytes: Vec<u8>,
     },
     ToolCallStarted {

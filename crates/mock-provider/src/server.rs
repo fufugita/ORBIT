@@ -167,11 +167,12 @@ async fn openai(
 async fn anthropic(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
     state
         .requests
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *state.last_body.lock().unwrap() = Some(body.clone());
     match behavior(&headers) {
         "rate-limit" => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -180,12 +181,59 @@ async fn anthropic(
         )
             .into_response(),
         "server-error" => (StatusCode::INTERNAL_SERVER_ERROR, "server error").into_response(),
-        _ => (
+        "tool-calls" => (
             StatusCode::OK,
             [("content-type", "text/event-stream")],
-            anthropic_success(),
+            anthropic_tool_calls(),
         )
             .into_response(),
+        _ => {
+            // Implicit script: tools advertised and no tool_result yet →
+            // round 0 returns a tool_use block; tool_result present →
+            // final text (mirrors the OpenAI implicit behavior).
+            let implicit = if headers.get("x-orbit-behavior").is_none() {
+                let has_tools = body
+                    .get("tools")
+                    .and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                let has_result = body
+                    .get("messages")
+                    .and_then(|v| v.as_array())
+                    .map(|msgs| {
+                        msgs.iter().any(|m| {
+                            m.get("content")
+                                .and_then(|c| c.as_array())
+                                .map(|blocks| {
+                                    blocks.iter().any(|b| {
+                                        b.get("type").and_then(|t| t.as_str())
+                                            == Some("tool_result")
+                                    })
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                has_tools && !has_result
+            } else {
+                false
+            };
+            if implicit {
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    anthropic_tool_calls(),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    anthropic_success(),
+                )
+                    .into_response()
+            }
+        }
     }
 }
 
@@ -228,6 +276,18 @@ fn openai_tool_calls() -> String {
         "",
     ]
     .join("\n\n")
+}
+fn anthropic_tool_calls() -> String {
+    [
+        r#"data: {"type":"message_start","usage":{"input_tokens":5,"output_tokens":0}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-1","name":"calculator","input":{}}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"expression\":"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"2*(3+4)\"}"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3,"input_tokens":5,"cache_read_input_tokens":120,"cache_creation_input_tokens":8}}"#,
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ].join("\n\n")
 }
 fn anthropic_success() -> String {
     [

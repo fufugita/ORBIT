@@ -20,11 +20,37 @@ pub struct PendingToolCall {
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutcome {
     pub output: String,
+    /// Assembled reasoning (thinking deltas), if the provider sent any.
+    /// Attached to the assistant message as an opaque block for replay;
+    /// never displayed, never sent to a provider that did not produce it.
+    pub thinking: Option<String>,
     pub tool_calls: Vec<PendingToolCall>,
     pub finish_reason: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_microcents: u64,
+}
+
+/// The provider kind selects the adapter: `openai-compatible` (default),
+/// `anthropic` or `ollama` (roadmap §Providers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProviderKind {
+    #[default]
+    OpenAiCompatible,
+    Anthropic,
+    Ollama,
+}
+
+impl ProviderKind {
+    /// From the providers.toml `kind` string (unknown → OpenAI-compatible,
+    /// the backwards-compatible default).
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "anthropic" => ProviderKind::Anthropic,
+            "ollama" => ProviderKind::Ollama,
+            _ => ProviderKind::OpenAiCompatible,
+        }
+    }
 }
 
 /// Per-model output limit (defect fix: the old hard 2,048 silently
@@ -36,6 +62,8 @@ pub struct TurnConfig {
     pub provider_id: String,
     pub gate: String,
     pub model: String,
+    /// Adapter kind from providers.toml (default openai-compatible).
+    pub kind: ProviderKind,
     pub credential_env: Option<String>,
     pub pricing: Option<orbit_adapter::types::CostRates>,
     pub max_output_tokens: u64,
@@ -80,15 +108,86 @@ pub fn run_dispatch(
         .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
 
     // Build the route binding (generic runtime config — no internal models).
+    // The adapter identity + kind follow the configured provider kind.
     let input = orbit_adapter::credential::SecretBytes::new(prompt.as_bytes().to_vec());
     let input_digest =
         orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(prompt.as_bytes())));
-    let adapter_identity = orbit_provider_http::openai::openai_identity();
+
+    type RegisterAdapter = Box<
+        dyn FnOnce(&mut orbit_gateway::ProviderRegistry) -> Result<(), (&'static str, String)>,
+    >;
+    let (adapter_kind, adapter_identity, register): (
+        orbit_adapter::types::AdapterKind,
+        orbit_adapter::types::AdapterIdentity,
+        RegisterAdapter,
+    ) = match config.kind {
+        ProviderKind::Anthropic => {
+            let identity = orbit_provider_http::anthropic::anthropic_identity();
+            let kind = orbit_adapter::types::AdapterKind::DeclarativeHttpJsonV1;
+            let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
+                let adapter = orbit_provider_http::AnthropicMessagesV1::new(
+                    identity,
+                    orbit_provider_http::anthropic::anthropic_capabilities(),
+                )
+                .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
+                registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
+                Ok(())
+            };
+            (
+                kind,
+                orbit_provider_http::anthropic::anthropic_identity(),
+                Box::new(register),
+            )
+        }
+        ProviderKind::Ollama => {
+            let identity = orbit_adapter::types::AdapterIdentity {
+                kind: orbit_adapter::types::AdapterKind::LocalProcessV1,
+                implementation_digest: orbit_adapter::types::Sha256Digest("o".repeat(64)),
+                profile_digest: orbit_adapter::types::Sha256Digest(
+                    "ollama-profile".repeat(8).chars().take(64).collect(),
+                ),
+            };
+            let kind = orbit_adapter::types::AdapterKind::LocalProcessV1;
+            let closure_identity = identity.clone();
+            let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
+                let adapter =
+                    orbit_provider_http::OllamaHttpV1::new(closure_identity, ollama_capabilities())
+                        .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
+                registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
+                Ok(())
+            };
+            (kind, identity, Box::new(register))
+        }
+        ProviderKind::OpenAiCompatible => {
+            let identity = orbit_provider_http::openai::openai_identity();
+            let kind = orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1;
+            let tls = orbit_adapter::types::TlsPinPolicy {
+                webpki: true,
+                spki_sha256: None,
+            };
+            let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
+                let adapter = orbit_provider_http::OpenAiCompatibleHttpV1::new(
+                    identity,
+                    orbit_provider_http::openai::openai_capabilities(),
+                    tls,
+                )
+                .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
+                registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
+                Ok(())
+            };
+            (
+                kind,
+                orbit_provider_http::openai::openai_identity(),
+                Box::new(register),
+            )
+        }
+    };
+
     let route = orbit_adapter::types::ProviderRouteBinding {
         provider_id: orbit_adapter::types::ProviderId(config.provider_id.clone()),
         deployment_id: orbit_adapter::types::DeploymentId(config.provider_id.clone()),
         region_id: orbit_adapter::types::RegionId("local".into()),
-        adapter_kind: orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1,
+        adapter_kind,
         adapter_implementation_digest: adapter_identity.implementation_digest.clone(),
         adapter_profile_digest: adapter_identity.profile_digest.clone(),
         endpoint_digest: orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(
@@ -103,20 +202,8 @@ pub fn run_dispatch(
 
     // Register the model + async adapter in a fresh registry.
     let mut registry = orbit_gateway::ProviderRegistry::new();
-    let adapter = orbit_provider_http::OpenAiCompatibleHttpV1::new(
-        adapter_identity,
-        orbit_provider_http::openai::openai_capabilities(),
-        orbit_adapter::types::TlsPinPolicy {
-            webpki: true,
-            spki_sha256: None,
-        },
-    )
-    .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
+    register(&mut registry)?;
     registry.register_model(orbit_gateway::ModelRef(config.model.clone()), route.clone());
-    registry.register_async_adapter(
-        orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1,
-        std::sync::Arc::new(adapter),
-    );
 
     // Egress allowlist: exactly this one gate tuple.
     let tuple = orbit_egress::EgressTuple {
@@ -235,6 +322,20 @@ pub fn run_dispatch(
                     _ => None,
                 })
                 .collect();
+            // Assemble thinking deltas into one opaque string (replay-only).
+            let thinking: Option<String> = {
+                let t: String = r
+                    .events
+                    .iter()
+                    .filter_map(|e| match &e.event {
+                        orbit_adapter::types::ProviderEventKind::ThinkingDelta { bytes } => {
+                            Some(String::from_utf8_lossy(bytes).into_owned())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (!t.is_empty()).then_some(t)
+            };
             // Assemble tool calls from the streamed events.
             let mut tool_calls: std::collections::BTreeMap<u32, PendingToolCall> =
                 std::collections::BTreeMap::new();
@@ -281,6 +382,7 @@ pub fn run_dispatch(
                 .unwrap_or(0);
             Ok(TurnOutcome {
                 output,
+                thinking,
                 tool_calls: tool_calls.into_values().collect(),
                 finish_reason,
                 input_tokens: usage.input_tokens,
@@ -301,5 +403,16 @@ pub fn run_dispatch(
         }
         orbit_gateway::DispatchOutcome::AdapterRefused { code, message } => Err((code, message)),
         other => Err(("ORBIT-E0406", format!("ask failed: {other:?}"))),
+    }
+}
+
+/// Ollama capabilities: loopback, streaming, tools; no JSON-schema output.
+fn ollama_capabilities() -> orbit_adapter::types::ProviderCapabilities {
+    orbit_adapter::types::ProviderCapabilities {
+        supports_streaming: true,
+        supports_tools: true,
+        supports_json_schema_output: false,
+        max_input_tokens: 262_144,
+        max_output_tokens: 32_000,
     }
 }
