@@ -113,9 +113,8 @@ pub fn run_dispatch(
     let input_digest =
         orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(prompt.as_bytes())));
 
-    type RegisterAdapter = Box<
-        dyn FnOnce(&mut orbit_gateway::ProviderRegistry) -> Result<(), (&'static str, String)>,
-    >;
+    type RegisterAdapter =
+        Box<dyn FnOnce(&mut orbit_gateway::ProviderRegistry) -> Result<(), (&'static str, String)>>;
     let (adapter_kind, adapter_identity, register): (
         orbit_adapter::types::AdapterKind,
         orbit_adapter::types::AdapterIdentity,
