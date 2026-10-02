@@ -218,9 +218,9 @@ pub fn execute_call(
             crate::permissions::PermissionRules::default()
         });
     let rule_verdict = rules.verdict(&call.name);
-    let verdict = if !known {
-        ApprovalVerdict::Deny
-    } else if rule_verdict == crate::permissions::RuleVerdict::Deny {
+    let verdict = if !known
+        || rule_verdict == crate::permissions::RuleVerdict::Deny
+    {
         ApprovalVerdict::Deny
     } else if rule_verdict == crate::permissions::RuleVerdict::Allow
         || auto_tools

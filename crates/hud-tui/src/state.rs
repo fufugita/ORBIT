@@ -1392,7 +1392,7 @@ impl App {
                 self.pending_plan = Some(plan);
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
-            Msg::PlanApproved(plan) => {
+            Msg::PlanApproved(_) => {
                 self.pending_plan = None;
                 self.dirty.set(DirtyFlags::LAYOUT);
             }
