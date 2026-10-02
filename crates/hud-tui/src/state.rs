@@ -454,6 +454,13 @@ pub struct App {
     /// composer text on every ComposerChanged — kept here so the
     /// renderer and key handler can see it without recomputing.
     pub slash_hints: SlashHints,
+    /// Plan mode (Claude Code parity): Shift+Tab cycles Insert → Plan →
+    /// Normal. In Plan mode, turns explore read-only and produce a plan
+    /// that waits for operator approval before anything executes.
+    pub plan_mode: bool,
+    /// The plan awaiting operator approval (set when a Plan-mode turn
+    /// finishes). `y` approves (runs it as a normal turn), `n` discards.
+    pub pending_plan: Option<String>,
     /// Queued prompts: typed while a turn is in flight. Drained one at a
     /// time when a turn ends (ResponseFinished or CancelTurn). Rendered as
     /// dimmed `⏳` lines above the composer.
@@ -719,6 +726,8 @@ impl App {
             toast_emitted_at: None,
             composer_state: ComposerState::Idle,
             slash_hints: SlashHints::default(),
+            plan_mode: false,
+            pending_plan: None,
             queued: Vec::new(),
             sessions: Vec::new(),
             header_title: String::new(),
@@ -1364,6 +1373,32 @@ impl App {
                 if self.composer_state == ComposerState::Idle {
                     self.composer_state = ComposerState::Typing;
                 }
+            }
+            Msg::PlanModeToggle => {
+                self.plan_mode = !self.plan_mode;
+                // Toggling out of plan mode discards any pending plan.
+                if !self.plan_mode {
+                    self.pending_plan = None;
+                }
+                self.dirty.set(DirtyFlags::STATUS | DirtyFlags::LAYOUT);
+            }
+            Msg::PlanReady(plan) => {
+                // The plan body lands in the transcript (readable, copiable)
+                // with the approval banner waiting above the composer.
+                self.transcript.push(crate::state::TranscriptLine::Assistant {
+                    text: plan.clone(),
+                    time: None,
+                });
+                self.pending_plan = Some(plan);
+                self.dirty.set(DirtyFlags::LAYOUT);
+            }
+            Msg::PlanApproved(plan) => {
+                self.pending_plan = None;
+                self.dirty.set(DirtyFlags::LAYOUT);
+            }
+            Msg::PlanDiscarded => {
+                self.pending_plan = None;
+                self.dirty.set(DirtyFlags::LAYOUT);
             }
             Msg::SlashHintSelect(idx) => {
                 if idx < self.slash_hints.items.len() {

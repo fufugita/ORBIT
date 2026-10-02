@@ -123,13 +123,54 @@ fn worker_main(
             },
         };
         match cmd {
+            WorkerCommand::PlanPrompt(prompt) => {
+                let token = orbit_provider_http::CancelToken::new();
+                if let Ok(mut guard) = cancel_slot.lock() {
+                    *guard = Some(token.clone());
+                }
+                let directive = crate::mods::system_directive(&mods, &mods_enabled);
+                // Plan directive: read-only posture, produce a plan.
+                let plan_directive = format!(
+                    "{directive}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes; all tool calls will be denied. Explore the problem, then respond with a concise, numbered implementation plan. End with a line: `PLAN READY`."
+                );
+                let (_ok, _input, _output, _cost, plan_text) = match run_tui_turn(
+                    &config,
+                    &mut transcript,
+                    &prompt,
+                    &ctx.sender,
+                    &ctx.approvals,
+                    &token,
+                    turns,
+                    &mut auto_grants,
+                    &plan_directive,
+                    true,
+                ) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        orbit_hud_tui::emit_error(&ctx.sender, &e);
+                        if let Ok(mut guard) = cancel_slot.lock() {
+                            *guard = None;
+                        }
+                        continue;
+                    }
+                };
+                if let Ok(mut guard) = cancel_slot.lock() {
+                    *guard = None;
+                }
+                turns = turns.saturating_add(1);
+                // The plan is HELD for approval — no counters commit, no
+                // session save yet (the plan isn't part of the transcript
+                // until approved and executed).
+                orbit_hud_tui::emit_response_finished(&ctx.sender, "", 0, 0, 0);
+                orbit_hud_tui::emit_plan_ready(&ctx.sender, &plan_text);
+            }
             WorkerCommand::Prompt(prompt) => {
                 let token = orbit_provider_http::CancelToken::new();
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = Some(token.clone());
                 }
                 let directive = crate::mods::system_directive(&mods, &mods_enabled);
-                let (_ok, input, output, cost) = match run_tui_turn(
+                let (_ok, input, output, cost, _final) = match run_tui_turn(
                     &config,
                     &mut transcript,
                     &prompt,
@@ -139,6 +180,7 @@ fn worker_main(
                     turns,
                     &mut auto_grants,
                     &directive,
+                    false,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
@@ -726,7 +768,8 @@ pub fn run_tui_turn(
     _turns: u64,
     auto_grants: &mut crate::tool_runtime::AutoGrants,
     mods_directive: &str,
-) -> Result<(bool, u64, u64, u64), String> {
+    plan_mode: bool,
+) -> Result<(bool, u64, u64, u64, String), String> {
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
     let mut cost = 0u64;
@@ -761,6 +804,7 @@ pub fn run_tui_turn(
     });
 
     let mut turn_ok = false;
+    let mut final_text = String::new();
     // The workspace rail tracks the turn's phases (§6.10):
     // 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
     let mut ws = orbit_hud_tui::state::Workspace {
@@ -801,7 +845,7 @@ pub fn run_tui_turn(
             Ok(o) => o,
             Err((code, msg)) => {
                 orbit_hud_tui::emit_error(sender, &format!("{code}: {msg}"));
-                return Ok((false, input_tokens, output_tokens, cost));
+                return Ok((false, input_tokens, output_tokens, cost, String::new()));
             }
         };
         input_tokens += o.input_tokens;
@@ -828,6 +872,7 @@ pub fn run_tui_turn(
                 tool_result: None,
             });
             turn_ok = true;
+            final_text = o.output.clone();
             break;
         }
 
@@ -860,6 +905,30 @@ pub fn run_tui_turn(
         // Tools are running: the act phase.
         ws.phase_index = 2;
         orbit_hud_tui::emit_workspace(sender, ws.clone());
+        // Plan mode: every tool call is denied read-only — no prompt, no
+        // execution. The model sees the notice and continues planning.
+        if plan_mode {
+            for call in &o.tool_calls {
+                let args = crate::tools::parse_arguments(&call.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                let summary = crate::tools::safe_call_summary(&call.name, &args);
+                orbit_hud_tui::emit_tool_started(sender, &call.name, &summary);
+                let result = r#"{"ok":false,"error":"plan mode: read-only — tool calls are denied until the plan is approved"}"#;
+                orbit_hud_tui::emit_tool_finished(
+                    sender,
+                    &call.name,
+                    orbit_hud_tui::state::ToolOutcome::Denied,
+                );
+                transcript.push(ChatMessage {
+                    role: ChatRole::Tool,
+                    content: result.to_string(),
+                    tool_calls: None,
+                    tool_call_id: Some(call.id.clone()),
+                    tool_result: Some(result.to_string()),
+                });
+            }
+            continue;
+        }
         // Execute each tool call via the TUI approval channel.
         let mut approval_channel = TuiApprovalChannel::new(sender.clone(), approvals.clone());
         for call in &o.tool_calls {
@@ -905,5 +974,5 @@ pub fn run_tui_turn(
         );
     }
 
-    Ok((turn_ok, input_tokens, output_tokens, cost))
+    Ok((turn_ok, input_tokens, output_tokens, cost, final_text))
 }

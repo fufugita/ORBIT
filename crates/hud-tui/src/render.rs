@@ -973,6 +973,28 @@ fn render_conversation(
         }
     }
 
+    // ── Plan-approval banner (Claude Code parity) ──────────────────────────
+    // While a plan is pending, a banner above the composer shows the
+    // decision: y approve · n discard. The plan text itself is already in
+    // the transcript (PlanReady renders as an assistant line).
+    if app.pending_plan.is_some() {
+        let row_y = composer_row.y.saturating_sub(1);
+        let buf = frame.buffer_mut();
+        for xx in composer_row.x..composer_row.x + composer_row.width {
+            buf[(xx, row_y)].set_style(Style::default().bg(p.surface2));
+        }
+        let mut cx = composer_row.x + 1;
+        for c in "PLAN READY — y approve · n discard".chars() {
+            if cx >= composer_row.x + composer_row.width {
+                break;
+            }
+            buf[(cx, row_y)]
+                .set_symbol(&c.to_string())
+                .set_style(Style::default().fg(p.cyan).bg(p.surface2).add_modifier(Modifier::BOLD));
+            cx += 1;
+        }
+    }
+
     // ── Slash-hint dropdown (Claude Code parity) ──────────────────────────
     // A live menu above the composer while the operator types a partial
     // `/command`: matched commands with one-line descriptions; ↑/↓ pick,
@@ -1539,11 +1561,15 @@ fn render_status_bar(
     // always knows whether keys type text or run commands. Shown next to
     // the ORBIT mark in the left cluster.
     {
-        let mode_label = match app.input_mode {
-            crate::state::InputMode::Insert => "INSERT",
-            crate::state::InputMode::Normal => "NORMAL",
-            crate::state::InputMode::Prefix => "PREFIX",
-            _ => "",
+        let mode_label = if app.plan_mode {
+            "PLAN"
+        } else {
+            match app.input_mode {
+                crate::state::InputMode::Insert => "INSERT",
+                crate::state::InputMode::Normal => "NORMAL",
+                crate::state::InputMode::Prefix => "PREFIX",
+                _ => "",
+            }
         };
         // The composer only accepts text in INSERT + Center focus; reflect
         // focus too so Tab-to-workspace doesn't silently eat keystrokes.

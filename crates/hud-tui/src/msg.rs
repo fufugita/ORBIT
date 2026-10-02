@@ -103,6 +103,14 @@ pub enum Msg {
     ComposerTextChanged(String),
     /// Move the slash-hint dropdown selection.
     SlashHintSelect(usize),
+    /// Toggle plan mode (Shift+Tab cycle).
+    PlanModeToggle,
+    /// A plan-mode turn finished; the text is held for approval.
+    PlanReady(String),
+    /// Operator approved the pending plan (payload = plan text).
+    PlanApproved(String),
+    /// Operator discarded the pending plan.
+    PlanDiscarded,
     /// Ctrl+C pressed — first press shows "press again to quit", second quits.
     /// While a turn is streaming, the first press cancels the turn instead.
     CtrlC,

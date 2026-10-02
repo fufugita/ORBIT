@@ -31,9 +31,9 @@ pub mod worker;
 
 pub use approval::{ApprovalRegistry, ApprovalResponse};
 pub use bridge::{
-    emit_cost, emit_error, emit_response_finished, emit_status, emit_text, emit_tool_finished,
-    emit_tool_started, emit_turn_cost, emit_workspace, safe_text, safe_text_probe, sanitize_glyphs,
-    strip_cot, CotStripper,
+    emit_cost, emit_error, emit_plan_ready, emit_response_finished, emit_status, emit_text,
+    emit_tool_finished, emit_tool_started, emit_turn_cost, emit_workspace, safe_text,
+    safe_text_probe, sanitize_glyphs, strip_cot, CotStripper,
 };
 pub use state::RedactionKind;
 pub use worker::{CommandSink, WorkerCommand, WorkerCtx, WorkerSpawner};
@@ -489,10 +489,28 @@ fn event_loop(
             // new turn (not when it queues). We detect this by snapshotting
             // turn_in_flight before reduce and checking it flipped to true.
             let was_in_flight = app.turn_in_flight;
+            // Plan approval (Claude Code parity): while a plan is pending,
+            // y approves (runs the plan as a normal turn), n discards.
+            if let Msg::PlanApproved(plan) = msg {
+                app.reduce(Msg::PlanApproved(plan.clone()));
+                // Run the approved plan as a normal (non-plan) turn.
+                app.transcript.push(crate::state::TranscriptLine::User {
+                    text: format!("Execute this approved plan:\n{plan}"),
+                    time: None,
+                });
+                let _ = command_sink.send(WorkerCommand::Prompt(format!(
+                    "Execute this approved plan:\n{plan}"
+                )));
+                continue;
+            }
             if let Msg::TextSubmitted(text) = msg {
                 app.reduce(Msg::TextSubmitted(text.clone()));
                 if !was_in_flight && app.turn_in_flight {
-                    let _ = command_sink.send(WorkerCommand::Prompt(text));
+                    if app.plan_mode {
+                        let _ = command_sink.send(WorkerCommand::PlanPrompt(text));
+                    } else {
+                        let _ = command_sink.send(WorkerCommand::Prompt(text));
+                    }
                 }
                 continue;
             }
@@ -1226,6 +1244,24 @@ fn handle_key(
         sender.send(Msg::HelpToggle);
     }
 
+    // Plan approval keys (Claude Code parity): while a plan is pending,
+    // y approves it (the event loop runs it as a normal turn), n
+    // discards. Handled before all other input so the operator can't
+    // type past the decision point.
+    if let Some(plan) = app.pending_plan.clone() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                sender.send(Msg::PlanApproved(plan));
+                return;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                sender.send(Msg::PlanDiscarded);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Command palette (§6.13): when open, ALL keys route to the palette —
     // chars build the query, ↑↓ move, enter executes, esc closes.
     if app.palette.open {
@@ -1535,9 +1571,17 @@ fn handle_key(
         // No completion found — fall through to focus navigation.
     }
 
+    // Shift+Tab (BackTab) cycles plan mode (Claude Code parity): Insert →
+    // Plan → Normal. Handled before the global Tab focus nav so BackTab
+    // never moves focus.
+    if matches!(key.code, KeyCode::BackTab) {
+        sender.send(Msg::PlanModeToggle);
+        return;
+    }
+
     // Focus navigation is global: Tab/BackTab must reach the key parser even
     // while the center composer is focused. Handle it before composer input.
-    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+    if matches!(key.code, KeyCode::Tab) {
         if let Some(action) = key_parser.parse(&key) {
             sender.send(Msg::KeyAction(action));
         }

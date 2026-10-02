@@ -17,6 +17,11 @@ use std::sync::mpsc;
 pub enum WorkerCommand {
     /// Run a normal user prompt as a turn.
     Prompt(String),
+    /// Run a prompt in PLAN MODE (Claude Code parity): read-only posture
+    /// — the turn carries a plan directive, every tool call is denied
+    /// with a plan-mode notice, and the final text is delivered as a
+    /// PlanReady card awaiting operator approval instead of running.
+    PlanPrompt(String),
     /// `/model <M>` — switch the active model for subsequent turns.
     SetModel(String),
     /// `/models` — list provider/model entries (formatted by the worker).

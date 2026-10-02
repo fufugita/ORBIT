@@ -381,6 +381,13 @@ pub fn emit_response_finished(
     });
 }
 
+/// Emit a plan-mode result: the plan text is held for operator approval
+/// (y runs it, n discards) — Claude Code plan-mode parity.
+pub fn emit_plan_ready(sender: &BusSender, plan: &str) {
+    let safe = safe_text(plan);
+    sender.send(Msg::PlanReady(safe));
+}
+
 /// Emit a backend error.
 pub fn emit_error(sender: &BusSender, error: &str) {
     let safe = safe_text(error);
