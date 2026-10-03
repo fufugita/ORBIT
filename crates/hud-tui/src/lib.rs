@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod approval;
+pub mod proto;
 pub mod bridge;
 pub mod bus;
 mod coalesce;
