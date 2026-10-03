@@ -1,0 +1,13 @@
+[package]
+name = "orbit-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orbit-adapter = { path = "../adapter" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ulid.workspace = true

@@ -27,6 +27,8 @@
 
 pub mod context;
 pub mod dispatch;
+pub mod hooks;
+pub mod skills;
 pub mod transcript;
 pub mod turn;
 

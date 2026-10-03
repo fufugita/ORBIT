@@ -14,6 +14,7 @@ members = [
   "crates/frontend-protocol",
   "crates/engine",
   "crates/tools",
+  "crates/mcp",
   "crates/reactor",
   "crates/sandbox",
   "crates/context",

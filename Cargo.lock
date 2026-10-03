@@ -2637,6 +2637,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbit-mcp"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "orbit-adapter",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "ulid",
+]
+
+[[package]]
 name = "orbit-memory"
 version = "0.1.0"
 dependencies = [
