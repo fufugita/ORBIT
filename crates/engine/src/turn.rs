@@ -40,6 +40,21 @@ pub struct TurnOptions {
     /// Output reserve subtracted from the window before the compaction
     /// threshold (the model needs room to answer).
     pub output_reserve_tokens: u64,
+    /// True inside a compaction request itself: never compact while
+    /// compacting (the recursion loops when the window is small — the
+    /// summary request alone can cross the threshold).
+    pub compacting: bool,
+}
+
+/// Rough token estimate for a transcript: ~4 chars per token across
+/// message text. Good enough to decide WHEN to compact (the provider's
+/// own usage refines it later in the turn).
+pub fn estimate_transcript_tokens(transcript: &[ChatMessage]) -> u64 {
+    let chars: usize = transcript
+        .iter()
+        .map(|m| m.content.len() + m.content.len() / 8)
+        .sum();
+    (chars as u64) / 4
 }
 
 /// The compaction threshold: compact when the next request would pass
@@ -67,6 +82,7 @@ impl Default for TurnOptions {
             request_stem: "orbit-engine".into(),
             window_tokens: None,
             output_reserve_tokens: 8_192,
+            compacting: false,
         }
     }
 }
@@ -91,6 +107,11 @@ pub fn run_turn(
 
     let mut report = TurnReport::default();
     let mut round: u32 = 0;
+    // Compaction latch: once this turn has compacted, do not compact
+    // again until the transcript grows past the threshold by NEW
+    // content (the summary itself is near the threshold when the
+    // window is small; re-checking immediately would loop forever).
+    let mut compacted_at: Option<u64> = None;
 
     loop {
         if cancel.is_cancelled() {
@@ -103,18 +124,31 @@ pub fn run_turn(
         events(FrontendEvent::RoundStarted { round });
 
         // Phase 4: auto-compaction — when the next request would pass
-        // 90% of (window − output reserve), compact first. The actual
-        // summarization dispatch runs without tools (a tool-happy
-        // model would answer with calls instead of the summary).
-        if round > 0
+        // 90% of (window − output reserve), compact first. The size is
+        // ESTIMATED from the transcript (~chars/4), not taken from the
+        // last response's usage: a resumed or continued session starts
+        // with a long transcript and zero reported input tokens, and
+        // the first request of such a turn must compact too.
+        let est_tokens = estimate_transcript_tokens(transcript);
+        let mut est_now = est_tokens;
+        if round == 0 && report.input_tokens > 0 {
+            // Later rounds in this same turn: trust the provider's own
+            // count when we have one (more accurate than the estimate).
+            est_now = report.input_tokens;
+        }
+        let grown = match compacted_at {
+            Some(at) => est_now > at,
+            None => true,
+        };
+        if !options.compacting && grown
             && should_compact(
-                report.input_tokens,
+                est_now,
                 options.window_tokens,
                 options.output_reserve_tokens,
             )
         {
             events(FrontendEvent::Compacting {
-                used_tokens: report.input_tokens,
+                used_tokens: est_now,
                 window_tokens: options.window_tokens.unwrap_or(0),
             });
             if let Some(summary) =
@@ -128,6 +162,7 @@ pub fn run_turn(
                 events(FrontendEvent::Compacted {
                     summary: summary.clone(),
                 });
+                compacted_at = Some(estimate_transcript_tokens(transcript));
             }
         }
 
@@ -432,6 +467,7 @@ fn compact_transcript(
         request_stem: format!("{}-compact", options.request_stem),
         window_tokens: options.window_tokens,
         output_reserve_tokens: options.output_reserve_tokens,
+        compacting: true,
         ..Default::default()
     };
     opts.max_rounds = 1;

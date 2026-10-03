@@ -82,16 +82,25 @@ async fn openai(
     } else {
         None
     };
-    let model_has_slow = body
+    let model = body
         .get("model")
         .and_then(|v| v.as_str())
-        .map(|m| m.contains("slow"))
-        .unwrap_or(false);
-    let selected = if model_has_slow && headers.get("x-orbit-behavior").is_none() {
-        "slow-stream"
+        .unwrap_or("")
+        .to_string();
+    // Model-name conventions for the gate scenarios: *-slow streams
+    // slowly, *-notools never emits tool calls, *-fat replies huge.
+    let model_behavior = if model.contains("slow") {
+        Some("slow-stream")
+    } else if model.contains("notools") {
+        Some("success")
+    } else if model.contains("fat") {
+        Some("fat-responses")
     } else {
-        implicit_tool_behavior.unwrap_or_else(|| behavior(&headers))
+        None
     };
+    let selected = model_behavior
+        .or(implicit_tool_behavior)
+        .unwrap_or_else(|| behavior(&headers));
     match selected {
         "rate-limit" => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -185,6 +194,12 @@ async fn anthropic(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             anthropic_tool_calls(),
+        )
+            .into_response(),
+        "fat-responses" => (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            anthropic_fat(),
         )
             .into_response(),
         _ => {
@@ -289,6 +304,20 @@ fn anthropic_tool_calls() -> String {
         "",
     ].join("\n\n")
 }
+/// A fat response: ~50k tokens of text, so a few rounds push the
+/// transcript past 90% of any small test window (gate 4).
+fn anthropic_fat() -> String {
+    let para = "The quick brown fox jumps over the lazy dog. ".repeat(40); // ~2k chars
+    let body = para.repeat(25); // ~50k chars ≈ 12k+ tokens
+    [
+        r#"{"type":"message_start","usage":{"input_tokens":3,"output_tokens":0}}"#,
+        &format!(r#"{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{body}"}}}}"#),
+        r#"{"type":"message_stop","usage":{"input_tokens":3,"output_tokens":12000}}"#,
+        "",
+    ]
+    .join("\n\n")
+}
+
 fn anthropic_success() -> String {
     [
         r#"data: {"type":"message_start","usage":{"input_tokens":3,"output_tokens":0}}"#,

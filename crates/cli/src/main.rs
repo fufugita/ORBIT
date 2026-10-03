@@ -794,10 +794,43 @@ fn cmd_headless(args: &[String]) -> i32 {
         pricing,
     );
 
+    // Session persistence in headless mode (phase 4): --continue /
+    // --resume load the prior transcript; after the turn the session
+    // is saved so the next --continue finds it. Without this, a
+    // killed session's work is lost (gate 4).
+    let resume_id = value_after(args, "--resume");
+    let wants_continue = args.iter().any(|a| a == "--continue");
+    let resumed_file = if wants_continue {
+        match orbit_cli::sessions::list_sessions(&home) {
+            Ok(mut list) if !list.is_empty() => {
+                list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                Some(list.remove(0))
+            }
+            _ => None,
+        }
+    } else {
+        resume_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| orbit_cli::sessions::load_session(&home, id).ok())
+    };
+    let mut session_id = format!("p-{}", ulid::Ulid::new());
+    let mut turns: u64 = 0;
+    let mut in_tokens: u64 = 0;
+    let mut out_tokens: u64 = 0;
+    let mut cost_microcents: u64 = 0;
     let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
+    if let Some(sf) = &resumed_file {
+        session_id = sf.session_id.clone();
+        turns = sf.turns;
+        in_tokens = sf.input_tokens;
+        out_tokens = sf.output_tokens;
+        cost_microcents = sf.cost_microcents;
+        transcript = sf.to_transcript();
+    }
     let mut executor = HeadlessToolExecutor {
         home: home.clone(),
-        session_id: format!("p-{}", ulid::Ulid::new()),
+        session_id: session_id.clone(),
         auto_tools,
     };
 
@@ -832,8 +865,30 @@ fn cmd_headless(args: &[String]) -> i32 {
         &mut events,
     );
 
+    // Persist the session whatever the outcome (a failed turn still
+    // belongs to the transcript; --continue resumes from what was
+    // WRITTEN, and the kill -9 case proves the write happens before
+    // the process can die mid-turn).
+    let save_session = |t: &Vec<orbit_adapter::types::ChatMessage>, r: &orbit_engine::TurnReport| {
+        let sf = orbit_cli::sessions::SessionFile::from_chat(
+            &session_id,
+            &model,
+            &resolved_gate,
+            &provider_id,
+            t,
+            turns + 1,
+            in_tokens + r.input_tokens,
+            out_tokens + r.output_tokens,
+            cost_microcents + r.cost_microcents,
+        );
+        if let Err(e) = orbit_cli::sessions::save_session(&home, &sf) {
+            eprintln!("warning: cannot save session: {e}");
+        }
+    };
+
     match report {
         Ok(r) => {
+            save_session(&transcript, &r);
             if json_out {
                 let summary = orbit_engine::automation::HeadlessSummary::from_report(
                     &r,
@@ -863,6 +918,15 @@ fn cmd_headless(args: &[String]) -> i32 {
             orbit_engine::automation::exit_code(&r, max_rounds, permission_denied)
         }
         Err(e) => {
+            save_session(
+                &transcript,
+                &orbit_engine::TurnReport {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microcents: 0,
+                    ..Default::default()
+                },
+            );
             eprintln!("{e}");
             1
         }
@@ -968,7 +1032,60 @@ fn find_web_bin() -> Option<PathBuf> {
 }
 
 /// Slash commands: `/help`, `/model <M>`, `/clear`, `/usage`.
+
+/// Create or enter a git worktree at .orbit/worktrees/<name> on a new
+/// branch (phase 4). Parallel sessions never touch each other's files.
+fn enter_worktree(name: &str) -> Result<PathBuf, String> {
+    // Validate the name: it becomes a branch name and a directory.
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("invalid worktree name".into());
+    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let dot_orbit = cwd.join(".orbit");
+    let wt_root = dot_orbit.join("worktrees");
+    let wt_path = wt_root.join(name);
+    if wt_path.exists() {
+        return Ok(wt_path); // idempotent: enter the existing one
+    }
+    std::fs::create_dir_all(&wt_root).map_err(|e| e.to_string())?;
+    let branch = format!("orbit/{name}");
+    let out = std::process::Command::new("git")
+        .arg("worktree")
+        .arg("add")
+        .arg("-b")
+        .arg(&branch)
+        .arg(&wt_path)
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(wt_path)
+}
 fn cmd_chat(args: &[String]) -> i32 {
+    // --worktree <name> (phase 4): create .orbit/worktrees/<name> on a
+    // new branch and enter it, so parallel sessions never touch each
+    // other's files. Idempotent: an existing worktree is entered.
+    if let Some(name) = value_after(args, "--worktree").filter(|n| !n.is_empty()) {
+        match enter_worktree(&name) {
+            Ok(path) => {
+                eprintln!("worktree: {name} at {}", path.display());
+                std::env::set_current_dir(&path).ok();
+            }
+            Err(e) => {
+                eprintln!("cannot enter worktree {name}: {e}");
+                return 2;
+            }
+        }
+    }
+
     let home = orbit_home(args).unwrap_or_else(|| {
         std::env::var("ORBIT_HOME")
             .map(PathBuf::from)

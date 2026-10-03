@@ -21,23 +21,26 @@ fn workspace_target() -> std::path::PathBuf {
         .join("target")
 }
 
-/// Spawn the mock provider binary; returns its port.
+/// Spawn the mock provider binary on a per-test port so parallel
+/// tests never fight over 8088. Returns the port. The port is derived
+/// from the test name (stable per test, unique across tests).
 fn spawn_mock() -> u16 {
-    // Build path: target/release (run from the workspace root) or
-    // target/debug. Prefer release, fall back to debug.
+    let name = std::thread::current().name().unwrap_or("gate").to_string();
+    let h = name
+        .bytes()
+        .fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619));
+    let port = 18000 + (h % 2000) as u16;
+    let bind = format!("127.0.0.1:{port}");
     let target = workspace_target();
     for profile in ["release", "debug"] {
         let bin = target.join(profile).join("orbit-mock-provider");
         if bin.exists() {
-            if let Ok(mut child) = Command::new(&bin).spawn() {
-                // Wait for the port to answer.
+            if let Ok(mut child) = Command::new(&bin).env("ORBIT_MOCK_BIND", &bind).spawn() {
                 for _ in 0..40 {
                     std::thread::sleep(std::time::Duration::from_millis(250));
-                    if std::net::TcpStream::connect("127.0.0.1:8088").is_ok() {
-                        // Leak the child intentionally for the test's
-                        // lifetime; the caller kills it at the end.
-                        std::mem::forget(child);
-                        return 8088;
+                    if std::net::TcpStream::connect(&bind).is_ok() {
+                        std::mem::forget(child); // leak for the test's life
+                        return port;
                     }
                 }
                 let _ = child.kill();
@@ -49,6 +52,7 @@ fn spawn_mock() -> u16 {
 
 /// Run `orbit -p` and collect the stream-json events.
 fn run_orbit_p(
+    port: u16,
     home: &std::path::Path,
     prompt: &str,
     extra: &[&str],
@@ -65,9 +69,9 @@ fn run_orbit_p(
         .arg("--home")
         .arg(home)
         .arg("--gate")
-        .arg("http://127.0.0.1:8088")
+        .arg(format!("http://127.0.0.1:{port}"))
         .arg("--model")
-        .arg("gate-test-model")
+        .arg(std::env::var("ORBIT_GATE_MODEL").unwrap_or_else(|_| "gate-test-model".into()))
         .arg("--output-format")
         .arg("stream-json")
         .args(extra)
@@ -111,7 +115,6 @@ fn init_home(bin: &str, home: &std::path::Path) {
 #[test]
 fn gate3_tools_run_through_the_binary() {
     let port = spawn_mock();
-    assert_eq!(port, 8088);
     let home = fresh_home("g3-binary");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {
@@ -121,7 +124,7 @@ fn gate3_tools_run_through_the_binary() {
     };
     init_home(&bin.to_string_lossy(), &home);
 
-    let (events, code) = run_orbit_p(&home, "what is 2*(3+4)?", &[]);
+    let (events, code) = run_orbit_p(port, &home, "what is 2*(3+4)?", &[]);
     let types: Vec<&str> = events
         .iter()
         .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
@@ -150,10 +153,7 @@ fn gate3_tools_run_through_the_binary() {
     );
 
     // Cleanup: kill the leaked mock.
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg("orbit-mock-provider")
-        .status();
+    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -162,7 +162,6 @@ fn gate3_tools_run_through_the_binary() {
 #[test]
 fn gate1_env_mention_refused_through_binary() {
     let port = spawn_mock();
-    assert_eq!(port, 8088);
     let home = fresh_home("g1-binary");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {
@@ -178,6 +177,7 @@ fn gate1_env_mention_refused_through_binary() {
     // lets a secret through: a prompt with a fake key in it must not
     // echo the key back in any event.
     let (events, _code) = run_orbit_p(
+        port,
         &home,
         "summarize token = sk-abcdefghijklmnopqrstuvwxyz123456",
         &[],
@@ -188,9 +188,148 @@ fn gate1_env_mention_refused_through_binary() {
         "a secret in the prompt must never appear in the event stream"
     );
 
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg("orbit-mock-provider")
-        .status();
+    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Gate 4, part 1: auto-compaction through the binary. A tiny
+/// context_window in providers.toml (100 tokens) means the second
+/// round's input count crosses 90% and the engine compacts — the
+/// stream must show `compacting`/`compacted` events and the turn must
+/// still finish ok.
+#[test]
+fn gate4_auto_compaction_through_the_binary() {
+    let port = spawn_mock();
+    let home = fresh_home("g4-compact");
+    let target = workspace_target();
+    let bin = if target.join("release/orbit").exists() {
+        target.join("release/orbit")
+    } else {
+        target.join("debug/orbit")
+    };
+    init_home(&bin.to_string_lossy(), &home);
+
+    // A tiny window: 100 tokens → threshold = 90. init does not write
+    // providers.toml, so write a complete valid one.
+    let providers = home.join("providers.toml");
+    std::fs::write(
+        &providers,
+        format!(
+            r#"[[provider]]
+name = "gate"
+kind = "openai-compatible"
+url = "http://127.0.0.1:{port}"
+
+[[provider.models]]
+id = "gate-test-model-notools"
+context_window = 100
+"#
+        ),
+    )
+    .unwrap();
+
+    std::env::set_var("ORBIT_GATE_MODEL", "gate-test-model-notools");
+    let (events, code) = run_orbit_p(port, &home, "count from 1 to 5", &[]);
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+        .collect();
+    // The turn must complete...
+    assert!(
+        types.contains(&"turn_ended"),
+        "gate4: the turn must end: {types:?}"
+    );
+    let ended = events
+        .iter()
+        .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended"))
+        .unwrap();
+    assert_eq!(ended.get("ok").and_then(|o| o.as_bool()), Some(true));
+    assert_eq!(code, 0);
+
+    // ...and at least one compaction must have fired (window crossed).
+    assert!(
+        types.contains(&"compacting") || types.contains(&"compacted"),
+        "gate4: with a 100-token window the session must compact: {types:?}"
+    );
+
+    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Gate 4, part 2: kill -9 mid-turn, then `orbit --continue` resumes
+/// with the earlier turns intact (nothing written before the kill is
+/// lost).
+#[test]
+fn gate4_continue_after_kill9() {
+    let port = spawn_mock();
+    let home = fresh_home("g4-continue");
+    let target = workspace_target();
+    let bin = if target.join("release/orbit").exists() {
+        target.join("release/orbit")
+    } else {
+        target.join("debug/orbit")
+    };
+    init_home(&bin.to_string_lossy(), &home);
+
+    // Turn 1 completes normally: the session file exists with 1 turn.
+    let (events, code) = run_orbit_p(port, &home, "say hi once", &[]);
+    assert_eq!(code, 0);
+    assert!(events
+        .iter()
+        .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended")));
+
+    // Turn 2 is killed mid-flight with SIGKILL (nothing can intercept).
+    let mut child = Command::new(&bin)
+        .arg("-p")
+        .arg("you will not finish this")
+        .arg("--home")
+        .arg(&home)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .arg("--model")
+        .arg("gate-test-model-slow-stream")
+        .arg("--output-format")
+        .arg("stream-json")
+        .env("ORBIT_HOME", &home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn orbit turn 2");
+    // Give it a moment to start streaming, then SIGKILL.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let _ = child.kill(); // SIGKILL on unix
+    let _ = child.wait();
+
+    // --continue must resume the FIRST turn's session and complete a
+    // fresh turn (the killed one never ended, so the newest saved
+    // state is turn 1).
+    let (events, code) = run_orbit_p(port, &home, "and we are back", &["--continue"]);
+    assert_eq!(code, 0, "--continue must work after a kill -9");
+    assert!(events
+        .iter()
+        .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended")),
+        "the resumed turn must complete");
+    // The stream-json transcript must show turn 1's content preserved
+    // (the provider received the prior conversation: we assert via the
+    // session file instead — turns > 1).
+    let sessions_dir = home.join("sessions");
+    let mut found_turns = 0u64;
+    if let Ok(rd) = std::fs::read_dir(&sessions_dir) {
+        for entry in rd.flatten() {
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(t) = v.get("turns").and_then(|t| t.as_u64()) {
+                        found_turns = found_turns.max(t);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        found_turns >= 2,
+        "the session after --continue must carry the pre-kill turns (found {found_turns})"
+    );
+
+    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
     let _ = std::fs::remove_dir_all(&home);
 }
