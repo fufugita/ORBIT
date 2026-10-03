@@ -14,7 +14,7 @@ use super::comps;
 use super::core::Token;
 use super::layout::View;
 use super::panels;
-use super::scenario::{Activity, Scenario};
+use super::scenario::{Activity, LineKind, Scenario, TranscriptLine};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -220,6 +220,10 @@ fn handle_key(
                     return true;
                 }
                 if !text.is_empty() {
+                    scenario.transcript.push(TranscriptLine {
+                        kind: LineKind::User,
+                        text: text.clone(),
+                    });
                     command_sink.send(crate::WorkerCommand::Prompt(text.clone()));
                     scenario.apply("round_started", 0);
                 }
@@ -258,13 +262,26 @@ fn handle_key(
 /// FrontendEvent-shaped Msgs → the scenario reducer.
 fn apply_msg(msg: Msg, scenario: &mut Scenario, sender: &BusSender, now_ms: u64) {
     match msg {
-        Msg::TextDelta(_) => {
+        Msg::TextDelta(text) => {
             scenario.apply("text_delta", 0);
             scenario.last_data_ms = now_ms;
+            // Stream into the transcript: append to the open model
+            // line, or open one.
+            match scenario.transcript.last_mut() {
+                Some(l) if l.kind == LineKind::Model => l.text.push_str(&text),
+                _ => scenario.transcript.push(TranscriptLine {
+                    kind: LineKind::Model,
+                    text,
+                }),
+            }
         }
-        Msg::ToolCallStarted { name, .. } => {
-            scenario.running.insert(name.clone(), name);
+        Msg::ToolCallStarted { name, summary } => {
+            scenario.running.insert(name.clone(), name.clone());
             scenario.apply("tool_started_full", 0);
+            scenario.transcript.push(TranscriptLine {
+                kind: LineKind::Tool,
+                text: format!("{name} {summary}"),
+            });
         }
         Msg::ToolCallFinished { name, .. } => {
             scenario.running.remove(&name);
@@ -279,8 +296,11 @@ fn apply_msg(msg: Msg, scenario: &mut Scenario, sender: &BusSender, now_ms: u64)
             scenario.apply("turn_ended", 0);
         }
         Msg::Status(text) => {
-            // Statuses surface as terminal-tail lines.
-            scenario.tool_output.push(text);
+            scenario.tool_output.push(text.clone());
+            scenario.transcript.push(TranscriptLine {
+                kind: LineKind::System,
+                text,
+            });
         }
         Msg::Identity { model, .. } => {
             scenario.model = model;

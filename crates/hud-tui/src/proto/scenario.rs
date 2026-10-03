@@ -40,6 +40,29 @@ pub struct Scenario {
     /// When data last arrived (the caret breathes after 400 ms
     /// without it — M06).
     pub last_data_ms: u64,
+    /// The transcript: every visible line of the session (user
+    /// prompts, model replies, tool lines). The conversation panel
+    /// renders the tail.
+    pub transcript: Vec<TranscriptLine>,
+}
+
+/// One visible transcript line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptLine {
+    pub kind: LineKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// The operator's prompt.
+    User,
+    /// Model output (streamed).
+    Model,
+    /// A tool line (started/finished).
+    Tool,
+    /// A system/status line.
+    System,
 }
 
 #[derive(Debug, Clone, PartialEq)]

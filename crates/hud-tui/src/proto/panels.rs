@@ -8,7 +8,7 @@
 use super::comps;
 use super::core::{glyphs, Token};
 use super::layout::View;
-use super::scenario::Scenario;
+use super::scenario::{LineKind, Scenario};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -81,16 +81,39 @@ pub fn render_panel(
 /// model works (M05) + the caret while streaming (M06).
 fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    // The last turn's visible output (the scenario keeps it simple:
-    // the reducer's transcript lives in the front-end state; here we
-    // render the activity + a transcript placeholder driven by it).
+    // The transcript tail: every visible line of the session — user
+    // prompts, model replies, tool lines — rendered with the kind's
+    // chrome. The thinking/streaming indicators ride on top.
+    let tail = s.transcript.iter().rev().take(200).collect::<Vec<_>>();
+    for l in tail.iter().rev() {
+        match l.kind {
+            LineKind::User => out.push(Line::from(vec![
+                Span::styled("❯ ", Style::default().fg(comps::colour(Token::Cyan))),
+                Span::styled(l.text.clone(), Style::default().fg(comps::colour(Token::Ink))),
+            ])),
+            LineKind::Model => out.push(Line::from(Span::styled(
+                l.text.clone(),
+                Style::default().fg(comps::colour(Token::Ink)),
+            ))),
+            LineKind::Tool => out.push(Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(comps::colour(Token::Magenta))),
+                Span::styled(l.text.clone(), Style::default().fg(comps::colour(Token::Muted))),
+            ])),
+            LineKind::System => out.push(Line::from(Span::styled(
+                l.text.clone(),
+                Style::default().fg(comps::colour(Token::Muted)),
+            ))),
+        }
+    }
+    // The live indicators: thinking (no visible output yet) or
+    // streaming (data flowing).
     if s.turn_live && !s.visible_output {
         out.push(comps::thinking_line(&s.model, glyphs::STAR_STILL));
     }
     if s.turn_live && s.visible_output {
         out.push(Line::from(vec![
             Span::styled("▌streaming", Style::default().fg(comps::colour(Token::Cyan))),
-            comps::caret(tick, tick, reduced),
+            comps::caret(tick, s.last_data_ms, reduced),
         ]));
     }
     out
