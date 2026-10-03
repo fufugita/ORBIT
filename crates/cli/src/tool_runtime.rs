@@ -338,6 +338,31 @@ pub fn execute_call(
         return Ok(output);
     }
 
+    // The Task tool (phase 5): spawn a subagent. The subagent needs
+    // the session's TurnConfig — derived from the same environment the
+    // front-ends use, so provider/gate/model match the parent.
+    if call.name == "Task" {
+        let agent = args.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        if agent.is_empty() || prompt.is_empty() {
+            let output = tool_error("Task requires 'agent' and 'prompt'");
+            record_result(&mut writer, session_id, decision_id, call, "error", &output)?;
+            return Ok(output);
+        }
+        let turn_config = subagent_turn_config(home);
+        let output = match crate::tools::execute_task(home, agent, prompt, &turn_config, approval) {
+            Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
+            Err(e) => tool_error(&e),
+        };
+        let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
+            "ok"
+        } else {
+            "error"
+        };
+        record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+        return Ok(output);
+    }
+
     // MCP tools (phase 5): mcp__<server>__<tool> — spawn, call, scan.
     if call.name.starts_with("mcp__") {
         let output = execute_mcp(home, call, &args);
@@ -588,6 +613,75 @@ fn execute_mcp(home: &Path, call: &crate::PendingToolCall, args: &serde_json::Va
             }
         }
         Err(e) => tool_error(&format!("mcp server unreachable: {e}")),
+    }
+}
+
+/// The subagent's tool executor: every call goes through execute_call
+/// — the same permission path, ledger and approval channel as the
+/// parent session (roadmap gate 5: the subagent's approval request
+/// appears in the main session).
+pub struct SubagentExecutor<'a> {
+    home: std::path::PathBuf,
+    session_id: String,
+    approval: &'a mut dyn ApprovalChannel,
+    grants: AutoGrants,
+}
+
+impl<'a> SubagentExecutor<'a> {
+    pub fn new(home: std::path::PathBuf, approval: &'a mut dyn ApprovalChannel) -> Self {
+        Self {
+            session_id: format!("subagent-{}", ulid::Ulid::new()),
+            home,
+            approval,
+            grants: AutoGrants::new(),
+        }
+    }
+}
+
+impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
+    fn execute(
+        &mut self,
+        calls: &[crate::PendingToolCall],
+        _round: u32,
+    ) -> Vec<orbit_engine::ToolRoundResult> {
+        calls
+            .iter()
+            .map(|call| {
+                let decision_id = ulid::Ulid::new().to_string();
+                let content = execute_call(
+                    &self.home,
+                    &self.session_id,
+                    &decision_id,
+                    call,
+                    false,
+                    true,
+                    self.approval,
+                    &mut self.grants,
+                )
+                .unwrap_or_else(|e| tool_error(&e));
+                orbit_engine::ToolRoundResult {
+                    call_id: call.id.clone(),
+                    content,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Derive the TurnConfig for a subagent from the same sources the
+/// front-ends use (env + providers.toml), so provider/gate/model match
+/// the parent session.
+pub fn subagent_turn_config(_home: &Path) -> orbit_engine::TurnConfig {
+    let gate = std::env::var("ORBIT_GATE_URL").unwrap_or_else(|_| "http://127.0.0.1:4001".into());
+    let model = std::env::var("ORBIT_MODEL").unwrap_or_else(|_| "glm-5.2".into());
+    orbit_engine::dispatch::TurnConfig {
+        provider_id: std::env::var("ORBIT_PROVIDER").unwrap_or_else(|_| "local".into()),
+        gate,
+        model,
+        kind: orbit_engine::dispatch::ProviderKind::OpenAiCompatible,
+        credential_env: std::env::var("ORBIT_CREDENTIAL_ENV").ok(),
+        pricing: None,
+        max_output_tokens: 0,
     }
 }
 

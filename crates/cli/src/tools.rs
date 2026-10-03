@@ -66,6 +66,9 @@ pub fn session_tool_definitions(home: &std::path::Path) -> Vec<ToolDefinition> {
     // The Skill tool: load a skill's body on demand.
     defs.push(skill_tool_definition());
 
+    // The Task tool: spawn a subagent (phase 5).
+    defs.push(task_tool_definition());
+
     // MCP tools.
     let trusted = {
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -133,6 +136,118 @@ fn skill_tool_definition() -> ToolDefinition {
             &bytes,
         ))),
     }
+}
+
+/// The Task tool definition (phase 5): spawn a subagent. The agent
+/// list is in the system prompt; the subagent runs a nested engine
+/// turn with the agent's restricted tool set and returns its final
+/// report.
+fn task_tool_definition() -> ToolDefinition {
+    let name = "Task";
+    let description = "Run a subagent: Explore (read-only research), Plan (implementation plan), or general-purpose (delegated work). Returns the subagent's final report.";
+    let parameters = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "agent": { "type": "string", "description": "The subagent to run (Explore, Plan, general-purpose)" },
+            "prompt": { "type": "string", "description": "The task for the subagent" }
+        },
+        "required": ["agent", "prompt"]
+    });
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(description.as_bytes());
+    bytes.extend_from_slice(
+        serde_json::to_string(&parameters)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    ToolDefinition {
+        name: name.into(),
+        description: description.into(),
+        parameters,
+        schema_digest: orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(
+            &bytes,
+        ))),
+    }
+}
+
+/// Execute the Task tool: run a subagent as a nested engine turn.
+/// `turn_config` carries the provider/gate/model the session already
+/// uses; the subagent's own tool set comes from its definition.
+pub fn execute_task(
+    home: &std::path::Path,
+    agent_name: &str,
+    prompt: &str,
+    turn_config: &orbit_engine::TurnConfig,
+    approval: &mut dyn crate::tool_runtime::ApprovalChannel,
+) -> Result<serde_json::Value, String> {
+    let trusted = {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
+    };
+    let agents = orbit_engine::skills::load_agents(home, trusted);
+    let agent = agents
+        .into_iter()
+        .find(|a| a.name == agent_name)
+        .ok_or_else(|| format!("unknown subagent: {agent_name}"))?;
+
+    // The subagent's tool set: its allowlist intersected with the
+    // session's tools (a subagent never gets tools the session lacks).
+    let session_tools = session_tool_definitions(home);
+    let sub_tools: Vec<ToolDefinition> = if agent.tools.is_empty() {
+        session_tools
+    } else {
+        session_tools
+            .into_iter()
+            .filter(|t| agent.tools.contains(&t.name))
+            .collect()
+    };
+
+    // A fresh transcript: the subagent does not see the parent's
+    // conversation, only its prompt.
+    let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
+    let cancel = orbit_provider_http::CancelToken::new();
+    let options = orbit_engine::TurnOptions {
+        tools: sub_tools,
+        max_rounds: agent.max_turns,
+        system_directive: Some(format!(
+            "You are {name}, a subagent. {desc}\n\nComplete the task and reply with your final report. You do not see the parent conversation.",
+            name = agent.name,
+            desc = agent.description
+        )),
+        request_stem: format!("orbit-task-{}", agent.name),
+        ..Default::default()
+    };
+
+    // The subagent's tool calls go through the same permission path as
+    // the parent's — the approval channel is shared, so a subagent's
+    // approval request appears in the main session (roadmap gate 5).
+    let mut executor = crate::tool_runtime::SubagentExecutor::new(home.to_path_buf(), approval);
+    let report = orbit_engine::run_turn(
+        home,
+        turn_config,
+        &options,
+        prompt,
+        &mut transcript,
+        &mut executor,
+        &cancel,
+        &mut |_| {},
+    )?;
+
+    // The final assistant text is the report.
+    let report_text = transcript
+        .iter()
+        .rev()
+        .find(|m| m.role == orbit_adapter::types::ChatRole::Assistant)
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "ok": report.ok,
+        "agent": agent.name,
+        "rounds": report.rounds,
+        "report": report_text,
+    }))
 }
 
 /// Execute the Skill tool: return the named skill's body.
