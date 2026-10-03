@@ -13,4 +13,8 @@
 
 pub mod anim;
 pub mod core;
+pub mod layout;
+pub mod comps;
+pub mod panels;
+pub mod app;
 pub mod scenario;

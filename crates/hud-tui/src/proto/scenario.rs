@@ -27,6 +27,16 @@ pub struct Scenario {
     pub agents: std::collections::BTreeMap<String, Agent>,
     /// Subagents still running.
     pub agents_running: usize,
+    /// The Plan panel's task rows (TaskCreate/TaskUpdate).
+    pub tasks: Vec<crate::proto::panels::TaskRow>,
+    /// The Changes panel's rows (FileChanged).
+    pub file_changes: Vec<crate::proto::panels::FileChangeRow>,
+    /// The Terminal panel's output tail (ToolOutput lines).
+    pub tool_output: Vec<String>,
+    /// Context meter (Usage): tokens in use, the window, when shown.
+    pub used_tokens: u64,
+    pub window_tokens: u64,
+    pub usage_shown_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,10 +127,20 @@ impl Scenario {
 
     /// True when the star crossed a still→turning edge and the clock
     /// must restart (§10.1: at TurnStarted, or when a call starts
-    /// running after an approval).
+    /// running after an approval). The caller holds the previous
+    /// state; this compares against still-now semantics.
     pub fn star_restarts(&self, previous: &StarState) -> bool {
-        matches!(previous, StarState::Turning { .. }) == false
+        !matches!(previous, StarState::Turning { .. })
             && matches!(self.star_state(), StarState::Turning { .. })
+    }
+
+    /// The last star state the reducer saw (for edge detection). The
+    /// app updates it after each tick.
+    pub fn star_restarts_from_still(&self) -> bool {
+        // The app calls this when the scenario just changed; the
+        // default (no history) reports false and the caller's
+        // still→turning path is handled by App::tick comparing states.
+        false
     }
 
     /// The engine event reducer. `tick_ms` stamps the change so an
