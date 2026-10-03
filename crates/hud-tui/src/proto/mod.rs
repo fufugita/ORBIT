@@ -17,4 +17,5 @@ pub mod layout;
 pub mod comps;
 pub mod panels;
 pub mod app;
+pub mod runtime;
 pub mod scenario;

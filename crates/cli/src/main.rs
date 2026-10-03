@@ -1427,6 +1427,9 @@ fn cmd_chat(args: &[String]) -> i32 {
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
             && std::io::IsTerminal::is_terminal(&std::io::stdout());
         let want_go_tui = args.iter().any(|a| a == "--go-tui");
+        // The motion-first redesign (the ORBIT TUI prototype) is the
+        // default screen; --old-tui keeps the v1 HUD.
+        let want_old_tui = args.iter().any(|a| a == "--old-tui");
         if want_tui {
             let session_id = resumed_file
                 .as_ref()
@@ -1462,7 +1465,13 @@ fn cmd_chat(args: &[String]) -> i32 {
             // set them for the in-process TUI before it computes the row.
             std::env::set_var("ORBIT_ACTIVE_MODEL", &tui_config.model);
             std::env::set_var("ORBIT_ACTIVE_PROVIDER", &tui_config.provider_id);
-            return orbit_hud_tui::run(args, tui_worker::make_spawner(tui_config));
+            if want_old_tui {
+                return orbit_hud_tui::run(args, tui_worker::make_spawner(tui_config));
+            }
+            return orbit_hud_tui::proto::runtime::run_proto(
+                args,
+                tui_worker::make_spawner(tui_config),
+            );
         }
     }
 
