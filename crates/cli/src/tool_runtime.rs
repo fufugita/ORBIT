@@ -590,30 +590,47 @@ fn execute_mcp(home: &Path, call: &crate::PendingToolCall, args: &serde_json::Va
     let Some(server_cfg) = cfg.servers.get(&server) else {
         return tool_error(&format!("mcp server not configured: {server}"));
     };
-    match orbit_mcp::McpSession::spawn(&server, server_cfg) {
-        Ok(mut session) => {
-            // Strip the wrapper args the model was told about; pass the
-            // rest through as the tool's own arguments.
-            let mut call_args = args.clone();
-            if let Some(obj) = call_args.as_object_mut() {
-                obj.remove("server");
-                obj.remove("tool");
-            }
-            match session.call_tool(&tool, call_args) {
-                Ok(text) => {
-                    let scanned = orbit_tools::scan::scan_result(&text.to_string());
-                    serde_json::json!({
-                        "ok": true,
-                        "result": scanned.text,
-                        "redactions": scanned.redactions.len(),
-                    })
-                    .to_string()
-                }
-                Err(e) => tool_error(&format!("mcp call failed: {e}")),
-            }
-        }
-        Err(e) => tool_error(&format!("mcp server unreachable: {e}")),
+    // The process-lifetime pool: the server was spawned once (at
+    // definition build) and is reused across every call (phase 5 —
+    // no re-spawn, no re-handshake per tool call).
+    let mut call_args = args.clone();
+    if let Some(obj) = call_args.as_object_mut() {
+        obj.remove("server");
+        obj.remove("tool");
     }
+    let params = serde_json::json!({
+        "name": tool,
+        "arguments": call_args,
+    });
+    match orbit_mcp::POOL.request(&server, server_cfg, "tools/call", params) {
+        Ok(result) => {
+            // MCP content blocks → text.
+            let text = mcp_result_text(&result);
+            let scanned = orbit_tools::scan::scan_result(&text);
+            serde_json::json!({
+                "ok": true,
+                "result": scanned.text,
+                "redactions": scanned.redactions.len(),
+            })
+            .to_string()
+        }
+        Err(e) => tool_error(&format!("mcp call failed: {e}")),
+    }
+}
+
+/// Pull the text out of an MCP tools/call result (content blocks).
+fn mcp_result_text(result: &serde_json::Value) -> String {
+    result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| result.to_string())
 }
 
 /// The subagent's tool executor: every call goes through execute_call

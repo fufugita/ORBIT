@@ -2452,6 +2452,7 @@ dependencies = [
  "orbit-ledger",
  "orbit-mcp",
  "orbit-pib",
+ "orbit-plugin",
  "orbit-provider-http",
  "orbit-reactor",
  "orbit-release",
@@ -2821,10 +2822,15 @@ dependencies = [
  "hex",
  "orbit-adapter",
  "orbit-frontend-protocol",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
  "ulid",
+ "url",
 ]
 
 [[package]]

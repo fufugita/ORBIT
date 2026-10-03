@@ -80,6 +80,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "restore" => cmd_restore(&home, args),
         "ask" => cmd_ask(&home, args),
         "models" | "list-models" => cmd_models(&home, args),
+        "mod" => cmd_mod(&home, args),
         "version" => Ok(
             serde_json::to_value(orbit_cli::version_evidence("0.1.0", "dev")).unwrap_or_default(),
         ),
@@ -102,6 +103,9 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "export --to   encrypt an age bundle",
                 "restore       restore into a fresh namespace",
                 "version       release evidence (claims + hashes)",
+                "mod install <pkg> --manifest <m>  install a signed mod",
+                "mod list                        installed mods",
+                "mod allow-issuer <hex-key>       trust a mod issuer",
                 "web           start the browser harness (orbit-web bridge)"
             ]
         })),
@@ -1514,6 +1518,104 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
 
 /// `orbit models` — list every declared model across all configured providers.
 /// Reads `$ORBIT_HOME/providers.toml` (missing = empty config).
+/// `orbit mod …` — mods as signed plugins (phase 5): a bundle of
+/// instructions, commands, skills, hooks and MCP servers, installed
+/// through orbit-plugin's signed-manifest flow (issuer key, content
+/// digest, operator approval, ledger record).
+fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    let sub = args.get(1).map(String::as_str).unwrap_or("");
+    // Issuer allowlist: $ORBIT_HOME/mods/issuers.txt, one hex key per
+    // line. The operator trusts an issuer explicitly; installs from
+    // anyone else are refused.
+    let issuers_path = home.join("mods").join("issuers.txt");
+    let read_issuers = || -> std::collections::HashSet<String> {
+        std::fs::read_to_string(&issuers_path)
+            .map(|t| {
+                t.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match sub {
+        "allow-issuer" => {
+            let Some(key) = args.get(2) else {
+                return Err(("ORBIT-E1101", "usage: orbit mod allow-issuer <hex-ed25519-key>".into()));
+            };
+            let key = key.trim();
+            if hex::decode(key).map(|b| b.len() != 32).unwrap_or(true) {
+                return Err(("ORBIT-E0806", "issuer key must be 32 bytes of hex".into()));
+            }
+            std::fs::create_dir_all(home.join("mods")).map_err(|e| ("ORBIT-E0501", e.to_string()))?;
+            let mut existing = read_issuers();
+            existing.insert(key.to_string());
+            let text = existing.into_iter().collect::<Vec<_>>().join("\n");
+            std::fs::write(&issuers_path, format!("{text}\n"))
+                .map_err(|e| ("ORBIT-E0501", e.to_string()))?;
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "mod allow-issuer",
+                "status": "ok",
+                "issuer": key,
+            }))
+        }
+        "list" => {
+            let issuers = read_issuers();
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "mod list",
+                "status": "ok",
+                "trusted_issuers": issuers.len(),
+                "issuers": issuers,
+            }))
+        }
+        "install" => {
+            let pkg = value_after(args, "--package")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| ("ORBIT-E1101", "usage: orbit mod install <package.wasm> --manifest <manifest.json>".into()))?;
+            let manifest_path = value_after(args, "--manifest")
+                .ok_or_else(|| ("ORBIT-E1101", "install needs --manifest <manifest.json>".into()))?;
+            let manifest_text = std::fs::read_to_string(&manifest_path)
+                .map_err(|e| ("ORBIT-E0401", format!("read manifest: {e}")))?;
+            let manifest: orbit_plugin::PluginManifest = serde_json::from_str(&manifest_text)
+                .map_err(|e| ("ORBIT-E0401", format!("parse manifest: {e}")))?;
+            let package_bytes = std::fs::read(&pkg)
+                .map_err(|e| ("ORBIT-E0401", format!("read package: {e}")))?;
+            let issuers = read_issuers();
+            if !issuers.contains(&manifest.issuer_public_key) {
+                return Err((
+                    "ORBIT-E0806",
+                    format!(
+                        "issuer {} is not trusted; run: orbit mod allow-issuer {}",
+                        &manifest.issuer_public_key[..8.min(manifest.issuer_public_key.len())],
+                        manifest.issuer_public_key
+                    ),
+                ));
+            }
+            let mut registry = orbit_plugin::PluginRegistry::new(4);
+            for i in issuers {
+                registry.allow_issuer(i);
+            }
+            registry.attach_ledger();
+            let allowlist = orbit_plugin::WasiHostAllowlist::canonical();
+            match registry.install(&manifest, &allowlist, &package_bytes) {
+                Ok(installed) => Ok(serde_json::json!({
+                    "schema": "orbit.cli/v1",
+                    "command": "mod install",
+                    "status": "ok",
+                    "mod": installed.name,
+                    "version": installed.version,
+                    "issuer": installed.issuer_fingerprint,
+                })),
+                Err(e) => Err(("ORBIT-E0806", e.to_string())),
+            }
+        }
+        other => Err(("ORBIT-E1101", format!("unknown mod subcommand {other:?} (install, list, allow-issuer)"))),
+    }
+}
+
 fn cmd_models(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
     let entries: Vec<(String, String)> = cfg.all_models();

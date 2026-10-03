@@ -26,6 +26,8 @@ pub mod fs_tools;
 pub mod permissions;
 pub mod sandbox;
 pub mod scan;
+pub mod tasks;
+pub mod webfetch;
 
 pub use fs_tools::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 
@@ -182,6 +184,10 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(GrepTool),
         Box::new(bash::BashTool),
         Box::new(bash::TaskStopTool),
+        Box::new(tasks::TaskCreateTool),
+        Box::new(tasks::TaskUpdateTool),
+        Box::new(tasks::TaskListTool),
+        Box::new(webfetch::WebFetchTool),
     ]
 }
 
@@ -226,6 +232,10 @@ pub fn tool_description(name: &str) -> &'static str {
         "TaskStop" => "Stops a background command",
         "AskUserQuestion" => "Asks the operator 1-4 multiple-choice questions",
         "ExitPlanMode" => "Presents the plan and asks to leave plan mode",
+        "TaskCreate" => "Adds a task to the session task list (drives the Plan panel)",
+        "TaskUpdate" => "Updates a task's status, title or detail",
+        "TaskList" => "Lists the session's tasks",
+        "WebFetch" => "Fetches an https URL as markdown; records an egress grant per domain",
         _ => "unknown tool",
     }
 }
@@ -248,7 +258,10 @@ pub fn is_wave1(name: &str) -> bool {
 
 /// Read-only classification (backend-authoritative, roadmap rule).
 pub fn is_read_only(name: &str) -> bool {
-    matches!(name, "Read" | "Glob" | "Grep" | "AskUserQuestion")
+    matches!(
+        name,
+        "Read" | "Glob" | "Grep" | "AskUserQuestion" | "TaskList" | "WebFetch"
+    )
 }
 
 /// The default deny-read list (roadmap: credentials never reach a

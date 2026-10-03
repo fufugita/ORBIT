@@ -200,6 +200,17 @@ impl McpSession {
     }
 }
 
+impl McpSession {
+    /// The child is still running (a crashed server is respawned by
+    /// the pool on the next call).
+    pub fn is_alive(&mut self) -> bool {
+        self.child
+            .try_wait()
+            .map(|st| st.is_none())
+            .unwrap_or(false)
+    }
+}
+
 impl Drop for McpSession {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -301,3 +312,78 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// A process-lifetime pool of MCP sessions: one spawned server per
+/// configured name, reused across calls (phase 5 — "MCP session
+/// reuse"). Without it every tool call re-spawned the server and
+/// re-ran the initialize handshake, and every definition build
+/// spawned them all again.
+pub struct McpPool {
+    sessions: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, McpSession>>>,
+}
+
+impl McpPool {
+    pub const fn new() -> Self {
+        McpPool {
+            sessions: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, std::collections::HashMap<String, McpSession>>, String> {
+        let m = self
+            .sessions
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        m.lock().map_err(|_| "pool poisoned".to_string())
+    }
+
+    /// Get or spawn the session for a configured server. A dead child
+    /// (server crashed) is replaced on the next call.
+    pub fn get(&self, name: &str, cfg: &McpServerConfig) -> Result<(), String> {
+        let mut g = self.lock()?;
+        let needs_spawn = match g.get_mut(name) {
+            Some(s) => !s.is_alive(),
+            None => true,
+        };
+        if needs_spawn {
+            let s = McpSession::spawn(name, cfg)?;
+            g.insert(name.into(), s);
+        }
+        Ok(())
+    }
+
+    /// Run a request on the pooled session.
+    pub fn request(
+        &self,
+        name: &str,
+        cfg: &McpServerConfig,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.get(name, cfg)?;
+        let mut g = self.lock()?;
+        let s = g.get_mut(name).ok_or("session vanished")?;
+        s.request(method, params)
+    }
+
+    /// List a pooled server's tools.
+    pub fn list_tools(
+        &self,
+        name: &str,
+        cfg: &McpServerConfig,
+    ) -> Result<Vec<McpToolInfo>, String> {
+        self.get(name, cfg)?;
+        let mut g = self.lock()?;
+        let s = g.get_mut(name).ok_or("session vanished")?;
+        s.list_tools()
+    }
+}
+
+impl Default for McpPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process-global pool (front-ends are single-process; the TUI
+/// worker and the headless executor share it).
+pub static POOL: McpPool = McpPool::new();

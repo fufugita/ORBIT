@@ -333,3 +333,99 @@ fn gate4_continue_after_kill9() {
     let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Phase 5, part 1: the signed-mod flow through the binary. A mod is
+/// installed only when the issuer is trusted, the signature verifies
+/// and the content digest matches; a tampered package is refused.
+#[test]
+fn mod_install_signed_flow_through_binary() {
+    let home = fresh_home("mod-install");
+    let target = workspace_target();
+    let bin = if target.join("release/orbit").exists() {
+        target.join("release/orbit")
+    } else {
+        target.join("debug/orbit")
+    };
+    init_home(&bin.to_string_lossy(), &home);
+
+    // Generate a key, sign a manifest, trust the issuer, install.
+    // (Signing happens via a tiny cargo script through the plugin
+    // crate's public sign_manifest — here we shell out to the
+    // workspace's test binary helper.)
+    let tmp = home.join("pkg");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let package = tmp.join("mod.wasm");
+    std::fs::write(&package, b"package-bytes").unwrap();
+    let manifest = tmp.join("manifest.json");
+
+    // Sign in-process (tests/Cargo.toml links orbit-plugin and
+    // ed25519-dalek).
+    let sk = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let m = orbit_plugin::sign_manifest(
+        "my-mod",
+        "0.1.0",
+        &sk,
+        b"package-bytes",
+        vec!["wasi:http/proxy".into()],
+    );
+    std::fs::write(&manifest, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+
+    // 1. Install WITHOUT trusting the issuer → refused.
+    let out = Command::new(&bin)
+        .args(["mod", "install"])
+        .arg(&package)
+        .arg("--manifest")
+        .arg(&manifest)
+        .env("ORBIT_HOME", &home)
+        .output()
+        .expect("mod install (untrusted)");
+    assert!(
+        !out.status.success(),
+        "an untrusted issuer must be refused"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("E0806") || err.contains("not trusted"),
+        "refusal names the issuer gate: {err}"
+    );
+
+    // 2. Trust the issuer, then install → ok.
+    let pubkey = hex::encode(sk.verifying_key().to_bytes());
+    let out = Command::new(&bin)
+        .args(["mod", "allow-issuer"])
+        .arg(&pubkey)
+        .env("ORBIT_HOME", &home)
+        .output()
+        .expect("allow-issuer");
+    assert!(out.status.success(), "allow-issuer: {}", String::from_utf8_lossy(&out.stderr));
+
+    let out = Command::new(&bin)
+        .args(["mod", "install"])
+        .arg(&package)
+        .arg("--manifest")
+        .arg(&manifest)
+        .env("ORBIT_HOME", &home)
+        .output()
+        .expect("mod install");
+    assert!(
+        out.status.success(),
+        "signed install must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("my-mod"), "install names the mod: {stdout}");
+
+    // 3. Tampered package → digest mismatch, refused.
+    std::fs::write(&package, b"package-bytes-tampered").unwrap();
+    let out = Command::new(&bin)
+        .args(["mod", "install"])
+        .arg(&package)
+        .arg("--manifest")
+        .arg(&manifest)
+        .env("ORBIT_HOME", &home)
+        .output()
+        .expect("mod install (tampered)");
+    assert!(!out.status.success(), "a tampered package must be refused");
+
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -76,32 +76,27 @@ pub fn session_tool_definitions(home: &std::path::Path) -> Vec<ToolDefinition> {
     };
     let cfg = orbit_mcp::McpConfig::load(home, trusted);
     for (name, server) in &cfg.servers {
-        if let Ok(mut session) = orbit_mcp::McpSession::spawn(name, server) {
-            if let Ok(tools) = session.list_tools() {
-                for t in tools {
-                    let wire = orbit_mcp::wire_name(name, &t.name);
-                    let mut bytes = Vec::new();
-                    bytes.extend_from_slice(wire.as_bytes());
-                    bytes.extend_from_slice(t.description.as_bytes());
-                    bytes.extend_from_slice(
-                        serde_json::to_string(&t.input_schema)
-                            .unwrap_or_default()
-                            .as_bytes(),
-                    );
-                    defs.push(ToolDefinition {
-                        name: wire.clone(),
-                        description: format!("{} (mcp: {name})", t.description),
-                        parameters: t.input_schema,
-                        schema_digest: orbit_adapter::types::Sha256Digest(hex::encode(
-                            sha2::Sha256::digest(&bytes),
-                        )),
-                    });
-                }
-                // The session dies with the scope of this call; the
-                // executor re-spawns per call (std.io servers are
-                // cheap; a persistent registry is a later
-                // optimization).
-                drop(session);
+        // The process-lifetime pool: one server process per name,
+        // reused across calls and definition builds (phase 5).
+        if let Ok(tools) = orbit_mcp::POOL.list_tools(name, server) {
+            for t in tools {
+                let wire = orbit_mcp::wire_name(name, &t.name);
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(wire.as_bytes());
+                bytes.extend_from_slice(t.description.as_bytes());
+                bytes.extend_from_slice(
+                    serde_json::to_string(&t.input_schema)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+                defs.push(ToolDefinition {
+                    name: wire.clone(),
+                    description: format!("{} (mcp: {name})", t.description),
+                    parameters: t.input_schema,
+                    schema_digest: orbit_adapter::types::Sha256Digest(hex::encode(
+                        sha2::Sha256::digest(&bytes),
+                    )),
+                });
             }
         }
     }
@@ -558,7 +553,11 @@ pub fn is_read_only(name: &str) -> bool {
 }
 
 pub fn is_known_tool(name: &str) -> bool {
-    orbit_tools::is_wave1(name) || builtin_tools().iter().any(|t| t.name == name)
+    orbit_tools::is_wave1(name)
+        || orbit_tools::registry()
+            .iter()
+            .any(|t| t.name() == name)
+        || builtin_tools().iter().any(|t| t.name == name)
 }
 
 /// Structured risk classification for a tool (backend-authoritative — the
@@ -617,6 +616,9 @@ pub fn tool_risk(name: &str) -> RiskLevel {
     // toward caution, never silently low.
     match name {
         "calculator" | "current_session" | "list_models" => RiskLevel::Low,
+        // Wave 2 pure-data tools: the task list is session state, not
+        // the filesystem.
+        "TaskList" => RiskLevel::Low,
         _ => RiskLevel::Medium,
     }
 }
@@ -674,8 +676,9 @@ mod tests {
     fn definitions_have_valid_schema_digests() {
         let defs = tool_definitions();
         // Wave 1 (Read/Write/Edit/Glob/Grep/Bash/TaskStop) + the three
-        // locked pure built-ins.
-        assert_eq!(defs.len(), 10);
+        // locked pure built-ins + Wave 2 (TaskCreate/TaskUpdate/
+        // TaskList/WebFetch).
+        assert_eq!(defs.len(), 14);
         assert!(defs.iter().all(|d| d.schema_digest.as_str().len() == 64));
         // Every Wave 1 name is present exactly once.
         for name in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TaskStop"] {

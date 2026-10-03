@@ -72,6 +72,7 @@ age = "0.12"
 rust-embed = { version = "8", features = ["debug-embed"] }
 toml = "0.8"
 libc = "0.2"
+url = "2"
 
 # v0.2 async provider stack — permissive-only (DR-13 §5, re-checked via cargo-deny).
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
