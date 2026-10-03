@@ -91,6 +91,7 @@ pub fn run_proto(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
                         &mut mode_insert,
                         &command_sink,
                         &sender,
+                        &approvals,
                     ) {
                         // quit
                         break;
@@ -138,6 +139,7 @@ fn handle_key(
     mode_insert: &mut bool,
     command_sink: &crate::CommandSink,
     sender: &BusSender,
+    approvals: &crate::ApprovalRegistry,
 ) -> bool {
     // Ctrl+C always quits.
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
@@ -189,24 +191,20 @@ fn handle_key(
         }
         return false;
     }
-    // An approval is pending: y/a allow, n/s deny.
+    // An approval is pending: y/a allow (this call), R allow the
+    // session, n/s deny. Resolving goes through the ApprovalRegistry
+    // — its channel is what releases the parked worker thread.
     if scenario.approval_pending.is_some() {
-        match k.code {
-            KeyCode::Char('y') | KeyCode::Char('a') => {
-                sender.send(Msg::ApprovalDecision {
-                    tool: scenario.approval_pending.clone().unwrap_or_default(),
-                    decision: crate::state::ApprovalDecision::Once,
-                });
-                scenario.apply("approval_resolved", 0);
-            }
-            KeyCode::Char('n') | KeyCode::Char('s') => {
-                sender.send(Msg::ApprovalDecision {
-                    tool: scenario.approval_pending.clone().unwrap_or_default(),
-                    decision: crate::state::ApprovalDecision::Denied,
-                });
-                scenario.apply("approval_resolved", 0);
-            }
-            _ => {}
+        let call_id = scenario.approval_call_id.clone().unwrap_or_default();
+        let response = match k.code {
+            KeyCode::Char('y') | KeyCode::Char('a') => Some(crate::ApprovalResponse::Allow),
+            KeyCode::Char('R') => Some(crate::ApprovalResponse::AllowSession),
+            KeyCode::Char('n') | KeyCode::Char('s') => Some(crate::ApprovalResponse::Deny),
+            _ => None,
+        };
+        if let Some(resp) = response {
+            approvals.resolve(&call_id, resp);
+            scenario.apply("approval_resolved", 0);
         }
         return false;
     }
@@ -287,8 +285,9 @@ fn apply_msg(msg: Msg, scenario: &mut Scenario, sender: &BusSender, now_ms: u64)
             scenario.running.remove(&name);
             scenario.apply("tool_finished_full", 0);
         }
-        Msg::ApprovalRequested { tool_name, .. } => {
+        Msg::ApprovalRequested { call_id, tool_name, .. } => {
             scenario.approval_pending = Some(tool_name.clone());
+            scenario.approval_call_id = Some(call_id);
             scenario.apply("approval_requested", 0);
             let _ = sender;
         }

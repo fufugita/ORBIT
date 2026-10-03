@@ -19,6 +19,9 @@ pub struct Scenario {
     pub running: std::collections::BTreeMap<String, String>,
     /// An approval is pending.
     pub approval_pending: Option<String>,
+    /// The pending approval's call_id — resolutions go through the
+    /// registry keyed by it.
+    pub approval_call_id: Option<String>,
     /// The last turn failed (until the next TurnStarted).
     pub last_failed: bool,
     /// Compaction in flight (M18's amber shimmer).
@@ -190,7 +193,10 @@ impl Scenario {
             "tool_started_full" => self.visible_output = false,
             "tool_finished_full" => self.visible_output = false,
             "approval_requested" => self.approval_pending = Some("tool".into()),
-            "approval_resolved" => self.approval_pending = None,
+            "approval_resolved" => {
+                self.approval_pending = None;
+                self.approval_call_id = None;
+            }
             "compacting" => self.compacting = true,
             "compacted" => self.compacting = false,
             "turn_ended" => {
