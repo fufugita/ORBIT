@@ -18,6 +18,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: install bubblewrap
+        # The shell sandbox tests are real: they run bwrap and assert
+        # confined writes succeed, /etc writes fail, and the network is
+        # unreachable. Without bwrap they silently skip — which is fine
+        # locally but hides regressions in CI.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy

@@ -451,15 +451,18 @@ mod tests {
             ),
             Verdict::Deny(_)
         ));
-        // dontAsk denies uncovered calls instead of asking.
+        // dontAsk denies uncovered calls instead of asking (sandbox
+        // pinned: the fallback rule would otherwise turn this into
+        // Ask on machines without bwrap).
         assert!(matches!(
-            evaluate(
+            evaluate_with_sandbox(
                 PermissionMode::DontAsk,
                 &RuleSet::default(),
                 "Bash",
                 "cargo build",
                 false,
-                false
+                false,
+                true
             ),
             Verdict::Deny(_)
         ));
