@@ -5,7 +5,7 @@
 //! deny-read), the approval channel handoff, the secret scanner on
 //! every result, and the ledger's intent/verdict/result records.
 
-use crate::permissions::{evaluate, PermissionMode, RuleSet, Verdict};
+use crate::permissions::{PermissionMode, RuleSet, Verdict};
 use crate::{registry, ToolContext, ToolResult};
 use orbit_adapter::types::ToolDefinition;
 use std::path::{Path, PathBuf};
@@ -115,10 +115,12 @@ impl<'a> Wave1Executor<'a> {
             && crate::bash::is_readonly_command(
                 input.get("command").and_then(|v| v.as_str()).unwrap_or(""),
             );
-        let verdict = if self.grants.is_granted(&grant_key) {
-            Verdict::Allow
+        let (verdict, _sandbox_up) = if self.grants.is_granted(&grant_key) {
+            (Verdict::Allow, true)
         } else {
-            evaluate(
+            // evaluate_live: mode/rules semantics + the fallback rule
+            // (no shell sandbox → every Bash command asks).
+            crate::permissions::evaluate_live(
                 self.mode,
                 &self.rules,
                 &key.tool,
