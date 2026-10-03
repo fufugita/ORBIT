@@ -135,6 +135,24 @@ pub fn build_system_prompt(
     }
     s.push('\n');
 
+    // 2b. Skills (phase 5): the index — names + one-line purposes.
+    // Bodies load on demand via the Skill tool.
+    {
+        let trusted =
+            orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(working_dir);
+        let skills = crate::skills::load_skills(home, trusted);
+        if !skills.is_empty() {
+            s.push_str("## Skills\n\n");
+            s.push_str("Load a skill with the Skill tool when a task matches.\n\n");
+            for sk in &skills {
+                let first = sk.body.lines().next().unwrap_or("").trim();
+                let purpose = first.trim_start_matches("# ").trim();
+                s.push_str(&format!("- {}: {}\n", sk.name, purpose));
+            }
+            s.push('\n');
+        }
+    }
+
     // 3. Environment snapshot.
     let env = EnvSnapshot::probe(working_dir, model);
     s.push_str(&env.render());

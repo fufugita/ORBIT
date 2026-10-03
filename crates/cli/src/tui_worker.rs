@@ -586,6 +586,60 @@ fn worker_main(
                     mods_enabled.len()
                 )));
             }
+            WorkerCommand::Rewind(arg) => {
+                // /rewind (phase 4): no argument lists checkpoints;
+                // with an id restores every snapshotted file and
+                // reports. Conversation restore reuses /undo's
+                // transcript pop per checkpoint event.
+                let cps =
+                    orbit_engine::transcript::Checkpoints::new(&config.home, &config.session_id);
+                if arg.trim().is_empty() {
+                    let list = cps.list();
+                    if list.is_empty() {
+                        ctx.sender.send(Msg::SystemMessage(
+                            "no checkpoints yet (one opens at each prompt that changes files)"
+                                .into(),
+                        ));
+                    } else {
+                        let text = list
+                            .iter()
+                            .rev()
+                            .map(|id| format!("  {id}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ctx.sender.send(Msg::SystemMessage(format!(
+                            "checkpoints (newest first):\n{text}"
+                        )));
+                    }
+                } else {
+                    match cps.restore(arg.trim()) {
+                        Ok(files) if !files.is_empty() => {
+                            if let Some(log) = &transcript_log {
+                                let _ = log.append(
+                                    &orbit_engine::transcript::TranscriptEvent::Rewound {
+                                        to_checkpoint: arg.trim().to_string(),
+                                    },
+                                );
+                            }
+                            ctx.sender.send(Msg::SystemMessage(format!(
+                                "restored {} file(s) to checkpoint {}",
+                                files.len(),
+                                arg.trim()
+                            )));
+                        }
+                        Ok(_) => {
+                            ctx.sender.send(Msg::SystemMessage(format!(
+                                "checkpoint {} has no file snapshots (nothing was written that turn)",
+                                arg.trim()
+                            )));
+                        }
+                        Err(e) => {
+                            ctx.sender
+                                .send(Msg::SystemMessage(format!("rewind failed: {e}")));
+                        }
+                    }
+                }
+            }
             WorkerCommand::Undo => {
                 // Claude Code `/undo`: pop the last user message + every
                 // assistant/tool message after it. The session FILE keeps
@@ -955,8 +1009,11 @@ pub fn run_tui_turn(
     };
 
     let options = orbit_engine::TurnOptions {
-        tools: crate::tools::tool_definitions(),
+        tools: crate::tools::session_tool_definitions(&config.home),
         system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
+        // The model's window: auto-compaction triggers at 90% of
+        // window minus the output reserve (phase 4).
+        window_tokens: crate::context_window_for(&config.home, &config.model),
         request_stem: "orbit-tui".into(),
         ..Default::default()
     };
@@ -1096,7 +1153,7 @@ fn build_session_prompt(
     mods: &[crate::mods::Mod],
     mods_enabled: &[String],
 ) -> String {
-    let defs = crate::tools::tool_definitions();
+    let defs = crate::tools::session_tool_definitions(home);
     let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     let mods_directive = crate::mods::system_directive(mods, mods_enabled);
     orbit_engine::context::build_system_prompt(

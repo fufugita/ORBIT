@@ -24,6 +24,7 @@ pub mod bash;
 pub mod executor;
 pub mod fs_tools;
 pub mod permissions;
+pub mod sandbox;
 pub mod scan;
 
 pub use fs_tools::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};

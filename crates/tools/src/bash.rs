@@ -148,25 +148,45 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
             std::env::temp_dir().join(format!("orbit-bash-{}.log", ulid::Ulid::new()))
         });
 
-    let mut child = match Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .current_dir(&cx.working_dir)
-        // Safety (review blocker 3): a child never inherits ORBIT's
-        // environment (provider keys included) — an explicit allowlist
-        // only. Null stdin: a command that reads stdin cannot take the
-        // TUI's keystrokes. Own process group: Esc/TaskStop can kill
-        // the whole tree.
-        .env_clear()
-        .envs(env_allowlist())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return ToolResult::err(&format!("cannot spawn bash: {e}")),
+    // The sandbox (review blocker 3, second half): when bubblewrap is
+    // available the command runs confined — writes only in the
+    // working dirs + session temp, no network. When it is not, the
+    // result SAYS the command ran unsandboxed so the operator and the
+    // permission layer can see it (the executor forces an ask).
+    let sandbox = crate::sandbox::ShellSandbox::standard(&cx.working_dirs, &cx.session_id);
+    let sandboxed = matches!(
+        crate::sandbox::ShellSandbox::probe(),
+        crate::sandbox::SandboxStatus::Confined
+    );
+
+    let mut child = if sandboxed {
+        let mut cmd = sandbox.wrap(command, &cx.working_dir);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return ToolResult::err(&format!("cannot spawn sandboxed bash: {e}")),
+        }
+    } else {
+        match Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&cx.working_dir)
+            // Safety (review blocker 3): a child never inherits ORBIT's
+            // environment (provider keys included) — an explicit allowlist
+            // only. Null stdin: a command that reads stdin cannot take the
+            // TUI's keystrokes. Own process group: Esc/TaskStop can kill
+            // the whole tree.
+            .env_clear()
+            .envs(env_allowlist())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return ToolResult::err(&format!("cannot spawn bash: {e}")),
+        }
     };
 
     // Wait with a timeout, polling.
@@ -189,6 +209,7 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
                     "ok": status.success(),
                     "exit_code": status.code().unwrap_or(-1),
                     "output": text,
+                    "sandboxed": sandboxed,
                 });
                 if !scanned.redactions.is_empty() {
                     payload["redacted"] = json!(scanned.redactions);

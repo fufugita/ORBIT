@@ -320,6 +320,36 @@ pub fn execute_call(
         }
     };
 
+    // The Skill tool (phase 5): load a body on demand.
+    if call.name == "Skill" {
+        let output = match args.get("name").and_then(|v| v.as_str()) {
+            Some(name) => match crate::tools::execute_skill(home, name) {
+                Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
+                Err(e) => tool_error(&e),
+            },
+            None => tool_error("Skill requires 'name'"),
+        };
+        let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
+            "ok"
+        } else {
+            "error"
+        };
+        record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+        return Ok(output);
+    }
+
+    // MCP tools (phase 5): mcp__<server>__<tool> — spawn, call, scan.
+    if call.name.starts_with("mcp__") {
+        let output = execute_mcp(home, call, &args);
+        let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
+            "ok"
+        } else {
+            "error"
+        };
+        record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+        return Ok(output);
+    }
+
     // Wave 1 tools (Read/Write/Edit/Glob/Grep/Bash/TaskStop) run
     // through the orbit-tools registry: the real implementations, the
     // permission layer (modes + pattern rules), the deny-read list and
@@ -458,14 +488,107 @@ fn execute_wave1(home: &Path, call: &crate::PendingToolCall, args: &serde_json::
 
     // Execute with the session's ToolContext.
     let working_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-    let cx = orbit_tools::ToolContext::new(home.to_path_buf(), session_id_stub(), working_dir);
+    let session_id = session_id_stub();
+    let cx = orbit_tools::ToolContext::new(home.to_path_buf(), session_id.clone(), working_dir);
+
+    // Hooks (phase 5): PreToolUse can block (exit 2 / Deny decision)
+    // before anything runs; PostToolUse sees the result.
+    let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted());
+    let pre = hooks.fire(
+        orbit_engine::hooks::HookEvent::PreToolUse,
+        &serde_json::json!({
+            "tool": call.name,
+            "arguments": args,
+        }),
+    );
+    if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
+        return tool_error(&format!("blocked by hook: {reason}"));
+    }
+
+    // Checkpoint (phase 4): before the first WRITE of a turn, snapshot
+    // the target file's current bytes so /rewind can restore them.
+    if call.name == "Write" || call.name == "Edit" {
+        if let Some(path_str) = args.get("file_path").and_then(|v| v.as_str()) {
+            let path = orbit_tools::resolve_path(&cx, path_str);
+            if path.exists() {
+                let cps = orbit_engine::transcript::Checkpoints::new(home, &session_id);
+                let turn_cp = current_turn_checkpoint();
+                let _ = cps.snapshot_file(&turn_cp, &path);
+            }
+        }
+    }
+
     let result = tool.run(args, &cx);
     let result = orbit_tools::finish(result, &cx, &call.id);
+
+    // PostToolUse: the hook sees the (scanned) result.
+    let _ = hooks.fire(
+        orbit_engine::hooks::HookEvent::PostToolUse,
+        &serde_json::json!({
+            "tool": call.name,
+            "ok": !result.is_error,
+        }),
+    );
     result.payload
+}
+
+/// Is the current folder trusted (project-scope rules/hooks/skills
+/// apply only after the operator trusted it once)?
+fn project_trusted() -> bool {
+    let home = std::env::var("ORBIT_HOME").unwrap_or_else(|_| ".orbit".into());
+    let cwd = std::env::current_dir().unwrap_or_default();
+    orbit_tools::permissions::FolderTrust::new(std::path::PathBuf::from(home)).is_trusted(&cwd)
+}
+
+/// The checkpoint id for the current turn: one per user prompt. The
+/// engine opens it at the prompt; the executor snapshots into it.
+fn current_turn_checkpoint() -> String {
+    std::env::var("ORBIT_TURN_CHECKPOINT").unwrap_or_else(|_| {
+        // No turn marker set (e.g. direct executor use): derive one
+        // per process invocation.
+        format!("cp-{}", ulid::Ulid::new())
+    })
 }
 
 fn session_id_stub() -> String {
     std::env::var("ORBIT_SESSION_ID").unwrap_or_else(|_| "live".into())
+}
+
+/// Execute one MCP call: resolve the server from the config, spawn,
+/// call, scan the result (never trust external output).
+fn execute_mcp(home: &Path, call: &crate::PendingToolCall, args: &serde_json::Value) -> String {
+    let Some((server, tool)) = orbit_mcp::split_wire_name(&call.name) else {
+        return tool_error("malformed mcp tool name");
+    };
+    let trusted = project_trusted();
+    let cfg = orbit_mcp::McpConfig::load(home, trusted);
+    let Some(server_cfg) = cfg.servers.get(&server) else {
+        return tool_error(&format!("mcp server not configured: {server}"));
+    };
+    match orbit_mcp::McpSession::spawn(&server, server_cfg) {
+        Ok(mut session) => {
+            // Strip the wrapper args the model was told about; pass the
+            // rest through as the tool's own arguments.
+            let mut call_args = args.clone();
+            if let Some(obj) = call_args.as_object_mut() {
+                obj.remove("server");
+                obj.remove("tool");
+            }
+            match session.call_tool(&tool, call_args) {
+                Ok(text) => {
+                    let scanned = orbit_tools::scan::scan_result(&text.to_string());
+                    serde_json::json!({
+                        "ok": true,
+                        "result": scanned.text,
+                        "redactions": scanned.redactions.len(),
+                    })
+                    .to_string()
+                }
+                Err(e) => tool_error(&format!("mcp call failed: {e}")),
+            }
+        }
+        Err(e) => tool_error(&format!("mcp server unreachable: {e}")),
+    }
 }
 
 #[cfg(test)]

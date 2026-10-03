@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 orbit-adapter = { path = "../adapter" }
+orbit-tools = { path = "../tools" }
 orbit-provider-http = { path = "../provider-http" }
 orbit-gateway = { path = "../gateway" }
 orbit-egress = { path = "../egress" }

@@ -34,6 +34,9 @@ pub enum WorkerCommand {
     /// message via the provider, then REPLACE the working transcript with
     /// that summary. Fresh context window, same session.
     Compact,
+    /// `/rewind` — restore code and/or conversation to a checkpoint
+    /// (phase 4). No argument: list checkpoints. With an id: restore.
+    Rewind(String),
     /// `/mods` — list installed mods with enabled state (formatted here).
     ListInstalledMods,
     /// `/mod <name>` — toggle a mod; subsequent turns see (or drop) its

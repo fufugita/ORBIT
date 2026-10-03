@@ -254,6 +254,44 @@ pub fn evaluate(
     is_read_only_tool: bool,
     is_readonly_command: bool,
 ) -> Verdict {
+    evaluate_with_sandbox(
+        mode,
+        rules,
+        tool,
+        argument,
+        is_read_only_tool,
+        is_readonly_command,
+        sandbox_available(),
+    )
+}
+
+/// Is the shell sandbox available on this machine? Probed once per
+/// process (the canary is a real confined /bin/true).
+fn sandbox_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        matches!(
+            crate::sandbox::ShellSandbox::probe(),
+            crate::sandbox::SandboxStatus::Confined
+        )
+    })
+}
+
+/// The full evaluation with an explicit sandbox fact. When the sandbox
+/// is unavailable, every Bash command asks, whatever the mode or rules
+/// — the roadmap's fallback: "when the sandbox cannot start, every
+/// command asks, whatever the mode."
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_with_sandbox(
+    mode: PermissionMode,
+    rules: &RuleSet,
+    tool: &str,
+    argument: &str,
+    is_read_only_tool: bool,
+    is_readonly_command: bool,
+    sandbox_up: bool,
+) -> Verdict {
     // Bypass: everything runs (refused at startup as root — the CLI
     // checks that separately).
     if mode == PermissionMode::Bypass {
@@ -275,7 +313,12 @@ pub fn evaluate(
         };
     }
 
-    // No rule: the mode decides.
+    // No rule: the mode decides — except Bash without a sandbox,
+    // which always asks (the fallback rule).
+    if tool == "Bash" && !sandbox_up && mode != PermissionMode::Bypass {
+        return Verdict::Ask;
+    }
+
     match mode {
         PermissionMode::Default | PermissionMode::AcceptEdits => {
             let edit_tools = matches!(tool, "Write" | "Edit" | "NotebookEdit");

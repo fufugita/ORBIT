@@ -54,6 +54,11 @@ pub struct ModelEntry {
     /// answers and file writes.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// The model's context window (input tokens). When present the
+    /// engine auto-compacts at 90% of window minus the output reserve
+    /// (phase 4); when absent compaction never triggers.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 /// One declared provider.
@@ -113,6 +118,13 @@ impl ProvidersConfig {
     }
 
     /// The declared max output tokens for a model id, if any.
+    pub fn context_window_for(&self, model: &str) -> Option<u64> {
+        self.provider
+            .iter()
+            .find_map(|p| p.models.iter().find(|m| m.id == model))
+            .and_then(|m| m.context_window)
+    }
+
     pub fn max_output_tokens_for(&self, model: &str) -> Option<u32> {
         self.provider
             .iter()
@@ -346,6 +358,7 @@ output_per_million_microcents = 600000
                     ..Default::default()
                 },
                 max_output_tokens: None,
+                context_window: None,
             }],
         })
         .unwrap();

@@ -255,6 +255,7 @@ fn add_configured_provider(
                 .and_then(|p| p.get(i).copied())
                 .unwrap_or_default(),
             max_output_tokens: None,
+            context_window: None,
         })
         .collect();
     cfg.add_provider(orbit_cli::config::ProviderConfig {
@@ -688,7 +689,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
 /// Build the session's frozen system prompt for the REPL / headless
 /// paths (same shape as the TUI worker's).
 fn build_session_prompt(home: &Path, model: &str) -> String {
-    let defs = tools::tool_definitions();
+    let defs = tools::session_tool_definitions(home);
     let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     let mods = orbit_cli::mods::load_all(home);
     let enabled = orbit_cli::mods::initial_enabled(home, &mods);
@@ -810,12 +811,13 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
     };
     let options = orbit_engine::TurnOptions {
-        tools: tools::tool_definitions(),
+        tools: tools::session_tool_definitions(&home),
         max_rounds,
         // The frozen system prompt: the model learns the working
         // directory, the platform, ORBIT.md and the tools (review
         // blocker 5).
         system_directive: Some(build_session_prompt(&home, &model)),
+        window_tokens: orbit_cli::context_window_for(&home, &model),
         request_stem: "orbit-p".into(),
         ..Default::default()
     };
@@ -990,17 +992,39 @@ fn cmd_chat(args: &[String]) -> i32 {
 
     // Session identity + persistence. `--resume <id>` loads a prior session's
     // transcript so the conversation continues across invocations.
+    // `--continue` reopens the LATEST session in this directory
+    // (phase 4; Claude Code parity).
     let resume = value_after(args, "--resume");
-    let resumed_file = resume
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .and_then(|id| match sessions::load_session(&home, id) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("warning: cannot resume {id}: {e}; starting fresh");
+    let wants_continue = args.iter().any(|a| a == "--continue");
+    let resumed_file = if wants_continue {
+        match sessions::list_sessions(&home) {
+            Ok(mut list) if !list.is_empty() => {
+                // newest by updated_at
+                list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                let latest = list.remove(0);
+                eprintln!(
+                    "continuing session {} ({} turns)",
+                    latest.session_id, latest.turns
+                );
+                Some(latest)
+            }
+            _ => {
+                eprintln!("no saved sessions; starting fresh");
                 None
             }
-        });
+        }
+    } else {
+        resume
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| match sessions::load_session(&home, id) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("warning: cannot resume {id}: {e}; starting fresh");
+                    None
+                }
+            })
+    };
 
     // TUI front-end (DR-20): if TTY + --tui (default), forward to the ratatui
     // TUI. --no-tui, non-TTY stdin/stdout, or the `tui` feature off → fall
@@ -1238,8 +1262,9 @@ fn cmd_chat(args: &[String]) -> i32 {
             }
         };
         let options = orbit_engine::TurnOptions {
-            tools: tools::tool_definitions(),
+            tools: tools::session_tool_definitions(&home),
             system_directive: Some(build_session_prompt(&home, &model)),
+            window_tokens: orbit_cli::context_window_for(&home, &model),
             request_stem: "orbit-repl".into(),
             ..Default::default()
         };

@@ -369,6 +369,14 @@ pub fn engine_turn_config(
     }
 }
 
+/// The model's context window from providers.toml, for the engine's
+/// auto-compaction threshold (None = compaction never triggers).
+pub fn context_window_for(home: &Path, model: &str) -> Option<u64> {
+    crate::config::ProvidersConfig::load(home)
+        .ok()
+        .and_then(|c| c.context_window_for(model))
+}
+
 /// Run one prompt through the configured gateway via the four-gate async
 /// dispatch pipeline. Shared by `orbit ask` (single-turn) and the interactive
 /// REPL (multi-turn with a transcript + live observer).

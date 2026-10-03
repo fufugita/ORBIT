@@ -283,6 +283,9 @@ fn handle_slash_command(cmd: &str, sender: &BusSender, command_sink: &CommandSin
         "/undo" => {
             let _ = command_sink.send(WorkerCommand::Undo);
         }
+        "/rewind" => {
+            let _ = command_sink.send(WorkerCommand::Rewind(arg.to_string()));
+        }
         "/permissions" => {
             // Persistent rules live in orbit-cli; route through the worker.
             let _ = command_sink.send(WorkerCommand::Permissions(arg.to_string()));
@@ -901,6 +904,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/history", "input history (use arrow keys)"),
     ("/compact", "summarize + shrink the context window"),
     ("/undo", "rewind the last exchange"),
+    ("/rewind", "restore code/conversation to a checkpoint"),
     ("/queue", "show/clear queued prompts"),
     ("/status", "session/model/connection snapshot"),
     ("/cost", "per-turn and cumulative cost"),
@@ -925,6 +929,7 @@ pub const SLASH_NAMES: &[&str] = &[
     "/history",
     "/compact",
     "/undo",
+    "/rewind",
     "/queue",
     "/status",
     "/cost",

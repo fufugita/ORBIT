@@ -56,6 +56,99 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     defs
 }
 
+/// The full session tool list: Wave 1 + built-ins + the Skill tool +
+/// MCP server tools (mcp__<server>__<tool>). MCP servers from the
+/// trusted scopes are spawned once, their tools declared up front so
+/// the list never changes mid-conversation (phase 5).
+pub fn session_tool_definitions(home: &std::path::Path) -> Vec<ToolDefinition> {
+    let mut defs = tool_definitions();
+
+    // The Skill tool: load a skill's body on demand.
+    defs.push(skill_tool_definition());
+
+    // MCP tools.
+    let trusted = {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
+    };
+    let cfg = orbit_mcp::McpConfig::load(home, trusted);
+    for (name, server) in &cfg.servers {
+        if let Ok(mut session) = orbit_mcp::McpSession::spawn(name, server) {
+            if let Ok(tools) = session.list_tools() {
+                for t in tools {
+                    let wire = orbit_mcp::wire_name(name, &t.name);
+                    let mut bytes = Vec::new();
+                    bytes.extend_from_slice(wire.as_bytes());
+                    bytes.extend_from_slice(t.description.as_bytes());
+                    bytes.extend_from_slice(
+                        serde_json::to_string(&t.input_schema)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    );
+                    defs.push(ToolDefinition {
+                        name: wire.clone(),
+                        description: format!("{} (mcp: {name})", t.description),
+                        parameters: t.input_schema,
+                        schema_digest: orbit_adapter::types::Sha256Digest(hex::encode(
+                            sha2::Sha256::digest(&bytes),
+                        )),
+                    });
+                }
+                // The session dies with the scope of this call; the
+                // executor re-spawns per call (std.io servers are
+                // cheap; a persistent registry is a later
+                // optimization).
+                drop(session);
+            }
+        }
+    }
+    defs
+}
+
+/// The Skill tool definition (phase 5).
+fn skill_tool_definition() -> ToolDefinition {
+    let name = "Skill";
+    let description =
+        "Load a skill's full instructions by name (the index is in the system prompt)";
+    let parameters = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "The skill to load" }
+        },
+        "required": ["name"]
+    });
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(description.as_bytes());
+    bytes.extend_from_slice(
+        serde_json::to_string(&parameters)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    ToolDefinition {
+        name: name.into(),
+        description: description.into(),
+        parameters,
+        schema_digest: orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(
+            &bytes,
+        ))),
+    }
+}
+
+/// Execute the Skill tool: return the named skill's body.
+pub fn execute_skill(home: &std::path::Path, name: &str) -> Result<serde_json::Value, String> {
+    let trusted = {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
+    };
+    let skills = orbit_engine::skills::load_skills(home, trusted);
+    skills
+        .into_iter()
+        .find(|s| s.name == name)
+        .map(|s| serde_json::json!({ "ok": true, "body": s.body }))
+        .ok_or_else(|| format!("unknown skill: {name}"))
+}
+
 /// Execute a tool by name with parsed JSON arguments. Unknown tools are denied
 /// (fail closed). Returns the JSON result or a structured error string.
 pub fn execute(name: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
