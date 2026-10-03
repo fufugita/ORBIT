@@ -106,25 +106,14 @@ fn bwrap_base() -> Command {
     // Base: read-only root, /dev, /proc; a private /tmp; no new
     // privileges (the roadmap's probe-safely rule generalized: NNP is
     // set per child, never on ORBIT itself).
-    cmd.arg("--ro-bind")
-        .arg("/usr")
-        .arg("/usr")
-        .arg("--ro-bind")
-        .arg("/lib")
-        .arg("/lib")
-        .arg("--ro-bind")
-        .arg("/lib64")
-        .arg("/lib64")
-        .arg("--ro-bind")
-        .arg("/bin")
-        .arg("/bin")
-        .arg("--ro-bind")
-        .arg("/sbin")
-        .arg("/sbin")
-        .arg("--ro-bind")
-        .arg("/etc")
-        .arg("/etc")
-        .arg("--proc")
+    // Only dirs that exist (merged-usr layouts may lack /lib64 or
+    // /sbin; a missing bind target makes bwrap fail to start).
+    for dir in ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
+        if Path::new(dir).exists() {
+            cmd.arg("--ro-bind").arg(dir).arg(dir);
+        }
+    }
+    cmd.arg("--proc")
         .arg("/proc")
         .arg("--dev")
         .arg("/dev")

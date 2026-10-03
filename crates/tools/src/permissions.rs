@@ -410,17 +410,34 @@ mod tests {
             ),
             Verdict::Allow
         );
-        // Bash readonly allowlist runs in default mode.
+        // Bash readonly allowlist runs in default mode (with the
+        // sandbox up; the machine-independent form — evaluate_with_sandbox
+        // pins the fact the live probe would supply).
         assert_eq!(
-            evaluate(
+            evaluate_with_sandbox(
                 PermissionMode::Default,
                 &RuleSet::default(),
                 "Bash",
                 "git status",
                 false,
+                true,
                 true
             ),
             Verdict::Allow
+        );
+        // Without the sandbox, every Bash command asks — the fallback
+        // rule — even a readonly one.
+        assert_eq!(
+            evaluate_with_sandbox(
+                PermissionMode::Default,
+                &RuleSet::default(),
+                "Bash",
+                "git status",
+                false,
+                true,
+                false
+            ),
+            Verdict::Ask
         );
         // Plan mode denies writes, allows reads.
         assert!(matches!(
