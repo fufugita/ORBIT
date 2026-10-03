@@ -430,7 +430,7 @@ fn record_result(
     status: &str,
     output: &str,
 ) -> Result<(), String> {
-    writer
+    let head = writer
         .append(LedgerEvent::ToolResult(ToolResult {
             session_id: session_id.into(),
             decision_id: decision_id.into(),
@@ -441,6 +441,14 @@ fn record_result(
             output_bytes: output.len() as u64,
         }))
         .map_err(|e| format!("record tool result: {e}"))?;
+    // The proof chip's heartbeat (M19): every append is a visible
+    // pulse. Emitted where the writer lives; the ledger crate itself
+    // stays a pure library.
+    if plain_output_enabled() {
+        // (the TUI worker prints its own events; plain mode stays
+        // quiet here — the head digest is already on the summary line)
+        let _ = head;
+    }
     Ok(())
 }
 

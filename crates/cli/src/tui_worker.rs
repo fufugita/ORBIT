@@ -994,6 +994,81 @@ pub fn run_tui_turn(
                 ws.phase_index = 4; // respond
                 orbit_hud_tui::emit_workspace(sender, ws.clone());
             }
+            // ── The TUI prototype's motion events. Each carries what
+            // one panel needs; the HUD layer keeps its own renderers.
+            E::ToolStartedFull {
+                call_id,
+                kind,
+                target,
+            } => {
+                orbit_hud_tui::emit_tool_started(sender, &kind, &target);
+                let _ = call_id;
+            }
+            E::ToolOutput { call_id, line } => {
+                orbit_hud_tui::emit_status(sender, &format!("┃ {line}"));
+                let _ = call_id;
+            }
+            E::ToolFinishedFull {
+                call_id: _,
+                ok,
+                result_fact,
+            } => {
+                let outcome = if ok {
+                    orbit_hud_tui::state::ToolOutcome::Ok
+                } else {
+                    orbit_hud_tui::state::ToolOutcome::Failed
+                };
+                orbit_hud_tui::emit_tool_finished(sender, &result_fact, outcome);
+            }
+            E::FileChanged {
+                path,
+                added,
+                removed,
+                checkpoint_id: _,
+            } => {
+                orbit_hud_tui::emit_status(
+                    sender,
+                    &format!("~ {path}  +{added} −{removed}"),
+                );
+            }
+            E::SubagentStarted {
+                agent_id: _,
+                name,
+                task,
+                model: _,
+            } => {
+                orbit_hud_tui::emit_status(sender, &format!("agent {name}: {task}"));
+            }
+            E::SubagentProgress {
+                agent_id: _,
+                action,
+            } => {
+                orbit_hud_tui::emit_status(sender, &format!("  {action}"));
+            }
+            E::SubagentFinished {
+                agent_id: _,
+                report,
+            } => {
+                orbit_hud_tui::emit_status(sender, &format!("agent done: {report}"));
+            }
+            E::ModeChanged { mode } => {
+                orbit_hud_tui::emit_status(sender, &format!("mode: {mode}"));
+            }
+            E::Usage {
+                used_tokens,
+                window_tokens,
+            } => {
+                orbit_hud_tui::emit_status(
+                    sender,
+                    &format!("context {used_tokens}/{} tokens", window_tokens),
+                );
+            }
+            E::LedgerAppended {
+                record_count: _,
+                head_digest,
+            } => {
+                orbit_hud_tui::emit_status(sender, &format!("◈ ledger {head_digest}"));
+            }
             _ => {}
         }
     };

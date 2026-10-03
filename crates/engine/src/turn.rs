@@ -193,6 +193,13 @@ pub fn run_turn(
         events(FrontendEvent::CostUpdated {
             total_microcents: report.cost_microcents,
         });
+        // The context meter (M18): tokens in use vs the window.
+        if let Some(w) = options.window_tokens {
+            events(FrontendEvent::Usage {
+                used_tokens: report.input_tokens,
+                window_tokens: w,
+            });
+        }
 
         if o.tool_calls.is_empty() {
             // Terminal text round. A `length` stop means the reply was
@@ -240,7 +247,51 @@ pub fn run_turn(
             o.thinking.clone(),
         ));
 
+        // The TUI's tool-line motion (M07/M08/M09/M10): the full
+        // start (kind + target) before execution, the finish with a
+        // result fact after. Targets are display-safe (the CLI
+        // executor's summaries pass the secret scanner before this).
+        for tc in &o.tool_calls {
+            let target = String::from_utf8_lossy(&tc.arguments)
+                .parse::<serde_json::Value>()
+                .ok()
+                .and_then(|a| {
+                    a.get("command")
+                        .or_else(|| a.get("file_path"))
+                        .or_else(|| a.get("path"))
+                        .or_else(|| a.get("pattern"))
+                        .or_else(|| a.get("prompt"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or_default();
+            events(FrontendEvent::ToolStartedFull {
+                call_id: tc.id.clone(),
+                kind: tc.name.clone(),
+                target,
+            });
+        }
         let results = executor.execute(&o.tool_calls, round);
+        for r in &results {
+            // A result fact for the settle animation: first small
+            // truth in the payload (lines, tests, exit code).
+            let fact = serde_json::from_str::<serde_json::Value>(&r.content)
+                .ok()
+                .and_then(|v| {
+                    v.get("lines")
+                        .or_else(|| v.get("tests_passed"))
+                        .or_else(|| v.get("exit_code"))
+                        .or_else(|| v.get("count"))
+                        .map(|f| f.to_string())
+                })
+                .unwrap_or_default();
+            let ok = !r.content.contains("\"ok\":false") && !r.content.contains("\"ok\": false");
+            events(FrontendEvent::ToolFinishedFull {
+                call_id: r.call_id.clone(),
+                ok,
+                result_fact: fact,
+            });
+        }
         for r in results {
             transcript.push(ChatMessage {
                 role: ChatRole::Tool,

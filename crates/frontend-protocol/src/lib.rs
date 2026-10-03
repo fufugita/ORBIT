@@ -95,6 +95,68 @@ pub enum FrontendEvent {
     },
     /// Compaction finished; history replaced by the summary.
     Compacted { summary: String },
+
+    // ── TUI motion events (the ORBIT TUI prototype's motion table).
+    // Each animation is tied to an engine event, never a guess.
+
+    /// A tool call started, with what the tool line needs: the call
+    /// id, the tool kind (Read/Bash/…) and the target (path, command
+    /// or task) after the secret scanner.
+    ToolStartedFull {
+        call_id: String,
+        kind: String,
+        target: String,
+    },
+    /// One line of live tool output (the output tail / terminal
+    /// stream panels).
+    ToolOutput {
+        call_id: String,
+        line: String,
+    },
+    /// A tool call finished with a result fact (lines read, tests
+    /// passed, exit code) for the settle animation.
+    ToolFinishedFull {
+        call_id: String,
+        ok: bool,
+        result_fact: String,
+    },
+    /// A file changed on disk (the Changes panel): path, added and
+    /// removed counts, checkpoint id.
+    FileChanged {
+        path: String,
+        added: u32,
+        removed: u32,
+        checkpoint_id: String,
+    },
+    /// A subagent started (agent arcs): id, name, task, model.
+    SubagentStarted {
+        agent_id: String,
+        name: String,
+        task: String,
+        model: String,
+    },
+    /// A subagent's progress line (its current action).
+    SubagentProgress {
+        agent_id: String,
+        action: String,
+    },
+    /// A subagent finished; its report is carried for the panel.
+    SubagentFinished {
+        agent_id: String,
+        report: String,
+    },
+    /// The permission mode changed (the mode pill wipe).
+    ModeChanged { mode: String },
+    /// Context usage (the context meter): tokens in use, the window.
+    Usage {
+        used_tokens: u64,
+        window_tokens: u64,
+    },
+    /// A record was appended to the ledger (the proof chip's dot).
+    LedgerAppended {
+        record_count: u64,
+        head_digest: String,
+    },
 }
 
 // ── Actions: frontend → harness ─────────────────────────────────────────────
