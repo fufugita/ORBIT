@@ -22,6 +22,8 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build gate binaries
+        run: cargo build -p orbit-cli -p orbit-mock-provider
       - name: test
         run: cargo test --workspace
       - name: deny
