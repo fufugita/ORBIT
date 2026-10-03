@@ -94,6 +94,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "init          initialize trust root + PIB + Ledger",
                 "models        list models from all configured providers",
                 "ask PROMPT    send one prompt through a configured gateway",
+                "-p PROMPT     headless one-shot with tools (stream-json output)",
                 "run           run the example phase chain",
                 "cancel        cancel the session (terminal: cancelled)",
                 "verify-ledger verify the Ledger hash chain",
