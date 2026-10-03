@@ -319,6 +319,22 @@ pub fn execute_call(
             return Ok(output);
         }
     };
+
+    // Wave 1 tools (Read/Write/Edit/Glob/Grep/Bash/TaskStop) run
+    // through the orbit-tools registry: the real implementations, the
+    // permission layer (modes + pattern rules), the deny-read list and
+    // the secret scanner on every result (review blocker 1).
+    if orbit_tools::is_wave1(&call.name) {
+        let output = execute_wave1(home, call, &args);
+        let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
+            "ok"
+        } else {
+            "error"
+        };
+        record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+        return Ok(output);
+    }
+
     let result = crate::tools::execute(&call.name, &args);
     let output = match result {
         Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
@@ -375,6 +391,81 @@ fn record_result(
 
 fn tool_error(msg: &str) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
+}
+
+/// Execute one Wave 1 call through the orbit-tools registry with the
+/// live permission layer: modes, pattern rules, folder trust, deny-read
+/// and the secret scanner. The verdict above (whole-tool rules +
+/// approval channel) already ran; this adds the pattern-level check.
+fn execute_wave1(home: &Path, call: &crate::PendingToolCall, args: &serde_json::Value) -> String {
+    use orbit_tools::permissions::{evaluate, parse_rule, PermissionMode, RuleEffectSerde};
+
+    // The session's mode: --permission-mode flag, else default.
+    let mode = std::env::var("ORBIT_PERMISSION_MODE")
+        .ok()
+        .and_then(|m| PermissionMode::from_config(&m))
+        .unwrap_or_default();
+
+    // Merged rules: the new pattern scopes + the legacy whole-tool file.
+    let mut rules = orbit_tools::executor::load_rules(home);
+    // --allowedTools / --disallowedTools (command-line scope).
+    if let Ok(list) = std::env::var("ORBIT_ALLOWED_TOOLS") {
+        for entry in list.split(',') {
+            if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Allow) {
+                rules.rules.push(r);
+            }
+        }
+    }
+    if let Ok(list) = std::env::var("ORBIT_DISALLOWED_TOOLS") {
+        for entry in list.split(',') {
+            if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Deny) {
+                rules.rules.push(r);
+            }
+        }
+    }
+
+    // Find the tool and compute its permission key.
+    let Some(tool) = orbit_tools::registry()
+        .into_iter()
+        .find(|t| t.name() == call.name)
+    else {
+        return tool_error("unknown tool (deny-by-default)");
+    };
+    let key = tool.permission_key(args);
+    let is_ro_cmd = call.name == "Bash"
+        && orbit_tools::bash::is_readonly_command(
+            args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+        );
+
+    match evaluate(
+        mode,
+        &rules,
+        &key.tool,
+        &key.pattern,
+        tool.read_only(),
+        is_ro_cmd,
+    ) {
+        orbit_tools::permissions::Verdict::Allow => {}
+        orbit_tools::permissions::Verdict::Deny(reason) => {
+            return tool_error(&reason);
+        }
+        orbit_tools::permissions::Verdict::Ask => {
+            // The whole-tool verdict above already asked the channel
+            // (the operator pressed y). Pattern-level ask collapses to
+            // allow here — the operator's approval IS the answer.
+        }
+    }
+
+    // Execute with the session's ToolContext.
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let cx = orbit_tools::ToolContext::new(home.to_path_buf(), session_id_stub(), working_dir);
+    let result = tool.run(args, &cx);
+    let result = orbit_tools::finish(result, &cx, &call.id);
+    result.payload
+}
+
+fn session_id_stub() -> String {
+    std::env::var("ORBIT_SESSION_ID").unwrap_or_else(|_| "live".into())
 }
 
 #[cfg(test)]

@@ -82,6 +82,7 @@ fn approval_app() -> App {
         tool_name: "shell".into(),
         summary: "Apply patch to 2 files in /work/atlas".into(),
         risk: 2,
+        working_dir: "/tmp".into(),
     });
     app
 }
@@ -686,6 +687,7 @@ fn invariant_no_truncated_approval() {
         tool_name: "workspace.apply_patch".into(),
         summary: summary.into(),
         risk: 2,
+        working_dir: "/tmp".into(),
     });
     for (w, h) in [(150u16, 44u16), (110, 30), (80, 30)] {
         let buf = render_buf(&app, &d, w, h);

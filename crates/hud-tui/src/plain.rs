@@ -147,6 +147,7 @@ mod tests {
             tool_name: "shell".into(),
             summary: "shell rm -rf target/".into(),
             risk: 2,
+            working_dir: "/tmp".into(),
         };
         let line = approval_line(&req, "14:06");
         assert!(line.starts_with("14:06 approval needed:"));

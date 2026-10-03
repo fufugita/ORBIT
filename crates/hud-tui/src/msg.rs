@@ -69,6 +69,9 @@ pub enum Msg {
         /// Structured risk (0..=3) from the backend classification —
         /// backend-authoritative, the UI renders it (§6.15).
         risk: u8,
+        /// The working directory the call runs in — a real fact for the
+        /// approval card (never invented).
+        working_dir: String,
     },
     /// Connection state changed (set by the harness on provider errors).
     ConnectionChanged(crate::state::ConnectionState),

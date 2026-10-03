@@ -1861,6 +1861,7 @@ mod tests {
             tool_name: "calculator".into(),
             summary: "calc(expr)".into(),
             risk: 1,
+            working_dir: "/tmp".into(),
         });
         assert!(!composer_wants_char(&char_key('y'), &app));
         assert!(!composer_wants_char(&char_key('n'), &app));

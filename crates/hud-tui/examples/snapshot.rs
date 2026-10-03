@@ -46,6 +46,7 @@ fn main() {
             tool_name: "calculator".into(),
             summary: "calculator(expression)".into(),
             risk: 1,
+            working_dir: "/tmp".into(),
         });
         app.tool_state = ToolState::AwaitingApproval;
     }

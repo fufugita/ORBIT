@@ -685,6 +685,24 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     }))
 }
 
+/// Build the session's frozen system prompt for the REPL / headless
+/// paths (same shape as the TUI worker's).
+fn build_session_prompt(home: &Path, model: &str) -> String {
+    let defs = tools::tool_definitions();
+    let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    let mods = orbit_cli::mods::load_all(home);
+    let enabled = orbit_cli::mods::initial_enabled(home, &mods);
+    let mods_directive = orbit_cli::mods::system_directive(&mods, &enabled);
+    orbit_engine::context::build_system_prompt(
+        home,
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        model,
+        &tool_names,
+        &mods_directive,
+    )
+    .text
+}
+
 /// `orbit -p "<prompt>"` — headless one-shot with tools.
 ///
 /// Runs one turn through the engine and prints the event stream. With
@@ -728,6 +746,22 @@ fn cmd_headless(args: &[String]) -> i32 {
     let cost_guard = orbit_engine::automation::CostGuard {
         max_microcents: value_after(args, "--max-cost").and_then(|v| v.parse().ok()),
     };
+    // --permission-mode / --allowedTools / --disallowedTools: the
+    // command-line permission scope (review blocker 4). The executor
+    // reads these env vars at evaluation time.
+    if let Some(mode) = value_after(args, "--permission-mode") {
+        if orbit_tools::permissions::PermissionMode::from_config(&mode).is_none() {
+            eprintln!("ORBIT-E1101: unknown --permission-mode {mode} (default, acceptEdits, plan, dontAsk, bypass)");
+            return 1;
+        }
+        std::env::set_var("ORBIT_PERMISSION_MODE", mode);
+    }
+    if let Some(list) = value_after(args, "--allowedTools") {
+        std::env::set_var("ORBIT_ALLOWED_TOOLS", list);
+    }
+    if let Some(list) = value_after(args, "--disallowedTools") {
+        std::env::set_var("ORBIT_DISALLOWED_TOOLS", list);
+    }
 
     let cfg = match config::ProvidersConfig::load(&home) {
         Ok(c) => c,
@@ -778,6 +812,10 @@ fn cmd_headless(args: &[String]) -> i32 {
     let options = orbit_engine::TurnOptions {
         tools: tools::tool_definitions(),
         max_rounds,
+        // The frozen system prompt: the model learns the working
+        // directory, the platform, ORBIT.md and the tools (review
+        // blocker 5).
+        system_directive: Some(build_session_prompt(&home, &model)),
         request_stem: "orbit-p".into(),
         ..Default::default()
     };
@@ -1201,6 +1239,7 @@ fn cmd_chat(args: &[String]) -> i32 {
         };
         let options = orbit_engine::TurnOptions {
             tools: tools::tool_definitions(),
+            system_directive: Some(build_session_prompt(&home, &model)),
             request_stem: "orbit-repl".into(),
             ..Default::default()
         };

@@ -2595,22 +2595,27 @@ fn render_approval_modal(
                     .add_modifier(Modifier::BOLD),
             );
     }
-    // Facts grid (fixture data; the backend supplies real facts).
-    let facts: [(&str, &str); 4] = [
-        ("runs in", "~/src/orbit"),
-        ("sandbox", "landlock · rw /tmp only"),
-        ("egress", "none"),
-        ("ledger", "decision is recorded"),
-    ];
+    // Facts grid: only facts computed from the request. Until the
+    // sandbox and egress broker are wired into the live path, the card
+    // shows the working directory and the computed risk — never
+    // invented sandbox/egress/ledger claims (defect fix #1: the old
+    // fixture facts drew over the keys row and the card's border).
+    let facts: Vec<(&str, String)> = vec![("working dir", first.working_dir.clone())];
     for (i, (label, value)) in facts.iter().enumerate() {
         let yy = rect.y + 4 + (i / 2) as u16;
         let xx = rect.x + 3 + (i % 2) as u16 * 40;
         for (j, c) in label.chars().enumerate() {
+            if xx + j as u16 >= rect.x + rect.width - 1 {
+                break;
+            }
             buf[(xx + j as u16, yy)]
                 .set_symbol(&c.to_string())
                 .set_style(Style::default().fg(p.muted).bg(fill));
         }
         for (j, c) in value.chars().enumerate() {
+            if xx + label.chars().count() as u16 + 2 + j as u16 >= rect.x + rect.width - 1 {
+                break;
+            }
             buf[(xx + label.chars().count() as u16 + 2 + j as u16, yy)]
                 .set_symbol(&c.to_string())
                 .set_style(Style::default().fg(p.ink2).bg(fill));

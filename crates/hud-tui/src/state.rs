@@ -705,6 +705,8 @@ pub struct PendingApproval {
     pub summary: String,
     /// Structured risk level 0..=3 (▰▰▱ badge, §6.15).
     pub risk: u8,
+    /// The working directory the call runs in (a real fact for the card).
+    pub working_dir: String,
 }
 
 /// The operator's answer to an approval card (§12): drives the Activity
@@ -1150,6 +1152,7 @@ impl App {
                 tool_name,
                 summary,
                 risk,
+                working_dir,
             } => {
                 self.tool_state = ToolState::AwaitingApproval;
                 self.pending_approvals.push(PendingApproval {
@@ -1157,6 +1160,7 @@ impl App {
                     tool_name,
                     summary,
                     risk,
+                    working_dir,
                 });
                 // D17: ring the terminal bell when configured — the
                 // operator watching something else hears the approval.
@@ -2031,6 +2035,7 @@ mod tests {
             tool_name: "calculator".into(),
             summary: "calculator(expression)".into(),
             risk: 1,
+            working_dir: "/tmp".into(),
         });
         assert_eq!(app.pending_approvals.len(), 1);
         assert_eq!(app.pending_approvals[0].call_id, "call-42");
@@ -2052,6 +2057,7 @@ mod tests {
             tool_name: "calculator".into(),
             summary: "calculator(expression)".into(),
             risk: 1,
+            working_dir: "/tmp".into(),
         });
         assert_eq!(app.pending_approvals.len(), 1);
         app.reduce(Msg::ToolCallFinished {
@@ -2105,6 +2111,7 @@ mod tests {
                 tool_name: "ssh".into(),
                 summary: format!("run command #{i}"),
                 risk: 1,
+                working_dir: "/tmp".into(),
             });
         }
         assert_eq!(app.pending_approvals.len(), 2);
@@ -2433,6 +2440,7 @@ mod bell_tests {
             tool_name: "shell".into(),
             summary: "ls".into(),
             risk: 0,
+            working_dir: "/tmp".into(),
         }
     }
 
@@ -2469,6 +2477,7 @@ mod approvals_denied_tests {
             tool_name: "shell".into(),
             summary: "rm -rf /tmp/x".into(),
             risk: 2,
+            working_dir: "/tmp".into(),
         }
     }
 

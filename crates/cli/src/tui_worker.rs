@@ -84,6 +84,20 @@ fn worker_main(
     let mut mods = crate::mods::load_all(&config.home);
     let mut mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
 
+    // The JSONL transcript (phase 4): one fsynced line per event —
+    // the content record that stays on the machine. Opened once;
+    // appended by each turn (user prompt, assistant blocks, tool
+    // results, notes).
+    let transcript_log =
+        orbit_engine::transcript::Transcript::open(&config.home, &config.session_id).ok();
+
+    // The frozen system prompt (phase 4): built once per session —
+    // base instructions, the tool set, the environment snapshot,
+    // memory files, mods. Sent as the System message; never
+    // re-inserted per request (that broke caching and edited-history
+    // replay). Rebuilt only when the enabled mods set changes.
+    let mut system_prompt = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+
     // Send identity to the TUI so the status bar shows model/provider/session.
     // D18: priced=false makes the status bar show `cost n/a` for models
     // without a pricing entry (never a fake $0.0000).
@@ -128,10 +142,11 @@ fn worker_main(
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = Some(token.clone());
                 }
-                let directive = crate::mods::system_directive(&mods, &mods_enabled);
-                // Plan directive: read-only posture, produce a plan.
+                // Plan mode appends its read-only posture to the frozen
+                // prompt (the model keeps its context; only the posture
+                // changes).
                 let plan_directive = format!(
-                    "{directive}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes; all tool calls will be denied. Explore the problem, then respond with a concise, numbered implementation plan. End with a line: `PLAN READY`."
+                    "{system_prompt}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes; all tool calls will be denied. Explore the problem, then respond with a concise, numbered implementation plan. End with a line: `PLAN READY`."
                 );
                 let (_ok, _input, _output, _cost, plan_text) = match run_tui_turn(
                     &config,
@@ -169,7 +184,13 @@ fn worker_main(
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = Some(token.clone());
                 }
-                let directive = crate::mods::system_directive(&mods, &mods_enabled);
+                if let Some(log) = &transcript_log {
+                    let _ = log.append(&orbit_engine::transcript::TranscriptEvent::UserPrompt {
+                        text: prompt.clone(),
+                    });
+                }
+                let transcript_len_before = transcript.len();
+                let directive = system_prompt.clone();
                 let (_ok, input, output, cost, _final) = match run_tui_turn(
                     &config,
                     &mut transcript,
@@ -234,6 +255,44 @@ fn worker_main(
                         &ctx.sender,
                         &format!("warning: session not saved: {e}"),
                     );
+                }
+                // The JSONL transcript: assistant blocks + tool results
+                // for the turn just finished, in order.
+                if let Some(log) = &transcript_log {
+                    for m in transcript.iter().skip(transcript_len_before) {
+                        match m.role {
+                            ChatRole::Assistant => {
+                                let calls: Vec<orbit_engine::transcript::ToolCallRecord> = m
+                                    .tool_calls
+                                    .as_ref()
+                                    .map(|tcs| {
+                                        tcs.iter()
+                                            .map(|tc| orbit_engine::transcript::ToolCallRecord {
+                                                id: tc.id.clone(),
+                                                name: tc.name.clone(),
+                                                arguments: tc.arguments.clone(),
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let _ = log.append(
+                                    &orbit_engine::transcript::TranscriptEvent::Assistant {
+                                        text: m.content.clone(),
+                                        tool_calls: calls,
+                                    },
+                                );
+                            }
+                            ChatRole::Tool => {
+                                let _ = log.append(
+                                    &orbit_engine::transcript::TranscriptEvent::ToolResult {
+                                        call_id: m.tool_call_id.clone().unwrap_or_default(),
+                                        content: m.tool_result.clone().unwrap_or_default(),
+                                    },
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             WorkerCommand::SetModel(model) => {
@@ -501,6 +560,11 @@ fn worker_main(
                         } else {
                             mods_enabled.retain(|n| n != &name);
                         }
+                        // The frozen prompt rebuilds so the next turn
+                        // carries the new mods set (append-only: the
+                        // change arrives as a new prompt, never an edit).
+                        system_prompt =
+                            build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
                         ctx.sender.send(Msg::SystemMessage(format!(
                             "mod {name}: {}",
                             if now_on { "enabled" } else { "disabled" }
@@ -514,6 +578,8 @@ fn worker_main(
             WorkerCommand::RefreshMods => {
                 mods = crate::mods::load_all(&config.home);
                 mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
+                system_prompt =
+                    build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
                 ctx.sender.send(Msg::SystemMessage(format!(
                     "mods reloaded: {} installed, {} enabled",
                     mods.len(),
@@ -750,6 +816,9 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
             tool_name: req.tool_name.clone(),
             summary: req.summary.clone(),
             risk: req.risk.level(),
+            working_dir: std::env::current_dir()
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         });
         // Park until the operator responds (y/n/R). Esc handled as deny.
         match rx.recv() {
@@ -1016,4 +1085,26 @@ impl TuiToolExecutor {
             content: result,
         }
     }
+}
+
+/// Build the session's frozen system prompt: the context builder's
+/// output (base + tools + env + memory) with the mods directive
+/// folded in. Called once at boot and when the enabled mods change.
+fn build_session_prompt(
+    home: &std::path::Path,
+    model: &str,
+    mods: &[crate::mods::Mod],
+    mods_enabled: &[String],
+) -> String {
+    let defs = crate::tools::tool_definitions();
+    let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    let mods_directive = crate::mods::system_directive(mods, mods_enabled);
+    orbit_engine::context::build_system_prompt(
+        home,
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        model,
+        &tool_names,
+        &mods_directive,
+    )
+    .text
 }

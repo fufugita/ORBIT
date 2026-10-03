@@ -70,6 +70,21 @@ pub fn execute(name: &str, args: &serde_json::Value) -> Result<serde_json::Value
 /// Display-safe summary of a tool call's arguments (name + argument keys only;
 /// never raw argument values — they may be secrets).
 pub fn safe_call_summary(name: &str, args: &serde_json::Value) -> String {
+    // The card and transcript lines must name the target (review
+    // blocker 2): the path for file tools, the command for Bash. The
+    // value passes the secret scanner first — a real secret redacts,
+    // an ordinary path or command shows.
+    let target_key = match name {
+        "Bash" => Some("command"),
+        "Read" | "Write" | "Edit" | "Glob" | "Grep" => Some("file_path"),
+        _ => None,
+    };
+    if let Some(key) = target_key {
+        if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+            let scanned = orbit_tools::scan::scan_result(v);
+            return format!("{name}({})", scanned.text.trim());
+        }
+    }
     let keys: Vec<&str> = args
         .as_object()
         .map(|o| o.keys().map(String::as_str).collect())

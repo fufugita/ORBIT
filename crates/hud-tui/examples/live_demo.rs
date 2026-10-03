@@ -129,6 +129,7 @@ fn main() -> io::Result<()> {
                     tool_name: "shell".into(),
                     summary: "bash -c 'cargo test -p orbit-ledger'".into(),
                     risk: 2,
+                    working_dir: "/tmp".into(),
                 });
                 app.tool_state = ToolState::AwaitingApproval;
             }

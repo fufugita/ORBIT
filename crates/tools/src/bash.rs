@@ -8,6 +8,7 @@
 
 use crate::{finish, Tool, ToolContext, ToolResult};
 use serde_json::json;
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -86,6 +87,9 @@ pub struct BackgroundCommand {
     pub id: String,
     pub command: String,
     pub output_path: PathBuf,
+    /// The child's PID — its process group leader. TaskStop kills the
+    /// whole group (negative PID), so shell children die with it.
+    pub pid: i32,
     #[allow(dead_code)]
     started: std::time::Instant,
 }
@@ -148,8 +152,17 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
         .arg("-c")
         .arg(command)
         .current_dir(&cx.working_dir)
+        // Safety (review blocker 3): a child never inherits ORBIT's
+        // environment (provider keys included) — an explicit allowlist
+        // only. Null stdin: a command that reads stdin cannot take the
+        // TUI's keystrokes. Own process group: Esc/TaskStop can kill
+        // the whole tree.
+        .env_clear()
+        .envs(env_allowlist())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
@@ -193,11 +206,13 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
                     // Move to the background: leave the child running,
                     // record it, and report.
                     let id = format!("bg-{}", ulid::Ulid::new());
+                    let pid = child.id() as i32;
                     if let Ok(mut bg) = BACKGROUND.lock() {
                         bg.push(BackgroundCommand {
                             id: id.clone(),
                             command: command.to_string(),
                             output_path: output_path.clone(),
+                            pid,
                             started: std::time::Instant::now(),
                         });
                     }
@@ -256,6 +271,17 @@ fn read_pipes(
     (read_pipe(stdout), read_pipe_err(stderr))
 }
 
+/// The environment a Bash child may see: an explicit allowlist, never
+/// ORBIT's own environment (provider keys must not leak into tool
+/// results via printenv).
+fn env_allowlist() -> Vec<(String, String)> {
+    const ALLOW: &[&str] = &["PATH", "HOME", "LANG", "TERM", "TMPDIR", "SHELL"];
+    ALLOW
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect()
+}
+
 /// TaskStop: stop a background command by id.
 pub struct TaskStopTool;
 
@@ -285,21 +311,34 @@ impl Tool for TaskStopTool {
         let Some(task_id) = input.get("task_id").and_then(|v| v.as_str()) else {
             return ToolResult::err("task_id is required");
         };
-        // The reaper thread owns the child; TaskStop marks the record
-        // stopped. Full process-group kill arrives with the sandbox
-        // (phase 3's bubblewrap work owns process trees).
+        // Kill the whole process group (negative PID) so shell children
+        // die with the leader; then drop the record.
         if let Ok(mut bg) = BACKGROUND.lock() {
-            let before = bg.len();
-            bg.retain(|b| b.id != task_id);
-            if bg.len() < before {
+            if let Some(pos) = bg.iter().position(|b| b.id == task_id) {
+                let cmd = bg.remove(pos);
+                let killed = kill_process_group(cmd.pid);
                 return ToolResult::ok(json!({
-                    "ok": true,
+                    "ok": killed,
                     "stopped": task_id,
                 }));
             }
         }
         ToolResult::err("no such background task")
     }
+}
+
+/// Kill a process group (negative PID = the whole group). Returns
+/// whether the signal was delivered.
+fn kill_process_group(pid: i32) -> bool {
+    use std::process::Command;
+    // kill -TERM -<pgid>: the child was spawned with process_group(0),
+    // so its PID IS its pgid.
+    Command::new("kill")
+        .arg("-TERM")
+        .arg(format!("-{pid}"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// List live background commands (for the status line / TaskList).
