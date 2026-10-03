@@ -101,3 +101,89 @@ async def pipeline(steps: list[dict[str, Any]]) -> RunHandle:
 def load_workflow(source: Union[dict[str, str], str]) -> dict[str, Any]:
     """Load a workflow from JSON/file (parity with TS loadWorkflow)."""
     return {"source": source, "schema": "orbit:ir@0.1.0"}
+
+
+# ── query(): the headless agent API (phase 6) ──────────────────────────────
+# Spawns `orbit -p --output-format stream-json` and yields typed events
+# generated from the engine protocol, so the SDK cannot drift from the engine.
+
+import json
+import os
+import subprocess
+from typing import Any, Dict, Iterator, Optional
+
+
+class QueryResult:
+    """The final result of a query()."""
+
+    def __init__(self) -> None:
+        self.ok: bool = False
+        self.final_text: str = ""
+        self.rounds: int = 0
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        self.cost_microcents: int = 0
+        self.exit_code: int = -1
+
+
+def query(
+    prompt: str,
+    *,
+    home: Optional[str] = None,
+    model: Optional[str] = None,
+    gate: Optional[str] = None,
+    permission_mode: Optional[str] = None,
+    max_turns: Optional[int] = None,
+    extra_args: Optional[list] = None,
+    orbit_bin: str = "orbit",
+) -> Iterator[Dict[str, Any]]:
+    """Run one headless agent turn: ``orbit -p "<prompt>"`` with tools,
+    streaming the engine's events as they arrive.
+
+    Yields each event dict; the final yield is a QueryResult.
+    Exit codes: 0 done, 1 turn failed, 2 stopped by a permission
+    denial, 3 hit --max-turns, 130 interrupted.
+    """
+    args = [orbit_bin, "-p", prompt]
+    if model:
+        args += ["--model", model]
+    if gate:
+        args += ["--gate", gate]
+    if max_turns:
+        args += ["--max-turns", str(max_turns)]
+    if home:
+        args += ["--home", home]
+    if permission_mode:
+        args += ["--permission-mode", permission_mode]
+    if extra_args:
+        args += extra_args
+    args += ["--output-format", "stream-json"]
+
+    result = QueryResult()
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=None,
+        text=True,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "response_finished":
+            result.final_text = ev.get("output", "")
+            result.input_tokens = ev.get("input_tokens", 0)
+            result.output_tokens = ev.get("output_tokens", 0)
+            result.cost_microcents = ev.get("cost_microcents", 0)
+        if ev.get("type") == "turn_ended":
+            result.ok = ev.get("ok", False)
+            result.rounds = ev.get("rounds", 0)
+        yield ev
+    proc.wait()
+    result.exit_code = proc.returncode or -1
+    yield result  # type: ignore[misc]

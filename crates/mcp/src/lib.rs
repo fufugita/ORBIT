@@ -79,16 +79,9 @@ impl McpSession {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("spawn mcp server {name}: {e}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "no stdin".to_string())?;
-        let stdout = std::io::BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| "no stdout".to_string())?,
-        );
+        let stdin = child.stdin.take().ok_or_else(|| "no stdin".to_string())?;
+        let stdout =
+            std::io::BufReader::new(child.stdout.take().ok_or_else(|| "no stdout".to_string())?);
         let mut session = McpSession {
             server_name: name.into(),
             child,
@@ -133,7 +126,9 @@ impl McpSession {
         // notifications).
         loop {
             let mut buf = String::new();
-            let n = self.stdout.read_line(&mut buf)
+            let n = self
+                .stdout
+                .read_line(&mut buf)
                 .map_err(|e| format!("read: {e}"))?;
             if n == 0 {
                 return Err("server closed stdout".into());
@@ -238,7 +233,10 @@ mod tests {
 
     #[test]
     fn wire_names_roundtrip() {
-        assert_eq!(wire_name("github", "create_issue"), "mcp__github__create_issue");
+        assert_eq!(
+            wire_name("github", "create_issue"),
+            "mcp__github__create_issue"
+        );
         assert_eq!(
             split_wire_name("mcp__github__create_issue"),
             Some(("github".into(), "create_issue".into()))

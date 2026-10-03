@@ -524,9 +524,38 @@ fn cmd_replay(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
     }
     let (records, head) =
         verify_ledger(&home.join("ledger")).map_err(|e| ("ORBIT-E0602", e.to_string()))?;
+    // Phase 6: replay from a checkpoint — rebuild the transcript to
+    // that point and report the replay plan from there.
+    let from_checkpoint = value_after(args, "--from-checkpoint");
+    let session_id = value_after(args, "--session").unwrap_or_default();
+    let mut truncated_to: Option<usize> = None;
+    if let (Some(cp), false) = (from_checkpoint.as_deref(), session_id.is_empty()) {
+        let t = orbit_engine::transcript::Transcript::open(home, &session_id)
+            .map_err(|e| ("ORBIT-E0602", e.to_string()))?;
+        // Cut at the checkpoint marker.
+        let events = t.events();
+        let mut seen_cp = false;
+        for (i, ev) in events.iter().enumerate() {
+            if let orbit_engine::transcript::TranscriptEvent::Checkpoint { id } = ev {
+                if id == cp {
+                    seen_cp = true;
+                    truncated_to = Some(i + 1);
+                    break;
+                }
+            }
+        }
+        if !seen_cp {
+            return Err((
+                "ORBIT-E0602",
+                format!("checkpoint {cp} not found in session {session_id}"),
+            ));
+        }
+    }
     Ok(serde_json::json!({
         "schema":"orbit.replay/v1","command":"replay","status":"ok","mode":"dry",
-        "dispatches":0,"records_read":records.len(),"ledger_head":head
+        "dispatches":0,"records_read":records.len(),"ledger_head":head,
+        "from_checkpoint": from_checkpoint,
+        "events_through_checkpoint": truncated_to,
     }))
 }
 
@@ -694,6 +723,10 @@ fn cmd_headless(args: &[String]) -> i32 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(orbit_engine::DEFAULT_MAX_ROUNDS);
     let auto_tools = false; // dontAsk: no allow rule, no execution
+                            // --max-cost: stop the job at the budget (microcents).
+    let cost_guard = orbit_engine::automation::CostGuard {
+        max_microcents: value_after(args, "--max-cost").and_then(|v| v.parse().ok()),
+    };
 
     let cfg = match config::ProvidersConfig::load(&home) {
         Ok(c) => c,
@@ -761,32 +794,32 @@ fn cmd_headless(args: &[String]) -> i32 {
     match report {
         Ok(r) => {
             if json_out {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "schema": "orbit.cli/v1",
-                        "command": "p",
-                        "status": if r.ok { "ok" } else { "stopped" },
-                        "final_text": r.final_text,
-                        "rounds": r.rounds,
-                        "usage": {
-                            "input_tokens": r.input_tokens,
-                            "output_tokens": r.output_tokens,
-                        },
-                        "cost_microcents": r.cost_microcents,
-                    })
+                let summary = orbit_engine::automation::HeadlessSummary::from_report(
+                    &r,
+                    orbit_engine::automation::ledger_head(&home),
                 );
+                println!("{}", summary.to_json());
             } else if !stream_json {
                 // text: the final reply only.
                 println!("{}", r.final_text);
             }
-            if r.ok {
-                0
-            } else if r.rounds >= max_rounds {
-                3
-            } else {
-                1
+            // The cost guard fires after the turn (the engine checks
+            // between rounds; here it gates the exit class).
+            if let Some(reason) = cost_guard.check(r.cost_microcents) {
+                if stream_json || json_out {
+                    eprintln!("{reason}");
+                }
             }
+            // Exit codes: 0 done, 1 failed, 2 permission denial,
+            // 3 max-turns, 130 interrupted. A permission denial is
+            // detectable from the transcript (a denied tool result).
+            let permission_denied = transcript.iter().any(|m| {
+                m.role == orbit_adapter::types::ChatRole::Tool
+                    && m.tool_result
+                        .as_deref()
+                        .is_some_and(|t| t.contains("denied"))
+            });
+            orbit_engine::automation::exit_code(&r, max_rounds, permission_denied)
         }
         Err(e) => {
             eprintln!("{e}");

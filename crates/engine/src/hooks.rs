@@ -73,10 +73,16 @@ pub struct HookOutcome {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HookDecision {
     Allow,
-    Deny { reason: String },
-    Ask { reason: String },
+    Deny {
+        reason: String,
+    },
+    Ask {
+        reason: String,
+    },
     /// Rewrite the tool input before execution.
-    Rewrite { input: serde_json::Value },
+    Rewrite {
+        input: serde_json::Value,
+    },
 }
 
 /// The loaded hooks for a session (user scope + trusted project scope).
@@ -324,7 +330,8 @@ timeout_secs = 5
         let hooks = Hooks {
             hooks: vec![HookConfig {
                 event: "PreToolUse".into(),
-                command: "grep -q 'git push' && { echo 'no force pushes' >&2; exit 2; } || true".into(),
+                command: "grep -q 'git push' && { echo 'no force pushes' >&2; exit 2; } || true"
+                    .into(),
                 timeout_secs: Some(10),
             }],
             project_trusted: true,

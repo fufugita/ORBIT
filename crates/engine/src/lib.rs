@@ -25,6 +25,7 @@
 //! runtime into the engine (see [`ToolExecutor`]); the system prompt
 //! and context builder are phase-4 work.
 
+pub mod automation;
 pub mod context;
 pub mod dispatch;
 pub mod hooks;
