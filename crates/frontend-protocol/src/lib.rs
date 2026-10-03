@@ -87,6 +87,14 @@ pub enum FrontendEvent {
     /// The reply was cut off by the output-token limit (engine v2).
     /// The turn ends with this note visible.
     OutputTruncated { limit: u64 },
+    /// The context is being compacted (phase 4): the next request
+    /// would pass 90% of the window.
+    Compacting {
+        used_tokens: u64,
+        window_tokens: u64,
+    },
+    /// Compaction finished; history replaced by the summary.
+    Compacted { summary: String },
 }
 
 // ── Actions: frontend → harness ─────────────────────────────────────────────

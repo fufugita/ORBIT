@@ -26,12 +26,32 @@ pub struct TurnOptions {
     /// Tools advertised to the model this turn. `/compact` passes an
     /// EMPTY list: a summarization request must not advertise tools.
     pub tools: Vec<orbit_adapter::types::ToolDefinition>,
-    /// A system directive prepended to the wire transcript (mods /
-    /// plan mode). Never persisted to the session file — the caller
-    /// rebuilds it from the enabled set every turn.
+    /// The frozen system prompt (phase 4: built once per session by
+    /// the context builder — base instructions, tools, environment,
+    /// memory files, mods). Sent as the System message; never
+    /// re-inserted per request (that broke caching and edited-history
+    /// replay). Plan mode appends its read-only posture here.
     pub system_directive: Option<String>,
     /// Request-id stem for ledger records (e.g. "orbit-tui", "orbit-p").
     pub request_stem: String,
+    /// The model's context window (phase 4: compaction threshold =
+    /// 90% of window minus the output reserve).
+    pub window_tokens: Option<u64>,
+    /// Output reserve subtracted from the window before the compaction
+    /// threshold (the model needs room to answer).
+    pub output_reserve_tokens: u64,
+}
+
+/// The compaction threshold: compact when the next request would pass
+/// 90% of (window − output reserve).
+fn should_compact(used_tokens: u64, window: Option<u64>, reserve: u64) -> bool {
+    match window {
+        Some(w) => {
+            let usable = w.saturating_sub(reserve);
+            used_tokens >= usable / 10 * 9
+        }
+        None => false,
+    }
 }
 
 impl Default for TurnOptions {
@@ -45,6 +65,8 @@ impl Default for TurnOptions {
             tools: Vec::new(),
             system_directive: None,
             request_stem: "orbit-engine".into(),
+            window_tokens: None,
+            output_reserve_tokens: 8_192,
         }
     }
 }
@@ -79,6 +101,35 @@ pub fn run_turn(
         }
 
         events(FrontendEvent::RoundStarted { round });
+
+        // Phase 4: auto-compaction — when the next request would pass
+        // 90% of (window − output reserve), compact first. The actual
+        // summarization dispatch runs without tools (a tool-happy
+        // model would answer with calls instead of the summary).
+        if round > 0
+            && should_compact(
+                report.input_tokens,
+                options.window_tokens,
+                options.output_reserve_tokens,
+            )
+        {
+            events(FrontendEvent::Compacting {
+                used_tokens: report.input_tokens,
+                window_tokens: options.window_tokens.unwrap_or(0),
+            });
+            if let Some(summary) =
+                compact_transcript(home, config, options, transcript, cancel, events)
+            {
+                let before = transcript.len();
+                transcript.clear();
+                transcript.push(user_message(format!(
+                    "[context compacted from {before} messages]\n\n{summary}"
+                )));
+                events(FrontendEvent::Compacted {
+                    summary: summary.clone(),
+                });
+            }
+        }
 
         // One dispatch, with retry on rate-limit-class refusals.
         let outcome = dispatch_with_retry(
@@ -323,6 +374,94 @@ pub(crate) fn assistant_with_calls_and_thinking(
         }]);
     }
     m
+}
+
+/// An executor that never runs anything (compaction dispatch carries
+/// no tools, so nothing can be called).
+struct NoopExecutor;
+
+impl ToolExecutor for NoopExecutor {
+    fn execute(
+        &mut self,
+        calls: &[crate::dispatch::PendingToolCall],
+        _round: u32,
+    ) -> Vec<crate::ToolRoundResult> {
+        calls
+            .iter()
+            .map(|c| crate::ToolRoundResult {
+                call_id: c.id.clone(),
+                content: r#"{"ok":false,"error":"compaction dispatch advertises no tools"}"#.into(),
+            })
+            .collect()
+    }
+}
+
+/// Run one no-tools summarization dispatch over the transcript and
+/// return the summary. Simple compaction (roadmap: the whole history
+/// becomes one summary + the latest user message; server-side
+/// compaction arrives with the live Anthropic leg).
+fn compact_transcript(
+    home: &std::path::Path,
+    config: &TurnConfig,
+    options: &TurnOptions,
+    transcript: &[ChatMessage],
+    cancel: &orbit_provider_http::CancelToken,
+    events: EventSink<'_>,
+) -> Option<String> {
+    let digest: String = transcript
+        .iter()
+        .map(|m| match m.role {
+            ChatRole::User | ChatRole::Assistant => format!(
+                "{}: {}\n",
+                m.role.as_str(),
+                truncate(m.content.as_str(), 400)
+            ),
+            ChatRole::Tool => format!(
+                "tool result: {}\n",
+                truncate(m.tool_result.as_deref().unwrap_or(""), 200)
+            ),
+            ChatRole::System => String::new(),
+        })
+        .collect();
+    let prompt = format!(
+        "Summarize this conversation for continuation. Keep: the task, decisions made, files touched, open questions, and the current plan. Be concise.\n\n{digest}"
+    );
+    let mut opts = TurnOptions {
+        tools: Vec::new(),
+        system_directive: None,
+        request_stem: format!("{}-compact", options.request_stem),
+        window_tokens: options.window_tokens,
+        output_reserve_tokens: options.output_reserve_tokens,
+        ..Default::default()
+    };
+    opts.max_rounds = 1;
+    opts.max_attempts = 2;
+    let mut scratch: Vec<ChatMessage> = Vec::new();
+    let mut noop = NoopExecutor;
+    let report = run_turn(
+        home,
+        config,
+        &opts,
+        &prompt,
+        &mut scratch,
+        &mut noop,
+        cancel,
+        events,
+    )
+    .ok()?;
+    (!report.final_text.is_empty()).then_some(report.final_text)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut cut = max;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &s[..cut])
+    }
 }
 
 #[cfg(test)]

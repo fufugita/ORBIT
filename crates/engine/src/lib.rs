@@ -25,7 +25,9 @@
 //! runtime into the engine (see [`ToolExecutor`]); the system prompt
 //! and context builder are phase-4 work.
 
+pub mod context;
 pub mod dispatch;
+pub mod transcript;
 pub mod turn;
 
 pub use dispatch::{run_dispatch, PendingToolCall, ProviderKind, TurnConfig, TurnOutcome};
