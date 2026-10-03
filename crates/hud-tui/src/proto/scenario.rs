@@ -37,6 +37,9 @@ pub struct Scenario {
     pub used_tokens: u64,
     pub window_tokens: u64,
     pub usage_shown_ms: u64,
+    /// When data last arrived (the caret breathes after 400 ms
+    /// without it — M06).
+    pub last_data_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,7 +158,12 @@ impl Scenario {
                 self.visible_output = false;
                 self.last_failed = false;
             }
-            "text_delta" => self.visible_output = true,
+            "text_delta" => {
+                self.visible_output = true;
+                // last_data_ms is wall-clock-ish; apply() carries the
+                // engine time if the runtime passes it, else the
+                // caller updates the field directly.
+            }
             "tool_started_full" => self.visible_output = false,
             "tool_finished_full" => self.visible_output = false,
             "approval_requested" => self.approval_pending = Some("tool".into()),

@@ -106,12 +106,12 @@ pub fn run_proto(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         }
         if last_tick.elapsed() >= UI_TICK {
             last_tick = Instant::now();
+            let now_ms = boot_ms.elapsed().as_millis() as u64;
             // Drain the bus into the scenario.
             while let Some(msg) = bus.try_recv() {
-                apply_msg(msg, &mut scenario, &sender);
+                apply_msg(msg, &mut scenario, &sender, now_ms);
             }
-            let now = boot_ms.elapsed().as_millis() as u64;
-            app.tick(now, &scenario);
+            app.tick(now_ms, &scenario);
             // Redraw only while something animates or the state is
             // dirty (an idle ORBIT draws nothing).
             guard
@@ -168,6 +168,27 @@ fn handle_key(
         }
         return false;
     }
+    // Arranging is on: the grammar owns the keyboard (esc started
+    // it; i or Enter leaves). This check comes BEFORE insert typing
+    // so v/s/x/HJKL act instead of landing in the composer.
+    if app.arranging {
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('i') => {
+                app.arranging = false;
+                *mode_insert = true;
+            }
+            KeyCode::Esc => {
+                app.key(Key::Esc);
+            }
+            KeyCode::Char(c) => {
+                if app.key(Key::Char(c)) {
+                    app.save_yours();
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
     // An approval is pending: y/a allow, n/s deny.
     if scenario.approval_pending.is_some() {
         match k.code {
@@ -208,8 +229,10 @@ fn handle_key(
             }
             KeyCode::Esc => {
                 if composer.is_empty() {
-                    // Esc with an empty composer: arrange mode.
-                    app.key(Key::Esc);
+                    // Esc with an empty composer: arrange mode. The
+                    // grammar now owns the keyboard until i / Enter.
+                    app.arranging = true;
+                    *mode_insert = false;
                 } else {
                     composer.clear();
                 }
@@ -229,28 +252,16 @@ fn handle_key(
         }
         return false;
     }
-    // NORMAL/arrange mode: the doc's grammar.
-    match k.code {
-        KeyCode::Char('i') | KeyCode::Enter => {
-            *mode_insert = true;
-        }
-        KeyCode::Char(c) => {
-            if app.key(Key::Char(c)) {
-                app.save_yours();
-            }
-        }
-        KeyCode::Esc => {
-            app.key(Key::Esc);
-        }
-        _ => {}
-    }
     false
 }
 
 /// FrontendEvent-shaped Msgs → the scenario reducer.
-fn apply_msg(msg: Msg, scenario: &mut Scenario, sender: &BusSender) {
+fn apply_msg(msg: Msg, scenario: &mut Scenario, sender: &BusSender, now_ms: u64) {
     match msg {
-        Msg::TextDelta(_) => scenario.apply("text_delta", 0),
+        Msg::TextDelta(_) => {
+            scenario.apply("text_delta", 0);
+            scenario.last_data_ms = now_ms;
+        }
         Msg::ToolCallStarted { name, .. } => {
             scenario.running.insert(name.clone(), name);
             scenario.apply("tool_started_full", 0);
@@ -351,14 +362,13 @@ fn draw(
     } else {
         Span::styled(composer.to_string(), Style::default().fg(comps::colour(Token::Ink)))
     };
-    let caret = Span::styled(
-        "▍",
-        Style::default().fg(comps::colour(if mode_insert {
-            Token::Cyan
-        } else {
-            Token::Rule
-        })),
-    );
+    // The breathing caret (M06): pulses at 0.9 Hz once 400 ms pass
+    // without data; bright cyan while typing.
+    let caret = if mode_insert {
+        comps::caret(app.tick_ms, scenario.last_data_ms, app.reduced)
+    } else {
+        Span::styled("▍", Style::default().fg(comps::colour(Token::Rule)))
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(comps::colour(Token::Rule)));
