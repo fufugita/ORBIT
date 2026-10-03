@@ -47,9 +47,13 @@ pub fn builtin_tools() -> Vec<BuiltinTool> {
     vec![calculator(), current_session_tool(), list_models_tool()]
 }
 
-/// Adapter-facing definitions for the provider.
+/// Adapter-facing definitions for the provider: the Wave 1 tool set
+/// (Read/Write/Edit/Glob/Grep/Bash/TaskStop) plus the locked pure
+/// built-ins (calculator, session/model lookups). Phase 3.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
-    builtin_tools().iter().map(|t| t.to_definition()).collect()
+    let mut defs: Vec<ToolDefinition> = orbit_tools::tool_definitions();
+    defs.extend(builtin_tools().iter().map(|t| t.to_definition()));
+    defs
 }
 
 /// Execute a tool by name with parsed JSON arguments. Unknown tools are denied
@@ -326,11 +330,12 @@ pub fn parse_arguments(accumulated: &[u8]) -> Result<serde_json::Value, String> 
 /// when write/shell tools land they classify false by default
 /// (fail toward caution, like `tool_risk`).
 pub fn is_read_only(name: &str) -> bool {
-    matches!(name, "calculator" | "current_session" | "list_models")
+    orbit_tools::is_read_only(name)
+        || matches!(name, "calculator" | "current_session" | "list_models")
 }
 
 pub fn is_known_tool(name: &str) -> bool {
-    builtin_tools().iter().any(|t| t.name == name)
+    orbit_tools::is_wave1(name) || builtin_tools().iter().any(|t| t.name == name)
 }
 
 /// Structured risk classification for a tool (backend-authoritative — the
@@ -376,6 +381,14 @@ impl RiskLevel {
 /// (deny-by-default before the approval channel), so this is total over the
 /// known set.
 pub fn tool_risk(name: &str) -> RiskLevel {
+    // Wave 1 risk: Bash is per-command (the executor computes it);
+    // writes are Medium at the classification level.
+    if matches!(name, "Write" | "Edit") {
+        return RiskLevel::Medium;
+    }
+    if orbit_tools::is_wave1(name) && !orbit_tools::is_read_only(name) {
+        return RiskLevel::Medium;
+    }
     // All v0.1 built-ins are pure-data (calculator, session snapshot, model
     // list). Anything not explicitly classified defaults to medium — fail
     // toward caution, never silently low.
@@ -437,8 +450,14 @@ mod tests {
     #[test]
     fn definitions_have_valid_schema_digests() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 3);
+        // Wave 1 (Read/Write/Edit/Glob/Grep/Bash/TaskStop) + the three
+        // locked pure built-ins.
+        assert_eq!(defs.len(), 10);
         assert!(defs.iter().all(|d| d.schema_digest.as_str().len() == 64));
+        // Every Wave 1 name is present exactly once.
+        for name in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TaskStop"] {
+            assert_eq!(defs.iter().filter(|d| d.name == name).count(), 1, "{name}");
+        }
     }
 
     #[test]

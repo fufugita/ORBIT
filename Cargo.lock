@@ -2454,6 +2454,7 @@ dependencies = [
  "orbit-provider-http",
  "orbit-reactor",
  "orbit-release",
+ "orbit-tools",
  "orbit-trust",
  "rand 0.8.7",
  "reqwest",
@@ -2797,6 +2798,19 @@ dependencies = [
  "rand_core 0.6.4",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "orbit-tools"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "orbit-adapter",
+ "orbit-frontend-protocol",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "ulid",
 ]
 
 [[package]]

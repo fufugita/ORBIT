@@ -33,6 +33,7 @@ orbit-release = { path = "../release" }
 orbit-adapter = { path = "../adapter" }
 orbit-provider-http = { path = "../provider-http" }
 orbit-engine = { path = "../engine" }
+orbit-tools = { path = "../tools" }
 orbit-frontend-protocol = { path = "../frontend-protocol" }
 orbit-gateway = { path = "../gateway" }
 orbit-egress = { path = "../egress" }

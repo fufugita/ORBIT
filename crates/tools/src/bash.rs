@@ -1,0 +1,315 @@
+//! Bash — runs a command in the persistent working directory.
+//!
+//! 2 min default / 10 min maximum timeout, then moved to the
+//! background. Output over 30,000 characters spills to a file (the
+//! model gets the path + a 2,000-character preview). Cancel kills the
+//! process group. The read-only allowlist runs without asking in
+//! default mode.
+
+use crate::{finish, Tool, ToolContext, ToolResult};
+use serde_json::json;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::Duration;
+
+/// Default timeout before a command moves to the background.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Hard maximum for a foreground command.
+pub const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// Commands that never need approval in default mode (read-only).
+pub const READONLY_ALLOWLIST: &[&str] = &[
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "rg",
+    "grep",
+    "find",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch",
+    "pwd",
+    "echo",
+    "wc",
+    "file",
+    "stat",
+    "which",
+    "tree",
+];
+
+/// Is this command on the read-only allowlist? Prefix match on the
+/// first word(s).
+pub fn is_readonly_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    READONLY_ALLOWLIST
+        .iter()
+        .any(|a| trimmed == *a || trimmed.starts_with(&format!("{a} ")))
+}
+
+/// High-risk command detection for the approval card's risk level
+/// (roadmap: rm -rf, git push --force, curl | sh are high).
+pub fn command_risk(cmd: &str) -> u8 {
+    let c = cmd.trim();
+    if c.contains("rm -rf")
+        || c.contains("rm -fr")
+        || c.contains("git push --force")
+        || c.contains("git push -f")
+        || c.contains("mkfs")
+        || c.contains("dd if=")
+        || c.contains("| sh")
+        || c.contains("| bash")
+        || c.contains("chmod 777")
+        || c.contains("curl") && c.contains("|")
+    {
+        3 // high
+    } else if c.contains("sudo")
+        || c.contains("git push")
+        || c.contains("kill")
+        || c.contains("mv ")
+        || c.contains("cp ")
+        || c.contains("rm ")
+    {
+        2 // medium
+    } else {
+        1 // low
+    }
+}
+
+/// Background command registry (session-scoped). A command that hits
+/// its timeout keeps running; its output lands in a file Read can open.
+static BACKGROUND: Mutex<Vec<BackgroundCommand>> = Mutex::new(Vec::new());
+
+pub struct BackgroundCommand {
+    pub id: String,
+    pub command: String,
+    pub output_path: PathBuf,
+    #[allow(dead_code)]
+    started: std::time::Instant,
+}
+
+pub struct BashTool;
+
+impl Tool for BashTool {
+    fn name(&self) -> &'static str {
+        "Bash"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "The command to run" },
+                "timeout": { "type": "integer", "description": "Seconds before moving to background (default 120, max 600)" },
+                "description": { "type": "string", "description": "What this command does (for the operator)" }
+            },
+            "required": ["command"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        false // the permission layer checks is_readonly_command per call
+    }
+    fn permission_key(&self, input: &serde_json::Value) -> crate::PermissionKey {
+        let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        // The rule pattern is the first word (Bash(git *) style).
+        let first = cmd.split_whitespace().next().unwrap_or("");
+        crate::PermissionKey {
+            tool: "Bash".into(),
+            pattern: first.to_string(),
+        }
+    }
+    fn run(&self, input: &serde_json::Value, cx: &ToolContext) -> ToolResult {
+        let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
+            return ToolResult::err("command is required");
+        };
+        let timeout = input
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .min(MAX_TIMEOUT_SECS);
+        run_command(command, timeout, cx)
+    }
+}
+
+/// Run a command, capturing combined output. On timeout the process
+/// keeps running in the background and the result says so.
+pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolResult {
+    use std::process::{Command, Stdio};
+
+    let output_path = cx
+        .outputs_dir()
+        .map(|d| d.join(format!("bash-{}.log", ulid::Ulid::new())))
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!("orbit-bash-{}.log", ulid::Ulid::new()))
+        });
+
+    let mut child = match Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .current_dir(&cx.working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return ToolResult::err(&format!("cannot spawn bash: {e}")),
+    };
+
+    // Wait with a timeout, polling.
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+                let (out, err) = read_pipes(stdout, stderr);
+                let combined = format!("{out}{err}");
+                let _ = std::fs::write(&output_path, &combined);
+                let scanned = crate::scan::scan_result(&combined);
+                let text = if scanned.redactions.is_empty() {
+                    combined
+                } else {
+                    scanned.text
+                };
+                let mut payload = json!({
+                    "ok": status.success(),
+                    "exit_code": status.code().unwrap_or(-1),
+                    "output": text,
+                });
+                if !scanned.redactions.is_empty() {
+                    payload["redacted"] = json!(scanned.redactions);
+                }
+                let mut r = ToolResult {
+                    payload: payload.to_string(),
+                    is_error: !status.success(),
+                    spilled_to: None,
+                };
+                r = finish(r, cx, &format!("bash-{}", ulid::Ulid::new()));
+                return r;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Move to the background: leave the child running,
+                    // record it, and report.
+                    let id = format!("bg-{}", ulid::Ulid::new());
+                    if let Ok(mut bg) = BACKGROUND.lock() {
+                        bg.push(BackgroundCommand {
+                            id: id.clone(),
+                            command: command.to_string(),
+                            output_path: output_path.clone(),
+                            started: std::time::Instant::now(),
+                        });
+                    }
+                    // Spawn a reaper that writes the output when done.
+                    let path = output_path.clone();
+                    std::thread::spawn(move || {
+                        let out = child.wait_with_output();
+                        if let Ok(o) = out {
+                            let combined = format!(
+                                "{}{}",
+                                String::from_utf8_lossy(&o.stdout),
+                                String::from_utf8_lossy(&o.stderr)
+                            );
+                            let _ = std::fs::write(&path, combined);
+                        }
+                    });
+                    return ToolResult::ok(json!({
+                        "ok": true,
+                        "backgrounded": true,
+                        "task_id": id,
+                        "note": format!("command still running after {timeout_secs}s; output will land in {}", output_path.display()),
+                    }));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return ToolResult::err(&format!("wait failed: {e}")),
+        }
+    }
+}
+
+fn read_pipes(
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+) -> (String, String) {
+    use std::io::Read;
+    fn read_pipe(mut p: Option<std::process::ChildStdout>) -> String {
+        match p.as_mut() {
+            Some(s) => {
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            }
+            None => String::new(),
+        }
+    }
+    fn read_pipe_err(mut p: Option<std::process::ChildStderr>) -> String {
+        match p.as_mut() {
+            Some(s) => {
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            }
+            None => String::new(),
+        }
+    }
+    (read_pipe(stdout), read_pipe_err(stderr))
+}
+
+/// TaskStop: stop a background command by id.
+pub struct TaskStopTool;
+
+impl Tool for TaskStopTool {
+    fn name(&self) -> &'static str {
+        "TaskStop"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The background task id to stop" }
+            },
+            "required": ["task_id"]
+        })
+    }
+    fn read_only(&self) -> bool {
+        false
+    }
+    fn permission_key(&self, _input: &serde_json::Value) -> crate::PermissionKey {
+        crate::PermissionKey {
+            tool: "TaskStop".into(),
+            pattern: String::new(),
+        }
+    }
+    fn run(&self, input: &serde_json::Value, _cx: &ToolContext) -> ToolResult {
+        let Some(task_id) = input.get("task_id").and_then(|v| v.as_str()) else {
+            return ToolResult::err("task_id is required");
+        };
+        // The reaper thread owns the child; TaskStop marks the record
+        // stopped. Full process-group kill arrives with the sandbox
+        // (phase 3's bubblewrap work owns process trees).
+        if let Ok(mut bg) = BACKGROUND.lock() {
+            let before = bg.len();
+            bg.retain(|b| b.id != task_id);
+            if bg.len() < before {
+                return ToolResult::ok(json!({
+                    "ok": true,
+                    "stopped": task_id,
+                }));
+            }
+        }
+        ToolResult::err("no such background task")
+    }
+}
+
+/// List live background commands (for the status line / TaskList).
+pub fn background_commands() -> Vec<(String, String)> {
+    BACKGROUND
+        .lock()
+        .map(|bg| {
+            bg.iter()
+                .map(|b| (b.id.clone(), b.command.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}

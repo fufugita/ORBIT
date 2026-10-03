@@ -13,6 +13,7 @@ exclude = ["fuzz", "crates/desktop/src-tauri"]
 members = [
   "crates/frontend-protocol",
   "crates/engine",
+  "crates/tools",
   "crates/reactor",
   "crates/sandbox",
   "crates/context",
