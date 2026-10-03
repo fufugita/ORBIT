@@ -719,6 +719,85 @@ fn build_session_prompt(home: &Path, model: &str) -> String {
 ///
 /// Exit codes: 0 done, 1 turn failed, 2 stopped by a permission
 /// denial, 3 hit `--max-turns`, 130 interrupted.
+/// Minimal JSON-Schema validation for --json-schema: the subset a
+/// structured reply realistically needs (type, required, properties,
+/// items, enum). Returns Err with the problems, or Ok(()) — the
+/// parsed value is not needed, only the verdict.
+fn validate_json_against_schema(
+    text: &str,
+    schema: &serde_json::Value,
+) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|e| format!("reply is not JSON: {e}"))?;
+    validate_value(&value, schema, "$")
+        .map_err(|problems| problems.join("; "))
+}
+
+fn validate_value(
+    v: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<(), Vec<String>> {
+    let mut problems = Vec::new();
+    let ty = schema.get("type").and_then(|t| t.as_str());
+    if let Some(ty) = ty {
+        let ok = match (ty, v) {
+            ("object", serde_json::Value::Object(_)) => true,
+            ("array", serde_json::Value::Array(_)) => true,
+            ("string", serde_json::Value::String(_)) => true,
+            ("number", serde_json::Value::Number(_)) => true,
+            ("integer", serde_json::Value::Number(n)) => n.is_u64() || n.is_i64(),
+            ("boolean", serde_json::Value::Bool(_)) => true,
+            ("null", serde_json::Value::Null) => true,
+            _ => false,
+        };
+        if !ok {
+            problems.push(format!("{path}: expected {ty}"));
+        }
+    }
+    if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
+        if let serde_json::Value::Object(map) = v {
+            for r in req {
+                if let Some(name) = r.as_str() {
+                    if !map.contains_key(name) {
+                        problems.push(format!("{path}: missing required field {name:?}"));
+                    }
+                }
+            }
+        }
+    }
+    if let (Some(props), serde_json::Value::Object(map)) =
+        (schema.get("properties"), v)
+    {
+        for (name, sub) in props.as_object().unwrap_or(&serde_json::Map::new()) {
+            if let Some(val) = map.get(name) {
+                if let Err(p) = validate_value(val, sub, &format!("{path}.{name}")) {
+                    problems.extend(p);
+                }
+            }
+        }
+    }
+    if let (Some(items), serde_json::Value::Array(arr)) =
+        (schema.get("items"), v)
+    {
+        for (i, val) in arr.iter().enumerate() {
+            if let Err(p) = validate_value(val, items, &format!("{path}[{i}]")) {
+                problems.extend(p);
+            }
+        }
+    }
+    if let Some(en) = schema.get("enum").and_then(|e| e.as_array()) {
+        if !en.contains(v) {
+            problems.push(format!("{path}: not in enum"));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
+}
+
 fn cmd_headless(args: &[String]) -> i32 {
     let home = orbit_home(args)
         .or_else(|| std::env::var("ORBIT_HOME").ok().map(PathBuf::from))
@@ -743,11 +822,34 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
     };
     let format = value_after(args, "--output-format").unwrap_or_else(|| "text".into());
+    // --bare: skip discovering hooks, skills, mods, MCP servers and
+    // memory files (phase 6 — fast start; recommended for scripts).
+    if args.iter().any(|a| a == "--bare") {
+        std::env::set_var("ORBIT_BARE", "1");
+    }
+    // --json-schema <file>: structured output. Anthropic gets
+    // output_config.format natively later; here the honest path for
+    // every provider: validate the final text as JSON against the
+    // schema and retry once with the validation error appended.
+    let json_schema: Option<serde_json::Value> = value_after(args, "--json-schema")
+        .map(|path| {
+            std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+        })
+        .transpose()
+        .map_err(|e| {
+            eprintln!("ORBIT-E0401: --json-schema: {e}");
+            1
+        })
+        .unwrap_or(None);
     let max_rounds: u32 = value_after(args, "--max-turns")
         .and_then(|v| v.parse().ok())
         .unwrap_or(orbit_engine::DEFAULT_MAX_ROUNDS);
-    let auto_tools = false; // dontAsk: no allow rule, no execution
-                            // --max-cost: stop the job at the budget (microcents).
+    // --auto-tools: up-front consent for pure built-ins (headless CI
+    // shape). Without it, dontAsk semantics: anything no allow rule
+    // covers is denied — and the exit code says so (2).
+    let auto_tools = args.iter().any(|a| a == "--auto-tools");
     let cost_guard = orbit_engine::automation::CostGuard {
         max_microcents: value_after(args, "--max-cost").and_then(|v| v.parse().ok()),
     };
@@ -858,7 +960,59 @@ fn cmd_headless(args: &[String]) -> i32 {
         request_stem: "orbit-p".into(),
         ..Default::default()
     };
-    let report = orbit_engine::run_turn(
+    // The authority extractor (phase 6): "run the tests but never
+    // push" becomes Bash(cargo test *) allowed and Bash(git push *)
+    // denied, for this job. The rules ride ORBIT_ALLOWED_TOOLS /
+    // ORBIT_DISALLOWED_TOOLS so the executor's own permission path
+    // enforces them like any other rule.
+    {
+        let spoken = orbit_engine::automation::extract_spoken_rules(prompt);
+        if !spoken.is_empty() {
+            let mut allow: Vec<String> = std::env::var("ORBIT_ALLOWED_TOOLS")
+                .map(|v| v.split(',').map(String::from).collect())
+                .unwrap_or_default();
+            let mut deny: Vec<String> = std::env::var("ORBIT_DISALLOWED_TOOLS")
+                .map(|v| v.split(',').map(String::from).collect())
+                .unwrap_or_default();
+            for r in spoken {
+                match r.effect {
+                    orbit_engine::automation::SpokenEffect::Allow => {
+                        if !allow.contains(&r.rule) {
+                            allow.push(r.rule.clone());
+                        }
+                    }
+                    orbit_engine::automation::SpokenEffect::Deny => {
+                        if !deny.contains(&r.rule) {
+                            deny.push(r.rule.clone());
+                        }
+                    }
+                }
+                if stream_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(
+                            &orbit_frontend_protocol::FrontendEvent::Status {
+                                text: format!(
+                                    "spoken rule recorded: {} {} (from \"{}\")",
+                                    match r.effect {
+                                        orbit_engine::automation::SpokenEffect::Allow => "allow",
+                                        orbit_engine::automation::SpokenEffect::Deny => "deny",
+                                    },
+                                    r.rule,
+                                    r.source_phrase
+                                )
+                            }
+                        )
+                        .unwrap_or_default()
+                    );
+                }
+            }
+            std::env::set_var("ORBIT_ALLOWED_TOOLS", allow.join(","));
+            std::env::set_var("ORBIT_DISALLOWED_TOOLS", deny.join(","));
+        }
+    }
+
+    let mut report = orbit_engine::run_turn(
         &home,
         &turn_config,
         &options,
@@ -868,6 +1022,115 @@ fn cmd_headless(args: &[String]) -> i32 {
         &orbit_provider_http::CancelToken::new(),
         &mut events,
     );
+
+    // --json-schema (phase 6): validate the final text as JSON
+    // against the schema; on failure, retry ONCE with the validation
+    // error appended to the transcript (validate-and-retry — the
+    // honest path for providers without native structured output).
+    if let Some(schema) = &json_schema {
+        if let Ok(r) = &report {
+            if let Err(problems) = validate_json_against_schema(&r.final_text, schema) {
+                if stream_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&orbit_frontend_protocol::FrontendEvent::Status {
+                            text: format!("schema validation failed, retrying: {problems}")
+                        })
+                        .unwrap_or_default()
+                    );
+                }
+                transcript.push(orbit_engine::user_message(format!(
+                    "Your previous reply did not match the required JSON schema: {problems}. Reply again with ONLY valid JSON matching the schema."
+                )));
+                report = orbit_engine::run_turn(
+                    &home,
+                    &turn_config,
+                    &options,
+                    "Reply with only valid JSON matching the schema.",
+                    &mut transcript,
+                    &mut executor,
+                    &orbit_provider_http::CancelToken::new(),
+                    &mut events,
+                );
+            }
+        }
+    }
+
+    // RTA (phase 6): a claim that tests pass turns green only after
+    // ORBIT's own re-run. Scan the turn's transcript for Bash test
+    // commands; if the final text claims a pass, re-run the last one
+    // and emit the attestation verdict.
+    let mut rta_verdict: Option<serde_json::Value> = None;
+    if let Ok(r) = &report {
+        let claims_pass = r.ok
+            && (r.final_text.to_lowercase().contains("tests pass")
+                || r.final_text.to_lowercase().contains("all tests pass")
+                || r.final_text.to_lowercase().contains("test suite passes"));
+        if claims_pass {
+            let test_cmd = transcript.iter().rev().find_map(|m| {
+                // tool_calls carry the Bash invocations of this turn
+                m.tool_calls.as_ref().and_then(|calls| {
+                    calls.iter().rev().find_map(|c| {
+                        let is_test = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                        .ok()
+                        .and_then(|a| {
+                            a.get("command")
+                                .and_then(|v| v.as_str())
+                                .map(|cmd| {
+                                    cmd.contains("cargo test")
+                                        || cmd.contains("npm test")
+                                        || cmd.contains("pytest")
+                                        || cmd.contains("go test")
+                                })
+                        })
+                        .unwrap_or(false);
+                        is_test.then(|| {
+                            serde_json::from_str::<serde_json::Value>(&c.arguments)
+                                .ok()
+                                .and_then(|a| {
+                                    a.get("command").and_then(|v| v.as_str()).map(String::from)
+                                })
+                                .unwrap_or_default()
+                        })
+                    })
+                })
+            });
+            if let Some(cmd) = test_cmd {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let verdict = match orbit_engine::automation::attest_test_pass(&cmd, &cwd) {
+                    Ok(p) => serde_json::json!({
+                        "attested": true,
+                        "command": p.command,
+                        "at": p.attested_at_epoch
+                    }),
+                    Err(e) => serde_json::json!({
+                        "attested": false,
+                        "command": cmd,
+                        "reason": e
+                    }),
+                };
+                if stream_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(
+                            &orbit_frontend_protocol::FrontendEvent::Status {
+                                text: format!(
+                                    "rta: {}",
+                                    if verdict["attested"].as_bool().unwrap_or(false) {
+                                        "tests re-run and PASSED (attested)"
+                                    } else {
+                                        "tests re-run and FAILED — the claim is not attested"
+                                    }
+                                )
+                            }
+                        )
+                        .unwrap_or_default()
+                    );
+                }
+                rta_verdict = Some(verdict);
+            }
+        }
+    }
 
     // Persist the session whatever the outcome (a failed turn still
     // belongs to the transcript; --continue resumes from what was
@@ -915,9 +1178,16 @@ fn cmd_headless(args: &[String]) -> i32 {
             // detectable from the transcript (a denied tool result).
             let permission_denied = transcript.iter().any(|m| {
                 m.role == orbit_adapter::types::ChatRole::Tool
-                    && m.tool_result
-                        .as_deref()
-                        .is_some_and(|t| t.contains("denied"))
+                    && m.tool_result.as_deref().is_some_and(|t| {
+                        // Every permission refusal carries one of these
+                        // markers: the explicit "denied", the headless
+                        // allowlist refusal, or a rule denial.
+                        t.contains("denied")
+                            || t.contains("requires --auto-tools")
+                            || t.contains("deny-by-default")
+                            || t.contains("persistent rule")
+                            || t.contains("dontAsk")
+                    })
             });
             orbit_engine::automation::exit_code(&r, max_rounds, permission_denied)
         }

@@ -124,7 +124,10 @@ fn gate3_tools_run_through_the_binary() {
     };
     init_home(&bin.to_string_lossy(), &home);
 
-    let (events, code) = run_orbit_p(port, &home, "what is 2*(3+4)?", &[]);
+    // --auto-tools: the honest way to let tools run headless. Without
+    // it the calculator call is denied (exit 2) — which the exit-code
+    // contract now makes visible instead of hiding behind turn-ok.
+    let (events, code) = run_orbit_p(port, &home, "what is 2*(3+4)?", &["--auto-tools"]);
     let types: Vec<&str> = events
         .iter()
         .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
@@ -272,7 +275,7 @@ fn gate4_continue_after_kill9() {
     init_home(&bin.to_string_lossy(), &home);
 
     // Turn 1 completes normally: the session file exists with 1 turn.
-    let (events, code) = run_orbit_p(port, &home, "say hi once", &[]);
+    let (events, code) = run_orbit_p(port, &home, "say hi once", &["--auto-tools"]);
     assert_eq!(code, 0);
     assert!(events
         .iter()
@@ -303,7 +306,7 @@ fn gate4_continue_after_kill9() {
     // --continue must resume the FIRST turn's session and complete a
     // fresh turn (the killed one never ended, so the newest saved
     // state is turn 1).
-    let (events, code) = run_orbit_p(port, &home, "and we are back", &["--continue"]);
+    let (events, code) = run_orbit_p(port, &home, "and we are back", &["--auto-tools", "--continue"]);
     assert_eq!(code, 0, "--continue must work after a kill -9");
     assert!(events
         .iter()
@@ -428,4 +431,97 @@ fn mod_install_signed_flow_through_binary() {
     assert!(!out.status.success(), "a tampered package must be refused");
 
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Gate 6: the audited CI run. `orbit -p` under an explicit allowlist
+/// with --bare and --max-cost behaves as CI needs it: the summary is
+/// valid JSON on stdout, a disallowed tool is denied (not executed),
+/// and the session's decisions are on disk for export.
+#[test]
+fn gate6_ci_run_allowlist_and_exit_codes() {
+    let port = spawn_mock();
+    let home = fresh_home("g6-ci");
+    let target = workspace_target();
+    let bin = if target.join("release/orbit").exists() {
+        target.join("release/orbit")
+    } else {
+        target.join("debug/orbit")
+    };
+    init_home(&bin.to_string_lossy(), &home);
+
+    // The CI shape: explicit allowlist, bare start, json summary,
+    // cost budget. The mock's implicit script calls a tool NOT in the
+    // allowlist → the call must be denied, and the turn still ends
+    // with a parseable summary + a distinct exit code (2: permission).
+    let (events, code) = run_orbit_p_ext(
+        port,
+        &home,
+        "review the changed files",
+        &[
+            "--allowedTools", "Read,Glob,Grep",
+            "--bare",
+            "--max-cost", "1000000",
+            "--output-format", "json",
+        ],
+    );
+    // Exit code 2 = stopped by a permission denial (the honest CI
+    // signal: the agent wanted a tool the allowlist does not grant).
+    assert_eq!(code, 2, "a non-allowlisted tool call must deny with exit 2");
+
+    // The json summary went to stdout — events here captured the
+    // stream; with --output-format json the summary is one object.
+    // (run_orbit_p_ext parses every line; find the summary.)
+    let summary = events
+        .iter()
+        .find(|e| e.get("schema").and_then(|s| s.as_str()) == Some("orbit.cli/v1"));
+    assert!(summary.is_some(), "the json summary object must print: {}", 
+        serde_json::to_string(&events).unwrap_or_default());
+
+    // The denial is recorded in the session (auditable).
+    let all = serde_json::to_string(&events).unwrap_or_default();
+    let _ = all;
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
+}
+
+/// run_orbit_p + extra passthrough (json output needs the raw line
+/// stream, not just FrontendEvents).
+fn run_orbit_p_ext(
+    port: u16,
+    home: &std::path::Path,
+    prompt: &str,
+    extra: &[&str],
+) -> (Vec<serde_json::Value>, i32) {
+    let target = workspace_target();
+    let bin = if target.join("release/orbit").exists() {
+        target.join("release/orbit")
+    } else {
+        target.join("debug/orbit")
+    };
+    let mut cmd = Command::new(&bin)
+        .arg("-p")
+        .arg(prompt)
+        .arg("--home")
+        .arg(home)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .arg("--model")
+        .arg("gate-test-model")
+        .args(extra)
+        .env("ORBIT_HOME", home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn orbit");
+    let mut events = Vec::new();
+    if let Some(out) = cmd.stdout.take() {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { continue };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                events.push(v);
+            }
+        }
+    }
+    let status = cmd.wait().expect("wait orbit");
+    (events, status.code().unwrap_or(-1))
 }

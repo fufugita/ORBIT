@@ -61,6 +61,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 /// trusted scopes are spawned once, their tools declared up front so
 /// the list never changes mid-conversation (phase 5).
 pub fn session_tool_definitions(home: &std::path::Path) -> Vec<ToolDefinition> {
+    // --bare skips discovering skills, mods, MCP servers and memory
+    // files (phase 6: fast start for scripts).
+    if std::env::var("ORBIT_BARE").map(|v| v == "1").unwrap_or(false) {
+        return tool_definitions();
+    }
     let mut defs = tool_definitions();
 
     // The Skill tool: load a skill's body on demand.

@@ -1,0 +1,98 @@
+name: 'ORBIT Agent'
+description: >-
+  Run ORBIT headless on a pull request event under an explicit tool
+  allowlist, post the result as a PR comment, and upload the encrypted
+  ledger export as a build artifact. An auditable CI agent run.
+inputs:
+  prompt:
+    description: 'The instruction for the agent (the PR body is appended).'
+    required: true
+  gate:
+    description: 'Gateway URL (a reachable ORBIT gateway).'
+    required: true
+  model:
+    description: 'Model id on the gateway.'
+    required: true
+  allowed-tools:
+    description: 'Comma-separated tool allowlist (Read,Glob,Grep are always safe).'
+    required: false
+    default: 'Read,Glob,Grep'
+  max-cost:
+    description: 'Cost budget in microcents (the job stops at the budget).'
+    required: false
+    default: ''
+  gate-token:
+    description: 'Bearer token for the gateway, if it needs one.'
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    - name: install orbit
+      shell: bash
+      run: |
+        cargo install --path "${{ github.action_path }}" --bin orbit --locked || {
+          echo "::error::cargo install orbit failed"; exit 1; }
+    - name: run the agent
+      id: run
+      shell: bash
+      env:
+        ORBIT_GATE_TOKEN: ${{ inputs.gate-token }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/orbit-home"
+        orbit init --home "$RUNNER_TEMP/orbit-home"
+        set +e
+        orbit -p "${{ inputs.prompt }}
+
+        --- pull request context ---
+        ${{ github.event.pull_request.title }}
+
+        ${{ github.event.pull_request.body }}" \
+          --home "$RUNNER_TEMP/orbit-home" \
+          --gate "${{ inputs.gate }}" \
+          --model "${{ inputs.model }}" \
+          --allowedTools "${{ inputs.allowed-tools }}" \
+          --max-cost "${{ inputs.max-cost }}" \
+          --bare \
+          --output-format json \
+          > "$RUNNER_TEMP/orbit-result.json"
+        code=$?
+        set -e
+        echo "exit=$code" >> "$GITHUB_OUTPUT"
+        exit 0  # the verdict is data, not a CI failure
+    - name: export the ledger (encrypted)
+      shell: bash
+      run: |
+        orbit export --to "$RUNNER_TEMP/orbit-ledger.age" \
+          --home "$RUNNER_TEMP/orbit-home" || true
+    - name: upload the audit bundle
+      uses: actions/upload-artifact@v4
+      with:
+        name: orbit-audit
+        path: |
+          ${{ runner.temp }}/orbit-result.json
+          ${{ runner.temp }}/orbit-ledger.age
+        if-no-files-found: warn
+    - name: post the result
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          let result = {};
+          try {
+            result = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/orbit-result.json', 'utf8'));
+          } catch (e) {}
+          const body = [
+            '### ORBIT agent run',
+            '',
+            '```json',
+            JSON.stringify(result, null, 2),
+            '```',
+            '',
+            `exit: ${{ steps.run.outputs.exit }} · audit bundle uploaded as \`orbit-audit\``,
+          ].join('\\n');
+          await github.rest.issues.createComment({
+            ...context.repo,
+            issue_number: context.issue.number,
+            body,
+          });

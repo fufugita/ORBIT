@@ -1,0 +1,26 @@
+# The auditable CI agent run (roadmap gate 6): ORBIT runs headless on
+# pull request events under an explicit allowlist, posts its result as
+# a comment, and uploads the encrypted ledger export. `orbit
+# verify-ledger` accepts that export on another machine.
+name: orbit-agent
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/orbit-agent
+        # The action's inputs come from repository variables so no
+        # secret lands in the workflow file.
+        with:
+          prompt: 'Review this pull request. Read the changed files, summarize the change, and check the tests cover it. Do not modify anything.'
+          gate: ${{ vars.ORBIT_GATE_URL }}
+          model: ${{ vars.ORBIT_MODEL }}
+          allowed-tools: 'Read,Glob,Grep'
+          max-cost: '500000'
+          gate-token: ${{ secrets.ORBIT_GATE_TOKEN }}

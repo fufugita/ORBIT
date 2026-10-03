@@ -251,12 +251,16 @@ impl HeadlessSummary {
 /// Exit codes (roadmap §Headless): 0 done, 1 turn failed, 2 stopped by
 /// a permission denial, 3 hit --max-turns, 130 interrupted.
 pub fn exit_code(report: &TurnReport, max_rounds: u32, permission_denied: bool) -> i32 {
-    if report.ok {
+    // A permission denial is detectable even when the turn afterwards
+    // completes (the model saw the refusal and answered around it) —
+    // CI must know the run was stopped by policy, so the denial wins
+    // over plain success.
+    if permission_denied {
+        2
+    } else if report.ok {
         0
     } else if report.interrupted {
         130
-    } else if permission_denied {
-        2
     } else if report.rounds >= max_rounds {
         3
     } else {
