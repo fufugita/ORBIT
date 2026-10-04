@@ -673,3 +673,47 @@ fn scenario_d1_deny_read_bypass() {
         "the secret leaked to the provider (S2)"
     );
 }
+
+// ── X2: no sandbox → Bash must not run unsandboxed in headless ────
+// Fails today: S3 (bwrap missing + --auto-tools → unsandboxed run,
+// nothing tells the operator).
+#[test]
+fn scenario_x2_no_sandbox_headless_bash_refused() {
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Bash", "args": {
+                "command": "echo pwned > x2ran.txt", "description": "x"}}]},
+            {"text": "ran"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let out = Command::new(orbit_binary())
+        .arg("-p")
+        .arg("run it")
+        .arg("--home")
+        .arg(&home.path)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{}", mock.port))
+        .arg("--model")
+        .arg("mock-model")
+        .arg("--auto-tools")
+        .arg("--output-format")
+        .arg("stream-json")
+        .env("ORBIT_TEST_SANDBOX_OFF", "1")
+        .current_dir(&fix.path)
+        .output()
+        .expect("run orbit -p");
+    let _ = out;
+
+    assert!(
+        !fix.path.join("x2ran.txt").exists(),
+        "headless Bash must not run unsandboxed when the sandbox is unavailable (S3)"
+    );
+    let logged = serde_json::to_string(&mock.requests()).unwrap();
+    assert!(
+        logged.contains("sandbox is unavailable"),
+        "the refusal must reach the provider (S3)"
+    );
+}

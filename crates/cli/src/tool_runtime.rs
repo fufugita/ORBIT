@@ -557,6 +557,14 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// S3: the standing refusal for an unrunnable sandbox.
+fn sandbox_refusal() -> String {
+    tool_error(
+        "refused: the shell sandbox is unavailable on this machine \
+(bubblewrap missing); set ORBIT_ALLOW_UNSANDBOXED_BASH=1 to run Bash unsandboxed",
+    )
+}
+
 fn tool_error(msg: &str) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
 }
@@ -610,6 +618,21 @@ fn execute_wave1(
             args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
         );
 
+    // S3: when the shell sandbox cannot run on this machine, a Bash
+    // command must not execute unsandboxed on an allow verdict. The
+    // operator opts in explicitly (ORBIT_ALLOW_UNSANDBOXED_BASH=1) or
+    // the call is refused with the reason. Read-only commands are
+    // still safe to run bare.
+    let sandbox_up = call.name != "Bash"
+        || is_ro_cmd
+        || matches!(
+            orbit_tools::sandbox::ShellSandbox::probe(),
+            orbit_tools::sandbox::SandboxStatus::Confined
+        )
+        || std::env::var("ORBIT_ALLOW_UNSANDBOXED_BASH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
     match evaluate(
         mode,
         &rules,
@@ -618,10 +641,15 @@ fn execute_wave1(
         tool.read_only(),
         is_ro_cmd,
     ) {
+        // S3 binds on every path that would RUN the command: a plain
+        // allow, and the ask-collapse (the operator approved the call
+        // — but not running it bare on a sandbox-less machine).
+        orbit_tools::permissions::Verdict::Allow if !sandbox_up => return sandbox_refusal(),
         orbit_tools::permissions::Verdict::Allow => {}
         orbit_tools::permissions::Verdict::Deny(reason) => {
             return tool_error(&reason);
         }
+        orbit_tools::permissions::Verdict::Ask if !sandbox_up => return sandbox_refusal(),
         orbit_tools::permissions::Verdict::Ask => {
             // The whole-tool verdict above already asked the channel
             // (the operator pressed y). Pattern-level ask collapses to

@@ -45,6 +45,12 @@ pub const READONLY_ALLOWLIST: &[&str] = &[
 /// first word(s).
 pub fn is_readonly_command(cmd: &str) -> bool {
     let trimmed = cmd.trim();
+    // A redirection or pipe operator makes the command side-effectful
+    // (echo x > f writes a file; cat f | sh executes) — it loses
+    // read-only classification no matter what the first word is.
+    if trimmed.contains('>') || trimmed.contains(">>") || trimmed.contains('|') {
+        return false;
+    }
     READONLY_ALLOWLIST
         .iter()
         .any(|a| trimmed == *a || trimmed.starts_with(&format!("{a} ")))

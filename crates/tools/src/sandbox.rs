@@ -55,6 +55,13 @@ impl ShellSandbox {
     /// Probe whether the sandbox can run here: bwrap present and
     /// functional. Runs a trivial confined true/false.
     pub fn probe() -> SandboxStatus {
+        // Test override: simulate a machine without bubblewrap (the
+        // scenarios can't uninstall the real one).
+        if std::env::var("ORBIT_TEST_SANDBOX_OFF").is_ok() {
+            return SandboxStatus::Unavailable(
+                "simulated absent (ORBIT_TEST_SANDBOX_OFF)".into(),
+            );
+        }
         if !cfg!(target_os = "linux") {
             return SandboxStatus::Unsupported;
         }
