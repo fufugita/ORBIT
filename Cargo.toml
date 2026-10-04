@@ -95,6 +95,11 @@ signal-hook = "0.3"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
+# Tool search (B1): ripgrep's UTF-8-correct engine and gitignore-aware
+# walker — both MIT OR Apache-2.0/Unlicense (permissive, DR-13 §5).
+regex = "1"
+ignore = "0.4"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

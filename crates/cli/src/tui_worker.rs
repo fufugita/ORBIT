@@ -1078,6 +1078,11 @@ pub fn run_tui_turn(
         sender: sender.clone(),
         approvals: approvals.clone(),
         auto_grants: std::mem::take(auto_grants),
+        tool_cx: orbit_tools::ToolContext::new(
+            config.home.clone(),
+            config.session_id.clone(),
+            std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+        ),
     };
 
     let options = orbit_engine::TurnOptions {
@@ -1130,6 +1135,9 @@ struct TuiToolExecutor {
     sender: BusSender,
     approvals: ApprovalRegistry,
     auto_grants: crate::tool_runtime::AutoGrants,
+    /// One context per TUI session (B2): read-before-edit survives
+    /// across rounds.
+    tool_cx: orbit_tools::ToolContext,
 }
 
 impl orbit_engine::ToolExecutor for TuiToolExecutor {
@@ -1203,6 +1211,7 @@ impl TuiToolExecutor {
             true,
             &mut approval_channel,
             &mut self.auto_grants,
+            &self.tool_cx,
         )
         .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
         // Classify the result into a ToolOutcome: a refusal must render

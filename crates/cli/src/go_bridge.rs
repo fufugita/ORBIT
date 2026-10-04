@@ -468,6 +468,13 @@ fn run_protocol_turn(
         }
     };
 
+    let working_dir =
+        std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+    let tool_cx = orbit_tools::ToolContext::new(
+        config.home.clone(),
+        config.session_id.clone(),
+        working_dir,
+    );
     let mut executor = GoToolExecutor {
         home: config.home.clone(),
         session_id: config.session_id.clone(),
@@ -475,6 +482,7 @@ fn run_protocol_turn(
         stream: stream.clone(),
         action_rx: action_rx.clone(),
         auto_grants: crate::tool_runtime::AutoGrants::new(),
+        tool_cx,
     };
 
     let options = orbit_engine::TurnOptions {
@@ -541,6 +549,8 @@ struct GoToolExecutor {
     stream: std::sync::Arc<std::sync::Mutex<UnixStream>>,
     action_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<serde_json::Value>>>,
     auto_grants: crate::tool_runtime::AutoGrants,
+    /// One context per Go session (B2).
+    tool_cx: orbit_tools::ToolContext,
 }
 
 impl orbit_engine::ToolExecutor for GoToolExecutor {
@@ -579,6 +589,7 @@ impl orbit_engine::ToolExecutor for GoToolExecutor {
                 true,
                 &mut approval_channel,
                 &mut self.auto_grants,
+                &self.tool_cx,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
             let ok = result.contains("\"ok\":true");

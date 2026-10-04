@@ -17,3 +17,5 @@ reqwest.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 tokio.workspace = true
+regex.workspace = true
+ignore.workspace = true

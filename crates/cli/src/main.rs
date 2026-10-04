@@ -1007,10 +1007,16 @@ fn cmd_headless(args: &[String]) -> i32 {
         cost_microcents = sf.cost_microcents;
         transcript = sf.to_transcript();
     }
+    let tool_cx = orbit_tools::ToolContext::new(
+        home.clone(),
+        session_id.clone(),
+        std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+    );
     let mut executor = HeadlessToolExecutor {
         home: home.clone(),
         session_id: session_id.clone(),
         auto_tools,
+        tool_cx,
     };
 
     use std::io::Write;
@@ -1285,6 +1291,8 @@ struct HeadlessToolExecutor {
     home: std::path::PathBuf,
     session_id: String,
     auto_tools: bool,
+    /// One context per headless session (B2).
+    tool_cx: orbit_tools::ToolContext,
 }
 
 impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
@@ -1305,6 +1313,7 @@ impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
                 false, // non-interactive: dontAsk semantics
                 &mut tool_runtime::StdApprovalChannel::new(false),
                 &mut tool_runtime::AutoGrants::new(),
+                &self.tool_cx,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
             results.push(orbit_engine::ToolRoundResult {
@@ -1714,6 +1723,12 @@ fn cmd_chat(args: &[String]) -> i32 {
             interactive,
             approval_channel: tool_runtime::StdApprovalChannel::new(interactive),
             auto_grants: tool_runtime::AutoGrants::new(),
+            tool_cx: orbit_tools::ToolContext::new(
+                home.clone(),
+                session.clone(),
+                std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+            ),
         };
         let mut stamped = false;
         let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
@@ -1844,6 +1859,8 @@ struct ReplToolExecutor {
     interactive: bool,
     approval_channel: tool_runtime::StdApprovalChannel,
     auto_grants: tool_runtime::AutoGrants,
+    /// One context per REPL session (B2).
+    tool_cx: orbit_tools::ToolContext,
 }
 
 impl orbit_engine::ToolExecutor for ReplToolExecutor {
@@ -1878,6 +1895,7 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
                 self.interactive,
                 &mut self.approval_channel,
                 &mut self.auto_grants,
+                &self.tool_cx,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
             results.push(orbit_engine::ToolRoundResult {

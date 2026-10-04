@@ -41,3 +41,4 @@ orbit-ledger-events = { path = "../crates/orbit-ledger" }
 orbit-release = { path = "../crates/release" }
 orbit-migrator = { path = "../migrator" }
 orbit-conformance = { path = "../conformance" }
+tempfile = "3"

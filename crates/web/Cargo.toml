@@ -23,6 +23,7 @@ orbit-gateway = { path = "../gateway" }
 orbit-adapter = { path = "../adapter" }
 orbit-provider-http = { path = "../provider-http" }
 orbit-hud = { path = "../hud" }
+orbit-tools = { path = "../tools" }
 orbit-hud-tui = { path = "../hud-tui" }
 tokio.workspace = true
 axum.workspace = true

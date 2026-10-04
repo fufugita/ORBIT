@@ -178,6 +178,10 @@ pub fn execute_call(
     interactive: bool,
     approval: &mut dyn ApprovalChannel,
     grants: &mut AutoGrants,
+    // The SESSION's tool context (B2): cloned per call, but the clone
+    // shares the read-before-edit map, so Read's record survives to
+    // Edit. Callers build this once per session.
+    tool_cx: &orbit_tools::ToolContext,
 ) -> Result<String, String> {
     if call.arguments.len() > MAX_ARGUMENT_BYTES {
         return Ok(tool_error("tool arguments exceed 64 KiB"));
@@ -380,7 +384,7 @@ pub fn execute_call(
     // permission layer (modes + pattern rules), the deny-read list and
     // the secret scanner on every result (review blocker 1).
     if orbit_tools::is_wave1(&call.name) {
-        let output = execute_wave1(home, call, &args);
+        let output = execute_wave1(home, call, &args, tool_cx);
         let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
             "ok"
         } else {
@@ -452,6 +456,18 @@ fn record_result(
     Ok(())
 }
 
+/// Extract a readable message from a caught panic payload
+/// (String or &str; anything else becomes "tool panicked").
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "tool panicked".to_string()
+    }
+}
+
 fn tool_error(msg: &str) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
 }
@@ -460,7 +476,12 @@ fn tool_error(msg: &str) -> String {
 /// live permission layer: modes, pattern rules, folder trust, deny-read
 /// and the secret scanner. The verdict above (whole-tool rules +
 /// approval channel) already ran; this adds the pattern-level check.
-fn execute_wave1(home: &Path, call: &crate::PendingToolCall, args: &serde_json::Value) -> String {
+fn execute_wave1(
+    home: &Path,
+    call: &crate::PendingToolCall,
+    args: &serde_json::Value,
+    tool_cx: &orbit_tools::ToolContext,
+) -> String {
     use orbit_tools::permissions::{evaluate, parse_rule, PermissionMode, RuleEffectSerde};
 
     // The session's mode: --permission-mode flag, else default.
@@ -519,10 +540,11 @@ fn execute_wave1(home: &Path, call: &crate::PendingToolCall, args: &serde_json::
         }
     }
 
-    // Execute with the session's ToolContext.
-    let working_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-    let session_id = session_id_stub();
-    let cx = orbit_tools::ToolContext::new(home.to_path_buf(), session_id.clone(), working_dir);
+    // Execute with the SESSION's ToolContext (B2): the clone shares
+    // the read-before-edit map, so a Read in an earlier round
+    // satisfies Edit's precondition. A fresh context per call is what
+    // made Edit always refuse.
+    let cx = tool_cx.clone();
 
     // Hooks (phase 5): PreToolUse can block (exit 2 / Deny decision)
     // before anything runs; PostToolUse sees the result.
@@ -544,14 +566,27 @@ fn execute_wave1(home: &Path, call: &crate::PendingToolCall, args: &serde_json::
         if let Some(path_str) = args.get("file_path").and_then(|v| v.as_str()) {
             let path = orbit_tools::resolve_path(&cx, path_str);
             if path.exists() {
-                let cps = orbit_engine::transcript::Checkpoints::new(home, &session_id);
+                let cps =
+                    orbit_engine::transcript::Checkpoints::new(home, &cx.session_id);
                 let turn_cp = current_turn_checkpoint();
                 let _ = cps.snapshot_file(&turn_cp, &path);
             }
         }
     }
 
-    let result = tool.run(args, &cx);
+    // B1: a tool bug must become a tool error, never a dead worker
+    // (a panic here used to take the whole process or the TUI thread).
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tool.run(args, &cx)
+    })) {
+        Ok(result) => result,
+        Err(panic) => {
+            let reason = panic_message(&panic);
+            orbit_tools::ToolResult::err(&format!(
+                "internal tool error: {reason} (the panic was contained)"
+            ))
+        }
+    };
     let result = orbit_tools::finish(result, &cx, &call.id);
 
     // PostToolUse: the hook sees the (scanned) result.
@@ -583,6 +618,7 @@ fn current_turn_checkpoint() -> String {
     })
 }
 
+#[allow(dead_code)]
 fn session_id_stub() -> String {
     std::env::var("ORBIT_SESSION_ID").unwrap_or_else(|_| "live".into())
 }
@@ -650,15 +686,24 @@ pub struct SubagentExecutor<'a> {
     session_id: String,
     approval: &'a mut dyn ApprovalChannel,
     grants: AutoGrants,
+    /// The subagent's own tool context (B2): read-before-edit state
+    /// shared across its calls, separate from the parent's.
+    tool_cx: orbit_tools::ToolContext,
 }
 
 impl<'a> SubagentExecutor<'a> {
     pub fn new(home: std::path::PathBuf, approval: &'a mut dyn ApprovalChannel) -> Self {
+        let session_id = format!("subagent-{}", ulid::Ulid::new());
+        let working_dir =
+            std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
+        let tool_cx =
+            orbit_tools::ToolContext::new(home.clone(), session_id.clone(), working_dir);
         Self {
-            session_id: format!("subagent-{}", ulid::Ulid::new()),
+            session_id,
             home,
             approval,
             grants: AutoGrants::new(),
+            tool_cx,
         }
     }
 }
@@ -682,6 +727,7 @@ impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
                     true,
                     self.approval,
                     &mut self.grants,
+                    &self.tool_cx,
                 )
                 .unwrap_or_else(|e| tool_error(&e));
                 orbit_engine::ToolRoundResult {
@@ -730,6 +776,15 @@ mod tests {
         home
     }
 
+    /// A session context for tests: same shape the executors build.
+    fn test_cx(home: &std::path::Path) -> orbit_tools::ToolContext {
+        orbit_tools::ToolContext::new(
+            home.to_path_buf(),
+            "test-session".into(),
+            std::env::temp_dir(),
+        )
+    }
+
     /// A channel that always returns the given verdict (for tests).
     struct FixedChannel(ApprovalVerdict);
     impl ApprovalChannel for FixedChannel {
@@ -745,7 +800,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::Deny); // shouldn't be asked
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants).unwrap();
+            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(out.contains("14"));
         let mut ledger = String::new();
         for e in std::fs::read_dir(home.join("ledger/segments"))
@@ -776,7 +831,7 @@ mod tests {
         let mut ch = StdApprovalChannel::new(false); // non-interactive
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, false, false, &mut ch, &mut grants).unwrap();
+            execute_call(&home, "s1", "d1", &call, false, false, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(out.contains("non-interactive"));
         assert!(!out.contains("\"result\":2"));
     }
@@ -788,7 +843,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants).unwrap();
+            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(out.contains("unknown tool"));
     }
 
@@ -799,7 +854,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants).unwrap();
+            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(out.contains("7"));
     }
 
@@ -810,7 +865,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::Deny);
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants).unwrap();
+            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(out.contains("operator denied"));
         assert!(!out.contains("\"result\":7"));
         // D9: the ledger records a DENIED status, not error — refusal is
@@ -838,7 +893,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
         let out1 =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants).unwrap();
+            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(out1.contains("10"));
         assert!(grants.is_granted("calculator"));
 
@@ -854,6 +909,7 @@ mod tests {
             true,
             &mut ch2,
             &mut grants,
+            &test_cx(&home),
         )
         .unwrap();
         assert!(out2.contains("12"), "R-grant should auto-approve");
@@ -867,7 +923,7 @@ mod tests {
         // Grant via R.
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let _ = execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants).unwrap();
+        let _ = execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(grants.is_granted("calculator"));
 
         // Revoke explicitly (the operator pressed n → revoke path).
@@ -877,7 +933,7 @@ mod tests {
         // Now the channel is asked again — deny.
         let mut ch2 = FixedChannel(ApprovalVerdict::Deny);
         let out =
-            execute_call(&home, "s1", "d2", &call, false, true, &mut ch2, &mut grants).unwrap();
+            execute_call(&home, "s1", "d2", &call, false, true, &mut ch2, &mut grants, &test_cx(&home)).unwrap();
         assert!(out.contains("operator denied"));
         assert!(!grants.is_granted("calculator"));
     }
@@ -889,7 +945,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants).unwrap();
+            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(out.contains("unknown tool"));
         assert!(
             !grants.is_granted("shell"),
@@ -906,7 +962,7 @@ mod tests {
         // Grant R on calculator.
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let _ = execute_call(&home, "s1", "d1", &calc, false, true, &mut ch, &mut grants).unwrap();
+        let _ = execute_call(&home, "s1", "d1", &calc, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
         assert!(grants.is_granted("calculator"));
         assert!(
             !grants.is_granted("list_models"),
@@ -924,6 +980,7 @@ mod tests {
             true,
             &mut ch2,
             &mut grants,
+            &test_cx(&home),
         )
         .unwrap();
         assert!(
@@ -948,7 +1005,7 @@ mod tests {
         let call = make_call("calculator", br#"{"expression":"2+2"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let _ = execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants).unwrap();
+        let _ = execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
 
         let mut ledger = String::new();
         for e in std::fs::read_dir(home.join("ledger/segments"))

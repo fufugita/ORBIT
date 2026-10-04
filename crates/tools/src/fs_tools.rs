@@ -458,31 +458,33 @@ pub fn glob_path_match(pattern: &str, path: &str) -> bool {
     rec(&pat, &segs)
 }
 
-/// Walk a directory tree (bounded depth, .gitignore-aware for the
-/// common entries).
+/// Build a gitignore-aware walker (ripgrep's `ignore` crate): hidden
+/// files stay out, .gitignore/.ignore are respected, and `target`/
+/// `node_modules`/`.git` are always excluded even without a gitignore.
+fn walk_builder(dir: &Path) -> ignore::WalkBuilder {
+    let mut b = ignore::WalkBuilder::new(dir);
+    b.hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .max_depth(Some(12))
+        .filter_entry(move |e| {
+            let name = e.file_name().to_string_lossy();
+            name != "target" && name != "node_modules" && name != ".git"
+        });
+    b
+}
+
+/// Walk a directory tree, gitignore-aware (B1: the walker).
 fn walk(dir: &Path, f: &mut dyn FnMut(&Path) -> bool) {
-    const MAX_DEPTH: usize = 12;
-    fn rec(dir: &Path, depth: usize, f: &mut dyn FnMut(&Path) -> bool) {
-        if depth > MAX_DEPTH {
+    for entry in walk_builder(dir).build().flatten() {
+        let Some(ft) = entry.file_type() else { continue };
+        if ft.is_file() && !f(entry.path()) {
             return;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == ".git" || name == "target" || name == "node_modules" {
-                continue;
-            }
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                rec(&p, depth + 1, f);
-            } else if !f(&p) {
-                return;
-            }
         }
     }
-    rec(dir, 0, f);
 }
 
 // ============================== Grep ==============================
@@ -535,58 +537,72 @@ impl Tool for GrepTool {
             .get("head_limit")
             .and_then(|v| v.as_u64())
             .unwrap_or(100) as usize;
-        let re = match simple_regex::compile(pattern) {
+        // The real regex engine (B1): UTF-8-correct, never panics on
+        // multi-byte text the way the hand-written offset loop did.
+        let re = match regex::Regex::new(pattern) {
             Ok(re) => re,
             Err(e) => return ToolResult::err(&format!("bad pattern: {e}")),
         };
         let mut matches: Vec<serde_json::Value> = Vec::new();
-        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut file_count = 0usize;
+        const FILE_LIMIT: usize = 2000;
         if base.is_file() {
-            files.push(base.clone());
+            file_count = 1;
+            if !is_deny_read(&base) {
+                grep_file(&base, &re, head_limit, &mut matches);
+            }
         } else {
+            // One honest pass over the whole tree (B1: the old cap
+            // returned early from whichever directory came first and
+            // still reported truncated:false).
             walk(&base, &mut |p| {
+                if matches.len() >= head_limit || file_count >= FILE_LIMIT {
+                    return false;
+                }
                 if let Some(g) = glob_filter {
                     if !glob_path_match(g, &p.to_string_lossy()) {
                         return true;
                     }
                 }
-                files.push(p.to_path_buf());
-                files.len() < 500
+                file_count += 1;
+                if !is_deny_read(p) {
+                    grep_file(p, &re, head_limit, &mut matches);
+                }
+                true
             });
         }
-        for file in files {
-            if matches.len() >= head_limit {
-                break;
-            }
-            if is_deny_read(&file) {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&file) else {
-                continue;
-            };
-            if bytes[..bytes.len().min(8192)].contains(&0) {
-                continue; // binary
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            for (i, line) in text.lines().enumerate() {
-                if matches.len() >= head_limit {
-                    break;
-                }
-                if re.is_match(line) {
-                    matches.push(json!({
-                        "file": file.to_string_lossy(),
-                        "line": i + 1,
-                        "text": line,
-                    }));
-                }
-            }
-        }
-        let truncated = matches.len() >= head_limit;
+        let truncated = matches.len() >= head_limit || file_count >= FILE_LIMIT;
         ToolResult::ok(json!({
             "ok": true,
             "matches": matches,
             "truncated": truncated,
+            "files_searched": file_count,
         }))
+    }
+}
+
+/// Search one file for `re`, appending up to the remaining limit.
+/// Non-UTF-8 and binary files are skipped; multi-byte text is safe
+/// (the regex crate is UTF-8-native).
+fn grep_file(path: &Path, re: &regex::Regex, limit: usize, out: &mut Vec<serde_json::Value>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    if bytes[..bytes.len().min(8192)].contains(&0) {
+        return; // binary
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    for (i, line) in text.lines().enumerate() {
+        if out.len() >= limit {
+            return;
+        }
+        if re.is_match(line) {
+            out.push(json!({
+                "file": path.to_string_lossy(),
+                "line": i + 1,
+                "text": line,
+            }));
+        }
     }
 }
 
