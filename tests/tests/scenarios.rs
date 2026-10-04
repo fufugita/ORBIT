@@ -732,3 +732,189 @@ fn scenario_x2_no_sandbox_headless_bash_refused() {
         "the refusal must reach the provider (S3)"
     );
 }
+
+// ── Gate 5: one session, every extension ───────────────────────────
+// MD gate 5: "One session uses an Explore subagent, a tool from a
+// stdio MCP server, a SKILL.md copied unchanged from a Claude Code
+// project, and a PreToolUse hook that blocks `git push`. The
+// subagent's approval request appears in the main session, and each
+// extension shows in the TUI and in the ledger."
+#[test]
+fn gate5_one_session_every_extension() {
+    // The script: round 0 loads the skill, round 1 runs the MCP tool,
+    // round 2 spawns the Explore subagent (its own conversation, keyed
+    // by the prompt), round 3 tries git push (the hook blocks), round
+    // 4 finishes. The subagent conversation: report text.
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Skill", "args": {"name": "review-checklist"}}]},
+            {"tools": [{"name": "mcp__demo__echo", "args": {"text": "hi"}}]},
+            {"tools": [{"name": "Task", "args": {
+                "agent": "Explore",
+                "prompt": "SURROGATE: list the files in this crate and report"}}]},
+            {"tools": [{"name": "Bash", "args": {
+                "command": "git push origin main", "description": "push"}}]},
+            {"text": "all extensions exercised"}
+        ],
+        "SURROGATE:": [
+            {"tools": [{"name": "Glob", "args": {"pattern": "*.py"}}]},
+            {"text": "found 2 python files: calc.py, test_calc.py"}
+        ]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    // The Claude Code skill, copied unchanged: frontmatter + body.
+    let skills_dir = fix.path.join(".orbit/skills/review-checklist");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    std::fs::write(
+        skills_dir.join("SKILL.md"),
+        "---\nname: review-checklist\ndescription: A checklist for reviewing changes\n---\n# Review checklist\n\n1. Tests pass\n2. No secrets in the diff\n",
+    )
+    .unwrap();
+
+    // The stdio MCP server: a tiny python JSON-RPC echo.
+    let mcp_server = fix.path.join("mcp_echo.py");
+    std::fs::write(
+        &mcp_server,
+        r#"#!/usr/bin/env python3
+import json, sys
+def send(o): sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+for line in sys.stdin:
+    try: req = json.loads(line)
+    except Exception: continue
+    m = req.get("method","")
+    if m == "initialize":
+        send({"jsonrpc":"2.0","id":req["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"demo","version":"1"}}})
+    elif m == "notifications/initialized":
+        pass
+    elif m == "tools/list":
+        send({"jsonrpc":"2.0","id":req["id"],"result":{"tools":[{"name":"echo","description":"echo the text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]}})
+    elif m == "tools/call":
+        arg = req["params"]["arguments"].get("text","")
+        send({"jsonrpc":"2.0","id":req["id"],"result":{"content":[{"type":"text","text":"echo: "+arg}]}})
+    else:
+        send({"jsonrpc":"2.0","id":req["id"],"error":{"code":-32601,"message":"no such method"}})
+"#)
+    .unwrap();
+    let orbit_dir = fix.path.join(".orbit");
+    std::fs::create_dir_all(&orbit_dir).unwrap();
+    std::fs::write(
+        orbit_dir.join("mcp.json"),
+        serde_json::json!({
+            "servers": {"demo": {"command": "python3", "args": [mcp_server.to_string_lossy()]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // The PreToolUse hook that blocks git push: exit 2 on push.
+    let hook = fix.path.join("block_push.sh");
+    std::fs::write(
+        &hook,
+        "#!/bin/bash\ninput=$(cat)\ncase \"$input\" in *push*) echo \"no push in tests\" >&2; exit 2;; esac\nexit 0\n",
+    )
+    .unwrap();
+    let mut st = std::fs::metadata(&hook).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    st.set_mode(0o755);
+    std::fs::set_permissions(&hook, st).unwrap();
+    // Project-scope hooks need folder trust: write settings + trust.
+    std::fs::write(
+        orbit_dir.join("settings.toml"),
+        format!(
+            "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"{}\"\n",
+            hook.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    // Trust the fixture folder so project-scope skills/MCP/hooks load
+    // (FolderTrust: a marker file named by the sha256 of the path).
+    let cwd_real = std::fs::canonicalize(&fix.path).unwrap();
+    {
+        use sha2::Digest;
+        let digest = hex::encode(sha2::Sha256::digest(cwd_real.to_string_lossy().as_bytes()));
+        let marker = home.path.join("trust/folders").join(digest);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(
+            &marker,
+            serde_json::json!({"path": cwd_real.to_string_lossy(), "trusted_at": "0"}).to_string(),
+        )
+        .unwrap();
+    }
+
+    let (events, _code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        "use every extension",
+        &["--auto-tools"],
+    );
+
+    let all = serde_json::to_string(&events).unwrap_or_default();
+    // What actually reached the model: the mock's request log.
+    let reqs = mock.requests();
+    let reqs_all = serde_json::to_string(&reqs).unwrap_or_default();
+
+    // 1. The skill loaded: its BODY reached the model as the Skill
+    //    tool's result (Claude Code format, unchanged).
+    assert!(
+        reqs_all.contains("Review checklist"),
+        "the SKILL.md body must reach the model: {reqs_all:.400}"
+    );
+
+    // 2. The MCP tool ran through the stdio server: the tool result
+    //    (the server's echo) reached the model.
+    assert!(
+        reqs_all.contains("echo: hi"),
+        "the stdio MCP tool's result must reach the model: {reqs_all:.400}"
+    );
+
+    // 3. The Explore subagent ran (its report text returns as the Task
+    //    result).
+    assert!(
+        reqs_all.contains("found 2 python files"),
+        "the subagent's report must come back to the main session: {reqs_all:.400}"
+    );
+
+    // 4. The PreToolUse hook blocked git push: the Bash result the
+    //    model sees says so.
+    assert!(
+        reqs_all.contains("no push in tests") || reqs_all.contains("blocked by hook"),
+        "the PreToolUse hook must block git push: {reqs_all:.400}"
+    );
+
+    // 5. The turn completed despite the blocked push (the hook result
+    //    is a tool error the model sees, not a turn failure).
+    let ended_ok = events.iter().any(|e| {
+        e.get("type").and_then(|t| t.as_str()) == Some("turn_ended")
+            && e.get("ok").and_then(|o| o.as_bool()) == Some(true)
+    });
+    assert!(ended_ok, "the turn ends ok: {all:.300}");
+
+    // 6. Each extension shows in the ledger: the verify listing has
+    //    the Skill, mcp__demo__echo, Task and Bash calls.
+    let out = Command::new(orbit_binary())
+        .arg("--home")
+        .arg(&home.path)
+        .arg("verify-ledger")
+        .output()
+        .expect("verify-ledger");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let calls = v
+        .get("calls")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let tools: Vec<&str> = calls
+        .iter()
+        .filter_map(|c| c.get("tool").and_then(|t| t.as_str()))
+        .collect();
+    for expected in ["Skill", "mcp__demo__echo", "Task", "Bash"] {
+        assert!(
+            tools.contains(&expected),
+            "the ledger must show {expected}: {tools:?}"
+        );
+    }
+}

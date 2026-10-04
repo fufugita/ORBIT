@@ -1024,6 +1024,15 @@ fn cmd_headless(args: &[String]) -> i32 {
         credential_env,
         pricing,
     );
+    // The full resolved config for subagents (phase 5): the Task tool
+    // derives its TurnConfig from these env vars, so a subagent matches
+    // the parent's provider/gate/model/credential exactly.
+    std::env::set_var("ORBIT_GATE_URL", &resolved_gate);
+    std::env::set_var("ORBIT_MODEL", &model);
+    std::env::set_var("ORBIT_PROVIDER", &provider_id);
+    if let Some(env_name) = credential_env {
+        std::env::set_var("ORBIT_CREDENTIAL_ENV", env_name);
+    }
 
     // Session persistence in headless mode (phase 4): --continue /
     // --resume load the prior transcript; after the turn the session

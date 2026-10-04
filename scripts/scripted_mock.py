@@ -104,6 +104,7 @@ def pick_conversation(body: dict, scripts: dict, live: dict) -> Conversation:
 
 
 class Handler(BaseHTTPRequestHandler):
+    _call_seq = 0
     protocol_version = "HTTP/1.1"
     scripts: dict = {}
     wire: str = "openai"
@@ -173,10 +174,14 @@ class Handler(BaseHTTPRequestHandler):
         if tool_calls:
             for i, call in enumerate(tool_calls):
                 args = json.dumps(call.get("args", {}), ensure_ascii=False)
+                # Globally-unique call ids (real providers never reuse
+                # a tool-call id across rounds).
+                Handler._call_seq += 1
+                call_id = f"call_{Handler._call_seq}"
                 first = {
                     "choices": [{"index": 0, "delta": {"tool_calls": [{
                         "index": i,
-                        "id": f"call_{i}",
+                        "id": call_id,
                         "type": "function",
                         "function": {"name": call["name"], "arguments": ""},
                     }]}}]
@@ -275,7 +280,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self._read_body()
-        step = pick_conversation(body, Handler.scripts, Handler.live).next_step()
+        conv = pick_conversation(body, Handler.scripts, Handler.live)
+        step = conv.next_step()
 
         if "status" in step:
             self._fail(step["status"], step.get("body") or "")

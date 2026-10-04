@@ -321,18 +321,18 @@ pub fn execute_call(
         );
     }
 
+    // Release the ledger's single-writer lock BEFORE execution: a
+    // nested session (the Task tool spawning a subagent, phase 5) opens
+    // its own writer for the subagent's calls, and holding this lock
+    // across the dispatch deadlocked the subagent at boot (E0719). The
+    // verdict is durably recorded above; the result reopens below.
+    drop(writer);
+
     if !allowed {
         let output = tool_error(reason);
         // D9: a denial is not an error — audits must be able to tell an
         // operator refusal apart from a tool that ran and failed.
-        record_result(
-            &mut writer,
-            session_id,
-            decision_id,
-            call,
-            "denied",
-            &output,
-        )?;
+        record_result(home, session_id, decision_id, call, "denied", &output)?;
         return Ok(output);
     }
 
@@ -340,7 +340,7 @@ pub fn execute_call(
         Ok(v) => v,
         Err(e) => {
             let output = tool_error(&e);
-            record_result(&mut writer, session_id, decision_id, call, "error", &output)?;
+            record_result(home, session_id, decision_id, call, "error", &output)?;
             return Ok(output);
         }
     };
@@ -359,7 +359,7 @@ pub fn execute_call(
         } else {
             "error"
         };
-        record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+        record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
     }
 
@@ -371,7 +371,7 @@ pub fn execute_call(
         let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         if agent.is_empty() || prompt.is_empty() {
             let output = tool_error("Task requires 'agent' and 'prompt'");
-            record_result(&mut writer, session_id, decision_id, call, "error", &output)?;
+            record_result(home, session_id, decision_id, call, "error", &output)?;
             return Ok(output);
         }
         let turn_config = subagent_turn_config(home);
@@ -384,7 +384,7 @@ pub fn execute_call(
         } else {
             "error"
         };
-        record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+        record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
     }
 
@@ -396,7 +396,7 @@ pub fn execute_call(
         } else {
             "error"
         };
-        record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+        record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
     }
 
@@ -411,7 +411,7 @@ pub fn execute_call(
         } else {
             "error"
         };
-        record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+        record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
     }
 
@@ -422,14 +422,7 @@ pub fn execute_call(
     };
     if output.len() > MAX_RESULT_BYTES {
         let truncated = tool_error("tool result exceeds 64 KiB");
-        record_result(
-            &mut writer,
-            session_id,
-            decision_id,
-            call,
-            "error",
-            &truncated,
-        )?;
+        record_result(home, session_id, decision_id, call, "error", &truncated)?;
         return Ok(truncated);
     }
     let status = if output.contains("\"ok\":true") {
@@ -437,7 +430,7 @@ pub fn execute_call(
     } else {
         "error"
     };
-    record_result(&mut writer, session_id, decision_id, call, status, &output)?;
+    record_result(home, session_id, decision_id, call, status, &output)?;
     Ok(output)
 }
 
@@ -530,14 +523,23 @@ fn safe_call_summary(call: &crate::PendingToolCall) -> String {
     crate::tools::safe_call_summary(&call.name, &args)
 }
 
+/// Open the ledger writer for one append (the single-writer lock is
+/// held only for the append, then released — nested sessions open
+/// their own between the parent's records).
+fn reopen_writer(home: &Path) -> Result<LedgerWriter, String> {
+    LedgerWriter::open(&home.join("ledger"), "orbit-tool".into(), "0.1.0")
+        .map_err(|e| format!("open ledger: {e}"))
+}
+
 fn record_result(
-    writer: &mut LedgerWriter,
+    home: &Path,
     session_id: &str,
     decision_id: &str,
     call: &crate::PendingToolCall,
     status: &str,
     output: &str,
 ) -> Result<(), String> {
+    let mut writer = reopen_writer(home)?;
     let head = writer
         .append(LedgerEvent::ToolResult(ToolResult {
             session_id: session_id.into(),
@@ -692,7 +694,7 @@ fn execute_wave1(
 
     // Hooks (phase 5): PreToolUse can block (exit 2 / Deny decision)
     // before anything runs; PostToolUse sees the result.
-    let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted());
+    let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
     let pre = hooks.fire(
         orbit_engine::hooks::HookEvent::PreToolUse,
         &serde_json::json!({
@@ -743,11 +745,20 @@ fn execute_wave1(
 }
 
 /// Is the current folder trusted (project-scope rules/hooks/skills
-/// apply only after the operator trusted it once)?
-fn project_trusted() -> bool {
-    let home = std::env::var("ORBIT_HOME").unwrap_or_else(|_| ".orbit".into());
+/// apply only after the operator trusted it once)? Resolved against
+/// the caller's REAL home path — the command
+/// line's --home does not set the env var, so any helper that resolved
+/// trust through the env silently skipped project scope (the MCP call
+/// path reported "mcp server not configured" for a configured, trusted
+/// project server).
+/// The command
+/// line's --home does not set the env var, so any helper that resolved
+/// trust through the env silently skipped project scope (the MCP call
+/// path reported "mcp server not configured" for a configured, trusted
+/// project server).
+fn project_trusted_home(home: &Path) -> bool {
     let cwd = std::env::current_dir().unwrap_or_default();
-    orbit_tools::permissions::FolderTrust::new(std::path::PathBuf::from(home)).is_trusted(&cwd)
+    orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
 }
 
 /// The checkpoint id for the current turn: one per user prompt. The
@@ -771,7 +782,7 @@ fn execute_mcp(home: &Path, call: &crate::PendingToolCall, args: &serde_json::Va
     let Some((server, tool)) = orbit_mcp::split_wire_name(&call.name) else {
         return tool_error("malformed mcp tool name");
     };
-    let trusted = project_trusted();
+    let trusted = project_trusted_home(home);
     let cfg = orbit_mcp::McpConfig::load(home, trusted);
     let Some(server_cfg) = cfg.servers.get(&server) else {
         return tool_error(&format!("mcp server not configured: {server}"));
