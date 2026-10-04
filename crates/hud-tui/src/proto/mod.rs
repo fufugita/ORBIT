@@ -19,3 +19,4 @@ pub mod panels;
 pub mod app;
 pub mod runtime;
 pub mod scenario;
+pub mod welcome;

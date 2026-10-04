@@ -8,7 +8,7 @@
 use super::comps;
 use super::core::{glyphs, Token};
 use super::layout::View;
-use super::scenario::{LineKind, Scenario};
+use super::scenario::{LineKind, Scenario, TranscriptLine};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -81,6 +81,15 @@ pub fn render_panel(
 /// model works (M05) + the caret while streaming (M06).
 fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    // The welcome block (§9.22): shown while the transcript is
+    // empty, replaced by the first output with no transition.
+    if s.transcript.is_empty() {
+        let w = super::welcome::Welcome {
+            tier: super::welcome::BrandTier::Static,
+            first_prompt_waiting: s.turn_live,
+        };
+        return w.lines();
+    }
     // The transcript tail: every visible line of the session — user
     // prompts, model replies, tool lines — rendered with the kind's
     // chrome. The thinking/streaming indicators ride on top.
@@ -291,6 +300,13 @@ mod tests {
         let tree = super::super::layout::Node::default_tree();
         let mut s = Scenario::new();
         s.model = "glm-5.2".into();
+        // A turn live with an empty transcript is the welcome's
+        // waiting state (§9.22); give the session one prior turn so
+        // the conversation shows the live activity instead.
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::User,
+            text: "prior turn".into(),
+        });
         s.apply("round_started", 0);
 
         term

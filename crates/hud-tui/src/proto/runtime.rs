@@ -14,7 +14,7 @@ use super::comps;
 use super::core::Token;
 use super::layout::View;
 use super::panels;
-use super::scenario::{Activity, LineKind, Scenario, TranscriptLine};
+use super::scenario::{Activity, LineKind, Scenario, TranscriptLine, TurnReport};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -80,6 +80,7 @@ pub fn run_proto(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         let timeout = UI_TICK
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::from_millis(0));
+        let now_ms = boot_ms.elapsed().as_millis() as u64;
         if event::poll(timeout).unwrap_or(false) {
             match event::read().unwrap_or(Event::FocusGained) {
                 Event::Key(k) => {
@@ -92,6 +93,7 @@ pub fn run_proto(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
                         &command_sink,
                         &sender,
                         &approvals,
+                        now_ms,
                     ) {
                         // quit
                         break;
@@ -107,7 +109,6 @@ pub fn run_proto(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
         }
         if last_tick.elapsed() >= UI_TICK {
             last_tick = Instant::now();
-            let now_ms = boot_ms.elapsed().as_millis() as u64;
             // Drain the bus into the scenario.
             while let Some(msg) = bus.try_recv() {
                 apply_msg(msg, &mut scenario, &sender, now_ms);
@@ -125,7 +126,22 @@ pub fn run_proto(args: &[String], worker_spawner: WorkerSpawner) -> i32 {
     // TerminalGuard's Drop restores the terminal (raw mode off, alt
     // screen off).
     drop(guard);
-    println!("✦ ORBIT  session saved");
+    // M8 / §9.24: one line to the scrollback after the screen
+    // closes. The session id lets `orbit chat --resume` pick it up.
+    let session = if scenario.session_id.is_empty() {
+        String::new()
+    } else {
+        format!("\n         resume with orbit chat --resume {}", scenario.session_id)
+    };
+    let cost = if scenario.priced {
+        format!("${:.4}", scenario.cost_microcents as f64 / 1_000_000.0)
+    } else {
+        "n/a".into()
+    };
+    println!(
+        "✦ ORBIT  session saved · {} turns · {} in · {} out · {cost}{session}",
+        scenario.turns, scenario.input_tokens, scenario.output_tokens
+    );
     0
 }
 
@@ -140,6 +156,7 @@ fn handle_key(
     command_sink: &crate::CommandSink,
     sender: &BusSender,
     approvals: &crate::ApprovalRegistry,
+    now_ms: u64,
 ) -> bool {
     // Ctrl+C always quits.
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
@@ -223,6 +240,7 @@ fn handle_key(
                         text: text.clone(),
                     });
                     command_sink.send(crate::WorkerCommand::Prompt(text.clone()));
+                    scenario.turn_started_ms = now_ms;
                     scenario.apply("round_started", 0);
                 }
             }
@@ -276,6 +294,7 @@ fn apply_msg(msg: Msg, scenario: &mut Scenario, sender: &BusSender, now_ms: u64)
         Msg::ToolCallStarted { name, summary } => {
             scenario.running.insert(name.clone(), name.clone());
             scenario.apply("tool_started_full", 0);
+            scenario.turn_tools += 1;
             scenario.transcript.push(TranscriptLine {
                 kind: LineKind::Tool,
                 text: format!("{name} {summary}"),
@@ -291,7 +310,21 @@ fn apply_msg(msg: Msg, scenario: &mut Scenario, sender: &BusSender, now_ms: u64)
             scenario.apply("approval_requested", 0);
             let _ = sender;
         }
-        Msg::ResponseFinished { .. } => {
+        Msg::ResponseFinished { output_tokens, input_tokens, cost_microcents, .. } => {
+            // M5: the turn report. Cumulative totals for the
+            // shutdown line.
+            let duration = scenario.turn_started_ms;
+            let _ = duration;
+            scenario.turns += 1;
+            scenario.input_tokens += input_tokens;
+            scenario.output_tokens += output_tokens;
+            scenario.cost_microcents += cost_microcents;
+            scenario.turn_report = Some(TurnReport {
+                duration_ms: now_ms.saturating_sub(scenario.turn_started_ms),
+                tools: scenario.turn_tools,
+                cost_microcents,
+                priced: scenario.priced,
+            });
             scenario.apply("turn_ended", 0);
         }
         Msg::Status(text) => {
@@ -301,8 +334,13 @@ fn apply_msg(msg: Msg, scenario: &mut Scenario, sender: &BusSender, now_ms: u64)
                 text,
             });
         }
-        Msg::Identity { model, .. } => {
-            scenario.model = model;
+        Msg::Identity { model, provider, session_prefix, session_id, priced } => {
+            scenario.model = model.clone();
+            scenario.model_id = model;
+            scenario.provider = provider;
+            scenario.session_prefix = session_prefix;
+            scenario.session_id = session_id;
+            scenario.priced = priced;
         }
         Msg::BackendError(_) => {
             scenario.apply("turn_failed", 0);
@@ -328,44 +366,144 @@ fn draw(
     };
     app.render_into(f, panels_area, scenario);
 
-    // ── The status line: star + activity + mode ──────────────────
+    // ── The status line (§9.18): mark + activity left, the right
+    // cluster by width level. No background, no separators.
     let star = app.star_glyph(scenario);
-    let activity = match scenario.activity() {
-        Activity::Ready => "ready".to_string(),
-        Activity::WaitingModel(m) => format!("waiting for {m}"),
-        Activity::Streaming => "streaming".to_string(),
-        Activity::Running(t) => format!("running {t}"),
-        Activity::RunningMany(n) => format!("running {n} tools"),
-        Activity::Approval(t) => format!("◇ approval needed · {t}"),
-        Activity::Compacting => "compacting context".to_string(),
-        Activity::Done => "✓ done".to_string(),
-        Activity::Failed => "✕ failed".to_string(),
+    let star_colour = comps::colour(match star.colour {
+        super::anim::StarColour::Cyan => Token::Cyan,
+        super::anim::StarColour::Magenta => Token::Magenta,
+        super::anim::StarColour::Amber => Token::Amber,
+        super::anim::StarColour::Red => Token::Red,
+    });
+    // The activity, first match wins (§9.18). The M5 turn report
+    // rides here for 2 s after a successful turn.
+    let elapsed_s = |now: u64, from: u64| {
+        let d = now.saturating_sub(from);
+        if d >= 1000 { format!(" · {}s", d / 1000) } else { String::new() }
     };
-    let status = Line::from(vec![
-        Span::styled(
-            format!("{} ", star.glyph),
-            Style::default().fg(comps::colour(match star.colour {
-                super::anim::StarColour::Cyan => Token::Cyan,
-                super::anim::StarColour::Magenta => Token::Magenta,
-                super::anim::StarColour::Amber => Token::Amber,
-                super::anim::StarColour::Red => Token::Red,
-            })),
-        ),
-        Span::styled(activity, Style::default().fg(comps::colour(Token::Muted))),
-        Span::styled(
-            format!(
-                "  · {}",
-                if mode_insert { "insert" } else { "normal" }
-            ),
-            Style::default().fg(comps::colour(Token::Rule)),
-        ),
-    ]);
+    let activity_spans: Vec<Span> = match scenario.activity() {
+        Activity::Approval(t) => vec![
+            Span::styled(format!("◇ approval needed · {t}"), Style::default().fg(comps::colour(Token::Magenta))),
+        ],
+        Activity::RunningMany(n) => vec![
+            Span::styled(format!("running {n} tools"), Style::default().fg(comps::colour(Token::Cyan))),
+            Span::styled(elapsed_s(app.tick_ms, scenario.turn_started_ms), Style::default().fg(comps::colour(Token::Muted))),
+        ],
+        Activity::Running(t) => vec![
+            Span::styled(format!("running {t}"), Style::default().fg(comps::colour(Token::Cyan))),
+            Span::styled(elapsed_s(app.tick_ms, scenario.turn_started_ms), Style::default().fg(comps::colour(Token::Muted))),
+        ],
+        Activity::Streaming => vec![
+            Span::styled("streaming", Style::default().fg(comps::colour(Token::Cyan))),
+            Span::styled(elapsed_s(app.tick_ms, scenario.turn_started_ms), Style::default().fg(comps::colour(Token::Muted))),
+        ],
+        Activity::WaitingModel(m) => vec![
+            Span::styled(format!("waiting for {m}"), Style::default().fg(comps::colour(Token::Cyan))),
+        ],
+        Activity::Compacting => vec![
+            Span::styled("compacting context", Style::default().fg(comps::colour(Token::Amber))),
+        ],
+        Activity::Done => vec![
+            Span::styled("✓", Style::default().fg(comps::colour(Token::Green))),
+            Span::styled(" done", Style::default().fg(comps::colour(Token::Ink))),
+        ],
+        Activity::Failed => vec![
+            Span::styled("✕ failed", Style::default().fg(comps::colour(Token::Red))),
+        ],
+        Activity::Ready => {
+            // The M5 turn report: ✓ done · 41s · 3 tools · +$0.0031,
+            // for 2 s or until the next key.
+            if let Some(r) = &scenario.turn_report {
+                if app.tick_ms.saturating_sub(scenario.turn_started_ms) < 4000 {
+                    let mut spans = vec![
+                        Span::styled("✓", Style::default().fg(comps::colour(Token::Green))),
+                        Span::styled(" done", Style::default().fg(comps::colour(Token::Ink))),
+                        Span::styled(format!(" · {}s", r.duration_ms / 1000), Style::default().fg(comps::colour(Token::Muted))),
+                    ];
+                    if r.tools > 0 {
+                        spans.push(Span::styled(format!(" · {} tools", r.tools), Style::default().fg(comps::colour(Token::Muted))));
+                    }
+                    if r.priced {
+                        spans.push(Span::styled(
+                            format!(" · +${:.4}", r.cost_microcents as f64 / 1_000_000.0),
+                            Style::default().fg(comps::colour(Token::Muted)),
+                        ));
+                    }
+                    spans
+                } else {
+                    vec![Span::styled("ready", Style::default().fg(comps::colour(Token::Muted)))]
+                }
+            } else {
+                vec![Span::styled("ready", Style::default().fg(comps::colour(Token::Muted)))]
+            }
+        }
+    };
+    // The mark: ✦ ORBIT (muted bold word) — the compact mark, every
+    // layout (§8.1).
+    let mut left = vec![
+        Span::styled(star.glyph.to_string(), Style::default().fg(star_colour)),
+        Span::styled(" ORBIT", Style::default().fg(comps::colour(Token::Muted)).add_modifier(ratatui::style::Modifier::BOLD)),
+        Span::raw("   "),
+    ];
+    left.extend(activity_spans);
+    // The right cluster, by width level (§9.18).
+    let w = area.width;
+    let mut right: Vec<Span> = Vec::new();
+    if w >= 60 {
+        // cost slot
+        if scenario.priced {
+            right.push(Span::styled(
+                format!("${:.4}", scenario.cost_microcents as f64 / 1_000_000.0),
+                Style::default().fg(comps::colour(Token::Ink)),
+            ));
+        } else {
+            right.push(Span::styled("cost n/a", Style::default().fg(comps::colour(Token::Muted))));
+        }
+    }
+    if w >= 110 {
+        // token slot
+        right.push(Span::styled(
+            format!("↓{} ↑{}", scenario.input_tokens, scenario.output_tokens),
+            Style::default().fg(comps::colour(Token::Muted)),
+        ));
+    }
+    if w >= 140 {
+        // session prefix
+        if !scenario.session_prefix.is_empty() {
+            right.push(Span::styled(
+                scenario.session_prefix.clone(),
+                Style::default().fg(comps::colour(Token::Muted)),
+            ));
+        }
+        // model · provider
+        if !scenario.model_id.is_empty() {
+            right.push(Span::styled(
+                format!("{} · {}", scenario.model_id, scenario.provider),
+                Style::default().fg(comps::colour(Token::Ink)),
+            ));
+        }
+    }
+    // Right cluster: 3 spaces between segments, right-aligned.
+    let left_w: u16 = left.iter().map(|s| s.width() as u16).sum();
+    let right_w: u16 = right.iter().map(|s| s.width() as u16).sum::<u16>()
+        + (right.len().saturating_sub(1).max(0) as u16) * 3;
+    let mut status = left;
+    if !right.is_empty() && left_w + 3 + right_w <= w {
+        let pad = w - left_w - right_w;
+        status.push(Span::raw(" ".repeat(pad as usize)));
+        for (i, seg) in right.into_iter().enumerate() {
+            if i > 0 {
+                status.push(Span::raw("   "));
+            }
+            status.push(seg);
+        }
+    }
     let status_area = Rect {
         y: area.y + panels_h,
         height: 1,
         ..area
     };
-    f.render_widget(Paragraph::new(status), status_area);
+    f.render_widget(Paragraph::new(Line::from(status)), status_area);
 
     // ── The composer ─────────────────────────────────────────────
     let composer_area = Rect {
@@ -373,11 +511,14 @@ fn draw(
         height: 3,
         ..area
     };
+    // The placeholder per §9.13: idle asks; a live turn queues.
+    let placeholder = if scenario.turn_live {
+        if area.width < 60 { "Add to the queue, or wait" } else { "Add to the queue, or wait for ORBIT" }
+    } else {
+        "Ask ORBIT, or type / for commands"
+    };
     let prompt_span = if composer.is_empty() {
-        Span::styled(
-            "type a prompt and press ⏎  ·  esc arranges  ·  ? keys",
-            Style::default().fg(comps::colour(Token::Muted)),
-        )
+        Span::styled(placeholder, Style::default().fg(comps::colour(Token::Rule)))
     } else {
         Span::styled(composer.to_string(), Style::default().fg(comps::colour(Token::Ink)))
     };

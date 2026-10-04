@@ -47,6 +47,36 @@ pub struct Scenario {
     /// prompts, model replies, tool lines). The conversation panel
     /// renders the tail.
     pub transcript: Vec<TranscriptLine>,
+    /// Session identity (Msg::Identity): model, provider, session
+    /// id prefix — the status line's right cluster and the shutdown
+    /// line.
+    pub model_id: String,
+    pub provider: String,
+    pub session_prefix: String,
+    pub session_id: String,
+    pub priced: bool,
+    /// Cumulative session cost (microcents) — the shutdown line.
+    pub cost_microcents: u64,
+    /// Cumulative tokens — the shutdown line.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Turns completed — the shutdown line.
+    pub turns: u64,
+    /// The last turn's report (M5): shown 2 s or until a key.
+    pub turn_report: Option<TurnReport>,
+    /// When the current turn started (elapsed counters, M3).
+    pub turn_started_ms: u64,
+    /// Tools run this turn (the M5 report's count).
+    pub turn_tools: u64,
+}
+
+/// The M5 turn report: ✓ done · 41s · 3 tools · +$0.0031.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnReport {
+    pub duration_ms: u64,
+    pub tools: u64,
+    pub cost_microcents: u64,
+    pub priced: bool,
 }
 
 /// One visible transcript line.
@@ -183,6 +213,8 @@ impl Scenario {
                 self.turn_live = true;
                 self.visible_output = false;
                 self.last_failed = false;
+                self.turn_report = None;
+                self.turn_tools = 0;
             }
             "text_delta" => {
                 self.visible_output = true;

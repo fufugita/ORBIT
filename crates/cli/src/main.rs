@@ -1429,11 +1429,9 @@ fn cmd_chat(args: &[String]) -> i32 {
         let want_go_tui = args.iter().any(|a| a == "--go-tui");
         // The motion-first redesign (the ORBIT TUI prototype) is the
         // default screen; --old-tui keeps the v1 HUD.
-        // The v1 HUD is the default TUI — it is the spec-complete
-        // front-end (docs/tui/PROMPT.md). The prototype stays behind
-        // --proto-tui until it reaches parity.
-        let want_proto_tui = args.iter().any(|a| a == "--proto-tui");
-        let want_old_tui = !want_proto_tui;
+        // The prototype is the target front-end (docs/tui/PROMPT.md).
+        // --old-tui keeps the v1 HUD available while parity work runs.
+        let want_old_tui = args.iter().any(|a| a == "--old-tui");
         if want_tui {
             let session_id = resumed_file
                 .as_ref()
