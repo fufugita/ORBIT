@@ -449,6 +449,8 @@ def main():
     s.read(0.5)
 
     # ── 5b. Esc during a slow tool kills it, and the next prompt works ────
+    import subprocess as _sp
+    _esc_baseline = set(_sp.run(["pgrep", "-x", "sleep"], capture_output=True, text=True).stdout.split())
     # MD gate 2: "Esc during a slow tool kills its process group, and
     # the next prompt works." The mock-slowbash model issues a Bash
     # `sleep 30` call (--auto-tools is NOT the TUI default; approvals
@@ -483,9 +485,13 @@ def main():
         print("SCREEN DUMP (esc):", file=_sys.stderr)
         print(s.screen_text()[-1500:], file=_sys.stderr)
     check("esc cancels the slow tool turn", ok, (buf or "")[-200:])
+    # No NEW sleep beyond the pre-scenario baseline: the machine may
+    # host unrelated sleeps (a parallel wait command), and the check is
+    # about THE TOOL's child dying, not the absence of any sleep.
     import subprocess as _sp
-    _left = _sp.run(["pgrep", "-x", "sleep"], capture_output=True, text=True).stdout.split()
-    check("esc killed the tool's process group", not _left, f"sleep alive: {_left}")
+    _new = [p for p in _sp.run(["pgrep", "-x", "sleep"], capture_output=True, text=True).stdout.split()
+            if p not in _esc_baseline]
+    check("esc killed the tool's process group", not _new, f"new sleep alive: {_new}")
     # The next prompt works.
     s.type("/model mock-slow")
     s.key("enter")
