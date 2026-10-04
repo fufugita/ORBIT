@@ -285,14 +285,12 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
         .await
         .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
         .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AdapterError::RateLimitedExhausted("429 (E0407)".into()));
-        }
         if !resp.status().is_success() {
-            return Err(AdapterError::ProviderTransportFailure(format!(
-                "status {}",
-                resp.status()
-            )));
+            // E1: the body carries the provider's own message; E2:
+            // 529/5xx classify retryable.
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::error::status_error(status, body).await);
         }
         Ok(anthropic_stream(resp.bytes_stream(), cancel.clone()))
     }

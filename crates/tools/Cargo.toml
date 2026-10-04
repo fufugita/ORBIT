@@ -19,3 +19,4 @@ rustls-native-certs.workspace = true
 tokio.workspace = true
 regex.workspace = true
 ignore.workspace = true
+toml = { workspace = true }

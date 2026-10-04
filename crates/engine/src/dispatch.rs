@@ -389,8 +389,12 @@ pub fn run_dispatch(
                 cost_microcents,
             })
         }
-        orbit_gateway::DispatchOutcome::AdapterRefused { code: "E0404", .. }
-            if credential.is_none() =>
+        // E1: a refusal without a usable message and without a
+        // credential is genuinely an unauthenticated gateway; anything
+        // else keeps the provider's own words (a 400's "prompt is too
+        // long" must not become "requires authentication").
+        orbit_gateway::DispatchOutcome::AdapterRefused { code: "E0404", message }
+            if credential.is_none() && message.trim() == "status 400" =>
         {
             Err((
                 "ORBIT-E0402",

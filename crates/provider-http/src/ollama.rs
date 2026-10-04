@@ -150,10 +150,11 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
         .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
         .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(AdapterError::ProviderTransportFailure(format!(
-                "status {}",
-                resp.status()
-            )));
+            // E1: the body carries the provider's own message; E2:
+            // 529/5xx classify retryable.
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::error::status_error(status, body).await);
         }
         Ok(ollama_stream(resp.bytes_stream(), cancel.clone()))
     }

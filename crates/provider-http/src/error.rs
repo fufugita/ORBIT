@@ -46,3 +46,47 @@ impl From<TransportError> for AdapterError {
         }
     }
 }
+
+
+/// Classify an HTTP status into the adapter error that carries it,
+/// reading the body for the provider's own message (E1: bodies were
+/// thrown away, so every 4xx looked like auth) and mapping the
+/// retryable server statuses to their retry classes (E2: 500/502/503/
+/// 504/529 must be retried).
+///
+/// Callers must have already drained the body for this call.
+pub async fn status_error(
+    status: reqwest::StatusCode,
+    body: String,
+) -> AdapterError {
+    use orbit_adapter::error::AdapterError as E;
+    let brief = if body.is_empty() {
+        format!("status {status}")
+    } else {
+        // Pull the provider's message out of the common JSON shapes;
+        // fall back to a trimmed body.
+        let msg = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .or_else(|| v.pointer("/error"))
+                    .or_else(|| v.pointer("/message"))
+                    .and_then(|m| m.as_str().map(str::to_string))
+            })
+            .unwrap_or_else(|| {
+                body.chars().take(200).collect::<String>()
+            });
+        format!("status {status}: {msg}")
+    };
+    match status.as_u16() {
+        429 => E::RateLimitedExhausted(brief),
+        500 | 502 | 503 | 504 | 529 => E::CapacityUnavailableExhausted(brief),
+        401 | 403 => E::CredentialRejected(brief),
+        404 => E::ModelOrDeploymentNotFound(brief),
+        // A 400 is the provider rejecting the REQUEST — often "prompt
+        // is too long" (the compaction path, B6/E1) — not a permission
+        // problem, and its message must reach the operator.
+        400 | 413 => E::RequestInvalidOrTooLarge(brief),
+        _ => E::ProviderPermissionDenied(brief),
+    }
+}

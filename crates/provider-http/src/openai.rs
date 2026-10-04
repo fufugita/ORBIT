@@ -171,16 +171,10 @@ impl OpenAiCompatibleHttpV1 {
             .map_err(|e| AdapterError::ProviderTransportFailure(format!("send: {e}")))?;
 
         let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AdapterError::RateLimitedExhausted("429 (E0407)".into()));
-        }
-        if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
-            return Err(AdapterError::ProviderTransportFailure("500 (E0410)".into()));
-        }
         if !status.is_success() {
-            return Err(AdapterError::ProviderPermissionDenied(format!(
-                "provider status {status}"
-            )));
+            // E1/E2: read the body, classify precisely, retry 5xx.
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::error::status_error(status, body).await);
         }
 
         let bytes = resp

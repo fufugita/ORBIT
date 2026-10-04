@@ -419,6 +419,11 @@ fn is_retryable(code: &str) -> bool {
         "ORBIT-E0407" | "ORBIT-E0503" | "ORBIT-E0504" | "ORBIT-E0529"
     ) || code.starts_with("E0407")
         || code.starts_with("E0503")
+        // E2: provider capacity (500/502/503/504/529 → E0408) and
+        // transport failures (E0410, incl. connection resets) are
+        // transient — retry with the same backoff as 429.
+        || code.starts_with("E0408")
+        || code.starts_with("E0410")
 }
 
 // The CLI's tool definitions are reused, not copied: a thin re-export

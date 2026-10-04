@@ -204,73 +204,92 @@ pub fn wave1_definitions() -> Vec<ToolDefinition> {
 pub fn load_rules(home: &Path) -> RuleSet {
     let mut rules = RuleSet::default();
     // User scope: $ORBIT_HOME/settings.toml [permissions] table.
-    if let Ok(text) = std::fs::read_to_string(home.join("settings.toml")) {
-        if let Ok(v) = toml_parse(&text) {
-            merge_scope(&mut rules, &v);
-        }
-    }
-    // Project scope: .orbit/settings.toml (folder trust checked by the
-    // caller before loading).
-    if let Ok(text) = std::fs::read_to_string(".orbit/settings.toml") {
-        if let Ok(v) = toml_parse(&text) {
-            merge_scope(&mut rules, &v);
-        }
-    }
-    // Local scope: .orbit/settings.local.toml (gitignored).
-    if let Ok(text) = std::fs::read_to_string(".orbit/settings.local.toml") {
-        if let Ok(v) = toml_parse(&text) {
-            merge_scope(&mut rules, &v);
-        }
-    }
-    // Migration: the old permissions.toml whole-tool rules.
-    if let Ok(text) = std::fs::read_to_string(home.join("permissions.toml")) {
-        if let Ok(v) = toml_parse(&text) {
-            merge_legacy(&mut rules, &v);
+    // A file that exists but does not parse is WARNED, never silently
+    // skipped (S1: silent skip deleted the user's deny rules).
+    for (path, legacy) in [
+        (home.join("settings.toml"), false),
+        (std::path::PathBuf::from(".orbit/settings.toml"), false),
+        (std::path::PathBuf::from(".orbit/settings.local.toml"), false),
+        (home.join("permissions.toml"), true),
+    ] {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match toml_parse(&text) {
+            Ok(v) => {
+                if legacy {
+                    merge_legacy(&mut rules, &v);
+                } else {
+                    merge_scope(&mut rules, &v);
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: {}: {e} (permission rules in it are NOT applied)", path.display());
+            }
         }
     }
     rules
 }
 
-/// Minimal TOML subset parser for the permissions tables (arrays of
-/// strings under allow/ask/deny). Avoids a toml dependency in this
-/// crate; the CLI's config layer can replace it later.
+/// Parse a settings file with the real TOML parser (S1): the old
+/// hand-written subset dropped multi-line arrays (`deny = [\n  "…",\n]`
+/// parsed as empty) and split items containing commas, silently
+/// deleting the user's rules. A file that does not parse is an error
+/// the caller surfaces — never a silent empty ruleset.
 fn toml_parse(text: &str) -> Result<serde_json::Value, String> {
+    let parsed: toml::Table = toml::from_str(text)
+        .map_err(|e| format!("settings parse error: {e}"))?;
+    Ok(flatten_toml(&parsed, ""))
+}
+
+/// Flatten nested TOML tables into dotted-key JSON (the shape
+/// merge_scope/merge_legacy expect: "permissions.deny" → array).
+fn flatten_toml(table: &toml::Table, prefix: &str) -> serde_json::Value {
     let mut out = serde_json::Map::new();
-    let mut current: Option<String> = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            current = Some(line[1..line.len() - 1].to_string());
-            continue;
-        }
-        if let Some(eq) = line.find('=') {
-            let key = line[..eq].trim().to_string();
-            let value = line[eq + 1..].trim();
-            let scope_key = current.clone().unwrap_or_default();
-            let full = if scope_key.is_empty() {
-                key
-            } else {
-                format!("{scope_key}.{key}")
-            };
-            // Parse: string, array of strings, bare word.
-            let parsed = if value.starts_with('[') {
-                let inner = value.trim_start_matches('[').trim_end_matches(']');
-                let items: Vec<String> = inner
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                serde_json::Value::Array(items.into_iter().map(serde_json::Value::String).collect())
-            } else {
-                serde_json::Value::String(value.trim_matches('"').trim_matches('\'').to_string())
-            };
-            out.insert(full, parsed);
+    for (k, v) in table {
+        let key = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            toml::Value::String(s) => {
+                out.insert(key, serde_json::Value::String(s.clone()));
+            }
+            toml::Value::Integer(i) => {
+                out.insert(key, serde_json::Value::Number((*i).into()));
+            }
+            toml::Value::Float(f) => {
+                if let Some(n) = serde_json::Number::from_f64(*f) {
+                    out.insert(key, serde_json::Value::Number(n));
+                }
+            }
+            toml::Value::Boolean(b) => {
+                out.insert(key, serde_json::Value::Bool(*b));
+            }
+            toml::Value::Array(a) => {
+                out.insert(
+                    key,
+                    serde_json::Value::Array(
+                        a.iter()
+                            .filter_map(|x| {
+                                x.as_str().map(|s| serde_json::Value::String(s.to_string()))
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            // Nested tables merge their flattened keys into THIS map
+            // (dotted, flat) — not into a nested object.
+            toml::Value::Table(t) => {
+                if let serde_json::Value::Object(inner) = flatten_toml(t, &key) {
+                    out.extend(inner);
+                }
+            }
+            _ => {}
         }
     }
-    Ok(serde_json::Value::Object(out))
+    serde_json::Value::Object(out)
 }
 
 fn merge_scope(rules: &mut RuleSet, v: &serde_json::Value) {
@@ -307,5 +326,17 @@ fn merge_legacy(rules: &mut RuleSet, v: &serde_json::Value) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod s1_tests {
+    use super::*;
+
+    #[test]
+    fn multiline_array_parses() {
+        let v = toml_parse("[permissions]\ndeny = [\n  \"Bash(echo *)\",\n]\n").unwrap();
+        eprintln!("FLAT: {v}");
+        assert!(v.get("permissions.deny").is_some(), "dotted key present: {v}");
     }
 }
