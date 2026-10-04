@@ -610,6 +610,7 @@ fn gate2_one_loop_same_event_stream() {
         .local_addr()
         .unwrap()
         .port();
+    #[allow(clippy::zombie_processes)] // killed at test end below
     let mut web = Command::new(&web_bin)
         .arg("--home")
         .arg(&home)
@@ -773,4 +774,67 @@ fn gate2_no_front_end_owns_a_loop() {
             );
         }
     }
+}
+
+// ── Gate 3: verify-ledger lists intent, decision and result ────────
+// MD gate 3: "orbit verify-ledger passes and lists intent, decision
+// and result for every call." A session that ran one tool must show
+// the full triple, not just a record count.
+#[test]
+fn gate3_verify_ledger_lists_the_triple() {
+    let port = spawn_mock();
+    let home = fresh_home("g3-ledger");
+    let target = workspace_target();
+    let bin = if target.join("release/orbit").exists() {
+        target.join("release/orbit")
+    } else {
+        target.join("debug/orbit")
+    };
+    init_home(&bin.to_string_lossy(), &home);
+
+    // One turn with one tool call (the mock's calculator).
+    let (_events, code) = run_orbit_p(port, &home, "what is 2*(3+4)?", &["--auto-tools"]);
+    assert_eq!(code, 0, "the turn must succeed");
+
+    // verify-ledger: passes AND lists the triple.
+    let out = Command::new(&bin)
+        .arg("--home")
+        .arg(&home)
+        .arg("verify-ledger")
+        .output()
+        .expect("run verify-ledger");
+    assert!(
+        out.status.success(),
+        "verify-ledger must pass: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("verify-ledger prints JSON");
+    assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("ok"));
+
+    // The listing: every tool call shows intent, decision (verdict)
+    // and result.
+    let calls = v
+        .get("calls")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !calls.is_empty(),
+        "verify-ledger must list the tool calls (got {} records but no calls)",
+        v.get("records").and_then(|r| r.as_u64()).unwrap_or(0)
+    );
+    for call in &calls {
+        let has = |k: &str| call.get(k).is_some();
+        assert!(
+            has("intent") && has("decision") && has("result"),
+            "every call must list intent, decision and result: {call}"
+        );
+    }
+
+    let _ = Command::new("fuser")
+        .arg("-k")
+        .arg(format!("{port}/tcp"))
+        .status();
+    let _ = std::fs::remove_dir_all(&home);
 }

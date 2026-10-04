@@ -421,7 +421,6 @@ fn kill_tree(pid: i32) {
     }
 }
 
-
 fn kill_process_group(pid: i32) -> bool {
     use std::process::Command;
     // kill -TERM -<pgid>: the child was spawned with process_group(0),

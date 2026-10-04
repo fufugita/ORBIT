@@ -460,12 +460,24 @@ fn pattern_layer_verdict(home: &Path, tool_name: &str, args: &serde_json::Value)
         .and_then(|m| PermissionMode::from_config(&m))
         .unwrap_or_default();
     let mut rules = orbit_tools::executor::load_rules(home);
-    if let Ok(list) = std::env::var("ORBIT_ALLOWED_TOOLS") {
-        for entry in list.split(',') {
-            if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Allow) {
-                rules.rules.push(r);
+    // An explicit operator allowlist (--allowedTools / settings) is a
+    // SCOPE statement: only what it names may run. The flag is tracked
+    // separately so the pure-built-in bypass below cannot punch
+    // through it (gate 6: a CI allowlist without calculator must deny
+    // calculator with exit 2, not let the built-in run).
+    let explicit_allowlist = std::env::var("ORBIT_ALLOWED_TOOLS")
+        .map(|list| {
+            let mut rules = rules.clone();
+            for entry in list.split(',') {
+                if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Allow) {
+                    rules.rules.push(r);
+                }
             }
-        }
+            rules
+        })
+        .unwrap_or_else(|_| rules.clone());
+    if std::env::var("ORBIT_ALLOWED_TOOLS").is_ok() {
+        rules = explicit_allowlist.clone();
     }
     if let Ok(list) = std::env::var("ORBIT_DISALLOWED_TOOLS") {
         for entry in list.split(',') {
@@ -479,13 +491,16 @@ fn pattern_layer_verdict(home: &Path, tool_name: &str, args: &serde_json::Value)
         .find(|t| t.name() == tool_name)
     else {
         // Not a registry tool. Pure built-ins (calculator, session
-        // lookups) are safe by construction; anything else has a
-        // dedicated handler and is not pattern-governed — leave it to
-        // the whole-tool layer, which has already run.
+        // lookups) are safe by construction — UNLESS the operator
+        // pinned an explicit allowlist, which names the whole scope
+        // (a built-in outside it is outside the scope, full stop).
         if crate::tools::builtin_tools()
             .iter()
             .any(|t| t.name == tool_name)
         {
+            if std::env::var("ORBIT_ALLOWED_TOOLS").is_ok() {
+                return PatternOutcome::Ask;
+            }
             return PatternOutcome::Allow;
         }
         return PatternOutcome::Ask;
@@ -590,12 +605,24 @@ fn execute_wave1(
     // Merged rules: the new pattern scopes + the legacy whole-tool file.
     let mut rules = orbit_tools::executor::load_rules(home);
     // --allowedTools / --disallowedTools (command-line scope).
-    if let Ok(list) = std::env::var("ORBIT_ALLOWED_TOOLS") {
-        for entry in list.split(',') {
-            if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Allow) {
-                rules.rules.push(r);
+    // An explicit operator allowlist (--allowedTools / settings) is a
+    // SCOPE statement: only what it names may run. The flag is tracked
+    // separately so the pure-built-in bypass below cannot punch
+    // through it (gate 6: a CI allowlist without calculator must deny
+    // calculator with exit 2, not let the built-in run).
+    let explicit_allowlist = std::env::var("ORBIT_ALLOWED_TOOLS")
+        .map(|list| {
+            let mut rules = rules.clone();
+            for entry in list.split(',') {
+                if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Allow) {
+                    rules.rules.push(r);
+                }
             }
-        }
+            rules
+        })
+        .unwrap_or_else(|_| rules.clone());
+    if std::env::var("ORBIT_ALLOWED_TOOLS").is_ok() {
+        rules = explicit_allowlist.clone();
     }
     if let Ok(list) = std::env::var("ORBIT_DISALLOWED_TOOLS") {
         for entry in list.split(',') {

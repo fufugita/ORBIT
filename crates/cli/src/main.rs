@@ -598,9 +598,61 @@ fn cmd_cancel(home: &Path) -> Result<serde_json::Value, (&'static str, String)> 
 fn cmd_verify(home: &Path) -> Result<serde_json::Value, (&'static str, String)> {
     let (records, head) =
         verify_ledger(&home.join("ledger")).map_err(|e| ("ORBIT-E0602", e.to_string()))?;
+    // MD gate 3: verify-ledger "lists intent, decision and result for
+    // every call" — the triple per call_id, in record order.
+    use orbit_ledger::LedgerEvent;
+    use std::collections::BTreeMap;
+    let mut calls: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for r in &records {
+        match &r.record.event {
+            LedgerEvent::ToolIntent(i) => {
+                let e = calls.entry(i.call_id.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "call_id": i.call_id,
+                        "tool": i.tool_name,
+                        "decision_id": i.decision_id,
+                    })
+                });
+                e["intent"] = serde_json::json!({
+                    "arguments_sha256": i.arguments_sha256,
+                    "arguments_bytes": i.arguments_bytes,
+                });
+            }
+            LedgerEvent::ToolVerdict(v) => {
+                let e = calls.entry(v.call_id.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "call_id": v.call_id,
+                        "tool": v.tool_name,
+                        "decision_id": v.decision_id,
+                    })
+                });
+                e["decision"] = serde_json::json!({
+                    "allowed": v.allowed,
+                    "reason": v.reason,
+                });
+            }
+            LedgerEvent::ToolResult(t) => {
+                let e = calls.entry(t.call_id.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "call_id": t.call_id,
+                        "tool": t.tool_name,
+                        "decision_id": t.decision_id,
+                    })
+                });
+                e["result"] = serde_json::json!({
+                    "status": t.status,
+                    "output_sha256": t.output_sha256,
+                    "output_bytes": t.output_bytes,
+                });
+            }
+            _ => {}
+        }
+    }
+    let calls: Vec<serde_json::Value> = calls.into_values().collect();
     Ok(serde_json::json!({
         "schema":"orbit.cli/v1","command":"verify-ledger","status":"ok",
-        "records":records.len(),"head":head
+        "records":records.len(),"head":head,
+        "calls":calls
     }))
 }
 
