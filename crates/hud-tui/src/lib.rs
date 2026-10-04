@@ -1569,6 +1569,15 @@ fn handle_key(
         return;
     }
 
+    // Esc during a running turn cancels it (MD §The agent loop: "Esc
+    // cancels the stream and kills each running tool's process group").
+    // Priority over the composer Esc semantics — the operator wants the
+    // turn stopped, not the draft touched.
+    if matches!(key.code, KeyCode::Esc) && app.turn_in_flight {
+        sender.send(Msg::CancelTurn);
+        return;
+    }
+
     // Modal input toggle (the multiplexer pattern): Esc from an empty
     // composer → NORMAL mode (single-key commands); `i` or Enter in NORMAL
     // → INSERT. The status line shows which mode you're in.

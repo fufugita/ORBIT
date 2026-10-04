@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 pub mod bash;
 pub mod executor;
 pub mod fs_tools;
+pub mod interrupt;
 pub mod permissions;
 pub mod sandbox;
 pub mod scan;

@@ -89,30 +89,32 @@ async fn openai(
         .to_string();
     // Model-name conventions for the gate scenarios: *-slow streams
     // slowly, *-notools never emits tool calls, *-fat replies huge.
-    let model_behavior = if model.contains("slow") {
+    // Round-local statefulness: the LAST message decides. A tool
+    // result as the final message means the previous round's call was
+    // executed (or cancelled) — answer with final text. Earlier rounds'
+    // results (a long session) must not suppress a fresh tool call.
+    let last_is_tool_result = || {
+        body.get("messages")
+            .and_then(|v| v.as_array())
+            .and_then(|msgs| msgs.last())
+            .map(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .unwrap_or(false)
+    };
+    let model_behavior = if model.contains("slowbash") && !last_is_tool_result() {
+        // A long-running Bash call (sleep): the Esc-during-a-tool
+        // scenario (MD gate 2). After the tool result (cancelled)
+        // arrives, fall through to the final text.
+        Some("slow-bash-tool-calls")
+    } else if model.contains("slowbash") {
+        None
+    } else if model.contains("slow") {
         Some("slow-stream")
     } else if model.contains("notools") {
         Some("success")
     } else if model.contains("fat") {
         Some("fat-responses")
-    } else if model.contains("bash") {
-        // A Bash tool call (not read-only): the approval-flow scenario.
-        // Stateful like the implicit script: once a tool result is in
-        // the messages, fall through to the final text so the turn
-        // completes after ONE approval.
-        let has_result = body
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .map(|msgs| {
-                msgs.iter()
-                    .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-            })
-            .unwrap_or(false);
-        if has_result {
-            None // fall through to the default success text
-        } else {
-            Some("bash-tool-calls")
-        }
+    } else if model.contains("bash") && !last_is_tool_result() {
+        Some("bash-tool-calls")
     } else {
         None
     };
@@ -149,6 +151,12 @@ async fn openai(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             openai_bash_tool_calls(),
+        )
+            .into_response(),
+        "slow-bash-tool-calls" => (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            openai_slow_bash_tool_calls(),
         )
             .into_response(),
         "slow" => {
@@ -224,6 +232,12 @@ async fn anthropic(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             anthropic_bash_tool_calls(),
+        )
+            .into_response(),
+        "slow-bash-tool-calls" => (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            anthropic_slow_bash_tool_calls(),
         )
             .into_response(),
         "fat-responses" => (
@@ -335,6 +349,31 @@ fn openai_bash_tool_calls() -> String {
     ]
     .join("\n\n")
 }
+
+/// A long-running Bash call (sleep 30): the Esc-during-a-tool scenario.
+fn openai_slow_bash_tool_calls() -> String {
+    [
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-slow","type":"function","function":{"name":"Bash","arguments":"{\"command\":"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"sleep 30 && echo done\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n")
+}
+fn anthropic_slow_bash_tool_calls() -> String {
+    [
+        r#"data: {"type":"message_start","usage":{"input_tokens":5,"output_tokens":0}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-slow","name":"Bash","input":{}}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"sleep 30 && echo done\"}"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3,"input_tokens":5}}"#,
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ].join("\n\n")
+}
+
 fn anthropic_bash_tool_calls() -> String {
     [
         r#"data: {"type":"message_start","usage":{"input_tokens":5,"output_tokens":0}}"#,

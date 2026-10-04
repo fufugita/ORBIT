@@ -266,7 +266,7 @@ def make_providers(home, provider, gate, model):
     # providers.toml — otherwise dispatch falls back to the default gate
     # (4001) and the turn dies with a 401 before any tool call / approval.
     with open(os.path.join(home, "providers.toml"), "w") as f:
-        f.write(f'[[provider]]\nname = "{provider}"\nurl = "{gate}"\nenv = "ORBIT_GATE_TOKEN"\n\n[[provider.models]]\nid = "{model}"\n[[provider.models]]\nid = "mock"\n')
+        f.write(f'[[provider]]\nname = "{provider}"\nurl = "{gate}"\nenv = "ORBIT_GATE_TOKEN"\n\n[[provider.models]]\nid = "{model}"\n[[provider.models]]\nid = "mock"\n[[provider.models]]\nid = "mock-slowbash"\n')
 
 
 def main():
@@ -447,6 +447,53 @@ def main():
     check("ctrl+c opens the quit card", ok, buf[-200:])
     s.key("n")  # stay (§11.7)
     s.read(0.5)
+
+    # ── 5b. Esc during a slow tool kills it, and the next prompt works ────
+    # MD gate 2: "Esc during a slow tool kills its process group, and
+    # the next prompt works." The mock-slowbash model issues a Bash
+    # `sleep 30` call (--auto-tools is NOT the TUI default; approvals
+    # fire — allow it with y, then Esc mid-run).
+    s.type("/model mock-slowbash")
+    s.key("enter")
+    time.sleep(0.5)
+    s.read(0.3)
+    s.type("run the slow thing")
+    s.key("enter")
+    # The approval card for Bash(sleep 30...) — allow once.
+    ok, buf = s.wait_for("approval", timeout=15)
+    if not ok:
+        ok, buf = s.wait_for("Bash", timeout=5)
+    time.sleep(1.6)  # §9.14 arming window
+    s.key("y")
+    time.sleep(1.0)  # the sleep is running now
+    s.key("esc")
+    # The turn must end (interrupted): the stamp ("cancelled") or the
+    # composer returning to ready both prove it; poll from t=1s.
+    ok = False
+    buf = ""
+    for _ in range(20):
+        time.sleep(0.5)
+        buf = s.read(0.2) if hasattr(s, "read") else buf
+        ok, buf2 = s.wait_for("cancelled", timeout=1)
+        if ok:
+            buf = buf2 or buf
+            break
+    if not ok:
+        import sys as _sys
+        print("SCREEN DUMP (esc):", file=_sys.stderr)
+        print(s.screen_text()[-1500:], file=_sys.stderr)
+    check("esc cancels the slow tool turn", ok, (buf or "")[-200:])
+    import subprocess as _sp
+    _left = _sp.run(["pgrep", "-x", "sleep"], capture_output=True, text=True).stdout.split()
+    check("esc killed the tool's process group", not _left, f"sleep alive: {_left}")
+    # The next prompt works.
+    s.type("/model mock-slow")
+    s.key("enter")
+    time.sleep(0.4)
+    s.type("still alive")
+    s.key("enter")
+    ok, buf = s.wait_for("slow", timeout=30)
+    check("next prompt works after esc", ok, buf[-200:])
 
     # ── 6. /sessions + /resume round-trip ──────────────────────────────────
     # A completed turn (the tool turn above) saved a session file.

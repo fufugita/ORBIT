@@ -168,6 +168,10 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
     let mut child = if sandboxed {
         let mut cmd = sandbox.wrap(command, &cx.working_dir);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Own process group (same as the unsandboxed arm below): the
+        // Esc interrupt and TaskStop kill the whole tree, never
+        // ORBIT's own group.
+        cmd.process_group(0);
         match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::err(&format!("cannot spawn sandboxed bash: {e}")),
@@ -229,6 +233,33 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
                 return r;
             }
             Ok(None) => {
+                // Esc (MD §The agent loop): the turn was cancelled —
+                // kill the whole process group and report the call as
+                // cancelled, keeping the transcript valid for the next
+                // turn.
+                if crate::interrupt::is_cancelled() && !crate::interrupt::kill_fired() {
+                    crate::interrupt::set_kill_fired();
+                    // Esc (MD §The agent loop): kill the tool's whole
+                    // process tree. TERM to the group first (graceful),
+                    // then KILL: the sandbox re-execs bwrap in a new
+                    // session (so the payload sits in a DIFFERENT group
+                    // than the child we spawned) and the payload runs
+                    // as PID 1 in its pid namespace, which ignores
+                    // TERM — KILL is kernel-enforced. Descendants are
+                    // walked via /proc so no orphan survives the turn.
+                    let pid = child.id() as i32;
+                    // TERM the spawned group first (graceful for plain
+                    // children), then ALWAYS walk the descendants and
+                    // KILL: the sandbox's re-exec lands in its own
+                    // session (outside the spawned child's group) and
+                    // the payload ignores TERM as its namespace's PID 1
+                    // — only the tree walk reaches them.
+                    kill_process_group(pid);
+                    kill_tree(pid);
+                    drop(child.stdout.take());
+                    drop(child.stderr.take());
+                    return ToolResult::err("cancelled by user");
+                }
                 if std::time::Instant::now() >= deadline {
                     // Move to the background: leave the child running,
                     // record it, and report.
@@ -356,6 +387,41 @@ impl Tool for TaskStopTool {
 
 /// Kill a process group (negative PID = the whole group). Returns
 /// whether the signal was delivered.
+//
+/// KILL every descendant of `pid` (walked via /proc children lists).
+/// Needed because the sandbox re-execs bwrap in a new session, putting
+/// the payload outside the spawned child's process group.
+fn kill_tree(pid: i32) {
+    let mut stack = vec![pid];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(p) = stack.pop() {
+        if !seen.insert(p) {
+            continue;
+        }
+        // Children of every thread of p.
+        if let Ok(tasks) = std::fs::read_dir(format!("/proc/{p}/task")) {
+            for task in tasks.flatten() {
+                if let Ok(list) = std::fs::read_to_string(task.path().join("children")) {
+                    for c in list.split_whitespace() {
+                        if let Ok(c) = c.parse::<i32>() {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        // KILL this pid DIRECTLY (not by group): a walked pid is
+        // usually not a process-group leader, and `kill -KILL -<pid>`
+        // on a non-leader is ESRCH — silently ignored. The group kill
+        // above already handled the leaders' groups.
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(p.to_string())
+            .status();
+    }
+}
+
+
 fn kill_process_group(pid: i32) -> bool {
     use std::process::Command;
     // kill -TERM -<pgid>: the child was spawned with process_group(0),
