@@ -393,17 +393,16 @@ pub fn run_dispatch(
         // credential is genuinely an unauthenticated gateway; anything
         // else keeps the provider's own words (a 400's "prompt is too
         // long" must not become "requires authentication").
-        orbit_gateway::DispatchOutcome::AdapterRefused { code: "E0404", message }
-            if credential.is_none() && message.trim() == "status 400" =>
-        {
-            Err((
-                "ORBIT-E0402",
-                format!(
-                    "gateway at {} requires authentication; set ORBIT_GATE_TOKEN",
-                    config.gate
-                ),
-            ))
-        }
+        orbit_gateway::DispatchOutcome::AdapterRefused {
+            code: "E0404",
+            message,
+        } if credential.is_none() && message.trim() == "status 400" => Err((
+            "ORBIT-E0402",
+            format!(
+                "gateway at {} requires authentication; set ORBIT_GATE_TOKEN",
+                config.gate
+            ),
+        )),
         orbit_gateway::DispatchOutcome::AdapterRefused { code, message } => Err((code, message)),
         other => Err(("ORBIT-E0406", format!("ask failed: {other:?}"))),
     }

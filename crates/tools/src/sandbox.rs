@@ -58,9 +58,7 @@ impl ShellSandbox {
         // Test override: simulate a machine without bubblewrap (the
         // scenarios can't uninstall the real one).
         if std::env::var("ORBIT_TEST_SANDBOX_OFF").is_ok() {
-            return SandboxStatus::Unavailable(
-                "simulated absent (ORBIT_TEST_SANDBOX_OFF)".into(),
-            );
+            return SandboxStatus::Unavailable("simulated absent (ORBIT_TEST_SANDBOX_OFF)".into());
         }
         if !cfg!(target_os = "linux") {
             return SandboxStatus::Unsupported;
@@ -119,9 +117,7 @@ impl ShellSandbox {
                 // mount point must exist; --tmpfs creates it.
                 cmd.arg("--tmpfs").arg(&canonical);
             } else if canonical.is_file() {
-                cmd.arg("--ro-bind")
-                    .arg("/dev/null")
-                    .arg(&canonical);
+                cmd.arg("--ro-bind").arg("/dev/null").arg(&canonical);
             }
         }
         // Run bash -c <command> inside, in the working directory.

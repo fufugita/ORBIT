@@ -209,7 +209,10 @@ pub fn load_rules(home: &Path) -> RuleSet {
     for (path, legacy) in [
         (home.join("settings.toml"), false),
         (std::path::PathBuf::from(".orbit/settings.toml"), false),
-        (std::path::PathBuf::from(".orbit/settings.local.toml"), false),
+        (
+            std::path::PathBuf::from(".orbit/settings.local.toml"),
+            false,
+        ),
         (home.join("permissions.toml"), true),
     ] {
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -224,7 +227,10 @@ pub fn load_rules(home: &Path) -> RuleSet {
                 }
             }
             Err(e) => {
-                eprintln!("warning: {}: {e} (permission rules in it are NOT applied)", path.display());
+                eprintln!(
+                    "warning: {}: {e} (permission rules in it are NOT applied)",
+                    path.display()
+                );
             }
         }
     }
@@ -237,8 +243,8 @@ pub fn load_rules(home: &Path) -> RuleSet {
 /// deleting the user's rules. A file that does not parse is an error
 /// the caller surfaces — never a silent empty ruleset.
 fn toml_parse(text: &str) -> Result<serde_json::Value, String> {
-    let parsed: toml::Table = toml::from_str(text)
-        .map_err(|e| format!("settings parse error: {e}"))?;
+    let parsed: toml::Table =
+        toml::from_str(text).map_err(|e| format!("settings parse error: {e}"))?;
     Ok(flatten_toml(&parsed, ""))
 }
 
@@ -337,6 +343,9 @@ mod s1_tests {
     fn multiline_array_parses() {
         let v = toml_parse("[permissions]\ndeny = [\n  \"Bash(echo *)\",\n]\n").unwrap();
         eprintln!("FLAT: {v}");
-        assert!(v.get("permissions.deny").is_some(), "dotted key present: {v}");
+        assert!(
+            v.get("permissions.deny").is_some(),
+            "dotted key present: {v}"
+        );
     }
 }

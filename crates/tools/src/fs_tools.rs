@@ -480,7 +480,9 @@ fn walk_builder(dir: &Path) -> ignore::WalkBuilder {
 /// Walk a directory tree, gitignore-aware (B1: the walker).
 fn walk(dir: &Path, f: &mut dyn FnMut(&Path) -> bool) {
     for entry in walk_builder(dir).build().flatten() {
-        let Some(ft) = entry.file_type() else { continue };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
         if ft.is_file() && !f(entry.path()) {
             return;
         }

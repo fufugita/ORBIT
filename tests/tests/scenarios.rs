@@ -57,7 +57,12 @@ impl Mock {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn scripted_mock.py (python3 required)");
-        let mut mock = Mock { child, port: 0, log, dir };
+        let mut mock = Mock {
+            child,
+            port: 0,
+            log,
+            dir,
+        };
         for _ in 0..80 {
             if let Ok(s) = std::fs::read_to_string(&port_out) {
                 mock.port = s.trim().parse().expect("port number");
@@ -159,17 +164,18 @@ impl Fixture {
     fn failing_test() -> Self {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().to_path_buf();
-        std::fs::write(
-            path.join("calc.py"),
-            "def add(a, b):\n    return a - b\n",
-        )
-        .expect("write calc.py");
+        std::fs::write(path.join("calc.py"), "def add(a, b):\n    return a - b\n")
+            .expect("write calc.py");
         std::fs::write(
             path.join("test_calc.py"),
             "from calc import add\nassert add(2, 3) == 5\nprint(\"ok: 1 passed\")\n",
         )
         .expect("write test_calc.py");
-        let _ = Command::new("git").arg("init").arg("-q").current_dir(&path).status();
+        let _ = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(&path)
+            .status();
         Fixture { dir, path }
     }
 
@@ -245,7 +251,13 @@ fn scenario_f1_fix_the_test() {
     let home = Home::init(&mock, "openai", "");
     let fix = Fixture::failing_test();
 
-    let (events, _code) = run_p(&mock, &home, &fix.path, "make the tests pass", &["--auto-tools"]);
+    let (events, _code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        "make the tests pass",
+        &["--auto-tools"],
+    );
 
     // The file was actually fixed.
     assert_eq!(
@@ -285,7 +297,13 @@ fn scenario_w2_write_twice() {
     let home = Home::init(&mock, "openai", "");
     let fix = Fixture::failing_test();
 
-    let (_events, _code) = run_p(&mock, &home, &fix.path, "write the file twice", &["--auto-tools"]);
+    let (_events, _code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        "write the file twice",
+        &["--auto-tools"],
+    );
 
     assert_eq!(
         Fixture::read(&fix.path, "made.txt"),
@@ -364,7 +382,11 @@ fn scenario_u1_grep_non_ascii() {
     let mock = Mock::start(&script, "openai");
     let home = Home::init(&mock, "openai", "");
     let fix = Fixture::failing_test();
-    std::fs::write(fix.path.join("notes.txt"), "see \u{a7}3.2 \u{2014} the caf\u{e9}\n").unwrap();
+    std::fs::write(
+        fix.path.join("notes.txt"),
+        "see \u{a7}3.2 \u{2014} the caf\u{e9}\n",
+    )
+    .unwrap();
 
     let (events, code) = run_p(&mock, &home, &fix.path, "grep for caf", &["--auto-tools"]);
 
@@ -525,7 +547,9 @@ fn scenario_p1_permission_matrix() {
             "default headless: Write must be denied (B4)"
         );
         assert!(
-            log.contains("denied") || log.contains("--allowedTools") || log.contains("--auto-tools"),
+            log.contains("denied")
+                || log.contains("--allowedTools")
+                || log.contains("--auto-tools"),
             "a headless denial must carry a visible reason (C4/B4)"
         );
         let _ = events;
@@ -537,13 +561,7 @@ fn scenario_p1_permission_matrix() {
         let fix = Fixture::failing_test();
         let mock = Mock::start(&read_then_write, "openai");
         let home = Home::init(&mock, "openai", "");
-        let (events, _c) = run_p(
-            &mock,
-            &home,
-            &fix.path,
-            "go",
-            &["--allowedTools", "Read"],
-        );
+        let (events, _c) = run_p(&mock, &home, &fix.path, "go", &["--allowedTools", "Read"]);
         let log = serde_json::to_string(&mock.requests()).unwrap();
         assert!(
             log.contains("calc.py"),
@@ -587,10 +605,7 @@ fn scenario_p1_permission_matrix() {
             &["--permission-mode", "plan"],
         );
         let log = serde_json::to_string(&mock.requests()).unwrap();
-        assert!(
-            log.contains("calc.py"),
-            "plan mode: Read runs (B4)"
-        );
+        assert!(log.contains("calc.py"), "plan mode: Read runs (B4)");
         assert!(
             !fix.path.join("out.txt").exists(),
             "plan mode: Write is denied (B4)"

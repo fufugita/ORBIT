@@ -656,10 +656,7 @@ fn advertised_tools_all_dispatch() {
             || name == "Skill"
             || name == "Task"
             || name.starts_with("mcp__");
-        assert!(
-            handled,
-            "{name} is advertised but has no handler (B3)"
-        );
+        assert!(handled, "{name} is advertised but has no handler (B3)");
     }
 }
 

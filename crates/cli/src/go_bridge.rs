@@ -470,11 +470,8 @@ fn run_protocol_turn(
 
     let working_dir =
         std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
-    let tool_cx = orbit_tools::ToolContext::new(
-        config.home.clone(),
-        config.session_id.clone(),
-        working_dir,
-    );
+    let tool_cx =
+        orbit_tools::ToolContext::new(config.home.clone(), config.session_id.clone(), working_dir);
     let mut executor = GoToolExecutor {
         home: config.home.clone(),
         session_id: config.session_id.clone(),

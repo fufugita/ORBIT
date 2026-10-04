@@ -1726,8 +1726,7 @@ fn cmd_chat(args: &[String]) -> i32 {
             tool_cx: orbit_tools::ToolContext::new(
                 home.clone(),
                 session.clone(),
-                std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+                std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
             ),
         };
         let mut stamped = false;

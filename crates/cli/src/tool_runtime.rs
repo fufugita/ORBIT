@@ -441,7 +441,6 @@ pub fn execute_call(
     Ok(output)
 }
 
-
 /// Layer-2 outcome for the pre-check (B4): what would the mode/pattern
 /// rules say about this call?
 #[derive(PartialEq)]
@@ -451,12 +450,10 @@ enum PatternOutcome {
     Deny(String),
 }
 
-fn pattern_layer_verdict(
-    home: &Path,
-    tool_name: &str,
-    args: &serde_json::Value,
-) -> PatternOutcome {
-    use orbit_tools::permissions::{evaluate, parse_rule, PermissionMode, RuleEffectSerde, Verdict};
+fn pattern_layer_verdict(home: &Path, tool_name: &str, args: &serde_json::Value) -> PatternOutcome {
+    use orbit_tools::permissions::{
+        evaluate, parse_rule, PermissionMode, RuleEffectSerde, Verdict,
+    };
 
     let mode = std::env::var("ORBIT_PERMISSION_MODE")
         .ok()
@@ -485,7 +482,10 @@ fn pattern_layer_verdict(
         // lookups) are safe by construction; anything else has a
         // dedicated handler and is not pattern-governed — leave it to
         // the whole-tool layer, which has already run.
-        if crate::tools::builtin_tools().iter().any(|t| t.name == tool_name) {
+        if crate::tools::builtin_tools()
+            .iter()
+            .any(|t| t.name == tool_name)
+        {
             return PatternOutcome::Allow;
         }
         return PatternOutcome::Ask;
@@ -683,8 +683,7 @@ fn execute_wave1(
         if let Some(path_str) = args.get("file_path").and_then(|v| v.as_str()) {
             let path = orbit_tools::resolve_path(&cx, path_str);
             if path.exists() {
-                let cps =
-                    orbit_engine::transcript::Checkpoints::new(home, &cx.session_id);
+                let cps = orbit_engine::transcript::Checkpoints::new(home, &cx.session_id);
                 let turn_cp = current_turn_checkpoint();
                 let _ = cps.snapshot_file(&turn_cp, &path);
             }
@@ -693,17 +692,16 @@ fn execute_wave1(
 
     // B1: a tool bug must become a tool error, never a dead worker
     // (a panic here used to take the whole process or the TUI thread).
-    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tool.run(args, &cx)
-    })) {
-        Ok(result) => result,
-        Err(panic) => {
-            let reason = panic_message(&panic);
-            orbit_tools::ToolResult::err(&format!(
-                "internal tool error: {reason} (the panic was contained)"
-            ))
-        }
-    };
+    let result =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.run(args, &cx))) {
+            Ok(result) => result,
+            Err(panic) => {
+                let reason = panic_message(&panic);
+                orbit_tools::ToolResult::err(&format!(
+                    "internal tool error: {reason} (the panic was contained)"
+                ))
+            }
+        };
     let result = orbit_tools::finish(result, &cx, &call.id);
 
     // PostToolUse: the hook sees the (scanned) result.
@@ -813,8 +811,7 @@ impl<'a> SubagentExecutor<'a> {
         let session_id = format!("subagent-{}", ulid::Ulid::new());
         let working_dir =
             std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf());
-        let tool_cx =
-            orbit_tools::ToolContext::new(home.clone(), session_id.clone(), working_dir);
+        let tool_cx = orbit_tools::ToolContext::new(home.clone(), session_id.clone(), working_dir);
         Self {
             session_id,
             home,
@@ -918,8 +915,18 @@ mod tests {
         let call = make_call("calculator", br#"{"expression":"2*(3+4)"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::Deny); // shouldn't be asked
         let mut grants = AutoGrants::new();
-        let out =
-            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
+        let out = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            true,
+            false,
+            &mut ch,
+            &mut grants,
+            &test_cx(&home.join("work")),
+        )
+        .unwrap();
         assert!(out.contains("14"));
         let mut ledger = String::new();
         for e in std::fs::read_dir(home.join("ledger/segments"))
@@ -978,8 +985,18 @@ mod tests {
         let call = make_call("shell", br#"{"cmd":"id"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
         let mut grants = AutoGrants::new();
-        let out =
-            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
+        let out = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            true,
+            false,
+            &mut ch,
+            &mut grants,
+            &test_cx(&home.join("work")),
+        )
+        .unwrap();
         assert!(out.contains("unknown tool"));
     }
 
@@ -989,8 +1006,18 @@ mod tests {
         let call = make_call("calculator", br#"{"expression":"3+4"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
         let mut grants = AutoGrants::new();
-        let out =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
+        let out = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            false,
+            true,
+            &mut ch,
+            &mut grants,
+            &test_cx(&home.join("work")),
+        )
+        .unwrap();
         assert!(out.contains("7"));
     }
 
@@ -1134,8 +1161,18 @@ mod tests {
         let call = make_call("shell", br#"{"cmd":"id"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let out =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
+        let out = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            false,
+            true,
+            &mut ch,
+            &mut grants,
+            &test_cx(&home.join("work")),
+        )
+        .unwrap();
         assert!(out.contains("unknown tool"));
         assert!(
             !grants.is_granted("shell"),
@@ -1168,7 +1205,10 @@ mod tests {
         )
         .unwrap();
         assert!(grants.is_granted("Write"));
-        assert!(!grants.is_granted("Edit"), "R on Write should not grant Edit");
+        assert!(
+            !grants.is_granted("Edit"),
+            "R on Write should not grant Edit"
+        );
 
         // Edit should still ask the channel.
         let mut ch2 = FixedChannel(ApprovalVerdict::Deny);
@@ -1208,7 +1248,18 @@ mod tests {
         let call = make_call("calculator", br#"{"expression":"2+2"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let _ = execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
+        let _ = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            false,
+            true,
+            &mut ch,
+            &mut grants,
+            &test_cx(&home.join("work")),
+        )
+        .unwrap();
 
         let mut ledger = String::new();
         for e in std::fs::read_dir(home.join("ledger/segments"))
