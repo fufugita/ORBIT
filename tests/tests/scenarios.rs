@@ -615,3 +615,61 @@ fn scenario_p1_permission_matrix() {
         );
     }
 }
+
+// ── D1: the deny-read list is bypassed by a symlink and by Bash ────
+// Fails on 1310e73-era code: S2 (is_deny_read matches the path string
+// as given; a symlink or `cat` through Bash sidesteps it).
+#[test]
+fn scenario_d1_deny_read_bypass() {
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [
+                {"name": "Read", "args": {"file_path": "secret_link.txt"}},
+                {"name": "Bash", "args": {
+                    "command": "cat ~/.ssh/d1_probe", "description": "read it via shell"}}]},
+            {"text": "done"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    // A real secret outside the fixture, plus a symlink to it.
+    let ssh_dir = home.path.join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    let secret = ssh_dir.join("d1_probe");
+    std::fs::write(&secret, "SECRET-D1").unwrap();
+    let link_path = fix.path.join("secret_link.txt");
+    let _ = std::os::unix::fs::symlink(&secret, &link_path);
+
+    // Run with HOME set to the temp home so the default deny-read
+    // list (~/.ssh) covers the probe file.
+    let mut cmd = Command::new(orbit_binary());
+    cmd.arg("-p")
+        .arg("read it")
+        .arg("--home")
+        .arg(&home.path)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{}", mock.port))
+        .arg("--model")
+        .arg("mock-model")
+        .arg("--auto-tools")
+        .arg("--output-format")
+        .arg("stream-json")
+        .env("HOME", home.path)
+        .current_dir(&fix.path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().expect("run orbit -p");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // Neither the symlink Read nor the Bash cat may leak the secret.
+    assert!(
+        !stdout.contains("SECRET-D1"),
+        "the secret leaked through a tool (S2): {stdout}"
+    );
+    let logged = serde_json::to_string(&mock.requests()).unwrap();
+    assert!(
+        !logged.contains("SECRET-D1"),
+        "the secret leaked to the provider (S2)"
+    );
+}

@@ -295,10 +295,14 @@ pub fn is_deny_read(path: &Path) -> bool {
     let s = path.to_string_lossy();
     let expanded = s.replace('~', &home);
     let p = Path::new(&expanded);
+    // S2: match the CANONICAL path — a symlink to ~/.ssh/… must not
+    // sidestep the list. Non-existent paths match as given (a Write
+    // to a not-yet-created deny path is still denied).
+    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     for entry in deny_read_paths() {
         let e = entry.replace('~', &home);
         let ep = Path::new(&e);
-        if p.starts_with(ep) {
+        if canonical.starts_with(ep) || p.starts_with(ep) {
             return true;
         }
         // glob tails: **/<name>

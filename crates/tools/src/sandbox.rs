@@ -94,6 +94,29 @@ impl ShellSandbox {
         if !self.network {
             cmd.arg("--unshare-net");
         }
+        // S2: blind the deny-read paths INSIDE the sandbox — a `cat
+        // ~/.ssh/id_rsa` reads /dev/null, not the key. Files are
+        // masked with a read-only /dev/null bind; directories with an
+        // empty tmpfs. Masks come AFTER the binds above so they win.
+        for entry in crate::deny_read_paths() {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let expanded = entry.replace('~', &home);
+            let path = Path::new(&expanded);
+            // Only mask paths that exist here; a missing path needs no
+            // mask (nothing to leak).
+            let Ok(canonical) = std::fs::canonicalize(path) else {
+                continue;
+            };
+            if canonical.is_dir() {
+                // An empty tmpfs hides directory listings but the
+                // mount point must exist; --tmpfs creates it.
+                cmd.arg("--tmpfs").arg(&canonical);
+            } else if canonical.is_file() {
+                cmd.arg("--ro-bind")
+                    .arg("/dev/null")
+                    .arg(&canonical);
+            }
+        }
         // Run bash -c <command> inside, in the working directory.
         cmd.arg("bash").arg("-c").arg(user_command);
         cmd.current_dir(working_dir);
