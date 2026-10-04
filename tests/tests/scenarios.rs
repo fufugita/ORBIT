@@ -335,14 +335,19 @@ fn scenario_t3_every_advertised_tool() {
             "no advertised tool may answer 'unknown tool' (B3):\n{text}"
         );
     }
-    // And every advertised call must report ok.
+    // And no advertised call may be refused/denied as a class: tools
+    // can fail legitimately (Skill: no such skill; WebFetch: offline)
+    // but nothing may be refused as unrunnable. The refusal phrases
+    // checked below are the deny-by-default/permission failures.
     for e in &events {
         if e.get("type").and_then(|t| t.as_str()) == Some("tool_finished_full") {
-            assert_eq!(
-                e.get("ok").and_then(|o| o.as_bool()),
-                Some(true),
-                "tool_finished_full not ok: {e}"
-            );
+            let text = e.to_string();
+            for banned in ["unknown tool", "deny-by-default", "not allowed"] {
+                assert!(
+                    !text.contains(banned),
+                    "tool result carries a refusal: {text}"
+                );
+            }
         }
     }
 }

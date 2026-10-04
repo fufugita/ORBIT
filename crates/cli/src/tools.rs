@@ -564,6 +564,13 @@ pub fn is_known_tool(name: &str) -> bool {
     orbit_tools::is_wave1(name)
         || orbit_tools::registry().iter().any(|t| t.name() == name)
         || builtin_tools().iter().any(|t| t.name == name)
+        // B3: these have handlers in tool_runtime::execute_call but
+        // were denied as "unknown tool (deny-by-default)" before the
+        // handlers were ever reached — Task and Skill are advertised
+        // to the model in the same request.
+        || name == "Skill"
+        || name == "Task"
+        || name.starts_with("mcp__")
 }
 
 /// Structured risk classification for a tool (backend-authoritative — the
@@ -626,6 +633,33 @@ pub fn tool_risk(name: &str) -> RiskLevel {
         // the filesystem.
         "TaskList" => RiskLevel::Low,
         _ => RiskLevel::Medium,
+    }
+}
+
+/// B3: a tool is advertised to the model only if a handler exists.
+/// Every name in the session list must dispatch somewhere: the
+/// registry (execute_wave1), a tool_runtime handler, or a pure
+/// built-in. This is the invariant whose absence made six advertised
+/// tools answer "unknown tool".
+#[test]
+fn advertised_tools_all_dispatch() {
+    let home = std::env::temp_dir().join("orbit-b3-dispatch");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let defs = session_tool_definitions(&home);
+    assert!(!defs.is_empty(), "the session must offer tools");
+    for d in &defs {
+        let name = d.name.as_str();
+        let handled = orbit_tools::is_wave1(name)
+            || orbit_tools::registry().iter().any(|t| t.name() == name)
+            || builtin_tools().iter().any(|t| t.name == name)
+            || name == "Skill"
+            || name == "Task"
+            || name.starts_with("mcp__");
+        assert!(
+            handled,
+            "{name} is advertised but has no handler (B3)"
+        );
     }
 }
 

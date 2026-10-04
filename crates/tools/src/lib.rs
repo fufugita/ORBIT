@@ -253,6 +253,13 @@ pub fn is_wave1(name: &str) -> bool {
             | "TaskStop"
             | "AskUserQuestion"
             | "ExitPlanMode"
+            // B3: these have real implementations in registry() but
+            // were missing here, so they fell through to the pure
+            // built-in executor and answered "unknown tool".
+            | "TaskCreate"
+            | "TaskUpdate"
+            | "TaskList"
+            | "WebFetch"
     )
 }
 
