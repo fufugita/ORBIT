@@ -87,35 +87,48 @@ mod tests {
             "the result must say cancelled: {}",
             r.payload
         );
-        // And no orphan survives (allow a moment for teardown).
-        let mut out = std::process::Command::new("pgrep")
-            .arg("-x")
-            .arg("sleep")
-            .output()
-            .expect("pgrep");
-        for _ in 0..30 {
-            if out.stdout.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            out = std::process::Command::new("pgrep")
+        // And no orphan survives: no NEW sleep process beyond the
+        // pre-run baseline (the machine may host unrelated sleeps).
+        let baseline: Vec<String> = {
+            let o = std::process::Command::new("pgrep")
                 .arg("-x")
                 .arg("sleep")
                 .output()
                 .expect("pgrep");
-        }
-        if !out.stdout.is_empty() {
-            let tree = std::process::Command::new("bash")
-                .arg("-c")
-                .arg("ps -eo pid,ppid,pgid,sid,cmd | grep -E 'sleep|bwrap' | grep -v grep")
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(String::from)
+                .collect()
+        };
+        let mut leaked = Vec::new();
+        for _ in 0..30 {
+            let o = std::process::Command::new("pgrep")
+                .arg("-x")
+                .arg("sleep")
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
-            panic!(
-                "the child must be dead: {}\n{tree}",
-                String::from_utf8_lossy(&out.stdout)
-            );
+                .expect("pgrep");
+            leaked = String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(String::from)
+                .filter(|p| !baseline.contains(p))
+                .collect();
+            if leaked.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
+        assert!(
+            leaked.is_empty(),
+            "the child must be dead (leaked: {leaked:?})\n{tree}",
+            tree = {
+                std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg("ps -eo pid,ppid,pgid,cmd | grep -E 'sleep 30|bwrap' | grep -v grep | head -6")
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default()
+            }
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 }

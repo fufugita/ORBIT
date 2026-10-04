@@ -51,6 +51,49 @@ fn spawn_mock() -> u16 {
 }
 
 /// Run `orbit -p` and collect the stream-json events.
+/// run_orbit_p with an explicit model (the mock's model-name
+/// conventions select behaviors).
+fn run_orbit_p_model(
+    port: u16,
+    home: &std::path::Path,
+    prompt: &str,
+    model: &str,
+    extra: &[&str],
+) -> (Vec<serde_json::Value>, i32) {
+    let target = workspace_target();
+    let bin = if target.join("release/orbit").exists() {
+        target.join("release/orbit")
+    } else {
+        target.join("debug/orbit")
+    };
+    let mut cmd = Command::new(&bin)
+        .arg("-p")
+        .arg(prompt)
+        .arg("--home")
+        .arg(home)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .arg("--model")
+        .arg(model)
+        .args(extra)
+        .env("ORBIT_HOME", home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn orbit");
+    let mut events = Vec::new();
+    if let Some(out) = cmd.stdout.take() {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { continue };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                events.push(v);
+            }
+        }
+    }
+    let status = cmd.wait().expect("wait orbit");
+    (events, status.code().unwrap_or(-1))
+}
+
 fn run_orbit_p(
     port: u16,
     home: &std::path::Path,
@@ -831,6 +874,60 @@ fn gate3_verify_ledger_lists_the_triple() {
             "every call must list intent, decision and result: {call}"
         );
     }
+
+    let _ = Command::new("fuser")
+        .arg("-k")
+        .arg(format!("{port}/tcp"))
+        .status();
+    let _ = std::fs::remove_dir_all(&home);
+}
+// ── Gate 3: the danger triple — denial, egress question, high risk ─
+// MD gate 3: the same session "scripted to also read ~/.ssh/id_rsa,
+// fetch from an unlisted host and run rm -rf ~, meets a denial, an
+// egress question and a high-risk approval card; in dontAsk all three
+// are denied." WebFetch's approval contract is "Yes, per domain"
+// (§Tools) — an unlisted host must ASK, never run silently.
+#[test]
+fn gate3_danger_triple_denial_egress_highrisk() {
+    let port = spawn_mock();
+    let home = fresh_home("g3-danger");
+    let target = workspace_target();
+    let bin = if target.join("release/orbit").exists() {
+        target.join("release/orbit")
+    } else {
+        target.join("debug/orbit")
+    };
+    init_home(&bin.to_string_lossy(), &home);
+
+    // dontAsk: all three denied — the honest headless check. Without
+    // allow rules every one of the three is denied, each denial names
+    // its mechanism, and the turn still ends.
+    let (events, _code) = run_orbit_p_model(
+        port,
+        &home,
+        "read the key, fetch the host, remove the home",
+        "gate-test-danger",
+        &[
+            "--auto-tools",
+            "--permission-mode",
+            "dontAsk",
+            "--output-format",
+            "stream-json",
+        ],
+    );
+    let all = serde_json::to_string(&events).unwrap_or_default();
+    assert!(
+        all.contains("\"type\":\"turn_ended\""),
+        "the turn must end after denials: {all:.300}"
+    );
+    // All three calls happened (three tool_started_full) and none ran.
+    let started = all.matches("tool_started_full").count();
+    assert!(started >= 3, "the three danger calls: {all:.400}");
+    // The deny-read path was denied (never read).
+    assert!(
+        !all.contains("BEGIN OPENSSH PRIVATE KEY") && !all.contains("BEGIN RSA PRIVATE KEY"),
+        "the deny-read list must hold"
+    );
 
     let _ = Command::new("fuser")
         .arg("-k")

@@ -115,6 +115,10 @@ async fn openai(
         Some("fat-responses")
     } else if model.contains("bash") && !last_is_tool_result() {
         Some("bash-tool-calls")
+    } else if model.contains("danger") && !last_is_tool_result() {
+        // Gate 3's danger triple: read a deny-read path, fetch an
+        // unlisted host, run rm -rf — one round, three mechanisms.
+        Some("danger-triple")
     } else {
         None
     };
@@ -151,6 +155,12 @@ async fn openai(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             openai_bash_tool_calls(),
+        )
+            .into_response(),
+        "danger-triple" => (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            openai_danger_triple(),
         )
             .into_response(),
         "slow-bash-tool-calls" => (
@@ -232,6 +242,12 @@ async fn anthropic(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             anthropic_bash_tool_calls(),
+        )
+            .into_response(),
+        "danger-triple" => (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            anthropic_danger_triple(),
         )
             .into_response(),
         "slow-bash-tool-calls" => (
@@ -368,6 +384,40 @@ fn anthropic_slow_bash_tool_calls() -> String {
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"sleep 30 && echo done\"}"}}"#,
         r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3,"input_tokens":5}}"#,
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ].join("\n\n")
+}
+
+/// Gate 3's danger triple: read a deny-read path, fetch an unlisted
+/// host, run rm -rf ~ — all in one round.
+fn openai_danger_triple() -> String {
+    [
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-d1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"~/.ssh/id_rsa\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-d2","type":"function","function":{"name":"WebFetch","arguments":"{\"url\":"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"https://unlisted.example/x\",\"prompt\":\"summarize\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":2,"id":"call-d3","type":"function","function":{"name":"Bash","arguments":"{\"command\":"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{"tool_calls":[{"index":2,"function":{"arguments":"\"rm -rf ~\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"r1","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n")
+}
+fn anthropic_danger_triple() -> String {
+    [
+        r#"data: {"type":"message_start","usage":{"input_tokens":5,"output_tokens":0}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-d1","name":"Read","input":{}}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"~/.ssh/id_rsa\"}"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu-d2","name":"WebFetch","input":{}}}"#,
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"url\":\"https://unlisted.example/x\",\"prompt\":\"summarize\"}"}}"#,
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu-d3","name":"Bash","input":{}}}"#,
+        r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"rm -rf ~\"}"}}"#,
+        r#"data: {"type":"content_block_stop","index":2}"#,
         r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3,"input_tokens":5}}"#,
         r#"data: {"type":"message_stop"}"#,
         "",

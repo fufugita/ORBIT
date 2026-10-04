@@ -624,6 +624,11 @@ pub fn tool_risk(name: &str) -> RiskLevel {
     if orbit_tools::is_wave1(name) && !orbit_tools::is_read_only(name) {
         return RiskLevel::Medium;
     }
+    // WebFetch: an egress question per domain — Low risk class (a read),
+    // but it always asks for a new domain.
+    if name == "WebFetch" {
+        return RiskLevel::Low;
+    }
     // All v0.1 built-ins are pure-data (calculator, session snapshot, model
     // list). Anything not explicitly classified defaults to medium — fail
     // toward caution, never silently low.

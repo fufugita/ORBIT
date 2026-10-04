@@ -266,9 +266,13 @@ pub fn is_wave1(name: &str) -> bool {
 
 /// Read-only classification (backend-authoritative, roadmap rule).
 pub fn is_read_only(name: &str) -> bool {
+    // WebFetch is deliberately NOT here: its approval contract is "Yes,
+    // per domain" (roadmap §Tools) — a new domain is an egress question,
+    // so the pattern layer asks rather than silently allowing. The
+    // tool's own read_only() flag still marks it parallel-safe.
     matches!(
         name,
-        "Read" | "Glob" | "Grep" | "AskUserQuestion" | "TaskList" | "WebFetch"
+        "Read" | "Glob" | "Grep" | "AskUserQuestion" | "TaskList"
     )
 }
 
