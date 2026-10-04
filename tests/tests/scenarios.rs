@@ -65,8 +65,12 @@ impl Mock {
         };
         for _ in 0..80 {
             if let Ok(s) = std::fs::read_to_string(&port_out) {
-                mock.port = s.trim().parse().expect("port number");
-                break;
+                // The mock writes the file once the port is bound; an
+                // empty read raced the write — retry, don't parse "".
+                if let Ok(p) = s.trim().parse() {
+                    mock.port = p;
+                    break;
+                }
             }
             if mock.child.try_wait().ok().flatten().is_some() {
                 panic!("scripted_mock.py exited early");
@@ -917,4 +921,78 @@ for line in sys.stdin:
             "the ledger must show {expected}: {tools:?}"
         );
     }
+}
+
+// ── Gate 4: /rewind restores files to their recorded digests ───────
+// MD gate 4: "/rewind to an earlier prompt restores every file to its
+// recorded digest and the conversation to that point." The checkpoint
+// store is the mechanism; the test drives a real session that edits a
+// file, then restores the turn's checkpoint and checks the digest.
+#[test]
+fn gate4_rewind_restores_recorded_digests() {
+    // The script: round 0 edits calc.py (the Write snapshots the
+    // pre-edit bytes into the turn's checkpoint), round 1 finishes.
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Read", "args": {"file_path": "calc.py"}}]},
+            {"tools": [{"name": "Edit", "args": {
+                "file_path": "calc.py",
+                "old_string": "return a - b",
+                "new_string": "return a + b"}}]},
+            {"text": "fixed"}
+        ]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+    let before = Fixture::read(&fix.path, "calc.py");
+
+    let (events, _code) = run_p(&mock, &home, &fix.path, "fix it", &["--auto-tools"]);
+    let after = Fixture::read(&fix.path, "calc.py");
+    assert_ne!(before, after, "the Edit must change the file first");
+
+    // The session wrote a checkpoint before the first write of the
+    // turn; its snapshot holds the pre-edit bytes.
+    // Find the session that owns the snapshots.
+    let sessions_dir = home.path.join("sessions");
+    let mut found: Option<(std::path::PathBuf, String)> = None;
+    for entry in std::fs::read_dir(&sessions_dir).unwrap().flatten() {
+        if entry.path().join("snapshots").exists() {
+            found = Some((
+                entry.path(),
+                entry.file_name().to_string_lossy().into_owned(),
+            ));
+            break;
+        }
+    }
+    let (_sess_dir, session_id) = found.expect("a session with snapshots");
+    let cps = orbit_engine::transcript::Checkpoints::new(&home.path, &session_id);
+    let list = cps.list();
+    assert!(!list.is_empty(), "a checkpoint must open at the write turn");
+
+    // Restore: every file in the manifest returns to its digest.
+    use sha2::Digest;
+    let cp_id = &list[0];
+    let snaps = home
+        .path
+        .join("sessions")
+        .join(&session_id)
+        .join("snapshots");
+    let restored = cps.restore(cp_id).expect("restore");
+    assert_eq!(restored.len(), 1, "the edited file: {restored:?}");
+    let content = Fixture::read(&fix.path, "calc.py");
+    let digest = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+    // The manifest's recorded sha256.
+    let manifest = std::fs::read_to_string(snaps.join(cp_id).join("manifest.jsonl")).unwrap();
+    let recorded: Vec<String> = manifest
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("sha256").and_then(|h| h.as_str()).map(String::from))
+        .collect();
+    assert!(
+        recorded.contains(&digest),
+        "restored bytes must match the recorded digest: {digest} vs {recorded:?}"
+    );
+    assert_eq!(content, before, "the file returns to its pre-edit bytes");
+    let _ = events;
 }

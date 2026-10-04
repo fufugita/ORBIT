@@ -36,6 +36,7 @@ orbit-core = { path = "../crates/orbit-core" }
 orbit-api = { path = "../crates/orbit-api" }
 orbit-hud = { path = "../crates/hud" }
 orbit-cli = { path = "../crates/cli" }
+orbit-engine = { path = "../crates/engine" }
 orbit-ir = { path = "../crates/orbit-ir" }
 orbit-ledger-events = { path = "../crates/orbit-ledger" }
 orbit-release = { path = "../crates/release" }
