@@ -204,6 +204,13 @@ pub fn execute_call(
 
     let known = crate::tools::is_known_tool(&call.name);
 
+    // B4: layer 2's pattern verdict, computed once here so headless
+    // runs don't blanket-deny calls the mode/rules allow. The channel
+    // is only asked when BOTH layers say ask.
+    let args_preview =
+        crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
+    let pattern_verdict = pattern_layer_verdict(home, &call.name, &args_preview);
+
     // Determine the verdict:
     // 1. Unknown tool → always deny (fail-closed, even with --auto-tools / R).
     // 2. Persistent deny rule → deny, no prompt.
@@ -226,8 +233,15 @@ pub fn execute_call(
     } else if rule_verdict == crate::permissions::RuleVerdict::Allow
         || auto_tools
         || grants.is_granted(&call.name)
+        // B4: the mode/pattern layer allows it outright (read-only in
+        // default mode, edits in acceptEdits, an allow rule from
+        // --allowedTools or settings.toml).
+        || pattern_verdict == PatternOutcome::Allow
     {
         ApprovalVerdict::AllowOnce
+    } else if matches!(pattern_verdict, PatternOutcome::Deny(_)) {
+        // A pattern deny rule (or plan mode refusing a write) is final.
+        ApprovalVerdict::Deny
     } else {
         approval.ask(
             &ApprovalRequest {
@@ -264,8 +278,15 @@ pub fn execute_call(
         "allowed by --auto-tools up-front consent"
     } else if grants.is_granted(&call.name) && !matches!(verdict, ApprovalVerdict::Deny) {
         "allowed by session R-grant"
+    } else if let PatternOutcome::Deny(r) = &pattern_verdict {
+        // B4: the mode/pattern layer denied (a deny rule, or plan mode
+        // refusing a write) — its reason is the honest one.
+        r
     } else if !interactive && !auto_tools {
-        "non-interactive tool call requires --auto-tools"
+        // B4: headless is not an error — the call needs one of the
+        // headless allow paths (--auto-tools, a rule, --allowedTools)
+        // and the denial says so.
+        "non-interactive tool call requires --auto-tools or an allow rule (--allowedTools / settings.toml)"
     } else if allowed {
         "operator approved"
     } else {
@@ -418,6 +439,74 @@ pub fn execute_call(
     };
     record_result(&mut writer, session_id, decision_id, call, status, &output)?;
     Ok(output)
+}
+
+
+/// Layer-2 outcome for the pre-check (B4): what would the mode/pattern
+/// rules say about this call?
+#[derive(PartialEq)]
+enum PatternOutcome {
+    Allow,
+    Ask,
+    Deny(String),
+}
+
+fn pattern_layer_verdict(
+    home: &Path,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> PatternOutcome {
+    use orbit_tools::permissions::{evaluate, parse_rule, PermissionMode, RuleEffectSerde, Verdict};
+
+    let mode = std::env::var("ORBIT_PERMISSION_MODE")
+        .ok()
+        .and_then(|m| PermissionMode::from_config(&m))
+        .unwrap_or_default();
+    let mut rules = orbit_tools::executor::load_rules(home);
+    if let Ok(list) = std::env::var("ORBIT_ALLOWED_TOOLS") {
+        for entry in list.split(',') {
+            if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Allow) {
+                rules.rules.push(r);
+            }
+        }
+    }
+    if let Ok(list) = std::env::var("ORBIT_DISALLOWED_TOOLS") {
+        for entry in list.split(',') {
+            if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Deny) {
+                rules.rules.push(r);
+            }
+        }
+    }
+    let Some(tool) = orbit_tools::registry()
+        .into_iter()
+        .find(|t| t.name() == tool_name)
+    else {
+        // Not a registry tool. Pure built-ins (calculator, session
+        // lookups) are safe by construction; anything else has a
+        // dedicated handler and is not pattern-governed — leave it to
+        // the whole-tool layer, which has already run.
+        if crate::tools::builtin_tools().iter().any(|t| t.name == tool_name) {
+            return PatternOutcome::Allow;
+        }
+        return PatternOutcome::Ask;
+    };
+    let key = tool.permission_key(args);
+    let is_ro_cmd = tool_name == "Bash"
+        && orbit_tools::bash::is_readonly_command(
+            args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+        );
+    match evaluate(
+        mode,
+        &rules,
+        &key.tool,
+        &key.pattern,
+        tool.read_only(),
+        is_ro_cmd,
+    ) {
+        Verdict::Allow => PatternOutcome::Allow,
+        Verdict::Ask => PatternOutcome::Ask,
+        Verdict::Deny(reason) => PatternOutcome::Deny(reason),
+    }
 }
 
 /// Display-safe summary of a tool call (name + argument keys only).
@@ -777,11 +866,13 @@ mod tests {
     }
 
     /// A session context for tests: same shape the executors build.
-    fn test_cx(home: &std::path::Path) -> orbit_tools::ToolContext {
+    /// The working dir is the given path (file tools resolve relative
+    /// paths against it).
+    fn test_cx(work_dir: &std::path::Path) -> orbit_tools::ToolContext {
         orbit_tools::ToolContext::new(
-            home.to_path_buf(),
+            work_dir.to_path_buf(),
             "test-session".into(),
-            std::env::temp_dir(),
+            work_dir.to_path_buf(),
         )
     }
 
@@ -800,7 +891,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::Deny); // shouldn't be asked
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants, &test_cx(&home)).unwrap();
+            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
         assert!(out.contains("14"));
         let mut ledger = String::new();
         for e in std::fs::read_dir(home.join("ledger/segments"))
@@ -825,15 +916,32 @@ mod tests {
     }
 
     #[test]
-    fn non_tty_denies_without_auto_tools() {
+    fn non_tty_denies_write_without_allow_path() {
+        // B4: headless denies an ask-class tool with a visible reason;
+        // read-only tools run (that is the fix, not a regression).
         let home = test_home("deny");
-        let call = make_call("calculator", br#"{"expression":"1+1"}"#);
+        let dir = home.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let call = make_call("Write", br#"{"file_path":"out.txt","content":"x"}"#);
         let mut ch = StdApprovalChannel::new(false); // non-interactive
         let mut grants = AutoGrants::new();
-        let out =
-            execute_call(&home, "s1", "d1", &call, false, false, &mut ch, &mut grants, &test_cx(&home)).unwrap();
-        assert!(out.contains("non-interactive"));
-        assert!(!out.contains("\"result\":2"));
+        let out = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            false,
+            false,
+            &mut ch,
+            &mut grants,
+            &test_cx(&dir),
+        )
+        .unwrap();
+        assert!(
+            out.contains("non-interactive"),
+            "headless ask must deny with the visible reason: {out}"
+        );
+        assert!(!dir.join("out.txt").exists());
     }
 
     #[test]
@@ -843,7 +951,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants, &test_cx(&home)).unwrap();
+            execute_call(&home, "s1", "d1", &call, true, false, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
         assert!(out.contains("unknown tool"));
     }
 
@@ -854,20 +962,32 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
+            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
         assert!(out.contains("7"));
     }
 
     #[test]
     fn deny_does_not_execute() {
         let home = test_home("deny-manual");
-        let call = make_call("calculator", br#"{"expression":"3+4"}"#);
+        let dir = home.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let call = make_call("Write", br#"{"file_path":"out.txt","content":"x"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::Deny);
         let mut grants = AutoGrants::new();
-        let out =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
+        let out = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            false,
+            true,
+            &mut ch,
+            &mut grants,
+            &test_cx(&dir),
+        )
+        .unwrap();
         assert!(out.contains("operator denied"));
-        assert!(!out.contains("\"result\":7"));
+        assert!(!dir.join("out.txt").exists());
         // D9: the ledger records a DENIED status, not error — refusal is
         // distinct from failure for audit purposes.
         let mut ledger = String::new();
@@ -886,19 +1006,33 @@ mod tests {
 
     #[test]
     fn r_grant_allows_subsequent_calls_without_prompt() {
+        // B4: R-grants apply to ask-class tools; Write asks in default
+        // mode, so the grant (not the channel) approves the second call.
         let home = test_home("r-grant");
-        let call = make_call("calculator", br#"{"expression":"5+5"}"#);
+        let dir = home.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let call = make_call("Write", br#"{"file_path":"a.txt","content":"1"}"#);
 
         // First call: R verdict → grant + execute.
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let out1 =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
-        assert!(out1.contains("10"));
-        assert!(grants.is_granted("calculator"));
+        let out1 = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            false,
+            true,
+            &mut ch,
+            &mut grants,
+            &test_cx(&dir),
+        )
+        .unwrap();
+        assert!(out1.contains("\"ok\":true"), "first write ran: {out1}");
+        assert!(grants.is_granted("Write"));
 
-        // Second call: should auto-approve from the grant (channel not asked).
-        let call2 = make_call("calculator", br#"{"expression":"6+6"}"#);
+        // Second call: auto-approved from the grant (channel not asked).
+        let call2 = make_call("Write", br#"{"file_path":"b.txt","content":"2"}"#);
         let mut ch2 = FixedChannel(ApprovalVerdict::Deny); // would deny, but shouldn't be asked
         let out2 = execute_call(
             &home,
@@ -909,33 +1043,61 @@ mod tests {
             true,
             &mut ch2,
             &mut grants,
-            &test_cx(&home),
+            &test_cx(&dir),
         )
         .unwrap();
-        assert!(out2.contains("12"), "R-grant should auto-approve");
+        assert!(
+            dir.join("b.txt").exists(),
+            "R-grant should auto-approve the second call: {out2}"
+        );
     }
 
     #[test]
     fn deny_revokes_r_grant() {
         let home = test_home("revoke");
-        let call = make_call("calculator", br#"{"expression":"1+1"}"#);
+        let dir = home.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let call = make_call("Write", br#"{"file_path":"c.txt","content":"x"}"#);
 
         // Grant via R.
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let _ = execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
-        assert!(grants.is_granted("calculator"));
+        let _ = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            false,
+            true,
+            &mut ch,
+            &mut grants,
+            &test_cx(&dir),
+        )
+        .unwrap();
+        assert!(grants.is_granted("Write"));
 
         // Revoke explicitly (the operator pressed n → revoke path).
-        grants.revoke("calculator");
-        assert!(!grants.is_granted("calculator"));
+        grants.revoke("Write");
+        assert!(!grants.is_granted("Write"));
 
         // Now the channel is asked again — deny.
         let mut ch2 = FixedChannel(ApprovalVerdict::Deny);
-        let out =
-            execute_call(&home, "s1", "d2", &call, false, true, &mut ch2, &mut grants, &test_cx(&home)).unwrap();
+        let call2 = make_call("Write", br#"{"file_path":"d.txt","content":"y"}"#);
+        let out = execute_call(
+            &home,
+            "s1",
+            "d2",
+            &call2,
+            false,
+            true,
+            &mut ch2,
+            &mut grants,
+            &test_cx(&dir),
+        )
+        .unwrap();
         assert!(out.contains("operator denied"));
-        assert!(!grants.is_granted("calculator"));
+        assert!(!dir.join("d.txt").exists());
+        assert!(!grants.is_granted("Write"));
     }
 
     #[test]
@@ -945,7 +1107,7 @@ mod tests {
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
         let out =
-            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
+            execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
         assert!(out.contains("unknown tool"));
         assert!(
             !grants.is_granted("shell"),
@@ -955,38 +1117,51 @@ mod tests {
 
     #[test]
     fn r_grant_is_per_tool() {
+        // B4: grants are per-tool-name; an R on Write does not leak to
+        // Edit. Edit asks the channel on its own.
         let home = test_home("r-per-tool");
-        let calc = make_call("calculator", br#"{"expression":"1+1"}"#);
-        let models = make_call("list_models", b"{}");
+        let dir = home.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = make_call("Write", br#"{"file_path":"e.txt","content":"x"}"#);
 
-        // Grant R on calculator.
+        // Grant R on Write.
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let _ = execute_call(&home, "s1", "d1", &calc, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
-        assert!(grants.is_granted("calculator"));
-        assert!(
-            !grants.is_granted("list_models"),
-            "R on calculator should not grant list_models"
-        );
+        let _ = execute_call(
+            &home,
+            "s1",
+            "d1",
+            &write,
+            false,
+            true,
+            &mut ch,
+            &mut grants,
+            &test_cx(&dir),
+        )
+        .unwrap();
+        assert!(grants.is_granted("Write"));
+        assert!(!grants.is_granted("Edit"), "R on Write should not grant Edit");
 
-        // list_models should still ask the channel.
+        // Edit should still ask the channel.
         let mut ch2 = FixedChannel(ApprovalVerdict::Deny);
+        let edit = make_call(
+            "Edit",
+            br#"{"file_path":"e.txt","old_string":"x","new_string":"y"}"#,
+        );
         let out = execute_call(
             &home,
             "s1",
             "d2",
-            &models,
+            &edit,
             false,
             true,
             &mut ch2,
             &mut grants,
-            &test_cx(&home),
+            &test_cx(&dir),
         )
         .unwrap();
-        assert!(
-            out.contains("operator denied"),
-            "list_models should not be auto-approved"
-        );
+        assert!(out.contains("operator denied"), "the channel must be asked");
+        assert!(!grants.is_granted("Edit"), "a Deny must not create a grant");
     }
 
     #[test]
@@ -1005,7 +1180,7 @@ mod tests {
         let call = make_call("calculator", br#"{"expression":"2+2"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let _ = execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home)).unwrap();
+        let _ = execute_call(&home, "s1", "d1", &call, false, true, &mut ch, &mut grants, &test_cx(&home.join("work"))).unwrap();
 
         let mut ledger = String::new();
         for e in std::fs::read_dir(home.join("ledger/segments"))

@@ -492,3 +492,126 @@ fn scenario_a1_anthropic_wire() {
         "input_tokens parsed from message_start.usage (B7)"
     );
 }
+
+// ── P1: the permission matrix ──────────────────────────────────────
+// Fails on 1310e73-era code: B4 (two contradicting layers — read-only
+// tools ask, --allowedTools without --auto-tools is refused, acceptEdits
+// denies everything, bypass ignores deny rules).
+
+#[test]
+fn scenario_p1_permission_matrix() {
+    let read_then_write: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [
+                {"name": "Read", "args": {"file_path": "calc.py"}},
+                {"name": "Write", "args": {"file_path": "out.txt", "content": "x"}}]},
+            {"text": "done"}]
+    });
+
+    // (a) default headless: Read (read-only, in the working dir) RUNS;
+    // Write is denied with a visible reason, and out.txt never appears.
+    {
+        let fix = Fixture::failing_test();
+        let mock = Mock::start(&read_then_write, "openai");
+        let home = Home::init(&mock, "openai", "");
+        let (events, _c) = run_p(&mock, &home, &fix.path, "go", &[]);
+        let log = serde_json::to_string(&mock.requests()).unwrap();
+        assert!(
+            log.contains("calc.py"),
+            "default headless: Read must run without asking (B4)"
+        );
+        assert!(
+            !fix.path.join("out.txt").exists(),
+            "default headless: Write must be denied (B4)"
+        );
+        assert!(
+            log.contains("denied") || log.contains("--allowedTools") || log.contains("--auto-tools"),
+            "a headless denial must carry a visible reason (C4/B4)"
+        );
+        let _ = events;
+    }
+
+    // (b) --allowedTools Read works WITHOUT --auto-tools: Read runs,
+    // Write (not listed) is denied.
+    {
+        let fix = Fixture::failing_test();
+        let mock = Mock::start(&read_then_write, "openai");
+        let home = Home::init(&mock, "openai", "");
+        let (events, _c) = run_p(
+            &mock,
+            &home,
+            &fix.path,
+            "go",
+            &["--allowedTools", "Read"],
+        );
+        let log = serde_json::to_string(&mock.requests()).unwrap();
+        assert!(
+            log.contains("calc.py"),
+            "--allowedTools Read must allow Read without --auto-tools (B4)"
+        );
+        assert!(
+            !fix.path.join("out.txt").exists(),
+            "an unlisted write tool must stay denied (B4)"
+        );
+        let _ = events;
+    }
+
+    // (c) acceptEdits headless: Write inside the working directory RUNS.
+    {
+        let fix = Fixture::failing_test();
+        let mock = Mock::start(&read_then_write, "openai");
+        let home = Home::init(&mock, "openai", "");
+        let (_events, _c) = run_p(
+            &mock,
+            &home,
+            &fix.path,
+            "go",
+            &["--permission-mode", "acceptEdits"],
+        );
+        assert!(
+            fix.path.join("out.txt").exists(),
+            "acceptEdits must let Write run in the working directory (B4)"
+        );
+    }
+
+    // (d) plan mode headless: read-only runs, writes denied.
+    {
+        let fix = Fixture::failing_test();
+        let mock = Mock::start(&read_then_write, "openai");
+        let home = Home::init(&mock, "openai", "");
+        let (_events, _c) = run_p(
+            &mock,
+            &home,
+            &fix.path,
+            "go",
+            &["--permission-mode", "plan"],
+        );
+        let log = serde_json::to_string(&mock.requests()).unwrap();
+        assert!(
+            log.contains("calc.py"),
+            "plan mode: Read runs (B4)"
+        );
+        assert!(
+            !fix.path.join("out.txt").exists(),
+            "plan mode: Write is denied (B4)"
+        );
+    }
+
+    // (e) deny rules bind even under --auto-tools (bypass runs
+    // everything EXCEPT deny rules).
+    {
+        let fix = Fixture::failing_test();
+        let mock = Mock::start(&read_then_write, "openai");
+        let home = Home::init(&mock, "openai", "");
+        std::fs::write(
+            home.path.join("settings.toml"),
+            "[permissions]\ndeny = [\n  \"Write\",\n]\n",
+        )
+        .unwrap();
+        let (_events, _c) = run_p(&mock, &home, &fix.path, "go", &["--auto-tools"]);
+        assert!(
+            !fix.path.join("out.txt").exists(),
+            "a deny rule must bind even under --auto-tools (B4)"
+        );
+    }
+}
