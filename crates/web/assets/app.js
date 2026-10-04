@@ -112,7 +112,7 @@ function toast(text, isError) {
 function showApproval() {
   const next = S.pendingApprovals[0];
   if (!next) { $("approval-modal").hidden = true; S.approvalModalOpen = false; return; }
-  $("ap-tool").textContent = next.name;
+  $("ap-tool").textContent = next.tool_name || next.name;
   $("ap-summary").textContent = next.summary;
   $("approval-modal").hidden = false;
   S.approvalModalOpen = true;
@@ -146,27 +146,27 @@ function connect() {
     setStatus();
   });
   on("resumed", (d) => { S.turns = d.turns ?? 0; S.cost = d.cost_microcents ?? null; setStatus(); });
-  on("delta", (d) => {
+  on("text_delta", (d) => {
     S.busy = true; setStatus();
     const body = ensureStreaming();
     body.insertBefore(document.createTextNode(d.text), body.lastChild);
     scrollDown();
   });
-  on("cost", (d) => { S.input = d.input_tokens; S.output = d.output_tokens; setStatus(); });
-  on("tool_call_started", (d) => {
+  on("cost_updated", (d) => { S.cost = d.total_microcents ?? S.cost; setStatus(); });
+  on("tool_started_full", (d) => {
     const card = el("div", "tool-card");
     card.dataset.callId = d.call_id;
-    card.appendChild(el("span", "name", `⚙ ${d.name}`));
+    card.appendChild(el("span", "name", `⚙ ${d.tool_name || d.name}`));
     card.appendChild(document.createTextNode(` ${d.summary}`));
     $("transcript").appendChild(card);
     scrollDown();
   });
-  S.es.addEventListener("approval", (e) => {
+  S.es.addEventListener("approval_requested", (e) => {
     const d = JSON.parse(e.data || "{}");
     S.pendingApprovals.push(d);
     showApproval();
   });
-  on("tool_call_finished", (d) => {
+  on("tool_finished_full", (d) => {
     const card = document.querySelector(`.tool-card[data-call-id="${CSS.escape(d.call_id)}"]`);
     if (card) {
       card.classList.add(d.ok ? "finished-ok" : "finished-err");
@@ -210,14 +210,13 @@ function connect() {
     addMsg("system", d.message || "error");
     toast(d.message || "error", true);
   });
-  on("finished", (d) => {
-    finishStreaming(d.output || "");
+  on("response_finished", (d) => { finishStreaming(d.output || ""); });
+  on("turn_ended", (d) => {
     S.busy = false;
-    if (d.cancelled) addMsg("system", "cancelled");
+    if (d.interrupted) addMsg("system", "cancelled");
     S.input = d.input_tokens ?? S.input;
     S.output = d.output_tokens ?? S.output;
     S.cost = d.cost_microcents ?? S.cost;
-    S.turns = d.turns ?? S.turns;
     setStatus();
   });
 

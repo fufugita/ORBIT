@@ -14,8 +14,8 @@ Checks:
   2. /static assets serve with correct MIME
   3. SSE stream delivers `identity` on connect
   4. WS `list_sessions` → `sessions` event
-  5. WS prompt → deltas stream → `finished` with usage
-  6. WS prompt with tool call → `approval` event → approve → finished
+  5. WS prompt → text_delta stream → `turn_ended` with usage
+  6. WS prompt with tool call → `approval` event → approve → turn_ended
   7. `list_sessions` shows the saved session after turns
   8. token gate: second server with token refuses unauthenticated SSE
 """
@@ -199,7 +199,7 @@ class SSEClient:
             return "".join(
                 json.loads(d).get("text", "")
                 for e, d in self.events
-                if e == "delta"
+                if e == "text_delta"
             )
 
 
@@ -281,28 +281,28 @@ def main():
         # ── 4. Prompt → stream → finished ──────────────────────────────
         print("\n== turn: stream ==")
         ws.send({"type": "prompt", "text": "hello from the browser test"})
-        fin = sse.wait_for("finished", timeout=30, pred=lambda d: not d.get("cancelled", False))
-        check("finished event", fin is not None, "no finished within 30s")
+        fin = sse.wait_for("turn_ended", timeout=30, pred=lambda d: d.get("ok", False))
+        check("turn_ended event", fin is not None, "no turn_ended within 30s")
         deltas = sse.collect_deltas(0)
-        check("deltas streamed", len(deltas) > 0, "no delta events")
+        check("deltas streamed", len(deltas) > 0, "no text_delta events")
         if fin:
-            check("usage reported", "input_tokens" in fin and "turns" in fin)
+            check("usage reported", "input_tokens" in fin and "output_tokens" in fin)
 
         # ── 5. Tool call → approval → finished ─────────────────────────
         print("\n== turn: approval ==")
         # The "mock" model issues a tool call (same as the TUI suite).
-        ws.send({"type": "set_model", "model": "mock"})
+        ws.send({"type": "set_model", "model": "mock-bash"})
         sse.wait_for("model_changed", timeout=10)
         ws.send({"type": "prompt", "text": "use a tool please"})
-        ap_ev = sse.wait_for("approval", timeout=30)
+        ap_ev = sse.wait_for("approval_requested", timeout=30)
         check("approval event", ap_ev is not None and "call_id" in ap_ev, str(ap_ev))
         if ap_ev:
             check("approval has summary", bool(ap_ev.get("summary")))
             ws.send({"type": "approve", "call_id": ap_ev["call_id"], "verdict": "allow"})
-            fin2 = sse.wait_for("finished", timeout=30)
+            fin2 = sse.wait_for("turn_ended", timeout=30)
             check("turn finished after approval", fin2 is not None)
-            tools = [e for e, _ in sse.events if e == "tool_call_started"]
-            check("tool_call_started emitted", len(tools) >= 1)
+            tools = [e for e, _ in sse.events if e == "tool_started_full"]
+            check("tool_started_full emitted", len(tools) >= 1)
 
         # ── 6. Session persisted ───────────────────────────────────────
         print("\n== persistence ==")

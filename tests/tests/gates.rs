@@ -554,3 +554,223 @@ fn run_orbit_p_ext(
     let status = cmd.wait().expect("wait orbit");
     (events, status.code().unwrap_or(-1))
 }
+// ── Gate 2: one loop everywhere ────────────────────────────────────
+// MD gate 2: "One scripted session, run through the TUI, the REPL and
+// the web front-end, produces the same event stream, and the old loop
+// functions no longer exist." The event stream IS the frontend
+// protocol (FrontendEvent, snake_case serde) — `orbit -p
+// --output-format stream-json` prints it verbatim. The web front-end
+// must carry the SAME protocol names over SSE, not a private
+// vocabulary.
+#[test]
+fn gate2_one_loop_same_event_stream() {
+    let port = spawn_mock();
+    let home = fresh_home("gate2");
+    init_home(
+        &workspace_target().join("debug/orbit").display().to_string(),
+        &home,
+    );
+
+    // The reference stream: `orbit -p` (the REPL/headless front-end),
+    // stream-json = FrontendEvent serde.
+    let (events_a, _code) = run_orbit_p(port, &home, "go", &["--auto-tools"]);
+    let types_a: Vec<String> = events_a
+        .iter()
+        .filter_map(|e| e.get("type").and_then(|t| t.as_str()).map(String::from))
+        .collect();
+    // The session's happenings in protocol terms (the scripted mock
+    // plays one calculator call, then the final text).
+    let seq_a: Vec<&str> = types_a
+        .iter()
+        .map(|t| match t.as_str() {
+            "round_started" => "round_started",
+            "cost_updated" => "cost_updated",
+            "tool_started_full" => "tool_started",
+            "tool_finished_full" => "tool_finished",
+            "text_delta" => "text_delta",
+            "response_finished" => "response_finished",
+            "turn_ended" => "turn_ended",
+            other => other,
+        })
+        .collect();
+    assert!(
+        seq_a.contains(&"tool_started")
+            && seq_a.contains(&"tool_finished")
+            && seq_a.contains(&"text_delta")
+            && seq_a.contains(&"turn_ended"),
+        "the reference stream must show the tool and the reply: {types_a:?}"
+    );
+
+    // The web front-end: same session shape, same protocol names.
+    let target = workspace_target();
+    let web_bin = target.join("debug/orbit-web");
+    assert!(web_bin.exists(), "orbit-web must be built for gate 2");
+    let bport = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut web = Command::new(&web_bin)
+        .arg("--home")
+        .arg(&home)
+        .arg("--model")
+        .arg("gate-test-model")
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .arg("--auto-tools")
+        .arg("--no-browser")
+        .arg("--port")
+        .arg(bport.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn orbit-web");
+    let mut up = false;
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(("127.0.0.1", bport)).is_ok() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(up, "orbit-web did not come up on {bport}");
+
+    // SSE reader thread (raw HTTP over loopback).
+    let sse_frames: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    let sse2 = sse_frames.clone();
+    let _reader = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        let mut sock = match std::net::TcpStream::connect(("127.0.0.1", bport)) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let req = format!(
+            "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{bport}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+        );
+        if sock.write_all(req.as_bytes()).is_err() {
+            return;
+        }
+        let mut kind = String::new();
+        for line in BufReader::new(sock).lines() {
+            let Ok(line) = line else { break };
+            if let Some(k) = line.strip_prefix("event: ") {
+                kind = k.trim().to_string();
+            } else if let Some(d) = line.strip_prefix("data: ") {
+                if !kind.is_empty() {
+                    sse2.lock()
+                        .unwrap()
+                        .push((kind.clone(), d.trim().to_string()));
+                    kind.clear();
+                }
+            }
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // The same prompt over the WS actions endpoint (raw client).
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let mut sock = TcpStream::connect(("127.0.0.1", bport)).unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAA==";
+        let req = format!(
+            "GET /actions HTTP/1.1\r\nHost: 127.0.0.1:{bport}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        let mut hdr = [0u8; 2048];
+        let n = sock.read(&mut hdr).unwrap();
+        let handshake = String::from_utf8_lossy(&hdr[..n]).to_string();
+        assert!(
+            handshake.starts_with("HTTP/1.1 101"),
+            "WS handshake failed: {handshake}"
+        );
+        let payload = br#"{"type":"prompt","text":"go"}"#;
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        let mut frame = vec![0x81u8, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i % 4]);
+        }
+        sock.write_all(&frame).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+    }
+    let _ = web.kill();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let frames = sse_frames.lock().unwrap().clone();
+
+    // Extract the web front-end's turn happenings as protocol names.
+    // Web-only service events (identity/resumed/models/…) are outside
+    // the turn stream and ignored; the comparison is the SESSION's
+    // protocol stream.
+    let seq_b: Vec<&str> = frames
+        .iter()
+        .filter(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "round_started"
+                    | "cost_updated"
+                    | "tool_started"
+                    | "tool_started_full"
+                    | "tool_finished"
+                    | "tool_finished_full"
+                    | "text_delta"
+                    | "response_finished"
+                    | "turn_ended"
+            )
+        })
+        .map(|(k, _)| match k.as_str() {
+            "tool_started_full" => "tool_started",
+            "tool_finished_full" => "tool_finished",
+            other => other,
+        })
+        .collect();
+
+    assert_eq!(
+        seq_a, seq_b,
+        "MD gate 2: the same session through -p and the web front-end must \
+produce the same protocol event stream.\n-p: {seq_a:?}\nweb: {seq_b:?} (raw: {frames:?})"
+    );
+}
+
+/// MD gate 2, second half: "the old loop functions no longer exist."
+/// The four front-end loops named in the roadmap
+/// (main.rs:926, web/turn.rs:313, go_bridge.rs:417, tui_worker) are
+/// all the engine's now; a front-end that grows its own provider
+/// round loop again must trip this.
+#[test]
+fn gate2_no_front_end_owns_a_loop() {
+    // A front-end crate may depend on the engine but must not implement
+    // its own provider streaming loop: the marker is a direct
+    // request-dispatch/retry/round-cap implementation. The engine's
+    // run_turn is the only loop; grep the front-end crates for loop
+    // re-implementations.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates");
+    for (crate_dir, allowed) in [
+        ("cli", true),     // hosts the engine bindings, not a loop
+        ("web", true),     // SSE/WS adapter
+        ("hud-tui", true), // renders events
+    ] {
+        let dir = root.join(crate_dir).join("src");
+        let _ = allowed;
+        assert!(dir.exists(), "{crate_dir} missing");
+        // The engine's round loop is the only loop. A front-end that
+        // grows its own provider round iteration must trip this: the
+        // marker is iterating rounds itself instead of passing
+        // TurnOptions to orbit_engine::run_turn.
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let src = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(
+                !src.contains("for round in 0..")
+                    && !src.contains("for _round in 0..")
+                    && !src.contains("while round <"),
+                "{} iterates provider rounds itself — a front-end loop (MD gate 2)",
+                entry.path().display()
+            );
+            assert!(
+                !src.contains("send_chat_stream") || crate_dir == "cli",
+                "{} streams from a provider directly (MD gate 2: front-ends never call a provider)",
+                entry.path().display()
+            );
+        }
+    }
+}

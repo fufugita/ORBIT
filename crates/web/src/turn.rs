@@ -68,6 +68,42 @@ pub fn run_bridge(config: BridgeConfig) -> i32 {
     0
 }
 
+/// The protocol wire name of a FrontendEvent (its serde tag) — used as
+/// the SSE event kind so the browser sees protocol names verbatim.
+fn protocol_kind(ev: &orbit_frontend_protocol::FrontendEvent) -> &'static str {
+    use orbit_frontend_protocol::FrontendEvent as E;
+    match ev {
+        E::TextDelta { .. } => "text_delta",
+        E::ResponseFinished { .. } => "response_finished",
+        E::ToolStarted { .. } => "tool_started",
+        E::ToolFinished { .. } => "tool_finished",
+        E::CostUpdated { .. } => "cost_updated",
+        E::WorkspaceUpdate(_) => "workspace_update",
+        E::ApprovalRequested { .. } => "approval_requested",
+        E::ApprovalResolved { .. } => "approval_resolved",
+        E::ConnectionChanged(_) => "connection_changed",
+        E::Identity(_) => "identity",
+        E::Error { .. } => "error",
+        E::Status { .. } => "status",
+        E::RoundStarted { .. } => "round_started",
+        E::TurnEnded { .. } => "turn_ended",
+        E::Retrying { .. } => "retrying",
+        E::OutputTruncated { .. } => "output_truncated",
+        E::Compacting { .. } => "compacting",
+        E::Compacted { .. } => "compacted",
+        E::ToolStartedFull { .. } => "tool_started_full",
+        E::ToolOutput { .. } => "tool_output",
+        E::ToolFinishedFull { .. } => "tool_finished_full",
+        E::FileChanged { .. } => "file_changed",
+        E::SubagentStarted { .. } => "subagent_started",
+        E::SubagentProgress { .. } => "subagent_progress",
+        E::SubagentFinished { .. } => "subagent_finished",
+        E::ModeChanged { .. } => "mode_changed",
+        E::Usage { .. } => "usage",
+        E::LedgerAppended { .. } => "ledger_appended",
+    }
+}
+
 /// The turn loop — same structure as go_bridge's main loop.
 fn turn_loop(
     state: BridgeState,
@@ -143,20 +179,12 @@ fn turn_loop(
                 cum_input = cum_input.saturating_add(input);
                 cum_output = cum_output.saturating_add(output);
                 cum_cost = cum_cost.saturating_add(cost);
-                // Doc protocol: `cancelled` is its own event, fired before
-                // `finished` so the client can stamp the turn either way.
+                // MD gate 2: the engine's turn_ended (with the real
+                // rounds count) already crossed through the adapter.
+                // `cancelled` stays as a browser service nicety.
                 if !ok {
                     state.emit("cancelled", serde_json::json!({}));
                 }
-                state.emit(
-                    "finished",
-                    serde_json::json!({
-                        "input_tokens": cum_input,
-                        "output_tokens": cum_output,
-                        "cost_microcents": cum_cost,
-                        "turns": turns,
-                    }),
-                );
                 // D9: cumulative save, same as the TUI worker.
                 let sf = orbit_cli::sessions::SessionFile::from_chat(
                     &config.session_id,
@@ -289,9 +317,12 @@ fn run_web_turn(
         pricing,
     );
 
-    // Event adapter: FrontendEvent → SSE. Same bridge as before: CoT
-    // stripper (D6) + glyph sanitize + display_safe (H-3). The browser
-    // never sees raw reasoning or unsafe bytes.
+    // Event adapter: FrontendEvent → SSE, verbatim (MD gate 2: ONE
+    // event stream — the protocol is every front-end's shared
+    // vocabulary). The display-safety pipeline stays (CoT strip, glyph
+    // sanitize, display gate): the browser never sees raw reasoning or
+    // unsafe bytes. Events pass through under their protocol names
+    // with their protocol payloads; nothing is renamed.
     let mut cot = orbit_hud_tui::CotStripper::new();
     let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
         use orbit_frontend_protocol::FrontendEvent as E;
@@ -299,54 +330,26 @@ fn run_web_turn(
             E::TextDelta { text } => {
                 let stripped = cot.push(&text);
                 let sanitized = orbit_hud_tui::sanitize_glyphs(&stripped);
-                // D7: probe, don't coerce — a rejected chunk emits the chip
-                // naming the gate, never the text.
+                // D7: probe, don't coerce — a rejected chunk emits the
+                // chip naming the gate, never the text.
                 if !orbit_hud_tui::safe_text_probe(&sanitized) {
                     state.emit("redacted", serde_json::json!({ "kind": "display_gate" }));
                     return;
                 }
-                state.emit("delta", serde_json::json!({ "text": sanitized }));
+                state.emit("text_delta", serde_json::json!({ "text": sanitized }));
             }
-            E::CostUpdated { total_microcents } => {
-                state.emit(
-                    "cost",
-                    serde_json::json!({
-                        "microcents": total_microcents,
-                    }),
-                );
+            other => {
+                // Everything else crosses under its protocol name, with
+                // its protocol payload (serde tag = "type",
+                // snake_case — the same wire form `orbit -p
+                // --output-format stream-json` prints).
+                let kind = protocol_kind(&other);
+                let payload =
+                    serde_json::to_value(&other).unwrap_or_else(|_| serde_json::json!({}));
+                // The payload carries its own "type"; the SSE event name
+                // is the same string.
+                state.emit(kind, payload);
             }
-            E::ToolStarted { name, summary } => {
-                state.emit(
-                    "tool_call_started",
-                    serde_json::json!({
-                        "name": name,
-                        "summary": summary,
-                    }),
-                );
-            }
-            E::OutputTruncated { .. } => {
-                state.emit(
-                    "error",
-                    serde_json::json!({ "message": "reply cut off by the output-token limit" }),
-                );
-            }
-            E::Retrying {
-                attempt,
-                retry_in_ms,
-                reason,
-            } => {
-                state.emit(
-                    "status",
-                    serde_json::json!({ "text": format!("retry {attempt} in {retry_in_ms}ms — {reason}") }),
-                );
-            }
-            E::Error { message } => {
-                state.emit("error", serde_json::json!({ "message": message }));
-            }
-            E::Status { text } => {
-                state.emit("status", serde_json::json!({ "text": text }));
-            }
-            _ => {}
         }
     };
 
@@ -414,17 +417,8 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
     ) -> Vec<orbit_engine::ToolRoundResult> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
-            let args = orbit_cli::tools::parse_arguments(&call.arguments)
-                .unwrap_or(serde_json::Value::Null);
-            let summary = orbit_cli::tools::safe_call_summary(&call.name, &args);
-            self.state.emit(
-                "tool_call_started",
-                serde_json::json!({
-                    "call_id": call.id,
-                    "name": call.name,
-                    "summary": summary,
-                }),
-            );
+            // MD gate 2: no private tool events — the engine's
+            // tool_started_full / tool_finished_full ARE the stream.
             // Per-call ULID decision ids (defect fix: the old
             // `tool-round-{round}-{index}` ids repeated every turn).
             let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
@@ -444,15 +438,8 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
                 &self.tool_cx,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
-            let ok = result.contains("\"ok\":true");
-            self.state.emit(
-                "tool_call_finished",
-                serde_json::json!({
-                    "call_id": call.id,
-                    "name": call.name,
-                    "ok": ok,
-                }),
-            );
+            let _ok = result.contains("\"ok\":true");
+            // MD gate 2: the engine's tool_finished_full IS the stream.
             results.push(orbit_engine::ToolRoundResult {
                 call_id: call.id.clone(),
                 content: result,

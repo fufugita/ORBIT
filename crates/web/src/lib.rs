@@ -216,12 +216,14 @@ impl orbit_cli::tool_runtime::ApprovalChannel for WebApprovalChannel {
         _auto_tools: bool,
     ) -> orbit_cli::tool_runtime::ApprovalVerdict {
         use orbit_cli::tool_runtime::ApprovalVerdict;
-        // Surface the card first — the browser renders the modal from this.
+        // Surface the card first — the browser renders the modal from
+        // this. MD gate 2: protocol name + protocol payload
+        // (ApprovalRequested: tool_name, not name).
         self.state.emit(
-            "approval",
+            "approval_requested",
             serde_json::json!({
                 "call_id": req.call_id,
-                "name": req.tool_name,
+                "tool_name": req.tool_name,
                 "summary": req.summary,
                 "risk": req.risk.level(),
             }),
