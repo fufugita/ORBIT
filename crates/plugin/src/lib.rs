@@ -280,6 +280,38 @@ impl PluginRegistry {
 
 pub use runtime::PluginRuntime;
 
+/// A signer for packagers (the mod author's side of the flow): build
+/// a signed manifest for a package's bytes. The CLI's `mod install`
+/// verifies what this produces.
+pub fn sign_manifest(
+    name: &str,
+    version: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    package_bytes: &[u8],
+    declared_imports: Vec<String>,
+) -> PluginManifest {
+    use ed25519_dalek::Signer;
+    let content_digest = hex::encode(Sha256::digest(package_bytes));
+    let issuer_public_key = hex::encode(signing_key.verifying_key().to_bytes());
+    let unsigned = PluginManifestUnsigned {
+        name: name.into(),
+        version: version.into(),
+        issuer_public_key: issuer_public_key.clone(),
+        content_digest: content_digest.clone(),
+        declared_imports: declared_imports.clone(),
+    };
+    let bytes = crate::canonical::canonical_bytes(&unsigned).expect("canonical");
+    let sig = signing_key.sign(&bytes);
+    PluginManifest {
+        name: name.into(),
+        version: version.into(),
+        issuer_public_key,
+        content_digest,
+        signature: hex::encode(sig.to_bytes()),
+        declared_imports,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,37 +408,5 @@ mod tests {
         reg.release_instance();
         assert_eq!(reg.in_use(), 63);
         assert!(reg.reserve_instance().is_ok());
-    }
-}
-
-/// A signer for packagers (the mod author's side of the flow): build
-/// a signed manifest for a package's bytes. The CLI's `mod install`
-/// verifies what this produces.
-pub fn sign_manifest(
-    name: &str,
-    version: &str,
-    signing_key: &ed25519_dalek::SigningKey,
-    package_bytes: &[u8],
-    declared_imports: Vec<String>,
-) -> PluginManifest {
-    use ed25519_dalek::Signer;
-    let content_digest = hex::encode(Sha256::digest(package_bytes));
-    let issuer_public_key = hex::encode(signing_key.verifying_key().to_bytes());
-    let unsigned = PluginManifestUnsigned {
-        name: name.into(),
-        version: version.into(),
-        issuer_public_key: issuer_public_key.clone(),
-        content_digest: content_digest.clone(),
-        declared_imports: declared_imports.clone(),
-    };
-    let bytes = crate::canonical::canonical_bytes(&unsigned).expect("canonical");
-    let sig = signing_key.sign(&bytes);
-    PluginManifest {
-        name: name.into(),
-        version: version.into(),
-        issuer_public_key,
-        content_digest,
-        signature: hex::encode(sig.to_bytes()),
-        declared_imports,
     }
 }

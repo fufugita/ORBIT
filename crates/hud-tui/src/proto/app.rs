@@ -86,7 +86,9 @@ impl App {
     }
 
     fn conversation_index(tree: &Node) -> Option<usize> {
-        tree.leaves().iter().position(|(_, v)| *v == View::Conversation)
+        tree.leaves()
+            .iter()
+            .position(|(_, v)| *v == View::Conversation)
     }
 
     /// Panel count (1–9; splits refuse to exceed 9).
@@ -335,15 +337,23 @@ impl App {
             .collect();
             let block = ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
-                .border_style(ratatui::style::Style::default().fg(
-                    super::comps::colour(super::core::Token::Cyan),
-                ));
+                .border_style(
+                    ratatui::style::Style::default()
+                        .fg(super::comps::colour(super::core::Token::Cyan)),
+                );
             f.render_widget(ratatui::widgets::Clear, r);
-            f.render_widget(
-                ratatui::widgets::Paragraph::new(lines).block(block),
-                r,
-            );
+            f.render_widget(ratatui::widgets::Paragraph::new(lines).block(block), r);
         }
+    }
+}
+
+// A tiny extension the app needs from the star clock: the current
+// glyph for a scenario at the app's tick.
+impl StarClock {
+    fn glyph_now(&self, scenario: &Scenario, _reduced: bool) -> super::anim::StarGlyph {
+        let state = scenario.star_state();
+        let mut c = *self;
+        c.tick(0, state)
     }
 }
 
@@ -468,7 +478,11 @@ mod tests {
         let text: String = (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol().to_string())
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .map(|c| c.symbol().to_string())
+                            .unwrap_or_default()
+                    })
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
@@ -477,15 +491,5 @@ mod tests {
         assert!(text.contains("Conversation"));
         assert!(text.contains("Terminal"));
         let _ = std::fs::remove_dir_all(&home);
-    }
-}
-
-// A tiny extension the app needs from the star clock: the current
-// glyph for a scenario at the app's tick.
-impl StarClock {
-    fn glyph_now(&self, scenario: &Scenario, _reduced: bool) -> super::anim::StarGlyph {
-        let state = scenario.star_state();
-        let mut c = *self;
-        c.tick(0, state)
     }
 }

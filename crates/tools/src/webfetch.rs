@@ -48,7 +48,10 @@ impl Tool for WebFetchTool {
             .and_then(|u| url::Url::parse(u).ok())
             .and_then(|u| u.host_str().map(String::from))
             .unwrap_or_default();
-        crate::PermissionKey { tool: "WebFetch".into(), pattern: domain }
+        crate::PermissionKey {
+            tool: "WebFetch".into(),
+            pattern: domain,
+        }
     }
     fn run(&self, args: &serde_json::Value, cx: &ToolContext) -> ToolResult {
         let raw = args
@@ -76,8 +79,7 @@ impl Tool for WebFetchTool {
                 || h == "::1"
                 || h.starts_with("10.")
                 || h.starts_with("192.168.")
-                || h
-                    .strip_prefix("172.")
+                || h.strip_prefix("172.")
                     .and_then(|r| r.split('.').next())
                     .and_then(|n| n.parse::<u8>().ok())
                     .is_some_and(|n| (16..=31).contains(&n))
@@ -138,17 +140,26 @@ impl Tool for WebFetchTool {
                     .timeout(Duration::from_secs(30))
                     .build()
                     .map_err(|e| e.to_string())?;
-                let resp = client.get(fetch_url.clone()).send().await.map_err(|e| e.to_string())?;
+                let resp = client
+                    .get(fetch_url.clone())
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let status = resp.status();
                 // Cross-host redirect: return it, do not follow.
                 if status.is_redirection() {
-                    if let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
+                    if let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok())
+                    {
                         let next = fetch_url.join(loc).map_err(|e| e.to_string())?;
                         if next.host_str() != fetch_url.host_str() {
                             return Ok((format!("{next}"), String::new(), true));
                         }
                         // same-host redirect: one follow is enough
-                        let resp2 = client.get(next.clone()).send().await.map_err(|e| e.to_string())?;
+                        let resp2 = client
+                            .get(next.clone())
+                            .send()
+                            .await
+                            .map_err(|e| e.to_string())?;
                         if !resp2.status().is_success() {
                             return Err(format!("HTTP {}", resp2.status()));
                         }
@@ -217,7 +228,13 @@ fn record_egress_grant(cx: &ToolContext, domain: &str, first_url: &str) {
     }
     let safe: String = domain
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

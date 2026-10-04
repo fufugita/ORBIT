@@ -8,8 +8,9 @@
 use super::comps;
 use super::core::{glyphs, Token};
 use super::layout::View;
-use super::scenario::{LineKind, Scenario, TranscriptLine};
-use ratatui::buffer::Buffer;
+#[cfg(test)]
+use super::scenario::TranscriptLine;
+use super::scenario::{LineKind, Scenario};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -51,6 +52,7 @@ pub fn frame(n: u8, view: View, focused: bool) -> Block<'static> {
 
 /// One panel's render: the frame plus the view's content, clipped to
 /// the inner rect.
+#[allow(clippy::too_many_arguments)]
 pub fn render_panel(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -85,10 +87,10 @@ fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
     // empty, replaced by the first output with no transition.
     if s.transcript.is_empty() {
         let w = super::welcome::Welcome {
-            tier: super::welcome::BrandTier::Static,
-            first_prompt_waiting: s.turn_live,
+            tier: s.brand_tier,
+            first_prompt_waiting: s.first_prompt_waiting,
         };
-        return w.lines();
+        return w.lines(tick);
     }
     // The transcript tail: every visible line of the session — user
     // prompts, model replies, tool lines — rendered with the kind's
@@ -98,7 +100,10 @@ fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
         match l.kind {
             LineKind::User => out.push(Line::from(vec![
                 Span::styled("❯ ", Style::default().fg(comps::colour(Token::Cyan))),
-                Span::styled(l.text.clone(), Style::default().fg(comps::colour(Token::Ink))),
+                Span::styled(
+                    l.text.clone(),
+                    Style::default().fg(comps::colour(Token::Ink)),
+                ),
             ])),
             LineKind::Model => out.push(Line::from(Span::styled(
                 l.text.clone(),
@@ -106,12 +111,24 @@ fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
             ))),
             LineKind::Tool => out.push(Line::from(vec![
                 Span::styled("◆ ", Style::default().fg(comps::colour(Token::Magenta))),
-                Span::styled(l.text.clone(), Style::default().fg(comps::colour(Token::Muted))),
+                Span::styled(
+                    l.text.clone(),
+                    Style::default().fg(comps::colour(Token::Muted)),
+                ),
             ])),
             LineKind::System => out.push(Line::from(Span::styled(
                 l.text.clone(),
                 Style::default().fg(comps::colour(Token::Muted)),
             ))),
+            // The queued row (§9.12): ◌ + the prompt, muted — it
+            // becomes a user turn at its TurnStarted.
+            LineKind::Queued => out.push(Line::from(vec![
+                Span::styled("◌ ", Style::default().fg(comps::colour(Token::Rule))),
+                Span::styled(
+                    l.text.clone(),
+                    Style::default().fg(comps::colour(Token::Muted)),
+                ),
+            ])),
         }
     }
     // The live indicators: thinking (no visible output yet) or
@@ -121,7 +138,10 @@ fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
     }
     if s.turn_live && s.visible_output {
         out.push(Line::from(vec![
-            Span::styled("▌streaming", Style::default().fg(comps::colour(Token::Cyan))),
+            Span::styled(
+                "▌streaming",
+                Style::default().fg(comps::colour(Token::Cyan)),
+            ),
             comps::caret(tick, s.last_data_ms, reduced),
         ]));
     }
@@ -132,7 +152,9 @@ fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
 fn changes(s: &Scenario) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         "Changes",
-        Style::default().fg(comps::colour(Token::Violet)).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(comps::colour(Token::Violet))
+            .add_modifier(Modifier::BOLD),
     ))];
     if s.file_changes.is_empty() {
         out.push(Line::from(Span::styled(
@@ -144,7 +166,7 @@ fn changes(s: &Scenario) -> Vec<Line<'static>> {
         out.push(Line::from(vec![
             Span::styled("~ ", Style::default().fg(comps::colour(Token::Violet))),
             Span::styled(
-                format!("{}", fc.path),
+                fc.path.to_string(),
                 Style::default().fg(comps::colour(Token::Blue)),
             ),
             Span::styled(
@@ -160,7 +182,9 @@ fn changes(s: &Scenario) -> Vec<Line<'static>> {
 fn terminal(s: &Scenario) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         "Terminal",
-        Style::default().fg(comps::colour(Token::Amber)).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(comps::colour(Token::Amber))
+            .add_modifier(Modifier::BOLD),
     ))];
     let tail: Vec<String> = s.tool_output.iter().rev().take(3).cloned().collect();
     for line in tail.iter().rev() {
@@ -176,7 +200,9 @@ fn terminal(s: &Scenario) -> Vec<Line<'static>> {
 fn plan(s: &Scenario) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         "Plan",
-        Style::default().fg(comps::colour(Token::Green)).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(comps::colour(Token::Green))
+            .add_modifier(Modifier::BOLD),
     ))];
     if s.tasks.is_empty() {
         out.push(Line::from(Span::styled(
@@ -197,7 +223,10 @@ fn plan(s: &Scenario) -> Vec<Line<'static>> {
         };
         out.push(Line::from(vec![
             Span::styled(format!("{g} "), Style::default().fg(comps::colour(token))),
-            Span::styled(t.title.clone(), Style::default().fg(comps::colour(Token::Ink))),
+            Span::styled(
+                t.title.clone(),
+                Style::default().fg(comps::colour(Token::Ink)),
+            ),
         ]));
     }
     out
@@ -207,7 +236,9 @@ fn plan(s: &Scenario) -> Vec<Line<'static>> {
 fn activity(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         "Activity",
-        Style::default().fg(comps::colour(Token::Cyan)).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(comps::colour(Token::Cyan))
+            .add_modifier(Modifier::BOLD),
     ))];
     if s.running.is_empty() {
         out.push(Line::from(Span::styled(
@@ -227,7 +258,9 @@ fn context(s: &Scenario, tick: u64, reduced: bool, width: u16) -> Vec<Line<'stat
     vec![
         Line::from(Span::styled(
             "Context",
-            Style::default().fg(comps::colour(Token::Blue)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(comps::colour(Token::Blue))
+                .add_modifier(Modifier::BOLD),
         )),
         comps::context_meter(
             s.used_tokens,
@@ -245,12 +278,25 @@ fn context(s: &Scenario, tick: u64, reduced: bool, width: u16) -> Vec<Line<'stat
 fn review(s: &Scenario) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         "Review",
-        Style::default().fg(comps::colour(Token::Red)).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(comps::colour(Token::Red))
+            .add_modifier(Modifier::BOLD),
     ))];
-    let g = if s.last_failed { glyphs::FAILED } else { glyphs::DONE };
-    let t = if s.last_failed { Token::Red } else { Token::Green };
+    let g = if s.last_failed {
+        glyphs::FAILED
+    } else {
+        glyphs::DONE
+    };
+    let t = if s.last_failed {
+        Token::Red
+    } else {
+        Token::Green
+    };
     out.push(Line::from(Span::styled(
-        format!("{g} last turn {}", if s.last_failed { "failed" } else { "ok" }),
+        format!(
+            "{g} last turn {}",
+            if s.last_failed { "failed" } else { "ok" }
+        ),
         Style::default().fg(comps::colour(t)),
     )));
     out
@@ -263,14 +309,20 @@ fn agent(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
         comps::agent_arc(tick, s.agents_running > 0, reduced),
         Span::styled(
             " Agent",
-            Style::default().fg(comps::colour(Token::Cyan)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(comps::colour(Token::Cyan))
+                .add_modifier(Modifier::BOLD),
         ),
     ])];
     for a in s.agents.values() {
         let status = if a.done {
             format!("{} {}", glyphs::DONE, a.name)
         } else {
-            format!("{} {}", comps::agent_arc(tick, true, reduced).content, a.action)
+            format!(
+                "{} {}",
+                comps::agent_arc(tick, true, reduced).content,
+                a.action
+            )
         };
         out.push(Line::from(Span::styled(
             status,
@@ -286,6 +338,8 @@ fn agent(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::buffer::Buffer;
+
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -306,26 +360,26 @@ mod tests {
         s.transcript.push(TranscriptLine {
             kind: LineKind::User,
             text: "prior turn".into(),
+            ..Default::default()
         });
         s.apply("round_started", 0);
 
-        term
-            .draw(|f| {
-                let areas = split_areas(f.area(), &tree);
-                for (i, (area, view)) in areas.iter().enumerate() {
-                    render_panel(
-                        f,
-                        *area,
-                        (i + 1) as u8,
-                        *view,
-                        i == 1, // focus the conversation (middle)
-                        &s,
-                        1000,
-                        false,
-                    );
-                }
-            })
-            .unwrap();
+        term.draw(|f| {
+            let areas = split_areas(f.area(), &tree);
+            for (i, (area, view)) in areas.iter().enumerate() {
+                render_panel(
+                    f,
+                    *area,
+                    (i + 1) as u8,
+                    *view,
+                    i == 1, // focus the conversation (middle)
+                    &s,
+                    1000,
+                    false,
+                );
+            }
+        })
+        .unwrap();
 
         let buf = term.backend().buffer();
         let text = buffer_text(buf);
@@ -356,7 +410,12 @@ mod tests {
         let lines = plan(&s);
         let t: String = lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(t.contains('✓'));
@@ -375,7 +434,12 @@ mod tests {
         let lines = changes(&s);
         let t: String = lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(t.contains("src/main.rs"));
@@ -387,7 +451,11 @@ mod tests {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol().to_string())
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .map(|c| c.symbol().to_string())
+                            .unwrap_or_default()
+                    })
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
@@ -425,7 +493,11 @@ fn areas_rec(area: Rect, node: &super::layout::Node, out: &mut Vec<(Rect, View)>
                         let last = i == children.len() - 1;
                         let r = Rect {
                             x,
-                            width: if last { area.right().saturating_sub(x) } else { w },
+                            width: if last {
+                                area.right().saturating_sub(x)
+                            } else {
+                                w
+                            },
                             ..area
                         };
                         areas_rec(r, c, out);
@@ -440,7 +512,11 @@ fn areas_rec(area: Rect, node: &super::layout::Node, out: &mut Vec<(Rect, View)>
                         let last = i == children.len() - 1;
                         let r = Rect {
                             y,
-                            height: if last { area.bottom().saturating_sub(y) } else { h },
+                            height: if last {
+                                area.bottom().saturating_sub(y)
+                            } else {
+                                h
+                            },
                             ..area
                         };
                         areas_rec(r, c, out);

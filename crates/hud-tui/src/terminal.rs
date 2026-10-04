@@ -103,6 +103,8 @@ pub(crate) fn force_signal(sig: ShutdownSignal) {
 
 /// Owns the terminal; restores it on drop.
 pub struct TerminalGuard {
+    /// Whether we enabled mouse capture (§12.4: the prototype does not).
+    pub mouse_capture: bool,
     pub terminal: Term,
 }
 
@@ -152,6 +154,13 @@ pub fn probe_ambiguous_width() -> bool {
 impl TerminalGuard {
     /// Enter raw mode + alternate screen, hide cursor, install signal handlers.
     pub fn enter() -> Result<Self, String> {
+        Self::enter_with(true)
+    }
+
+    /// `mouse_capture = false` follows §12.4 (the MD's prototype:
+    /// mouse capture stays off — the terminal's native selection owns
+    /// the mouse).
+    pub fn enter_with(mouse_capture: bool) -> Result<Self, String> {
         // NOTE: no locale forcing. Forcing LANG/LC_ALL to en_US.UTF-8 hides
         // non-UTF-8 terminals (H-7 hard downgrade); the glyph set is chosen
         // by locale detection + the width probe instead (§11.3).
@@ -172,17 +181,30 @@ impl TerminalGuard {
         // Bracketed paste (D12): without it, a pasted multi-line block
         // arrives as individual keystrokes — every line's first Enter
         // submits a partial prompt.
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            Hide,
-            EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste
-        )
-        .map_err(|e| format!("enter alt screen: {e}"))?;
+        if mouse_capture {
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                Hide,
+                EnableMouseCapture,
+                crossterm::event::EnableBracketedPaste
+            )
+            .map_err(|e| format!("enter alt screen: {e}"))?;
+        } else {
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                Hide,
+                crossterm::event::EnableBracketedPaste
+            )
+            .map_err(|e| format!("enter alt screen: {e}"))?;
+        }
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).map_err(|e| format!("create terminal: {e}"))?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            mouse_capture,
+        })
     }
 
     /// Render the app state to the terminal.
@@ -208,14 +230,24 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        execute!(
-            std::io::stdout(),
-            Show,
-            DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste,
-            LeaveAlternateScreen
-        )
-        .ok();
+        if self.mouse_capture {
+            execute!(
+                std::io::stdout(),
+                Show,
+                DisableMouseCapture,
+                crossterm::event::DisableBracketedPaste,
+                LeaveAlternateScreen
+            )
+            .ok();
+        } else {
+            execute!(
+                std::io::stdout(),
+                Show,
+                crossterm::event::DisableBracketedPaste,
+                LeaveAlternateScreen
+            )
+            .ok();
+        }
         disable_raw_mode().ok();
     }
 }

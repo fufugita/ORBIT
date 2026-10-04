@@ -311,7 +311,9 @@ fn anthropic_fat() -> String {
     let body = para.repeat(25); // ~50k chars ≈ 12k+ tokens
     [
         r#"{"type":"message_start","usage":{"input_tokens":3,"output_tokens":0}}"#,
-        &format!(r#"{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{body}"}}}}"#),
+        &format!(
+            r#"{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{body}"}}}}"#
+        ),
         r#"{"type":"message_stop","usage":{"input_tokens":3,"output_tokens":12000}}"#,
         "",
     ]

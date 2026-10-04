@@ -20,10 +20,7 @@ pub fn colour(t: Token) -> Color {
 /// Replaced by the first token in the same row.
 pub fn thinking_line(model: &str, star: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{star} "),
-            Style::default().fg(colour(Token::Cyan)),
-        ),
+        Span::styled(format!("{star} "), Style::default().fg(colour(Token::Cyan))),
         Span::styled(
             format!("waiting for {model}"),
             Style::default().fg(colour(Token::Muted)),
@@ -40,16 +37,12 @@ pub fn fresh_ink_style(now_ms: u64, arrived_ms: u64, reduced: bool) -> Style {
     }
     let a = Anim::new(arrived_ms, 450, Curve::EaseOut);
     let p = a.progress(now_ms); // 0 → 1
-    // lerp white(0xEE) → ink(0xEE)… actually bright → ink: near-white
-    // (0xFF-ish) to ink (0xEE,0xEA,0xF5) is subtle; the design means
-    // bright white → normal ink, i.e. bold-white → ink. Use the ink
-    // channel lerp from white.
+                                // lerp white(0xEE) → ink(0xEE)… actually bright → ink: near-white
+                                // (0xFF-ish) to ink (0xEE,0xEA,0xF5) is subtle; the design means
+                                // bright white → normal ink, i.e. bold-white → ink. Use the ink
+                                // channel lerp from white.
     let (ir, ig, ib) = Token::Ink.rgb();
-    let (r, g, b) = (
-        lerp(0xFF, ir, p),
-        lerp(0xFF, ig, p),
-        lerp(0xFF, ib, p),
-    );
+    let (r, g, b) = (lerp(0xFF, ir, p), lerp(0xFF, ig, p), lerp(0xFF, ib, p));
     Style::default().fg(Color::Rgb(r, g, b))
 }
 
@@ -62,8 +55,7 @@ pub fn caret(now_ms: u64, last_data_ms: u64, reduced: bool) -> Span<'static> {
     let bright = pulse(now_ms, 0.9) > 0.5;
     Span::styled(
         "▍",
-        Style::default()
-            .fg(colour(if bright { Token::Ink } else { Token::Muted })),
+        Style::default().fg(colour(if bright { Token::Ink } else { Token::Muted })),
     )
 }
 
@@ -83,7 +75,9 @@ pub fn tool_line(
     };
     let chip_flash = !reduced && now_ms.saturating_sub(started_ms) < 250;
     let chip_style = if chip_flash {
-        Style::default().fg(colour(Token::Ink)).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(colour(Token::Ink))
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(colour(Token::Cyan))
     };
@@ -130,7 +124,12 @@ pub fn comet_row(now_ms: u64, track_width: u16, reduced: bool) -> Line<'static> 
     while col < track_width {
         let dist = head.abs_diff(col);
         let (ch, st) = if dist == 0 {
-            ("●", Style::default().fg(colour(Token::Cyan)).add_modifier(Modifier::BOLD))
+            (
+                "●",
+                Style::default()
+                    .fg(colour(Token::Cyan))
+                    .add_modifier(Modifier::BOLD),
+            )
         } else if dist <= 10 {
             // tail fades: 10 cells behind the head
             let fade = 1.0 - dist as f64 / 10.0;
@@ -209,7 +208,11 @@ pub fn context_meter(
         (used as f64 / window as f64).min(1.0) * p
     };
     let full = (frac * width as f64).round() as u16;
-    let token = if compacting { Token::Amber } else { Token::Blue };
+    let token = if compacting {
+        Token::Amber
+    } else {
+        Token::Blue
+    };
     Line::from(vec![
         Span::styled(
             glyphs::BAR_FULL.repeat(full as usize),
@@ -278,10 +281,7 @@ mod tests {
         let end = fresh_ink_style(1000, 0, false);
         assert_ne!(start, end);
         // reduced: steady ink
-        assert_eq!(
-            fresh_ink_style(0, 0, true),
-            fresh_ink_style(1000, 0, true)
-        );
+        assert_eq!(fresh_ink_style(0, 0, true), fresh_ink_style(1000, 0, true));
     }
 
     #[test]

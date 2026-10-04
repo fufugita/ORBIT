@@ -98,7 +98,6 @@ pub enum FrontendEvent {
 
     // ── TUI motion events (the ORBIT TUI prototype's motion table).
     // Each animation is tied to an engine event, never a guess.
-
     /// A tool call started, with what the tool line needs: the call
     /// id, the tool kind (Read/Bash/…) and the target (path, command
     /// or task) after the secret scanner.
@@ -109,10 +108,7 @@ pub enum FrontendEvent {
     },
     /// One line of live tool output (the output tail / terminal
     /// stream panels).
-    ToolOutput {
-        call_id: String,
-        line: String,
-    },
+    ToolOutput { call_id: String, line: String },
     /// A tool call finished with a result fact (lines read, tests
     /// passed, exit code) for the settle animation.
     ToolFinishedFull {
@@ -136,15 +132,9 @@ pub enum FrontendEvent {
         model: String,
     },
     /// A subagent's progress line (its current action).
-    SubagentProgress {
-        agent_id: String,
-        action: String,
-    },
+    SubagentProgress { agent_id: String, action: String },
     /// A subagent finished; its report is carried for the panel.
-    SubagentFinished {
-        agent_id: String,
-        report: String,
-    },
+    SubagentFinished { agent_id: String, report: String },
     /// The permission mode changed (the mode pill wipe).
     ModeChanged { mode: String },
     /// Context usage (the context meter): tokens in use, the window.

@@ -2,11 +2,11 @@
 //! module). Engine events in, panel state out — every animation is
 //! tied to an event, never a guess.
 
-use super::anim::{StarColour, StarState};
+use super::anim::StarState;
 
 /// What a panel of the scenario knows. The reducer is total: every
 /// FrontendEvent maps to a state change (or an explicit ignore).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct Scenario {
     /// The model being waited on (M05's "waiting for {model}").
     pub model: String,
@@ -50,6 +50,22 @@ pub struct Scenario {
     /// Session identity (Msg::Identity): model, provider, session
     /// id prefix — the status line's right cluster and the shutdown
     /// line.
+    /// Approval arming (§9.14): the ms of the last keypress, and the
+    /// ms the pending card appeared. While `now − last_key < 1000`
+    /// the decision keys are disabled and the border reads
+    /// ` paused while you type `.
+    pub last_key_ms: u64,
+    pub approval_shown_ms: u64,
+    /// The pending approval's queue (§9.14): oldest first.
+    pub approval_queue: Vec<String>,
+    /// The oldest pending request's display-safe summary (§9.14).
+    pub approval_summary: Option<String>,
+    /// M9's window (§10.2): the first prompt of an empty session is
+    /// live and no output has arrived. The welcome shrinks to mark +
+    /// tagline and the star orbits; the first output ends it.
+    pub first_prompt_waiting: bool,
+    /// The brand tier (§8.5): governs the welcome mark + M1/M9.
+    pub brand_tier: crate::proto::welcome::BrandTier,
     pub model_id: String,
     pub provider: String,
     pub session_prefix: String,
@@ -68,6 +84,9 @@ pub struct Scenario {
     pub turn_started_ms: u64,
     /// Tools run this turn (the M5 report's count).
     pub turn_tools: u64,
+    /// The reactor phase (§6.10): 0 orient … 4 respond — the
+    /// workspace stepper.
+    pub phase: usize,
 }
 
 /// The M5 turn report: ✓ done · 41s · 3 tools · +$0.0031.
@@ -80,10 +99,64 @@ pub struct TurnReport {
 }
 
 /// One visible transcript line.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TranscriptLine {
     pub kind: LineKind,
     pub text: String,
+    /// Tool lines (§9.8): the tool name and state, rendered as
+    /// `{glyph} {name}  {arg}` with right-aligned meta.
+    pub tool_name: String,
+    pub tool_state: ToolState,
+    /// User/model turns: the submit/settle time (`HH:MM`), shown
+    /// right-aligned on the first row (§9.4/§9.5).
+    pub time: Option<String>,
+    /// Tool lines (§9.8): the meta text (`{outcome} · {duration}`).
+    pub meta: String,
+    /// When the call started (duration = finish − start).
+    pub started_ms: Option<u64>,
+}
+
+impl Default for TranscriptLine {
+    fn default() -> Self {
+        TranscriptLine {
+            kind: LineKind::System,
+            text: String::new(),
+            tool_name: String::new(),
+            tool_state: ToolState::Queued,
+            time: None,
+            meta: String::new(),
+            started_ms: None,
+        }
+    }
+}
+
+/// The §9.8 tool-line states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolState {
+    #[default]
+    Queued,
+    Running,
+    AwaitingYou,
+    Done,
+    Failed,
+    Denied,
+    Blocked,
+}
+
+impl ToolState {
+    /// (glyph, colour) per the §9.8 state table.
+    pub fn glyph_parts(self) -> (&'static str, super::core::Token) {
+        use super::core::Token;
+        match self {
+            ToolState::Queued => ("◌", Token::Muted),
+            ToolState::Running => ("◉", Token::Cyan),
+            ToolState::AwaitingYou => ("◇", Token::Magenta),
+            ToolState::Done => ("✓", Token::Muted),
+            ToolState::Failed => ("✕", Token::Red),
+            ToolState::Denied => ("⊘", Token::Muted),
+            ToolState::Blocked => ("⊖", Token::Amber),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +167,8 @@ pub enum LineKind {
     Model,
     /// A tool line (started/finished).
     Tool,
+    /// A queued prompt (§9.12): waiting for its turn to start.
+    Queued,
     /// A system/status line.
     System,
 }
@@ -126,6 +201,48 @@ impl Scenario {
 
     /// The star state for the current scenario (§10.1's table, first
     /// match wins).
+    /// A monotonic change counter (§10.5): any state mutation bumps
+    /// it, so the loop can skip draws when nothing changed.
+    pub fn state_version(&self) -> u64 {
+        self.transcript.len() as u64
+            + self.turns
+            + self.turn_tools
+            + self.running.len() as u64
+            + self.approval_queue.len() as u64
+            + self.approval_summary.is_some() as u64
+            + self.tool_output.len() as u64
+            + (self.turn_live as u64)
+            + (self.last_failed as u64)
+    }
+
+    /// The star is turning (an animation is in flight).
+    pub fn is_turning(&self) -> bool {
+        matches!(self.star_state(), StarState::Turning { .. })
+    }
+
+    /// The workspace is empty (§9.2: the switcher shows Workspace
+    /// faint with no count).
+    pub fn workspace_empty(&self) -> bool {
+        self.tasks.is_empty() && self.file_changes.is_empty()
+    }
+
+    /// The session title (§13.2): the first prompt's first line,
+    /// else `New session`.
+    pub fn session_title(&self) -> String {
+        for l in &self.transcript {
+            if l.kind == LineKind::User {
+                return l.text.lines().next().unwrap_or("New session").to_string();
+            }
+        }
+        "New session".into()
+    }
+
+    /// The current reactor phase (the workspace stepper, §9.17):
+    /// 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
+    pub fn phase_index(&self) -> usize {
+        self.phase
+    }
+
     pub fn star_state(&self) -> StarState {
         if self.approval_pending.is_some() {
             return StarState::StillMagenta; // needs you
@@ -150,8 +267,6 @@ impl Scenario {
         }
         StarState::StillMagenta // ready
     }
-
-
 
     /// The activity row (evaluated in the same order as the star).
     pub fn activity(&self) -> Activity {
@@ -217,6 +332,8 @@ impl Scenario {
                 self.turn_tools = 0;
             }
             "text_delta" => {
+                // M9 ends at the first output.
+                self.first_prompt_waiting = false;
                 self.visible_output = true;
                 // last_data_ms is wall-clock-ish; apply() carries the
                 // engine time if the runtime passes it, else the
@@ -225,6 +342,7 @@ impl Scenario {
             "tool_started_full" => self.visible_output = false,
             "tool_finished_full" => self.visible_output = false,
             "approval_requested" => self.approval_pending = Some("tool".into()),
+            "approval_requested_full" => {}
             "approval_resolved" => {
                 self.approval_pending = None;
                 self.approval_call_id = None;
@@ -291,13 +409,13 @@ mod tests {
         s.apply("round_started", 0);
         let st = s.star_state();
         let reduced = match st {
-            StarState::Turning { .. } => StarGlyph_reduced(),
+            StarState::Turning { .. } => star_glyph_reduced(),
             still => still,
         };
         assert_eq!(reduced, StarState::StillCyan);
     }
 
-    fn StarGlyph_reduced() -> StarState {
+    fn star_glyph_reduced() -> StarState {
         StarState::StillCyan
     }
 

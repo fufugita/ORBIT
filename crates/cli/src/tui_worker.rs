@@ -1026,10 +1026,7 @@ pub fn run_tui_turn(
                 removed,
                 checkpoint_id: _,
             } => {
-                orbit_hud_tui::emit_status(
-                    sender,
-                    &format!("~ {path}  +{added} −{removed}"),
-                );
+                orbit_hud_tui::emit_status(sender, &format!("~ {path}  +{added} −{removed}"));
             }
             E::SubagentStarted {
                 agent_id: _,

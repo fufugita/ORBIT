@@ -178,7 +178,10 @@ impl Node {
             return false;
         };
         let child_i = *path.last().unwrap();
-        let Some(Node::Split { shares, children, .. }) = self.at_mut(&parent_path) else {
+        let Some(Node::Split {
+            shares, children, ..
+        }) = self.at_mut(&parent_path)
+        else {
             return false;
         };
         if child_i >= children.len() {
@@ -202,7 +205,7 @@ impl Node {
             return false;
         };
         // If the parent split has the same direction, insert a sibling.
-        if path.len() >= 1 {
+        if !path.is_empty() {
             let parent_path = path[..path.len() - 1].to_vec();
             let child_i = *path.last().unwrap();
             if let Some(Node::Split {
@@ -234,10 +237,7 @@ impl Node {
                 direction,
                 shares: vec![50, 50],
                 children: vec![
-                    Node::Panel {
-                        view: old,
-                        agent,
-                    },
+                    Node::Panel { view: old, agent },
                     Node::Panel {
                         view,
                         agent: String::new(),
@@ -285,7 +285,12 @@ impl Node {
             return false;
         };
         let child_i = *path.last().unwrap();
-        let Some(Node::Split { direction, shares, children }) = self.at_mut(&parent_path) else {
+        let Some(Node::Split {
+            direction,
+            shares,
+            children,
+        }) = self.at_mut(&parent_path)
+        else {
             return false;
         };
         let wants = match axis {
@@ -316,7 +321,7 @@ impl Node {
         if other == child_i || shares.len() < 2 {
             return false;
         }
-        let moved = new as i32 - cur as i32;
+        let moved = new as i32 - cur;
         let other_new = (shares[other] as i32 - moved).max(min_share as i32) as u32;
         shares[child_i] = new;
         shares[other] = other_new;
@@ -327,7 +332,9 @@ impl Node {
     pub fn even(&mut self) {
         match self {
             Node::Panel { .. } => {}
-            Node::Split { shares, children, .. } => {
+            Node::Split {
+                shares, children, ..
+            } => {
                 normalize_shares(shares, children.len());
                 for c in children {
                     c.even();
@@ -382,24 +389,42 @@ impl Node {
                         direction: Direction::Down,
                         shares: vec![1, 1],
                         children: vec![
-                            Node::Panel { view: Conversation, agent: String::new() },
-                            Node::Panel { view: Changes, agent: String::new() },
+                            Node::Panel {
+                                view: Conversation,
+                                agent: String::new(),
+                            },
+                            Node::Panel {
+                                view: Changes,
+                                agent: String::new(),
+                            },
                         ],
                     },
-                    Node::Panel { view: Terminal, agent: String::new() },
+                    Node::Panel {
+                        view: Terminal,
+                        agent: String::new(),
+                    },
                 ],
             },
             Preset::Agents => Node::Split {
                 direction: Direction::Right,
                 shares: vec![67, 33],
                 children: vec![
-                    Node::Panel { view: Conversation, agent: String::new() },
+                    Node::Panel {
+                        view: Conversation,
+                        agent: String::new(),
+                    },
                     Node::Split {
                         direction: Direction::Down,
                         shares: vec![1, 1],
                         children: vec![
-                            Node::Panel { view: Activity, agent: String::new() },
-                            Node::Panel { view: Agent, agent: String::new() },
+                            Node::Panel {
+                                view: Activity,
+                                agent: String::new(),
+                            },
+                            Node::Panel {
+                                view: Agent,
+                                agent: String::new(),
+                            },
                         ],
                     },
                 ],
@@ -408,8 +433,14 @@ impl Node {
                 direction: Direction::Right,
                 shares: vec![60, 40],
                 children: vec![
-                    Node::Panel { view: Review, agent: String::new() },
-                    Node::Panel { view: Conversation, agent: String::new() },
+                    Node::Panel {
+                        view: Review,
+                        agent: String::new(),
+                    },
+                    Node::Panel {
+                        view: Conversation,
+                        agent: String::new(),
+                    },
                 ],
             },
         }
@@ -536,7 +567,10 @@ impl LayoutFile {
                     let v = toml::Value::try_from(tree).map_err(|e| e.to_string())?;
                     lt.insert("tree".into(), v);
                 }
-                lt.insert("from_preset".into(), toml::Value::String(self.from_preset.clone()));
+                lt.insert(
+                    "from_preset".into(),
+                    toml::Value::String(self.from_preset.clone()),
+                );
             }
         }
         std::fs::write(&path, toml::to_string_pretty(&root).unwrap_or_default())
@@ -587,7 +621,8 @@ mod tests {
         assert!(t.close(0)); // close Changes
         assert_eq!(t.panel_count(), 2);
         assert_eq!(t.leaves()[0].1, View::Conversation);
-        assert!(!t.close(0).then(|| t.close(0)).unwrap_or(false) || t.panel_count() >= 1);
+        let closed_twice = if t.close(0) { t.close(0) } else { false };
+        assert!(!closed_twice || t.panel_count() >= 1);
         // closing the last panel is refused
         let mut one = Node::preset(Preset::Review);
         one.close(1);
@@ -638,7 +673,12 @@ mod tests {
         assert_eq!(Preset::Review.next(), Preset::Columns);
         assert_eq!(Preset::Columns.prev(), Preset::Review);
         // each preset's tree parses and has ≥ 2 panels
-        for p in [Preset::Columns, Preset::Build, Preset::Agents, Preset::Review] {
+        for p in [
+            Preset::Columns,
+            Preset::Build,
+            Preset::Agents,
+            Preset::Review,
+        ] {
             assert!(Node::preset(p).panel_count() >= 2, "{p:?}");
         }
     }

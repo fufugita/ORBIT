@@ -63,7 +63,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 pub fn session_tool_definitions(home: &std::path::Path) -> Vec<ToolDefinition> {
     // --bare skips discovering skills, mods, MCP servers and memory
     // files (phase 6: fast start for scripts).
-    if std::env::var("ORBIT_BARE").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("ORBIT_BARE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return tool_definitions();
     }
     let mut defs = tool_definitions();
@@ -559,9 +562,7 @@ pub fn is_read_only(name: &str) -> bool {
 
 pub fn is_known_tool(name: &str) -> bool {
     orbit_tools::is_wave1(name)
-        || orbit_tools::registry()
-            .iter()
-            .any(|t| t.name() == name)
+        || orbit_tools::registry().iter().any(|t| t.name() == name)
         || builtin_tools().iter().any(|t| t.name == name)
 }
 

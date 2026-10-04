@@ -140,7 +140,8 @@ pub fn run_turn(
             Some(at) => est_now > at,
             None => true,
         };
-        if !options.compacting && grown
+        if !options.compacting
+            && grown
             && should_compact(
                 est_now,
                 options.window_tokens,

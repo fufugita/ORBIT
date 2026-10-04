@@ -20,6 +20,25 @@ pub enum Token {
     Amber,
     Violet,
     Blue,
+    // §6.1's palette, exactly.
+    /// `bg` — the canvas.
+    Bg,
+    /// `surface` — user-turn band, composer band, approval fill.
+    Surface,
+    /// `surface2` — chips, palette fill, unfocused cursor row.
+    Surface2,
+    /// `wash` — the focused cursor row.
+    Wash,
+    /// `rule_hi` — focused header rule, overlay frames.
+    RuleHi,
+    /// `ink2` — secondary text.
+    Ink2,
+    /// `faint` — placeholders, disabled items, session id.
+    Faint,
+    /// `magenta_hi` — the one-frame startup flash.
+    MagentaHi,
+    /// `magenta_dim` — the expanded mark's ring.
+    MagentaDim,
 }
 
 impl Token {
@@ -41,6 +60,15 @@ impl Token {
             Self::Amber => (0xE9, 0xB2, 0x52),
             Self::Violet => (0xB3, 0x9D, 0xFF),
             Self::Blue => (0x7A, 0xA2, 0xF7),
+            Self::Bg => (0x10, 0x0E, 0x16),
+            Self::Surface => (0x17, 0x14, 0x1F),
+            Self::Surface2 => (0x21, 0x1C, 0x2B),
+            Self::Wash => (0x2B, 0x16, 0x31),
+            Self::RuleHi => (0x46, 0x3F, 0x55),
+            Self::Ink2 => (0xBD, 0xB6, 0xCA),
+            Self::Faint => (0x65, 0x5F, 0x73),
+            Self::MagentaHi => (0xF5, 0x8C, 0xE4),
+            Self::MagentaDim => (0x8E, 0x3C, 0x7F),
         }
     }
 }
@@ -101,7 +129,10 @@ mod tests {
             Tier::detect(false, Some("truecolor"), Some("xterm")),
             Tier::TrueColor
         );
-        assert_eq!(Tier::detect(false, None, Some("xterm-256color")), Tier::T256);
+        assert_eq!(
+            Tier::detect(false, None, Some("xterm-256color")),
+            Tier::T256
+        );
         assert_eq!(Tier::detect(false, None, Some("xterm")), Tier::T16);
     }
 

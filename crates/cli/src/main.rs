@@ -28,7 +28,32 @@ fn main() {
     // "harness". `orbit chat` is the explicit alias. Both stream live to
     // stdout, so they run outside the JSON-envelope dispatch path.
     // `--help`/`-h`/`--version` stay on the JSON dispatch (first-class verbs).
-    let first_is_command = args.first().map(|a| !a.starts_with('-')).unwrap_or(false);
+    // A leading flag may carry a value (`--home X init`): skip
+    // flag/value pairs to find the first real word.
+    let first_is_command = {
+        let mut i = 0usize;
+        let mut found = false;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "--home" || a == "--model" || a == "--gate" || a == "--resume" {
+                i += 2; // the flag and its value
+                continue;
+            }
+            if a == "--continue"
+                || a == "--bare"
+                || a == "--old-tui"
+                || a == "--go-tui"
+                || a == "--no-tui"
+                || a == "--tui"
+            {
+                i += 1;
+                continue;
+            }
+            found = !a.starts_with('-');
+            break;
+        }
+        found
+    };
     let wants_chat = args.is_empty()
         || args[0] == "chat"
         || (!first_is_command && args[0] != "--help" && args[0] != "-h" && args[0] != "--version");
@@ -70,7 +95,32 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(".orbit"))
     });
-    match args[0].as_str() {
+    // The verb is the first non-flag word (flags may lead: `--home X init`).
+    let _verb = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .cloned()
+        .unwrap_or_default();
+    // Flag values are skipped by the filter above only when they don't
+    // start with '-'; a value like `X` would be mistaken for a verb —
+    // walk pairs properly instead.
+    let mut verb = String::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--home" || a == "--model" || a == "--gate" || a == "--resume" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        verb = a.clone();
+        break;
+    }
+    let _ = &verb;
+    match verb.as_str() {
         "init" => cmd_init(&home, args),
         "run" => cmd_run(&home, args),
         "cancel" => cmd_cancel(&home),
@@ -113,10 +163,41 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
     }
 }
 
+/// The ORBIT home (README): `--home` > `ORBIT_HOME` > `~/.orbit`.
+/// A repo-local `.orbit` is used only when it already exists (legacy
+/// behaviour) — a fresh checkout must not shadow the user config.
+fn default_orbit_home() -> PathBuf {
+    if let Ok(h) = std::env::var("ORBIT_HOME") {
+        if !h.is_empty() {
+            return PathBuf::from(h);
+        }
+    }
+    let user = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join(".orbit"));
+    if let Some(u) = &user {
+        if u.exists() {
+            return u.clone();
+        }
+    }
+    let local = PathBuf::from(".orbit");
+    if local.exists() {
+        return local;
+    }
+    user.unwrap_or(local)
+}
+
 fn orbit_home(args: &[String]) -> Option<PathBuf> {
     args.windows(2)
         .find(|w| w[0] == "--home")
         .map(|w| PathBuf::from(&w[1]))
+        .or_else(|| {
+            let d = default_orbit_home();
+            // ORBIT_HOME / ~/.orbit resolution counts as a default
+            // only when it exists; keep Option semantics for callers
+            // that treat None as "not initialized".
+            Some(d)
+        })
 }
 
 /// `orbit init`: generate a local Ed25519 trust root, sign the manifest, verify it,
@@ -723,14 +804,10 @@ fn build_session_prompt(home: &Path, model: &str) -> String {
 /// structured reply realistically needs (type, required, properties,
 /// items, enum). Returns Err with the problems, or Ok(()) — the
 /// parsed value is not needed, only the verdict.
-fn validate_json_against_schema(
-    text: &str,
-    schema: &serde_json::Value,
-) -> Result<(), String> {
-    let value: serde_json::Value = serde_json::from_str(text.trim())
-        .map_err(|e| format!("reply is not JSON: {e}"))?;
-    validate_value(&value, schema, "$")
-        .map_err(|problems| problems.join("; "))
+fn validate_json_against_schema(text: &str, schema: &serde_json::Value) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(text.trim()).map_err(|e| format!("reply is not JSON: {e}"))?;
+    validate_value(&value, schema, "$").map_err(|problems| problems.join("; "))
 }
 
 fn validate_value(
@@ -766,9 +843,7 @@ fn validate_value(
             }
         }
     }
-    if let (Some(props), serde_json::Value::Object(map)) =
-        (schema.get("properties"), v)
-    {
+    if let (Some(props), serde_json::Value::Object(map)) = (schema.get("properties"), v) {
         for (name, sub) in props.as_object().unwrap_or(&serde_json::Map::new()) {
             if let Some(val) = map.get(name) {
                 if let Err(p) = validate_value(val, sub, &format!("{path}.{name}")) {
@@ -777,9 +852,7 @@ fn validate_value(
             }
         }
     }
-    if let (Some(items), serde_json::Value::Array(arr)) =
-        (schema.get("items"), v)
-    {
+    if let (Some(items), serde_json::Value::Array(arr)) = (schema.get("items"), v) {
         for (i, val) in arr.iter().enumerate() {
             if let Err(p) = validate_value(val, items, &format!("{path}[{i}]")) {
                 problems.extend(p);
@@ -990,19 +1063,17 @@ fn cmd_headless(args: &[String]) -> i32 {
                 if stream_json {
                     println!(
                         "{}",
-                        serde_json::to_string(
-                            &orbit_frontend_protocol::FrontendEvent::Status {
-                                text: format!(
-                                    "spoken rule recorded: {} {} (from \"{}\")",
-                                    match r.effect {
-                                        orbit_engine::automation::SpokenEffect::Allow => "allow",
-                                        orbit_engine::automation::SpokenEffect::Deny => "deny",
-                                    },
-                                    r.rule,
-                                    r.source_phrase
-                                )
-                            }
-                        )
+                        serde_json::to_string(&orbit_frontend_protocol::FrontendEvent::Status {
+                            text: format!(
+                                "spoken rule recorded: {} {} (from \"{}\")",
+                                match r.effect {
+                                    orbit_engine::automation::SpokenEffect::Allow => "allow",
+                                    orbit_engine::automation::SpokenEffect::Deny => "deny",
+                                },
+                                r.rule,
+                                r.source_phrase
+                            )
+                        })
                         .unwrap_or_default()
                     );
                 }
@@ -1060,6 +1131,7 @@ fn cmd_headless(args: &[String]) -> i32 {
     // ORBIT's own re-run. Scan the turn's transcript for Bash test
     // commands; if the final text claims a pass, re-run the last one
     // and emit the attestation verdict.
+    #[allow(unused_assignments, unused_variables)]
     let mut rta_verdict: Option<serde_json::Value> = None;
     if let Ok(r) = &report {
         let claims_pass = r.ok
@@ -1072,18 +1144,16 @@ fn cmd_headless(args: &[String]) -> i32 {
                 m.tool_calls.as_ref().and_then(|calls| {
                     calls.iter().rev().find_map(|c| {
                         let is_test = serde_json::from_str::<serde_json::Value>(&c.arguments)
-                        .ok()
-                        .and_then(|a| {
-                            a.get("command")
-                                .and_then(|v| v.as_str())
-                                .map(|cmd| {
+                            .ok()
+                            .and_then(|a| {
+                                a.get("command").and_then(|v| v.as_str()).map(|cmd| {
                                     cmd.contains("cargo test")
                                         || cmd.contains("npm test")
                                         || cmd.contains("pytest")
                                         || cmd.contains("go test")
                                 })
-                        })
-                        .unwrap_or(false);
+                            })
+                            .unwrap_or(false);
                         is_test.then(|| {
                             serde_json::from_str::<serde_json::Value>(&c.arguments)
                                 .ok()
@@ -1112,22 +1182,21 @@ fn cmd_headless(args: &[String]) -> i32 {
                 if stream_json {
                     println!(
                         "{}",
-                        serde_json::to_string(
-                            &orbit_frontend_protocol::FrontendEvent::Status {
-                                text: format!(
-                                    "rta: {}",
-                                    if verdict["attested"].as_bool().unwrap_or(false) {
-                                        "tests re-run and PASSED (attested)"
-                                    } else {
-                                        "tests re-run and FAILED — the claim is not attested"
-                                    }
-                                )
-                            }
-                        )
+                        serde_json::to_string(&orbit_frontend_protocol::FrontendEvent::Status {
+                            text: format!(
+                                "rta: {}",
+                                if verdict["attested"].as_bool().unwrap_or(false) {
+                                    "tests re-run and PASSED (attested)"
+                                } else {
+                                    "tests re-run and FAILED — the claim is not attested"
+                                }
+                            )
+                        })
                         .unwrap_or_default()
                     );
                 }
-                rta_verdict = Some(verdict);
+                rta_verdict = Some(verdict.clone());
+                let _ = &rta_verdict;
             }
         }
     }
@@ -1136,7 +1205,8 @@ fn cmd_headless(args: &[String]) -> i32 {
     // belongs to the transcript; --continue resumes from what was
     // WRITTEN, and the kill -9 case proves the write happens before
     // the process can die mid-turn).
-    let save_session = |t: &Vec<orbit_adapter::types::ChatMessage>, r: &orbit_engine::TurnReport| {
+    let save_session = |t: &Vec<orbit_adapter::types::ChatMessage>,
+                        r: &orbit_engine::TurnReport| {
         let sf = orbit_cli::sessions::SessionFile::from_chat(
             &session_id,
             &model,
@@ -1306,7 +1376,6 @@ fn find_web_bin() -> Option<PathBuf> {
 }
 
 /// Slash commands: `/help`, `/model <M>`, `/clear`, `/usage`.
-
 /// Create or enter a git worktree at .orbit/worktrees/<name> on a new
 /// branch (phase 4). Parallel sessions never touch each other's files.
 fn enter_worktree(name: &str) -> Result<PathBuf, String> {
@@ -1373,13 +1442,36 @@ fn cmd_chat(args: &[String]) -> i32 {
     let gate = value_after(args, "--gate")
         .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
         .unwrap_or_else(|| "http://127.0.0.1:4001".into());
-    let mut model = value_after(args, "--model")
-        .or_else(|| std::env::var("ORBIT_MODEL").ok())
-        .unwrap_or_else(|| "glm-5.2".into());
-
     let cfg = config::ProvidersConfig::load(&home)
         .map_err(|e| eprintln!("warning: providers.toml: {e}"))
         .unwrap_or_default();
+    // The model resolves in priority order: --model / ORBIT_MODEL /
+    // ORBIT_ACTIVE_MODEL / the first configured provider's first
+    // model. A model no provider declares falls back to the default
+    // gate and every turn fails — so prefer a configured one.
+    let mut model = value_after(args, "--model")
+        .or_else(|| std::env::var("ORBIT_MODEL").ok())
+        .or_else(|| std::env::var("ORBIT_ACTIVE_MODEL").ok())
+        .unwrap_or_else(|| {
+            cfg.provider
+                .iter()
+                .flat_map(|p| p.models.iter().map(|m| m.id.clone()))
+                .next()
+                .unwrap_or_else(|| "glm-5.2".into())
+        });
+    // If the resolved model matches no provider, use the first
+    // configured model instead (the gate fallback would 401/conn-ref).
+    if cfg.provider_for_model(&model).is_none() {
+        if let Some(first) = cfg
+            .provider
+            .iter()
+            .flat_map(|p| p.models.iter().map(|m| m.id.clone()))
+            .next()
+        {
+            eprintln!("warning: model {model} is not configured; using {first}");
+            model = first;
+        }
+    }
 
     // Session identity + persistence. `--resume <id>` loads a prior session's
     // transcript so the conversation continues across invocations.
@@ -1823,13 +1915,17 @@ fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     match sub {
         "allow-issuer" => {
             let Some(key) = args.get(2) else {
-                return Err(("ORBIT-E1101", "usage: orbit mod allow-issuer <hex-ed25519-key>".into()));
+                return Err((
+                    "ORBIT-E1101",
+                    "usage: orbit mod allow-issuer <hex-ed25519-key>".into(),
+                ));
             };
             let key = key.trim();
             if hex::decode(key).map(|b| b.len() != 32).unwrap_or(true) {
                 return Err(("ORBIT-E0806", "issuer key must be 32 bytes of hex".into()));
             }
-            std::fs::create_dir_all(home.join("mods")).map_err(|e| ("ORBIT-E0501", e.to_string()))?;
+            std::fs::create_dir_all(home.join("mods"))
+                .map_err(|e| ("ORBIT-E0501", e.to_string()))?;
             let mut existing = read_issuers();
             existing.insert(key.to_string());
             let text = existing.into_iter().collect::<Vec<_>>().join("\n");
@@ -1855,15 +1951,24 @@ fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         "install" => {
             let pkg = value_after(args, "--package")
                 .or_else(|| args.get(2).cloned())
-                .ok_or_else(|| ("ORBIT-E1101", "usage: orbit mod install <package.wasm> --manifest <manifest.json>".into()))?;
-            let manifest_path = value_after(args, "--manifest")
-                .ok_or_else(|| ("ORBIT-E1101", "install needs --manifest <manifest.json>".into()))?;
+                .ok_or_else(|| {
+                    (
+                        "ORBIT-E1101",
+                        "usage: orbit mod install <package.wasm> --manifest <manifest.json>".into(),
+                    )
+                })?;
+            let manifest_path = value_after(args, "--manifest").ok_or_else(|| {
+                (
+                    "ORBIT-E1101",
+                    "install needs --manifest <manifest.json>".into(),
+                )
+            })?;
             let manifest_text = std::fs::read_to_string(&manifest_path)
                 .map_err(|e| ("ORBIT-E0401", format!("read manifest: {e}")))?;
             let manifest: orbit_plugin::PluginManifest = serde_json::from_str(&manifest_text)
                 .map_err(|e| ("ORBIT-E0401", format!("parse manifest: {e}")))?;
-            let package_bytes = std::fs::read(&pkg)
-                .map_err(|e| ("ORBIT-E0401", format!("read package: {e}")))?;
+            let package_bytes =
+                std::fs::read(&pkg).map_err(|e| ("ORBIT-E0401", format!("read package: {e}")))?;
             let issuers = read_issuers();
             if !issuers.contains(&manifest.issuer_public_key) {
                 return Err((
@@ -1893,7 +1998,10 @@ fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
                 Err(e) => Err(("ORBIT-E0806", e.to_string())),
             }
         }
-        other => Err(("ORBIT-E1101", format!("unknown mod subcommand {other:?} (install, list, allow-issuer)"))),
+        other => Err((
+            "ORBIT-E1101",
+            format!("unknown mod subcommand {other:?} (install, list, allow-issuer)"),
+        )),
     }
 }
 

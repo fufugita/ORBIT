@@ -252,7 +252,10 @@ mod tests {
         // 0.9 Hz caret: period ≈ 1111 ms
         let a = pulse(0, 0.9);
         let b = pulse(555, 0.9);
-        assert!(a < 0.1 && b > 0.9, "pulse rises through its period: {a} {b}");
+        assert!(
+            a < 0.1 && b > 0.9,
+            "pulse rises through its period: {a} {b}"
+        );
         assert!(flash(100, 100, 250));
         assert!(!flash(350, 100, 250));
         assert!(!flash(99, 100, 250));

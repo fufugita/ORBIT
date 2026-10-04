@@ -12,11 +12,15 @@
 //! and collapses to its end state under reduced motion.
 
 pub mod anim;
+pub mod app;
+pub mod chrome;
+pub mod comps;
 pub mod core;
 pub mod layout;
-pub mod comps;
+pub mod mark;
 pub mod panels;
-pub mod app;
 pub mod runtime;
 pub mod scenario;
+pub mod screen;
+pub mod view;
 pub mod welcome;

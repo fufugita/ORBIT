@@ -77,7 +77,10 @@ impl Tool for TaskCreateTool {
         false // it writes the session's task file
     }
     fn permission_key(&self, _input: &serde_json::Value) -> crate::PermissionKey {
-        crate::PermissionKey { tool: "TaskCreate".into(), pattern: String::new() }
+        crate::PermissionKey {
+            tool: "TaskCreate".into(),
+            pattern: String::new(),
+        }
     }
     fn run(&self, args: &serde_json::Value, cx: &ToolContext) -> ToolResult {
         let title = args
@@ -141,20 +144,29 @@ impl Tool for TaskUpdateTool {
         false
     }
     fn permission_key(&self, _input: &serde_json::Value) -> crate::PermissionKey {
-        crate::PermissionKey { tool: "TaskUpdate".into(), pattern: String::new() }
+        crate::PermissionKey {
+            tool: "TaskUpdate".into(),
+            pattern: String::new(),
+        }
     }
     fn run(&self, args: &serde_json::Value, cx: &ToolContext) -> ToolResult {
         let Some(id) = args.get("id").and_then(|v| v.as_u64()) else {
             return ToolResult::err("id is required");
         };
-        let status = args.get("status").and_then(|v| v.as_str()).map(String::from);
+        let status = args
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         if let Some(s) = &status {
             if !matches!(s.as_str(), "pending" | "in_progress" | "done") {
                 return ToolResult::err("status must be pending, in_progress or done");
             }
         }
         let title = args.get("title").and_then(|v| v.as_str()).map(String::from);
-        let detail = args.get("detail").and_then(|v| v.as_str()).map(String::from);
+        let detail = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let mut list = load(cx);
         let Some(t) = list.tasks.iter_mut().find(|t| t.id as u64 == id) else {
             return ToolResult::err(&format!("no task {id}"));
@@ -192,7 +204,10 @@ impl Tool for TaskListTool {
         true
     }
     fn permission_key(&self, _input: &serde_json::Value) -> crate::PermissionKey {
-        crate::PermissionKey { tool: "TaskList".into(), pattern: String::new() }
+        crate::PermissionKey {
+            tool: "TaskList".into(),
+            pattern: String::new(),
+        }
     }
     fn run(&self, _args: &serde_json::Value, cx: &ToolContext) -> ToolResult {
         let list = load(cx);
@@ -242,10 +257,7 @@ mod tests {
         assert!(p.get("created").and_then(|v| v.as_bool()) == Some(true));
         let id = p.get("id").and_then(|v| v.as_u64()).unwrap();
 
-        let r = TaskUpdateTool.run(
-            &serde_json::json!({"id": id, "status": "in_progress"}),
-            &c,
-        );
+        let r = TaskUpdateTool.run(&serde_json::json!({"id": id, "status": "in_progress"}), &c);
         let p: serde_json::Value = serde_json::from_str(&r.payload).unwrap();
         assert!(
             p.get("updated").and_then(|v| v.as_bool()) == Some(true),

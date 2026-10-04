@@ -11,15 +11,8 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-/// The expanded mark, exactly (§9.22): 3 rows. The star is cyan
-/// while the first prompt waits (M9's rest state is magenta).
-pub const MARK_ROWS: [&str; 3] = [
-    "   ▄▀▀▀▄⠤⠤✦ █▀▀▀▄ █▀▀▀▄ ▀█▀ ▀▀█▀▀",
-    "⣠⠖⠋█   █⣠⠴⠋ █▄▄▄▀ █▀▀▀▄  █    █",
-    "⠙⠒⠒▀▄▄▄▀    █  ▀▄ █▄▄▄▀ ▄█▄   █",
-];
-
-pub const TAGLINE: &str = "the harness that orbits around you";
+pub use super::mark::MARK_ROWS;
+pub use super::mark::TAGLINE;
 
 /// Which brand tier governs the welcome block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -45,7 +38,10 @@ pub struct Welcome {
 
 impl Welcome {
     /// The block's rows (mark + tagline + starters), already styled.
-    pub fn lines(&self) -> Vec<Line<'static>> {
+    /// `tick_ms` drives M1 (the 17 startup frames at 250 ms) at tier
+    /// Anim; M9 (the welcome orbit) shows the station frame while
+    /// the first prompt waits.
+    pub fn lines(&self, tick_ms: u64) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         match self.tier {
             BrandTier::Off => return out,
@@ -62,10 +58,30 @@ impl Welcome {
                 out.push(Line::from(""));
             }
             BrandTier::Anim | BrandTier::Static => {
-                for row in MARK_ROWS.iter() {
+                let rows: [&str; 3] = if self.first_prompt_waiting {
+                    // M9: the station frame at 250 ms steps, cyan
+                    // star (station 0 = rest until TurnStarted, then
+                    // advance).
+                    let station = ((tick_ms / 250) % 12) as usize;
+                    super::mark::M9_STATIONS[station]
+                } else if self.tier == BrandTier::Anim && tick_ms < 4000 {
+                    // M1: the 17 startup frames, 250 ms each.
+                    let fi = ((tick_ms / 250).min(16)) as usize;
+                    super::mark::M1_FRAMES[fi]
+                } else {
+                    super::mark::MARK_ROWS
+                };
+                for row in rows.iter() {
                     out.push(mark_line(row, self.first_prompt_waiting));
                 }
             }
+        }
+        // The tagline arrives at M1's F17 (4 s); it is always there
+        // at static/text and while the first prompt waits.
+        let tagline_shown =
+            self.first_prompt_waiting || self.tier != BrandTier::Anim || tick_ms >= 4000;
+        if !tagline_shown {
+            return out;
         }
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
@@ -95,7 +111,10 @@ impl Welcome {
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::styled(desc.to_string(), Style::default().fg(comps::colour(Token::Muted))),
+                    Span::styled(
+                        desc.to_string(),
+                        Style::default().fg(comps::colour(Token::Muted)),
+                    ),
                 ]));
             }
         }

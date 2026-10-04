@@ -156,7 +156,10 @@ fn gate3_tools_run_through_the_binary() {
     );
 
     // Cleanup: kill the leaked mock.
-    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
+    let _ = Command::new("fuser")
+        .arg("-k")
+        .arg(format!("{port}/tcp"))
+        .status();
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -191,7 +194,10 @@ fn gate1_env_mention_refused_through_binary() {
         "a secret in the prompt must never appear in the event stream"
     );
 
-    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
+    let _ = Command::new("fuser")
+        .arg("-k")
+        .arg(format!("{port}/tcp"))
+        .status();
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -255,7 +261,10 @@ context_window = 100
         "gate4: with a 100-token window the session must compact: {types:?}"
     );
 
-    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
+    let _ = Command::new("fuser")
+        .arg("-k")
+        .arg(format!("{port}/tcp"))
+        .status();
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -306,12 +315,19 @@ fn gate4_continue_after_kill9() {
     // --continue must resume the FIRST turn's session and complete a
     // fresh turn (the killed one never ended, so the newest saved
     // state is turn 1).
-    let (events, code) = run_orbit_p(port, &home, "and we are back", &["--auto-tools", "--continue"]);
+    let (events, code) = run_orbit_p(
+        port,
+        &home,
+        "and we are back",
+        &["--auto-tools", "--continue"],
+    );
     assert_eq!(code, 0, "--continue must work after a kill -9");
-    assert!(events
-        .iter()
-        .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended")),
-        "the resumed turn must complete");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended")),
+        "the resumed turn must complete"
+    );
     // The stream-json transcript must show turn 1's content preserved
     // (the provider received the prior conversation: we assert via the
     // session file instead — turns > 1).
@@ -333,7 +349,10 @@ fn gate4_continue_after_kill9() {
         "the session after --continue must carry the pre-kill turns (found {found_turns})"
     );
 
-    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
+    let _ = Command::new("fuser")
+        .arg("-k")
+        .arg(format!("{port}/tcp"))
+        .status();
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -382,10 +401,7 @@ fn mod_install_signed_flow_through_binary() {
         .env("ORBIT_HOME", &home)
         .output()
         .expect("mod install (untrusted)");
-    assert!(
-        !out.status.success(),
-        "an untrusted issuer must be refused"
-    );
+    assert!(!out.status.success(), "an untrusted issuer must be refused");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("E0806") || err.contains("not trusted"),
@@ -400,7 +416,11 @@ fn mod_install_signed_flow_through_binary() {
         .env("ORBIT_HOME", &home)
         .output()
         .expect("allow-issuer");
-    assert!(out.status.success(), "allow-issuer: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "allow-issuer: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let out = Command::new(&bin)
         .args(["mod", "install"])
@@ -458,10 +478,13 @@ fn gate6_ci_run_allowlist_and_exit_codes() {
         &home,
         "review the changed files",
         &[
-            "--allowedTools", "Read,Glob,Grep",
+            "--allowedTools",
+            "Read,Glob,Grep",
             "--bare",
-            "--max-cost", "1000000",
-            "--output-format", "json",
+            "--max-cost",
+            "1000000",
+            "--output-format",
+            "json",
         ],
     );
     // Exit code 2 = stopped by a permission denial (the honest CI
@@ -474,14 +497,20 @@ fn gate6_ci_run_allowlist_and_exit_codes() {
     let summary = events
         .iter()
         .find(|e| e.get("schema").and_then(|s| s.as_str()) == Some("orbit.cli/v1"));
-    assert!(summary.is_some(), "the json summary object must print: {}", 
-        serde_json::to_string(&events).unwrap_or_default());
+    assert!(
+        summary.is_some(),
+        "the json summary object must print: {}",
+        serde_json::to_string(&events).unwrap_or_default()
+    );
 
     // The denial is recorded in the session (auditable).
     let all = serde_json::to_string(&events).unwrap_or_default();
     let _ = all;
     let _ = std::fs::remove_dir_all(&home);
-    let _ = Command::new("fuser").arg("-k").arg(format!("{port}/tcp")).status();
+    let _ = Command::new("fuser")
+        .arg("-k")
+        .arg(format!("{port}/tcp"))
+        .status();
 }
 
 /// run_orbit_p + extra passthrough (json output needs the raw line

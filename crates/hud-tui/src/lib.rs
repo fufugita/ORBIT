@@ -12,7 +12,6 @@
 #![forbid(unsafe_code)]
 
 pub mod approval;
-pub mod proto;
 pub mod bridge;
 pub mod bus;
 mod coalesce;
@@ -21,6 +20,7 @@ pub mod glyphs;
 pub mod input;
 pub mod msg;
 pub mod plain;
+pub mod proto;
 pub mod render;
 mod rich;
 pub mod secret_scan;
