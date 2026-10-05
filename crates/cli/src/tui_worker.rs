@@ -43,6 +43,64 @@ pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
         let slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let handle_slot = slot.clone();
+        // AskUserQuestion in the TUI renders through the approval card
+        // (an operator decision — same interaction shape): the card's
+        // summary lists the question + options; y takes option 1, n
+        // takes option 2, Esc/R fall back to option 2 (decline-shaped).
+        let ask_sender = ctx.sender.clone();
+        let ask_approvals = ctx.approvals.clone();
+        struct TuiAsk {
+            sender: orbit_hud_tui::bus::BusSender,
+            approvals: orbit_hud_tui::ApprovalRegistry,
+        }
+        impl orbit_tools::askuser::AskChannel for TuiAsk {
+            fn ask(
+                &self,
+                questions: &[orbit_tools::askuser::AskQuestion],
+            ) -> orbit_tools::askuser::AskAnswer {
+                let first = &questions[0];
+                let summary = format!(
+                    "{} — options: {}",
+                    first.question,
+                    first.options.join(" / ")
+                );
+                let call_id = format!("ask-{}", ulid::Ulid::new());
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.approvals.register(&call_id, tx);
+                self.sender
+                    .send(orbit_hud_tui::msg::Msg::ApprovalRequested {
+                        call_id,
+                        tool_name: "AskUserQuestion".into(),
+                        summary,
+                        risk: 1,
+                        working_dir: std::env::current_dir()
+                            .map(|d| d.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    });
+                let pick = match rx.recv() {
+                    Ok(orbit_hud_tui::ApprovalResponse::Allow)
+                    | Ok(orbit_hud_tui::ApprovalResponse::AllowSession) => 0,
+                    _ => 1,
+                };
+                orbit_tools::askuser::AskAnswer {
+                    choices: questions
+                        .iter()
+                        .map(|q| {
+                            vec![q
+                                .options
+                                .get(pick)
+                                .or_else(|| q.options.first())
+                                .cloned()
+                                .unwrap_or_default()]
+                        })
+                        .collect(),
+                }
+            }
+        }
+        orbit_tools::askuser::set_ask_channel(Some(std::sync::Arc::new(TuiAsk {
+            sender: ask_sender,
+            approvals: ask_approvals,
+        })));
         std::thread::Builder::new()
             .name("orbit-tui-worker".into())
             .spawn(move || worker_main(ctx, config, slot))
@@ -990,9 +1048,14 @@ pub fn run_tui_turn(
             E::Status { text } => {
                 orbit_hud_tui::emit_status(sender, &text);
             }
-            E::TurnEnded { .. } => {
+            E::TurnEnded { interrupted, .. } => {
                 ws.phase_index = 4; // respond
                 orbit_hud_tui::emit_workspace(sender, ws.clone());
+                if interrupted {
+                    // The visible cancel: the MD's loop contract says a
+                    // cancelled turn keeps the transcript valid — say so.
+                    orbit_hud_tui::emit_status(sender, "cancelled");
+                }
             }
             // ── The TUI prototype's motion events. Each carries what
             // one panel needs; the HUD layer keeps its own renderers.

@@ -24,6 +24,16 @@ use orbit_cli::{config, go_bridge, sessions, tool_runtime, tools, tui_worker};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // Web search backend (roadmap §Wave 2): off until configured. The
+    // env pair names a search API; the tool answers honestly otherwise.
+    if let (Ok(api), Ok(key)) = (
+        std::env::var("ORBIT_SEARCH_API"),
+        std::env::var("ORBIT_SEARCH_KEY"),
+    ) {
+        let backend = orbit_tools::websearch::tavily_backend(&api, &key);
+        orbit_tools::websearch::set_search_backend(Some(backend));
+    }
+
     // Bare `orbit` (no args, or only flags) summons the interactive CLI — the
     // "harness". `orbit chat` is the explicit alias. Both stream live to
     // stdout, so they run outside the JSON-envelope dispatch path.

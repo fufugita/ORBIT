@@ -77,20 +77,26 @@ fn spawn_mock_guarded() -> (u16, MockGuard) {
                 }
             }
         };
-        // Wait until the port actually accepts connections.
-        for _ in 0..40 {
+        // Wait until the port actually accepts connections. The window
+        // is generous (30 s): under a full `cargo test --workspace`
+        // run every test binary competes for CPU, and a mock that
+        // would bind in 50 ms can take seconds. The child-death check
+        // still exits early on a real failure.
+        for _ in 0..300 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 return (port, MockGuard { child: Some(child) });
             }
             if let Ok(Some(_)) = child.try_wait() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let _ = child.kill();
         let _ = child.wait();
     }
-    panic!("orbit-mock-provider not built or failed to start; run cargo build -p orbit-mock-provider");
+    panic!(
+        "orbit-mock-provider not built or failed to start; run cargo build -p orbit-mock-provider"
+    );
 }
 
 /// Run `orbit -p` and collect the stream-json events.

@@ -717,13 +717,24 @@ mod tests {
     #[test]
     fn definitions_have_valid_schema_digests() {
         let defs = tool_definitions();
-        // Wave 1 (Read/Write/Edit/Glob/Grep/Bash/TaskStop) + the three
-        // locked pure built-ins + Wave 2 (TaskCreate/TaskUpdate/
-        // TaskList/WebFetch).
-        assert_eq!(defs.len(), 14);
+        // Wave 1 (Read/Write/Edit/Glob/Grep/Bash/TaskStop/
+        // AskUserQuestion/ExitPlanMode) + the three locked pure
+        // built-ins + Wave 2 (TaskCreate/TaskUpdate/TaskList/WebFetch/
+        // WebSearch/Agent/NotebookEdit) + Task/Skill.
+        assert_eq!(defs.len(), 19);
         assert!(defs.iter().all(|d| d.schema_digest.as_str().len() == 64));
         // Every Wave 1 name is present exactly once.
-        for name in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TaskStop"] {
+        for name in [
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Bash",
+            "TaskStop",
+            "AskUserQuestion",
+            "ExitPlanMode",
+        ] {
             assert_eq!(defs.iter().filter(|d| d.name == name).count(), 1, "{name}");
         }
     }

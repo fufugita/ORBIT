@@ -168,7 +168,10 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         approvals: approvals.clone(),
         command_rx: cmd_rx,
     };
-    let _cancel = worker_spawner(spawn_ctx, cmd_tx);
+    // The cancel handle (Esc during a live turn fires it — MD §The
+    // agent loop: "Esc cancels the stream and kills each running
+    // tool's process group"). A spawn failure falls back to a no-op.
+    let cancel_handle: Option<crate::worker::CancelHandle> = worker_spawner(spawn_ctx, cmd_tx).ok();
 
     // §9.13: the terminal's real cursor is a steady bar at the
     // insertion point while the composer is focused; restored on exit.
@@ -206,6 +209,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                         &mut tui,
                         &mut scenario,
                         &mut composer,
+                        cancel_handle.as_ref(),
                         &command_sink,
                         &sender,
                         &approvals,
@@ -277,7 +281,21 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
             // it must redraw as time passes.
             let card_armed = scenario.approval_pending.is_some()
                 && now_ms.saturating_sub(scenario.last_key_ms) < 1500;
-            if animating || bus_dirty || last_drawn != composer || overlay_dirty || card_armed {
+            // The breathing caret (§9.13, 0.9 Hz) is always live while
+            // the composer holds focus — the idle screen must visibly
+            // breathe, not render one dead frame ("frozen" bug). Draw
+            // at the caret's pace (~2 changes/s) instead of the 16 ms
+            // tick: same animation, a fraction of the redraws.
+            let caret_breathes = !tui.reduced
+                && tui.focus == Focus::Conversation
+                && (now_ms / 550) != (now_ms.saturating_sub(UI_TICK.as_millis() as u64) / 550);
+            if animating
+                || bus_dirty
+                || last_drawn != composer
+                || overlay_dirty
+                || card_armed
+                || caret_breathes
+            {
                 last_drawn.clone_from(&composer);
                 overlay_dirty = false;
                 guard
@@ -340,6 +358,7 @@ fn handle_key(
     tui: &mut Tui,
     scenario: &mut Scenario,
     composer: &mut String,
+    cancel_handle: Option<&crate::worker::CancelHandle>,
     command_sink: &CommandSink,
     sender: &BusSender,
     approvals: &ApprovalRegistry,
@@ -472,6 +491,17 @@ fn handle_key(
             } else {
                 scenario.approval_shown_ms = now_ms;
             }
+        }
+        return false;
+    }
+
+    // Esc while a turn is live (no overlay, no approval card): cancel
+    // the turn — MD §The agent loop: "Esc cancels the stream and kills
+    // each running tool's process group". Outside a turn Esc keeps its
+    // per-context meaning (close completion, defocus…).
+    if k.code == KeyCode::Esc && scenario.is_turning() {
+        if let Some(cancel) = &cancel_handle {
+            cancel();
         }
         return false;
     }

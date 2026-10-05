@@ -363,14 +363,24 @@ pub fn execute_call(
         return Ok(output);
     }
 
-    // The Task tool (phase 5): spawn a subagent. The subagent needs
-    // the session's TurnConfig — derived from the same environment the
-    // front-ends use, so provider/gate/model match the parent.
-    if call.name == "Task" {
-        let agent = args.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-        let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-        if agent.is_empty() || prompt.is_empty() {
-            let output = tool_error("Task requires 'agent' and 'prompt'");
+    // The Task tool (phase 5) and its Agent alias: spawn a subagent.
+    // The subagent needs the session's TurnConfig — derived from the
+    // same environment the front-ends use, so provider/gate/model
+    // match the parent. `Agent` is the current Claude Code name; both
+    // shapes route to the one runner.
+    if call.name == "Task" || call.name == "Agent" {
+        let agent = args
+            .get("agent")
+            .or_else(|| args.get("agent_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("general");
+        let prompt = args
+            .get("prompt")
+            .or_else(|| args.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if prompt.is_empty() {
+            let output = tool_error("Task/Agent requires a 'prompt'");
             record_result(home, session_id, decision_id, call, "error", &output)?;
             return Ok(output);
         }

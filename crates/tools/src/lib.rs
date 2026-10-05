@@ -20,15 +20,19 @@ use orbit_adapter::types::ToolDefinition;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+pub mod agent;
+pub mod askuser;
 pub mod bash;
 pub mod executor;
 pub mod fs_tools;
 pub mod interrupt;
+pub mod notebook;
 pub mod permissions;
 pub mod sandbox;
 pub mod scan;
 pub mod tasks;
 pub mod webfetch;
+pub mod websearch;
 
 pub use fs_tools::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 
@@ -189,6 +193,11 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(tasks::TaskUpdateTool),
         Box::new(tasks::TaskListTool),
         Box::new(webfetch::WebFetchTool),
+        Box::new(askuser::AskUserQuestionTool),
+        Box::new(askuser::ExitPlanModeTool),
+        Box::new(agent::AgentTool),
+        Box::new(websearch::WebSearchTool),
+        Box::new(notebook::NotebookEditTool),
     ]
 }
 
@@ -237,6 +246,9 @@ pub fn tool_description(name: &str) -> &'static str {
         "TaskUpdate" => "Updates a task's status, title or detail",
         "TaskList" => "Lists the session's tasks",
         "WebFetch" => "Fetches an https URL as markdown; records an egress grant per domain",
+        "WebSearch" => "Searches the web (requires a configured search API)",
+        "Agent" => "Runs a subagent in its own context; returns its final report",
+        "NotebookEdit" => "Edits a Jupyter notebook cell (read before edit)",
         _ => "unknown tool",
     }
 }
@@ -261,6 +273,10 @@ pub fn is_wave1(name: &str) -> bool {
             | "TaskUpdate"
             | "TaskList"
             | "WebFetch"
+            // Wave 2 completion: same registry membership rule.
+            | "WebSearch"
+            | "Agent"
+            | "NotebookEdit"
     )
 }
 
@@ -272,7 +288,7 @@ pub fn is_read_only(name: &str) -> bool {
     // tool's own read_only() flag still marks it parallel-safe.
     matches!(
         name,
-        "Read" | "Glob" | "Grep" | "AskUserQuestion" | "TaskList"
+        "Read" | "Glob" | "Grep" | "AskUserQuestion" | "TaskList" | "WebSearch"
     )
 }
 
