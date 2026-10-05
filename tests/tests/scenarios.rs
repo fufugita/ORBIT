@@ -860,6 +860,26 @@ for line in sys.stdin:
     // What actually reached the model: the mock's request log.
     let reqs = mock.requests();
     let reqs_all = serde_json::to_string(&reqs).unwrap_or_default();
+    // Diagnostic probe: run the hook script exactly as run_hook does,
+    // so a CI-only failure shows whether the hook itself works there.
+    let hook_probe = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(
+            "input=$(cat); case \"$input\" in *push*) echo 'no push in tests' >&2; exit 2;; esac; exit 0",
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            if let Some(mut si) = c.stdin.take() {
+                let _ = si.write_all(br#"{"tool":"Bash","arguments":{"command":"git push origin main"}}"#);
+            }
+            c.wait_with_output()
+        })
+        .map(|o| format!("exit-sig {:?} stderr {:?}", o.status.code(), String::from_utf8_lossy(&o.stderr)))
+        .unwrap_or_else(|e| format!("probe spawn failed: {e}"));
 
     // 1. The skill loaded: its BODY reached the model as the Skill
     //    tool's result (Claude Code format, unchanged).
@@ -886,7 +906,7 @@ for line in sys.stdin:
     //    model sees says so.
     assert!(
         reqs_all.contains("no push in tests") || reqs_all.contains("blocked by hook"),
-        "the PreToolUse hook must block git push (exit {exit_code}): {reqs_all:.2000}\n--- events: {all:.4000}"
+        "the PreToolUse hook must block git push (exit {exit_code}, probe: {hook_probe}): {reqs_all:.2000}\n--- events: {all:.4000}"
     );
 
     // 5. The turn completed despite the blocked push (the hook result
