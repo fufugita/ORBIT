@@ -1016,3 +1016,62 @@ fn gate4_rewind_restores_recorded_digests() {
     assert_eq!(content, before, "the file returns to its pre-edit bytes");
     let _ = events;
 }
+
+// ── K1: compaction keeps the question and emits one turn_ended ────
+// Fails on main: B6 — the whole transcript including the current
+// prompt is replaced by a summary, and the nested summary turn leaks
+// its own `turn_ended` (and `text_delta`s) onto the shared sink.
+#[test]
+fn scenario_k1_compaction_keeps_the_question() {
+    // A long prompt (~54 KB of filler ending with a question) over a
+    // 20,000-token window forces compaction before the first dispatch.
+    // The summary request is keyed "Summarize this conversation".
+    let filler = "A".repeat(54 * 1024);
+    let question = "WHAT IS THE MEANING OF LIFE, THE UNIVERSE AND EVERYTHING?";
+    let prompt = format!("{filler}\n\n{question}");
+
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"text": "42"}
+        ],
+        "Summarize this conversation": [
+            {"text": "SUMMARY: the user asked a question."}
+        ]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "context_window = 20000\n");
+    let fix = Fixture::failing_test();
+
+    let (events, code) = run_p(&mock, &home, &fix.path, &prompt, &["--auto-tools"]);
+
+    // 1. Exactly ONE turn_ended: the summary's nested turn must not
+    //    leak its own turn_ended onto the stream.
+    let ended = count(&events, "turn_ended");
+    assert_eq!(
+        ended, 1,
+        "B6: one turn_ended, not {ended} (the summary turn leaked)"
+    );
+
+    // 2. The question survives compaction VERBATIM: the request the
+    //    model answered must contain it, not a 94-char digest.
+    let reqs = mock.requests();
+    let answered = serde_json::to_string(&reqs.last().expect("a request")["body"]["messages"])
+        .expect("messages");
+    assert!(
+        answered.contains(question),
+        "B6: the question must reach the model verbatim after compaction"
+    );
+
+    // 3. Compaction actually fired (else this test asserts nothing).
+    let types: Vec<String> = events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(|t| t.as_str()).map(String::from))
+        .collect();
+    assert!(
+        types.contains(&"compacting".to_string()) || types.contains(&"compacted".to_string()),
+        "K1: with a 20000-token window and a 54 KB prompt the session must compact: {types:?}"
+    );
+
+    // 4. The turn completes normally.
+    assert_eq!(code, 0, "the turn completes after compaction");
+}

@@ -48,11 +48,21 @@ pub struct TurnOptions {
 
 /// Rough token estimate for a transcript: ~4 chars per token across
 /// message text. Good enough to decide WHEN to compact (the provider's
-/// own usage refines it later in the turn).
+/// own usage refines it later in the turn). Tool-call arguments and
+/// tool results count too — they ride the request just as text does.
 pub fn estimate_transcript_tokens(transcript: &[ChatMessage]) -> u64 {
     let chars: usize = transcript
         .iter()
-        .map(|m| m.content.len() + m.content.len() / 8)
+        .map(|m| {
+            let base = m.content.len() + m.content.len() / 8;
+            let calls = m
+                .tool_calls
+                .as_ref()
+                .map(|cs| cs.iter().map(|c| c.arguments.len()).sum::<usize>())
+                .unwrap_or(0);
+            let result = m.tool_result.as_ref().map(|r| r.len()).unwrap_or(0);
+            base + calls + result
+        })
         .sum();
     (chars as u64) / 4
 }
@@ -152,14 +162,17 @@ pub fn run_turn(
                 used_tokens: est_now,
                 window_tokens: options.window_tokens.unwrap_or(0),
             });
-            if let Some(summary) =
-                compact_transcript(home, config, options, transcript, cancel, events)
-            {
-                let before = transcript.len();
-                transcript.clear();
+            if let Some(summary) = compact_transcript(home, config, options, transcript, cancel) {
+                // B6: keep the tail verbatim (the current prompt is the
+                // last message) and let the summary stand in for older
+                // history. The system prompt rides `options`, not the
+                // transcript, so it is untouched here.
+                let keep_from = transcript.len().saturating_sub(COMPACT_KEEP_TAIL);
+                let tail: Vec<ChatMessage> = transcript.split_off(keep_from);
                 transcript.push(user_message(format!(
-                    "[context compacted from {before} messages]\n\n{summary}"
+                    "[context compacted from {keep_from} older messages]\n\n{summary}"
                 )));
+                transcript.extend(tail);
                 events(FrontendEvent::Compacted {
                     summary: summary.clone(),
                 });
@@ -515,15 +528,23 @@ impl ToolExecutor for NoopExecutor {
 /// return the summary. Simple compaction (roadmap: the whole history
 /// becomes one summary + the latest user message; server-side
 /// compaction arrives with the live Anthropic leg).
+/// How many trailing messages survive compaction verbatim. The current
+/// prompt is always among them (it is the transcript's tail); the rest
+/// keep the newest exchanges in their own words.
+const COMPACT_KEEP_TAIL: usize = 6;
+
 fn compact_transcript(
     home: &std::path::Path,
     config: &TurnConfig,
     options: &TurnOptions,
     transcript: &[ChatMessage],
     cancel: &orbit_provider_http::CancelToken,
-    events: EventSink<'_>,
 ) -> Option<String> {
-    let digest: String = transcript
+    // Split: the newest COMPACT_KEEP_TAIL messages survive verbatim;
+    // only what precedes them is summarised (B6: never summarise the
+    // in-flight prompt — it sits at the tail).
+    let keep_from = transcript.len().saturating_sub(COMPACT_KEEP_TAIL);
+    let digest: String = transcript[..keep_from]
         .iter()
         .map(|m| match m.role {
             ChatRole::User | ChatRole::Assistant => format!(
@@ -554,6 +575,10 @@ fn compact_transcript(
     opts.max_attempts = 2;
     let mut scratch: Vec<ChatMessage> = Vec::new();
     let mut noop = NoopExecutor;
+    // Private sink (B6): the summary turn is housekeeping, not a turn
+    // the front-end should see. Its deltas, usage and turn_ended would
+    // land mid-turn on the real stream — swallow everything.
+    let mut private_sink = |_ev: FrontendEvent| {};
     let report = run_turn(
         home,
         config,
@@ -562,7 +587,7 @@ fn compact_transcript(
         &mut scratch,
         &mut noop,
         cancel,
-        events,
+        &mut private_sink,
     )
     .ok()?;
     (!report.final_text.is_empty()).then_some(report.final_text)
