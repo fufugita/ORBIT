@@ -273,8 +273,13 @@ mod tests {
         assert_eq!(names, ["SIGHUP (terminal closed)", "SIGTERM", "SIGINT"]);
     }
 
+    /// The signal flags are process-global; tests that mutate them must not
+    /// interleave (cargo runs tests in parallel threads).
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn take_pending_signal_drains_flag_exactly_once() {
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         force_signal(ShutdownSignal::Hangup);
         assert_eq!(take_pending_signal(), Some(ShutdownSignal::Hangup));
         // Second poll sees nothing — the flag was consumed.
@@ -283,6 +288,7 @@ mod tests {
 
     #[test]
     fn take_pending_signal_reports_each_signal_kind() {
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for sig in [
             ShutdownSignal::Hangup,
             ShutdownSignal::Terminate,

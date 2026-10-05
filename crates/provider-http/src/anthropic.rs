@@ -242,10 +242,11 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
             "model": request.route.expected_model,
             "stream": true,
             "max_tokens": request.sampling.max_output_tokens,
-            "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
             "messages": messages,
             // Adaptive thinking: it cannot be disabled on current models;
             // display stays omitted (chain-of-thought never renders).
+            // No temperature: the Messages API rejects temperature combined
+            // with thinking, and adaptive thinking owns sampling (B7).
             "thinking": { "type": "adaptive" },
         });
 
@@ -358,6 +359,15 @@ fn anthropic_stream(
                                     seq += 1;
                                 }
                             }
+                            "signature_delta" => {
+                                // The thinking block's signature: replayed
+                                // verbatim next round (the API rejects
+                                // unsigned replayed thinking).
+                                if let Some(sig) = v.pointer("/delta/signature").and_then(|x|x.as_str()) {
+                                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ThinkingSignatureDelta { bytes: sig.as_bytes().to_vec() } });
+                                    seq += 1;
+                                }
+                            }
                             "input_json_delta" => {
                                 if let Some(part) = v.pointer("/delta/partial_json").and_then(|x|x.as_str()) {
                                     if let Some((_, _, json)) = tool_calls.get_mut(&index) {
@@ -386,7 +396,10 @@ fn anthropic_stream(
                     }
                     _ => {}
                 }
-                if let Some(u) = v.get("usage") {
+                // message_start carries usage nested under /message;
+                // message_delta carries it top-level.
+                let u = v.get("usage").or_else(|| v.pointer("/message/usage"));
+                if let Some(u) = u {
                     usage.input_tokens = u.get("input_tokens").and_then(|x|x.as_u64()).unwrap_or(usage.input_tokens);
                     // Cache accounting (roadmap: check cache_read in tests).
                     usage.cache_read_tokens = u.get("cache_read_input_tokens").and_then(|x|x.as_u64()).unwrap_or(usage.cache_read_tokens);

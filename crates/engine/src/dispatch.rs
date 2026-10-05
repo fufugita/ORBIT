@@ -24,6 +24,9 @@ pub struct TurnOutcome {
     /// Attached to the assistant message as an opaque block for replay;
     /// never displayed, never sent to a provider that did not produce it.
     pub thinking: Option<String>,
+    /// Signature of the thinking block (Anthropic signature_delta),
+    /// replayed verbatim next round.
+    pub thinking_signature: Option<String>,
     pub tool_calls: Vec<PendingToolCall>,
     pub finish_reason: Option<String>,
     pub input_tokens: u64,
@@ -335,6 +338,20 @@ pub fn run_dispatch(
                     .collect();
                 (!t.is_empty()).then_some(t)
             };
+            // Assemble the thinking signature the same way (replay-only).
+            let thinking_signature: Option<String> = {
+                let s: String = r
+                    .events
+                    .iter()
+                    .filter_map(|e| match &e.event {
+                        orbit_adapter::types::ProviderEventKind::ThinkingSignatureDelta {
+                            bytes,
+                        } => Some(String::from_utf8_lossy(bytes).into_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                (!s.is_empty()).then_some(s)
+            };
             // Assemble tool calls from the streamed events.
             let mut tool_calls: std::collections::BTreeMap<u32, PendingToolCall> =
                 std::collections::BTreeMap::new();
@@ -382,6 +399,7 @@ pub fn run_dispatch(
             Ok(TurnOutcome {
                 output,
                 thinking,
+                thinking_signature,
                 tool_calls: tool_calls.into_values().collect(),
                 finish_reason,
                 input_tokens: usage.input_tokens,

@@ -481,7 +481,6 @@ fn scenario_r1_multiline_deny() {
 // Fails on 1310e73: B7 (temperature sent; thinking dropped;
 // input_tokens read as 0).
 #[test]
-#[ignore] // requires the B7 adapter fixes; enable in Phase 3
 fn scenario_a1_anthropic_wire() {
     let script: serde_json::Value = serde_json::json!({
         "main": [

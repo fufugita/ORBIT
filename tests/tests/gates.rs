@@ -21,33 +21,76 @@ fn workspace_target() -> std::path::PathBuf {
         .join("target")
 }
 
-/// Spawn the mock provider binary on a per-test port so parallel
-/// tests never fight over 8088. Returns the port. The port is derived
-/// from the test name (stable per test, unique across tests).
-fn spawn_mock() -> u16 {
-    let name = std::thread::current().name().unwrap_or("gate").to_string();
-    let h = name
-        .bytes()
-        .fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619));
-    let port = 18000 + (h % 2000) as u16;
-    let bind = format!("127.0.0.1:{port}");
+/// A mock provider owned by one test. Dropping the guard kills the child —
+/// no leaked servers, no stale ports for a later run to collide with.
+struct MockGuard {
+    child: Option<std::process::Child>,
+}
+
+impl Drop for MockGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// Spawn the mock provider on an OS-assigned port (127.0.0.1:0) and read
+/// the real port from its stdout line. Parallel tests can never collide,
+/// and the mock dies with its guard instead of leaking past the run.
+fn spawn_mock_guarded() -> (u16, MockGuard) {
     let target = workspace_target();
     for profile in ["release", "debug"] {
         let bin = target.join(profile).join("orbit-mock-provider");
-        if bin.exists() {
-            if let Ok(mut child) = Command::new(&bin).env("ORBIT_MOCK_BIND", &bind).spawn() {
-                for _ in 0..40 {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    if std::net::TcpStream::connect(&bind).is_ok() {
-                        std::mem::forget(child); // leak for the test's life
-                        return port;
-                    }
-                }
-                let _ = child.kill();
-            }
+        if !bin.exists() {
+            continue;
         }
+        let mut child = Command::new(&bin)
+            .env("ORBIT_MOCK_BIND", "127.0.0.1:0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn orbit-mock-provider");
+        // The mock prints "orbit-mock-provider listening on http://127.0.0.1:P".
+        let port = {
+            let out = child.stdout.take().expect("mock stdout");
+            let reader = std::io::BufReader::new(out);
+            let mut port: Option<u16> = None;
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if let Some(p) = line
+                    .rsplit("http://127.0.0.1:")
+                    .next()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+                {
+                    port = Some(p);
+                    break;
+                }
+            }
+            match port {
+                Some(p) => p,
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    continue;
+                }
+            }
+        };
+        // Wait until the port actually accepts connections.
+        for _ in 0..40 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return (port, MockGuard { child: Some(child) });
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    panic!("orbit-mock-provider not built; run cargo build -p orbit-mock-provider");
+    panic!("orbit-mock-provider not built or failed to start; run cargo build -p orbit-mock-provider");
 }
 
 /// Run `orbit -p` and collect the stream-json events.
@@ -100,40 +143,26 @@ fn run_orbit_p(
     prompt: &str,
     extra: &[&str],
 ) -> (Vec<serde_json::Value>, i32) {
-    let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
-    let mut cmd = Command::new(&bin)
-        .arg("-p")
-        .arg(prompt)
-        .arg("--home")
-        .arg(home)
-        .arg("--gate")
-        .arg(format!("http://127.0.0.1:{port}"))
-        .arg("--model")
-        .arg(std::env::var("ORBIT_GATE_MODEL").unwrap_or_else(|_| "gate-test-model".into()))
-        .arg("--output-format")
-        .arg("stream-json")
-        .args(extra)
-        .env("ORBIT_HOME", home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn orbit");
-    let mut events = Vec::new();
-    if let Some(out) = cmd.stdout.take() {
-        for line in BufReader::new(out).lines() {
-            let Ok(line) = line else { continue };
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                events.push(v);
-            }
-        }
-    }
-    let status = cmd.wait().expect("wait orbit");
-    (events, status.code().unwrap_or(-1))
+    // stream-json is this runner's contract (events are parsed as JSON
+    // lines); run_orbit_p_model passes flags through verbatim.
+    let mut args: Vec<&str> = vec!["--output-format", "stream-json"];
+    args.extend_from_slice(extra);
+    run_orbit_p_model(port, home, prompt, "gate-test-model", &args)
+}
+
+/// `run_orbit_p` with a model chosen by the caller — never by a global
+/// env var. `std::env::set_var` in one test thread poisons every
+/// concurrent test that reads the same var (parallel cargo tests share
+/// one process).
+#[allow(dead_code)]
+fn run_orbit_p_with_model(
+    port: u16,
+    home: &std::path::Path,
+    prompt: &str,
+    model: &str,
+    extra: &[&str],
+) -> (Vec<serde_json::Value>, i32) {
+    run_orbit_p_model(port, home, prompt, model, extra)
 }
 
 fn fresh_home(tag: &str) -> std::path::PathBuf {
@@ -157,7 +186,7 @@ fn init_home(bin: &str, home: &std::path::Path) {
 /// "unknown tool"), and the turn completes.
 #[test]
 fn gate3_tools_run_through_the_binary() {
-    let port = spawn_mock();
+    let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-binary");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {
@@ -210,7 +239,7 @@ fn gate3_tools_run_through_the_binary() {
 /// (deny-read), and the refusal is visible in the event stream.
 #[test]
 fn gate1_env_mention_refused_through_binary() {
-    let port = spawn_mock();
+    let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g1-binary");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {
@@ -251,7 +280,7 @@ fn gate1_env_mention_refused_through_binary() {
 /// still finish ok.
 #[test]
 fn gate4_auto_compaction_through_the_binary() {
-    let port = spawn_mock();
+    let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g4-compact");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {
@@ -280,8 +309,13 @@ context_window = 100
     )
     .unwrap();
 
-    std::env::set_var("ORBIT_GATE_MODEL", "gate-test-model-notools");
-    let (events, code) = run_orbit_p(port, &home, "count from 1 to 5", &[]);
+    let (events, code) = run_orbit_p_model(
+        port,
+        &home,
+        "count from 1 to 5",
+        "gate-test-model-notools",
+        &["--output-format", "stream-json"],
+    );
     let types: Vec<&str> = events
         .iter()
         .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
@@ -316,7 +350,7 @@ context_window = 100
 /// lost).
 #[test]
 fn gate4_continue_after_kill9() {
-    let port = spawn_mock();
+    let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g4-continue");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {
@@ -502,7 +536,7 @@ fn mod_install_signed_flow_through_binary() {
 /// and the session's decisions are on disk for export.
 #[test]
 fn gate6_ci_run_allowlist_and_exit_codes() {
-    let port = spawn_mock();
+    let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g6-ci");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {
@@ -607,7 +641,7 @@ fn run_orbit_p_ext(
 // vocabulary.
 #[test]
 fn gate2_one_loop_same_event_stream() {
-    let port = spawn_mock();
+    let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("gate2");
     init_home(
         &workspace_target().join("debug/orbit").display().to_string(),
@@ -825,7 +859,7 @@ fn gate2_no_front_end_owns_a_loop() {
 // the full triple, not just a record count.
 #[test]
 fn gate3_verify_ledger_lists_the_triple() {
-    let port = spawn_mock();
+    let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-ledger");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {
@@ -889,7 +923,7 @@ fn gate3_verify_ledger_lists_the_triple() {
 // (§Tools) — an unlisted host must ASK, never run silently.
 #[test]
 fn gate3_danger_triple_denial_egress_highrisk() {
-    let port = spawn_mock();
+    let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-danger");
     let target = workspace_target();
     let bin = if target.join("release/orbit").exists() {

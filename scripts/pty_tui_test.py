@@ -266,7 +266,7 @@ def make_providers(home, provider, gate, model):
     # providers.toml — otherwise dispatch falls back to the default gate
     # (4001) and the turn dies with a 401 before any tool call / approval.
     with open(os.path.join(home, "providers.toml"), "w") as f:
-        f.write(f'[[provider]]\nname = "{provider}"\nurl = "{gate}"\nenv = "ORBIT_GATE_TOKEN"\n\n[[provider.models]]\nid = "{model}"\n[[provider.models]]\nid = "mock"\n[[provider.models]]\nid = "mock-slowbash"\n')
+        f.write(f'[[provider]]\nname = "{provider}"\nurl = "{gate}"\nenv = "ORBIT_GATE_TOKEN"\n\n[[provider.models]]\nid = "{model}"\n[[provider.models]]\nid = "mock"\n[[provider.models]]\nid = "mock-bash"\n[[provider.models]]\nid = "mock-slowbash"\n')
 
 
 def main():
@@ -396,8 +396,10 @@ def main():
     time.sleep(0.3)
 
     # ── 4. Tool approval modal (y allows, turn completes) ──────────────────
-    # The `mock` model (no "slow") triggers a calculator tool call on the
-    # first round, then returns "hello world" after the tool result.
+    # The `mock-bash` model triggers a Bash tool call (touch — not
+    # read-only, so the approval card fires), then returns "hello world"
+    # after the tool result. Calculator never asks: it is a pure
+    # built-in, safe by construction (gate 6 depends on that).
     # Ensure the mock is still up (it can die mid-test); restart if needed.
     print(f"  [health] before approval: port8088={_port_open(8088)} mock_alive={mock_proc is not None and mock_proc.poll() is None}")
     if not _port_open(8088):
@@ -406,8 +408,8 @@ def main():
             mock_proc.wait()
         mock_proc = start_mock(args.mock, 8088)
         print("mock provider: restarted for approval test")
-    # Switch to the tool-call model for this section (§11.6 /model).
-    s.type("/model mock")
+    # Switch to the bash-tool model for this section (§11.6 /model).
+    s.type("/model mock-bash")
     s.key("enter")
     s.wait_for("model", timeout=5)
     s.read(0.5)
@@ -418,7 +420,7 @@ def main():
     # [tool] line BEFORE the ApprovalRequested message is reduced, so 'y'
     # could arrive while pending_approvals is still empty and get typed into
     # the composer instead of resolving the modal (race).
-    ok, buf = s.wait_for("Allow calculator", timeout=15)
+    ok, buf = s.wait_for("Allow Bash", timeout=15)
     check("approval card appears", ok, buf[-300:])
     print(f"  [health] after modal: port8088={_port_open(8088)} mock_alive={mock_proc is not None and mock_proc.poll() is None}")
     if ok:

@@ -424,6 +424,13 @@ pub enum ProviderEventKind {
     ThinkingDelta {
         bytes: Vec<u8>,
     },
+    /// A signature delta for the thinking block (Anthropic
+    /// `signature_delta`). Assembled with ThinkingDelta into the same
+    /// opaque replay block; never surfaced as display text, never
+    /// counted as delivered output.
+    ThinkingSignatureDelta {
+        bytes: Vec<u8>,
+    },
     ToolCallStarted {
         call_index: u32,
         provider_call_id: Option<String>,

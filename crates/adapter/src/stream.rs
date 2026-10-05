@@ -25,6 +25,7 @@ fn event_tag(kind: &ProviderEventKind) -> u16 {
         ProviderEventKind::UsageUpdate(_) => 6,
         ProviderEventKind::Finished { .. } => 7,
         ProviderEventKind::ThinkingDelta { .. } => 8,
+        ProviderEventKind::ThinkingSignatureDelta { .. } => 9,
     }
 }
 
@@ -35,6 +36,7 @@ fn event_to_hash_bytes(ev: &ProviderStreamEvent) -> Vec<u8> {
     let payload: Vec<u8> = match &ev.event {
         ProviderEventKind::TextDelta { bytes }
         | ProviderEventKind::ThinkingDelta { bytes }
+        | ProviderEventKind::ThinkingSignatureDelta { bytes }
         | ProviderEventKind::ToolCallArgumentsDelta { bytes, .. } => bytes.clone(),
         ProviderEventKind::ResponseStarted {
             upstream_request_id,

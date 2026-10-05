@@ -218,6 +218,7 @@ pub fn run_turn(
             transcript.push(assistant_message_with_thinking(
                 o.output.clone(),
                 o.thinking.clone(),
+                o.thinking_signature.clone(),
             ));
             report.final_text = o.output.clone();
             report.ok = true;
@@ -246,6 +247,7 @@ pub fn run_turn(
             o.output.clone(),
             assistant_calls,
             o.thinking.clone(),
+            o.thinking_signature.clone(),
         ));
 
         // The TUI's tool-line motion (M07/M08/M09/M10): the full
@@ -439,16 +441,28 @@ fn is_retryable(code: &str) -> bool {
 // for the loop; engine → cli's tools via this alias). In phase 3 the
 // tool runtime moves bodily into the engine and the shim inverts.
 
+/// Build the opaque thinking block for replay. The signature (when the
+/// provider sent one) is replayed verbatim — the API rejects unsigned
+/// replayed thinking.
+fn thinking_block_json(thinking: &str, signature: Option<&str>) -> String {
+    let mut v = serde_json::json!({ "type": "thinking", "thinking": thinking });
+    if let Some(s) = signature.filter(|s| !s.is_empty()) {
+        v["signature"] = serde_json::json!(s);
+    }
+    v.to_string()
+}
+
 /// An assistant message carrying replay-only thinking as an opaque block.
 /// The thinking JSON is stored verbatim; the adapter replays it unchanged.
 pub(crate) fn assistant_message_with_thinking(
     text: String,
     thinking: Option<String>,
+    signature: Option<String>,
 ) -> ChatMessage {
     let mut m = assistant_message(text);
     if let Some(t) = thinking.filter(|t| !t.is_empty()) {
         m.blocks = Some(vec![orbit_adapter::types::ContentBlock::Opaque {
-            json: serde_json::json!({ "type": "thinking", "thinking": t }).to_string(),
+            json: thinking_block_json(&t, signature.as_deref()),
         }]);
     }
     m
@@ -459,6 +473,7 @@ pub(crate) fn assistant_with_calls_and_thinking(
     text: String,
     calls: Vec<orbit_adapter::types::ToolCallMessage>,
     thinking: Option<String>,
+    signature: Option<String>,
 ) -> ChatMessage {
     let mut m = ChatMessage {
         role: ChatRole::Assistant,
@@ -470,7 +485,7 @@ pub(crate) fn assistant_with_calls_and_thinking(
     };
     if let Some(t) = thinking.filter(|t| !t.is_empty()) {
         m.blocks = Some(vec![orbit_adapter::types::ContentBlock::Opaque {
-            json: serde_json::json!({ "type": "thinking", "thinking": t }).to_string(),
+            json: thinking_block_json(&t, signature.as_deref()),
         }]);
     }
     m

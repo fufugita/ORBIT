@@ -188,8 +188,17 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
             .unwrap_or(Duration::from_millis(0));
         let now_ms = boot_ms.elapsed().as_millis() as u64;
         tui.tick_ms = now_ms;
-        if event::poll(timeout).unwrap_or(false) {
-            match event::read().unwrap_or(Event::FocusGained) {
+        // A deleted terminal (closed window, dead PTY) makes poll/read
+        // fail with EIO — swallow nothing: treat any input error as
+        // "terminal gone" and quit at once (the same rule as SIGHUP).
+        // unwrap_or(false) here would busy-loop the EIO at 100% CPU.
+        let ev = match event::poll(timeout) {
+            Ok(true) => event::read().ok(),
+            Ok(false) => None,
+            Err(_) => break,
+        };
+        if let Some(ev) = ev {
+            match ev {
                 Event::Key(k) => {
                     overlay_dirty = true;
                     if handle_key(
