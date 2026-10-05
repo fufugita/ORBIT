@@ -31,7 +31,9 @@ runs:
     - name: install orbit
       shell: bash
       run: |
-        cargo install --path "${{ github.action_path }}" --bin orbit --locked || {
+        # The workspace root carries the Cargo.toml; action_path is
+        # this action's own directory and has nothing to install.
+        cargo install --path "${{ github.workspace }}" --bin orbit --locked || {
           echo "::error::cargo install orbit failed"; exit 1; }
     - name: run the agent
       id: run
