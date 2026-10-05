@@ -15,6 +15,9 @@ env:
   # reclaimed mid-run). Panic backtraces are not needed on CI.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  # Integration-test binaries relink the whole workspace each; the
+  # incremental cache is dead weight on a one-shot runner.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   check:
@@ -37,8 +40,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build gate binaries
         run: cargo build -p orbit-cli -p orbit-mock-provider
+      - name: disk before test
+        run: df -h /
       - name: test
         run: cargo test --workspace
+      - name: disk after test
+        if: always()
+        run: df -h /
       - name: deny
         run: |
           cargo install --locked cargo-deny >/dev/null 2>&1
