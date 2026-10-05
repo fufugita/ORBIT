@@ -847,13 +847,14 @@ for line in sys.stdin:
         .unwrap();
     }
 
-    let (events, _code) = run_p(
+    let (events, exit_code) = run_p(
         &mock,
         &home,
         &fix.path,
         "use every extension",
         &["--auto-tools"],
     );
+    let _ = exit_code; // printed in the hook assertion's diagnostic
 
     let all = serde_json::to_string(&events).unwrap_or_default();
     // What actually reached the model: the mock's request log.
@@ -885,7 +886,7 @@ for line in sys.stdin:
     //    model sees says so.
     assert!(
         reqs_all.contains("no push in tests") || reqs_all.contains("blocked by hook"),
-        "the PreToolUse hook must block git push: {reqs_all:.400}\n--- events: {all:.600}"
+        "the PreToolUse hook must block git push (exit {exit_code}): {reqs_all:.2000}\n--- events: {all:.4000}"
     );
 
     // 5. The turn completed despite the blocked push (the hook result
