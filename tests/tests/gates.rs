@@ -39,64 +39,111 @@ impl Drop for MockGuard {
 /// Spawn the mock provider on an OS-assigned port (127.0.0.1:0) and read
 /// the real port from its stdout line. Parallel tests can never collide,
 /// and the mock dies with its guard instead of leaking past the run.
+/// Every wait carries a deadline: on a starved CI runner the mock can
+/// take seconds to print/bind, and an unbounded read would hang the
+/// whole suite.
 fn spawn_mock_guarded() -> (u16, MockGuard) {
     let target = workspace_target();
-    for profile in ["release", "debug"] {
-        let bin = target.join(profile).join("orbit-mock-provider");
-        if !bin.exists() {
-            continue;
-        }
-        let mut child = Command::new(&bin)
-            .env("ORBIT_MOCK_BIND", "127.0.0.1:0")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn orbit-mock-provider");
-        // The mock prints "orbit-mock-provider listening on http://127.0.0.1:P".
-        let port = {
-            let out = child.stdout.take().expect("mock stdout");
-            let reader = std::io::BufReader::new(out);
-            let mut port: Option<u16> = None;
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                if let Some(p) = line
-                    .rsplit("http://127.0.0.1:")
-                    .next()
-                    .and_then(|s| s.trim().parse::<u16>().ok())
-                {
-                    port = Some(p);
-                    break;
-                }
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        for profile in ["release", "debug"] {
+            let bin = target.join(profile).join("orbit-mock-provider");
+            if !bin.exists() {
+                last_err = format!("{} not built", bin.display());
+                continue;
             }
-            match port {
-                Some(p) => p,
-                None => {
+            let mut child = match Command::new(&bin)
+                .env("ORBIT_MOCK_BIND", "127.0.0.1:0")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("spawn: {e}");
+                    continue;
+                }
+            };
+            // The mock prints "orbit-mock-provider listening on
+            // http://127.0.0.1:P". Read that line on a helper thread
+            // with a hard 30 s deadline — a blocked pipe read has no
+            // timeout of its own.
+            let out = child.stdout.take().expect("mock stdout");
+            let (tx, rx) = std::sync::mpsc::channel();
+            // The drain thread holds the pipe open for the child's
+            // lifetime; its handle is deliberately dropped (detached).
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                let mut reader = std::io::BufReader::new(out);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Some(p) = line
+                                .rsplit("http://127.0.0.1:")
+                                .next()
+                                .and_then(|s| s.trim().parse::<u16>().ok())
+                            {
+                                let _ = tx.send(Ok(p));
+                                // Keep draining so the mock never blocks
+                                // on a full pipe; exits when it dies.
+                                loop {
+                                    line.clear();
+                                    match reader.read_line(&mut line) {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(_) => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = tx.send(Err("mock printed no port line".into()));
+            });
+            let port = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    last_err = e;
                     let _ = child.kill();
                     let _ = child.wait();
                     continue;
                 }
+                Err(_) => {
+                    last_err = "mock did not report its port in 30 s".into();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    continue;
+                }
+            };
+            // Wait until the port actually accepts connections (same
+            // generous window; early-exits on child death).
+            let mut ready = false;
+            for _ in 0..300 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    ready = true;
+                    break;
+                }
+                if let Ok(Some(_)) = child.try_wait() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-        };
-        // Wait until the port actually accepts connections. The window
-        // is generous (30 s): under a full `cargo test --workspace`
-        // run every test binary competes for CPU, and a mock that
-        // would bind in 50 ms can take seconds. The child-death check
-        // still exits early on a real failure.
-        for _ in 0..300 {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            if ready {
+                // The drain thread holds the pipe open for the child's
+                // lifetime; it exits when the mock dies.
                 return (port, MockGuard { child: Some(child) });
             }
-            if let Ok(Some(_)) = child.try_wait() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            last_err = "mock port never opened".into();
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
-    panic!(
-        "orbit-mock-provider not built or failed to start; run cargo build -p orbit-mock-provider"
-    );
+    panic!("orbit-mock-provider failed to start: {last_err}");
 }
 
 /// Run `orbit -p` and collect the stream-json events.
