@@ -106,8 +106,13 @@ impl Tool for AgentTool {
 mod tests {
     use super::*;
 
+    /// The runner slot is process-global; tests that swap it must not
+    /// interleave (parallel cargo tests share one process).
+    static RUNNER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn runs_the_installed_runner() {
+        let _g = RUNNER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_subagent_runner(Some(Arc::new(|req: &SubagentRequest| {
             Ok(format!("did: {}", req.prompt))
         })));
@@ -125,6 +130,7 @@ mod tests {
 
     #[test]
     fn honest_when_no_runner() {
+        let _g = RUNNER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_subagent_runner(None);
         let cx = ToolContext::new(
             std::env::temp_dir().join("agent-test"),
