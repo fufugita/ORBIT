@@ -657,6 +657,22 @@ fn execute_wave1(
             args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
         );
 
+    // Hooks (phase 5): PreToolUse fires BEFORE every other gate —
+    // hooks are the operator's policy layer and must see (and be able
+    // to block) every call, whatever the machine's sandbox state.
+    // PostToolUse sees the result.
+    let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
+    let pre = hooks.fire(
+        orbit_engine::hooks::HookEvent::PreToolUse,
+        &serde_json::json!({
+            "tool": call.name,
+            "arguments": args,
+        }),
+    );
+    if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
+        return tool_error(&format!("blocked by hook: {reason}"));
+    }
+
     // S3: when the shell sandbox cannot run on this machine, a Bash
     // command must not execute unsandboxed on an allow verdict. The
     // operator opts in explicitly (ORBIT_ALLOW_UNSANDBOXED_BASH=1) or
@@ -702,8 +718,6 @@ fn execute_wave1(
     // made Edit always refuse.
     let cx = tool_cx.clone();
 
-    // Hooks (phase 5): PreToolUse can block (exit 2 / Deny decision)
-    // before anything runs; PostToolUse sees the result.
     let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
     let pre = hooks.fire(
         orbit_engine::hooks::HookEvent::PreToolUse,

@@ -2880,6 +2880,7 @@ dependencies = [
  "orbit-release",
  "orbit-sandbox",
  "orbit-session",
+ "orbit-tools",
  "orbit-trust",
  "rand_core 0.6.4",
  "serde_json",
