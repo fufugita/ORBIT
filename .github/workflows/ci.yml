@@ -5,9 +5,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  # No debuginfo on CI: artifacts shrink several-fold, linking gets
+  # faster, and the whole job fits comfortably inside the runner's
+  # time envelope (a cold full-workspace debug build was being
+  # reclaimed mid-run). Panic backtraces are not needed on CI.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   check:
