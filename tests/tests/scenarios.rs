@@ -885,7 +885,7 @@ for line in sys.stdin:
     //    model sees says so.
     assert!(
         reqs_all.contains("no push in tests") || reqs_all.contains("blocked by hook"),
-        "the PreToolUse hook must block git push: {reqs_all:.400}"
+        "the PreToolUse hook must block git push: {reqs_all:.400}\n--- events: {all:.600}"
     );
 
     // 5. The turn completed despite the blocked push (the hook result

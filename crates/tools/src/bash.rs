@@ -56,6 +56,36 @@ pub fn is_readonly_command(cmd: &str) -> bool {
         .any(|a| trimmed == *a || trimmed.starts_with(&format!("{a} ")))
 }
 
+/// Does the command touch a deny-read path (S2)? The sandbox masks
+/// deny paths when it can run, but that defense silently disappears
+/// when bwrap cannot — the command's own path-like arguments are
+/// checked here so the rule holds on every machine. Word-level and
+/// conservative: a token that resolves (after ~ expansion) onto a
+/// deny-read path denies the whole command.
+pub fn command_touches_deny_read(cmd: &str) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    for token in cmd.split_whitespace() {
+        // Strip shell punctuation that hugs paths.
+        let t =
+            token.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';' || c == ':');
+        if t.is_empty() {
+            continue;
+        }
+        let expanded = if let Some(rest) = t.strip_prefix("~/") {
+            format!("{home}/{rest}")
+        } else if t == "~" {
+            home.clone()
+        } else {
+            t.to_string()
+        };
+        let p = std::path::Path::new(&expanded);
+        if crate::is_deny_read(p) {
+            return true;
+        }
+    }
+    false
+}
+
 /// High-risk command detection for the approval card's risk level
 /// (roadmap: rm -rf, git push --force, curl | sh are high).
 pub fn command_risk(cmd: &str) -> u8 {
@@ -146,6 +176,15 @@ impl Tool for BashTool {
 /// keeps running in the background and the result says so.
 pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolResult {
     use std::process::{Command, Stdio};
+
+    // S2: the deny-read list holds for the shell too — checked on the
+    // command's own arguments, before any sandbox consideration (the
+    // sandbox mask is defense-in-depth, not the rule).
+    if command_touches_deny_read(command) {
+        return ToolResult::err(
+            "denied: the command touches a deny-read path (credentials never reach a provider)",
+        );
+    }
 
     let output_path = cx
         .outputs_dir()
