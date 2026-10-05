@@ -185,5 +185,7 @@ def query(
             result.rounds = ev.get("rounds", 0)
         yield ev
     proc.wait()
-    result.exit_code = proc.returncode or -1
+    # `or -1` would map a clean exit 0 to failure; None (killed by a
+    # signal) is the only case that should read as -1.
+    result.exit_code = proc.returncode if proc.returncode is not None else -1
     yield result  # type: ignore[misc]
