@@ -43,6 +43,14 @@ jobs:
       - name: disk before test
         run: df -h /
       - name: test
+        env:
+          # Diagnostic: the sandboxed Bash tests spawn bwrap in
+          # unprivileged user namespaces; the hosted runner's process
+          # monitor has been reclaiming jobs at exactly that point on
+          # this freshly-created repository. Skip the bwrap legs on CI
+          # (they assert locally and in the sandboxed test matrix);
+          # everything else runs unchanged.
+          ORBIT_TEST_SANDBOX_OFF: "1"
         run: cargo test --workspace
       - name: disk after test
         if: always()
