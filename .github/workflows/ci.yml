@@ -51,7 +51,11 @@ jobs:
           # (they assert locally and in the sandboxed test matrix);
           # everything else runs unchanged.
           ORBIT_TEST_SANDBOX_OFF: "1"
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude orbit-tools
+      - name: tools suite alone
+        env:
+          ORBIT_TEST_SANDBOX_OFF: "1"
+        run: cargo test -p orbit-tools
       - name: disk after test
         if: always()
         run: df -h /
