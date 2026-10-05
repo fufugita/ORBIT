@@ -797,6 +797,45 @@ fn worker_main(
                     },
                 }
             }
+            WorkerCommand::ShellBang(command) => {
+                // The shell bang (gate 1): one command through the Bash
+                // tool's FULL path — sandbox, permissions, approvals,
+                // scanner, ledger — exactly as if the model had called
+                // it. The transcript shows the tool line; the composer
+                // never blocks (this runs on the worker thread).
+                let call = orbit_engine::PendingToolCall {
+                    index: 0,
+                    id: format!("bang-{}", ulid::Ulid::new()),
+                    name: "Bash".into(),
+                    arguments: serde_json::json!({ "command": command })
+                        .to_string()
+                        .into_bytes(),
+                };
+                let decision_id = format!("bang-{}", ulid::Ulid::new());
+                let mut approval_channel =
+                    TuiApprovalChannel::new(ctx.sender.clone(), ctx.approvals.clone());
+                let tool_cx = orbit_tools::ToolContext::new(
+                    config.home.clone(),
+                    config.session_id.clone(),
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+                );
+                orbit_hud_tui::emit_tool_started(&ctx.sender, "Bash", &command);
+                let result = crate::tool_runtime::execute_call(
+                    &config.home,
+                    &config.session_id,
+                    &decision_id,
+                    &call,
+                    false, // never auto-allow: the bang asks like any Bash call
+                    true,
+                    &mut approval_channel,
+                    &mut auto_grants,
+                    &tool_cx,
+                )
+                .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+                let outcome = classify_tool_result(&result);
+                orbit_hud_tui::emit_tool_finished(&ctx.sender, "Bash", outcome);
+            }
             WorkerCommand::ModCommand(mod_name, cmd_name) => {
                 // A mod command runs its body as a normal prompt turn.
                 let body = mods

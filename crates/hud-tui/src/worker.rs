@@ -56,6 +56,12 @@ pub enum WorkerCommand {
     /// persistent permission rules (CLI-side: the rules module lives in
     /// orbit-cli, which the TUI crate can't depend on).
     Permissions(String),
+    /// `!command` — the shell bang (gate 1): run one command through
+    /// the Bash tool's full path — sandbox, permissions, approvals,
+    /// scanner — and show the result as a tool line. The composer
+    /// stays responsive: the command runs on the worker thread, and
+    /// Esc kills it like any tool.
+    ShellBang(String),
 }
 
 /// The sender end of the worker-command channel — held by the TUI's event

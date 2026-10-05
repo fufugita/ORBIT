@@ -47,6 +47,8 @@ profraw/
 docs/handoff-pivot-to-claude-code.md
 docs/handoff-tui-endtoend.md
 .planning/
+# PTY-suite byproduct (mock provider touches this in cwd)
+approval-probe.txt
 scripts/__pycache__/
 crates/hud-tui/receipts/
 crates/hud-tui/review-receipts/

@@ -563,6 +563,25 @@ fn handle_key(
                 composer.push('\n');
             }
             KeyCode::Enter => {
+                // The shell bang (gate 1): `!command` runs one command
+                // through the Bash tool's full path on the worker
+                // thread — the composer stays responsive (the "!
+                // sleep 5" gate).
+                if composer.starts_with('!') && composer.trim().len() > 1 {
+                    let command = composer.trim()[1..].trim().to_string();
+                    composer.clear();
+                    history.insert(0, format!("!{command}"));
+                    *history_idx = None;
+                    scenario.transcript.push(TranscriptLine {
+                        kind: LineKind::Tool,
+                        text: command.clone(),
+                        tool_name: "Bash".into(),
+                        tool_state: super::scenario::ToolState::Running,
+                        ..Default::default()
+                    });
+                    let _ = command_sink.send(WorkerCommand::ShellBang(command));
+                    return false;
+                }
                 if composer.starts_with('/') && !composer.trim().eq("/") {
                     let text = composer.trim().to_string();
                     composer.clear();

@@ -661,6 +661,47 @@ def main():
         sb.key("ctrl+d")
         time.sleep(0.5)
 
+    # ── 8. Shell bang: !cmd runs via the Bash tool's full path ─────────────
+    # Gate 1: "!sleep 5" must surface the approval card (never a silent
+    # bypass), and the composer must keep accepting keys while the
+    # command runs. Probed by writing one char at a time and requiring
+    # an output frame per char — the stream-order vs screen-of-truth
+    # trap means we assert on render activity, not on finding the
+    # literal char in a diff frame.
+    print("\n== Shell bang test ==")
+    s6 = PtySession(
+        [args.binary, "--home", args.home, "--model", args.model],
+        env=env, timeout=20, rows=30, cols=110,
+    )
+    ok, _ = s6.wait_for("ORBIT", timeout=15)
+    check("boots TUI for bang test", ok)
+    if ok:
+        for ch in "!sleep 5":
+            s6.key(ch); time.sleep(0.05)
+        s6.key("enter"); time.sleep(1.2); s6.read(0.5)
+        # approval card: wait past the 1s arming window, then allow.
+        time.sleep(1.4)
+        s6.key("y")
+        time.sleep(1.0)  # the sleep is now running
+        responsive = True
+        for ch in "probe":
+            s6.key(ch)
+            chunk = s6.read(0.5)
+            if len(chunk) == 0:
+                responsive = False
+            time.sleep(0.1)
+        check("composer responsive during !sleep", responsive)
+        # let the sleep finish, then quit
+        time.sleep(4.5)
+        s6.read(1.0)
+        s6.key("esc")
+        time.sleep(0.3)
+        s6.key("ctrl+d"); time.sleep(0.5); s6.key("y"); time.sleep(0.6)
+        try:
+            s6.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            s6.terminate()
+
     # ── 8. SIGHUP → clean exit ─────────────────────────────────────────────
 
 
