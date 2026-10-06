@@ -371,6 +371,7 @@ fn run_web_turn(
     let options = orbit_engine::TurnOptions {
         tools: orbit_cli::tools::tool_definitions(),
         request_stem: "orbit-web".into(),
+        session_id: config.session_id.clone(),
         ..Default::default()
     };
 

@@ -95,6 +95,7 @@ pub fn run_dispatch(
     cancel: orbit_provider_http::CancelToken,
     tools: Vec<orbit_adapter::types::ToolDefinition>,
     request_stem: &str,
+    session_id: &str,
 ) -> Result<TurnOutcome, (&'static str, String)> {
     // Parse the gate URL; only http loopback or https is acceptable.
     let url =
@@ -233,20 +234,16 @@ pub fn run_dispatch(
     );
 
     // Build the provider request carrying the REAL prompt bytes.
+    // E7: every dispatch mints a fresh ULID request id (unique per
+    // round, turn and retry — the old "{stem}-{pid}" was identical
+    // for the whole process life, so the ledger could not tie rounds
+    // to turns or sessions).
+    let request_ulid = ulid::Ulid::new();
     let request = orbit_adapter::types::ProviderRequest {
         schema_version: 1,
-        request_id: orbit_adapter::types::RequestId(format!(
-            "{request_stem}-{}",
-            std::process::id()
-        )),
-        decision_id: orbit_adapter::types::DecisionId(format!(
-            "{request_stem}-{}",
-            std::process::id()
-        )),
-        attempt_id: orbit_adapter::types::AttemptId(format!(
-            "{request_stem}-{}",
-            std::process::id()
-        )),
+        request_id: orbit_adapter::types::RequestId(format!("{request_stem}-{request_ulid}")),
+        decision_id: orbit_adapter::types::DecisionId(format!("{request_stem}-{request_ulid}")),
+        attempt_id: orbit_adapter::types::AttemptId(format!("{request_stem}-{request_ulid}")),
         route: route.clone(),
         input,
         messages,
@@ -291,7 +288,10 @@ pub fn run_dispatch(
         .filter(|t| !t.is_empty())
         .map(|t| orbit_adapter::credential::SecretBytes::new(t.into_bytes()));
 
-    let session = orbit_gateway::new_session_id();
+    // E7: the session id comes from the front-end (one per chat
+    // session, stable across rounds and turns) — not minted per
+    // round, which made the ledger unable to tie rounds to sessions.
+    let session: orbit_ledger::SessionId = session_id.to_string();
     let decision = orbit_gateway::new_decision_id();
 
     // Run the full pipeline via tokio.

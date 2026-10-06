@@ -411,6 +411,7 @@ pub fn run_turn(
         observer,
         cancel,
         tools::tool_definitions(),
+        &format!("ask-{}", ulid::Ulid::new()),
     )
 }
 
@@ -430,6 +431,7 @@ pub fn run_turn_with_tools(
     observer: orbit_provider_http::stream::StreamObserver<'_>,
     cancel: orbit_provider_http::CancelToken,
     tools: Vec<orbit_adapter::types::ToolDefinition>,
+    session_id: &str,
 ) -> Result<TurnOutcome, (&'static str, String)> {
     let config = engine_turn_config(home, provider_id, gate, model, credential_env, pricing);
     orbit_engine::run_dispatch(
@@ -441,6 +443,7 @@ pub fn run_turn_with_tools(
         cancel,
         tools,
         "orbit-cli",
+        session_id,
     )
 }
 #[cfg(test)]

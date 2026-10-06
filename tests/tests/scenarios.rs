@@ -1367,3 +1367,79 @@ fn scenario_e5_stalled_stream_times_out_and_retries() {
         "E5: the recovered reply streamed after the retry"
     );
 }
+
+// ── E7: the ledger ties every call to one session id ──────────────
+// Request/decision ids used to be "{stem}-{pid}" (identical for the
+// whole process) and the ledger session was minted per round. After a
+// fix-the-test run, verify-ledger must list intent+decision+result
+// for every call, all under the session's stable id.
+#[test]
+fn scenario_e7_ledger_ties_calls_to_one_session() {
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Read", "args": {"file_path": "calc.py"}}]},
+            {"tools": [{"name": "Edit", "args": {
+                "file_path": "calc.py",
+                "old_string": "return a - b",
+                "new_string": "return a + b"}}]},
+            {"tools": [{"name": "Bash", "args": {
+                "command": "python3 test_calc.py",
+                "description": "run the tests"}}]},
+            {"text": "the test passes now"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let (events, code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        "make the tests pass",
+        &["--auto-tools"],
+    );
+    assert_eq!(code, 0, "the turn completes");
+    assert_eq!(count(&events, "turn_ended"), 1, "one turn");
+    let _ = events;
+
+    // verify-ledger: every call has intent+decision+result, and the
+    // raw ledger records all carry ONE session id.
+    let out = Command::new(orbit_binary())
+        .arg("--home")
+        .arg(&home.path)
+        .arg("verify-ledger")
+        .output()
+        .expect("verify-ledger");
+    assert!(out.status.success(), "verify-ledger passes");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify-ledger json");
+    let calls = v["calls"].as_array().cloned().unwrap_or_default();
+    assert!(calls.len() >= 3, "three tool calls recorded");
+    for c in &calls {
+        assert!(c.get("intent").is_some(), "intent present: {c}");
+        assert!(c.get("decision").is_some(), "decision present: {c}");
+        assert!(c.get("result").is_some(), "result present: {c}");
+    }
+
+    // One session id across the raw ledger records (read through
+    // the ledger's own reader — segment files, not flat jsonl).
+    let (records, _head) =
+        orbit_ledger::verify_ledger(&home.path.join("ledger")).expect("ledger verifies");
+    let mut sessions = std::collections::BTreeSet::new();
+    for r in &records {
+        let s = match &r.record.event {
+            orbit_ledger::LedgerEvent::ToolIntent(i) => i.session_id.clone(),
+            orbit_ledger::LedgerEvent::ToolVerdict(v) => v.session_id.clone(),
+            orbit_ledger::LedgerEvent::ToolResult(t) => t.session_id.clone(),
+            _ => continue,
+        };
+        sessions.insert(s);
+    }
+    assert!(
+        sessions.len() == 1,
+        "E7: every tool record under ONE session id, got {sessions:?}"
+    );
+    // And the session id is NOT the old per-round mint shape? The
+    // front-end mints p-ULID for headless: assert it starts with p-.
+    let sid = sessions.iter().next().unwrap();
+    assert!(sid.starts_with("p-"), "headless session id shape: {sid}");
+}

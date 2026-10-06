@@ -763,7 +763,9 @@ fn execute_wave1(
             let path = orbit_tools::resolve_path(&cx, path_str);
             if path.exists() {
                 let cps = orbit_engine::transcript::Checkpoints::new(home, &cx.session_id);
-                let turn_cp = current_turn_checkpoint();
+                // E7: one checkpoint id per turn — the context mints
+                // it on first write and reuses it for the turn.
+                let turn_cp = cx.turn_checkpoint_id();
                 let _ = cps.snapshot_file(&turn_cp, &path);
             }
         }
@@ -809,14 +811,6 @@ fn execute_wave1(
 fn project_trusted_home(home: &Path) -> bool {
     let cwd = std::env::current_dir().unwrap_or_default();
     orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
-}
-
-/// The checkpoint id for the current turn: one per user prompt. The
-/// engine opens it at the prompt; the executor snapshots into it.
-/// (S5: the old env-var marker was never set by anyone; the ULID is
-/// per write-turn, which is the checkpoint granularity /rewind needs.)
-fn current_turn_checkpoint() -> String {
-    format!("cp-{}", ulid::Ulid::new())
 }
 
 /// Execute one MCP call: resolve the server from the config, spawn,

@@ -23,6 +23,10 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 8;
 pub struct TurnOptions {
     pub max_rounds: u32,
     pub max_attempts: u32,
+    /// The session this turn belongs to (E7): the ledger session id,
+    /// the checkpoint owner, and the tie between rounds and turns.
+    /// Front-ends mint one ULID session at startup and reuse it.
+    pub session_id: String,
     /// Tools advertised to the model this turn. `/compact` passes an
     /// EMPTY list: a summarization request must not advertise tools.
     pub tools: Vec<orbit_adapter::types::ToolDefinition>,
@@ -89,6 +93,7 @@ impl Default for TurnOptions {
             // Phase 3 moves the tool runtime into the engine.
             tools: Vec::new(),
             system_directive: None,
+            session_id: format!("s-{}", ulid::Ulid::new()),
             request_stem: "orbit-engine".into(),
             window_tokens: None,
             output_reserve_tokens: 8_192,
@@ -410,6 +415,7 @@ fn dispatch_with_retry(
             cancel.clone(),
             options.tools.clone(),
             &options.request_stem,
+            &options.session_id,
         );
         match result {
             Ok(o) => return Ok(o),

@@ -65,6 +65,12 @@ pub trait Tool: Send + Sync {
 /// interior-mutex) so every tool call in a session sees the same map.
 #[derive(Clone)]
 pub struct ToolContext {
+    /// The current turn's checkpoint id (E7): minted once per user
+    /// prompt, shared by every Write/Edit in that turn — /rewind
+    /// restores a turn, not a single call. Reset by the front-end at
+    /// each prompt. Arc so the Clone derive (cheap handle sharing,
+    /// like read_hashes) keeps working.
+    pub turn_checkpoint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub home: PathBuf,
     pub session_id: String,
     pub working_dir: PathBuf,
@@ -85,7 +91,27 @@ impl ToolContext {
             read_hashes: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            turn_checkpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// The turn's checkpoint id (E7): minted on first write of the
+    /// turn, reused by every Write/Edit after it — one checkpoint per
+    /// user prompt, so /rewind restores the turn.
+    pub fn turn_checkpoint_id(&self) -> String {
+        let mut guard = self.turn_checkpoint.lock().expect("checkpoint lock");
+        if let Some(id) = guard.as_ref() {
+            return id.clone();
+        }
+        let id = format!("cp-{}", ulid::Ulid::new());
+        *guard = Some(id.clone());
+        id
+    }
+
+    /// Reset at the start of a turn (front-ends call this per prompt).
+    pub fn reset_turn_checkpoint(&self) {
+        let mut guard = self.turn_checkpoint.lock().expect("checkpoint lock");
+        *guard = None;
     }
 
     /// Record a full read (or an equivalent write) — the file's current

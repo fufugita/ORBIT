@@ -140,6 +140,13 @@ fn worker_main(
     // not per provider round, and not per turn — so `R` means what its
     // label says. Reset on resume and on a new session.
     let mut auto_grants = crate::tool_runtime::AutoGrants::new();
+    // The SESSION-scoped tool context (B2/E7): read-before-edit map and
+    // the turn checkpoint id live here, reset per prompt.
+    let session_tool_cx = orbit_tools::ToolContext::new(
+        config.home.clone(),
+        config.session_id.clone(),
+        std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+    );
     // Mods (Claude-Mods parity): loaded once at boot, toggleable at
     // runtime. The directive is rebuilt whenever the enabled set changes.
     let mut mods = crate::mods::load_all(&config.home);
@@ -247,6 +254,8 @@ fn worker_main(
                 orbit_hud_tui::emit_plan_ready(&ctx.sender, &plan_text);
             }
             WorkerCommand::Prompt(prompt) => {
+                // E7: a new user prompt opens a new checkpoint turn.
+                session_tool_cx.reset_turn_checkpoint();
                 let token = orbit_provider_http::CancelToken::new();
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = Some(token.clone());
@@ -525,6 +534,7 @@ fn worker_main(
                     None,
                     token.clone(),
                     vec![],
+                    &config.session_id,
                 );
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = None;
@@ -1226,6 +1236,7 @@ pub fn run_tui_turn(
 
     let options = orbit_engine::TurnOptions {
         tools: crate::tools::session_tool_definitions(&config.home),
+        session_id: config.session_id.clone(),
         system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
         // The model's window: auto-compaction triggers at 90% of
         // window minus the output reserve (phase 4).

@@ -1107,6 +1107,7 @@ fn cmd_headless(args: &[String]) -> i32 {
         system_directive: Some(build_session_prompt(&home, &model)),
         window_tokens: orbit_cli::context_window_for(&home, &model),
         request_stem: "orbit-p".into(),
+        session_id: session_id.clone(),
         ..Default::default()
     };
     // The authority extractor (phase 6): "run the tests but never
@@ -1855,6 +1856,7 @@ fn cmd_chat(args: &[String]) -> i32 {
             system_directive: Some(build_session_prompt(&home, &model)),
             window_tokens: orbit_cli::context_window_for(&home, &model),
             request_stem: "orbit-repl".into(),
+            session_id: session.clone(),
             ..Default::default()
         };
         let report = orbit_engine::run_turn(
