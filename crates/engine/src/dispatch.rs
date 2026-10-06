@@ -262,9 +262,19 @@ pub fn run_dispatch(
             input_bytes: prompt.len() as u64,
             tools_count: tools.len() as u32,
         },
+        // E5: 30 s to the first byte, 90 s max gap between chunks.
+        // Both overridable for tests (ORBIT_TEST_* never ship in
+        // production configs — the scenarios use them to keep the
+        // suite fast while proving the timeout fires).
         connect_timeout_ms: 10_000,
-        first_byte_timeout_ms: 30_000,
-        total_timeout_ms: 120_000,
+        first_byte_timeout_ms: std::env::var("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000),
+        idle_timeout_ms: std::env::var("ORBIT_TEST_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90_000),
     };
 
     // Gate authentication (never printed/persisted). A provider may require a

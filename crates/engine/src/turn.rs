@@ -452,6 +452,9 @@ fn is_retryable(code: &str) -> bool {
         // transient — retry with the same backoff as 429.
         || code.starts_with("E0408")
         || code.starts_with("E0410")
+        // E5: a stalled stream (idle timeout, E0409) is transient —
+        // the retry re-requests and the provider usually answers.
+        || code.starts_with("E0409")
 }
 
 // The CLI's tool definitions are reused, not copied: a thin re-export

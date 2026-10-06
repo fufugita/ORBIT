@@ -30,6 +30,11 @@ conversation:
         input tokens in message_start
   {"status": 400, "body": "{\"error\":...}"}
         fail with this HTTP status (and body); 500/502/503/504/529 are
+  {"stall_ms": 10000}
+        send response headers, then send NOTHING for this long (a
+        stalled stream — the client's idle timeout must fire)
+  {"stall_ms": 10000, "stall_bytes": "data: {...}\n\n"}
+        send headers, send stall_bytes once, then go silent
         retryable from the client's point of view
   {"status": 529}
         fail with this status and an empty body
@@ -285,6 +290,20 @@ class Handler(BaseHTTPRequestHandler):
 
         if "status" in step:
             self._fail(step["status"], step.get("body") or "")
+            return
+
+        if "stall_ms" in step:
+            # E5: a stalled stream. Headers (200) go out, optional
+            # stall_bytes, then silence for stall_ms — the client must
+            # time out between chunks and retry.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            if step.get("stall_bytes"):
+                self.wfile.write(step["stall_bytes"].encode())
+                self.wfile.flush()
+            time.sleep(step["stall_ms"] / 1000.0)
             return
 
         if Handler.wire == "anthropic" or self.path.endswith("/v1/messages"):

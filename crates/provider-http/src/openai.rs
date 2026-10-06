@@ -177,16 +177,23 @@ impl OpenAiCompatibleHttpV1 {
             return Err(crate::error::status_error(status, body).await);
         }
 
-        let bytes = resp
-            .bytes_stream()
-            .map(|b| b.map_err(|e| AdapterError::ProviderTransportFailure(e.to_string())));
-        Ok(openai_stream(bytes, cancel.clone()))
+        Ok(openai_stream(
+            resp.bytes_stream(),
+            request.first_byte_timeout_ms,
+            request.idle_timeout_ms,
+            cancel.clone(),
+        ))
     }
 }
 
 /// Consume the OpenAI SSE byte stream and emit `ProviderStreamEvent`s.
 fn openai_stream(
-    mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, AdapterError>> + Unpin + Send + 'static,
+    mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
+        + Unpin
+        + Send
+        + 'static,
+    first_byte_timeout_ms: u64,
+    idle_timeout_ms: u64,
     cancel: CancelToken,
 ) -> AsyncProviderEventStream {
     Box::pin(async_stream::stream! {
@@ -201,11 +208,31 @@ fn openai_stream(
         yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ResponseStarted { upstream_request_id: None } });
         seq += 1;
 
-        while let Some(chunk) = bytes.next().await {
+        // E5: a stream that stops sending bytes must fail as a
+        // retryable timeout, not hang the turn forever. First gap
+        // gets first_byte_timeout; later gaps get idle_timeout.
+        let mut first_chunk = true;
+        while let Some(chunk) = {
+            let budget = std::time::Duration::from_millis(if first_chunk {
+                first_byte_timeout_ms
+            } else {
+                idle_timeout_ms
+            });
+            match tokio::time::timeout(budget, bytes.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    yield Err(AdapterError::ProviderTimeout(
+                        "stream stalled: no bytes within the idle timeout (E0409)".into(),
+                    ));
+                    return;
+                }
+            }
+        } {
             if cancel.is_cancelled() { break; }
+            first_chunk = false;
             let chunk = match chunk {
                 Ok(c) => c,
-                Err(e) => { yield Err(e); return; }
+                Err(e) => { yield Err(AdapterError::ProviderTransportFailure(e.to_string())); return; }
             };
             let events = match parser.feed(&chunk) {
                 Ok(evs) => evs,

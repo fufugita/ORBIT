@@ -124,6 +124,6 @@ pub fn canonical_request(route: &ProviderRouteBinding, input: &[u8]) -> Provider
         },
         connect_timeout_ms: 10_000,
         first_byte_timeout_ms: 30_000,
-        total_timeout_ms: 120_000,
+        idle_timeout_ms: 90_000,
     }
 }

@@ -1297,3 +1297,73 @@ fn scenario_e4_result_verdict_typed_not_substring() {
         "E4: no error event for a successful read of poison content"
     );
 }
+
+// ── E5: a stalled stream times out between chunks and retries ─────
+// Once headers arrive, a stream that never sends another byte used to
+// hang the turn forever. Now the first gap gets first_byte_timeout and
+// later gaps idle_timeout, both failing as retryable E0409.
+#[test]
+fn scenario_e5_stalled_stream_times_out_and_retries() {
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            // Attempt 1: headers, one chunk of real SSE, then silence
+            // for 30 s — far beyond the test's 2 s idle timeout.
+            {"stall_ms": 30000, "stall_bytes": "data: {\"choices\":[{\"index\":0,\"delta\":{}}]}\n\n"},
+            // Attempt 2 (after the retry): a normal reply.
+            {"text": "recovered after retry"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let mut cmd = Command::new(orbit_binary());
+    cmd.arg("-p")
+        .arg("try to answer")
+        .arg("--home")
+        .arg(&home.path)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{}", mock.port))
+        .arg("--model")
+        .arg("mock-model")
+        .arg("--output-format")
+        .arg("stream-json")
+        .env("ORBIT_TEST_IDLE_TIMEOUT_MS", "2000")
+        .env("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS", "2000")
+        .current_dir(&fix.path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().expect("run orbit -p");
+    let events: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the turn completes after the retry"
+    );
+
+    // Exactly one turn_ended (the stall was retried, not fatal).
+    assert_eq!(
+        count(&events, "turn_ended"),
+        1,
+        "E5: stalled stream retried to completion"
+    );
+    // The retry actually happened: two provider requests.
+    assert!(
+        mock.requests().len() >= 2,
+        "E5: the stalled request was retried ({} requests)",
+        mock.requests().len()
+    );
+    // The final text arrived.
+    assert!(
+        events.iter().any(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("text_delta")
+                && e.get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .contains("recovered")
+        }),
+        "E5: the recovered reply streamed after the retry"
+    );
+}

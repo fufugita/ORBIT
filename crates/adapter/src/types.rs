@@ -316,8 +316,13 @@ pub struct ProviderRequest {
     pub tools: Vec<ToolDefinition>,
     pub metadata: RequestMetadata,
     pub connect_timeout_ms: u64,
+    /// Time to the FIRST byte of the response body. A provider that
+    /// accepts the request but never starts answering is dead.
     pub first_byte_timeout_ms: u64,
-    pub total_timeout_ms: u64,
+    /// Max gap between stream chunks (E5). A stream may run as long
+    /// as it keeps producing bytes; a silent gap longer than this is
+    /// a stalled stream and fails as a retryable timeout.
+    pub idle_timeout_ms: u64,
 }
 
 /// Terminal status of a provider call (DR-09 §4).

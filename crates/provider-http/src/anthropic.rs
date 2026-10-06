@@ -295,7 +295,12 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
             let body = resp.text().await.unwrap_or_default();
             return Err(crate::error::status_error(status, body).await);
         }
-        Ok(anthropic_stream(resp.bytes_stream(), cancel.clone()))
+        Ok(anthropic_stream(
+            resp.bytes_stream(),
+            request.first_byte_timeout_ms,
+            request.idle_timeout_ms,
+            cancel.clone(),
+        ))
     }
 }
 
@@ -304,6 +309,8 @@ fn anthropic_stream(
         + Unpin
         + Send
         + 'static,
+    first_byte_timeout_ms: u64,
+    idle_timeout_ms: u64,
     cancel: CancelToken,
 ) -> AsyncProviderEventStream {
     use futures::StreamExt;
@@ -320,8 +327,28 @@ fn anthropic_stream(
             std::collections::BTreeMap::new(); // index -> (id, name, partial json)
         let mut finish_reason: Option<String> = None;
 
-        while let Some(chunk) = bytes.next().await {
+        // E5: a stream that stops sending bytes must fail as a
+        // retryable timeout, not hang the turn forever. First gap
+        // gets first_byte_timeout; later gaps get idle_timeout.
+        let mut first_chunk = true;
+        while let Some(chunk) = {
+            let budget = std::time::Duration::from_millis(if first_chunk {
+                first_byte_timeout_ms
+            } else {
+                idle_timeout_ms
+            });
+            match tokio::time::timeout(budget, bytes.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    yield Err(AdapterError::ProviderTimeout(
+                        "stream stalled: no bytes within the idle timeout (E0409)".into(),
+                    ));
+                    return;
+                }
+            }
+        } {
             if cancel.is_cancelled() { break; }
+            first_chunk = false;
             let chunk = match chunk { Ok(c) => c, Err(e) => { yield Err(AdapterError::ProviderTransportFailure(e.to_string())); return; } };
             for ev in parser.feed(&chunk).unwrap_or_default() {
                 let v: serde_json::Value = match serde_json::from_str(&ev.data) { Ok(v) => v, Err(_) => continue };
