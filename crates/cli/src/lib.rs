@@ -351,6 +351,8 @@ pub fn engine_turn_config(
 ) -> orbit_engine::TurnConfig {
     let cfg = crate::config::ProvidersConfig::load(home).unwrap_or_default();
     let max_output_tokens = cfg.max_output_tokens_for(model).unwrap_or(32_000) as u64;
+    // E8: sampling per model — only what providers.toml sets is sent.
+    let sampling = cfg.sampling_for(model).map(|s| (s.temperature, s.top_p));
     // The provider kind selects the adapter (anthropic / ollama /
     // openai-compatible). Resolved from the provider entry owning this
     // model; the fallback chain covers a model with no declared owner.
@@ -366,6 +368,7 @@ pub fn engine_turn_config(
         credential_env: credential_env.map(str::to_string),
         pricing: pricing.map(std::convert::From::from),
         max_output_tokens,
+        sampling,
     }
 }
 

@@ -343,6 +343,7 @@ fn add_configured_provider(
         .into_iter()
         .enumerate()
         .map(|(i, id)| orbit_cli::config::ModelEntry {
+            sampling: None,
             id,
             label: None,
             pricing: pricing

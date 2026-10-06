@@ -943,6 +943,7 @@ pub fn subagent_turn_config(_home: &Path) -> orbit_engine::TurnConfig {
         provider_id: std::env::var("ORBIT_PROVIDER").unwrap_or_else(|_| "local".into()),
         gate,
         model,
+        sampling: None, // E8: subagents inherit no sampling
         kind: orbit_engine::dispatch::ProviderKind::OpenAiCompatible,
         credential_env: std::env::var("ORBIT_CREDENTIAL_ENV").ok(),
         pricing: None,

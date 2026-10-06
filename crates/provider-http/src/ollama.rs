@@ -132,16 +132,23 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
                 {"role":"user","content": String::from_utf8_lossy(request.input.expose()).into_owned()}
             ]),
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": request.route.expected_model,
             "stream": true,
             "messages": messages,
             "options": {
-                "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
-                "top_p": request.sampling.top_p_millionths as f64 / 1_000_000.0,
                 "num_predict": request.sampling.max_output_tokens,
             }
         });
+        // E8: sampling opt-in per model; zero means unset — omitted.
+        if request.sampling.temperature_milliunits > 0 {
+            body["options"]["temperature"] =
+                serde_json::json!(request.sampling.temperature_milliunits as f64 / 1000.0);
+        }
+        if request.sampling.top_p_millionths > 0 {
+            body["options"]["top_p"] =
+                serde_json::json!(request.sampling.top_p_millionths as f64 / 1_000_000.0);
+        }
         let resp = tokio::time::timeout(
             std::time::Duration::from_millis(request.connect_timeout_ms),
             self.client.post(url).json(&body).send(),

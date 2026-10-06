@@ -42,7 +42,7 @@ impl From<Pricing> for orbit_adapter::types::CostRates {
 }
 
 /// A model declared for a provider (id + optional display label + pricing).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
     #[serde(default)]
@@ -59,10 +59,27 @@ pub struct ModelEntry {
     /// (phase 4); when absent compaction never triggers.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Optional sampling override (E8): temperature and top_p. Omitted
+    /// by default — current Anthropic models reject temperature with
+    /// thinking, and OpenAI reasoning models reject temperature
+    /// outright, so sampling is opt-in per model, never ambient.
+    #[serde(default)]
+    pub sampling: Option<SamplingOverride>,
+}
+
+/// Per-model sampling (E8): only what is explicitly set is sent.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SamplingOverride {
+    /// Temperature, 0.0–2.0.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Top-p, 0.0–1.0.
+    #[serde(default)]
+    pub top_p: Option<f64>,
 }
 
 /// One declared provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     /// Adapter kind: `openai-compatible` (the only supported kind today).
@@ -81,7 +98,7 @@ fn default_kind() -> String {
 }
 
 /// The full providers config (a TOML array-of-tables).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ProvidersConfig {
     #[serde(default)]
     pub provider: Vec<ProviderConfig>,
@@ -123,6 +140,14 @@ impl ProvidersConfig {
             .iter()
             .find_map(|p| p.models.iter().find(|m| m.id == model))
             .and_then(|m| m.context_window)
+    }
+
+    /// The sampling block declared for a model id (E8), if any.
+    pub fn sampling_for(&self, model: &str) -> Option<SamplingOverride> {
+        self.provider
+            .iter()
+            .find_map(|p| p.models.iter().find(|m| m.id == model))
+            .and_then(|m| m.sampling.clone())
     }
 
     pub fn max_output_tokens_for(&self, model: &str) -> Option<u32> {
@@ -350,6 +375,7 @@ output_per_million_microcents = 600000
             url: "http://127.0.0.1:4001".into(),
             env: Some("ORBIT_GATE_TOKEN".into()),
             models: vec![ModelEntry {
+                sampling: None,
                 id: "glm-5.2".into(),
                 label: None,
                 pricing: Pricing {

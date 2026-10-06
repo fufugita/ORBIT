@@ -84,6 +84,7 @@ fn gate2_anthropic_tool_round_and_replay() {
     std::fs::create_dir_all(dir.join("ledger")).expect("mkdir ledger");
 
     let config = orbit_engine::TurnConfig {
+        sampling: None,
         provider_id: "mock-anthropic".into(),
         // The adapter builds https://host:port/v1/messages from the
         // route; the mock listens on plain http loopback. The adapter

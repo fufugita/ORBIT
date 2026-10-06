@@ -136,13 +136,22 @@ impl OpenAiCompatibleHttpV1 {
             "model": request.route.expected_model,
             "stream": true,
             "stream_options": { "include_usage": true },
-            "temperature": request.sampling.temperature_milliunits as f64 / 1000.0,
             "max_tokens": request.sampling.max_output_tokens,
             "messages": messages,
         });
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(tools);
             body["tool_choice"] = serde_json::Value::String("auto".into());
+        }
+        // E8: sampling is opt-in per model. Zero means unset — omit it
+        // entirely (OpenAI reasoning models reject `temperature`).
+        if request.sampling.temperature_milliunits > 0 {
+            body["temperature"] =
+                serde_json::json!(request.sampling.temperature_milliunits as f64 / 1000.0);
+        }
+        if request.sampling.top_p_millionths > 0 {
+            body["top_p"] =
+                serde_json::json!(request.sampling.top_p_millionths as f64 / 1_000_000.0);
         }
 
         let mut req = self

@@ -1443,3 +1443,48 @@ fn scenario_e7_ledger_ties_calls_to_one_session() {
     let sid = sessions.iter().next().unwrap();
     assert!(sid.starts_with("p-"), "headless session id shape: {sid}");
 }
+
+// ── E8: sampling is opt-in per model, omitted by default ──────────
+// temperature 0.7 / top_p 0.95 were sent to every provider. Current
+// Anthropic models reject temperature with thinking, and OpenAI
+// reasoning models reject temperature outright. Default now omits
+// both; providers.toml [model.sampling] opts in.
+#[test]
+fn scenario_e8_sampling_omitted_unless_configured() {
+    // Leg 1: default home — no sampling keys may appear.
+    let script: serde_json::Value = serde_json::json!({
+        "main": [{"text": "hi"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+    let (_e, code) = run_p(&mock, &home, &fix.path, "hello", &[]);
+    assert_eq!(code, 0);
+    let log = serde_json::to_string(&mock.requests()).unwrap();
+    assert!(
+        !log.contains("\"temperature\"") && !log.contains("\"top_p\""),
+        "E8: no sampling keys by default:\n{log}"
+    );
+
+    // Leg 2: sampling configured per model — both keys sent, exact values.
+    let mock2 = Mock::start(&script, "openai");
+    let home2 = Home::init(
+        &mock2,
+        "openai",
+        // TOML nesting: inside [[provider.models]], a nested table is
+        // [provider.models.sampling] — [model.sampling] would define a
+        // top-level table the schema ignores.
+        "[provider.models.sampling]\ntemperature = 0.2\ntop_p = 0.9\n",
+    );
+    let (_e2, code2) = run_p(&mock2, &home2, &fix.path, "hello", &[]);
+    assert_eq!(code2, 0);
+    let log2 = serde_json::to_string(&mock2.requests()).unwrap();
+    assert!(
+        log2.contains("\"temperature\":0.2"),
+        "E8: configured temperature sent:\n{log2}"
+    );
+    assert!(
+        log2.contains("\"top_p\":0.9"),
+        "E8: configured top_p sent:\n{log2}"
+    );
+}

@@ -74,6 +74,11 @@ pub struct TurnConfig {
     pub credential_env: Option<String>,
     pub pricing: Option<orbit_adapter::types::CostRates>,
     pub max_output_tokens: u64,
+    /// Optional sampling override (E8): temperature / top_p as
+    /// configured per model in providers.toml. None = omit —
+    /// providers apply their own defaults, and several current
+    /// model families REJECT explicit sampling parameters.
+    pub sampling: Option<(Option<f64>, Option<f64>)>,
 }
 
 /// Run one provider round through the four-gate async dispatch
@@ -247,9 +252,19 @@ pub fn run_dispatch(
         route: route.clone(),
         input,
         messages,
+        // E8: sampling is opt-in per model. Zero means "not set" —
+        // the wire adapters omit a zero temperature/top_p (B7/E8).
         sampling: orbit_adapter::types::SamplingParameters {
-            temperature_milliunits: 700,
-            top_p_millionths: 950_000,
+            temperature_milliunits: config
+                .sampling
+                .and_then(|(t, _)| t)
+                .and_then(|t| (t >= 0.0).then(|| (t * 1000.0) as u32))
+                .unwrap_or(0),
+            top_p_millionths: config
+                .sampling
+                .and_then(|(_, p)| p)
+                .and_then(|p| (p >= 0.0).then(|| (p * 1_000_000.0) as u32))
+                .unwrap_or(0),
             max_output_tokens: config.max_output_tokens,
         },
         output: orbit_adapter::types::OutputRequirements::Text,
