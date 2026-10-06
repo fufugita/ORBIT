@@ -13,6 +13,7 @@ license.workspace = true
 description = "Async provider HTTP adapters, streaming, TLS/SPKI pinning"
 
 [dependencies]
+orbit-tools = { path = "../tools" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

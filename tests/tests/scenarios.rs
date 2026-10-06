@@ -1234,3 +1234,66 @@ fn scenario_e3_context_meter_last_round_not_sum() {
         ended[0]
     );
 }
+
+// ── E4: tool success is the typed verdict, not a substring ────────
+// A Read of a JSON fixture containing the literal text "ok":false was
+// reported as a failed tool call (settle animation, Anthropic wire
+// is_error, ledger status). The verdict is now the top-level ok
+// field, parsed once — content that merely contains the text is fine.
+#[test]
+fn scenario_e4_result_verdict_typed_not_substring() {
+    // Fixture content with the poison string INSIDE.
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Read", "args": {
+                "file_path": "fixture.json"}}]},
+            {"text": "done"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    // The fixture: a JSON body whose content includes the poison text.
+    let fix = TempDir::new().expect("tempdir");
+    std::fs::write(
+        fix.path().join("fixture.json"),
+        r#"{"note": "a body that says \"ok\":false inside a string"}"#,
+    )
+    .expect("write fixture");
+
+    let (events, code) = run_p(&mock, &home, fix.path(), "use tools", &["--auto-tools"]);
+    assert_eq!(code, 0, "the turn completes");
+
+    // Round 2's tool message carries the Read result. Parse it as
+    // JSON (no byte-grepping across escape levels): the top-level ok
+    // must be true, and the poison text must be inside content.
+    let reqs = mock.requests();
+    let msgs = reqs
+        .get(1)
+        .and_then(|r| r["body"]["messages"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let tool_msg = msgs
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .cloned()
+        .unwrap_or_default();
+    let content = tool_msg["content"].as_str().unwrap_or("");
+    let verdict: serde_json::Value =
+        serde_json::from_str(content).unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        verdict.get("ok"),
+        Some(&serde_json::json!(true)),
+        "E4: top-level ok must be true (Read succeeded):\n{content}"
+    );
+    let inner = verdict["content"].as_str().unwrap_or("");
+    assert!(
+        inner.contains("a body that says") && inner.contains("false"),
+        "E4: the fixture content (with the poison text) must be delivered:\n{inner}"
+    );
+    // 2. No tool error event fired.
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("error")),
+        "E4: no error event for a successful read of poison content"
+    );
+}

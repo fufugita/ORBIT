@@ -311,7 +311,10 @@ pub fn run_turn(
                         .map(|f| f.to_string())
                 })
                 .unwrap_or_default();
-            let ok = !r.content.contains("\"ok\":false") && !r.content.contains("\"ok\": false");
+            // E4: the typed verdict — top-level ok, parsed once. A
+            // result whose *content* happens to contain the text
+            // "ok":false (a Read of a JSON fixture) is not an error.
+            let ok = !orbit_tools::result_is_error(&r.content);
             events(FrontendEvent::ToolFinishedFull {
                 call_id: r.call_id.clone(),
                 ok,

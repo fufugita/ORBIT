@@ -2801,6 +2801,7 @@ dependencies = [
  "hex",
  "orbit-adapter",
  "orbit-mock-provider",
+ "orbit-tools",
  "reqwest",
  "rustls",
  "rustls-native-certs",

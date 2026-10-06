@@ -403,10 +403,10 @@ pub fn execute_call(
             },
             None => tool_error("Skill requires 'name'"),
         };
-        let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
-            "ok"
-        } else {
+        let status = if orbit_tools::result_is_error(&output) {
             "error"
+        } else {
+            "ok"
         };
         record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
@@ -438,10 +438,10 @@ pub fn execute_call(
             Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
             Err(e) => tool_error(&e),
         };
-        let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
-            "ok"
-        } else {
+        let status = if orbit_tools::result_is_error(&output) {
             "error"
+        } else {
+            "ok"
         };
         record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
@@ -450,10 +450,10 @@ pub fn execute_call(
     // MCP tools (phase 5): mcp__<server>__<tool> — spawn, call, scan.
     if call.name.starts_with("mcp__") {
         let output = execute_mcp(home, call, &args);
-        let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
-            "ok"
-        } else {
+        let status = if orbit_tools::result_is_error(&output) {
             "error"
+        } else {
+            "ok"
         };
         record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
@@ -465,10 +465,10 @@ pub fn execute_call(
     // the secret scanner on every result (review blocker 1).
     if orbit_tools::is_wave1(&call.name) {
         let output = execute_wave1(home, scope, call, &args, tool_cx);
-        let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
-            "ok"
-        } else {
+        let status = if orbit_tools::result_is_error(&output) {
             "error"
+        } else {
+            "ok"
         };
         record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
@@ -484,10 +484,10 @@ pub fn execute_call(
         record_result(home, session_id, decision_id, call, "error", &truncated)?;
         return Ok(truncated);
     }
-    let status = if output.contains("\"ok\":true") {
-        "ok"
-    } else {
+    let status = if orbit_tools::result_is_error(&output) {
         "error"
+    } else {
+        "ok"
     };
     record_result(home, session_id, decision_id, call, status, &output)?;
     Ok(output)

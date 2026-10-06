@@ -121,7 +121,9 @@ fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<serde_js
                 // block keyed by the originating tool_use id.
                 let id = m.tool_call_id.clone().unwrap_or_default();
                 let content = m.tool_result.clone().unwrap_or_else(|| m.content.clone());
-                let is_error = content.contains("\"ok\":false");
+                // E4: the typed verdict, shared with the engine and
+                // the ledger — never a substring of the content.
+                let is_error = orbit_tools::result_is_error(&content);
                 wire.push(serde_json::json!({
                     "role": "user",
                     "content": [{

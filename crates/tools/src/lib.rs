@@ -158,6 +158,23 @@ impl ToolResult {
 /// model can Read later (roadmap's spanning rule).
 pub const INLINE_LIMIT: usize = 30_000;
 
+/// The authoritative tool-result verdict (E4): the TOP-LEVEL `ok` field
+/// of the result JSON, parsed once — never a substring search, which
+/// fires on any tool whose *output* merely contains the text
+/// `"ok":false` (a Read of a JSON fixture, a grep hit). A result that
+/// is not valid JSON, or JSON without an `ok` field, is NOT an error:
+/// several legacy results are plain strings.
+pub fn result_is_error(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        // The ok field's VALUE (true = success); invert for the
+        // verdict. A missing field or non-JSON payload is not an
+        // error (legacy plain-string results).
+        .and_then(|v| v.get("ok").and_then(|f| f.as_bool()))
+        .map(|ok| !ok)
+        .unwrap_or(false)
+}
+
 /// Wrap a result payload: inline when short, spilled when long.
 pub fn finish(mut result: ToolResult, cx: &ToolContext, call_id: &str) -> ToolResult {
     if result.payload.len() > INLINE_LIMIT {
@@ -166,7 +183,10 @@ pub fn finish(mut result: ToolResult, cx: &ToolContext, call_id: &str) -> ToolRe
             if std::fs::write(&path, &result.payload).is_ok() {
                 let preview = result.payload.chars().take(2_000).collect::<String>();
                 result.payload = serde_json::json!({
-                    "ok": result.payload.contains("\"ok\":true") || !result.is_error,
+                    // E4: the spill wrapper's verdict is the typed one
+                    // (the payload's own top-level ok, parsed — never
+                    // a substring of the preview).
+                    "ok": !result_is_error(&result.payload) && !result.is_error,
                     "note": "result too long for inline display",
                     "spilled_to": path.to_string_lossy(),
                     "preview": preview,
@@ -382,5 +402,33 @@ pub fn resolve_path(cx: &ToolContext, p: &str) -> PathBuf {
         path.to_path_buf()
     } else {
         cx.working_dir.join(path)
+    }
+}
+
+#[cfg(test)]
+mod e4_tests {
+    use super::*;
+
+    #[test]
+    fn verdict_ignores_nested_poison_but_catches_real_errors() {
+        // Poison inside content: NOT an error. Built with json! so
+        // the escaping is serde's own, not hand-rolled.
+        let inner = serde_json::json!({
+            "note": "a body that says \"ok\":false inside a string"
+        })
+        .to_string();
+        let payload = serde_json::json!({
+            "content": format!("1\t{inner}\n"),
+            "ok": true
+        })
+        .to_string();
+        assert!(!result_is_error(&payload), "nested text is not a verdict");
+        // Real error: top-level ok:false.
+        let real_error = r#"{"ok":false,"error":"denied"}"#;
+        assert!(result_is_error(real_error));
+        // Missing ok field: not an error (legacy plain payloads).
+        assert!(!result_is_error("{\"content\":\"hello\"}"));
+        // Not JSON at all: not an error.
+        assert!(!result_is_error("plain text output"));
     }
 }
