@@ -258,12 +258,12 @@ pub fn run_dispatch(
             temperature_milliunits: config
                 .sampling
                 .and_then(|(t, _)| t)
-                .and_then(|t| (t >= 0.0).then(|| (t * 1000.0) as u32))
+                .and_then(|t| (t >= 0.0).then_some((t * 1000.0) as u32))
                 .unwrap_or(0),
             top_p_millionths: config
                 .sampling
                 .and_then(|(_, p)| p)
-                .and_then(|p| (p >= 0.0).then(|| (p * 1_000_000.0) as u32))
+                .and_then(|p| (p >= 0.0).then_some((p * 1_000_000.0) as u32))
                 .unwrap_or(0),
             max_output_tokens: config.max_output_tokens,
         },
