@@ -118,6 +118,13 @@ pub fn run_turn(
     cancel: &orbit_provider_http::CancelToken,
     events: EventSink<'_>,
 ) -> Result<TurnReport, String> {
+    // E9: hooks — the prompt enters the session before the turn runs.
+    let hooks = crate::hooks::Hooks::load(home, crate::hooks::project_trusted(home));
+    let _ = hooks.fire(
+        crate::hooks::HookEvent::UserPromptSubmit,
+        &serde_json::json!({ "prompt": prompt }),
+    );
+
     transcript.push(user_message(prompt));
 
     let mut report = TurnReport::default();
@@ -163,6 +170,11 @@ pub fn run_turn(
                 options.output_reserve_tokens,
             )
         {
+            // E9: PreCompact fires before the summarisation.
+            let _ = hooks.fire(
+                crate::hooks::HookEvent::PreCompact,
+                &serde_json::json!({ "estimated_tokens": est_now }),
+            );
             events(FrontendEvent::Compacting {
                 used_tokens: est_now,
                 window_tokens: options.window_tokens.unwrap_or(0),
@@ -178,6 +190,11 @@ pub fn run_turn(
                     "[context compacted from {keep_from} older messages]\n\n{summary}"
                 )));
                 transcript.extend(tail);
+                // E9: PostCompact fires after the swap-in.
+                let _ = hooks.fire(
+                    crate::hooks::HookEvent::PostCompact,
+                    &serde_json::json!({ "summary_bytes": summary.len() }),
+                );
                 events(FrontendEvent::Compacted {
                     summary: summary.clone(),
                 });
@@ -231,6 +248,15 @@ pub fn run_turn(
                 Some("length") | Some("max_tokens")
             );
             if truncated {
+                // E9: Notification — a condition the operator should
+                // hear about (the reply was cut off).
+                let _ = hooks.fire(
+                    crate::hooks::HookEvent::Notification,
+                    &serde_json::json!({
+                        "kind": "output_truncated",
+                        "limit": config.max_output_tokens,
+                    }),
+                );
                 events(FrontendEvent::OutputTruncated {
                     limit: config.max_output_tokens,
                 });
@@ -248,6 +274,12 @@ pub fn run_turn(
                 output_tokens: report.output_tokens,
                 cost_microcents: report.cost_microcents,
             });
+            // E9: Stop fires when the turn ends its reply — the
+            // main loop's natural pause point.
+            let _ = hooks.fire(
+                crate::hooks::HookEvent::Stop,
+                &serde_json::json!({ "final_text_bytes": o.output.len() }),
+            );
             emit_turn_ended(events, &report, report.rounds);
             return Ok(report);
         }

@@ -292,6 +292,16 @@ pub fn execute_call(
         // A pattern deny rule (or plan mode refusing a write) is final.
         ApprovalVerdict::Deny
     } else {
+        // E9: PermissionRequest fires when the operator is asked to
+        // decide (hooks can observe, not replace, the ask).
+        let hooks_pr = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
+        let _ = hooks_pr.fire(
+            orbit_engine::hooks::HookEvent::PermissionRequest,
+            &serde_json::json!({
+                "tool": call.name,
+                "summary": safe_call_summary(call),
+            }),
+        );
         approval.ask(
             &ApprovalRequest {
                 call_id: call.id.clone(),
@@ -470,6 +480,15 @@ pub fn execute_call(
         } else {
             "ok"
         };
+        // E9: PostToolUseFailure fires for the error path (the plain
+        // PostToolUse fires inside execute_wave1 with ok=true/false).
+        if status == "error" {
+            let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
+            let _ = hooks.fire(
+                orbit_engine::hooks::HookEvent::PostToolUseFailure,
+                &serde_json::json!({ "tool": call.name, "ok": false }),
+            );
+        }
         record_result(home, session_id, decision_id, call, status, &output)?;
         return Ok(output);
     }

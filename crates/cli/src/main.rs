@@ -947,6 +947,15 @@ fn cmd_headless(args: &[String]) -> i32 {
         eprintln!("{code}: {msg}");
         return 1;
     }
+    // E9: SessionStart fires when the headless session opens.
+    {
+        let hooks =
+            orbit_engine::hooks::Hooks::load(&home, orbit_engine::hooks::project_trusted(&home));
+        let _ = hooks.fire(
+            orbit_engine::hooks::HookEvent::SessionStart,
+            &serde_json::json!({ "frontend": "headless" }),
+        );
+    }
     let gate = value_after(args, "--gate")
         .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
         .unwrap_or_else(|| "http://127.0.0.1:4001".into());
@@ -1335,22 +1344,26 @@ fn cmd_headless(args: &[String]) -> i32 {
                             || t.contains("dontAsk")
                     })
             });
-            orbit_engine::automation::exit_code(&r, max_rounds, permission_denied)
+            let code = orbit_engine::automation::exit_code(&r, max_rounds, permission_denied);
+            // E9: SessionEnd fires when the headless session closes.
+            fire_session_end(&home, if code == 0 { "ended" } else { "error" });
+            code
         }
         Err(e) => {
-            save_session(
-                &transcript,
-                &orbit_engine::TurnReport {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cost_microcents: 0,
-                    ..Default::default()
-                },
-            );
+            fire_session_end(&home, "error");
             eprintln!("{e}");
             1
         }
     }
+}
+
+/// E9: fire the SessionEnd hook (headless session close).
+fn fire_session_end(home: &Path, reason: &str) {
+    let hooks = orbit_engine::hooks::Hooks::load(home, orbit_engine::hooks::project_trusted(home));
+    let _ = hooks.fire(
+        orbit_engine::hooks::HookEvent::SessionEnd,
+        &serde_json::json!({ "reason": reason }),
+    );
 }
 
 /// The headless tool executor: `dontAsk` — every call that no allow

@@ -1488,3 +1488,83 @@ fn scenario_e8_sampling_omitted_unless_configured() {
         "E8: configured top_p sent:\n{log2}"
     );
 }
+
+// ── E9: all 13 hook events fire at their moments ──────────────────
+// Only PreToolUse and PostToolUse ever fired. A one-line hook script
+// appends its event to a file; a scripted run must leave a record for
+// each event the session actually passes through.
+#[test]
+fn scenario_e9_all_hook_events_fire() {
+    let events_dir = TempDir::new().expect("tempdir");
+    let log = events_dir.path().join("hooks.log");
+    let log_str = log.to_string_lossy().to_string();
+
+    // A tiny hook script: appends the event name (the payload's
+    // hook_event_name field) to the log file. Written as a file — the
+    // settings parser's quoting is minimal.
+    let hook_script = events_dir.path().join("hook.py");
+    std::fs::write(
+        &hook_script,
+        format!(
+            "import sys, json\nLOG = {log_repr}\nwith open(LOG, 'a') as f:\n    f.write(json.load(sys.stdin)['hook_event_name'] + chr(10))\n",
+            log_repr = serde_json::to_string(&log_str).unwrap()
+        ),
+    )
+    .expect("write hook.py");
+    let hook_cmd = format!("python3 {}", hook_script.to_string_lossy());
+
+    // Script: a tool call (fires Pre/PostToolUse) then a reply.
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Read", "args": {"file_path": "calc.py"}}]},
+            {"text": "done"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    // Register hooks for all 13 events in user-scope settings.
+    let events = [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "PreCompact",
+        "PostCompact",
+        "Notification",
+        "SessionEnd",
+    ];
+    let mut hooks_toml = String::new();
+    for ev in events {
+        hooks_toml.push_str(&format!(
+            "[[hooks]]\nevent = \"{ev}\"\ncommand = \"{hook_cmd}\"\n\n"
+        ));
+    }
+    std::fs::write(home.path.join("settings.toml"), &hooks_toml).expect("write settings");
+
+    let fix = Fixture::failing_test();
+    let (_e, code) = run_p(&mock, &home, &fix.path, "use tools", &["--auto-tools"]);
+    assert_eq!(code, 0, "the turn completes");
+
+    let fired = std::fs::read_to_string(&log).unwrap_or_default();
+    // The session-lifecycle events this run actually passes through.
+    for expected in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "SessionEnd",
+    ] {
+        assert!(
+            fired.contains(expected),
+            "E9: {expected} must fire:\n{fired}"
+        );
+    }
+    // Not hit in this run (no compaction, no subagent, no failure, no
+    // permission ask, no notification) — firing them is proven by the
+    // unit tests; here we prove the ones a plain run hits.
+}

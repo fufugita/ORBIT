@@ -93,6 +93,16 @@ pub struct Hooks {
     pub project_trusted: bool,
 }
 
+/// Is the current folder trusted for project-scope hooks? (E9: the
+/// engine fires lifecycle hooks itself now, so the trust check lives
+/// with the loader.) Same FolderTrust scheme the CLI uses.
+pub fn project_trusted(home: &Path) -> bool {
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
+}
+
 impl Hooks {
     /// Load hooks from the settings scopes.
     pub fn load(home: &Path, project_trusted: bool) -> Self {
@@ -126,7 +136,13 @@ impl Hooks {
     pub fn fire(&self, event: HookEvent, payload: &serde_json::Value) -> Vec<HookOutcome> {
         self.matching(event)
             .iter()
-            .map(|h| run_hook(h, payload))
+            .map(|h| {
+                // The payload carries the event name (E9): a hook
+                // listening to several events can tell them apart.
+                let mut body = payload.as_object().cloned().unwrap_or_default();
+                body.insert("hook_event_name".into(), serde_json::json!(event.as_str()));
+                run_hook(h, &serde_json::Value::Object(body))
+            })
             .collect()
     }
 }

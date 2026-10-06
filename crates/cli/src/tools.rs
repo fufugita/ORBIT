@@ -206,6 +206,13 @@ pub fn execute_task(
             .collect()
     };
 
+    // E9: SubagentStart fires at spawn.
+    let hooks = orbit_engine::hooks::Hooks::load(home, trusted);
+    let _ = hooks.fire(
+        orbit_engine::hooks::HookEvent::SubagentStart,
+        &serde_json::json!({ "agent": agent.name, "prompt_bytes": prompt.len() }),
+    );
+
     // A fresh transcript: the subagent does not see the parent's
     // conversation, only its prompt.
     let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
@@ -236,6 +243,12 @@ pub fn execute_task(
         &cancel,
         &mut |_| {},
     )?;
+
+    // E9: SubagentStop fires when the subagent's turn ends.
+    let _ = hooks.fire(
+        orbit_engine::hooks::HookEvent::SubagentStop,
+        &serde_json::json!({ "agent": agent.name, "ok": report.ok }),
+    );
 
     // The final assistant text is the report.
     let report_text = transcript
