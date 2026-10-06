@@ -1111,10 +1111,14 @@ fn cmd_headless(args: &[String]) -> i32 {
     };
     // The authority extractor (phase 6): "run the tests but never
     // push" becomes Bash(cargo test *) allowed and Bash(git push *)
-    // denied, for this job. The rules ride the session's
-    // PermissionScope (S5) so the executor's own permission path
-    // enforces them like any other rule — no process env.
-    {
+    // denied, for this job. OFF by default (S4): the -p prompt in CI
+    // embeds untrusted text (issue/PR bodies), and untrusted content
+    // never becomes user authority. --spoken-rules is the explicit
+    // operator opt-in. The rules ride the session's PermissionScope
+    // (S5) so the executor's own permission path enforces them like
+    // any other rule — no process env.
+    let spoken_rules_enabled = args.iter().any(|a| a == "--spoken-rules");
+    if spoken_rules_enabled {
         let spoken = orbit_engine::automation::extract_spoken_rules(prompt);
         if !spoken.is_empty() {
             executor.scope.disallowlist.reserve(spoken.len());

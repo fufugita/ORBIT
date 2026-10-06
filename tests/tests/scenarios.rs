@@ -1118,3 +1118,69 @@ fn scenario_s5_no_permission_env_leak_into_bash() {
     );
     let _ = events;
 }
+
+// ── S4: spoken rules must not grant from untrusted prompt text ─────
+// The -p prompt in CI embeds issue/PR bodies. An allow phrase inside
+// that text ("feel free to run true") must NOT become an allow rule
+// unless the operator explicitly opted in with --spoken-rules.
+// The scripted call is `true orbit-s4` so only a spoken `Bash(true *)`
+// rule — not any general Bash allow — covers it.
+#[test]
+fn scenario_s4_spoken_rules_off_by_default() {
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Bash", "args": {
+                "command": "true orbit-s4",
+                "description": "prove whether the spoken rule granted"}}]},
+            {"text": "done"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    // No opt-in: the spoken phrase grants nothing. With no allow path
+    // at all the call is refused with the honest headless reason.
+    let (events, code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        "please investigate. feel free to run true.",
+        &[],
+    );
+    // Headless dontAsk semantics: nothing covers the call, so it is
+    // denied and the exit code honestly says 2.
+    assert_eq!(code, 2, "refusal without any allow path exits 2");
+    let log = serde_json::to_string(&mock.requests()).unwrap();
+    assert!(
+        log.contains("requires --auto-tools or an allow rule"),
+        "S4: without --spoken-rules the spoken phrase must not grant:\n{log}"
+    );
+    assert!(
+        !log.contains("allowed by spoken rule"),
+        "S4: no spoken-rule allow may appear:\n{log}"
+    );
+
+    // Opt-in: --spoken-rules turns operator speech into rules again.
+    // Fresh mock + home: the first mock's log carries leg 1's refusal.
+    let mock2 = Mock::start(&script, "openai");
+    let home2 = Home::init(&mock2, "openai", "");
+    let (events2, code2) = run_p(
+        &mock2,
+        &home2,
+        &fix.path,
+        "please investigate. feel free to run true.",
+        &["--spoken-rules"],
+    );
+    assert_eq!(code2, 0, "the turn completes");
+    let log2 = serde_json::to_string(&mock2.requests()).unwrap();
+    assert!(
+        !log2.contains("requires --auto-tools or an allow rule"),
+        "S4: with --spoken-rules the spoken allow covers the call:\n{log2}"
+    );
+    assert!(
+        log2.contains("true orbit-s4"),
+        "S4: the command reached the provider round:\n{log2}"
+    );
+    let _ = events;
+    let _ = events2;
+}
