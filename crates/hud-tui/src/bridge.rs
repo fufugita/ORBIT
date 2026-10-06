@@ -340,6 +340,12 @@ pub fn emit_status(sender: &BusSender, text: &str) {
     sender.send(Msg::Status(safe));
 }
 
+/// Emit a permission-mode change (S5): the mode pill flips without a
+/// full redraw. `mode` is the config name (default, acceptEdits, ...).
+pub fn emit_mode_changed(sender: &BusSender, mode: &str) {
+    sender.send(Msg::ModeChanged(mode.to_string()));
+}
+
 /// Emit a tool-call-started event with a display-safe summary.
 pub fn emit_tool_started(sender: &BusSender, name: &str, summary: &str) {
     let safe_summary = safe_text(summary);

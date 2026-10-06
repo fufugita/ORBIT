@@ -989,21 +989,19 @@ fn cmd_headless(args: &[String]) -> i32 {
         max_microcents: value_after(args, "--max-cost").and_then(|v| v.parse().ok()),
     };
     // --permission-mode / --allowedTools / --disallowedTools: the
-    // command-line permission scope (review blocker 4). The executor
-    // reads these env vars at evaluation time.
+    // command-line permission scope (review blocker 4), carried in the
+    // session's PermissionScope (S5) — never process env vars.
     if let Some(mode) = value_after(args, "--permission-mode") {
         if orbit_tools::permissions::PermissionMode::from_config(&mode).is_none() {
             eprintln!("ORBIT-E1101: unknown --permission-mode {mode} (default, acceptEdits, plan, dontAsk, bypass)");
             return 1;
         }
-        std::env::set_var("ORBIT_PERMISSION_MODE", mode);
     }
-    if let Some(list) = value_after(args, "--allowedTools") {
-        std::env::set_var("ORBIT_ALLOWED_TOOLS", list);
-    }
-    if let Some(list) = value_after(args, "--disallowedTools") {
-        std::env::set_var("ORBIT_DISALLOWED_TOOLS", list);
-    }
+    let scope = tool_runtime::PermissionScope::from_flags(
+        value_after(args, "--permission-mode").as_deref(),
+        value_after(args, "--allowedTools").as_deref(),
+        value_after(args, "--disallowedTools").as_deref(),
+    );
 
     let cfg = match config::ProvidersConfig::load(&home) {
         Ok(c) => c,
@@ -1087,6 +1085,7 @@ fn cmd_headless(args: &[String]) -> i32 {
         home: home.clone(),
         session_id: session_id.clone(),
         auto_tools,
+        scope,
         tool_cx,
     };
 
@@ -1112,28 +1111,24 @@ fn cmd_headless(args: &[String]) -> i32 {
     };
     // The authority extractor (phase 6): "run the tests but never
     // push" becomes Bash(cargo test *) allowed and Bash(git push *)
-    // denied, for this job. The rules ride ORBIT_ALLOWED_TOOLS /
-    // ORBIT_DISALLOWED_TOOLS so the executor's own permission path
-    // enforces them like any other rule.
+    // denied, for this job. The rules ride the session's
+    // PermissionScope (S5) so the executor's own permission path
+    // enforces them like any other rule — no process env.
     {
         let spoken = orbit_engine::automation::extract_spoken_rules(prompt);
         if !spoken.is_empty() {
-            let mut allow: Vec<String> = std::env::var("ORBIT_ALLOWED_TOOLS")
-                .map(|v| v.split(',').map(String::from).collect())
-                .unwrap_or_default();
-            let mut deny: Vec<String> = std::env::var("ORBIT_DISALLOWED_TOOLS")
-                .map(|v| v.split(',').map(String::from).collect())
-                .unwrap_or_default();
+            executor.scope.disallowlist.reserve(spoken.len());
             for r in spoken {
                 match r.effect {
                     orbit_engine::automation::SpokenEffect::Allow => {
-                        if !allow.contains(&r.rule) {
-                            allow.push(r.rule.clone());
+                        let list = executor.scope.allowlist.get_or_insert_with(Vec::new);
+                        if !list.contains(&r.rule) {
+                            list.push(r.rule.clone());
                         }
                     }
                     orbit_engine::automation::SpokenEffect::Deny => {
-                        if !deny.contains(&r.rule) {
-                            deny.push(r.rule.clone());
+                        if !executor.scope.disallowlist.contains(&r.rule) {
+                            executor.scope.disallowlist.push(r.rule.clone());
                         }
                     }
                 }
@@ -1155,8 +1150,6 @@ fn cmd_headless(args: &[String]) -> i32 {
                     );
                 }
             }
-            std::env::set_var("ORBIT_ALLOWED_TOOLS", allow.join(","));
-            std::env::set_var("ORBIT_DISALLOWED_TOOLS", deny.join(","));
         }
     }
 
@@ -1362,6 +1355,8 @@ struct HeadlessToolExecutor {
     home: std::path::PathBuf,
     session_id: String,
     auto_tools: bool,
+    /// The session's permission scope (S5).
+    scope: tool_runtime::PermissionScope,
     /// One context per headless session (B2).
     tool_cx: orbit_tools::ToolContext,
 }
@@ -1384,6 +1379,7 @@ impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
                 false, // non-interactive: dontAsk semantics
                 &mut tool_runtime::StdApprovalChannel::new(false),
                 &mut tool_runtime::AutoGrants::new(),
+                &self.scope,
                 &self.tool_cx,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
@@ -1620,6 +1616,11 @@ fn cmd_chat(args: &[String]) -> i32 {
                 model: model.clone(),
                 provider_id,
                 auto_tools: args.iter().any(|a| a == "--auto-tools"),
+                scope: tool_runtime::PermissionScope::from_flags(
+                    value_after(args, "--permission-mode").as_deref(),
+                    value_after(args, "--allowedTools").as_deref(),
+                    value_after(args, "--disallowedTools").as_deref(),
+                ),
                 initial_transcript: resumed_file
                     .as_ref()
                     .map(|s| s.to_transcript())
@@ -1794,6 +1795,11 @@ fn cmd_chat(args: &[String]) -> i32 {
             interactive,
             approval_channel: tool_runtime::StdApprovalChannel::new(interactive),
             auto_grants: tool_runtime::AutoGrants::new(),
+            scope: tool_runtime::PermissionScope::from_flags(
+                value_after(args, "--permission-mode").as_deref(),
+                value_after(args, "--allowedTools").as_deref(),
+                value_after(args, "--disallowedTools").as_deref(),
+            ),
             tool_cx: orbit_tools::ToolContext::new(
                 home.clone(),
                 session.clone(),
@@ -1929,6 +1935,8 @@ struct ReplToolExecutor {
     interactive: bool,
     approval_channel: tool_runtime::StdApprovalChannel,
     auto_grants: tool_runtime::AutoGrants,
+    /// The session's permission scope (S5).
+    scope: tool_runtime::PermissionScope,
     /// One context per REPL session (B2).
     tool_cx: orbit_tools::ToolContext,
 }
@@ -1965,6 +1973,7 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
                 self.interactive,
                 &mut self.approval_channel,
                 &mut self.auto_grants,
+                &self.scope,
                 &self.tool_cx,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());

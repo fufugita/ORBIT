@@ -33,8 +33,8 @@ pub mod worker;
 
 pub use approval::{ApprovalRegistry, ApprovalResponse};
 pub use bridge::{
-    emit_cost, emit_error, emit_plan_ready, emit_response_finished, emit_status, emit_text,
-    emit_tool_finished, emit_tool_started, emit_turn_cost, emit_workspace, safe_text,
+    emit_cost, emit_error, emit_mode_changed, emit_plan_ready, emit_response_finished, emit_status,
+    emit_text, emit_tool_finished, emit_tool_started, emit_turn_cost, emit_workspace, safe_text,
     safe_text_probe, sanitize_glyphs, strip_cot, CotStripper,
 };
 pub use state::RedactionKind;

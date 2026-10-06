@@ -130,6 +130,52 @@ pub struct AutoGrants {
     tools: std::collections::HashSet<String>,
 }
 
+/// The session's permission scope (S5): the mode and the operator's
+/// explicit allow/disallow lists, owned by the session and passed
+/// explicitly — never process-wide environment variables, which are
+/// not thread-safe (subagents run nested turns), can't change at
+/// runtime, and leak into every Bash child.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionScope {
+    /// `--permission-mode` (default, acceptEdits, plan, dontAsk, bypass).
+    pub mode: orbit_tools::permissions::PermissionMode,
+    /// `--allowedTools`: an explicit scope — only what it names may run.
+    pub allowlist: Option<Vec<String>>,
+    /// `--disallowedTools`: deny rules on top of the scope.
+    pub disallowlist: Vec<String>,
+}
+
+impl PermissionScope {
+    /// Build from the CLI flags (`--permission-mode`, `--allowedTools`,
+    /// `--disallowedTools`), comma-separated as on the command line.
+    pub fn from_flags(mode: Option<&str>, allow: Option<&str>, deny: Option<&str>) -> Self {
+        let mode = mode
+            .and_then(orbit_tools::permissions::PermissionMode::from_config)
+            .unwrap_or_default();
+        let allowlist = allow.map(|l| {
+            l.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+        let disallowlist = deny
+            .map(|l| {
+                l.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Self {
+            mode,
+            allowlist,
+            disallowlist,
+        }
+    }
+}
+
 impl AutoGrants {
     pub fn new() -> Self {
         Self::default()
@@ -178,6 +224,9 @@ pub fn execute_call(
     interactive: bool,
     approval: &mut dyn ApprovalChannel,
     grants: &mut AutoGrants,
+    // The SESSION's permission scope (S5): mode + operator lists,
+    // owned by the caller and passed explicitly — env vars are gone.
+    scope: &PermissionScope,
     // The SESSION's tool context (B2): cloned per call, but the clone
     // shares the read-before-edit map, so Read's record survives to
     // Edit. Callers build this once per session.
@@ -209,7 +258,7 @@ pub fn execute_call(
     // is only asked when BOTH layers say ask.
     let args_preview =
         crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
-    let pattern_verdict = pattern_layer_verdict(home, &call.name, &args_preview);
+    let pattern_verdict = pattern_layer_verdict(home, scope, &call.name, &args_preview);
 
     // Determine the verdict:
     // 1. Unknown tool → always deny (fail-closed, even with --auto-tools / R).
@@ -415,7 +464,7 @@ pub fn execute_call(
     // permission layer (modes + pattern rules), the deny-read list and
     // the secret scanner on every result (review blocker 1).
     if orbit_tools::is_wave1(&call.name) {
-        let output = execute_wave1(home, call, &args, tool_cx);
+        let output = execute_wave1(home, scope, call, &args, tool_cx);
         let status = if output.contains("\"ok\":true") || output.contains("\"ok\": true") {
             "ok"
         } else {
@@ -453,40 +502,30 @@ enum PatternOutcome {
     Deny(String),
 }
 
-fn pattern_layer_verdict(home: &Path, tool_name: &str, args: &serde_json::Value) -> PatternOutcome {
-    use orbit_tools::permissions::{
-        evaluate, parse_rule, PermissionMode, RuleEffectSerde, Verdict,
-    };
+fn pattern_layer_verdict(
+    home: &Path,
+    scope: &PermissionScope,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> PatternOutcome {
+    use orbit_tools::permissions::{evaluate, parse_rule, RuleEffectSerde, Verdict};
 
-    let mode = std::env::var("ORBIT_PERMISSION_MODE")
-        .ok()
-        .and_then(|m| PermissionMode::from_config(&m))
-        .unwrap_or_default();
     let mut rules = orbit_tools::executor::load_rules(home);
     // An explicit operator allowlist (--allowedTools / settings) is a
     // SCOPE statement: only what it names may run. The flag is tracked
     // separately so the pure-built-in bypass below cannot punch
     // through it (gate 6: a CI allowlist without calculator must deny
     // calculator with exit 2, not let the built-in run).
-    let explicit_allowlist = std::env::var("ORBIT_ALLOWED_TOOLS")
-        .map(|list| {
-            let mut rules = rules.clone();
-            for entry in list.split(',') {
-                if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Allow) {
-                    rules.rules.push(r);
-                }
-            }
-            rules
-        })
-        .unwrap_or_else(|_| rules.clone());
-    if std::env::var("ORBIT_ALLOWED_TOOLS").is_ok() {
-        rules = explicit_allowlist.clone();
-    }
-    if let Ok(list) = std::env::var("ORBIT_DISALLOWED_TOOLS") {
-        for entry in list.split(',') {
-            if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Deny) {
+    if let Some(list) = &scope.allowlist {
+        for entry in list {
+            if let Some(r) = parse_rule(entry, RuleEffectSerde::Allow) {
                 rules.rules.push(r);
             }
+        }
+    }
+    for entry in &scope.disallowlist {
+        if let Some(r) = parse_rule(entry, RuleEffectSerde::Deny) {
+            rules.rules.push(r);
         }
     }
     let Some(tool) = orbit_tools::registry()
@@ -501,7 +540,7 @@ fn pattern_layer_verdict(home: &Path, tool_name: &str, args: &serde_json::Value)
             .iter()
             .any(|t| t.name == tool_name)
         {
-            if std::env::var("ORBIT_ALLOWED_TOOLS").is_ok() {
+            if scope.allowlist.is_some() {
                 return PatternOutcome::Ask;
             }
             return PatternOutcome::Allow;
@@ -514,7 +553,7 @@ fn pattern_layer_verdict(home: &Path, tool_name: &str, args: &serde_json::Value)
             args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
         );
     match evaluate(
-        mode,
+        scope.mode,
         &rules,
         &key.tool,
         &key.pattern,
@@ -602,45 +641,32 @@ fn tool_error(msg: &str) -> String {
 /// approval channel) already ran; this adds the pattern-level check.
 fn execute_wave1(
     home: &Path,
+    scope: &PermissionScope,
     call: &crate::PendingToolCall,
     args: &serde_json::Value,
     tool_cx: &orbit_tools::ToolContext,
 ) -> String {
-    use orbit_tools::permissions::{evaluate, parse_rule, PermissionMode, RuleEffectSerde};
-
-    // The session's mode: --permission-mode flag, else default.
-    let mode = std::env::var("ORBIT_PERMISSION_MODE")
-        .ok()
-        .and_then(|m| PermissionMode::from_config(&m))
-        .unwrap_or_default();
+    use orbit_tools::permissions::{evaluate, parse_rule, RuleEffectSerde};
 
     // Merged rules: the new pattern scopes + the legacy whole-tool file.
     let mut rules = orbit_tools::executor::load_rules(home);
-    // --allowedTools / --disallowedTools (command-line scope).
+    // --allowedTools / --disallowedTools (command-line scope), from the
+    // session's PermissionScope (S5) — not process env.
     // An explicit operator allowlist (--allowedTools / settings) is a
     // SCOPE statement: only what it names may run. The flag is tracked
     // separately so the pure-built-in bypass below cannot punch
     // through it (gate 6: a CI allowlist without calculator must deny
     // calculator with exit 2, not let the built-in run).
-    let explicit_allowlist = std::env::var("ORBIT_ALLOWED_TOOLS")
-        .map(|list| {
-            let mut rules = rules.clone();
-            for entry in list.split(',') {
-                if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Allow) {
-                    rules.rules.push(r);
-                }
-            }
-            rules
-        })
-        .unwrap_or_else(|_| rules.clone());
-    if std::env::var("ORBIT_ALLOWED_TOOLS").is_ok() {
-        rules = explicit_allowlist.clone();
-    }
-    if let Ok(list) = std::env::var("ORBIT_DISALLOWED_TOOLS") {
-        for entry in list.split(',') {
-            if let Some(r) = parse_rule(entry.trim(), RuleEffectSerde::Deny) {
+    if let Some(list) = &scope.allowlist {
+        for entry in list {
+            if let Some(r) = parse_rule(entry, RuleEffectSerde::Allow) {
                 rules.rules.push(r);
             }
+        }
+    }
+    for entry in &scope.disallowlist {
+        if let Some(r) = parse_rule(entry, RuleEffectSerde::Deny) {
+            rules.rules.push(r);
         }
     }
 
@@ -689,7 +715,7 @@ fn execute_wave1(
             .unwrap_or(false);
 
     match evaluate(
-        mode,
+        scope.mode,
         &rules,
         &key.tool,
         &key.pattern,
@@ -787,17 +813,10 @@ fn project_trusted_home(home: &Path) -> bool {
 
 /// The checkpoint id for the current turn: one per user prompt. The
 /// engine opens it at the prompt; the executor snapshots into it.
+/// (S5: the old env-var marker was never set by anyone; the ULID is
+/// per write-turn, which is the checkpoint granularity /rewind needs.)
 fn current_turn_checkpoint() -> String {
-    std::env::var("ORBIT_TURN_CHECKPOINT").unwrap_or_else(|_| {
-        // No turn marker set (e.g. direct executor use): derive one
-        // per process invocation.
-        format!("cp-{}", ulid::Ulid::new())
-    })
-}
-
-#[allow(dead_code)]
-fn session_id_stub() -> String {
-    std::env::var("ORBIT_SESSION_ID").unwrap_or_else(|_| "live".into())
+    format!("cp-{}", ulid::Ulid::new())
 }
 
 /// Execute one MCP call: resolve the server from the config, spawn,
@@ -863,6 +882,9 @@ pub struct SubagentExecutor<'a> {
     session_id: String,
     approval: &'a mut dyn ApprovalChannel,
     grants: AutoGrants,
+    /// The subagent inherits the parent session's permission scope
+    /// (S5): same mode, same operator lists.
+    pub scope: PermissionScope,
     /// The subagent's own tool context (B2): read-before-edit state
     /// shared across its calls, separate from the parent's.
     tool_cx: orbit_tools::ToolContext,
@@ -879,6 +901,7 @@ impl<'a> SubagentExecutor<'a> {
             home,
             approval,
             grants: AutoGrants::new(),
+            scope: PermissionScope::default(),
             tool_cx,
         }
     }
@@ -903,6 +926,7 @@ impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
                     true,
                     self.approval,
                     &mut self.grants,
+                    &self.scope,
                     &self.tool_cx,
                 )
                 .unwrap_or_else(|e| tool_error(&e));
@@ -986,6 +1010,7 @@ mod tests {
             false,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&home.join("work")),
         )
         .unwrap();
@@ -1031,6 +1056,7 @@ mod tests {
             false,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&dir),
         )
         .unwrap();
@@ -1056,6 +1082,7 @@ mod tests {
             false,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&home.join("work")),
         )
         .unwrap();
@@ -1077,6 +1104,7 @@ mod tests {
             true,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&home.join("work")),
         )
         .unwrap();
@@ -1100,6 +1128,7 @@ mod tests {
             true,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&dir),
         )
         .unwrap();
@@ -1142,6 +1171,7 @@ mod tests {
             true,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&dir),
         )
         .unwrap();
@@ -1160,6 +1190,7 @@ mod tests {
             true,
             &mut ch2,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&dir),
         )
         .unwrap();
@@ -1188,6 +1219,7 @@ mod tests {
             true,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&dir),
         )
         .unwrap();
@@ -1209,6 +1241,7 @@ mod tests {
             true,
             &mut ch2,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&dir),
         )
         .unwrap();
@@ -1232,6 +1265,7 @@ mod tests {
             true,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&home.join("work")),
         )
         .unwrap();
@@ -1263,6 +1297,7 @@ mod tests {
             true,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&dir),
         )
         .unwrap();
@@ -1287,6 +1322,7 @@ mod tests {
             true,
             &mut ch2,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&dir),
         )
         .unwrap();
@@ -1319,6 +1355,7 @@ mod tests {
             true,
             &mut ch,
             &mut grants,
+            &PermissionScope::default(),
             &test_cx(&home.join("work")),
         )
         .unwrap();

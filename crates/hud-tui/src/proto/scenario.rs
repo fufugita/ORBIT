@@ -10,6 +10,9 @@ use super::anim::StarState;
 pub struct Scenario {
     /// The model being waited on (M05's "waiting for {model}").
     pub model: String,
+    /// The session's permission mode (S5), updated by ModeChanged and
+    /// read by Shift+Tab to pick the next mode in the cycle.
+    pub permission_mode: Option<String>,
     /// A turn is live (RoundStarted seen, no TurnEnded yet).
     pub turn_live: bool,
     /// Visible output arrived since the turn started or the last tool

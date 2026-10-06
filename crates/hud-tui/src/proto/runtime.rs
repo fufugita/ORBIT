@@ -535,11 +535,17 @@ fn handle_key(
             return false;
         }
         KeyCode::BackTab => {
-            tui.focus = tui.focus.prev();
-            match tui.focus {
-                Focus::Sessions => *sessions_pushed = true,
-                _ => *sessions_pushed = false,
-            }
+            // Shift+Tab cycles the permission mode (S5, Claude Code
+            // parity): default → acceptEdits → plan → dontAsk →
+            // bypass → default. Focus cycling stays on Tab.
+            const MODES: [&str; 5] = ["default", "acceptEdits", "plan", "dontAsk", "bypass"];
+            let current = scenario
+                .permission_mode
+                .as_deref()
+                .and_then(|m| MODES.iter().position(|c| *c == m))
+                .unwrap_or(0);
+            let next = MODES[(current + 1) % MODES.len()];
+            let _ = command_sink.send(WorkerCommand::SetMode(next.to_string()));
             return false;
         }
         _ => {}
@@ -1031,6 +1037,11 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
                 text,
                 ..Default::default()
             });
+        }
+        Msg::ModeChanged(mode) => {
+            // S5: Shift+Tab's next cycle reads this; the toast comes
+            // from the reducer.
+            scenario.permission_mode = Some(mode);
         }
         Msg::Identity {
             model,

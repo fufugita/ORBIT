@@ -88,6 +88,7 @@ fn main() {
         model,
         provider_id,
         auto_tools,
+        scope: orbit_cli::tool_runtime::PermissionScope::default(),
         initial_transcript: resumed
             .as_ref()
             .map(|s| s.to_transcript())

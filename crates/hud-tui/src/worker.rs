@@ -56,6 +56,11 @@ pub enum WorkerCommand {
     /// persistent permission rules (CLI-side: the rules module lives in
     /// orbit-cli, which the TUI crate can't depend on).
     Permissions(String),
+    /// Change the session's permission mode at runtime (S5): the
+    /// worker mutates the session's PermissionScope in place; the next
+    /// turn (and every approval card) obeys it. Payload: the mode name
+    /// (default, acceptEdits, plan, dontAsk, bypass).
+    SetMode(String),
     /// `!command` — the shell bang (gate 1): run one command through
     /// the Bash tool's full path — sandbox, permissions, approvals,
     /// scanner — and show the result as a tool line. The composer

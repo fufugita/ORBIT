@@ -414,6 +414,10 @@ pub struct App {
     pub osc52_pending: Option<String>,
     /// Last status one-liner (shown in toast / status bar).
     pub last_status: String,
+    /// The session's permission mode (S5), set at start and updated by
+    /// runtime mode changes (Shift+Tab / /mode). None until the worker
+    /// reports one — the hint row falls back to "default".
+    pub permission_mode: Option<String>,
     /// Active error from the backend, if any.
     pub last_error: Option<String>,
     /// Transcript scroll offset (lines from top). Auto-scrolls to bottom.
@@ -755,6 +759,7 @@ impl App {
             selection: None,
             osc52_pending: None,
             last_status: String::new(),
+            permission_mode: None,
             last_error: None,
             transcript_scroll: 0,
             ctrl_c_count: 0,
@@ -960,6 +965,17 @@ impl App {
                 // is the only visible surface for worker status messages.
                 self.toast = Some(Toast {
                     text,
+                    kind: ToastKind::Neutral,
+                });
+                self.toast_emitted_at = Some(self.tick_count);
+                self.dirty.set(DirtyFlags::STATUS | DirtyFlags::LAYOUT);
+            }
+            Msg::ModeChanged(mode) => {
+                // S5: runtime mode change — record it (the hint row /
+                // status surfaces read it) and toast the change.
+                self.permission_mode = Some(mode.clone());
+                self.toast = Some(Toast {
+                    text: format!("permission mode: {mode}"),
                     kind: ToastKind::Neutral,
                 });
                 self.toast_emitted_at = Some(self.tick_count);

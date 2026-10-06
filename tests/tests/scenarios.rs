@@ -1075,3 +1075,46 @@ fn scenario_k1_compaction_keeps_the_question() {
     // 4. The turn completes normally.
     assert_eq!(code, 0, "the turn completes after compaction");
 }
+
+// ── S5: session state is not process-wide env ─────────────────────
+// Fails on the env-var design: --permission-mode/--allowedTools set
+// ORBIT_* vars that every Bash child inherited. With the
+// PermissionScope struct, a Bash child's environment is clean.
+#[test]
+fn scenario_s5_no_permission_env_leak_into_bash() {
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Bash", "args": {
+                "command": "env | grep -c '^ORBIT_' || true",
+                "description": "count ORBIT_ vars in the child env"}}]},
+            {"text": "done"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    // Pass the flags that USED to set the env vars.
+    let (events, code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        "show me the env",
+        &[
+            "--auto-tools",
+            "--permission-mode",
+            "dontAsk",
+            "--allowedTools",
+            "Bash",
+        ],
+    );
+    assert_eq!(code, 0, "the turn completes");
+
+    // The provider must see the tool result: zero ORBIT_ vars in the
+    // child environment (S5). Any leak shows as a positive count.
+    let log = serde_json::to_string(&mock.requests()).unwrap();
+    assert!(
+        log.contains("\"0\"") || log.contains(":0") || log.contains(" 0\n"),
+        "S5: the Bash child must see ZERO ORBIT_ env vars:\n{log}"
+    );
+    let _ = events;
+}

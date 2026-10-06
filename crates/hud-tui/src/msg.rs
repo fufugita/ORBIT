@@ -29,6 +29,10 @@ pub enum Msg {
     /// A one-line status message (model changed, session loaded, etc.).
     /// Rendered in the status bar / toast, NOT in the transcript.
     Status(String),
+    /// The session's permission mode changed at runtime (S5:
+    /// Shift+Tab or /mode). Payload: the mode name (default,
+    /// acceptEdits, plan, dontAsk, bypass).
+    ModeChanged(String),
     /// The model finished a response (final text + usage).
     ResponseFinished {
         output: String,

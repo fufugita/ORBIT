@@ -479,6 +479,7 @@ fn run_protocol_turn(
         stream: stream.clone(),
         action_rx: action_rx.clone(),
         auto_grants: crate::tool_runtime::AutoGrants::new(),
+        scope: config.scope.clone(),
         tool_cx,
     };
 
@@ -546,6 +547,8 @@ struct GoToolExecutor {
     stream: std::sync::Arc<std::sync::Mutex<UnixStream>>,
     action_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<serde_json::Value>>>,
     auto_grants: crate::tool_runtime::AutoGrants,
+    /// The session's permission scope (S5).
+    scope: crate::tool_runtime::PermissionScope,
     /// One context per Go session (B2).
     tool_cx: orbit_tools::ToolContext,
 }
@@ -586,6 +589,7 @@ impl orbit_engine::ToolExecutor for GoToolExecutor {
                 true,
                 &mut approval_channel,
                 &mut self.auto_grants,
+                &self.scope,
                 &self.tool_cx,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());

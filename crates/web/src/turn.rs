@@ -360,6 +360,7 @@ fn run_web_turn(
         state: state.clone(),
         action_rx: action_rx.clone(),
         auto_grants: std::mem::take(auto_grants),
+        scope: orbit_cli::tool_runtime::PermissionScope::default(),
         tool_cx: orbit_tools::ToolContext::new(
             config.home.clone(),
             config.session_id.clone(),
@@ -405,6 +406,8 @@ struct WebToolExecutor {
     state: BridgeState,
     action_rx: Arc<Mutex<mpsc::Receiver<serde_json::Value>>>,
     auto_grants: orbit_cli::tool_runtime::AutoGrants,
+    /// The session's permission scope (S5).
+    scope: orbit_cli::tool_runtime::PermissionScope,
     /// One context per web session (B2).
     tool_cx: orbit_tools::ToolContext,
 }
@@ -435,6 +438,7 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
                 true,
                 &mut approval_channel,
                 &mut self.auto_grants,
+                &self.scope,
                 &self.tool_cx,
             )
             .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());

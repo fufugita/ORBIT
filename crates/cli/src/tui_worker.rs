@@ -25,6 +25,9 @@ pub struct TuiTurnConfig {
     pub model: String,
     pub provider_id: String,
     pub auto_tools: bool,
+    /// The session's permission scope (S5): mode + operator lists.
+    /// Mutable at runtime via WorkerCommand::SetMode.
+    pub scope: crate::tool_runtime::PermissionScope,
     /// Restored session state. Empty/zero for a fresh chat.
     pub initial_transcript: Vec<ChatMessage>,
     pub initial_turns: u64,
@@ -206,6 +209,9 @@ fn worker_main(
                 let plan_directive = format!(
                     "{system_prompt}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes; all tool calls will be denied. Explore the problem, then respond with a concise, numbered implementation plan. End with a line: `PLAN READY`."
                 );
+                // Take the scope out of config for the turn (borrow
+                // rules: config is borrowed immutably by run_tui_turn).
+                let mut scope = std::mem::take(&mut config.scope);
                 let (_ok, _input, _output, _cost, plan_text) = match run_tui_turn(
                     &config,
                     &mut transcript,
@@ -217,9 +223,11 @@ fn worker_main(
                     &mut auto_grants,
                     &plan_directive,
                     true,
+                    &mut scope,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
+                        config.scope = scope;
                         orbit_hud_tui::emit_error(&ctx.sender, &e);
                         if let Ok(mut guard) = cancel_slot.lock() {
                             *guard = None;
@@ -227,6 +235,7 @@ fn worker_main(
                         continue;
                     }
                 };
+                config.scope = scope;
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = None;
                 }
@@ -249,6 +258,7 @@ fn worker_main(
                 }
                 let transcript_len_before = transcript.len();
                 let directive = system_prompt.clone();
+                let mut scope = std::mem::take(&mut config.scope);
                 let (_ok, input, output, cost, _final) = match run_tui_turn(
                     &config,
                     &mut transcript,
@@ -260,9 +270,11 @@ fn worker_main(
                     &mut auto_grants,
                     &directive,
                     false,
+                    &mut scope,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
+                        config.scope = scope;
                         orbit_hud_tui::emit_error(&ctx.sender, &e);
                         if let Ok(mut guard) = cancel_slot.lock() {
                             *guard = None;
@@ -270,6 +282,7 @@ fn worker_main(
                         continue;
                     }
                 };
+                config.scope = scope;
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = None;
                 }
@@ -750,6 +763,24 @@ fn worker_main(
                     }
                 }
             }
+            WorkerCommand::SetMode(mode_name) => {
+                // S5: runtime mode change. The scope is session state
+                // (no env var); the next turn obeys it.
+                match orbit_tools::permissions::PermissionMode::from_config(&mode_name) {
+                    Some(mode) => {
+                        config.scope.mode = mode;
+                        orbit_hud_tui::emit_mode_changed(&ctx.sender, &mode_name);
+                    }
+                    None => {
+                        orbit_hud_tui::emit_error(
+                            &ctx.sender,
+                            &format!(
+                                "unknown mode {mode_name} (default, acceptEdits, plan, dontAsk, bypass)"
+                            ),
+                        );
+                    }
+                }
+            }
             WorkerCommand::Permissions(arg) => {
                 let sub = arg.split_whitespace().next().unwrap_or("");
                 let tool = arg.split_whitespace().nth(1).unwrap_or("");
@@ -830,6 +861,7 @@ fn worker_main(
                     true,
                     &mut approval_channel,
                     &mut auto_grants,
+                    &config.scope,
                     &tool_cx,
                 )
                 .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
@@ -1004,6 +1036,10 @@ pub fn run_tui_turn(
     auto_grants: &mut crate::tool_runtime::AutoGrants,
     mods_directive: &str,
     plan_mode: bool,
+    // The session's permission scope (S5), mutable across turns: the
+    // worker loop's SetMode command updates config.scope in place —
+    // no process env, no per-call reads.
+    scope: &mut crate::tool_runtime::PermissionScope,
 ) -> Result<(bool, u64, u64, u64, String), String> {
     // Resolve provider / pricing from config (same as REPL).
     let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
@@ -1180,6 +1216,7 @@ pub fn run_tui_turn(
         sender: sender.clone(),
         approvals: approvals.clone(),
         auto_grants: std::mem::take(auto_grants),
+        scope: std::mem::take(scope),
         tool_cx: orbit_tools::ToolContext::new(
             config.home.clone(),
             config.session_id.clone(),
@@ -1208,9 +1245,11 @@ pub fn run_tui_turn(
         &mut events,
     );
 
-    // Restore the grants into the caller's slot (the executor borrowed
-    // them for the turn).
+    // Restore the grants and the scope into the caller's slots (the
+    // executor borrowed them for the turn; SetMode may have changed
+    // the scope mid-turn).
     *auto_grants = executor.auto_grants;
+    *scope = executor.scope;
 
     match report {
         Ok(r) => Ok((
@@ -1237,6 +1276,9 @@ struct TuiToolExecutor {
     sender: BusSender,
     approvals: ApprovalRegistry,
     auto_grants: crate::tool_runtime::AutoGrants,
+    /// The session's permission scope (S5): mode + operator lists,
+    /// mutable at runtime via WorkerCommand::SetMode.
+    scope: crate::tool_runtime::PermissionScope,
     /// One context per TUI session (B2): read-before-edit survives
     /// across rounds.
     tool_cx: orbit_tools::ToolContext,
@@ -1313,6 +1355,7 @@ impl TuiToolExecutor {
             true,
             &mut approval_channel,
             &mut self.auto_grants,
+            &self.scope,
             &self.tool_cx,
         )
         .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
