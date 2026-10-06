@@ -390,7 +390,24 @@ fn run_web_turn(
     *auto_grants = executor.auto_grants;
 
     match report {
-        Ok(r) => Ok((r.ok, r.input_tokens, r.output_tokens, r.cost_microcents)),
+        Ok(r) => {
+            // E10: the attestation scan runs in EVERY front-end — the
+            // browser sees an unverified claim event, not silence.
+            if let Some(scan) = orbit_engine::automation::scan_attestation(transcript) {
+                if scan.claimed_pass && scan.exit_code != 0 {
+                    state.emit(
+                        "status",
+                        serde_json::json!({
+                            "text": format!(
+                                "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
+                                scan.command, scan.exit_code
+                            )
+                        }),
+                    );
+                }
+            }
+            Ok((r.ok, r.input_tokens, r.output_tokens, r.cost_microcents))
+        }
         Err(e) => {
             state.emit("error", serde_json::json!({ "message": e }));
             Ok((false, 0, 0, 0))

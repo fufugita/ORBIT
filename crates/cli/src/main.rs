@@ -1212,76 +1212,61 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
     }
 
-    // RTA (phase 6): a claim that tests pass turns green only after
-    // ORBIT's own re-run. Scan the turn's transcript for Bash test
-    // commands; if the final text claims a pass, re-run the last one
-    // and emit the attestation verdict.
-    #[allow(unused_assignments, unused_variables)]
+    // RTA (E10): attest from the structured exit status of the last
+    // test-like command, in every front-end. A claim after a failing
+    // command is an unverified claim and is shown as one.
     let mut rta_verdict: Option<serde_json::Value> = None;
-    if let Ok(r) = &report {
-        let claims_pass = r.ok
-            && (r.final_text.to_lowercase().contains("tests pass")
-                || r.final_text.to_lowercase().contains("all tests pass")
-                || r.final_text.to_lowercase().contains("test suite passes"));
-        if claims_pass {
-            let test_cmd = transcript.iter().rev().find_map(|m| {
-                // tool_calls carry the Bash invocations of this turn
-                m.tool_calls.as_ref().and_then(|calls| {
-                    calls.iter().rev().find_map(|c| {
-                        let is_test = serde_json::from_str::<serde_json::Value>(&c.arguments)
-                            .ok()
-                            .and_then(|a| {
-                                a.get("command").and_then(|v| v.as_str()).map(|cmd| {
-                                    cmd.contains("cargo test")
-                                        || cmd.contains("npm test")
-                                        || cmd.contains("pytest")
-                                        || cmd.contains("go test")
-                                })
-                            })
-                            .unwrap_or(false);
-                        is_test.then(|| {
-                            serde_json::from_str::<serde_json::Value>(&c.arguments)
-                                .ok()
-                                .and_then(|a| {
-                                    a.get("command").and_then(|v| v.as_str()).map(String::from)
-                                })
-                                .unwrap_or_default()
-                        })
-                    })
-                })
-            });
-            if let Some(cmd) = test_cmd {
+    if let Ok(_r) = &report {
+        if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript) {
+            if scan.claimed_pass {
                 let cwd = std::env::current_dir().unwrap_or_default();
-                let verdict = match orbit_engine::automation::attest_test_pass(&cmd, &cwd) {
-                    Ok(p) => serde_json::json!({
-                        "attested": true,
-                        "command": p.command,
-                        "at": p.attested_at_epoch
-                    }),
-                    Err(e) => serde_json::json!({
+                let verdict = if scan.exit_code == 0 {
+                    // The recorded exit was 0 — re-run to attest (the
+                    // re-run is ORBIT's own eyes on the claim).
+                    match orbit_engine::automation::attest_test_pass(&scan.command, &cwd) {
+                        Ok(p) => serde_json::json!({
+                            "attested": true,
+                            "command": p.command,
+                            "at": p.attested_at_epoch
+                        }),
+                        Err(e) => serde_json::json!({
+                            "attested": false,
+                            "command": scan.command,
+                            "reason": e
+                        }),
+                    }
+                } else {
+                    // The recorded exit status was already a failure:
+                    // no re-run needed — the claim contradicts the
+                    // recorded facts.
+                    serde_json::json!({
                         "attested": false,
-                        "command": cmd,
-                        "reason": e
-                    }),
+                        "command": scan.command,
+                        "recorded_exit_code": scan.exit_code,
+                        "reason": "the last test-like command exited non-zero; the claim is unverified"
+                    })
                 };
                 if stream_json {
+                    let attested = verdict["attested"].as_bool().unwrap_or(false);
                     println!(
                         "{}",
                         serde_json::to_string(&orbit_frontend_protocol::FrontendEvent::Status {
                             text: format!(
                                 "rta: {}",
-                                if verdict["attested"].as_bool().unwrap_or(false) {
-                                    "tests re-run and PASSED (attested)"
+                                if attested {
+                                    "tests re-run and PASSED (attested)".to_string()
                                 } else {
-                                    "tests re-run and FAILED — the claim is not attested"
+                                    format!(
+                                        "UNVERIFIED CLAIM — {} exited {} at turn time; the claim is not attested",
+                                        scan.command, scan.exit_code
+                                    )
                                 }
                             )
                         })
                         .unwrap_or_default()
                     );
                 }
-                rta_verdict = Some(verdict.clone());
-                let _ = &rta_verdict;
+                rta_verdict = Some(verdict);
             }
         }
     }
@@ -1312,10 +1297,11 @@ fn cmd_headless(args: &[String]) -> i32 {
         Ok(r) => {
             save_session(&transcript, &r);
             if json_out {
-                let summary = orbit_engine::automation::HeadlessSummary::from_report(
+                let mut summary = orbit_engine::automation::HeadlessSummary::from_report(
                     &r,
                     orbit_engine::automation::ledger_head(&home),
                 );
+                summary.rta = rta_verdict.clone();
                 println!("{}", summary.to_json());
             } else if !stream_json {
                 // text: the final reply only.
@@ -1913,6 +1899,16 @@ fn cmd_chat(args: &[String]) -> i32 {
                 total_cost += r.cost_microcents;
                 if r.interrupted {
                     eprintln!("turn cancelled");
+                }
+                // E10: the attestation scan runs in EVERY front-end —
+                // an unverified claim is shown, not just in headless.
+                if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript) {
+                    if scan.claimed_pass && scan.exit_code != 0 {
+                        eprintln!(
+                            "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
+                            scan.command, scan.exit_code
+                        );
+                    }
                 }
             }
             Err(_) => {

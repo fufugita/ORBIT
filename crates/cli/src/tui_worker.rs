@@ -303,6 +303,20 @@ fn worker_main(
                 cum_input = cum_input.saturating_add(input);
                 cum_output = cum_output.saturating_add(output);
                 cum_cost = cum_cost.saturating_add(cost);
+                // E10: the attestation scan runs in EVERY front-end —
+                // an unverified claim becomes a visible status, not a
+                // silent exit 0.
+                if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript) {
+                    if scan.claimed_pass && scan.exit_code != 0 {
+                        orbit_hud_tui::emit_status(
+                            &ctx.sender,
+                            &format!(
+                                "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
+                                scan.command, scan.exit_code
+                            ),
+                        );
+                    }
+                }
                 // Always emit ResponseFinished — the TUI's turn_in_flight flag
                 // and queue drain both depend on it, whether the turn
                 // completed, was cancelled by the operator, or errored. The

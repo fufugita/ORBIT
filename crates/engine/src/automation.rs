@@ -149,6 +149,85 @@ pub struct AttestedPass {
     pub attested_at_epoch: u64,
 }
 
+/// The structured attestation scan (E10): the last test-like Bash
+/// command of a turn, its RECORDED exit status (from the paired tool
+/// result — not a re-run, not the model's word), and whether the final
+/// text claims a pass. A claim after a failing command is an
+/// unverified claim and must be shown as one.
+#[derive(Debug, Clone)]
+pub struct AttestationScan {
+    pub command: String,
+    pub exit_code: i64,
+    pub claimed_pass: bool,
+}
+
+/// Scan a turn's transcript for the attestation facts (E10). Returns
+/// None when no test-like command ran. The exit code comes from the
+/// tool result JSON recorded by the Bash tool itself; the claim check
+/// covers the common phrasings ("tests pass", "the test passes now",
+/// "tests passed", "tests are passing") — the old three-phrase list
+/// missed the singular, and a claim is a claim.
+pub fn scan_attestation(
+    transcript: &[orbit_adapter::types::ChatMessage],
+) -> Option<AttestationScan> {
+    use orbit_adapter::types::ChatRole;
+
+    // The last test-like Bash tool call, its paired result, and the
+    // final assistant text — one reverse pass.
+    let mut command: Option<String> = None;
+    let mut exit_code: Option<i64> = None;
+    let mut final_text = String::new();
+    for m in transcript.iter().rev() {
+        if m.role == ChatRole::Assistant && final_text.is_empty() && !m.content.is_empty() {
+            final_text = m.content.to_lowercase();
+        }
+        if command.is_none() {
+            if let Some(calls) = m.tool_calls.as_ref() {
+                for c in calls.iter().rev() {
+                    let Ok(a) = serde_json::from_str::<serde_json::Value>(&c.arguments) else {
+                        continue;
+                    };
+                    let Some(cmd) = a.get("command").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let is_test = cmd.contains("cargo test")
+                        || cmd.contains("npm test")
+                        || cmd.contains("pytest")
+                        || cmd.contains("go test")
+                        || cmd.contains("python3 test");
+                    if is_test {
+                        command = Some(cmd.to_string());
+                        // The paired result: the Tool message with this
+                        // call id carries the recorded exit_code.
+                        let id = c.id.clone();
+                        if let Some(tm) = transcript.iter().rev().find(|t| {
+                            t.role == ChatRole::Tool
+                                && t.tool_call_id.as_deref() == Some(id.as_str())
+                        }) {
+                            if let Some(r) = tm.tool_result.as_deref() {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(r) {
+                                    exit_code = v.get("exit_code").and_then(|x| x.as_i64());
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if command.is_some() && !final_text.is_empty() {
+            break;
+        }
+    }
+    let command = command?;
+    let claimed_pass = final_text.contains("test") && (final_text.contains("pass"));
+    Some(AttestationScan {
+        command,
+        exit_code: exit_code.unwrap_or(-1),
+        claimed_pass,
+    })
+}
+
 /// Re-run a command and attest the result. Only a zero exit code
 /// attests a pass — the agent's claim is never trusted (roadmap:
 /// "when the agent says tests pass, ORBIT re-runs the recorded
@@ -216,6 +295,9 @@ pub struct HeadlessSummary {
     pub cost_microcents: u64,
     /// The ledger head digest at turn end (proof anchor).
     pub ledger_head: Option<String>,
+    /// The RTA verdict when the model claimed a test pass (E10):
+    /// attested, or an unverified claim against a recorded failure.
+    pub rta: Option<serde_json::Value>,
 }
 
 impl HeadlessSummary {
@@ -228,6 +310,7 @@ impl HeadlessSummary {
             output_tokens: report.output_tokens,
             cost_microcents: report.cost_microcents,
             ledger_head,
+            rta: None,
         }
     }
 
@@ -244,6 +327,7 @@ impl HeadlessSummary {
             },
             "cost_microcents": self.cost_microcents,
             "ledger_head": self.ledger_head,
+            "rta": self.rta,
         })
     }
 }

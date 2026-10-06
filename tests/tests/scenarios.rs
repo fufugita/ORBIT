@@ -1568,3 +1568,57 @@ fn scenario_e9_all_hook_events_fire() {
     // permission ask, no notification) — firing them is proven by the
     // unit tests; here we prove the ones a plain run hits.
 }
+
+// ── E10: an unverified claim is shown, not a silent exit 0 ────────
+// The attestation trigger matched only three exact phrases ("tests
+// pass", "all tests pass", "test suite passes") — "The test passes
+// now" slipped past, and the check trusted the claim enough to re-run.
+// The verdict now comes from the RECORDED exit status of the last
+// test-like command; a claim after a failing command is an unverified
+// claim, flagged in the event stream and the JSON summary.
+#[test]
+fn scenario_e10_unverified_claim_flagged() {
+    // The scripted run: the model edits NOTHING, runs the failing test
+    // (it exits 1 in the fixture), and claims success anyway.
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Bash", "args": {
+                "command": "python3 test_calc.py",
+                "description": "run the test"}}]},
+            {"text": "The test passes now."}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let (events, code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        "make the tests pass",
+        &["--auto-tools"],
+    );
+    // The turn itself completed — the claim is the problem, not the turn.
+    assert_eq!(count(&events, "turn_ended"), 1, "one turn_ended");
+
+    // The unverified claim is visible in the status events.
+    let flagged = events.iter().any(|e| {
+        e.get("type").and_then(|t| t.as_str()) == Some("status")
+            && e.get("text")
+                .and_then(|t| t.as_str())
+                .map(|t| t.contains("UNVERIFIED CLAIM"))
+                .unwrap_or(false)
+    });
+    assert!(
+        flagged,
+        "E10: the unverified claim must be flagged in the event stream"
+    );
+
+    // And the fixture was never fixed — the claim was false.
+    assert_ne!(
+        Fixture::read(&fix.path, "calc.py"),
+        "def add(a, b):\n    return a + b\n",
+        "the fixture is still broken"
+    );
+    let _ = code;
+}
