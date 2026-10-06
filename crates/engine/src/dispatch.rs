@@ -295,8 +295,9 @@ pub fn run_dispatch(
     let decision = orbit_gateway::new_decision_id();
 
     // Run the full pipeline via tokio.
-    let result = tokio::runtime::Runtime::new()
-        .map_err(|e| ("ORBIT-E0410", e.to_string()))?
+    // E6: one shared runtime for the process — a round used to spawn
+    // its own thread pool every time.
+    let result = orbit_provider_http::shared_runtime()
         .block_on(async {
             let mut writer = orbit_ledger::LedgerWriter::open(
                 &home.join("ledger"),

@@ -13,7 +13,6 @@ use crate::cancel::CancelToken;
 use crate::error::TransportError;
 use crate::sse::SseParser;
 use crate::stream::AsyncProviderEventStream;
-use crate::tls;
 use crate::AsyncProviderAdapter;
 use futures::StreamExt;
 use orbit_adapter::credential::SecretBytes;
@@ -22,7 +21,6 @@ use orbit_adapter::types::{
     AdapterIdentity, AdapterKind, ProviderCapabilities, ProviderEventKind, ProviderRequest,
     ProviderRouteBinding, ProviderStreamEvent, ProviderUsage, Sha256Digest,
 };
-use std::sync::Arc;
 
 /// The OpenAI-compatible HTTP adapter.
 pub struct OpenAiCompatibleHttpV1 {
@@ -40,14 +38,9 @@ impl OpenAiCompatibleHttpV1 {
         capabilities: ProviderCapabilities,
         tls_policy: orbit_adapter::types::TlsPinPolicy,
     ) -> Result<Self, TransportError> {
-        let config = tls::client_config(&tls_policy)?;
-        // reqwest's use_preconfigured_tls expects the RAW ClientConfig
-        // (it downcasts Option<ClientConfig>), not an Arc.
-        let config = Arc::try_unwrap(config).unwrap_or_else(|arc| (*arc).clone());
-        let client = reqwest::Client::builder()
-            .use_preconfigured_tls(config)
-            .build()
-            .map_err(|e| TransportError::Transport(format!("client build: {e}")))?;
+        // E6: draw from the shared client pool — one TLS config, one
+        // connection pool per policy, reused across every round.
+        let client = crate::shared_tls_client(&tls_policy)?;
         Ok(Self {
             identity,
             capabilities,

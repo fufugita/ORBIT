@@ -34,8 +34,8 @@ impl AnthropicMessagesV1 {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
-        let client = reqwest::Client::builder()
-            .build()
+        // E6: shared client — one connection pool for the process.
+        let client = crate::shared_plain_client()
             .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
         Ok(Self {
             identity,
