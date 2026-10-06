@@ -32,6 +32,10 @@ pub struct TurnOutcome {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_microcents: u64,
+    /// Context in use after this round (E3): the last request's input
+    /// plus cache tokens, provider-normalised. NOT a sum over rounds —
+    /// the context meter shows instantaneous occupancy, not traffic.
+    pub context_tokens: u64,
 }
 
 /// The provider kind selects the adapter: `openai-compatible` (default),
@@ -405,6 +409,9 @@ pub fn run_dispatch(
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_microcents,
+                context_tokens: usage.input_tokens
+                    + usage.cache_read_tokens
+                    + usage.cache_write_tokens,
             })
         }
         // E1: a refusal without a usable message and without a

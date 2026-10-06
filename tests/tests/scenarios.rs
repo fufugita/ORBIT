@@ -1184,3 +1184,53 @@ fn scenario_s4_spoken_rules_off_by_default() {
     let _ = events;
     let _ = events2;
 }
+
+// ── E3: the context meter shows occupancy, not traffic ─────────────
+// used_tokens was the SUM of every round's input — four rounds of
+// ~100 prompt tokens showed "context 460/200000". The meter must show
+// the LAST round's occupancy (input + cache), which is what the
+// window actually holds after the final request.
+#[test]
+fn scenario_e3_context_meter_last_round_not_sum() {
+    // Two rounds: round 1 carries 100 input tokens, round 2 carries
+    // 230 (the transcript grew: prompt + tool result + reply).
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"ptok": 100,
+             "tools": [{"name": "Glob", "args": {"pattern": "*.py"}}]},
+            {"ptok": 230, "text": "done"}]
+    });
+    let mock = Mock::start(&script, "anthropic");
+    let home = Home::init(&mock, "anthropic", "context_window = 20000\n");
+    let fix = Fixture::failing_test();
+
+    let (events, code) = run_p(&mock, &home, &fix.path, "use tools", &["--auto-tools"]);
+    assert_eq!(code, 0, "the turn completes");
+
+    // The last Usage event must report the LAST round's context
+    // (230), never the sum (330) or round 1 alone (100).
+    let usage: Vec<_> = events
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("usage"))
+        .collect();
+    assert!(!usage.is_empty(), "at least one Usage event (E3)");
+    let last = usage.last().unwrap();
+    let used = last["used_tokens"].as_u64().unwrap_or(0);
+    assert!(
+        (230..330).contains(&used),
+        "E3: context meter must show the last round's occupancy ({used} used, expected >=230 and <330 — the sum would be 330):\n{last}"
+    );
+
+    // Cost accounting still sums every round (turn_ended carries the
+    // totals — unaffected by the meter fix).
+    let ended: Vec<_> = events
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended"))
+        .collect();
+    assert!(!ended.is_empty(), "turn_ended present");
+    assert!(
+        ended[0]["input_tokens"].as_u64().unwrap_or(0) >= 330,
+        "E3: turn_ended input_tokens still sums rounds (>=330):\n{}",
+        ended[0]
+    );
+}

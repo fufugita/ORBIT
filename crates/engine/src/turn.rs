@@ -207,10 +207,12 @@ pub fn run_turn(
         events(FrontendEvent::CostUpdated {
             total_microcents: report.cost_microcents,
         });
-        // The context meter (M18): tokens in use vs the window.
+        // The context meter (E3/M18): tokens in use vs the window —
+        // the LAST round's occupancy (input + cache), not the sum of
+        // every round's input. The sums stay for cost accounting.
         if let Some(w) = options.window_tokens {
             events(FrontendEvent::Usage {
-                used_tokens: report.input_tokens,
+                used_tokens: o.context_tokens.max(estimate_transcript_tokens(transcript)),
                 window_tokens: w,
             });
         }

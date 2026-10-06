@@ -294,16 +294,25 @@ fn openai_stream(
                 if let Some(u) = json.get("usage") {
                     let prompt_details = u.get("prompt_tokens_details");
                     let completion_details = u.get("completion_tokens_details");
+                    // OpenAI's prompt_tokens INCLUDES cached tokens;
+                    // the crate's convention (GW-15, and what the cost
+                    // table charges) is input EXCLUDES cache. Subtract
+                    // so input + cache = the request's true context
+                    // size, and cache reads bill at the cache rate
+                    // only, never twice.
+                    let prompt_total =
+                        u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let cached = prompt_details
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
                     usage = ProviderUsage {
-                        input_tokens: u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                        input_tokens: prompt_total.saturating_sub(cached),
                         output_tokens: u
                             .get("completion_tokens")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0),
-                        cache_read_tokens: prompt_details
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0),
+                        cache_read_tokens: cached,
                         cache_write_tokens: 0,
                         reasoning_tokens: completion_details
                             .and_then(|d| d.get("reasoning_tokens"))
