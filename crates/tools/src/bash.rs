@@ -430,11 +430,93 @@ impl Tool for TaskStopTool {
 /// KILL every descendant of `pid` (walked via /proc children lists).
 /// Needed because the sandbox re-execs bwrap in a new session, putting
 /// the payload outside the spawned child's process group.
+/// A pid is safe to signal only if it is a LIVE DESCENDANT of `root` —
+/// verified by walking its /proc PPID chain upward. The children-list
+/// walk in kill_tree can only ever *enumerate* descendants, but between
+/// enumeration and the kill a pid may exit and be REUSED by an
+/// unrelated process (observed 2026-10-07: a recycled pid TERMed the
+/// whole user session via `kill -TERM -{pid}`). Re-validating ancestry
+/// immediately before each signal closes that window.
+fn is_descendant_of(pid: i32, root: i32) -> bool {
+    let mut cur = pid;
+    for _ in 0..64 {
+        if cur == root {
+            return true;
+        }
+        if cur <= 1 {
+            return false;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else {
+            return false; // gone — nothing to confirm
+        };
+        // Field 4 is PPID. comm (field 2) is parenthesized and may
+        // contain spaces/parens, so split AFTER the last ')'.
+        let Some((_comm, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next();
+        let Some(ppid) = fields.next().and_then(|f: &str| f.parse::<i32>().ok()) else {
+            return false;
+        };
+        cur = ppid;
+    }
+    false
+}
+
+/// Whether `anc` is an ancestor of `pid` per the /proc PPID chain.
+fn is_ancestor_of(anc: i32, pid: i32) -> bool {
+    if anc <= 1 || anc == pid {
+        return false;
+    }
+    let mut cur = pid;
+    for _ in 0..64 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else {
+            return false;
+        };
+        let Some((_comm, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next();
+        let Some(ppid) = fields.next().and_then(|f: &str| f.parse::<i32>().ok()) else {
+            return false;
+        };
+        if ppid == anc {
+            return true;
+        }
+        if ppid <= 1 {
+            return false;
+        }
+        cur = ppid;
+    }
+    false
+}
+
+/// KILL every descendant of `pid` (walked via /proc children lists).
+/// Needed because the sandbox re-execs bwrap in a new session, putting
+/// the payload outside the spawned child's process group.
+///
+/// Guards (2026-10-07, after a recycled-pid kill TERMed the user's whole
+/// session): never signal pid <= 1, ourselves, our own ancestors (the
+/// session supervisor survives every kill path), or any pid whose live
+/// /proc ancestry can not be confirmed as descending from the original
+/// child.
 fn kill_tree(pid: i32) {
+    let me = std::process::id() as i32;
+    // The root itself must be alive; if /proc/{pid} is gone the tree is
+    // already dead and signaling risks hitting a REUSED pid.
+    if pid <= 1 || pid == me || !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        return;
+    }
     let mut stack = vec![pid];
     let mut seen = std::collections::HashSet::new();
     while let Some(p) = stack.pop() {
         if !seen.insert(p) {
+            continue;
+        }
+        // Never signal init, ourselves, or our own ancestors.
+        if p <= 1 || p == me || is_ancestor_of(p, me) {
             continue;
         }
         // Children of every thread of p.
@@ -453,6 +535,12 @@ fn kill_tree(pid: i32) {
         // usually not a process-group leader, and `kill -KILL -<pid>`
         // on a non-leader is ESRCH — silently ignored. The group kill
         // above already handled the leaders' groups.
+        // Re-validate immediately before signaling: the pid must still
+        // be a live descendant of the original child (exit+reuse between
+        // enumeration and kill is exactly the 2026-10-07 failure).
+        if !is_descendant_of(p, pid) {
+            continue;
+        }
         let _ = std::process::Command::new("kill")
             .arg("-KILL")
             .arg(p.to_string())
@@ -463,13 +551,37 @@ fn kill_tree(pid: i32) {
 fn kill_process_group(pid: i32) -> bool {
     use std::process::Command;
     // kill -TERM -<pgid>: the child was spawned with process_group(0),
-    // so its PID IS its pgid.
+    // so its PID IS its pgid. Guard (2026-10-07): refuse pid <= 1 and
+    // require the LIVE pgid from /proc/{pid}/stat to match — a pid that
+    // exited and was reused would otherwise TERM an unrelated process
+    // group (observed taking down the entire user session).
+    if pid <= 1 {
+        return false;
+    }
+    let Some(pgrp) = live_pgrp(pid) else {
+        return false; // already dead
+    };
+    if pgrp != pid {
+        return false; // not the group leader — never signal -pid
+    }
     Command::new("kill")
         .arg("-TERM")
         .arg(format!("-{pid}"))
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The live process-group id of `pid` from /proc, or None if gone.
+fn live_pgrp(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after comm: state(3) ppid(4) pgrp(5). comm (field 2) is
+    // parenthesized and may contain spaces/parens — split AFTER ')'.
+    let (_comm, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next();
+    let _ppid = fields.next();
+    fields.next().and_then(|f: &str| f.parse::<i32>().ok())
 }
 
 /// List live background commands (for the status line / TaskList).
