@@ -357,6 +357,21 @@ pub fn run_turn(
                 ok,
                 result_fact: fact,
             });
+            // C4: a policy refusal is its own event — the tool and the
+            // reason travel with it, so a headless consumer (and the
+            // exit-code path) never substring-hunts the payload.
+            if orbit_tools::result_is_denial(&r.content) {
+                events(FrontendEvent::ToolDenied {
+                    call_id: r.call_id.clone(),
+                    tool: o
+                        .tool_calls
+                        .iter()
+                        .find(|tc| tc.id == r.call_id)
+                        .map(|tc| tc.name.clone())
+                        .unwrap_or_default(),
+                    reason: orbit_tools::denial_reason(&r.content).unwrap_or_default(),
+                });
+            }
         }
         for r in results {
             transcript.push(ChatMessage {

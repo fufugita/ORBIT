@@ -154,7 +154,7 @@ impl<'a> Wave1Executor<'a> {
                         self.grants.grant(grant_key);
                     }
                     ApprovalAnswer::Deny => {
-                        return ToolResult::err("denied by you").payload;
+                        return ToolResult::denied("denied by you").payload;
                     }
                 }
             }

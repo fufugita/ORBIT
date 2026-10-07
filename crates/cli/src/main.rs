@@ -1107,6 +1107,12 @@ fn cmd_headless(args: &[String]) -> i32 {
             println!("{}", serde_json::to_string(&ev).unwrap_or_default());
             let _ = std::io::stdout().flush();
         }
+        // C4: a refusal says WHY on stderr — one line a script (or an
+        // operator redirected to a log) can read without parsing the
+        // JSON stream. Works in every output format.
+        if let orbit_frontend_protocol::FrontendEvent::ToolDenied { tool, reason, .. } = &ev {
+            eprintln!("orbit: {tool} denied: {reason}");
+        }
     };
     let options = orbit_engine::TurnOptions {
         tools: tools::session_tool_definitions(&home),
@@ -1316,19 +1322,15 @@ fn cmd_headless(args: &[String]) -> i32 {
             }
             // Exit codes: 0 done, 1 failed, 2 permission denial,
             // 3 max-turns, 130 interrupted. A permission denial is
-            // detectable from the transcript (a denied tool result).
+            // detectable from the transcript's typed flag (C4): every
+            // policy refusal carries `"denied": true` — no substring
+            // hunt (E4's lesson: text-matching fires on content that
+            // merely looks like a marker).
             let permission_denied = transcript.iter().any(|m| {
                 m.role == orbit_adapter::types::ChatRole::Tool
-                    && m.tool_result.as_deref().is_some_and(|t| {
-                        // Every permission refusal carries one of these
-                        // markers: the explicit "denied", the headless
-                        // allowlist refusal, or a rule denial.
-                        t.contains("denied")
-                            || t.contains("requires --auto-tools")
-                            || t.contains("deny-by-default")
-                            || t.contains("persistent rule")
-                            || t.contains("dontAsk")
-                    })
+                    && m.tool_result
+                        .as_deref()
+                        .is_some_and(orbit_tools::result_is_denial)
             });
             let code = orbit_engine::automation::exit_code(&r, max_rounds, permission_denied);
             // E9: SessionEnd fires when the headless session closes.

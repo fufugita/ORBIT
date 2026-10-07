@@ -98,6 +98,7 @@ fn protocol_kind(ev: &orbit_frontend_protocol::FrontendEvent) -> &'static str {
         E::SubagentStarted { .. } => "subagent_started",
         E::SubagentProgress { .. } => "subagent_progress",
         E::SubagentFinished { .. } => "subagent_finished",
+        E::ToolDenied { .. } => "tool_denied",
         E::ModeChanged { .. } => "mode_changed",
         E::Usage { .. } => "usage",
         E::LedgerAppended { .. } => "ledger_appended",

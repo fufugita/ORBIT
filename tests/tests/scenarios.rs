@@ -1622,3 +1622,119 @@ fn scenario_e10_unverified_claim_flagged() {
     );
     let _ = code;
 }
+
+// ── C4: a silent denial ────────────────────────────────────────────
+// Fails on 1310e73: a denied tool made `orbit -p` exit 2 with no
+// event and no stderr line saying which tool or why. Now every
+// refusal carries a typed `denied: true` flag (C4, the denial twin
+// of E4): a tool_denied event with the tool and the reason, a
+// one-line stderr reason readable without parsing the JSON stream,
+// and the exit-code path keys on the flag, never on substrings.
+#[test]
+fn scenario_c4_denial_is_typed_not_silent() {
+    // The script asks for a Write with no allow path: headless
+    // dontAsk semantics deny it with the honest reason.
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Write", "args": {
+                "file_path": "c4-out.txt",
+                "content": "must not appear"}}]},
+            {"text": "done"}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let mut cmd = Command::new(orbit_binary());
+    cmd.arg("-p")
+        .arg("write it")
+        .arg("--home")
+        .arg(&home.path)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{}", mock.port))
+        .arg("--model")
+        .arg("mock-model")
+        .arg("--output-format")
+        .arg("stream-json")
+        .current_dir(&fix.path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().expect("run orbit -p");
+    let mut events = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            events.push(v);
+        }
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // The denial is its own event, with the tool and the reason.
+    let denied_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_denied"))
+        .collect();
+    assert_eq!(
+        denied_events.len(),
+        1,
+        "C4: exactly one tool_denied event:\n{events:#?}"
+    );
+    let ev = denied_events[0];
+    assert_eq!(
+        ev.get("tool").and_then(|t| t.as_str()),
+        Some("Write"),
+        "C4: the event names the tool"
+    );
+    let reason = ev.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+    assert!(
+        !reason.is_empty(),
+        "C4: the event carries the refusal reason"
+    );
+
+    // The one-line stderr reason names the tool — readable without
+    // parsing the JSON stream.
+    assert!(
+        stderr.contains("Write denied:"),
+        "C4: stderr must say which tool was denied and why:\n{stderr}"
+    );
+
+    // The exit code honestly says 2 (permission denial), and nothing
+    // was written.
+    assert_eq!(out.status.code(), Some(2), "a denial exits 2");
+    assert!(
+        !fix.path.join("c4-out.txt").exists(),
+        "the denied Write must not create the file"
+    );
+
+    // The provider-visible transcript carries the TYPED flag — the
+    // exit-code path keys on it (no substring hunt). Parse the tool
+    // message's content as JSON (same discipline as E4: never
+    // byte-grep across escape levels).
+    let reqs = mock.requests();
+    let msgs = reqs
+        .get(1)
+        .and_then(|r| r["body"]["messages"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let tool_msg = msgs
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .cloned()
+        .unwrap_or_default();
+    let content = tool_msg["content"].as_str().unwrap_or("");
+    let verdict: serde_json::Value =
+        serde_json::from_str(content).unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        verdict.get("denied"),
+        Some(&serde_json::json!(true)),
+        "C4: the refusal result carries the typed denied flag:\n{content}"
+    );
+    // And the refusal reached the provider with its reason (the model
+    // learns WHY its call never ran).
+    assert!(
+        verdict["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("requires --auto-tools or an allow rule"),
+        "C4: the denial reason reached the provider:\n{content}"
+    );
+}

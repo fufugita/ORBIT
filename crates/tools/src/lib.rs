@@ -178,6 +178,17 @@ impl ToolResult {
             spilled_to: None,
         }
     }
+    /// A permission refusal (C4): `denied: true` marks the payload as
+    /// policy-said-no — the typed flag exit codes, events and UI
+    /// glyphs key on, instead of message substrings.
+    pub fn denied(message: &str) -> Self {
+        ToolResult {
+            payload: serde_json::json!({ "ok": false, "denied": true, "error": message })
+                .to_string(),
+            is_error: true,
+            spilled_to: None,
+        }
+    }
 }
 
 /// Inline limit for tool results; longer payloads spill to a file the
@@ -199,6 +210,31 @@ pub fn result_is_error(payload: &str) -> bool {
         .and_then(|v| v.get("ok").and_then(|f| f.as_bool()))
         .map(|ok| !ok)
         .unwrap_or(false)
+}
+
+/// A permission refusal, not a tool failure (C4, same shape as E4):
+/// the TOP-LEVEL `denied` flag the verdict layer stamps on a refusal.
+/// Distinguishes "the operator/policy said no" (auditable denial) from
+/// "the tool ran and failed" — exit codes, events and UI glyphs key on
+/// it. A result without the flag is not a denial, whatever its text.
+pub fn result_is_denial(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| v.get("denied").and_then(|f| f.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Extract the refusal reason from a denial payload (for events and
+/// stderr). None on a non-denial payload.
+pub fn denial_reason(payload: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    if !result_is_denial(payload) {
+        return None;
+    }
+    v.get("error")
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .or_else(|| Some("denied".into()))
 }
 
 /// Wrap a result payload: inline when short, spilled when long.
@@ -456,5 +492,25 @@ mod e4_tests {
         assert!(!result_is_error("{\"content\":\"hello\"}"));
         // Not JSON at all: not an error.
         assert!(!result_is_error("plain text output"));
+    }
+
+    #[test]
+    fn denial_flag_is_typed_not_textual() {
+        // A refusal: the typed flag.
+        let refusal = ToolResult::denied("denied by you").payload;
+        assert!(result_is_denial(&refusal));
+        assert!(result_is_error(&refusal), "a denial is also not-ok");
+        assert_eq!(denial_reason(&refusal).as_deref(), Some("denied by you"));
+        // A tool that ran and failed: NOT a denial, however much the
+        // message says "denied" — the word alone was the old substring
+        // heuristic (C4's bug).
+        let failed = r#"{"ok":false,"error":"denied: no such file"}"#;
+        assert!(!result_is_denial(failed));
+        assert!(result_is_error(failed));
+        assert!(denial_reason(failed).is_none());
+        // A success payload is never a denial.
+        assert!(!result_is_denial(r#"{"ok":true,"result":"x"}"#));
+        // Legacy plain strings: no flag, not a denial.
+        assert!(!result_is_denial("operator denied something"));
     }
 }

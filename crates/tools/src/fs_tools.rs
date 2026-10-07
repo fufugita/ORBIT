@@ -49,8 +49,8 @@ impl Tool for ReadTool {
         };
         let path = resolve_path(cx, file_path);
         if is_deny_read(&path) {
-            return ToolResult::err(
-                "denied: that path is on the deny-read list (credentials never reach the provider)",
+            return ToolResult::denied(
+                "that path is on the deny-read list (credentials never reach the provider)",
             );
         }
         let metadata = match std::fs::metadata(&path) {
@@ -166,7 +166,7 @@ impl Tool for WriteTool {
         };
         let path = resolve_path(cx, file_path);
         if is_deny_read(&path) {
-            return ToolResult::err("denied: that path is on the deny list");
+            return ToolResult::denied("that path is on the deny list");
         }
         // An existing file must have been read in full this session
         // (read-before-write, the Write half of read-before-edit).
@@ -253,7 +253,7 @@ impl Tool for EditTool {
             .unwrap_or(false);
         let path = resolve_path(cx, file_path);
         if is_deny_read(&path) {
-            return ToolResult::err("denied: that path is on the deny list");
+            return ToolResult::denied("that path is on the deny list");
         }
         if !cx.was_read(&path) {
             return ToolResult::err(
@@ -402,7 +402,7 @@ impl Tool for GlobTool {
             .map(|p| resolve_path(cx, p))
             .unwrap_or_else(|| cx.working_dir.clone());
         if is_deny_read(&base) {
-            return ToolResult::err("denied: that path is on the deny-read list");
+            return ToolResult::denied("that path is on the deny-read list");
         }
         let mut matches = Vec::new();
         let cap = 100usize;
@@ -532,7 +532,7 @@ impl Tool for GrepTool {
             .map(|p| resolve_path(cx, p))
             .unwrap_or_else(|| cx.working_dir.clone());
         if is_deny_read(&base) {
-            return ToolResult::err("denied: that path is on the deny-read list");
+            return ToolResult::denied("that path is on the deny-read list");
         }
         let glob_filter = input.get("glob").and_then(|v| v.as_str());
         let head_limit = input

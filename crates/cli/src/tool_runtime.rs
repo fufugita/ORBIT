@@ -388,7 +388,7 @@ pub fn execute_call(
     drop(writer);
 
     if !allowed {
-        let output = tool_error(reason);
+        let output = tool_denial(reason);
         // D9: a denial is not an error — audits must be able to tell an
         // operator refusal apart from a tool that ran and failed.
         record_result(home, session_id, decision_id, call, "denied", &output)?;
@@ -413,7 +413,9 @@ pub fn execute_call(
             },
             None => tool_error("Skill requires 'name'"),
         };
-        let status = if orbit_tools::result_is_error(&output) {
+        let status = if orbit_tools::result_is_denial(&output) {
+            "denied"
+        } else if orbit_tools::result_is_error(&output) {
             "error"
         } else {
             "ok"
@@ -448,7 +450,9 @@ pub fn execute_call(
             Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
             Err(e) => tool_error(&e),
         };
-        let status = if orbit_tools::result_is_error(&output) {
+        let status = if orbit_tools::result_is_denial(&output) {
+            "denied"
+        } else if orbit_tools::result_is_error(&output) {
             "error"
         } else {
             "ok"
@@ -460,7 +464,9 @@ pub fn execute_call(
     // MCP tools (phase 5): mcp__<server>__<tool> — spawn, call, scan.
     if call.name.starts_with("mcp__") {
         let output = execute_mcp(home, call, &args);
-        let status = if orbit_tools::result_is_error(&output) {
+        let status = if orbit_tools::result_is_denial(&output) {
+            "denied"
+        } else if orbit_tools::result_is_error(&output) {
             "error"
         } else {
             "ok"
@@ -475,13 +481,17 @@ pub fn execute_call(
     // the secret scanner on every result (review blocker 1).
     if orbit_tools::is_wave1(&call.name) {
         let output = execute_wave1(home, scope, call, &args, tool_cx);
-        let status = if orbit_tools::result_is_error(&output) {
+        let status = if orbit_tools::result_is_denial(&output) {
+            "denied"
+        } else if orbit_tools::result_is_error(&output) {
             "error"
         } else {
             "ok"
         };
         // E9: PostToolUseFailure fires for the error path (the plain
         // PostToolUse fires inside execute_wave1 with ok=true/false).
+        // A denial (status "denied") is not a failure — the tool never
+        // ran (D9), and PermissionRequest already covered the moment.
         if status == "error" {
             let hooks = orbit_engine::hooks::Hooks::load(home, project_trusted_home(home));
             let _ = hooks.fire(
@@ -503,7 +513,9 @@ pub fn execute_call(
         record_result(home, session_id, decision_id, call, "error", &truncated)?;
         return Ok(truncated);
     }
-    let status = if orbit_tools::result_is_error(&output) {
+    let status = if orbit_tools::result_is_denial(&output) {
+        "denied"
+    } else if orbit_tools::result_is_error(&output) {
         "error"
     } else {
         "ok"
@@ -644,7 +656,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 
 /// S3: the standing refusal for an unrunnable sandbox.
 fn sandbox_refusal() -> String {
-    tool_error(
+    tool_denial(
         "refused: the shell sandbox is unavailable on this machine \
 (bubblewrap missing); set ORBIT_ALLOW_UNSANDBOXED_BASH=1 to run Bash unsandboxed",
     )
@@ -652,6 +664,14 @@ fn sandbox_refusal() -> String {
 
 fn tool_error(msg: &str) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
+}
+
+/// A permission refusal (C4): the typed `denied` flag marks "policy or
+/// the operator said no" — distinct from a tool that ran and failed
+/// (D9). Exit codes, the ToolDenied event and the UI's denial glyph
+/// key on the flag, never on message substrings.
+fn tool_denial(msg: &str) -> String {
+    serde_json::json!({ "ok": false, "denied": true, "error": msg }).to_string()
 }
 
 /// Execute one Wave 1 call through the orbit-tools registry with the
@@ -694,7 +714,7 @@ fn execute_wave1(
         .into_iter()
         .find(|t| t.name() == call.name)
     else {
-        return tool_error("unknown tool (deny-by-default)");
+        return tool_denial("unknown tool (deny-by-default)");
     };
     let key = tool.permission_key(args);
     let is_ro_cmd = call.name == "Bash"
@@ -715,7 +735,7 @@ fn execute_wave1(
         }),
     );
     if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
-        return tool_error(&format!("blocked by hook: {reason}"));
+        return tool_denial(&format!("blocked by hook: {reason}"));
     }
 
     // S3: when the shell sandbox cannot run on this machine, a Bash
@@ -747,7 +767,7 @@ fn execute_wave1(
         orbit_tools::permissions::Verdict::Allow if !sandbox_up => return sandbox_refusal(),
         orbit_tools::permissions::Verdict::Allow => {}
         orbit_tools::permissions::Verdict::Deny(reason) => {
-            return tool_error(&reason);
+            return tool_denial(&reason);
         }
         orbit_tools::permissions::Verdict::Ask if !sandbox_up => return sandbox_refusal(),
         orbit_tools::permissions::Verdict::Ask => {
@@ -772,7 +792,7 @@ fn execute_wave1(
         }),
     );
     if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
-        return tool_error(&format!("blocked by hook: {reason}"));
+        return tool_denial(&format!("blocked by hook: {reason}"));
     }
 
     // Checkpoint (phase 4): before the first WRITE of a turn, snapshot

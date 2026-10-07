@@ -116,6 +116,16 @@ pub enum FrontendEvent {
         ok: bool,
         result_fact: String,
     },
+    /// A tool call was refused by policy or the operator (C4): the
+    /// denial is its own event with the tool and the reason, so a
+    /// headless consumer learns WHY a call never ran without parsing
+    /// the result payload. D9: distinct from a tool that ran and
+    /// failed (ToolFinishedFull with ok=false).
+    ToolDenied {
+        call_id: String,
+        tool: String,
+        reason: String,
+    },
     /// A file changed on disk (the Changes panel): path, added and
     /// removed counts, checkpoint id.
     FileChanged {

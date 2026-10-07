@@ -997,11 +997,11 @@ impl TuiApprovalChannel {
 fn classify_tool_result(result: &str) -> orbit_hud_tui::state::ToolOutcome {
     if result.contains("\"ok\":true") {
         orbit_hud_tui::state::ToolOutcome::Ok
-    } else if result.contains("operator denied") || result.contains("denied by persistent rule") {
+    } else if orbit_tools::result_is_denial(result) {
+        // C4: the typed flag — every policy refusal carries it, so the
+        // substring lists are gone (they missed new denial sites).
         orbit_hud_tui::state::ToolOutcome::Denied
-    } else if result.contains("non-interactive tool call requires --auto-tools")
-        || result.contains("unknown tool (deny-by-default)")
-    {
+    } else if result.contains("unknown tool (deny-by-default)") {
         orbit_hud_tui::state::ToolOutcome::Blocked
     } else {
         orbit_hud_tui::state::ToolOutcome::Failed
