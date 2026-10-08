@@ -70,8 +70,7 @@ static SIGINT_FLAG: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(Atomic
 /// on master close (caught → graceful path), while the watchdog detects
 /// *terminal death via the fd* for the case where the signal was missed or
 /// the loop can no longer reach its signal check. The watchdog sets BOTH.
-static TERMINAL_DEAD_AT: LazyLock<Arc<AtomicU64>> =
-    LazyLock::new(|| Arc::new(AtomicU64::new(0)));
+static TERMINAL_DEAD_AT: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64::new(0)));
 
 /// A terminal-loss / external-termination signal caught since the last poll.
 ///
@@ -196,9 +195,7 @@ impl TerminalWatchdog {
                 continue;
             }
             let revents = fds[0].revents();
-            if revents
-                .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
-            {
+            if revents.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
                 Self::terminal_died();
                 return;
             }

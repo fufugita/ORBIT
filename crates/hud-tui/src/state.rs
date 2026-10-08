@@ -547,8 +547,11 @@ pub struct ReadinessRow {
 /// check is measured, not asserted — a missing trust root shows ✗.
 pub fn compute_readiness(home: &std::path::Path) -> Vec<ReadinessRow> {
     let mut rows = Vec::new();
-    // Trust root: $ORBIT_HOME/trust/root.json (the signed trust anchor).
-    let trust_ok = home.join("trust/root.json").exists();
+    // Trust root: the signed trust anchor `orbit init` writes. The file
+    // is trust/manifest.json (see cmd_init) — an earlier revision of
+    // this check looked for trust/root.json, which init never writes,
+    // so every fresh home showed ✕ trust root.
+    let trust_ok = home.join("trust/manifest.json").exists();
     rows.push(ReadinessRow {
         ok: trust_ok,
         label: "trust root".into(),

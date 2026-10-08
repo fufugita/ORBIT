@@ -40,7 +40,10 @@ fn cli_version_evidence_golden() {
         profile == "debug" || profile == "release",
         "profile must be the real build profile, got {profile:?}"
     );
-    assert!(!v["data"]["build"]["target"].as_str().unwrap_or("").is_empty());
+    assert!(!v["data"]["build"]["target"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty());
     assert!(!v["data"]["build"]["toolchain"]
         .as_str()
         .unwrap_or("")

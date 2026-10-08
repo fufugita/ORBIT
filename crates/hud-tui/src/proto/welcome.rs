@@ -42,6 +42,20 @@ impl Welcome {
     /// Anim; M9 (the welcome orbit) shows the station frame while
     /// the first prompt waits.
     pub fn lines(&self, tick_ms: u64) -> Vec<Line<'static>> {
+        self.lines_in(tick_ms, 0, &[])
+    }
+
+    /// The block laid out for a conversation pane `pane_w` columns
+    /// wide: the mark, tagline and readiness chips each centred, the
+    /// starters centred as one left-aligned block. `pane_w == 0`
+    /// leaves every row unpadded. `chips` are measured readiness
+    /// facts `(ok, label)` — never fixture text.
+    pub fn lines_in(
+        &self,
+        tick_ms: u64,
+        pane_w: u16,
+        chips: &[(bool, String)],
+    ) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         match self.tier {
             BrandTier::Off => return out,
@@ -49,12 +63,16 @@ impl Welcome {
                 // Only the middle row: ORBIT bold. The mark's other
                 // two rows are blank.
                 out.push(Line::from(""));
-                out.push(Line::from(Span::styled(
-                    "ORBIT",
-                    Style::default()
-                        .fg(comps::colour(Token::Ink))
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                )));
+                out.push(centred(
+                    Line::from(Span::styled(
+                        "ORBIT",
+                        Style::default()
+                            .fg(comps::colour(Token::Ink))
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )),
+                    5,
+                    pane_w,
+                ));
                 out.push(Line::from(""));
             }
             BrandTier::Anim | BrandTier::Static => {
@@ -72,7 +90,11 @@ impl Welcome {
                     super::mark::MARK_ROWS
                 };
                 for row in rows.iter() {
-                    out.push(mark_line(row, self.first_prompt_waiting));
+                    out.push(centred(
+                        mark_line(row, self.first_prompt_waiting),
+                        MARK_W,
+                        pane_w,
+                    ));
                 }
             }
         }
@@ -84,38 +106,57 @@ impl Welcome {
             return out;
         }
         out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            TAGLINE,
-            Style::default().fg(comps::colour(Token::Muted)),
-        )));
+        out.push(centred(
+            Line::from(Span::styled(
+                TAGLINE,
+                Style::default().fg(comps::colour(Token::Muted)),
+            )),
+            TAGLINE.chars().count() as u16,
+            pane_w,
+        ));
         // Items 4–9 drop while the first prompt waits.
         if !self.first_prompt_waiting {
             out.push(Line::from(""));
             out.push(Line::from(""));
-            out.push(Line::from(""));
-            out.push(Line::from(Span::styled(
-                "Describe a task below, or start with",
-                Style::default().fg(comps::colour(Token::Muted)),
-            )));
+            if !chips.is_empty() {
+                out.push(readiness_line(chips, pane_w));
+                out.push(Line::from(""));
+                out.push(Line::from(""));
+                out.push(Line::from(""));
+            } else {
+                out.push(Line::from(""));
+            }
+            out.push(centred(
+                Line::from(Span::styled(
+                    "Describe a task below, or start with",
+                    Style::default().fg(comps::colour(Token::Muted)),
+                )),
+                STARTERS_W,
+                pane_w,
+            ));
             out.push(Line::from(""));
             for (cmd, desc) in [
                 ("/models", "list models from configured providers"),
                 ("/sessions", "browse and resume earlier work"),
                 ("?", "keys and commands"),
             ] {
-                out.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {cmd}"),
-                        Style::default()
-                            .fg(comps::colour(Token::Ink))
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        desc.to_string(),
-                        Style::default().fg(comps::colour(Token::Muted)),
-                    ),
-                ]));
+                out.push(centred(
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {cmd:<9}"),
+                            Style::default()
+                                .fg(comps::colour(Token::Ink))
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        ),
+                        Span::raw("   "),
+                        Span::styled(
+                            desc.to_string(),
+                            Style::default().fg(comps::colour(Token::Muted)),
+                        ),
+                    ]),
+                    STARTERS_W,
+                    pane_w,
+                ));
             }
         }
         out
@@ -131,6 +172,51 @@ impl Welcome {
             44
         }
     }
+}
+
+/// The mark's box width (§10.2).
+const MARK_W: u16 = 33;
+/// The starters block: two columns of indent + the widest command
+/// row (`/sessions` padded to 9, three air columns, 38-column text).
+const STARTERS_W: u16 = 52;
+
+/// Indent `line` so a `block_w`-wide block sits centred in `pane_w`.
+fn centred(line: Line<'static>, block_w: u16, pane_w: u16) -> Line<'static> {
+    let pad = pane_w.saturating_sub(block_w) / 2;
+    if pad == 0 {
+        return line;
+    }
+    let mut spans = vec![Span::raw(" ".repeat(pad as usize))];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+/// The readiness chips (`✓ trust root    ✓ ledger · 7 segments …`),
+/// centred as one row. A failed check shows `✕` in red.
+fn readiness_line(chips: &[(bool, String)], pane_w: u16) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut width = 0usize;
+    for (i, (ok, label)) in chips.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("    "));
+            width += 4;
+        }
+        let (glyph, token) = if *ok {
+            ("✓", Token::Green)
+        } else {
+            ("✕", Token::Red)
+        };
+        spans.push(Span::styled(
+            glyph,
+            Style::default().fg(comps::colour(token)),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(comps::colour(Token::Muted)),
+        ));
+        width += 1 + 1 + label.chars().count();
+    }
+    centred(Line::from(spans), width as u16, pane_w)
 }
 
 /// One mark row: letters ink, ring magenta_dim, star magenta (cyan

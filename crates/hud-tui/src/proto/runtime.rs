@@ -125,6 +125,10 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     let approvals = ApprovalRegistry::new();
     let mut scenario = Scenario::new();
     scenario.brand_tier = brand_tier;
+    scenario.welcome_chips = crate::state::compute_readiness(&home)
+        .into_iter()
+        .map(|r| (r.ok, r.label))
+        .collect();
     // The model name arrives via Msg::Identity; the waiting line
     // needs it before then too.
     scenario.model = std::env::var("ORBIT_ACTIVE_MODEL").unwrap_or_default();
@@ -1257,9 +1261,11 @@ fn draw_row0(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scenari
             ));
         }
         let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
-        let rule_w = left.w.saturating_sub(used + 1);
+        // One air column after the tabs and one before the divider.
+        let rule_w = left.w.saturating_sub(used + 2);
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            "─".repeat(rule_w as usize),
+            (if focused { "━" } else { "─" }).repeat(rule_w as usize),
             Style::default().fg(comps::colour(if focused {
                 Token::RuleHi
             } else {
@@ -1312,11 +1318,15 @@ fn draw_row0(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scenari
             ),
         ];
         let used: u16 = 1 + title_w as u16;
-        let rule_end = conv.w.saturating_sub(2 + meta_w);
+        // The rule ends one column short of the divider; the meta
+        // rides at its right end behind one air column.
+        let reserved = if meta.is_empty() { 1 } else { meta_w + 2 };
+        let rule_end = conv.w.saturating_sub(reserved);
         let rule_w = rule_end.saturating_sub(used + 1);
         if rule_w > 0 {
+            spans.push(Span::raw(" "));
             spans.push(Span::styled(
-                "─".repeat(rule_w as usize),
+                (if focused { "━" } else { "─" }).repeat(rule_w as usize),
                 Style::default().fg(comps::colour(if focused {
                     Token::RuleHi
                 } else {
@@ -1325,7 +1335,7 @@ fn draw_row0(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scenari
             ));
         }
         if !meta.is_empty() {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 meta,
                 Style::default().fg(comps::colour(Token::Muted)),
@@ -1360,8 +1370,9 @@ fn draw_row0(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scenari
         ];
         let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
         let rule_w = right.w.saturating_sub(used + 1);
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            "─".repeat(rule_w as usize),
+            (if focused { "━" } else { "─" }).repeat(rule_w as usize),
             Style::default().fg(comps::colour(if focused {
                 Token::RuleHi
             } else {
@@ -1448,6 +1459,48 @@ fn draw_workspace_rail(
     let x = pane.x;
     let w = pane.w;
     let mut y = pane.y;
+    // Empty (§9.17): no stepper yet — nothing is planned, so the rail
+    // opens straight on the empty state. EXCEPT while a turn runs: the
+    // stepper is the rail's live heartbeat (the star's twin), and a
+    // "Nothing planned yet" placeholder during an active turn reads as
+    // a dead screen.
+    if scenario.tasks.is_empty() && scenario.file_changes.is_empty() && !scenario.is_turning() {
+        // Empty state (§9.17).
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("◌", Style::default().fg(comps::colour(Token::Faint))),
+                Span::raw(" "),
+                Span::styled(
+                    "Nothing planned yet.",
+                    Style::default().fg(comps::colour(Token::Ink2)),
+                ),
+            ])),
+            Rect {
+                x: x + 2,
+                y,
+                width: w.saturating_sub(2),
+                height: 1,
+            },
+        );
+        y += 2;
+        let help =
+            "When a task has steps, the plan, findings and verification evidence collect here.";
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                help,
+                Style::default().fg(comps::colour(Token::Muted)),
+            )))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+            Rect {
+                x: x + 4,
+                y,
+                width: w.saturating_sub(4),
+                height: 4,
+            },
+        );
+        let _ = focused;
+        return;
+    }
     // The phase stepper (§9.17): 5 nodes, current = phase_index().
     let phases = ["init", "plan", "execute", "verify", "checkpoint"];
     let cur = scenario.phase_index().min(4);
@@ -1499,44 +1552,6 @@ fn draw_workspace_rail(
         },
     );
     y += 2;
-
-    if scenario.tasks.is_empty() && scenario.file_changes.is_empty() {
-        // Empty state (§9.17).
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("◌", Style::default().fg(comps::colour(Token::Faint))),
-                Span::raw(" "),
-                Span::styled(
-                    "Nothing planned yet.",
-                    Style::default().fg(comps::colour(Token::Ink2)),
-                ),
-            ])),
-            Rect {
-                x: x + 2,
-                y,
-                width: w.saturating_sub(2),
-                height: 1,
-            },
-        );
-        y += 2;
-        let help =
-            "When a task has steps, the plan, findings and verification evidence collect here.";
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                help,
-                Style::default().fg(comps::colour(Token::Muted)),
-            )))
-            .wrap(ratatui::widgets::Wrap { trim: false }),
-            Rect {
-                x: x + 4,
-                y,
-                width: w.saturating_sub(5),
-                height: 3,
-            },
-        );
-        let _ = focused;
-        return;
-    }
 
     // PLAN section: label + count right-aligned, then task rows (§9.17).
     let label = |t: &str| {
@@ -1632,14 +1647,20 @@ fn draw_conversation(
             tier: tui.brand_tier,
             first_prompt_waiting: scenario.first_prompt_waiting,
         };
-        let block = welcome.lines(tui.tick_ms);
+        let block = welcome.lines_in(tui.tick_ms, pane.w, &scenario.welcome_chips);
         let free = view.saturating_sub(block.len());
         for _ in 0..(free / 3) {
             lines.push(Line::from(""));
         }
         lines.extend(block);
     } else {
-        lines.extend(super::view::transcript_lines(scenario, cl, cw, scr.class));
+        let body = super::view::transcript_lines(scenario, cl, cw, scr.class);
+        // §8.3: the transcript is bottom-anchored — a short one sits
+        // against the composer, not at the top of the pane.
+        for _ in 0..view.saturating_sub(body.len()) {
+            lines.push(Line::from(""));
+        }
+        lines.extend(body);
     }
     // start = max(0, total − view − offset) (§8.6).
     let total = lines.len();
@@ -1730,7 +1751,17 @@ fn draw_composer(
         } else {
             Line::from("")
         };
-        f.render_widget(Paragraph::new(hint), hint_area);
+        // The hint starts at cl+1, aligned under the composer text.
+        let hx = (cl + 1).min(hint_area.right());
+        f.render_widget(
+            Paragraph::new(hint),
+            Rect {
+                x: hx,
+                y: hint_area.y,
+                width: hint_area.right().saturating_sub(hx),
+                height: hint_area.height,
+            },
+        );
     }
 }
 
@@ -1739,13 +1770,18 @@ fn draw_composer(
 fn hint_row(scenario: &Scenario, class: WidthClass, toast: Option<&Toast>) -> Line<'static> {
     let key = |k: &str| {
         Span::styled(
-            format!(" {k} "),
+            k.to_string(),
             Style::default()
                 .fg(comps::colour(Token::Ink))
                 .add_modifier(Modifier::BOLD),
         )
     };
-    let label = |l: &'static str| Span::styled(l, Style::default().fg(comps::colour(Token::Muted)));
+    let label = |l: &'static str| {
+        Span::styled(
+            format!(" {l}"),
+            Style::default().fg(comps::colour(Token::Muted)),
+        )
+    };
     let mut spans = Vec::new();
     if scenario.turn_live {
         spans.push(key("⏎"));
@@ -1768,6 +1804,10 @@ fn hint_row(scenario: &Scenario, class: WidthClass, toast: Option<&Toast>) -> Li
         spans.push(Span::raw("   "));
         spans.push(key("tab"));
         spans.push(label("views"));
+    } else if class == WidthClass::Medium {
+        spans.push(Span::raw("   "));
+        spans.push(key("⇧tab"));
+        spans.push(label("sessions"));
     }
     if let Some(t) = toast {
         spans.push(Span::raw("   "));
@@ -1895,6 +1935,7 @@ fn draw_status(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scena
     };
     // The mark: glyph + ` ORBIT` (muted bold).
     let mut left = vec![
+        Span::raw(" "),
         Span::styled(star.glyph.to_string(), Style::default().fg(star_colour)),
         Span::styled(
             " ORBIT",
@@ -1910,61 +1951,65 @@ fn draw_status(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scena
     // model · provider, tokens, cost, the short session id, then
     // `? keys` — exactly as wide_idle.txt reads.
     let level = scr.class.status_level();
-    let mut right: Vec<Span> = Vec::new();
+    let mut right: Vec<Vec<Span>> = Vec::new();
     // model · provider (the cluster's left-most segment).
     if level <= 1 && !scenario.model_id.is_empty() {
-        right.push(Span::styled(
-            scenario.model_id.clone(),
-            Style::default().fg(comps::colour(Token::Ink2)),
-        ));
-        right.push(Span::styled(
-            format!(" · {}", scenario.provider),
-            Style::default().fg(comps::colour(Token::Muted)),
-        ));
+        right.push(vec![
+            Span::styled(
+                scenario.model_id.clone(),
+                Style::default().fg(comps::colour(Token::Ink2)),
+            ),
+            Span::styled(
+                format!(" · {}", scenario.provider),
+                Style::default().fg(comps::colour(Token::Muted)),
+            ),
+        ]);
     }
     if level <= 1 {
         // token slot.
-        right.push(Span::styled(
+        right.push(vec![Span::styled(
             format!("↓{} ↑{}", scenario.input_tokens, scenario.output_tokens),
             Style::default().fg(comps::colour(Token::Muted)),
-        ));
+        )]);
     }
     if level <= 2 {
         // cost slot.
         if scenario.priced {
-            right.push(Span::styled(
+            right.push(vec![Span::styled(
                 format!("${:.4}", scenario.cost_microcents as f64 / 1_000_000.0),
                 Style::default().fg(comps::colour(Token::Ink2)),
-            ));
+            )]);
         } else {
-            right.push(Span::styled(
+            right.push(vec![Span::styled(
                 "cost n/a",
                 Style::default().fg(comps::colour(Token::Muted)),
-            ));
+            )]);
         }
     }
     if level == 0 {
         // short session id (§7.3), then `? keys` right-most.
         if !scenario.session_prefix.is_empty() {
-            right.push(Span::styled(
+            right.push(vec![Span::styled(
                 scenario.session_prefix.clone(),
                 Style::default().fg(comps::colour(Token::Faint)),
-            ));
+            )]);
         }
-        right.push(Span::styled(
-            "?",
-            Style::default()
-                .fg(comps::colour(Token::Ink2))
-                .add_modifier(Modifier::BOLD),
-        ));
-        right.push(Span::styled(
-            " keys",
-            Style::default().fg(comps::colour(Token::Muted)),
-        ));
+        right.push(vec![
+            Span::styled(
+                "?",
+                Style::default()
+                    .fg(comps::colour(Token::Ink2))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" keys", Style::default().fg(comps::colour(Token::Muted))),
+        ]);
     }
     let w = area.width;
     let left_w: u16 = left.iter().map(|s| s.width() as u16).sum();
-    let right_w: u16 = right.iter().map(|s| s.width() as u16).sum::<u16>()
+    let right_w: u16 = right
+        .iter()
+        .map(|seg| seg.iter().map(|s| s.width() as u16).sum::<u16>())
+        .sum::<u16>()
         + (right.len().saturating_sub(1) as u16) * 3;
     let mut status = left;
     if !right.is_empty() && left_w + 3 + right_w <= w {
@@ -1974,7 +2019,7 @@ fn draw_status(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scena
             if i > 0 {
                 status.push(Span::raw("   "));
             }
-            status.push(seg);
+            status.extend(seg);
         }
     }
     f.render_widget(Paragraph::new(Line::from(status)), area);

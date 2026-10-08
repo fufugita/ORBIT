@@ -52,25 +52,42 @@ fn golden_min_size_notice() {
 #[test]
 fn golden_welcome_medium_static() {
     // welcome.txt is 111 cols: the Medium class with the mark,
-    // tagline and starters centred in the conversation column.
+    // tagline, readiness chips and starters centred in the
+    // conversation column. Every row above the status line must match
+    // the golden exactly (the status line differs by design: it shows
+    // measured facts only — no unmeasured `● online`, `cost n/a` while
+    // unpriced).
     let mut tui = Tui::new();
     tui.brand_tier = orbit_hud_tui::proto::welcome::BrandTier::Static;
-    let s = base_scenario();
-    let out = render(&tui, &s, 111, 35);
+    let mut s = base_scenario();
+    s.welcome_chips = vec![
+        (true, "trust root".into()),
+        (true, "ledger · 7 records".into()),
+        (true, "local · glm-5.2".into()),
+    ];
+    let out = render(&tui, &s, 111, 34);
     let golden = std::fs::read_to_string("../../docs/tui/golden/welcome.txt").unwrap();
-    let g: Vec<&str> = golden.lines().collect();
-    // The tagline and starters are stable anchors.
-    assert!(out.contains("the harness that orbits around you"), "{out}");
-    assert!(
-        out.contains("Describe a task below, or start with"),
-        "{out}"
-    );
-    assert!(out.contains("/models"), "{out}");
-    // The composer + hint row (§9.13).
-    assert!(out.contains("Ask ORBIT, or type / for commands"), "{out}");
-    // The status line shows the mark + ready.
-    assert!(out.contains("ORBIT"), "{out}");
-    let _ = g;
+    let want: Vec<&str> = golden.lines().map(str::trim_end).collect();
+    let got: Vec<&str> = out.lines().collect();
+    assert_eq!(got.len(), want.len(), "row count\n{out}");
+    for (y, (g, w)) in got.iter().zip(&want).enumerate().take(want.len() - 1) {
+        assert_eq!(g, w, "row {y} differs from welcome.txt\n{out}");
+    }
+    assert!(got[want.len() - 1].contains("ORBIT"), "{out}");
+}
+
+#[test]
+fn dividers_run_the_full_height_through_the_composer() {
+    // §8.6: the rails continue through the air row, the composer and
+    // the hint row, so the composer sits inside the conversation column.
+    let tui = Tui::new();
+    let s = base_scenario();
+    let out = render(&tui, &s, 150, 40);
+    let rows: Vec<Vec<char>> = out.lines().map(|l| l.chars().collect()).collect();
+    for (y, row) in rows.iter().enumerate().take(39) {
+        assert_eq!(row[30], '│', "left divider missing on row {y}\n{out}");
+        assert_eq!(row[113], '│', "right divider missing on row {y}\n{out}");
+    }
 }
 
 #[test]

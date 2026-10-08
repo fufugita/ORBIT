@@ -176,7 +176,7 @@ fn worker_main(
     ctx.sender.send(Msg::Identity {
         model: config.model.clone(),
         provider: config.provider_id.clone(),
-        session_prefix: config.session_id.chars().take(8).collect(),
+        session_prefix: short_session_id(&config.session_id),
         session_id: config.session_id.clone(),
         priced: boot_priced,
     });
@@ -447,7 +447,7 @@ fn worker_main(
                         ctx.sender.send(Msg::Identity {
                             model: s.model.clone(),
                             provider: s.provider.clone(),
-                            session_prefix: s.session_id.chars().take(8).collect(),
+                            session_prefix: short_session_id(&s.session_id),
                             session_id: s.session_id.clone(),
                             // D18: priced stays true unless we know the
                             // resumed model is unpriced.
@@ -1415,4 +1415,25 @@ fn build_session_prompt(
         &mods_directive,
     )
     .text
+}
+
+/// The short id the status line shows: the first eight characters of
+/// the id proper, without the `session-` tag every stored id carries.
+fn short_session_id(id: &str) -> String {
+    id.strip_prefix("session-")
+        .unwrap_or(id)
+        .chars()
+        .take(8)
+        .collect()
+}
+
+#[cfg(test)]
+mod short_session_id_tests {
+    use super::short_session_id;
+
+    #[test]
+    fn drops_the_session_tag() {
+        assert_eq!(short_session_id("session-01J8ZK4QX2M7C9RT"), "01J8ZK4Q");
+        assert_eq!(short_session_id("deadbeefcafe"), "deadbeef");
+    }
 }

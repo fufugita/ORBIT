@@ -69,6 +69,9 @@ pub struct Scenario {
     pub first_prompt_waiting: bool,
     /// The brand tier (§8.5): governs the welcome mark + M1/M9.
     pub brand_tier: crate::proto::welcome::BrandTier,
+    /// Measured readiness facts for the welcome screen `(ok, label)`:
+    /// trust root, ledger, active provider · model. Empty → no row.
+    pub welcome_chips: Vec<(bool, String)>,
     pub model_id: String,
     pub provider: String,
     pub session_prefix: String,

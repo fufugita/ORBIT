@@ -169,9 +169,15 @@ impl Screen {
             x: area.x,
             y: area.y + 2,
             width,
-            height: body_bottom.saturating_sub(area.y + 2),
+            // `body_bottom` is the last body row (inclusive).
+            height: (body_bottom + 1).saturating_sub(area.y + 2),
         };
         let air_y = input_y.saturating_sub(1);
+        // §8.6: the rails continue through the air row, the composer
+        // and the hint row — dividers run from row 0 to H−2, so the
+        // composer sits inside the conversation column, not under it.
+        let div_top = area.y;
+        let div_bottom = area.y + height.saturating_sub(2);
 
         let mut left = None;
         let mut right = None;
@@ -200,12 +206,8 @@ impl Screen {
                     w: r,
                     h: body.height,
                 });
-                dividers.push((area.x + l, body.y, body.y + body.height.saturating_sub(1)));
-                dividers.push((
-                    area.x + l + 1 + c,
-                    body.y,
-                    body.y + body.height.saturating_sub(1),
-                ));
+                dividers.push((area.x + l, div_top, div_bottom));
+                dividers.push((area.x + l + 1 + c, div_top, div_bottom));
             }
             WidthClass::Medium if sessions_pushed => {
                 // The push: Sessions │ Conversation, Workspace hidden.
@@ -223,7 +225,7 @@ impl Screen {
                     w: c,
                     h: body.height,
                 };
-                dividers.push((area.x + l, body.y, body.y + body.height.saturating_sub(1)));
+                dividers.push((area.x + l, div_top, div_bottom));
             }
             WidthClass::Medium => {
                 let r = clamp(30, (width as u32 * 30 / 100) as u16, 36);
@@ -240,7 +242,7 @@ impl Screen {
                     w: r,
                     h: body.height,
                 });
-                dividers.push((area.x + c, body.y, body.y + body.height.saturating_sub(1)));
+                dividers.push((area.x + c, div_top, div_bottom));
             }
             // Narrow/Compact/Tight: one full-width view.
             _ => {
@@ -366,7 +368,7 @@ mod tests {
         assert_eq!(s.hint.unwrap().y, 38);
         assert_eq!(s.status.y, 39);
         assert_eq!(s.body.y, 2);
-        assert_eq!(s.body.height, 33); // 2 … 34 inclusive = 33 rows
+        assert_eq!(s.body.height, 34); // 2 … 35 inclusive = 34 rows
     }
 
     #[test]
