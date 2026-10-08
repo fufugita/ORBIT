@@ -365,6 +365,51 @@ pub fn emit_tool_finished(sender: &BusSender, name: &str, outcome: crate::state:
     });
 }
 
+/// Emit a changed file (path and line counts).
+pub fn emit_file_changed(sender: &BusSender, path: &str, added: u32, removed: u32) {
+    sender.send(Msg::FileChanged {
+        path: safe_text(path),
+        added,
+        removed,
+    });
+}
+
+/// Emit a subagent lifecycle event.
+pub fn emit_subagent_started(sender: &BusSender, id: &str, name: &str, task: &str) {
+    sender.send(Msg::SubagentStarted {
+        id: id.to_string(),
+        name: safe_text(name),
+        task: safe_text(task),
+    });
+}
+
+pub fn emit_subagent_progress(sender: &BusSender, id: &str, action: &str) {
+    sender.send(Msg::SubagentProgress {
+        id: id.to_string(),
+        action: safe_text(action),
+    });
+}
+
+pub fn emit_subagent_finished(sender: &BusSender, id: &str, report: &str) {
+    sender.send(Msg::SubagentFinished {
+        id: id.to_string(),
+        report: safe_text(report),
+    });
+}
+
+/// Emit context usage (tokens in use, the model's window).
+pub fn emit_usage(sender: &BusSender, used_tokens: u64, window_tokens: u64) {
+    sender.send(Msg::Usage {
+        used_tokens,
+        window_tokens,
+    });
+}
+
+/// Emit the ledger's record count after an append.
+pub fn emit_ledger_appended(sender: &BusSender, record_count: u64) {
+    sender.send(Msg::LedgerAppended { record_count });
+}
+
 /// Emit a workspace update (the right rail's live state).
 pub fn emit_workspace(sender: &BusSender, w: crate::state::Workspace) {
     sender.send(Msg::WorkspaceUpdate(w));

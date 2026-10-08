@@ -76,7 +76,7 @@ impl App {
             focus: Self::conversation_index(&tree).unwrap_or(0),
             arranging: false,
             picker: None,
-            sidebar: true,
+            sidebar: tree == Node::preset(Preset::Build),
             star: StarClock::new(),
             reduced,
             tick_ms: 0,
@@ -89,6 +89,49 @@ impl App {
         tree.leaves()
             .iter()
             .position(|(_, v)| *v == View::Conversation)
+    }
+
+    /// A copy of the layout state, for tests that compare before/after.
+    pub fn clone_for_test(&self) -> App {
+        App {
+            tree: self.tree.clone(),
+            focus: self.focus,
+            arranging: self.arranging,
+            picker: self.picker,
+            sidebar: self.sidebar,
+            star: self.star,
+            reduced: self.reduced,
+            tick_ms: self.tick_ms,
+            animating: self.animating,
+            home: self.home.clone(),
+        }
+    }
+
+    /// The preset the tree currently is, or `None` once it is "yours".
+    pub fn current_preset(&self) -> Option<Preset> {
+        [
+            Preset::Columns,
+            Preset::Build,
+            Preset::Agents,
+            Preset::Review,
+        ]
+        .into_iter()
+        .find(|p| self.tree == Node::preset(*p))
+    }
+
+    /// Move focus to the next/previous panel (wraps).
+    pub fn cycle_focus(&mut self, forward: bool) {
+        let n = self.panel_count().max(1);
+        self.focus = if forward {
+            (self.focus + 1) % n
+        } else {
+            (self.focus + n - 1) % n
+        };
+    }
+
+    /// The view the focus is on.
+    pub fn focused_view(&self) -> View {
+        self.tree.view_at(self.focus).unwrap_or(View::Conversation)
     }
 
     /// Panel count (1–9; splits refuse to exceed 9).
@@ -156,16 +199,19 @@ impl App {
                 true
             }
             '[' | ']' => {
-                let cur = LayoutFile::load(&self.home).from_preset;
-                let cur = match cur.as_str() {
-                    "build" => Preset::Build,
-                    "agents" => Preset::Agents,
-                    "review" => Preset::Review,
-                    _ => Preset::Columns,
-                };
+                let cur = self.current_preset().unwrap_or_else(|| {
+                    match LayoutFile::load(&self.home).from_preset.as_str() {
+                        "build" => Preset::Build,
+                        "agents" => Preset::Agents,
+                        "review" => Preset::Review,
+                        _ => Preset::Columns,
+                    }
+                });
                 let next = if c == ']' { cur.next() } else { cur.prev() };
                 self.tree = Node::preset(next);
                 self.focus = 0;
+                // The build layout carries the sidebar; the others don't.
+                self.sidebar = next == Preset::Build;
                 true
             }
             _ if self.arranging => self.arrange_key(c),

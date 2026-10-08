@@ -1522,6 +1522,14 @@ impl App {
                 self.push_activity("model", format!("model → {}", self.model));
                 self.dirty.set(DirtyFlags::STATUS);
             }
+            // The panel front-end's events: the legacy HUD has no panel
+            // for them.
+            Msg::FileChanged { .. }
+            | Msg::SubagentStarted { .. }
+            | Msg::SubagentProgress { .. }
+            | Msg::SubagentFinished { .. }
+            | Msg::Usage { .. }
+            | Msg::LedgerAppended { .. } => {}
             Msg::SystemMessage(text) => {
                 self.transcript.push(TranscriptLine::System(text));
                 self.dirty.set(DirtyFlags::TRANSCRIPT);

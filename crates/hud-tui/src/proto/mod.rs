@@ -22,5 +22,6 @@ pub mod panels;
 pub mod runtime;
 pub mod scenario;
 pub mod screen;
+pub mod shell;
 pub mod view;
 pub mod welcome;

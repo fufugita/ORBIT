@@ -93,7 +93,7 @@ impl Node {
     pub fn default_tree() -> Self {
         Node::Split {
             direction: Direction::Right,
-            shares: vec![34, 33, 33],
+            shares: vec![30, 40, 30],
             children: vec![
                 Node::Panel {
                     view: View::Changes,
@@ -377,72 +377,77 @@ impl Node {
     }
 
     /// The presets: `[ ]` cycles columns → build → agents → review.
+    /// Trees and shares are the prototype's.
     pub fn preset(which: Preset) -> Self {
         use View::*;
+        let pane = |view: View, agent: &str| Node::Panel {
+            view,
+            agent: agent.to_string(),
+        };
+        let split = |direction: Direction, shares: Vec<u32>, children: Vec<Node>| Node::Split {
+            direction,
+            shares,
+            children,
+        };
         match which {
             Preset::Columns => Self::default_tree(),
-            Preset::Build => Node::Split {
-                direction: Direction::Right,
-                shares: vec![40, 60],
-                children: vec![
-                    Node::Split {
-                        direction: Direction::Down,
-                        shares: vec![1, 1],
-                        children: vec![
-                            Node::Panel {
-                                view: Conversation,
-                                agent: String::new(),
-                            },
-                            Node::Panel {
-                                view: Changes,
-                                agent: String::new(),
-                            },
-                        ],
-                    },
-                    Node::Panel {
-                        view: Terminal,
-                        agent: String::new(),
-                    },
+            // Conversation | Changes over Terminal.
+            Preset::Build => split(
+                Direction::Right,
+                vec![56, 44],
+                vec![
+                    pane(Conversation, ""),
+                    split(
+                        Direction::Down,
+                        vec![48, 52],
+                        vec![pane(Changes, ""), pane(Terminal, "")],
+                    ),
                 ],
-            },
-            Preset::Agents => Node::Split {
-                direction: Direction::Right,
-                shares: vec![67, 33],
-                children: vec![
-                    Node::Panel {
-                        view: Conversation,
-                        agent: String::new(),
-                    },
-                    Node::Split {
-                        direction: Direction::Down,
-                        shares: vec![1, 1],
-                        children: vec![
-                            Node::Panel {
-                                view: Activity,
-                                agent: String::new(),
-                            },
-                            Node::Panel {
-                                view: Agent,
-                                agent: String::new(),
-                            },
-                        ],
-                    },
+            ),
+            // Two agent panels flank the conversation.
+            Preset::Agents => split(
+                Direction::Right,
+                vec![30, 40, 30],
+                vec![
+                    pane(Agent, "explore"),
+                    pane(Conversation, ""),
+                    pane(Agent, "review"),
                 ],
-            },
-            Preset::Review => Node::Split {
-                direction: Direction::Right,
-                shares: vec![60, 40],
-                children: vec![
-                    Node::Panel {
-                        view: Review,
-                        agent: String::new(),
-                    },
-                    Node::Panel {
-                        view: Conversation,
-                        agent: String::new(),
-                    },
+            ),
+            // Review | Plan over Activity.
+            Preset::Review => split(
+                Direction::Right,
+                vec![70, 30],
+                vec![
+                    pane(Review, ""),
+                    split(
+                        Direction::Down,
+                        vec![45, 55],
+                        vec![pane(Plan, ""), pane(Activity, "")],
+                    ),
                 ],
-            },
+            ),
+        }
+    }
+
+    /// The agent name of the leaf at panel index (empty when none).
+    pub fn agent_at(&self, index: usize) -> String {
+        let Some(path) = self.path_of(index) else {
+            return String::new();
+        };
+        let mut node = self;
+        for i in path {
+            match node {
+                Node::Split { children, .. } => match children.get(i) {
+                    Some(c) => node = c,
+                    None => return String::new(),
+                },
+                Node::Panel { .. } => break,
+            }
+        }
+        match node {
+            Node::Panel { agent, .. } => agent.clone(),
+            _ => String::new(),
         }
     }
 }

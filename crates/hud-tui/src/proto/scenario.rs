@@ -63,6 +63,34 @@ pub struct Scenario {
     pub approval_queue: Vec<String>,
     /// The oldest pending request's display-safe summary (§9.14).
     pub approval_summary: Option<String>,
+    /// The pending approval's backend-classified risk (0..=3) and the
+    /// directory the call runs in (§9.14 facts — real values only).
+    pub approval_risk: u8,
+    /// Ledger records appended this session (the top bar's `●` chip).
+    pub ledger_count: Option<u64>,
+    /// The screen animates until this tick (ms): bumped by every
+    /// message so the 16 ms redraw runs only while something moves.
+    pub motion_until_ms: u64,
+    /// When the last turn ended (the report types in, M25).
+    pub turn_ended_ms: Option<u64>,
+    /// The mode the pill wipes away from, and when it changed (M14).
+    pub mode_prev: Option<String>,
+    pub mode_changed_ms: Option<u64>,
+    /// The context meter eases between fractions (M18).
+    pub ctx_from: f32,
+    pub ctx_to: f32,
+    pub ctx_ms: u64,
+    /// The ledger chip's dot flashes per record (M19).
+    pub ledger_ms: Option<u64>,
+    /// When each plan row / changed-file row last changed (M17, M11),
+    /// parallel to `tasks` / `file_changes`.
+    pub task_changed_ms: Vec<u64>,
+    pub file_changed_ms: Vec<u64>,
+    /// Rate-limit backoff: retry at this tick, and for how long it
+    /// started (M27).
+    pub backoff_until_ms: Option<u64>,
+    pub backoff_total_ms: u64,
+    pub approval_dir: String,
     /// M9's window (§10.2): the first prompt of an empty session is
     /// live and no output has arrived. The welcome shrinks to mark +
     /// tagline and the star orbits; the first output ends it.
@@ -118,6 +146,11 @@ pub struct TranscriptLine {
     pub time: Option<String>,
     /// Tool lines (§9.8): the meta text (`{outcome} · {duration}`).
     pub meta: String,
+    /// Model text: `(char offset, arrival ms)` per streamed chunk — the
+    /// fresh-ink fade reads it (M06).
+    pub arrivals: Vec<(usize, u64)>,
+    /// Tool lines: when the call settled (M10).
+    pub finished_ms: Option<u64>,
     /// When the call started (duration = finish − start).
     pub started_ms: Option<u64>,
 }
@@ -131,6 +164,8 @@ impl Default for TranscriptLine {
             tool_state: ToolState::Queued,
             time: None,
             meta: String::new(),
+            arrivals: Vec::new(),
+            finished_ms: None,
             started_ms: None,
         }
     }
@@ -184,6 +219,9 @@ pub struct Agent {
     pub name: String,
     pub action: String,
     pub done: bool,
+    /// When it started / finished (M15, M16).
+    pub started_ms: u64,
+    pub done_ms: Option<u64>,
 }
 
 /// The activity the status line shows (§9.18, evaluated in order).
@@ -222,6 +260,14 @@ impl Scenario {
     }
 
     /// The star is turning (an animation is in flight).
+    /// The context fraction shown now, easing toward the latest usage
+    /// over 300 ms (M18).
+    pub fn ctx_eased(&self, now_ms: u64) -> f32 {
+        let p = (now_ms.saturating_sub(self.ctx_ms) as f32 / 300.0).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - p).powi(3);
+        self.ctx_from + (self.ctx_to - self.ctx_from) * e
+    }
+
     pub fn is_turning(&self) -> bool {
         matches!(self.star_state(), StarState::Turning { .. })
     }

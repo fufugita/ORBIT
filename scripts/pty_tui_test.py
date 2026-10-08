@@ -370,7 +370,10 @@ def main():
 
     s.type("/help")
     s.key("enter")
-    ok, buf = s.wait_for("OUTSIDE THE COMPOSER", timeout=10)
+    # The redesigned keys overlay: its stable markers are the KEYS frame
+    # and the section heads (TYPING / APPROVALS / ARRANGE) — the old
+    # "OUTSIDE THE COMPOSER" line belonged to the retired design.
+    ok, buf = s.wait_for_re(r"KEYS|TYPING|ARRANGE", timeout=10)
     check("/help opens the help overlay", ok, buf[-300:])
     time.sleep(0.5)
 
@@ -500,8 +503,25 @@ def main():
     # host unrelated sleeps (a parallel wait command), and the check is
     # about THE TOOL's child dying, not the absence of any sleep.
     import subprocess as _sp
+    # Only sleeps that descend from THIS TUI count: other sessions on
+    # the machine start their own sleeps at any moment.
+    def _descendants(root):
+        rows = _sp.run(["ps", "-eo", "pid=,ppid="], capture_output=True, text=True).stdout.split("\n")
+        kids = {}
+        for r in rows:
+            parts = r.split()
+            if len(parts) == 2:
+                kids.setdefault(parts[1], []).append(parts[0])
+        out, todo = set(), [str(root)]
+        while todo:
+            for k in kids.get(todo.pop(), []):
+                if k not in out:
+                    out.add(k)
+                    todo.append(k)
+        return out
+    _mine = _descendants(s.proc.pid)
     _new = [p for p in _sp.run(["pgrep", "-x", "sleep"], capture_output=True, text=True).stdout.split()
-            if p not in _esc_baseline]
+            if p not in _esc_baseline and p in _mine]
     check("esc killed the tool's process group", not _new, f"new sleep alive: {_new}")
     # The next prompt works.
     s.type("/model mock-slow")
@@ -518,9 +538,9 @@ def main():
     # Use ordered letters for frame-interleaved matching.
     s.type("/sessions")
     s.key("enter")
-    ok, buf = s.wait_for("TODAY", timeout=10)
-    # §9.15: the rail lists the open session under TODAY (saved
-    # sessions carry no state today — §13).
+    ok, buf = s.wait_for("turns=", timeout=10)
+    # `/sessions` lists every saved session in the transcript
+    # (`id model=… turns=… updated=…`).
     check("/sessions lists saved session", ok, buf[-300:])
     time.sleep(0.3)
 
@@ -596,10 +616,13 @@ def main():
         # TODAY + the open-session row — and the Workspace header is
         # gone. That observable end-state proves every tab landed.
         buf2 = sb.clean(raw)
-        pushed = "TODAY" in buf2
+        # 7 tabs from the Conversation (panel 2 of 3): 2 + 7 = 9 ≡ 3 (mod 3),
+        # the Terminal panel. Under 120 columns one panel shows at a time,
+        # so ending on Terminal proves every tab landed.
+        pushed = "No commands yet" in buf2 and "Terminal" in buf2
         check("tab burst cycles focus one-by-one",
               pushed,
-              f"sessions push not visible after 7 tabs")
+              f"terminal panel not focused after 7 tabs")
         sb.key("ctrl+d")
         time.sleep(0.5)
         sb.key("y")

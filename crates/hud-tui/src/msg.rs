@@ -202,6 +202,30 @@ pub enum Msg {
     ClearTranscript,
     /// The active model changed (status bar + future turns).
     ModelChanged(String),
+    /// A file the agent changed (path, lines added/removed) — the
+    /// Changes panel's rows.
+    FileChanged {
+        path: String,
+        added: u32,
+        removed: u32,
+    },
+    /// A subagent started (id, name, task).
+    SubagentStarted {
+        id: String,
+        name: String,
+        task: String,
+    },
+    /// A subagent's current action.
+    SubagentProgress { id: String, action: String },
+    /// A subagent finished with its report.
+    SubagentFinished { id: String, report: String },
+    /// Context usage: tokens in use and the model's window.
+    Usage {
+        used_tokens: u64,
+        window_tokens: u64,
+    },
+    /// The ledger grew: the record count after the append.
+    LedgerAppended { record_count: u64 },
     /// A display-safe system line appended to the transcript (e.g. command
     /// results such as `/help`, `/usage`, `/models`, `/sessions`).
     SystemMessage(String),

@@ -6,15 +6,14 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthStr;
 
 use super::comps;
 use super::core::Token;
-use super::scenario::{Activity, LineKind, Scenario, ToolState, TranscriptLine, TurnReport};
-use super::screen::{Focus, Screen, WidthClass};
+use super::scenario::{LineKind, Scenario, ToolState, TranscriptLine, TurnReport};
+use super::screen::Focus;
 use crate::worker::WorkerCtx;
 
 use crate::bus::{Bus, BusSender};
@@ -52,6 +51,12 @@ pub struct Tui {
     pub reduced: bool,
     pub tick_ms: u64,
     pub brand_tier: super::welcome::BrandTier,
+    /// The layout tree, focus and arrange mode (the screen's panels).
+    pub app: super::app::App,
+    /// Timestamps of interface changes, for the motion between states.
+    pub fx: super::shell::Fx,
+    /// The colour tier the screen is mapped to.
+    pub tier: super::core::Tier,
 }
 
 impl Default for Tui {
@@ -68,12 +73,20 @@ impl Tui {
             reduced: false,
             tick_ms: 0,
             brand_tier: super::welcome::BrandTier::Static,
+            app: super::app::App::new(std::path::PathBuf::new(), false),
+            fx: super::shell::Fx::default(),
+            tier: super::core::Tier::TrueColor,
         }
     }
 
-    fn star_glyph(&self, scenario: &Scenario) -> super::anim::StarGlyph {
-        let mut c = self.star;
-        c.tick(self.tick_ms, scenario.star_state())
+    /// Keep the keyboard mode in step with the focused panel: the
+    /// composer takes keys only while a Conversation panel has focus.
+    pub fn sync_focus(&mut self) {
+        self.focus = if self.app.focused_view() == super::layout::View::Conversation {
+            Focus::Conversation
+        } else {
+            Focus::Workspace
+        };
     }
 }
 
@@ -139,7 +152,21 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         reduced,
         tick_ms: 0,
         brand_tier,
+        app: super::app::App::new(home.clone(), reduced),
+        fx: super::shell::Fx::default(),
+        tier: match raw.capabilities.mode.as_str() {
+            "truecolor" => super::core::Tier::TrueColor,
+            "256" => super::core::Tier::T256,
+            "16" => super::core::Tier::T16,
+            "mono" => super::core::Tier::None,
+            _ => super::core::Tier::detect(
+                std::env::var_os("NO_COLOR").is_some(),
+                std::env::var("COLORTERM").ok().as_deref(),
+                std::env::var("TERM").ok().as_deref(),
+            ),
+        },
     };
+    tui.sync_focus();
 
     // The composer: text lives here (the event loop owns it).
     let mut composer = String::new();
@@ -208,7 +235,9 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
             match ev {
                 Event::Key(k) => {
                     overlay_dirty = true;
-                    if handle_key(
+                    let snap_before =
+                        super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
+                    let quit = handle_key(
                         k,
                         &mut tui,
                         &mut scenario,
@@ -231,7 +260,11 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                         &mut sessions_pushed,
                         &mut scroll_offset,
                         &mut last_prompt,
-                    ) {
+                    );
+                    let snap_after =
+                        super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
+                    tui.fx.observe(&snap_before, &snap_after, now_ms);
+                    if quit {
                         break;
                     }
                 }
@@ -280,7 +313,22 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                 scenario.turn_started_ms = now_ms;
                 scenario.apply("round_started", 0);
             }
-            let animating = scenario.is_turning() && !tui.reduced;
+            // Anything that moves keeps the 16 ms redraw alive: the
+            // startup window, a live turn, the first-prompt orbit, a
+            // fresh message, a breathing approval card.
+            let animating = !tui.reduced
+                && (scenario.is_turning()
+                    || now_ms < 2200
+                    || scenario.first_prompt_waiting
+                    || now_ms < scenario.motion_until_ms
+                    || tui.fx.active(now_ms)
+                    || toast.is_some()
+                    || scenario
+                        .backoff_until_ms
+                        .map(|u| u > now_ms)
+                        .unwrap_or(false)
+                    || (scenario.approval_pending.is_some()
+                        && now_ms.saturating_sub(scenario.approval_shown_ms) < 3200));
             // A pending approval card re-arms on a timer (§9.14) —
             // it must redraw as time passes.
             let card_armed = scenario.approval_pending.is_some()
@@ -390,7 +438,9 @@ fn handle_key(
         *overlay = Some(Overlay::Quit);
         return false;
     }
-    // Overlays own the keyboard (§9.19–9.21).
+    // Overlays own the keyboard (§9.19–9.21): the key that closes one
+    // is spent — it must not also start arranging.
+    let had_overlay = overlay.is_some();
     match overlay {
         Some(Overlay::Palette) => match k.code {
             KeyCode::Esc => *overlay = None,
@@ -425,7 +475,8 @@ fn handle_key(
                         *overlay = Some(o);
                     }
                     if fs {
-                        tui.focus = Focus::Sessions;
+                        // The sidebar carries the SESSIONS section.
+                        tui.app.sidebar = true;
                         *sessions_pushed = true;
                     }
                 }
@@ -456,7 +507,7 @@ fn handle_key(
         }
         None => {}
     }
-    if overlay.is_some() {
+    if had_overlay || overlay.is_some() {
         return false;
     }
 
@@ -510,6 +561,51 @@ fn handle_key(
         return false;
     }
 
+    // The picker asks what a new or changed panel shows (digits pick).
+    if tui.app.picker.is_some() {
+        match k.code {
+            KeyCode::Esc => {
+                tui.app.key(super::app::Key::Esc);
+            }
+            KeyCode::Char(ch @ '1'..='8') => {
+                let i = ch as usize - '1' as usize;
+                if tui.app.pick(super::shell::PICKER_VIEWS[i]) {
+                    tui.app.save_yours();
+                }
+            }
+            _ => {}
+        }
+        tui.sync_focus();
+        return false;
+    }
+    // Arrange mode (esc): hjkl move, v/s split, p change, x close,
+    // HJKL swap, < > - + size, = even, b sidebar, [ ] layouts, i back.
+    if tui.app.arranging {
+        let key = match k.code {
+            KeyCode::Esc => Some(super::app::Key::Esc),
+            KeyCode::Enter => Some(super::app::Key::Enter),
+            KeyCode::Tab => Some(super::app::Key::Tab),
+            KeyCode::Char(ch) => Some(super::app::Key::Char(ch)),
+            _ => None,
+        };
+        if let Some(key) = key {
+            if tui.app.key(key) {
+                tui.app.save_yours();
+            }
+        }
+        tui.sync_focus();
+        return false;
+    }
+    // esc on an idle, empty composer starts arranging.
+    if k.code == KeyCode::Esc
+        && composer.is_empty()
+        && !scenario.is_turning()
+        && !composer.starts_with('/')
+    {
+        tui.app.arranging = true;
+        return false;
+    }
+
     // z is a leader: z y enters copy mode (§11.2).
     if tui.focus == Focus::Conversation && k.code == KeyCode::Char('z') {
         *pending_leader = Some('z');
@@ -526,16 +622,9 @@ fn handle_key(
     // Focus keys (§11.1).
     match k.code {
         KeyCode::Tab => {
-            let class = WidthClass::of(screen_width_hint(), 40);
-            if class.single_view() {
-                tui.focus = tui.focus.next_view();
-            } else {
-                tui.focus = tui.focus.next();
-                match tui.focus {
-                    Focus::Sessions => *sessions_pushed = true,
-                    _ => *sessions_pushed = false,
-                }
-            }
+            // Tab walks the panels in reading order.
+            tui.app.cycle_focus(true);
+            tui.sync_focus();
             return false;
         }
         KeyCode::BackTab => {
@@ -561,6 +650,10 @@ fn handle_key(
         match k.code {
             KeyCode::Char('?') if composer.is_empty() => {
                 *overlay = Some(Overlay::Help);
+                return false;
+            }
+            KeyCode::Char(':') if composer.is_empty() => {
+                *overlay = Some(Overlay::Palette);
                 return false;
             }
             KeyCode::Char('/') if composer.is_empty() => {
@@ -612,7 +705,8 @@ fn handle_key(
                         *overlay = Some(o);
                     }
                     if fs {
-                        tui.focus = Focus::Sessions;
+                        // The sidebar carries the SESSIONS section.
+                        tui.app.sidebar = true;
                         *sessions_pushed = true;
                     }
                 } else if !composer.trim().is_empty() && !composer.starts_with('/') {
@@ -734,21 +828,35 @@ fn handle_key(
 
     // Rail / status focused (§11.2 context 4).
     match k.code {
-        KeyCode::Char('1') => tui.focus = Focus::Sessions,
-        KeyCode::Char('2') => tui.focus = Focus::Conversation,
-        KeyCode::Char('3') => tui.focus = Focus::Workspace,
+        KeyCode::Char(ch @ '1'..='9') => {
+            let i = ch as usize - '1' as usize;
+            if i < tui.app.panel_count() {
+                tui.app.focus = i;
+                tui.sync_focus();
+            }
+        }
         KeyCode::Char('/') => *overlay = Some(Overlay::Palette),
         KeyCode::Char('?') => *overlay = Some(Overlay::Help),
         KeyCode::Char('q') => *overlay = Some(Overlay::Quit),
-        KeyCode::Esc => tui.focus = Focus::Conversation,
+        KeyCode::Char('i') => {
+            // Back to ORBIT: focus the first Conversation panel.
+            if let Some(i) = tui
+                .app
+                .tree
+                .leaves()
+                .iter()
+                .position(|(_, v)| *v == super::layout::View::Conversation)
+            {
+                tui.app.focus = i;
+                tui.sync_focus();
+            }
+        }
+        KeyCode::Esc => {
+            tui.app.arranging = true;
+        }
         _ => {}
     }
     false
-}
-
-/// The terminal width for focus decisions between draws.
-fn screen_width_hint() -> u16 {
-    crossterm::terminal::size().map(|(w, _)| w).unwrap_or(100)
 }
 
 fn now_hhmm() -> String {
@@ -858,7 +966,9 @@ fn run_command(
     let open: Option<Overlay> = match cmd {
         "/help" => Some(Overlay::Help),
         "/sessions" => {
-            // §11.6: focus the Sessions rail (or view).
+            // List the saved sessions in the transcript and open the
+            // sidebar (its SESSIONS section) where there is room.
+            let _ = command_sink.send(WorkerCommand::ListSessions);
             *focus_sessions = true;
             None
         }
@@ -927,15 +1037,25 @@ fn run_command(
 /// FrontendEvent-shaped Msgs → the scenario reducer.
 fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
     use crate::msg::Msg;
+    // Every message may start a motion: keep redrawing for a second.
+    scenario.motion_until_ms = now_ms + 1000;
     match msg {
         Msg::TextDelta(text) => {
             scenario.apply("text_delta", 0);
             scenario.last_data_ms = now_ms;
             match scenario.transcript.last_mut() {
-                Some(l) if l.kind == LineKind::Model => l.text.push_str(&text),
+                Some(l) if l.kind == LineKind::Model => {
+                    // Fresh ink: remember when this chunk landed.
+                    l.arrivals.push((l.text.chars().count(), now_ms));
+                    if l.arrivals.len() > 64 {
+                        l.arrivals.remove(0);
+                    }
+                    l.text.push_str(&text);
+                }
                 _ => scenario.transcript.push(TranscriptLine {
                     kind: LineKind::Model,
                     text,
+                    arrivals: vec![(0, now_ms)],
                     ..Default::default()
                 }),
             }
@@ -943,20 +1063,34 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
         Msg::ToolCallStarted { name, summary } => {
             scenario.running.insert(name.clone(), name.clone());
             scenario.apply("tool_started_full", 0);
-            scenario.turn_tools += 1;
             // The tool line (§9.8): glyph + name + the display-safe
             // argument (the summary without `name(` … `)`).
             let arg = summary
                 .strip_prefix(&format!("{name}("))
                 .and_then(|s| s.strip_suffix(')'))
                 .unwrap_or(summary.as_str());
-            scenario.transcript.push(TranscriptLine {
-                kind: LineKind::Tool,
-                text: arg.to_string(),
-                tool_name: name.clone(),
-                tool_state: super::scenario::ToolState::Running,
-                ..Default::default()
-            });
+            // The engine announces a call twice (the plain start, then
+            // the one carrying its target): one card, not two.
+            if let Some(open) = scenario.transcript.iter_mut().rev().find(|l| {
+                l.kind == LineKind::Tool
+                    && l.tool_name == name
+                    && l.tool_state == super::scenario::ToolState::Running
+                    && (l.text.is_empty() || l.text == arg)
+            }) {
+                if open.text.is_empty() {
+                    open.text = arg.to_string();
+                }
+            } else {
+                scenario.turn_tools += 1;
+                scenario.transcript.push(TranscriptLine {
+                    kind: LineKind::Tool,
+                    text: arg.to_string(),
+                    tool_name: name.clone(),
+                    tool_state: super::scenario::ToolState::Running,
+                    started_ms: Some(now_ms),
+                    ..Default::default()
+                });
+            }
         }
         Msg::ToolCallFinished { name, outcome } => {
             scenario.running.remove(&name);
@@ -965,6 +1099,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
                 if l.kind == LineKind::Tool && l.tool_name == name {
                     // §9.8: the final state comes only from the
                     // worker's outcome (never optimistic).
+                    l.finished_ms = Some(now_ms);
                     let dur = l
                         .started_ms
                         .map(|st| now_ms.saturating_sub(st))
@@ -996,8 +1131,11 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
             call_id,
             tool_name,
             summary,
-            ..
+            risk,
+            working_dir,
         } => {
+            scenario.approval_risk = risk;
+            scenario.approval_dir = working_dir;
             scenario.approval_pending = Some(tool_name.clone());
             scenario.approval_call_id = Some(call_id.clone());
             scenario.approval_queue.push(tool_name.clone());
@@ -1021,6 +1159,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
                 cost_microcents,
                 priced: scenario.priced,
             });
+            scenario.turn_ended_ms = Some(now_ms);
             scenario.apply("turn_ended", 0);
         }
         Msg::SystemMessage(text) => {
@@ -1034,17 +1173,158 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
                 });
             }
         }
-        Msg::Status(text) => {
-            scenario.tool_output.push(text.clone());
+        Msg::Status(text) if text.starts_with("┃ ") => {
+            // Streamed tool output: the Terminal panel's lines.
+            scenario
+                .tool_output
+                .push(text.trim_start_matches("┃ ").to_string());
+        }
+        Msg::Status(text) if text.starts_with("retry ") => {
+            // `retry {n} in {ms}ms — {reason}`: the backoff countdown (M27).
+            let ms = text
+                .split(" in ")
+                .nth(1)
+                .and_then(|r| r.split("ms").next())
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            scenario.backoff_until_ms = Some(now_ms + ms);
+            scenario.backoff_total_ms = ms.max(1);
             scenario.transcript.push(TranscriptLine {
                 kind: LineKind::System,
                 text,
                 ..Default::default()
             });
         }
+        Msg::Status(text) => {
+            scenario.transcript.push(TranscriptLine {
+                kind: LineKind::System,
+                text,
+                ..Default::default()
+            });
+        }
+        Msg::WorkspaceUpdate(ws) => {
+            // The Plan panel lists the worker's plan, state by state.
+            let before: Vec<(String, String)> = scenario
+                .tasks
+                .iter()
+                .map(|t| (t.title.clone(), t.status.clone()))
+                .collect();
+            scenario.tasks = ws
+                .plan
+                .iter()
+                .map(|t| super::panels::TaskRow {
+                    title: t.title.clone(),
+                    status: match t.state {
+                        crate::state::TaskState::Done => "done",
+                        crate::state::TaskState::Active => "active",
+                        _ => "pending",
+                    }
+                    .to_string(),
+                })
+                .collect();
+            // M17: a row whose state changed flashes for 450 ms.
+            scenario.task_changed_ms = scenario
+                .tasks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let same = before
+                        .get(i)
+                        .map(|(title, st)| *title == t.title && *st == t.status)
+                        .unwrap_or(false);
+                    if same {
+                        scenario.task_changed_ms.get(i).copied().unwrap_or(0)
+                    } else {
+                        now_ms
+                    }
+                })
+                .collect();
+        }
+        Msg::FileChanged {
+            path,
+            added,
+            removed,
+        } => {
+            // One row per file; later edits to it add to its totals.
+            match scenario.file_changes.iter_mut().find(|f| f.path == path) {
+                Some(f) => {
+                    f.added += added;
+                    f.removed += removed;
+                }
+                None => scenario.file_changes.push(super::panels::FileChangeRow {
+                    path: path.clone(),
+                    added,
+                    removed,
+                }),
+            }
+            // The row flashes (M11): note when its file last changed.
+            let idx = scenario
+                .file_changes
+                .iter()
+                .position(|f| f.path == path)
+                .unwrap_or(0);
+            scenario
+                .file_changed_ms
+                .resize(scenario.file_changes.len(), 0);
+            scenario.file_changed_ms[idx] = now_ms;
+        }
+        Msg::SubagentStarted { id, name, task } => {
+            scenario.agents.insert(
+                id,
+                super::scenario::Agent {
+                    name,
+                    action: task,
+                    done: false,
+                    started_ms: now_ms,
+                    done_ms: None,
+                },
+            );
+            scenario.agents_running = scenario.agents.values().filter(|a| !a.done).count();
+        }
+        Msg::SubagentProgress { id, action } => {
+            if let Some(a) = scenario.agents.get_mut(&id) {
+                a.action = action;
+            }
+        }
+        Msg::SubagentFinished { id, report } => {
+            if let Some(a) = scenario.agents.get_mut(&id) {
+                a.action = report;
+                a.done = true;
+                a.done_ms = Some(now_ms);
+            }
+            scenario.agents_running = scenario.agents.values().filter(|a| !a.done).count();
+        }
+        Msg::Usage {
+            used_tokens,
+            window_tokens,
+        } => {
+            let now_ctx = scenario.ctx_eased(now_ms);
+            scenario.ctx_from = now_ctx;
+            scenario.ctx_to = if window_tokens > 0 {
+                (used_tokens as f32 / window_tokens as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            scenario.ctx_ms = now_ms;
+            scenario.used_tokens = used_tokens;
+            scenario.window_tokens = window_tokens;
+            scenario.usage_shown_ms = now_ms;
+        }
+        Msg::LedgerAppended { record_count } => {
+            scenario.ledger_count = Some(record_count);
+            scenario.ledger_ms = Some(now_ms);
+        }
+        Msg::ModelChanged(m) => {
+            scenario.model = m.clone();
+            scenario.model_id = m;
+        }
         Msg::ModeChanged(mode) => {
             // S5: Shift+Tab's next cycle reads this; the toast comes
             // from the reducer.
+            if scenario.permission_mode.as_deref() != Some(mode.as_str()) {
+                scenario.mode_prev = scenario.permission_mode.clone();
+                scenario.mode_changed_ms = Some(now_ms);
+            }
             scenario.permission_mode = Some(mode);
         }
         Msg::Identity {
@@ -1082,8 +1362,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
 
 // ── The draw (§8, §9) ─────────────────────────────────────────────
 
-/// The whole screen: headers/switcher, panes, dividers, composer,
-/// hint row, status line, overlays.
+/// The whole screen: top bar, the panel tree, status line, overlays.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     f: &mut ratatui::Frame,
@@ -1097,6 +1376,7 @@ pub fn draw(
     sessions_pushed: bool,
     scroll_offset: usize,
 ) {
+    let _ = sessions_pushed;
     let area = f.area();
     // The size notice (§9.23): below 40 × 10 it is the whole screen.
     if area.width < 40 || area.height < 10 {
@@ -1110,934 +1390,51 @@ pub fn draw(
         f.render_widget(Paragraph::new(out), area);
         return;
     }
-    let scr = Screen::resolve(area, sessions_pushed);
-    let (_cl, _cw) = scr.conv_column();
-
-    // Row 0: pane headers (§9.1) or the view switcher (§9.2).
-    draw_row0(f, &scr, tui, scenario);
-
-    // The panes.
-    if let Some(left) = scr.left {
-        draw_sessions_rail(f, left, tui.focus == Focus::Sessions, scenario);
-    }
-    draw_conversation(f, &scr, tui, scenario, composer, scroll_offset);
-    if let Some(right) = scr.right {
-        draw_workspace_rail(f, right, tui.focus == Focus::Workspace, scenario);
-    }
-
-    // The dividers (§8.6): one column of │, row 0 … H−2.
-    for (x, y0, y1) in &scr.dividers {
-        let r = Rect {
-            x: *x,
-            y: *y0,
-            width: 1,
-            height: y1.saturating_sub(*y0) + 1,
-        };
-        for y in r.y..r.bottom() {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "│",
-                    Style::default().fg(comps::colour(Token::Rule)),
-                ))),
-                Rect {
-                    x: *x,
-                    y,
-                    width: 1,
-                    height: 1,
-                },
-            );
-        }
-    }
-
-    // The approval card (§9.14) replaces the composer while a
-    // request is pending; the draft is kept untouched.
-    if scenario.approval_pending.is_some() {
-        super::view::approval_card(f, &scr, scenario, tui.tick_ms);
-    } else {
-        draw_composer(f, &scr, tui, scenario, composer, toast);
-    }
-
-    // The status line (§9.18).
-    draw_status(f, &scr, tui, scenario);
-
-    // The overlays (§9.19–9.21), on top of everything.
-    match overlay {
-        Some(Overlay::Palette) => {
-            let r = super::chrome::palette_area(area);
-            let lines = super::chrome::palette_lines(palette_query, palette_sel);
-            super::chrome::overlay(f, r, "Commands", lines, Some("esc close · ⏎ run"));
-        }
-        Some(Overlay::Help) => {
-            let r = super::chrome::help_area(area);
-            let lines = super::chrome::help_lines();
-            super::chrome::overlay(f, r, "Keys", lines, Some("esc close"));
-        }
-        Some(Overlay::Quit) => {
-            let (r, lines) = super::chrome::quit_card(scenario.turn_live, area);
-            super::chrome::overlay(f, r, "Quit ORBIT?", lines, None);
-        }
-        None => {}
-    }
-}
-
-/// Row 0: the pane headers (§9.1) or the view switcher (§9.2).
-fn draw_row0(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scenario) {
-    let area = scr.header;
-    if scr.class.single_view() {
-        // §9.2: ` Sessions   Conversation   Workspace n/m ━━━…`
-        let active = match tui.focus {
-            Focus::Sessions => 0,
-            Focus::Conversation => 1,
-            Focus::Workspace => 2,
-            Focus::Status => 1,
-        };
-        let mut spans: Vec<Span> = Vec::new();
-        for (i, name) in ["Sessions", "Conversation", "Workspace"].iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw("   "));
-            }
-            if i == active {
-                spans.push(Span::styled(
-                    *name,
-                    Style::default()
-                        .fg(comps::colour(Token::Magenta))
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else if i == 2 && scenario.workspace_empty() {
-                spans.push(Span::styled(
-                    *name,
-                    Style::default().fg(comps::colour(Token::Faint)),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    *name,
-                    Style::default().fg(comps::colour(Token::Muted)),
-                ));
-            }
-        }
-        // n/m: completed/total plan tasks (none today → `0/0` muted).
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            "0/0",
-            Style::default().fg(comps::colour(Token::Muted)),
-        ));
-        // The heavy rule fills the rest.
-        let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
-        let rule_w = area.width.saturating_sub(used + 1).saturating_sub(1);
-        spans.push(Span::styled(" ".to_string(), Style::default()));
-        spans.push(Span::styled(
-            "━".repeat(rule_w as usize),
-            Style::default().fg(comps::colour(Token::RuleHi)),
-        ));
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
-        return;
-    }
-    // §9.1: one shared header row, per pane.
-    if let Some(left) = scr.left {
-        let focused = tui.focus == Focus::Sessions;
-        let mut first = true;
-        let mut spans = Vec::new();
-        for (i, tab) in ["Sessions", "Activity"].iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw("  "));
-            }
-            let tab_disp = if first {
-                format!(" {tab}")
-            } else {
-                tab.to_string()
-            };
-            first = false;
-            spans.push(Span::styled(
-                tab_disp,
-                if focused {
-                    Style::default()
-                        .fg(comps::colour(Token::Magenta))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(comps::colour(Token::Ink))
-                        .add_modifier(Modifier::BOLD)
-                },
-            ));
-        }
-        let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
-        // One air column after the tabs and one before the divider.
-        let rule_w = left.w.saturating_sub(used + 2);
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            (if focused { "━" } else { "─" }).repeat(rule_w as usize),
-            Style::default().fg(comps::colour(if focused {
-                Token::RuleHi
-            } else {
-                Token::Rule
-            })),
-        ));
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect {
-                x: left.x,
-                y: area.y,
-                width: left.w,
-                height: 1,
-            },
-        );
-    }
-    // Conversation header: title + `n turns` meta.
-    {
-        let conv = scr.conv;
-        let focused = tui.focus == Focus::Conversation;
-        let title = if scenario.transcript.is_empty() {
-            "New session".to_string()
-        } else {
-            scenario.session_title()
-        };
-        let meta = if scenario.turns == 0 {
-            String::new()
-        } else if scenario.turns == 1 {
-            "1 turn".into()
-        } else {
-            format!("{} turns", scenario.turns)
-        };
-        let meta_w = meta.len() as u16;
-        let title_budget = conv.w.saturating_sub(7 + meta_w).max(3);
-        let title = truncate_end(&title, title_budget as usize);
-        let title_w = title.width();
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::styled(
-                title,
-                if focused {
-                    Style::default()
-                        .fg(comps::colour(Token::Magenta))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(comps::colour(Token::Ink))
-                        .add_modifier(Modifier::BOLD)
-                },
-            ),
-        ];
-        let used: u16 = 1 + title_w as u16;
-        // The rule ends one column short of the divider; the meta
-        // rides at its right end behind one air column.
-        let reserved = if meta.is_empty() { 1 } else { meta_w + 2 };
-        let rule_end = conv.w.saturating_sub(reserved);
-        let rule_w = rule_end.saturating_sub(used + 1);
-        if rule_w > 0 {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                (if focused { "━" } else { "─" }).repeat(rule_w as usize),
-                Style::default().fg(comps::colour(if focused {
-                    Token::RuleHi
-                } else {
-                    Token::Rule
-                })),
-            ));
-        }
-        if !meta.is_empty() {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                meta,
-                Style::default().fg(comps::colour(Token::Muted)),
-            ));
-        }
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect {
-                x: conv.x,
-                y: area.y,
-                width: conv.w,
-                height: 1,
-            },
-        );
-    }
-    if let Some(right) = scr.right {
-        let focused = tui.focus == Focus::Workspace;
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::styled(
-                "Workspace",
-                if focused {
-                    Style::default()
-                        .fg(comps::colour(Token::Magenta))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(comps::colour(Token::Ink))
-                        .add_modifier(Modifier::BOLD)
-                },
-            ),
-        ];
-        let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
-        let rule_w = right.w.saturating_sub(used + 1);
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            (if focused { "━" } else { "─" }).repeat(rule_w as usize),
-            Style::default().fg(comps::colour(if focused {
-                Token::RuleHi
-            } else {
-                Token::Rule
-            })),
-        ));
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect {
-                x: right.x,
-                y: area.y,
-                width: right.w,
-                height: 1,
-            },
-        );
-    }
-}
-
-/// The Sessions rail (§9.15): groups + rows. Today only the open
-/// session exists (§13), so the rail shows TODAY + the open row.
-fn draw_sessions_rail(
-    f: &mut ratatui::Frame,
-    pane: super::screen::Pane,
-    focused: bool,
-    scenario: &Scenario,
-) {
-    let x = pane.x;
-    let w = pane.w;
-    let mut y = pane.y;
-    // Section label.
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "TODAY",
-            Style::default().fg(comps::colour(Token::Muted)),
-        ))),
-        Rect {
-            x: x + 2,
-            y,
-            width: (w - 2),
-            height: 1,
-        },
-    );
-    y += 2;
-    // The open session row (§8.4): ▌/state glyph at x+1, title x+3.
-    let title = if scenario.session_title().is_empty() {
-        "New session".to_string()
-    } else {
-        scenario.session_title()
+    use super::shell::overlays::Overlay as Ov;
+    let ov = match overlay {
+        Some(Overlay::Palette) => Some(Ov::Palette {
+            query: palette_query,
+            sel: palette_sel,
+            sel_prev: tui.fx.sel_prev,
+            opened_ms: tui.fx.overlay_ms,
+            sel_ms: tui.fx.sel_ms,
+        }),
+        Some(Overlay::Help) => Some(Ov::Help {
+            opened_ms: tui.fx.overlay_ms,
+        }),
+        Some(Overlay::Quit) => Some(Ov::Quit {
+            turn_live: scenario.turn_live,
+        }),
+        None => None,
     };
-    let fill = if focused {
-        comps::colour(Token::Wash)
-    } else {
-        comps::colour(Token::Surface2)
-    };
-    let spans = vec![
-        Span::styled("▌", Style::default().fg(comps::colour(Token::Magenta))),
-        Span::styled(" ", Style::default()),
-        Span::styled(
-            title,
-            Style::default()
-                .fg(comps::colour(Token::Ink))
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    let line = Line::from(spans);
-    let row = Rect {
-        x,
-        y,
-        width: w,
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(line).style(Style::default().bg(fill)), row);
-    let _ = spans;
-}
-
-/// The Workspace rail (§9.17): the phase stepper + sections. Empty
-/// today (§13) → the empty state.
-fn draw_workspace_rail(
-    f: &mut ratatui::Frame,
-    pane: super::screen::Pane,
-    focused: bool,
-    scenario: &Scenario,
-) {
-    let x = pane.x;
-    let w = pane.w;
-    let mut y = pane.y;
-    // Empty (§9.17): no stepper yet — nothing is planned, so the rail
-    // opens straight on the empty state. EXCEPT while a turn runs: the
-    // stepper is the rail's live heartbeat (the star's twin), and a
-    // "Nothing planned yet" placeholder during an active turn reads as
-    // a dead screen.
-    if scenario.tasks.is_empty() && scenario.file_changes.is_empty() && !scenario.is_turning() {
-        // Empty state (§9.17).
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("◌", Style::default().fg(comps::colour(Token::Faint))),
-                Span::raw(" "),
-                Span::styled(
-                    "Nothing planned yet.",
-                    Style::default().fg(comps::colour(Token::Ink2)),
-                ),
-            ])),
-            Rect {
-                x: x + 2,
-                y,
-                width: w.saturating_sub(2),
-                height: 1,
-            },
-        );
-        y += 2;
-        let help =
-            "When a task has steps, the plan, findings and verification evidence collect here.";
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                help,
-                Style::default().fg(comps::colour(Token::Muted)),
-            )))
-            .wrap(ratatui::widgets::Wrap { trim: false }),
-            Rect {
-                x: x + 4,
-                y,
-                width: w.saturating_sub(4),
-                height: 4,
-            },
-        );
-        let _ = focused;
-        return;
-    }
-    // The phase stepper (§9.17): 5 nodes, current = phase_index().
-    let phases = ["init", "plan", "execute", "verify", "checkpoint"];
-    let cur = scenario.phase_index().min(4);
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, _) in phases.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(
-                if i <= cur { "━━" } else { "──" },
-                Style::default().fg(comps::colour(if i <= cur {
-                    Token::Muted
-                } else {
-                    Token::Rule
-                })),
-            ));
-        }
-        let (g, c) = if i < cur {
-            ("✓", Token::Muted)
-        } else if i == cur {
-            ("◉", Token::Cyan)
-        } else {
-            ("◌", Token::Faint)
-        };
-        spans.push(Span::styled(g, Style::default().fg(comps::colour(c))));
-    }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        phases[cur],
-        Style::default()
-            .fg(comps::colour(Token::Cyan))
-            .add_modifier(Modifier::BOLD),
-    ));
-    // k/5 right-aligned.
-    let done = scenario.tasks.iter().filter(|t| t.status == "done").count();
-    let k5 = format!("{}/{}", done, scenario.tasks.len());
-    let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
-    let pad = w.saturating_sub(2 + used + 2 + k5.len() as u16 + 1);
-    spans.push(Span::raw(" ".repeat(pad.max(1) as usize)));
-    spans.push(Span::styled(
-        k5,
-        Style::default().fg(comps::colour(Token::Muted)),
-    ));
-    f.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect {
-            x: x + 2,
-            y,
-            width: w.saturating_sub(2),
-            height: 1,
-        },
-    );
-    y += 2;
-
-    // PLAN section: label + count right-aligned, then task rows (§9.17).
-    let label = |t: &str| {
-        Span::styled(
-            t.to_string(),
-            Style::default().fg(comps::colour(Token::Muted)),
-        )
-    };
-    if !scenario.tasks.is_empty() {
-        let count = format!("{}", scenario.tasks.len());
-        let used = 5u16 + count.len() as u16;
-        let pad = w.saturating_sub(2 + used + 2);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                label("PLAN"),
-                Span::raw(" ".repeat(pad.max(1) as usize)),
-                label(&count),
-            ])),
-            Rect {
-                x: x + 2,
-                y,
-                width: w.saturating_sub(2),
-                height: 1,
-            },
-        );
-        y += 1;
-        for t in &scenario.tasks {
-            if y >= pane.y + pane.h {
-                break;
-            }
-            let active = t.status == "active" || t.status == "running";
-            let (g, gc) = if active {
-                ("◉", Token::Cyan)
-            } else if t.status == "done" {
-                ("✓", Token::Ink2)
-            } else {
-                ("◌", Token::Faint)
-            };
-            let title_colour = if active { Token::Ink } else { Token::Ink2 };
-            let mut spans = vec![
-                Span::styled(g, Style::default().fg(comps::colour(gc))),
-                Span::raw(" "),
-                Span::styled(
-                    t.title.clone(),
-                    Style::default()
-                        .fg(comps::colour(title_colour))
-                        .add_modifier(if active {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-            ];
-            if active && !t.status.is_empty() {
-                spans.push(Span::styled(
-                    format!("  running · {}", t.status),
-                    Style::default().fg(comps::colour(Token::Cyan)),
-                ));
-            }
-            f.render_widget(
-                Paragraph::new(Line::from(spans)),
-                Rect {
-                    x: x + 2,
-                    y,
-                    width: w.saturating_sub(2),
-                    height: 1,
-                },
-            );
-            y += 1;
-        }
-    }
-}
-
-/// The conversation column (§8.3/§9.4–9.12): the transcript,
-/// bottom-anchored.
-fn draw_conversation(
-    f: &mut ratatui::Frame,
-    scr: &Screen,
-    tui: &Tui,
-    scenario: &Scenario,
-    composer: &str,
-    scroll_offset: usize,
-) {
-    let _ = composer;
-    let pane = scr.conv;
-    let (cl, cw) = scr.conv_column();
-    let view = pane.h as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    if scenario.transcript.is_empty() {
-        // The welcome block (§9.22), placed at 2 + free/3 from the
-        // pane top, centred per line.
-        let welcome = super::welcome::Welcome {
-            tier: tui.brand_tier,
-            first_prompt_waiting: scenario.first_prompt_waiting,
-        };
-        let block = welcome.lines_in(tui.tick_ms, pane.w, &scenario.welcome_chips);
-        let free = view.saturating_sub(block.len());
-        for _ in 0..(free / 3) {
-            lines.push(Line::from(""));
-        }
-        lines.extend(block);
-    } else {
-        let body = super::view::transcript_lines(scenario, cl, cw, scr.class);
-        // §8.3: the transcript is bottom-anchored — a short one sits
-        // against the composer, not at the top of the pane.
-        for _ in 0..view.saturating_sub(body.len()) {
-            lines.push(Line::from(""));
-        }
-        lines.extend(body);
-    }
-    // start = max(0, total − view − offset) (§8.6).
-    let total = lines.len();
-    let start = total.saturating_sub(view).saturating_sub(scroll_offset);
-    let shown: Vec<Line> = lines.into_iter().skip(start).take(view).collect();
-    f.render_widget(
-        Paragraph::new(shown),
-        Rect {
-            x: pane.x,
-            y: pane.y,
-            width: pane.w,
-            height: pane.h,
+    super::shell::draw(
+        f,
+        &super::shell::DrawIn {
+            app: &tui.app,
+            fx: &tui.fx,
+            scenario,
+            composer,
+            now_ms: tui.tick_ms,
+            reduced: tui.reduced,
+            tier: tui.tier,
+            scroll_offset,
+            brand: tui.brand_tier,
+            toast: toast.map(|t| super::shell::ToastIn {
+                text: t.text.as_str(),
+                ok: t.ok,
+                shown_ms: t.shown_ms,
+            }),
+            overlay: ov,
         },
     );
 }
 
-/// The composer (§9.13): the surface band, `›` at cl−1, text from
-/// cl+1, the hint row below.
-fn draw_composer(
-    f: &mut ratatui::Frame,
-    scr: &Screen,
-    tui: &Tui,
-    scenario: &Scenario,
-    composer: &str,
-    toast: Option<&Toast>,
-) {
-    let (cl, cw) = scr.conv_column();
-    let focused = tui.focus == Focus::Conversation;
-    // The band spans cl−2 … cl+cw on the input row and the hint row.
-    let band_x = cl.saturating_sub(2);
-    let band_w = cw + 3;
-    let band = Rect {
-        x: band_x,
-        y: scr.composer.y,
-        width: band_w,
-        height: 1 + if scr.hint.is_some() { 1 } else { 0 },
-    };
-    f.render_widget(
-        ratatui::widgets::Block::default()
-            .style(Style::default().bg(comps::colour(Token::Surface))),
-        band,
-    );
-    // `›` at cl−1; text from cl+1.
-    let prompt_colour = if focused {
-        Token::Magenta
-    } else {
-        Token::Faint
-    };
-    let placeholder = if scenario.turn_live {
-        if scr.class == WidthClass::Tight {
-            "Add to the queue, or wait"
-        } else {
-            "Add to the queue, or wait for ORBIT"
-        }
-    } else {
-        "Ask ORBIT, or type / for commands"
-    };
-    let text_span = if composer.is_empty() {
-        Span::styled(
-            placeholder,
-            Style::default().fg(comps::colour(Token::Faint)),
-        )
-    } else {
-        Span::styled(
-            composer.to_string(),
-            Style::default().fg(comps::colour(Token::Ink)),
-        )
-    };
-    let spans = vec![
-        Span::raw(" "),
-        Span::styled("›", Style::default().fg(comps::colour(prompt_colour))),
-        Span::raw("  "),
-        text_span,
-    ];
-    f.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect {
-            x: band_x,
-            y: scr.composer.y,
-            width: band_w,
-            height: 1,
-        },
-    );
-    // The hint row (§9.13): keycaps + the context hint, toast right.
-    if let Some(hint_area) = scr.hint {
-        let hint = if focused {
-            hint_row(scenario, scr.class, toast)
-        } else {
-            Line::from("")
-        };
-        // The hint starts at cl+1, aligned under the composer text.
-        let hx = (cl + 1).min(hint_area.right());
-        f.render_widget(
-            Paragraph::new(hint),
-            Rect {
-                x: hx,
-                y: hint_area.y,
-                width: hint_area.right().saturating_sub(hx),
-                height: hint_area.height,
-            },
-        );
+/// The overlay as a small code for change detection (0 none).
+fn overlay_code(o: Option<Overlay>) -> u8 {
+    match o {
+        None => 0,
+        Some(Overlay::Palette) => 1,
+        Some(Overlay::Help) => 2,
+        Some(Overlay::Quit) => 3,
     }
-}
-
-/// The hint row (§9.13): `⏎ send`, `⇧⏎ newline`, `/ commands`, then
-/// the first applicable context hint; toasts end at cl+cw−1.
-fn hint_row(scenario: &Scenario, class: WidthClass, toast: Option<&Toast>) -> Line<'static> {
-    let key = |k: &str| {
-        Span::styled(
-            k.to_string(),
-            Style::default()
-                .fg(comps::colour(Token::Ink))
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    let label = |l: &'static str| {
-        Span::styled(
-            format!(" {l}"),
-            Style::default().fg(comps::colour(Token::Muted)),
-        )
-    };
-    let mut spans = Vec::new();
-    if scenario.turn_live {
-        spans.push(key("⏎"));
-        spans.push(label("queue"));
-        spans.push(Span::raw("   "));
-        spans.push(key("⇧⏎"));
-        spans.push(label("newline"));
-    } else {
-        spans.push(key("⏎"));
-        spans.push(label("send"));
-        spans.push(Span::raw("   "));
-        spans.push(key("⇧⏎"));
-        spans.push(label("newline"));
-        spans.push(Span::raw("   "));
-        spans.push(key("/"));
-        spans.push(label("commands"));
-    }
-    // The context hint: first that applies.
-    if class.single_view() {
-        spans.push(Span::raw("   "));
-        spans.push(key("tab"));
-        spans.push(label("views"));
-    } else if class == WidthClass::Medium {
-        spans.push(Span::raw("   "));
-        spans.push(key("⇧tab"));
-        spans.push(label("sessions"));
-    }
-    if let Some(t) = toast {
-        spans.push(Span::raw("   "));
-        if t.ok {
-            spans.push(Span::styled(
-                "✓ ",
-                Style::default().fg(comps::colour(Token::Green)),
-            ));
-        }
-        spans.push(Span::styled(
-            t.text.clone(),
-            Style::default().fg(comps::colour(Token::Muted)),
-        ));
-    }
-    Line::from(spans)
-}
-
-/// The status line (§9.18): mark + activity left, the right cluster
-/// by level.
-fn draw_status(f: &mut ratatui::Frame, scr: &Screen, tui: &Tui, scenario: &Scenario) {
-    let area = scr.status;
-    let star = tui.star_glyph(scenario);
-    let star_colour = comps::colour(match star.colour {
-        super::anim::StarColour::Cyan => Token::Cyan,
-        super::anim::StarColour::Magenta => Token::Magenta,
-        super::anim::StarColour::Amber => Token::Amber,
-        super::anim::StarColour::Red => Token::Red,
-    });
-    // The activity, first match wins (§9.18).
-    let elapsed_s = |now: u64, from: u64| {
-        let d = now.saturating_sub(from);
-        if d >= 1000 {
-            format!(" · {}s", d / 1000)
-        } else {
-            String::new()
-        }
-    };
-    let activity_spans: Vec<Span> = match scenario.activity() {
-        Activity::Approval(t) => vec![Span::styled(
-            format!("◇ approval needed · {t}"),
-            Style::default().fg(comps::colour(Token::Magenta)),
-        )],
-        Activity::RunningMany(n) => vec![
-            Span::styled(
-                format!("running {n} tools"),
-                Style::default().fg(comps::colour(Token::Cyan)),
-            ),
-            Span::styled(
-                elapsed_s(tui.tick_ms, scenario.turn_started_ms),
-                Style::default().fg(comps::colour(Token::Muted)),
-            ),
-        ],
-        Activity::Running(t) => vec![
-            Span::styled(
-                format!("running {t}"),
-                Style::default().fg(comps::colour(Token::Cyan)),
-            ),
-            Span::styled(
-                elapsed_s(tui.tick_ms, scenario.turn_started_ms),
-                Style::default().fg(comps::colour(Token::Muted)),
-            ),
-        ],
-        Activity::Streaming => vec![
-            Span::styled("streaming", Style::default().fg(comps::colour(Token::Cyan))),
-            Span::styled(
-                elapsed_s(tui.tick_ms, scenario.turn_started_ms),
-                Style::default().fg(comps::colour(Token::Muted)),
-            ),
-        ],
-        Activity::WaitingModel(m) => vec![Span::styled(
-            format!("waiting for {m}"),
-            Style::default().fg(comps::colour(Token::Cyan)),
-        )],
-        Activity::Compacting => vec![Span::styled(
-            "compacting context",
-            Style::default().fg(comps::colour(Token::Amber)),
-        )],
-        Activity::Done => vec![
-            Span::styled("✓", Style::default().fg(comps::colour(Token::Green))),
-            Span::styled(" done", Style::default().fg(comps::colour(Token::Ink))),
-        ],
-        Activity::Failed => vec![Span::styled(
-            "✕ failed",
-            Style::default().fg(comps::colour(Token::Red)),
-        )],
-        Activity::Ready => {
-            // The M5 turn report: ✓ done · {duration} · {n} tools ·
-            // +{cost}, for 2 s or until the next key.
-            if let Some(r) = &scenario.turn_report {
-                if tui.tick_ms.saturating_sub(scenario.turn_started_ms) < 4000 {
-                    let mut spans = vec![
-                        Span::styled("✓", Style::default().fg(comps::colour(Token::Green))),
-                        Span::styled(" done", Style::default().fg(comps::colour(Token::Ink))),
-                        Span::styled(
-                            format!(" · {}s", r.duration_ms / 1000),
-                            Style::default().fg(comps::colour(Token::Muted)),
-                        ),
-                    ];
-                    if r.tools > 0 {
-                        spans.push(Span::styled(
-                            format!(" · {} tools", r.tools),
-                            Style::default().fg(comps::colour(Token::Muted)),
-                        ));
-                    }
-                    if r.priced {
-                        spans.push(Span::styled(
-                            format!(" · +${:.4}", r.cost_microcents as f64 / 1_000_000.0),
-                            Style::default().fg(comps::colour(Token::Muted)),
-                        ));
-                    }
-                    spans
-                } else {
-                    vec![Span::styled(
-                        "ready",
-                        Style::default().fg(comps::colour(Token::Muted)),
-                    )]
-                }
-            } else {
-                vec![Span::styled(
-                    "ready",
-                    Style::default().fg(comps::colour(Token::Muted)),
-                )]
-            }
-        }
-    };
-    // The mark: glyph + ` ORBIT` (muted bold).
-    let mut left = vec![
-        Span::raw(" "),
-        Span::styled(star.glyph.to_string(), Style::default().fg(star_colour)),
-        Span::styled(
-            " ORBIT",
-            Style::default()
-                .fg(comps::colour(Token::Muted))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-    ];
-    left.extend(activity_spans);
-    // The right cluster by level (§9.18). Segments are placed right to
-    // left ending at W−2: the row therefore shows, left→right, the
-    // model · provider, tokens, cost, the short session id, then
-    // `? keys` — exactly as wide_idle.txt reads.
-    let level = scr.class.status_level();
-    let mut right: Vec<Vec<Span>> = Vec::new();
-    // model · provider (the cluster's left-most segment).
-    if level <= 1 && !scenario.model_id.is_empty() {
-        right.push(vec![
-            Span::styled(
-                scenario.model_id.clone(),
-                Style::default().fg(comps::colour(Token::Ink2)),
-            ),
-            Span::styled(
-                format!(" · {}", scenario.provider),
-                Style::default().fg(comps::colour(Token::Muted)),
-            ),
-        ]);
-    }
-    if level <= 1 {
-        // token slot.
-        right.push(vec![Span::styled(
-            format!("↓{} ↑{}", scenario.input_tokens, scenario.output_tokens),
-            Style::default().fg(comps::colour(Token::Muted)),
-        )]);
-    }
-    if level <= 2 {
-        // cost slot.
-        if scenario.priced {
-            right.push(vec![Span::styled(
-                format!("${:.4}", scenario.cost_microcents as f64 / 1_000_000.0),
-                Style::default().fg(comps::colour(Token::Ink2)),
-            )]);
-        } else {
-            right.push(vec![Span::styled(
-                "cost n/a",
-                Style::default().fg(comps::colour(Token::Muted)),
-            )]);
-        }
-    }
-    if level == 0 {
-        // short session id (§7.3), then `? keys` right-most.
-        if !scenario.session_prefix.is_empty() {
-            right.push(vec![Span::styled(
-                scenario.session_prefix.clone(),
-                Style::default().fg(comps::colour(Token::Faint)),
-            )]);
-        }
-        right.push(vec![
-            Span::styled(
-                "?",
-                Style::default()
-                    .fg(comps::colour(Token::Ink2))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" keys", Style::default().fg(comps::colour(Token::Muted))),
-        ]);
-    }
-    let w = area.width;
-    let left_w: u16 = left.iter().map(|s| s.width() as u16).sum();
-    let right_w: u16 = right
-        .iter()
-        .map(|seg| seg.iter().map(|s| s.width() as u16).sum::<u16>())
-        .sum::<u16>()
-        + (right.len().saturating_sub(1) as u16) * 3;
-    let mut status = left;
-    if !right.is_empty() && left_w + 3 + right_w <= w {
-        let pad = w - left_w - right_w;
-        status.push(Span::raw(" ".repeat(pad as usize)));
-        for (i, seg) in right.into_iter().enumerate() {
-            if i > 0 {
-                status.push(Span::raw("   "));
-            }
-            status.extend(seg);
-        }
-    }
-    f.render_widget(Paragraph::new(Line::from(status)), area);
-}
-
-/// End truncation (§7.4): keep the head, append `…`.
-fn truncate_end(s: &str, w: usize) -> String {
-    if s.width() <= w {
-        return s.to_string();
-    }
-    if w == 0 {
-        return String::new();
-    }
-    let mut end = w.saturating_sub(1);
-    while end > 0 && !s[..end].is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = s[..end].to_string();
-    out.push('…');
-    out
 }

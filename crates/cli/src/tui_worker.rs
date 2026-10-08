@@ -1188,45 +1188,36 @@ pub fn run_tui_turn(
                 removed,
                 checkpoint_id: _,
             } => {
-                orbit_hud_tui::emit_status(sender, &format!("~ {path}  +{added} −{removed}"));
+                orbit_hud_tui::emit_file_changed(sender, &path, added, removed);
             }
             E::SubagentStarted {
-                agent_id: _,
+                agent_id,
                 name,
                 task,
                 model: _,
             } => {
-                orbit_hud_tui::emit_status(sender, &format!("agent {name}: {task}"));
+                orbit_hud_tui::emit_subagent_started(sender, &agent_id, &name, &task);
             }
-            E::SubagentProgress {
-                agent_id: _,
-                action,
-            } => {
-                orbit_hud_tui::emit_status(sender, &format!("  {action}"));
+            E::SubagentProgress { agent_id, action } => {
+                orbit_hud_tui::emit_subagent_progress(sender, &agent_id, &action);
             }
-            E::SubagentFinished {
-                agent_id: _,
-                report,
-            } => {
-                orbit_hud_tui::emit_status(sender, &format!("agent done: {report}"));
+            E::SubagentFinished { agent_id, report } => {
+                orbit_hud_tui::emit_subagent_finished(sender, &agent_id, &report);
             }
             E::ModeChanged { mode } => {
-                orbit_hud_tui::emit_status(sender, &format!("mode: {mode}"));
+                orbit_hud_tui::emit_mode_changed(sender, &mode);
             }
             E::Usage {
                 used_tokens,
                 window_tokens,
             } => {
-                orbit_hud_tui::emit_status(
-                    sender,
-                    &format!("context {used_tokens}/{} tokens", window_tokens),
-                );
+                orbit_hud_tui::emit_usage(sender, used_tokens, window_tokens);
             }
             E::LedgerAppended {
-                record_count: _,
-                head_digest,
+                record_count,
+                head_digest: _,
             } => {
-                orbit_hud_tui::emit_status(sender, &format!("◈ ledger {head_digest}"));
+                orbit_hud_tui::emit_ledger_appended(sender, record_count);
             }
             _ => {}
         }
