@@ -2668,6 +2668,7 @@ dependencies = [
  "crossterm",
  "orbit-hud",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
  "signal-hook",

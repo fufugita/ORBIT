@@ -203,7 +203,16 @@ class PtySession:
         except Exception:
             self.proc.kill()
             self.proc.wait()
-        os.close(self.master)
+        self._close_master()
+
+    def _close_master(self):
+        if self.master is None:
+            return
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+        self.master = None
 
 
 def _port_open(port, timeout=0.5):
@@ -720,7 +729,47 @@ def main():
         if not exited:
             s5.terminate()
 
-    # ── 9. Resize → no crash ───────────────────────────────────────────────
+    # ── 9. Terminal death under the app (closed PTY master) → no orphan ────
+    #
+    # Regression test for the orphan-spin bug: closing the master end of the
+    # PTY deletes the terminal underneath the running TUI. The kernel makes
+    # the input fd permanently ready-with-EOF, so crossterm 0.29's tty read
+    # loop never returns and the event loop cannot reach its signal check —
+    # the process used to spin at 100% CPU forever. The terminal watchdog
+    # (crates/hud-tui/src/terminal.rs) polls for POLLHUP/POLLERR, flags
+    # SIGHUP for a graceful shutdown, and force-exits 128+1 after a grace
+    # period if the loop is wedged. This test closes the master and expects
+    # the process to exit (exit code 129) WITHOUT burning CPU in between.
+    print("\n== Terminal-death (master close) test ==")
+    s7 = PtySession(
+        [args.binary, "--home", args.home, "--model", args.model],
+        env=env, timeout=20, rows=30, cols=100,
+    )
+    ok, _ = s7.wait_for("ORBIT", timeout=15)
+    check("boots TUI for terminal-death test", ok)
+    if ok:
+        # Close the master: the terminal is deleted under the app.
+        t_dead = time.time()
+        s7._close_master()
+        exited = False
+        try:
+            s7.proc.wait(timeout=10)
+            exited = True
+        except subprocess.TimeoutExpired:
+            pass
+        check("exits after terminal death (no orphan spin)", exited,
+              "still running 10s after PTY close")
+        if exited:
+            code = s7.proc.returncode
+            elapsed = time.time() - t_dead
+            check("exit code is 128+1 (SIGHUP)", code == 129,
+                  f"exit code {code}")
+            check("exits within the watchdog grace window", elapsed < 5.5,
+                  f"{elapsed:.1f}s")
+        if not exited:
+            s7.terminate()
+
+    # ── 10. Resize → no crash ──────────────────────────────────────────────
     print("\n== Resize test ==")
     s4 = PtySession(
         [args.binary, "--home", args.home, "--model", args.model],

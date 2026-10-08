@@ -18,6 +18,24 @@
 //!   Keyboard Ctrl+C is distinct: raw mode delivers it as a key event, which
 //!   drives the interactive double-press-to-quit flow instead.
 //!
+//! ## The terminal watchdog (2026-10-07)
+//!
+//! A closed PTY master does NOT only deliver SIGHUP: it also makes the input
+//! fd permanently readable-with-no-data (`read` returns EOF or EIO
+//! instantly, forever). crossterm 0.29's tty read loop has no exit for that
+//! case — `event::poll` never returns and the event loop can never reach its
+//! signal check. Observed live: three `orbit` processes spinning at 45–99%
+//! CPU on deleted PTYs for hours after their terminals closed.
+//!
+//! [`TerminalWatchdog`] closes the gap. It polls the input fd with
+//! `events = 0` (only POLLHUP/POLLERR/POLLNVAL — which the kernel always
+//! reports, so it never contends with crossterm for input bytes). When the
+//! terminal dies it (a) sets `SIGHUP_FLAG` so a HEALTHY loop exits through
+//! its normal shutdown path within one tick, then (b) after a grace period,
+//! force-exits `128 + 1` for the wedged case. `_exit` is safe there: the
+//! terminal is gone, nothing can be rendered or flushed, and the session
+//! file is written per-turn — the most that is lost is the in-flight turn.
+//!
 //! `Drop` restores the terminal unconditionally — even on panic — so the
 //! operator's terminal is never left in a broken state. Write failures on an
 //! already-dead PTY are swallowed (`.ok()`): there is nothing left to restore.
@@ -32,8 +50,9 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::Stdout;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -42,6 +61,17 @@ pub type Term = Terminal<CrosstermBackend<Stdout>>;
 static SIGTERM_FLAG: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 static SIGHUP_FLAG: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 static SIGINT_FLAG: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+
+/// The moment the terminal watchdog detected terminal loss — set when the
+/// watchdog first sees POLLHUP/POLLERR on the input fd. `0` = terminal
+/// alive (or watchdog not yet run).
+///
+/// Distinct from [`SIGHUP_FLAG`]: the kernel delivers SIGHUP *to the process*
+/// on master close (caught → graceful path), while the watchdog detects
+/// *terminal death via the fd* for the case where the signal was missed or
+/// the loop can no longer reach its signal check. The watchdog sets BOTH.
+static TERMINAL_DEAD_AT: LazyLock<Arc<AtomicU64>> =
+    LazyLock::new(|| Arc::new(AtomicU64::new(0)));
 
 /// A terminal-loss / external-termination signal caught since the last poll.
 ///
@@ -101,11 +131,110 @@ pub(crate) fn force_signal(sig: ShutdownSignal) {
     }
 }
 
+/// The terminal watchdog: a background thread that detects terminal death
+/// when the event loop cannot (see the module doc — crossterm 0.29's tty
+/// read loop never returns on a dead PTY, wedging the loop at 100% CPU).
+///
+/// It polls the input fd with `events = 0`: POLLHUP/POLLERR/POLLNVAL are
+/// always reported by the kernel regardless of the requested events, so the
+/// watchdog never contends with crossterm for input bytes and costs one
+/// syscall per [`WATCHDOG_POLL_MS`]. On terminal death it:
+///
+/// 1. sets `SIGHUP_FLAG` (a healthy loop exits through its normal
+///    noninteractive-shutdown path on the next tick), and
+/// 2. records the death time; if the process is still alive
+///    [`WATCHDOG_GRACE`] later, force-exits `128 + 1` — the wedged case.
+///    Nothing can be rendered or flushed on a dead terminal, and the
+///    session file is written per-turn, so `_exit` loses at most the
+///    in-flight turn.
+///
+/// The thread parks in `poll` and exits with the process; it is a daemon
+/// by construction (never joined, never blocks shutdown).
+pub(crate) struct TerminalWatchdog;
+
+/// The watchdog's poll cadence. Not performance-critical — it exists to
+/// catch a case that must not persist, not to react in milliseconds.
+const WATCHDOG_POLL_MS: i64 = 500;
+
+/// How long the watchdog waits for the event loop to shut itself down
+/// after terminal death before force-exiting. Generous against a slow
+/// final render or a busy provider round finishing up.
+const WATCHDOG_GRACE: Duration = Duration::from_secs(3);
+
+impl TerminalWatchdog {
+    /// Spawn the watchdog for the input fd crossterm reads (stdin — the
+    /// guard is only entered when stdin is a TTY; crossterm's `tty_fd()`
+    /// uses stdin in exactly that case, so the fds match).
+    pub fn spawn() -> Self {
+        let stdin = std::io::stdin();
+        std::thread::Builder::new()
+            .name("orbit-terminal-watchdog".into())
+            .spawn(move || Self::run(&stdin))
+            .ok();
+        Self
+    }
+
+    fn run(input: &std::io::Stdin) {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        loop {
+            let mut fds = [PollFd::new(input, PollFlags::empty())];
+            let timeout = Timespec {
+                tv_sec: 0,
+                tv_nsec: WATCHDOG_POLL_MS * 1_000_000,
+            };
+            let n = match poll(&mut fds, Some(&timeout)) {
+                Ok(n) => n,
+                Err(_) => {
+                    // A transient poll failure (EINTR-class) — retry. A
+                    // permanent one means the fd is unusable; treat that
+                    // as terminal death rather than spinning.
+                    std::thread::sleep(Duration::from_millis(WATCHDOG_POLL_MS as u64));
+                    continue;
+                }
+            };
+            if n == 0 {
+                continue;
+            }
+            let revents = fds[0].revents();
+            if revents
+                .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
+            {
+                Self::terminal_died();
+                return;
+            }
+            // POLLIN-only with events=0 cannot happen (we requested
+            // nothing); anything else is unexpected — keep watching.
+        }
+    }
+
+    fn terminal_died() {
+        // (a) The graceful path: a healthy event loop sees SIGHUP on its
+        // next tick and runs its normal shutdown (deny approvals, save,
+        // exit 129).
+        SIGHUP_FLAG.store(true, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        TERMINAL_DEAD_AT.store(now, Ordering::Relaxed);
+        // (b) The wedged path: crossterm's read loop never returns on a
+        // dead PTY, so the loop above may never run again. Give the
+        // process the grace period, then take the conventional exit.
+        std::thread::sleep(WATCHDOG_GRACE);
+        std::process::exit(ShutdownSignal::Hangup.exit_code());
+    }
+}
+
 /// Owns the terminal; restores it on drop.
 pub struct TerminalGuard {
     /// Whether we enabled mouse capture (§12.4: the prototype does not).
     pub mouse_capture: bool,
     pub terminal: Term,
+    /// The terminal-death watchdog (module doc): detects a closed PTY when
+    /// the event loop is wedged inside crossterm's read and cannot reach
+    /// its signal check. Held so its lifetime reads clearly; the thread
+    /// itself parks in poll and exits with the process.
+    _watchdog: TerminalWatchdog,
 }
 
 /// Ambiguous-width probe (§11.3): print ● at column 0, ask the terminal
@@ -201,9 +330,14 @@ impl TerminalGuard {
         }
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).map_err(|e| format!("create terminal: {e}"))?;
+        // The watchdog watches the same fd crossterm reads (stdin — we are
+        // only here when stdin is a TTY). Spawned AFTER raw mode + alt
+        // screen so a probe failure never leaves a watchdog behind.
+        let watchdog = TerminalWatchdog::spawn();
         Ok(Self {
             terminal,
             mouse_capture,
+            _watchdog: watchdog,
         })
     }
 
