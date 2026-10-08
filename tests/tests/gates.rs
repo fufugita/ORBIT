@@ -9,6 +9,20 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
+
+/// The orbit binary built by THIS invocation (Q2): the active profile
+/// first (PROFILE is set for the test's build), then debug — never a
+/// stale release preferred over the current build.
+fn orbit_bin() -> std::path::PathBuf {
+    let target = workspace_target();
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    let active = target.join(&profile).join("orbit");
+    if active.exists() {
+        return active;
+    }
+    target.join("debug/orbit")
+}
+
 /// The workspace root (tests run from tests/, the target dir is the
 /// workspace's).
 fn workspace_target() -> std::path::PathBuf {
@@ -46,7 +60,15 @@ fn spawn_mock_guarded() -> (u16, MockGuard) {
     let target = workspace_target();
     let mut last_err = String::new();
     for attempt in 0..3 {
-        for profile in ["release", "debug"] {
+        // Q2: the profile this invocation builds first, then the other
+        // as fallback — the mock must match the orbit binary under test.
+        let profile_env = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+        let profiles: [&str; 2] = if profile_env == "release" {
+            ["release", "debug"]
+        } else {
+            ["debug", "release"]
+        };
+        for profile in profiles {
             let bin = target.join(profile).join("orbit-mock-provider");
             if !bin.exists() {
                 last_err = format!("{} not built", bin.display());
@@ -157,11 +179,7 @@ fn run_orbit_p_model(
     extra: &[&str],
 ) -> (Vec<serde_json::Value>, i32) {
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     let mut cmd = Command::new(&bin)
         .arg("-p")
         .arg(prompt)
@@ -242,11 +260,7 @@ fn gate3_tools_run_through_the_binary() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-binary");
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
     // --auto-tools: the honest way to let tools run headless. Without
@@ -295,11 +309,7 @@ fn gate1_env_mention_refused_through_binary() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g1-binary");
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
     // The @.env expansion happens in the TUI composer; headless passes
@@ -336,11 +346,7 @@ fn gate4_auto_compaction_through_the_binary() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g4-compact");
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
     // A tiny window: 100 tokens → threshold = 90. init does not write
@@ -406,11 +412,7 @@ fn gate4_continue_after_kill9() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g4-continue");
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
     // Turn 1 completes normally: the session file exists with 1 turn.
@@ -493,11 +495,7 @@ fn gate4_continue_after_kill9() {
 fn mod_install_signed_flow_through_binary() {
     let home = fresh_home("mod-install");
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
     // Generate a key, sign a manifest, trust the issuer, install.
@@ -592,11 +590,7 @@ fn gate6_ci_run_allowlist_and_exit_codes() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g6-ci");
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
     // The CI shape: explicit allowlist, bare start, json summary,
@@ -652,11 +646,7 @@ fn run_orbit_p_ext(
     extra: &[&str],
 ) -> (Vec<serde_json::Value>, i32) {
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     let mut cmd = Command::new(&bin)
         .arg("-p")
         .arg(prompt)
@@ -915,11 +905,7 @@ fn gate3_verify_ledger_lists_the_triple() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-ledger");
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
     // One turn with one tool call (the mock's calculator).
@@ -979,11 +965,7 @@ fn gate3_danger_triple_denial_egress_highrisk() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-danger");
     let target = workspace_target();
-    let bin = if target.join("release/orbit").exists() {
-        target.join("release/orbit")
-    } else {
-        target.join("debug/orbit")
-    };
+    let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
     // dontAsk: all three denied — the honest headless check. Without

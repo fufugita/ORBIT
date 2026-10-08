@@ -379,7 +379,7 @@ fn openai_slow_bash_tool_calls() -> String {
 }
 fn anthropic_slow_bash_tool_calls() -> String {
     [
-        r#"data: {"type":"message_start","usage":{"input_tokens":5,"output_tokens":0}}"#,
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#,
         r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-slow","name":"Bash","input":{}}}"#,
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"sleep 30 && echo done\"}"}}"#,
@@ -408,7 +408,7 @@ fn openai_danger_triple() -> String {
 }
 fn anthropic_danger_triple() -> String {
     [
-        r#"data: {"type":"message_start","usage":{"input_tokens":5,"output_tokens":0}}"#,
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#,
         r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-d1","name":"Read","input":{}}}"#,
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"~/.ssh/id_rsa\"}"}}"#,
         r#"data: {"type":"content_block_stop","index":0}"#,
@@ -426,7 +426,7 @@ fn anthropic_danger_triple() -> String {
 
 fn anthropic_bash_tool_calls() -> String {
     [
-        r#"data: {"type":"message_start","usage":{"input_tokens":5,"output_tokens":0}}"#,
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#,
         r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-9","name":"Bash","input":{}}}"#,
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"touch approval-probe.txt\"}"}}"#,
@@ -439,7 +439,7 @@ fn anthropic_bash_tool_calls() -> String {
 
 fn anthropic_tool_calls() -> String {
     [
-        r#"data: {"type":"message_start","usage":{"input_tokens":5,"output_tokens":0}}"#,
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#,
         r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-1","name":"calculator","input":{}}}"#,
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"expression\":"}}"#,
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"2*(3+4)\"}"}}"#,
@@ -455,7 +455,7 @@ fn anthropic_fat() -> String {
     let para = "The quick brown fox jumps over the lazy dog. ".repeat(40); // ~2k chars
     let body = para.repeat(25); // ~50k chars ≈ 12k+ tokens
     [
-        r#"{"type":"message_start","usage":{"input_tokens":3,"output_tokens":0}}"#,
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
         &format!(
             r#"{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{body}"}}}}"#
         ),
@@ -467,7 +467,7 @@ fn anthropic_fat() -> String {
 
 fn anthropic_success() -> String {
     [
-        r#"data: {"type":"message_start","usage":{"input_tokens":3,"output_tokens":0}}"#,
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
         r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello world"}}"#,
         r#"data: {"type":"message_stop","usage":{"input_tokens":3,"output_tokens":2}}"#,
         "",

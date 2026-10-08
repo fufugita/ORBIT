@@ -18,10 +18,14 @@ non-overridable compliance kernel.
 The v0.1 release-gate claims previously printed here ("implementation-
 complete", "audited release-ready") were not accurate: the capability
 gap analysis of 2 Oct 2026 found no working tools, one provider kind,
-and four copies of the agent loop. Development now follows the six-
-phase roadmap in `docs/roadmap/` — phase 1 (fix the honesty and
-privacy defects) is in progress. No roadmap gate has been passed yet;
-this section will name the last gate that has.
+and four copies of the agent loop. Development then followed the
+repair guide (`REPAIR_GUIDE`): the B (blocker), S (security), E
+(error-mapping) and C (CLI honesty) finding series have landed with
+their scenario tests, plus a terminal watchdog that stops a closed
+PTY from orphaning the TUI. **Last gate passed: Phase 4 (turn
+integrity)** — compaction, interrupt, hooks and attestation — via the
+scenario suite in `tests/tests/scenarios.rs`. The TUI redesign
+(prototype motion work) is in progress on top.
 
 | Track | State |
 |---|---|
@@ -66,15 +70,16 @@ content can never become user authority.
 - **Interactive REPL** — streaming multi-turn conversation with slash
   commands (`/help`, `/model`, `/clear`, `/usage`, `/models`, `/sessions`),
   session persistence, and resume.
-- **Terminal UI** — a ratatui + crossterm front-end with a three-pane layout
-  (Sessions/Verbose, Conversation, Tasks), dedicated composer, animated
-  status, markdown/code/slash-command rendering, and a customizable theme.
-  Launches automatically when stdin/stdout are a TTY; `--no-tui` opts out.
+- **Terminal UI** — a ratatui + crossterm front-end: the motion-first
+  prototype screen (Sessions rail, Conversation, Workspace rail) is the
+  default when stdin/stdout are a TTY; `--old-tui` keeps the earlier
+  three-pane HUD and `--no-tui` drops to the plain REPL. Theme and
+  motion settings live in `tui.toml`.
 - **Tool calling with approval** — `y` (allow once), `n` (deny), `R`
   (always-allow-this-tool-this-session, ledger-logged, revocable), `Esc`
   (deny). Session-scoped grants never bypass the known-tool check.
 - **Usage and cost accounting** — per-turn and cumulative token counts and
-  microcent costs, surfaced in the status bar and session files.
+  microdollar costs, surfaced in the status bar and session files.
 - **WASI plugin runtime** — wasmtime 47 with an import allowlist, bounded
   instance pool, and WASI-kill lifecycle.
 - **Trace, replay, export, restore** — verify the Ledger hash chain, emit a
@@ -82,8 +87,9 @@ content can never become user authority.
   namespace.
 - **SDKs** — TypeScript (lead) and Python (parity) expose the IR types and
   workflow descriptors for cross-language conformance.
-- **Release evidence** — `orbit version --evidence` emits version, build
-  metadata, SBOM hash, provenance, and reproducibility claims.
+- **Release evidence** — `orbit version` emits the version, the commit it
+  was built from, the build profile, and hashes of the evidence bundle when
+  one exists (all computed from the files on disk; no fixed claims).
 
 ## Quickstart
 
@@ -124,11 +130,14 @@ orbit verify-ledger    verify the Ledger hash chain
 orbit replay --dry     verify + emit a no-dispatch replay plan
 orbit export --to      encrypt an age bundle
 orbit restore          restore into a fresh namespace
-orbit version          release evidence (claims + hashes)
+orbit version          build + evidence facts (computed, no fixed claims)
+orbit web              start the browser harness
+orbit -p PROMPT        headless one-shot with tools (stream-json)
 ```
 
 Common flags: `--model <M>`, `--gate <URL>`, `--provider <name>`,
-`--no-tui`, `--auto-tools`.
+`--home <DIR>`, `--continue`, `--resume <ID>`, `--no-tui`,
+`--old-tui`, `--auto-tools`, `--permission-mode <M>`.
 
 ## Architecture
 
