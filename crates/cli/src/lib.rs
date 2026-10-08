@@ -270,9 +270,7 @@ pub fn version_evidence(version: &str, commit_sha: &str) -> CliOutput {
     let provenance_sha = hash_of(evidence_dir.join("provenance.intoto.jsonl"));
     // A bundle is ready only when every artifact EXISTS and hashes to
     // something — a present-but-empty file is not evidence.
-    let bundle_ready = !sbom_sha.is_empty()
-        && !repro_sha.is_empty()
-        && !provenance_sha.is_empty();
+    let bundle_ready = !sbom_sha.is_empty() && !repro_sha.is_empty() && !provenance_sha.is_empty();
 
     CliOutput::ok(
         "version",

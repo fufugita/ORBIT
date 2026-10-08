@@ -21,14 +21,46 @@ fn canonical(v: serde_json::Value) -> String {
 
 #[test]
 fn cli_version_evidence_golden() {
+    // C2 made the record COMPUTED: the commit, profile, arch and evidence
+    // hashes all vary by build, so a byte-golden would pin a lie. The
+    // golden now pins the envelope + echoed inputs + the field SET, and
+    // the dynamic fields are asserted present and non-empty — every
+    // claim the record makes must be backed by a computed value.
     let out = orbit_cli::version_evidence("0.1.0", "dev");
-    let actual = canonical(serde_json::to_value(&out).unwrap());
-    let golden_raw = std::fs::read_to_string(fixture_path("version_evidence.golden.json")).unwrap();
-    let golden = canonical(serde_json::from_str(&golden_raw).unwrap());
-    assert_eq!(
-        actual, golden,
-        "version --evidence must match the golden fixture"
+    let v = serde_json::to_value(&out).unwrap();
+    assert_eq!(v["schema_version"], "orbit.cli/v1");
+    assert_eq!(v["command"], "version");
+    assert_eq!(v["status"], "ok");
+    // Echoed inputs.
+    assert_eq!(v["data"]["version"], "0.1.0");
+    assert_eq!(v["data"]["commit_sha"], "dev");
+    // Build facts: present, non-empty, one of the known profiles.
+    let profile = v["data"]["build"]["profile"].as_str().unwrap_or("");
+    assert!(
+        profile == "debug" || profile == "release",
+        "profile must be the real build profile, got {profile:?}"
     );
+    assert!(!v["data"]["build"]["target"].as_str().unwrap_or("").is_empty());
+    assert!(!v["data"]["build"]["toolchain"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty());
+    // Evidence: hashes present (hex or empty) and bundle_ready CONSISTENT
+    // with them — a bundle is ready only when all three hash to something.
+    let ev = &v["data"]["evidence"];
+    let shas = ["sbom_sha256", "provenance_sha256", "reproducibility_sha256"];
+    let all_present = shas
+        .iter()
+        .all(|k| !ev[k].as_str().unwrap_or("").is_empty());
+    assert_eq!(
+        ev["bundle_ready"].as_bool().unwrap_or(false),
+        all_present,
+        "bundle_ready must be derived from the evidence files, not asserted"
+    );
+    // The fixed claim booleans are GONE — this record states only what it
+    // computed (the old fixture pinned implementation_complete etc.).
+    assert!(v["data"].get("claims").is_none());
+    assert!(v["data"].get("audit").is_none());
 }
 
 #[test]

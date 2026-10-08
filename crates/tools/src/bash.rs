@@ -385,7 +385,7 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
             .process_group(0);
         cmd.spawn()
     };
-    let mut child = if sandboxed {
+    let child = if sandboxed {
         let mut wrapped = sandbox.wrap(command, &cx.working_dir);
         match spawn(&mut wrapped) {
             Ok(c) => c,

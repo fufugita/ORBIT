@@ -78,7 +78,11 @@ fn main() {
             std::process::exit(0);
         }
     }
-    if args.first().map(|a| a == "--version" || a == "-V").unwrap_or(false) {
+    if args
+        .first()
+        .map(|a| a == "--version" || a == "-V")
+        .unwrap_or(false)
+    {
         println!("orbit {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
@@ -129,7 +133,10 @@ fn print_human_help() {
         ("init", "initialize trust root + PIB + ledger"),
         ("models", "list models from all configured providers"),
         ("ask PROMPT", "send one prompt through a configured gateway"),
-        ("-p PROMPT", "headless one-shot with tools (stream-json output)"),
+        (
+            "-p PROMPT",
+            "headless one-shot with tools (stream-json output)",
+        ),
         ("web", "start the browser harness (orbit-web bridge)"),
         ("verify-ledger", "verify the ledger hash chain"),
         ("replay --dry", "verify + emit a no-dispatch replay plan"),
@@ -150,7 +157,10 @@ fn print_human_help() {
         ("--continue", "reopen the latest session in this directory"),
         ("--resume <ID>", "resume a specific session"),
         ("--no-tui", "plain REPL instead of the TUI"),
-        ("--auto-tools", "TUI/chat: run tools without asking (bypass)"),
+        (
+            "--auto-tools",
+            "TUI/chat: run tools without asking (bypass)",
+        ),
     ] {
         println!("    {name:<28} {desc}");
     }
@@ -237,13 +247,11 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "ask" => cmd_ask(&home, args),
         "models" | "list-models" => cmd_models(&home, args),
         "mod" => cmd_mod(&home, args),
-        "version" => Ok(
-            serde_json::to_value(orbit_cli::version_evidence(
-                env!("CARGO_PKG_VERSION"),
-                &build_commit(),
-            ))
-            .unwrap_or_default(),
-        ),
+        "version" => Ok(serde_json::to_value(orbit_cli::version_evidence(
+            env!("CARGO_PKG_VERSION"),
+            &build_commit(),
+        ))
+        .unwrap_or_default()),
         "--help" | "-h" | "help" => Ok(serde_json::json!({
             "schema": "orbit.cli/v1",
             "command": "help",
@@ -278,10 +286,6 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
 /// behaviour) — a fresh checkout must not shadow the user config.
 /// C8: the implementation lives in config::resolve_home — ONE resolver
 /// for every crate (tools.rs used to default to a CWD-relative `.orbit`).
-fn default_orbit_home() -> PathBuf {
-    orbit_cli::config::resolve_home(&[])
-}
-
 fn orbit_home(args: &[String]) -> Option<PathBuf> {
     Some(orbit_cli::config::resolve_home(args))
 }
@@ -799,11 +803,7 @@ fn cmd_export(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
         .and_then(|v| v.get("pib_id").and_then(|p| p.as_str()).map(String::from))
         .unwrap_or_else(|| "pib-unknown".into());
     let (recipient, identity) = generate_local_key();
-    let mut b = ExportBuilder::new(
-        "session-example".into(),
-        pib_id,
-        head.trim().into(),
-    );
+    let mut b = ExportBuilder::new("session-example".into(), pib_id, head.trim().into());
     b.add_file("ledger/segments".into(), &ledger_bytes).exclude(
         "ephemeral/prompt.txt".into(),
         "prompt bytes excluded (IF-10)",

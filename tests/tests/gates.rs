@@ -9,7 +9,6 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
-
 /// The orbit binary built by THIS invocation (Q2): the active profile
 /// first (PROFILE is set for the test's build), then debug — never a
 /// stale release preferred over the current build.
@@ -178,7 +177,6 @@ fn run_orbit_p_model(
     model: &str,
     extra: &[&str],
 ) -> (Vec<serde_json::Value>, i32) {
-    let target = workspace_target();
     let bin = orbit_bin();
     let mut cmd = Command::new(&bin)
         .arg("-p")
@@ -259,7 +257,6 @@ fn init_home(bin: &str, home: &std::path::Path) {
 fn gate3_tools_run_through_the_binary() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-binary");
-    let target = workspace_target();
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
@@ -308,7 +305,6 @@ fn gate3_tools_run_through_the_binary() {
 fn gate1_env_mention_refused_through_binary() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g1-binary");
-    let target = workspace_target();
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
@@ -345,7 +341,6 @@ fn gate1_env_mention_refused_through_binary() {
 fn gate4_auto_compaction_through_the_binary() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g4-compact");
-    let target = workspace_target();
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
@@ -411,7 +406,6 @@ context_window = 100
 fn gate4_continue_after_kill9() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g4-continue");
-    let target = workspace_target();
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
@@ -494,7 +488,6 @@ fn gate4_continue_after_kill9() {
 #[test]
 fn mod_install_signed_flow_through_binary() {
     let home = fresh_home("mod-install");
-    let target = workspace_target();
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
@@ -589,7 +582,6 @@ fn mod_install_signed_flow_through_binary() {
 fn gate6_ci_run_allowlist_and_exit_codes() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g6-ci");
-    let target = workspace_target();
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
@@ -645,7 +637,6 @@ fn run_orbit_p_ext(
     prompt: &str,
     extra: &[&str],
 ) -> (Vec<serde_json::Value>, i32) {
-    let target = workspace_target();
     let bin = orbit_bin();
     let mut cmd = Command::new(&bin)
         .arg("-p")
@@ -904,7 +895,6 @@ fn gate2_no_front_end_owns_a_loop() {
 fn gate3_verify_ledger_lists_the_triple() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-ledger");
-    let target = workspace_target();
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
@@ -964,7 +954,6 @@ fn gate3_verify_ledger_lists_the_triple() {
 fn gate3_danger_triple_denial_egress_highrisk() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g3-danger");
-    let target = workspace_target();
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
