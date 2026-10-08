@@ -187,9 +187,13 @@ env = "ORBIT_GATE_TOKEN"   # env-var NAME, never the value
 id = "model-a"
 
 [provider.models.pricing]
-input_per_million_microcents = 200000
-output_per_million_microcents = 600000
+input_per_million_microdollars = 200000   # $0.20 per million input tokens
+output_per_million_microdollars = 600000   # $0.60 per million output tokens
 ```
+
+The pricing unit is microdollars per million tokens (the old key names
+`*_per_million_microcents` still parse — they were mislabeled; the values
+always meant microdollars).
 
 ### `tui.toml`
 

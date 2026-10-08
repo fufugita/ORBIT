@@ -142,7 +142,8 @@ impl Tool for BashTool {
             "properties": {
                 "command": { "type": "string", "description": "The command to run" },
                 "timeout": { "type": "integer", "description": "Seconds before moving to background (default 120, max 600)" },
-                "description": { "type": "string", "description": "What this command does (for the operator)" }
+                "description": { "type": "string", "description": "What this command does (for the operator)" },
+                "run_in_background": { "type": "boolean", "description": "Start the command detached and return a task_id at once; stop it with TaskStop (C7 — the flag was advertised by TaskStop but missing from this schema, so a call with it ran in the foreground)" }
             },
             "required": ["command"]
         })
@@ -168,6 +169,16 @@ impl Tool for BashTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
+        // C7: an explicit background run skips the wait entirely — the
+        // command is spawned, registered, and the task_id returns at
+        // once (the timeout path still auto-backgrounds long commands).
+        if input
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return run_command_backgrounded(command, cx);
+        }
         run_command(command, timeout, cx)
     }
 }
@@ -338,6 +349,91 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
             Err(e) => return ToolResult::err(&format!("wait failed: {e}")),
         }
     }
+}
+
+/// Run a command detached from the start (C7: Bash run_in_background).
+/// Same spawn discipline as run_command — sandbox when available,
+/// env-allowlist otherwise, own process group — but no wait loop: the
+/// task_id returns at once and a reaper thread writes the output when
+/// the command finishes. TaskStop kills it by id.
+pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
+    use std::process::{Command, Stdio};
+
+    if command_touches_deny_read(command) {
+        return ToolResult::denied(
+            "the command touches a deny-read path (credentials never reach a provider)",
+        );
+    }
+
+    let output_path = cx
+        .outputs_dir()
+        .map(|d| d.join(format!("bash-{}.log", ulid::Ulid::new())))
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!("orbit-bash-{}.log", ulid::Ulid::new()))
+        });
+
+    let sandbox = crate::sandbox::ShellSandbox::standard(&cx.working_dirs, &cx.session_id);
+    let sandboxed = matches!(
+        crate::sandbox::ShellSandbox::probe(),
+        crate::sandbox::SandboxStatus::Confined
+    );
+
+    let spawn = |cmd: &mut std::process::Command| -> std::io::Result<std::process::Child> {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        cmd.spawn()
+    };
+    let mut child = if sandboxed {
+        let mut wrapped = sandbox.wrap(command, &cx.working_dir);
+        match spawn(&mut wrapped) {
+            Ok(c) => c,
+            Err(e) => return ToolResult::err(&format!("cannot spawn sandboxed bash: {e}")),
+        }
+    } else {
+        let mut plain = Command::new("bash");
+        plain
+            .arg("-c")
+            .arg(command)
+            .current_dir(&cx.working_dir)
+            .env_clear()
+            .envs(env_allowlist());
+        match spawn(&mut plain) {
+            Ok(c) => c,
+            Err(e) => return ToolResult::err(&format!("cannot spawn bash: {e}")),
+        }
+    };
+
+    let id = format!("bg-{}", ulid::Ulid::new());
+    let pid = child.id() as i32;
+    if let Ok(mut bg) = BACKGROUND.lock() {
+        bg.push(BackgroundCommand {
+            id: id.clone(),
+            command: command.to_string(),
+            output_path: output_path.clone(),
+            pid,
+            started: std::time::Instant::now(),
+        });
+    }
+    let path = output_path.clone();
+    std::thread::spawn(move || {
+        if let Ok(o) = child.wait_with_output() {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let _ = std::fs::write(&path, combined);
+        }
+    });
+    ToolResult::ok(json!({
+        "ok": true,
+        "backgrounded": true,
+        "task_id": id,
+        "note": format!("running detached; output will land in {}", output_path.display()),
+        "sandboxed": sandboxed,
+    }))
 }
 
 fn read_pipes(

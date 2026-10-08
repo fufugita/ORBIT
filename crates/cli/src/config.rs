@@ -10,33 +10,60 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Per-million-token pricing in microcents (DR-09 §8). All optional; a model
-/// with no pricing block is billed at 0 µ¢ until the user declares rates.
+/// Per-million-token pricing in microdollars (DR-09 §8; C5: the unit was
+/// mislabeled "microcents" — 200000 means $0.20 per million tokens, and the
+/// display path divides by 1e6 to print dollars, which is only correct for
+/// microdollars). All optional; a model with no pricing block is billed at
+/// $0 until the user declares rates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Pricing {
-    #[serde(default)]
-    pub input_per_million_microcents: u64,
-    #[serde(default)]
-    pub output_per_million_microcents: u64,
-    #[serde(default)]
-    pub cache_read_per_million_microcents: Option<u64>,
-    #[serde(default)]
-    pub cache_write_per_million_microcents: Option<u64>,
-    #[serde(default)]
-    pub reasoning_per_million_microcents: Option<u64>,
-    #[serde(default)]
-    pub request_flat_microcents: u64,
+    #[serde(
+        default,
+        alias = "input_per_million_microcents",
+        rename = "input_per_million_microdollars"
+    )]
+    pub input_per_million_microdollars: u64,
+    #[serde(
+        default,
+        alias = "output_per_million_microcents",
+        rename = "output_per_million_microdollars"
+    )]
+    pub output_per_million_microdollars: u64,
+    #[serde(
+        default,
+        alias = "cache_read_per_million_microcents",
+        rename = "cache_read_per_million_microdollars"
+    )]
+    pub cache_read_per_million_microdollars: Option<u64>,
+    #[serde(
+        default,
+        alias = "cache_write_per_million_microcents",
+        rename = "cache_write_per_million_microdollars"
+    )]
+    pub cache_write_per_million_microdollars: Option<u64>,
+    #[serde(
+        default,
+        alias = "reasoning_per_million_microcents",
+        rename = "reasoning_per_million_microdollars"
+    )]
+    pub reasoning_per_million_microdollars: Option<u64>,
+    #[serde(
+        default,
+        alias = "request_flat_microcents",
+        rename = "request_flat_microdollars"
+    )]
+    pub request_flat_microdollars: u64,
 }
 
 impl From<Pricing> for orbit_adapter::types::CostRates {
     fn from(p: Pricing) -> Self {
         orbit_adapter::types::CostRates {
-            input_per_million_microcents: p.input_per_million_microcents,
-            output_per_million_microcents: p.output_per_million_microcents,
-            cache_read_per_million_microcents: p.cache_read_per_million_microcents,
-            cache_write_per_million_microcents: p.cache_write_per_million_microcents,
-            reasoning_per_million_microcents: p.reasoning_per_million_microcents,
-            request_flat_microcents: p.request_flat_microcents,
+            input_per_million_microcents: p.input_per_million_microdollars,
+            output_per_million_microcents: p.output_per_million_microdollars,
+            cache_read_per_million_microcents: p.cache_read_per_million_microdollars,
+            cache_write_per_million_microcents: p.cache_write_per_million_microdollars,
+            reasoning_per_million_microcents: p.reasoning_per_million_microdollars,
+            request_flat_microcents: p.request_flat_microdollars,
         }
     }
 }
@@ -102,6 +129,41 @@ fn default_kind() -> String {
 pub struct ProvidersConfig {
     #[serde(default)]
     pub provider: Vec<ProviderConfig>,
+}
+
+/// The ONE ORBIT-home resolver (C8): `--home` flag > `ORBIT_HOME` env >
+/// `~/.orbit` (when it exists) > a repo-local `.orbit` (only when it
+/// already exists — a fresh checkout must not shadow the user config) >
+/// `~/.orbit` as the creation default. Every crate and every path through
+/// the CLI resolves the home through this function; the old second
+/// resolver in tools.rs defaulted to a CWD-relative `.orbit` and silently
+/// disagreed with the rest of ORBIT.
+pub fn resolve_home(args: &[String]) -> std::path::PathBuf {
+    if let Some(h) = args
+        .windows(2)
+        .find(|w| w[0] == "--home")
+        .map(|w| w[1].clone())
+    {
+        return std::path::PathBuf::from(h);
+    }
+    if let Ok(h) = std::env::var("ORBIT_HOME") {
+        if !h.is_empty() {
+            return std::path::PathBuf::from(h);
+        }
+    }
+    let user = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".orbit"));
+    if let Some(u) = &user {
+        if u.exists() {
+            return u.clone();
+        }
+    }
+    let local = std::path::PathBuf::from(".orbit");
+    if local.exists() {
+        return local;
+    }
+    user.unwrap_or(local)
 }
 
 impl ProvidersConfig {
@@ -311,21 +373,45 @@ url = "http://127.0.0.1:4001"
 [[provider.models]]
 id = "m"
 [provider.models.pricing]
+input_per_million_microdollars = 200000
+output_per_million_microdollars = 600000
+"#,
+        )
+        .unwrap();
+        let pricing = cfg.pricing_for_model("m").expect("pricing found");
+        assert_eq!(pricing.input_per_million_microdollars, 200_000);
+        assert_eq!(pricing.output_per_million_microdollars, 600_000);
+        assert_eq!(pricing.cache_read_per_million_microdollars, None);
+    }
+
+    /// C5: the old (mislabeled) key names still parse — existing
+    /// providers.toml files keep working.
+    #[test]
+    fn parses_pricing_block_legacy_microcents_keys() {
+        let cfg: ProvidersConfig = toml::from_str(
+            r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:4001"
+[[provider.models]]
+id = "m"
+[provider.models.pricing]
 input_per_million_microcents = 200000
 output_per_million_microcents = 600000
 "#,
         )
         .unwrap();
         let pricing = cfg.pricing_for_model("m").expect("pricing found");
-        assert_eq!(pricing.input_per_million_microcents, 200_000);
-        assert_eq!(pricing.output_per_million_microcents, 600_000);
-        assert_eq!(pricing.cache_read_per_million_microcents, None);
+        assert_eq!(pricing.input_per_million_microdollars, 200_000);
+        assert_eq!(pricing.output_per_million_microdollars, 600_000);
     }
 
     #[test]
     fn cost_microcents_math() {
         use orbit_adapter::types::{CostRates, ProviderUsage};
-        // $0.20/M input + $0.60/M output: 1000 in + 1000 out → 200 + 600 = 800 µ¢
+        // $0.20/M input + $0.60/M output: 1000 in + 1000 out → 200 + 600 = 800 µ$.
+        // (The accumulator field keeps its historical name cost_microcents;
+        // the unit is microdollars — C5.)
         let rates = CostRates {
             input_per_million_microcents: 200_000,
             output_per_million_microcents: 600_000,
@@ -379,8 +465,8 @@ output_per_million_microcents = 600000
                 id: "glm-5.2".into(),
                 label: None,
                 pricing: Pricing {
-                    input_per_million_microcents: 200_000,
-                    output_per_million_microcents: 600_000,
+                    input_per_million_microdollars: 200_000,
+                    output_per_million_microdollars: 600_000,
                     ..Default::default()
                 },
                 max_output_tokens: None,
@@ -395,7 +481,7 @@ output_per_million_microcents = 600000
         assert_eq!(
             loaded.provider[0].models[0]
                 .pricing
-                .output_per_million_microcents,
+                .output_per_million_microdollars,
             600_000
         );
         // Token VALUE never stored; only the env-var NAME is present.

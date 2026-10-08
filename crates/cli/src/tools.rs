@@ -9,9 +9,10 @@ use orbit_adapter::types::ToolDefinition;
 use sha2::{Digest, Sha256};
 
 pub(crate) fn config_home_from_env() -> std::path::PathBuf {
-    std::env::var("ORBIT_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(".orbit"))
+    // C8: the ONE home resolver — same precedence as the CLI entry
+    // (--home > ORBIT_HOME > ~/.orbit > existing local .orbit). The old
+    // CWD-relative default silently disagreed with every other path.
+    crate::config::resolve_home(&[])
 }
 
 /// A built-in tool's declarative identity (sent to the provider as the JSON

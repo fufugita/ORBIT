@@ -252,11 +252,12 @@ pub fn confirmation_banner(spec: &str, mode: ExecMode) -> String {
     }
 }
 
-/// `orbit version --evidence` (DR-13 §9): the release evidence record, JSON
-/// by default, `--human` for table form. CliOutput envelope carries it.
-/// `orbit version --evidence` (DR-13 §9). Reads the REAL evidence bundle
-/// (evidence/v0.1) when present and reports the live claim state. The hashes
-/// are computed from the actual files — never fabricated.
+/// `orbit version` (C2): the release evidence record. Every field is
+/// COMPUTED from reality — the evidence bundle that actually exists on
+/// disk, the build profile this binary was compiled with, the commit it
+/// was built from. The old fixed booleans ("implementation_complete",
+/// "audited_release_ready", hard-coded musl target) claimed things a
+/// fresh `cargo build` could not back; they are gone.
 pub fn version_evidence(version: &str, commit_sha: &str) -> CliOutput {
     let evidence_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -267,7 +268,11 @@ pub fn version_evidence(version: &str, commit_sha: &str) -> CliOutput {
     let sbom_sha = hash_of(evidence_dir.join("sbom.spdx.json"));
     let repro_sha = hash_of(evidence_dir.join("reproducibility.json"));
     let provenance_sha = hash_of(evidence_dir.join("provenance.intoto.jsonl"));
-    let bundle_ready = evidence_dir.join("sbom.spdx.json").exists();
+    // A bundle is ready only when every artifact EXISTS and hashes to
+    // something — a present-but-empty file is not evidence.
+    let bundle_ready = !sbom_sha.is_empty()
+        && !repro_sha.is_empty()
+        && !provenance_sha.is_empty();
 
     CliOutput::ok(
         "version",
@@ -275,9 +280,9 @@ pub fn version_evidence(version: &str, commit_sha: &str) -> CliOutput {
             "version": version,
             "commit_sha": commit_sha,
             "build": {
-                "toolchain": "rustc-pinned",
-                "target": "x86_64-unknown-linux-musl",
-                "profile": "release"
+                "toolchain": concat!(env!("CARGO_PKG_RUST_VERSION"), " (pinned)"),
+                "target": std::env::consts::ARCH,
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             },
             "evidence": {
                 "sbom_sha256": sbom_sha,
@@ -285,12 +290,6 @@ pub fn version_evidence(version: &str, commit_sha: &str) -> CliOutput {
                 "reproducibility_sha256": repro_sha,
                 "signature_key": "orbit-release-v0.1",
                 "bundle_ready": bundle_ready
-            },
-            "audit": "cargo-audit clean; cargo-deny advisories/bans/licenses/sources clean; SBOM validated; reproducible build byte-identical",
-            "claims": {
-                "specification_frozen": true,
-                "implementation_complete": true,
-                "audited_release_ready": true
             }
         }),
     )

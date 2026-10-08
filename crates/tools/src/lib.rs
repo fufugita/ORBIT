@@ -311,26 +311,52 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
-/// One-line descriptions (kept beside the registry so definitions and
-/// docs cannot drift).
+/// Tool descriptions (kept beside the registry so definitions and docs
+/// cannot drift). C6: full usage rules, not one-liners — the model is
+/// told the contract each tool enforces (read-before-edit, uniqueness,
+/// timeouts) so it does not have to discover them by failure.
 pub fn tool_description(name: &str) -> &'static str {
     match name {
-        "Read" => "Reads a file from the local filesystem with line numbers",
-        "Write" => "Creates or overwrites a file with the given content",
-        "Edit" => "Replaces an exact string in a file (read before edit)",
-        "Glob" => "Lists files matching a glob pattern",
-        "Grep" => "Searches file contents (ripgrep-style regex)",
-        "Bash" => "Runs a command in the persistent working directory",
-        "TaskStop" => "Stops a background command",
-        "AskUserQuestion" => "Asks the operator 1-4 multiple-choice questions",
-        "ExitPlanMode" => "Presents the plan and asks to leave plan mode",
-        "TaskCreate" => "Adds a task to the session task list (drives the Plan panel)",
-        "TaskUpdate" => "Updates a task's status, title or detail",
-        "TaskList" => "Lists the session's tasks",
-        "WebFetch" => "Fetches an https URL as markdown; records an egress grant per domain",
-        "WebSearch" => "Searches the web (requires a configured search API)",
-        "Agent" => "Runs a subagent in its own context; returns its final report",
-        "NotebookEdit" => "Edits a Jupyter notebook cell (read before edit)",
+        "Read" => "Reads a file from the local filesystem. Returns up to 2000 lines by default \
+            with 1-based line numbers (cat -n format). Use offset/limit for long files. \
+            Reading a file in full records it for the session's read-before-edit rule.",
+        "Write" => "Creates or overwrites a file with the given content. Overwriting an EXISTING \
+            file requires reading it in full first this session (read-before-write). New files \
+            need no prior read. Writes are atomic (temp file + rename).",
+        "Edit" => "Replaces one exact string in a file. The file must have been read in full this \
+            session first (read-before-edit). old_string must be UNIQUE in the file — include \
+            surrounding context lines to disambiguate. The new_string replaces it verbatim.",
+        "Glob" => "Lists file paths matching a glob pattern (e.g. '**/*.rs', 'src/*.py'). \
+            Respects .gitignore. Returns paths relative to the working directory, capped at 100 \
+            matches.",
+        "Grep" => "Searches file contents with a regex (ripgrep-style). Searches the working \
+            directory recursively, respecting .gitignore; use 'path' to scope and 'glob' to \
+            filter file names (e.g. '*.py'). Results are capped — check the truncated flag.",
+        "Bash" => "Runs a shell command in the working directory, sandboxed (bubblewrap) when \
+            available. Default timeout 120s; the command is killed at the timeout and partial \
+            output is returned. Output is scanned for secrets before it reaches the model. \
+            Commands touching deny-read paths (credentials) are refused.",
+        "TaskStop" => "Stops a background command started with Bash's run_in_background, by its \
+            background id. The command's process group is killed.",
+        "AskUserQuestion" => "Asks the operator 1-4 multiple-choice questions when a decision is \
+            genuinely theirs. Each question has 2-4 options; the operator may always answer \
+            free-form. Use sparingly — most choices have a conventional default.",
+        "ExitPlanMode" => "Presents the completed plan and asks the operator to approve leaving \
+            plan mode. On approval, execution proceeds with the plan as the prompt.",
+        "TaskCreate" => "Adds a task to the session task list (drives the Plan panel). Tasks are \
+            visible to the operator and to subsequent turns.",
+        "TaskUpdate" => "Updates a task's status (todo/in_progress/done), title or detail by id.",
+        "TaskList" => "Lists the session's tasks with ids and statuses.",
+        "WebFetch" => "Fetches an https URL and returns it as markdown. Each domain requires an \
+            egress grant (asked once per domain per session). http and private addresses are \
+            refused.",
+        "WebSearch" => "Searches the web and returns results with titles, URLs and snippets \
+            (requires a configured search API backend).",
+        "Agent" => "Runs a subagent with its own context window and tool access; returns its \
+            final report. Use for parallel or context-heavy exploration. The subagent shares \
+            the session's permission scope.",
+        "NotebookEdit" => "Edits a Jupyter notebook (.ipynb) cell: replace, insert or delete by \
+            cell id. The notebook must have been read this session first.",
         _ => "unknown tool",
     }
 }

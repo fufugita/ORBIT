@@ -67,6 +67,21 @@ fn main() {
     let wants_chat = args.is_empty()
         || args[0] == "chat"
         || (!first_is_command && args[0] != "--help" && args[0] != "-h" && args[0] != "--version");
+    // C1: `--help`/`-h` print HUMAN help (exit 0); `--version` prints the
+    // version line. The machine-readable forms stay on the verbs:
+    // `orbit help --json` and `orbit version` (JSON).
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        if args.iter().any(|a| a == "--json") {
+            // fall through to the JSON verb below
+        } else {
+            print_human_help();
+            std::process::exit(0);
+        }
+    }
+    if args.first().map(|a| a == "--version" || a == "-V").unwrap_or(false) {
+        println!("orbit {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     if args.first().map(|a| a == "web").unwrap_or(false) {
         let code = cmd_web(&args[1..]);
         std::process::exit(code);
@@ -94,6 +109,87 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// Human help for `--help`/`-h` (C1): plain text to stdout, exit 0. The
+/// JSON vocabulary stays available at `orbit help --json` / `orbit help`.
+fn print_human_help() {
+    println!(
+        "orbit {} — the harness that orbits around you",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!();
+    println!("USAGE:");
+    println!("    orbit [chat] [--model <M>] [--gate <URL>]    interactive TUI harness");
+    println!("    orbit <command> [args]                       run a command");
+    println!();
+    println!("COMMANDS:");
+    for (name, desc) in [
+        ("chat", "start the interactive harness (default when bare)"),
+        ("init", "initialize trust root + PIB + ledger"),
+        ("models", "list models from all configured providers"),
+        ("ask PROMPT", "send one prompt through a configured gateway"),
+        ("-p PROMPT", "headless one-shot with tools (stream-json output)"),
+        ("web", "start the browser harness (orbit-web bridge)"),
+        ("verify-ledger", "verify the ledger hash chain"),
+        ("replay --dry", "verify + emit a no-dispatch replay plan"),
+        ("export --to", "encrypt an age bundle"),
+        ("restore", "restore into a fresh namespace"),
+        ("version", "release evidence (claims + hashes)"),
+        ("mod install/list/allow-issuer", "signed mod management"),
+        ("help [--json]", "this help (JSON vocabulary with --json)"),
+    ] {
+        println!("    {name:<28} {desc}");
+    }
+    println!();
+    println!("CHAT FLAGS:");
+    for (name, desc) in [
+        ("--model <M>", "model id (providers.toml)"),
+        ("--gate <URL>", "gateway base URL"),
+        ("--home <DIR>", "ORBIT home (default ~/.orbit)"),
+        ("--continue", "reopen the latest session in this directory"),
+        ("--resume <ID>", "resume a specific session"),
+        ("--no-tui", "plain REPL instead of the TUI"),
+        ("--auto-tools", "TUI/chat: run tools without asking (bypass)"),
+    ] {
+        println!("    {name:<28} {desc}");
+    }
+    println!();
+    println!("    --version                    print the version and exit");
+    println!("    --help | -h                 this help");
+}
+
+/// The commit this binary was built from, as honestly as it can be known.
+/// Build scripts may pin it via ORBIT_BUILD_COMMIT (compile-time); a tree
+/// build without that falls back to asking git at runtime; a binary with
+/// no git in reach reports "unknown" rather than inventing a value (C2).
+fn build_commit() -> String {
+    if let Some(c) = option_env!("ORBIT_BUILD_COMMIT") {
+        if !c.is_empty() {
+            return c.to_string();
+        }
+    }
+    // Runtime fallback: ask the source tree (dev builds run from a repo).
+    let manifest_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.to_path_buf());
+    if let Some(root) = manifest_root {
+        if let Ok(out) = std::process::Command::new("git")
+            .arg("rev-parse")
+            .arg("--short=12")
+            .arg("HEAD")
+            .current_dir(&root)
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
+    }
+    "unknown".into()
 }
 
 fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
@@ -142,7 +238,11 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "models" | "list-models" => cmd_models(&home, args),
         "mod" => cmd_mod(&home, args),
         "version" => Ok(
-            serde_json::to_value(orbit_cli::version_evidence("0.1.0", "dev")).unwrap_or_default(),
+            serde_json::to_value(orbit_cli::version_evidence(
+                env!("CARGO_PKG_VERSION"),
+                &build_commit(),
+            ))
+            .unwrap_or_default(),
         ),
         "--help" | "-h" | "help" => Ok(serde_json::json!({
             "schema": "orbit.cli/v1",
@@ -176,38 +276,14 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
 /// The ORBIT home (README): `--home` > `ORBIT_HOME` > `~/.orbit`.
 /// A repo-local `.orbit` is used only when it already exists (legacy
 /// behaviour) — a fresh checkout must not shadow the user config.
+/// C8: the implementation lives in config::resolve_home — ONE resolver
+/// for every crate (tools.rs used to default to a CWD-relative `.orbit`).
 fn default_orbit_home() -> PathBuf {
-    if let Ok(h) = std::env::var("ORBIT_HOME") {
-        if !h.is_empty() {
-            return PathBuf::from(h);
-        }
-    }
-    let user = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".orbit"));
-    if let Some(u) = &user {
-        if u.exists() {
-            return u.clone();
-        }
-    }
-    let local = PathBuf::from(".orbit");
-    if local.exists() {
-        return local;
-    }
-    user.unwrap_or(local)
+    orbit_cli::config::resolve_home(&[])
 }
 
 fn orbit_home(args: &[String]) -> Option<PathBuf> {
-    args.windows(2)
-        .find(|w| w[0] == "--home")
-        .map(|w| PathBuf::from(&w[1]))
-        .or_else(|| {
-            let d = default_orbit_home();
-            // ORBIT_HOME / ~/.orbit resolution counts as a default
-            // only when it exists; keep Option semantics for callers
-            // that treat None as "not initialized".
-            Some(d)
-        })
+    Some(orbit_cli::config::resolve_home(args))
 }
 
 /// `orbit init`: generate a local Ed25519 trust root, sign the manifest, verify it,
@@ -260,9 +336,10 @@ fn cmd_init(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static
         .map_err(ioe)?;
     }
 
-    // Initialize PIB.
+    // Initialize PIB. C3: the id is a real ULID minted per install —
+    // every install used to share the hard-coded "01J-LOCAL-PIB".
     let mut pib = PibRegistry::new();
-    let pib_id = "01J-LOCAL-PIB".to_string();
+    let pib_id = format!("pib-{}", ulid::Ulid::new());
     pib.register(
         pib_id.clone(),
         "local".into(),
@@ -496,7 +573,7 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
 
         let mut pricing = Vec::new();
         for id in &model_ids {
-            println!("Pricing for {id} (microcents per million tokens; blank = 0):");
+            println!("Pricing for {id} (microdollars per million tokens; blank = 0):");
             let input = prompt_line("  input", Some("0"))?
                 .parse::<u64>()
                 .unwrap_or(0);
@@ -504,8 +581,8 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
                 .parse::<u64>()
                 .unwrap_or(0);
             pricing.push(orbit_cli::config::Pricing {
-                input_per_million_microcents: input,
-                output_per_million_microcents: output,
+                input_per_million_microdollars: input,
+                output_per_million_microdollars: output,
                 ..Default::default()
             });
         }
@@ -714,10 +791,17 @@ fn cmd_export(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
     let to = value_after(args, "--to").ok_or(("ORBIT-E1101", "export requires --to".into()))?;
     let ledger_bytes = collect_ledger_bytes(&home.join("ledger"))?;
     let head = std::fs::read_to_string(home.join("ledger/HEAD")).map_err(ioe)?;
+    // C3: the export carries THIS install's PIB id (pib.json), not a
+    // hard-coded placeholder.
+    let pib_id = std::fs::read_to_string(home.join("pib.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("pib_id").and_then(|p| p.as_str()).map(String::from))
+        .unwrap_or_else(|| "pib-unknown".into());
     let (recipient, identity) = generate_local_key();
     let mut b = ExportBuilder::new(
         "session-example".into(),
-        "01J-LOCAL-PIB".into(),
+        pib_id,
         head.trim().into(),
     );
     b.add_file("ledger/segments".into(), &ledger_bytes).exclude(
@@ -2247,7 +2331,37 @@ fn ensure_initialized(home: &Path) -> Result<(), (&'static str, String)> {
     if !home.join("trust/manifest.json").exists() {
         return Err(("ORBIT-E0706", "not initialized; run `orbit init`".into()));
     }
+    // C3 migration: an existing home may still carry the placeholder PIB
+    // id every pre-2026-10 install shared. Mint a real ULID once, in
+    // place — the identity (keys, fingerprint) is unchanged, only the id
+    // becomes unique to this install.
+    migrate_placeholder_pib(home);
     Ok(())
+}
+
+/// One-time in-place migration of the hard-coded "01J-LOCAL-PIB" id to a
+/// per-install ULID (C3). Idempotent: a home already migrated (or never
+/// affected) is left untouched. Failures are non-fatal — a read-only home
+/// still works with the old id.
+fn migrate_placeholder_pib(home: &Path) {
+    const PLACEHOLDER: &str = "01J-LOCAL-PIB";
+    let path = home.join("pib.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    if v.get("pib_id").and_then(|p| p.as_str()) != Some(PLACEHOLDER) {
+        return;
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "pib_id".into(),
+            serde_json::json!(format!("pib-{}", ulid::Ulid::new())),
+        );
+    }
+    let _ = std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap_or_default());
 }
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
