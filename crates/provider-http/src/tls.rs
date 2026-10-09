@@ -11,11 +11,19 @@ use orbit_adapter::types::TlsPinPolicy;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-/// Build the rustls client config with the optional SPKI-pinning verifier.
-pub fn client_config(tls: &TlsPinPolicy) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+/// Install rustls's process-wide crypto provider (ring) if none is
+/// installed yet. Idempotent. Every client in this crate is built with the
+/// `no-provider` feature, so building one without this first panics ("No
+/// provider set").
+pub fn ensure_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
+}
+
+/// Build the rustls client config with the optional SPKI-pinning verifier.
+pub fn client_config(tls: &TlsPinPolicy) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+    ensure_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for cert in native.certs {
