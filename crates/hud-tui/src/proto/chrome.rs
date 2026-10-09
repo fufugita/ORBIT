@@ -92,6 +92,31 @@ pub const COMMANDS: [(&str, &str); 7] = [
     ("/usage", "turns, tokens and cost for this session"),
 ];
 
+/// The commands the inline list offers for what is typed: every one
+/// whose name starts with it (§9.13). The list shows a window of them
+/// that follows the selection, so none is out of reach.
+pub fn completion_matches(typed: &str) -> Vec<(&'static str, &'static str)> {
+    let prefix = typed.trim_start_matches('/');
+    COMMANDS
+        .iter()
+        .filter(|(c, _)| c.trim_start_matches('/').starts_with(prefix))
+        .copied()
+        .collect()
+}
+
+/// Rows the `/` list shows at once.
+pub const COMPLETION_ROWS: usize = 6;
+
+/// The `/` list is open while the composer holds one command word —
+/// `/`, `/he` — and closes once arguments begin or the text is not a
+/// command.
+pub fn slash_list(composer: &str) -> Vec<(&'static str, &'static str)> {
+    if !composer.starts_with('/') || composer.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    completion_matches(composer)
+}
+
 /// The inline completion list above the composer (§9.13).
 pub fn completion_list(typed: &str, selected: usize) -> (Rect, Vec<Line<'static>>) {
     let prefix = typed.trim_start_matches('/');

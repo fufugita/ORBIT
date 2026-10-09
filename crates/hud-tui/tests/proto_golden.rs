@@ -369,3 +369,58 @@ fn an_armed_approval_border_replaces_the_keys_instead_of_overdrawing_them() {
     assert!(keys.contains("allow this session"), "{keys}");
     assert!(keys.contains("deny"), "{keys}");
 }
+
+#[test]
+fn typing_a_slash_opens_the_command_list_above_the_composer() {
+    // The composer promises "type / for commands"; the list that answers
+    // it (§9.13) was dead code after the shell rewrite, so typing "/"
+    // showed nothing.
+    let tui = Tui::new();
+    let s = base_scenario();
+    let mut term = ratatui::Terminal::new(TestBackend::new(164, 48)).unwrap();
+    let mut shot = |composer: &str, sel: usize| {
+        let mut t = Tui::new();
+        t.completion_sel = sel;
+        let _ = &tui;
+        term.draw(|f| draw(f, &t, &s, composer, None, "", 0, None, false, 0))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut rows = Vec::new();
+        for y in 0..48u16 {
+            let mut row = String::new();
+            for x in 0..164u16 {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            rows.push(row.trim_end().to_string());
+        }
+        rows.join("\n")
+    };
+
+    let all = shot("/", 0);
+    assert!(all.contains("↑↓ choose"), "{all}");
+    assert!(
+        all.contains("/help") && all.contains("keys and commands"),
+        "{all}"
+    );
+    assert!(all.contains("⇥ complete"), "the keys that act on it: {all}");
+    // Six rows show at once; the rest are one ↓ away, never out of reach.
+    assert!(all.contains("↓ more") && !all.contains("/usage"), "{all}");
+    let scrolled = shot("/", 6);
+    assert!(
+        scrolled.contains("/usage") && !scrolled.contains("↓ more"),
+        "{scrolled}"
+    );
+
+    // Typing narrows it: /mod → /model and /models, not /help.
+    let narrowed = shot("/mod", 0);
+    assert!(narrowed.contains("/model"), "{narrowed}");
+    assert!(!narrowed.contains("/help"), "{narrowed}");
+
+    // Once arguments begin, the list closes.
+    let args = shot("/model glm", 0);
+    assert!(!args.contains("↑↓ choose"), "{args}");
+
+    // Not a command: no list.
+    let plain = shot("fix the bug", 0);
+    assert!(!plain.contains("↑↓ choose"), "{plain}");
+}

@@ -64,6 +64,8 @@ pub struct Tui {
     pub scrolls: Vec<usize>,
     /// The text selection — bound to one panel, never crossing it.
     pub selection: Option<super::shell::Selection>,
+    /// The highlighted row of the `/` command list.
+    pub completion_sel: usize,
 }
 
 impl Default for Tui {
@@ -85,6 +87,7 @@ impl Tui {
             tier: super::core::Tier::TrueColor,
             scrolls: Vec::new(),
             selection: None,
+            completion_sel: 0,
         }
     }
 
@@ -200,6 +203,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         },
         scrolls: Vec::new(),
         selection: None,
+        completion_sel: 0,
     };
     tui.sync_focus();
 
@@ -411,6 +415,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
             {
                 last_drawn.clone_from(&composer);
                 overlay_dirty = false;
+                tui.completion_sel = completion_sel;
                 let done = guard
                     .terminal
                     .draw(|f| {
@@ -725,6 +730,32 @@ fn handle_key(
     }
     let _ = pending_leader;
 
+    // The `/` command list owns Up, Down and Tab while it is open.
+    if tui.focus == Focus::Conversation {
+        let list = super::chrome::slash_list(composer);
+        if !list.is_empty() {
+            match k.code {
+                KeyCode::Up => {
+                    *completion_sel = completion_sel.saturating_sub(1);
+                    return false;
+                }
+                KeyCode::Down => {
+                    *completion_sel = (*completion_sel + 1).min(list.len() - 1);
+                    return false;
+                }
+                KeyCode::Tab => {
+                    let (cmd, _) = list[(*completion_sel).min(list.len() - 1)];
+                    composer.clear();
+                    composer.push_str(cmd);
+                    composer.push(' ');
+                    *completion_sel = 0;
+                    return false;
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Focus keys (§11.1).
     match k.code {
         KeyCode::Tab => {
@@ -792,7 +823,14 @@ fn handle_key(
                     return false;
                 }
                 if composer.starts_with('/') && !composer.trim().eq("/") {
-                    let text = composer.trim().to_string();
+                    let mut text = composer.trim().to_string();
+                    // A partly typed command runs the highlighted match
+                    // (`/he` ⏎ → /help); a complete one, or one with
+                    // arguments, runs as typed.
+                    let list = super::chrome::slash_list(&text);
+                    if !list.is_empty() && !list.iter().any(|(c, _)| *c == text) {
+                        text = list[(*completion_sel).min(list.len() - 1)].0.to_string();
+                    }
                     composer.clear();
                     let mut fs = false;
                     if let Some(o) = run_command(
@@ -892,6 +930,7 @@ fn handle_key(
             }
             KeyCode::Backspace => {
                 composer.pop();
+                *completion_sel = 0;
             }
             KeyCode::Esc => {
                 // §11.3: Esc closes the completion list; otherwise
@@ -919,6 +958,7 @@ fn handle_key(
                     c
                 };
                 composer.push(ch);
+                *completion_sel = 0;
             }
         }
         return false;
@@ -1701,6 +1741,7 @@ pub fn draw(
             fx: &tui.fx,
             scenario,
             composer,
+            completion_sel: tui.completion_sel,
             now_ms: tui.tick_ms,
             // Colour-effect gating (the spec): shimmer, fades and flashes
             // are COLOUR motion — they switch off under 16 colours or no

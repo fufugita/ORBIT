@@ -25,6 +25,8 @@ pub struct ConvIn<'a> {
     /// fresh-ink fade switch off.
     pub mono: bool,
     pub composer: &'a str,
+    /// The highlighted row of the `/` command list.
+    pub completion_sel: usize,
     pub focused: bool,
     pub focus_fx: super::frame::FocusFx,
     pub scroll_offset: usize,
@@ -862,10 +864,65 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
                         inp.reduced,
                     );
                 }
-                None => draw_composer(cv, x, y + h - 2, w, inp),
+                None => {
+                    draw_composer(cv, x, y + h - 2, w, inp);
+                    // The `/` command list floats above the composer.
+                    let list = crate::proto::chrome::slash_list(inp.composer);
+                    if !list.is_empty() && inp.focused {
+                        draw_completion(cv, x, y + h - 3, w, &list, inp.completion_sel);
+                    }
+                }
             }
         },
     );
+}
+
+/// The inline `/` command list (§9.13): the commands that match what is
+/// typed, the highlighted one marked, with the keys that act on it. It
+/// sits on the row above the composer and grows upward.
+fn draw_completion(
+    cv: &mut Cv,
+    x: i32,
+    bottom: i32,
+    w: i32,
+    list: &[(&'static str, &'static str)],
+    sel: usize,
+) {
+    let sel = sel.min(list.len().saturating_sub(1));
+    // A window of the matches that follows the selection.
+    let rows = list.len().min(crate::proto::chrome::COMPLETION_ROWS);
+    let start = if sel >= rows { sel + 1 - rows } else { 0 };
+    let shown = &list[start..start + rows];
+    let n = rows as i32;
+    let top = bottom - n; // first command row; the header is one above
+    cv.fill(x, top - 1, w, n + 1, RAISE);
+    cv.text(x + 2, top - 1, "Commands", FAINT, Some(RAISE));
+    let more = if start + rows < list.len() {
+        "  ↓ more"
+    } else {
+        ""
+    };
+    let keys = &format!("↑↓ choose   ⇥ complete   ⏎ run{more}");
+    let kw = text_width(keys);
+    if w > kw + 14 {
+        cv.text(x + w - kw - 2, top - 1, keys, FAINT, Some(RAISE));
+    }
+    for (i, (cmd, desc)) in shown.iter().enumerate() {
+        let yy = top + i as i32;
+        let on = start + i == sel;
+        let bg = if on {
+            tint(MAGENTA, RAISE, 0.14)
+        } else {
+            RAISE
+        };
+        cv.fill(x, yy, w, 1, bg);
+        if on {
+            cv.text(x, yy, "▌", MAGENTA, Some(bg));
+        }
+        let cx = cv.bold(x + 2, yy, cmd, if on { WHITE } else { INK }, Some(bg));
+        let dx = (x + 2 + 10).max(cx + 2);
+        cv.text(dx, yy, &clip_text(desc, x + w - dx - 1), MUTED, Some(bg));
+    }
 }
 
 #[cfg(test)]
