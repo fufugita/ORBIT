@@ -171,9 +171,18 @@ fn orbit_rows(
     mono: bool,
 ) -> Vec<Row> {
     let time = l.time.clone().unwrap_or_default();
-    let arrivals = l.arrivals.clone();
+    // The reply as the reader sees it: markdown markers gone, what they
+    // meant kept as per-character style. Streaming arrival offsets count
+    // raw chars; map them onto the displayed ones so the fresh-ink fade
+    // keeps its place when markers drop.
+    let md = super::md::rich_styled(&l.text);
+    let arrivals: Vec<(usize, u64)> = l
+        .arrivals
+        .iter()
+        .map(|&(raw, ms)| (md.raw_to_plain[raw.min(md.raw_to_plain.len() - 1)], ms))
+        .collect();
     let last_data = arrivals.last().map(|a| a.1);
-    let (plain, mask) = rich_plain(&l.text);
+    let (plain, sty) = (md.plain, md.sty);
     let text: String = plain.iter().collect();
     let lines = wrap_ranges(&text, w - 5 - if time.is_empty() { 0 } else { 7 });
     let n = lines.len();
@@ -182,7 +191,7 @@ fn orbit_rows(
         .enumerate()
         .map(|(i, (a, b))| {
             let plain = plain.clone();
-            let mask = mask.clone();
+            let sty = sty.clone();
             let time = time.clone();
             let arrivals = arrivals.clone();
             Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
@@ -199,13 +208,37 @@ fn orbit_rows(
                     }
                 }
                 for k in a..b.min(plain.len()) {
-                    let bg = if mask[k] { Some(RAISE2) } else { None };
+                    let st = sty[k];
+                    let bg = if st.code { Some(RAISE2) } else { None };
+                    // What the markdown meant, as colour and weight. Magenta
+                    // stays reserved for ORBIT and authority; emphasis is
+                    // brightness, links are blue, furniture is muted.
+                    let (target, mods) = if st.dim || st.quote {
+                        (MUTED, Modifier::empty())
+                    } else if st.link {
+                        (BLUE, Modifier::UNDERLINED)
+                    } else if st.heading > 0 {
+                        (if st.heading <= 2 { WHITE } else { INK }, Modifier::BOLD)
+                    } else if st.bold {
+                        (mix(INK, WHITE, 0.6), Modifier::BOLD)
+                    } else if st.italic {
+                        (INK2, Modifier::ITALIC)
+                    } else {
+                        (INK, Modifier::empty())
+                    };
                     // M06 fresh ink: a chunk lands near white and fades
-                    // to ink in 450 ms, ease-out.
+                    // to its colour in 450 ms, ease-out.
                     let t0 = arrivals.iter().rev().find(|a| a.0 <= k).map(|a| secs(a.1));
                     let fade = ease_out(prog(secs(now_ms), t0, 0.45, reduced || mono));
-                    let fg = mix(mix(WHITE, CYAN, 0.35), INK, fade);
-                    cv.text(x + 4 + (k - a) as i32, y, &plain[k].to_string(), fg, bg);
+                    let fg = mix(mix(WHITE, CYAN, 0.35), target, fade);
+                    cv.put(
+                        x + 4 + (k - a) as i32,
+                        y,
+                        &plain[k].to_string(),
+                        fg,
+                        bg,
+                        mods,
+                    );
                 }
                 if live && i + 1 == n {
                     // The caret breathes at 0.9 Hz after 400 ms without data.

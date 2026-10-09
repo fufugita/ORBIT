@@ -11,6 +11,7 @@ pub mod canvas;
 pub mod convo;
 pub mod frame;
 pub mod mark;
+pub mod md;
 pub mod motion;
 pub mod overlays;
 pub mod pal;

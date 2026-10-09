@@ -499,3 +499,68 @@ fn the_welcome_lists_the_sandbox_among_what_is_ready() {
     let out = render(&tui, &s, 164, 48);
     assert!(out.contains("sandbox · off — every command asks"), "{out}");
 }
+
+#[test]
+fn a_reply_shows_its_markdown_as_style_not_as_markup() {
+    // Every reply is markdown. Headings, emphasis, links and quotes used
+    // to print their raw markers (`## `, `**`, `[x](y)`, `> `).
+    use ratatui::style::Modifier;
+    let tui = Tui::new();
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "summarize".into(),
+        ..Default::default()
+    });
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::Model,
+        text: "## Summary\n\nIt is **what changed** and *why*.\n\n- one\n> a quote\n\nSee [the docs](https://e.com/d).".into(),
+        ..Default::default()
+    });
+    let mut term = ratatui::Terminal::new(TestBackend::new(164, 48)).unwrap();
+    term.draw(|f| draw(f, &tui, &s, "", None, "", 0, None, false, 0))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut rows = Vec::new();
+    for y in 0..48u16 {
+        let mut row = String::new();
+        for x in 0..164u16 {
+            row.push_str(buf[(x, y)].symbol());
+        }
+        rows.push(row);
+    }
+    let screen = rows.join("\n");
+    for marker in ["##", "**", "[the docs]", "](https"] {
+        assert!(
+            !screen.contains(marker),
+            "raw {marker:?} on screen:\n{screen}"
+        );
+    }
+    assert!(
+        screen.contains("Summary") && screen.contains("what changed"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("• one") && screen.contains("│ a quote"),
+        "{screen}"
+    );
+    assert!(screen.contains("the docs (https://e.com/d)"), "{screen}");
+
+    // The style is on the cells: find a word and look at its modifier.
+    let mods_of = |word: &str| -> Modifier {
+        for (y, row) in rows.iter().enumerate() {
+            if let Some(byte) = row.find(word) {
+                let col = row[..byte].chars().count() as u16;
+                return buf[(col, y as u16)].modifier;
+            }
+        }
+        panic!("{word:?} not on screen:\n{screen}");
+    };
+    assert!(mods_of("what changed").contains(Modifier::BOLD));
+    assert!(mods_of("why").contains(Modifier::ITALIC));
+    assert!(mods_of("Summary").contains(Modifier::BOLD));
+    assert!(mods_of("the docs").contains(Modifier::UNDERLINED));
+    // Plain words stay plain.
+    let plain = mods_of("It is");
+    assert!(!plain.contains(Modifier::BOLD) && !plain.contains(Modifier::ITALIC));
+}
