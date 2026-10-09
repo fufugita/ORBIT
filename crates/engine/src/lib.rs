@@ -27,6 +27,7 @@
 
 pub mod automation;
 pub mod context;
+pub mod diff;
 pub mod dispatch;
 pub mod hooks;
 pub mod skills;

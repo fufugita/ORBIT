@@ -3,7 +3,7 @@
 //! "show what?" picker, toasts that slide in with a draining line, and
 //! the big panel numbers shown while arranging.
 
-use super::canvas::{clip_text, mix, text_width, tint, Cv, Rgb};
+use super::canvas::{clip_text, mix, segs_width, text_width, tint, Cv, Rgb, Seg};
 use super::frame::{hints_width, keyhints};
 use super::motion::{ease_in_out, ease_out, prog, secs};
 use super::pal::*;
@@ -26,6 +26,15 @@ pub enum Overlay<'a> {
     },
     Quit {
         turn_live: bool,
+    },
+    /// The full diff of a changed file (M11): the bounded hunks carried
+    /// by the FileChanged event, or the honest "no diff captured" note.
+    Diff {
+        path: &'a str,
+        added: u32,
+        removed: u32,
+        hunks: &'a Option<Vec<orbit_frontend_protocol::DiffHunk>>,
+        opened_ms: u64,
     },
 }
 
@@ -95,7 +104,148 @@ pub fn draw(cv: &mut Cv, w: i32, h: i32, ov: &Overlay, now_ms: u64, reduced: boo
         ),
         Overlay::Help { opened_ms } => help(cv, w, h, *opened_ms, now_ms, reduced),
         Overlay::Quit { turn_live } => quit(cv, w, h, *turn_live),
+        Overlay::Diff {
+            path,
+            added,
+            removed,
+            hunks,
+            opened_ms,
+        } => diff(
+            cv, w, h, path, *added, *removed, hunks, *opened_ms, now_ms, reduced,
+        ),
     }
+}
+
+/// The diff overlay (M11): `@@` headers, `-`/`+` lines in red/green,
+/// context in muted ink — bounded by what the event carried. When no
+/// "before" existed (an uncheckpointed write, or a fixture without
+/// hunks) it says so plainly instead of inventing a diff.
+#[allow(clippy::too_many_arguments)]
+fn diff(
+    cv: &mut Cv,
+    w: i32,
+    h: i32,
+    path: &str,
+    added: u32,
+    removed: u32,
+    hunks: &Option<Vec<orbit_frontend_protocol::DiffHunk>>,
+    opened_ms: u64,
+    now_ms: u64,
+    reduced: bool,
+) {
+    let rows_avail = h.saturating_sub(8) as usize;
+    // Count the overlay's rows: hunk headers + lines.
+    let body: Vec<(char, String)> = match hunks {
+        Some(hs) => {
+            let mut v = Vec::new();
+            for hk in hs {
+                v.push((
+                    '@',
+                    format!(
+                        "@@ -{},{} +{},{} @@",
+                        hk.old_start, hk.old_lines, hk.new_start, hk.new_lines
+                    ),
+                ));
+                for (m, l) in &hk.lines {
+                    v.push((*m, l.clone()));
+                }
+            }
+            v
+        }
+        None => Vec::new(),
+    };
+    let shown = body.len().min(rows_avail);
+    let box_h = (shown as i32 + 6).min(h.saturating_sub(2));
+    let box_w = (w.saturating_sub(8)).clamp(30, 100);
+    let x = (w - box_w) / 2;
+    let y = (h - box_h) / 2;
+    let reveal = (ease_out(prog(secs(now_ms), Some(secs(opened_ms)), 0.22, reduced)) * box_h as f32)
+        .round() as i32;
+
+    frame_box(cv, x, y, box_w, box_h, reveal, "diff");
+    if reveal < box_h {
+        return;
+    }
+    cv.clipped(
+        Rect {
+            x: x as u16,
+            y: y as u16,
+            width: box_w as u16,
+            height: box_h as u16,
+        },
+        |cv| {
+            // Header: path + counts.
+            let p = clip_text(path, box_w - 16);
+            cv.bold(x + 2, y + 2, &p, INK, Some(RAISE));
+            let mut cnt = vec![Seg::bold(format!("+{added}"), GREEN)];
+            if removed > 0 {
+                cnt.push(Seg::bold(format!(" −{removed}"), RED));
+            }
+            let cw = segs_width(&cnt);
+            cv.spans(x + box_w - 2 - cw, y + 2, &cnt, Some(RAISE));
+            // Rule under the header.
+            cv.text(
+                x + 2,
+                y + 3,
+                &"─".repeat((box_w - 4) as usize),
+                RULE,
+                Some(RAISE),
+            );
+
+            match hunks {
+                None => {
+                    cv.text(x + 3, y + 5, "◌ no diff captured", MUTED, Some(RAISE));
+                    cv.text(
+                        x + 3,
+                        y + 6,
+                        &clip_text(
+                            "this change arrived without a \"before\" to diff against",
+                            box_w - 6,
+                        ),
+                        FAINT,
+                        Some(RAISE),
+                    );
+                }
+                Some(hs) if hs.is_empty() => {
+                    cv.text(x + 3, y + 5, "◌ no visible changes", MUTED, Some(RAISE));
+                    cv.text(
+                        x + 3,
+                        y + 6,
+                        &clip_text("the edit touched only lines the bounds cut", box_w - 6),
+                        FAINT,
+                        Some(RAISE),
+                    );
+                }
+                Some(_) => {
+                    for (i, (m, l)) in body.iter().take(shown).enumerate() {
+                        let yy = y + 5 + i as i32;
+                        let (glyph, fg) = match m {
+                            '@' => ("  ", VIOLET),
+                            '+' => ("+ ", GREEN),
+                            '-' => ("- ", RED),
+                            '…' => ("  ", FAINT),
+                            _ => ("  ", INK2),
+                        };
+                        if *m == '@' {
+                            cv.bold(x + 2, yy, &clip_text(l, box_w - 4), VIOLET, Some(RAISE));
+                        } else {
+                            let t = format!("{glyph}{}", clip_text(l, box_w - 6));
+                            cv.text(x + 2, yy, &t, fg, Some(RAISE));
+                        }
+                    }
+                }
+            }
+            // Footer hint.
+            let hint = "esc close";
+            cv.text(
+                x + box_w - 2 - text_width(hint),
+                y + box_h - 2,
+                hint,
+                FAINT,
+                Some(RAISE),
+            );
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

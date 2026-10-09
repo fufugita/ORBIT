@@ -272,60 +272,66 @@ impl Node {
         Some(target)
     }
 
-    /// `< >` width, `- +` height: change the focused panel's share by
-    /// 6% of its split; no panel goes below 16%.
+    /// `< >` width, `- +` height: the focused panel gets narrower/wider
+    /// (shorter/taller) by 6% of its split. The panel's own share moves;
+    /// the difference comes from, or goes to, its right (lower)
+    /// neighbour, or its left (upper) one when it is last. When the
+    /// panel's parent splits the other way, the nearest ancestor that
+    /// splits along `axis` is the one resized, so every panel can be
+    /// resized in both directions. No share goes below 16% and the total
+    /// never changes; a move that would cross the floor is shortened, not
+    /// refused.
     pub fn resize(&mut self, index: usize, axis: Axis, delta: i32) -> bool {
         let Some(path) = self.path_of(index) else {
             return false;
         };
-        // The axis must match the parent split's direction for a width
-        // change to make sense: width adjusts a Right split's shares,
-        // height a Down split's.
-        let Some(parent_path) = path.get(..path.len() - 1).map(|p| p.to_vec()) else {
-            return false;
-        };
-        let child_i = *path.last().unwrap();
-        let Some(Node::Split {
-            direction,
-            shares,
-            children,
-        }) = self.at_mut(&parent_path)
-        else {
-            return false;
-        };
         let wants = match axis {
-            Axis::Width => *direction == Direction::Right,
-            Axis::Height => *direction == Direction::Down,
+            Axis::Width => Direction::Right,
+            Axis::Height => Direction::Down,
         };
-        if !wants {
+        // The deepest ancestor splitting along the axis, and which of
+        // its children holds the focused panel.
+        for depth in (0..path.len()).rev() {
+            let ancestor: Vec<usize> = path[..depth].to_vec();
+            let child_i = path[depth];
+            let Some(Node::Split {
+                direction,
+                shares,
+                children,
+            }) = self.at_mut(&ancestor)
+            else {
+                continue;
+            };
+            if *direction != wants || shares.len() != children.len() || shares.len() < 2 {
+                continue;
+            }
+            let total: u32 = shares.iter().sum();
+            let step = ((total as f64) * 0.06).ceil() as i32;
+            let min = ((total as f64) * 0.16).ceil() as i32;
+            let want = delta * step;
+            // The neighbour that gives or takes: right/lower first.
+            let candidates: Vec<usize> = [child_i + 1, child_i.wrapping_sub(1)]
+                .into_iter()
+                .filter(|i| *i < shares.len())
+                .collect();
+            let cur = shares[child_i] as i32;
+            for other in candidates {
+                let oth = shares[other] as i32;
+                // Growing needs room in the neighbour; shrinking needs
+                // room in the panel itself.
+                let room = if want > 0 { oth - min } else { cur - min };
+                let moved = want.abs().min(room.max(0));
+                if moved == 0 {
+                    continue;
+                }
+                let signed = if want > 0 { moved } else { -moved };
+                shares[child_i] = (cur + signed) as u32;
+                shares[other] = (oth - signed) as u32;
+                return true;
+            }
             return false;
         }
-        if shares.len() != children.len() || child_i >= shares.len() {
-            return false;
-        }
-        let total: u32 = shares.iter().sum();
-        let step = ((total as f64) * 0.06).ceil() as i32;
-        let cur = shares[child_i] as i32;
-        let new = (cur + delta * step).max(0) as u32;
-        // no panel below 16% of the total
-        let min_share = ((total as f64) * 0.16).ceil() as u32;
-        if new < min_share {
-            return false;
-        }
-        // take from / give to the neighbour
-        let other = if delta > 0 {
-            child_i.saturating_sub(1)
-        } else {
-            (child_i + 1).min(shares.len() - 1)
-        };
-        if other == child_i || shares.len() < 2 {
-            return false;
-        }
-        let moved = new as i32 - cur;
-        let other_new = (shares[other] as i32 - moved).max(min_share as i32) as u32;
-        shares[child_i] = new;
-        shares[other] = other_new;
-        true
+        false
     }
 
     /// `=` — even out every split.
@@ -658,6 +664,48 @@ mod tests {
         }
         if let Node::Split { shares, .. } = t {
             assert!(shares[0] >= 16, "no panel below 16%: {:?}", shares);
+        }
+    }
+
+    #[test]
+    fn resize_works_at_both_ends_and_keeps_the_total() {
+        // The leftmost panel can widen, the rightmost can narrow — the
+        // two moves the old code refused.
+        let mut t = Node::default_tree();
+        let total = |t: &Node| match t {
+            Node::Split { shares, .. } => shares.iter().sum::<u32>(),
+            _ => 0,
+        };
+        let before = total(&t);
+        assert!(t.resize(0, Axis::Width, 1), "leftmost widens");
+        assert!(t.resize(2, Axis::Width, -1), "rightmost narrows");
+        assert_eq!(total(&t), before, "shares still sum to the same total");
+        if let Node::Split { shares, .. } = &t {
+            assert!(shares[0] > 30, "{shares:?}");
+        }
+    }
+
+    #[test]
+    fn resize_climbs_to_the_ancestor_that_splits_along_the_axis() {
+        // Build: Conversation | (Changes over Terminal). Changes sits in a
+        // Down split; `>` on it must still move the Right split's edge.
+        let mut t = Node::preset(Preset::Build);
+        let before = t.clone();
+        assert!(t.resize(1, Axis::Width, 1) || t.resize(1, Axis::Width, -1));
+        assert_ne!(t, before, "width changed through the ancestor");
+        let mut v = Node::preset(Preset::Build);
+        assert!(v.resize(1, Axis::Height, 1), "height uses its own Down split");
+    }
+
+    #[test]
+    fn resize_is_shortened_at_the_floor_not_refused() {
+        let mut t = Node::default_tree();
+        for _ in 0..30 {
+            t.resize(1, Axis::Width, -1);
+        }
+        if let Node::Split { shares, .. } = &t {
+            assert!(shares.iter().all(|s| *s >= 16), "{shares:?}");
+            assert_eq!(shares.iter().sum::<u32>(), 100);
         }
     }
 

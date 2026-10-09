@@ -208,6 +208,9 @@ pub enum Msg {
         path: String,
         added: u32,
         removed: u32,
+        /// Bounded unified hunks (M11) — None when there was no
+        /// "before" to diff against.
+        hunks: Option<Vec<orbit_frontend_protocol::DiffHunk>>,
     },
     /// A subagent started (id, name, task).
     SubagentStarted {

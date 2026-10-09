@@ -73,8 +73,10 @@ impl Token {
     }
 }
 
-/// The colour tier detected from the environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The colour tier detected from the environment. Ordered: `TrueColor`
+/// is the richest tier, `None` the poorest — comparisons read as
+/// "richer than" (`tier <= T16` = colour effects must switch off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Tier {
     TrueColor,
     T256,

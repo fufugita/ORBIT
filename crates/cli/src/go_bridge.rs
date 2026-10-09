@@ -592,8 +592,8 @@ impl orbit_engine::ToolExecutor for GoToolExecutor {
                 &self.scope,
                 &self.tool_cx,
             )
-            .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
-            let ok = result.contains("\"ok\":true");
+            .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
+            let ok = result.0.contains("\"ok\":true");
             emit(
                 &self.stream,
                 &serde_json::json!({
@@ -605,7 +605,7 @@ impl orbit_engine::ToolExecutor for GoToolExecutor {
             );
             results.push(orbit_engine::ToolRoundResult {
                 call_id: call.id.clone(),
-                content: result,
+                content: result.0,
             });
         }
         results

@@ -211,9 +211,24 @@ impl AutoGrants {
 
 /// Execute one pending call with approval + ledger evidence.
 ///
+/// A real file change from a checkpointed write (M11): true counts and
+/// bounded hunks for the Changes panel — computed from the
+/// checkpoint's before/after bytes, never invented.
+pub struct FileChange {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+    pub checkpoint_id: String,
+    pub hunks: Option<Vec<orbit_frontend_protocol::DiffHunk>>,
+}
+
 /// The `approval` channel is injected — `StdApprovalChannel` for the REPL,
 /// `TuiApprovalChannel` for the TUI. The `grants` set tracks session-scoped
 /// R-grants so previously-approved tools skip the prompt.
+///
+/// Returns the tool's payload plus, when the call was a successful
+/// checkpointed write, the real file change (M11): true counts and
+/// bounded hunks computed from the checkpoint's before/after bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_call(
     home: &Path,
@@ -231,9 +246,9 @@ pub fn execute_call(
     // shares the read-before-edit map, so Read's record survives to
     // Edit. Callers build this once per session.
     tool_cx: &orbit_tools::ToolContext,
-) -> Result<String, String> {
+) -> Result<(String, Option<FileChange>), String> {
     if call.arguments.len() > MAX_ARGUMENT_BYTES {
-        return Ok(tool_error("tool arguments exceed 64 KiB"));
+        return Ok((tool_error("tool arguments exceed 64 KiB"), None));
     }
     let arguments_sha256 = hex::encode(Sha256::digest(&call.arguments));
     let mut writer = LedgerWriter::open(&home.join("ledger"), "orbit-tool".into(), "0.1.0")
@@ -392,7 +407,7 @@ pub fn execute_call(
         // D9: a denial is not an error — audits must be able to tell an
         // operator refusal apart from a tool that ran and failed.
         record_result(home, session_id, decision_id, call, "denied", &output)?;
-        return Ok(output);
+        return Ok((output, None));
     }
 
     let args = match crate::tools::parse_arguments(&call.arguments) {
@@ -400,7 +415,7 @@ pub fn execute_call(
         Err(e) => {
             let output = tool_error(&e);
             record_result(home, session_id, decision_id, call, "error", &output)?;
-            return Ok(output);
+            return Ok((output, None));
         }
     };
 
@@ -421,7 +436,7 @@ pub fn execute_call(
             "ok"
         };
         record_result(home, session_id, decision_id, call, status, &output)?;
-        return Ok(output);
+        return Ok((output, None));
     }
 
     // The Task tool (phase 5) and its Agent alias: spawn a subagent.
@@ -443,7 +458,7 @@ pub fn execute_call(
         if prompt.is_empty() {
             let output = tool_error("Task/Agent requires a 'prompt'");
             record_result(home, session_id, decision_id, call, "error", &output)?;
-            return Ok(output);
+            return Ok((output, None));
         }
         let turn_config = subagent_turn_config(home);
         let output = match crate::tools::execute_task(home, agent, prompt, &turn_config, approval) {
@@ -458,7 +473,7 @@ pub fn execute_call(
             "ok"
         };
         record_result(home, session_id, decision_id, call, status, &output)?;
-        return Ok(output);
+        return Ok((output, None));
     }
 
     // MCP tools (phase 5): mcp__<server>__<tool> — spawn, call, scan.
@@ -472,7 +487,7 @@ pub fn execute_call(
             "ok"
         };
         record_result(home, session_id, decision_id, call, status, &output)?;
-        return Ok(output);
+        return Ok((output, None));
     }
 
     // Wave 1 tools (Read/Write/Edit/Glob/Grep/Bash/TaskStop) run
@@ -480,7 +495,7 @@ pub fn execute_call(
     // permission layer (modes + pattern rules), the deny-read list and
     // the secret scanner on every result (review blocker 1).
     if orbit_tools::is_wave1(&call.name) {
-        let output = execute_wave1(home, scope, call, &args, tool_cx);
+        let (output, file_change) = execute_wave1(home, scope, call, &args, tool_cx);
         let status = if orbit_tools::result_is_denial(&output) {
             "denied"
         } else if orbit_tools::result_is_error(&output) {
@@ -500,7 +515,7 @@ pub fn execute_call(
             );
         }
         record_result(home, session_id, decision_id, call, status, &output)?;
-        return Ok(output);
+        return Ok((output, file_change));
     }
 
     let result = crate::tools::execute(&call.name, &args);
@@ -511,7 +526,7 @@ pub fn execute_call(
     if output.len() > MAX_RESULT_BYTES {
         let truncated = tool_error("tool result exceeds 64 KiB");
         record_result(home, session_id, decision_id, call, "error", &truncated)?;
-        return Ok(truncated);
+        return Ok((truncated, None));
     }
     let status = if orbit_tools::result_is_denial(&output) {
         "denied"
@@ -521,7 +536,10 @@ pub fn execute_call(
         "ok"
     };
     record_result(home, session_id, decision_id, call, status, &output)?;
-    Ok(output)
+    // Legacy tools (Bash/Glob/...) don't snapshot, so no diff — only
+    // checkpointed writes (Write/Edit through execute_wave1) carry a
+    // FileChange.
+    Ok((output, None))
 }
 
 /// Layer-2 outcome for the pre-check (B4): what would the mode/pattern
@@ -684,7 +702,7 @@ fn execute_wave1(
     call: &crate::PendingToolCall,
     args: &serde_json::Value,
     tool_cx: &orbit_tools::ToolContext,
-) -> String {
+) -> (String, Option<FileChange>) {
     use orbit_tools::permissions::{evaluate, parse_rule, RuleEffectSerde};
 
     // Merged rules: the new pattern scopes + the legacy whole-tool file.
@@ -714,7 +732,7 @@ fn execute_wave1(
         .into_iter()
         .find(|t| t.name() == call.name)
     else {
-        return tool_denial("unknown tool (deny-by-default)");
+        return (tool_denial("unknown tool (deny-by-default)"), None);
     };
     let key = tool.permission_key(args);
     let is_ro_cmd = call.name == "Bash"
@@ -735,7 +753,7 @@ fn execute_wave1(
         }),
     );
     if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
-        return tool_denial(&format!("blocked by hook: {reason}"));
+        return (tool_denial(&format!("blocked by hook: {reason}")), None);
     }
 
     // S3: when the shell sandbox cannot run on this machine, a Bash
@@ -764,12 +782,12 @@ fn execute_wave1(
         // S3 binds on every path that would RUN the command: a plain
         // allow, and the ask-collapse (the operator approved the call
         // — but not running it bare on a sandbox-less machine).
-        orbit_tools::permissions::Verdict::Allow if !sandbox_up => return sandbox_refusal(),
+        orbit_tools::permissions::Verdict::Allow if !sandbox_up => return (sandbox_refusal(), None),
         orbit_tools::permissions::Verdict::Allow => {}
         orbit_tools::permissions::Verdict::Deny(reason) => {
-            return tool_denial(&reason);
+            return (tool_denial(&reason), None);
         }
-        orbit_tools::permissions::Verdict::Ask if !sandbox_up => return sandbox_refusal(),
+        orbit_tools::permissions::Verdict::Ask if !sandbox_up => return (sandbox_refusal(), None),
         orbit_tools::permissions::Verdict::Ask => {
             // The whole-tool verdict above already asked the channel
             // (the operator pressed y). Pattern-level ask collapses to
@@ -792,11 +810,15 @@ fn execute_wave1(
         }),
     );
     if let Some(reason) = orbit_engine::hooks::blocked(&pre) {
-        return tool_denial(&format!("blocked by hook: {reason}"));
+        return (tool_denial(&format!("blocked by hook: {reason}")), None);
     }
 
     // Checkpoint (phase 4): before the first WRITE of a turn, snapshot
     // the target file's current bytes so /rewind can restore them.
+    // M11: remember the "before" bytes so the change can carry a real
+    // diff to the Changes panel (line counts from the diff, hunks from
+    // the same bytes — nothing invented).
+    let mut before: Option<(std::path::PathBuf, Vec<u8>, String)> = None;
     if call.name == "Write" || call.name == "Edit" {
         if let Some(path_str) = args.get("file_path").and_then(|v| v.as_str()) {
             let path = orbit_tools::resolve_path(&cx, path_str);
@@ -805,7 +827,10 @@ fn execute_wave1(
                 // E7: one checkpoint id per turn — the context mints
                 // it on first write and reuses it for the turn.
                 let turn_cp = cx.turn_checkpoint_id();
-                let _ = cps.snapshot_file(&turn_cp, &path);
+                if let Ok(pre) = std::fs::read(&path) {
+                    let _ = cps.snapshot_file(&turn_cp, &path);
+                    before = Some((path, pre, turn_cp));
+                }
             }
         }
     }
@@ -832,7 +857,32 @@ fn execute_wave1(
             "ok": !result.is_error,
         }),
     );
-    result.payload
+
+    // M11: a successful checkpointed write carries a real diff — the
+    // "before" bytes were captured above, the "after" bytes are read
+    // now. Counts are the true totals; hunks are bounded (context 2,
+    // first 4 hunks, 6 lines each) for the panel's line budget.
+    let file_change = match (&before, result.is_error) {
+        (Some((path, pre, cp)), false) => {
+            let after = std::fs::read(path).ok();
+            after.map(|post| {
+                let old = String::from_utf8_lossy(pre).into_owned();
+                let new = String::from_utf8_lossy(&post).into_owned();
+                let (added, removed) = orbit_engine::diff::counts(&old, &new);
+                let hunks = orbit_engine::diff::hunks(&old, &new);
+                FileChange {
+                    path: path.to_string_lossy().into_owned(),
+                    added,
+                    removed,
+                    checkpoint_id: cp.clone(),
+                    hunks,
+                }
+            })
+        }
+        _ => None,
+    };
+
+    (result.payload, file_change)
 }
 
 /// Is the current folder trusted (project-scope rules/hooks/skills
@@ -950,7 +1000,7 @@ impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
             .iter()
             .map(|call| {
                 let decision_id = ulid::Ulid::new().to_string();
-                let content = execute_call(
+                let (content, _) = execute_call(
                     &self.home,
                     &self.session_id,
                     &decision_id,
@@ -962,7 +1012,7 @@ impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
                     &self.scope,
                     &self.tool_cx,
                 )
-                .unwrap_or_else(|e| tool_error(&e));
+                .unwrap_or_else(|e| (tool_error(&e), None));
                 orbit_engine::ToolRoundResult {
                     call_id: call.id.clone(),
                     content,
@@ -1035,7 +1085,7 @@ mod tests {
         let call = make_call("calculator", br#"{"expression":"2*(3+4)"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::Deny); // shouldn't be asked
         let mut grants = AutoGrants::new();
-        let out = execute_call(
+        let (out, _) = execute_call(
             &home,
             "s1",
             "d1",
@@ -1081,7 +1131,7 @@ mod tests {
         let call = make_call("Write", br#"{"file_path":"out.txt","content":"x"}"#);
         let mut ch = StdApprovalChannel::new(false); // non-interactive
         let mut grants = AutoGrants::new();
-        let out = execute_call(
+        let (out, _) = execute_call(
             &home,
             "s1",
             "d1",
@@ -1107,7 +1157,7 @@ mod tests {
         let call = make_call("shell", br#"{"cmd":"id"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
         let mut grants = AutoGrants::new();
-        let out = execute_call(
+        let (out, _) = execute_call(
             &home,
             "s1",
             "d1",
@@ -1129,7 +1179,7 @@ mod tests {
         let call = make_call("calculator", br#"{"expression":"3+4"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
         let mut grants = AutoGrants::new();
-        let out = execute_call(
+        let (out, _) = execute_call(
             &home,
             "s1",
             "d1",
@@ -1153,7 +1203,7 @@ mod tests {
         let call = make_call("Write", br#"{"file_path":"out.txt","content":"x"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::Deny);
         let mut grants = AutoGrants::new();
-        let out = execute_call(
+        let (out, _) = execute_call(
             &home,
             "s1",
             "d1",
@@ -1196,7 +1246,7 @@ mod tests {
         // First call: R verdict → grant + execute.
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let out1 = execute_call(
+        let (out1, _) = execute_call(
             &home,
             "s1",
             "d1",
@@ -1215,7 +1265,7 @@ mod tests {
         // Second call: auto-approved from the grant (channel not asked).
         let call2 = make_call("Write", br#"{"file_path":"b.txt","content":"2"}"#);
         let mut ch2 = FixedChannel(ApprovalVerdict::Deny); // would deny, but shouldn't be asked
-        let out2 = execute_call(
+        let (out2, _) = execute_call(
             &home,
             "s1",
             "d2",
@@ -1266,7 +1316,7 @@ mod tests {
         // Now the channel is asked again — deny.
         let mut ch2 = FixedChannel(ApprovalVerdict::Deny);
         let call2 = make_call("Write", br#"{"file_path":"d.txt","content":"y"}"#);
-        let out = execute_call(
+        let (out, _) = execute_call(
             &home,
             "s1",
             "d2",
@@ -1290,7 +1340,7 @@ mod tests {
         let call = make_call("shell", br#"{"cmd":"id"}"#);
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
-        let out = execute_call(
+        let (out, _) = execute_call(
             &home,
             "s1",
             "d1",
@@ -1347,7 +1397,7 @@ mod tests {
             "Edit",
             br#"{"file_path":"e.txt","old_string":"x","new_string":"y"}"#,
         );
-        let out = execute_call(
+        let (out, _) = execute_call(
             &home,
             "s1",
             "d2",

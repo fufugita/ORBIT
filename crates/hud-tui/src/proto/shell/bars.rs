@@ -10,6 +10,27 @@ use ratatui::style::Modifier;
 /// The layout tabs the top bar offers.
 pub const PRESET_TABS: [&str; 4] = ["columns", "build", "agents", "review"];
 
+/// The preset whose tab sits at column `x` in the top bar (tabs start at
+/// column 12, each ` name ` plus one air column).
+pub fn preset_at(x: i32) -> Option<crate::proto::layout::Preset> {
+    use crate::proto::layout::Preset;
+    let presets = [
+        Preset::Columns,
+        Preset::Build,
+        Preset::Agents,
+        Preset::Review,
+    ];
+    let mut cx = 12;
+    for (name, p) in PRESET_TABS.iter().zip(presets) {
+        let w = name.chars().count() as i32 + 2;
+        if x >= cx && x < cx + w {
+            return Some(p);
+        }
+        cx += w + 1;
+    }
+    None
+}
+
 /// The working directory as `~/…` when under home.
 pub fn cwd_label() -> String {
     let Ok(cwd) = std::env::current_dir() else {
@@ -54,8 +75,13 @@ pub struct TopBar<'a> {
     pub approval_pending: bool,
     pub now_ms: u64,
     pub reduced: bool,
+    /// Colour effects off (16 colours or less): the shimmer and the
+    /// ledger flash switch off.
+    pub mono: bool,
     /// When the layout last saved as "yours" (the ✓ saved note).
     pub saved_ms: Option<u64>,
+    /// The focused panel is zoomed (`z`).
+    pub zoom: bool,
     /// One-at-a-time mode: `(number, title, badge glyph)` per panel.
     pub switcher: Option<Vec<(usize, String, bool)>>,
     pub focus_idx: usize,
@@ -133,6 +159,9 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
         if tb.preset.is_none() {
             x = cv.put(x, 0, " yours ", INK2, Some(bg_at(x)), Modifier::BOLD) + 1;
         }
+        if tb.zoom {
+            x = cv.put(x + 1, 0, " ZOOM ", ON_ACCENT, Some(AMBER), Modifier::BOLD);
+        }
         // M30: `✓ saved` for 1.2 s, then it fades.
         if let Some(t) = tb.saved_ms {
             let age = secs(tb.now_ms.saturating_sub(t));
@@ -208,7 +237,7 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                     mix(
                         GREEN,
                         WHITE,
-                        flash(secs(tb.now_ms), s.ledger_ms.map(secs), 0.35, tb.reduced),
+                        flash(secs(tb.now_ms), s.ledger_ms.map(secs), 0.35, tb.reduced || tb.mono),
                     ),
                 ),
                 Seg::new(group_thousands(n), INK2),
@@ -280,6 +309,7 @@ pub fn status_line(
     s: &Scenario,
     now_ms: u64,
     reduced: bool,
+    mono: bool,
     focus_is_conversation: bool,
     focus_is_diff: bool,
     arranging: bool,
@@ -337,7 +367,7 @@ pub fn status_line(
     let waiting_model = matches!(s.activity(), Activity::WaitingModel(_));
     // 2 fps while waiting for the model, 4 fps while streaming or running.
     let star = star_at(now, if waiting_model { 2.0 } else { 4.0 }, reduced);
-    let sh = |t: &str, c: Rgb| shimmer(t, now, c, reduced);
+    let sh = |t: &str, c: Rgb| shimmer(t, now, c, reduced || mono);
     let secs = |from: u64| now_ms.saturating_sub(from) / 1000;
     let el = |t: u64| {
         let n = secs(t);

@@ -59,7 +59,7 @@ class PtySession:
         # The raw PTY stream interleaves frame writes (diff rendering skips
         # unchanged cells), so stream-order matching can transpose letters;
         # the emulated screen never lies.
-        self.screen = pyte.Screen(110, 30) if pyte else None
+        self.screen = pyte.Screen(cols, rows) if pyte else None
         self.stream = pyte.ByteStream(self.screen) if pyte else None
         self.proc = subprocess.Popen(
             cmd,
@@ -288,6 +288,18 @@ def main():
     ap.add_argument("--gate", default="http://127.0.0.1:8088")
     ap.add_argument("--token", default="test-token")
     args = ap.parse_args()
+
+    # This suite runs real tool calls (Bash under bwrap, Esc → kill of a
+    # process group) and deliberately kills terminals. On 2026-10-08 a run
+    # was followed within a second by SIGTERM to the user manager and a
+    # full desktop logout (journal: "Received SIGTERM from PID … (kill)").
+    # Root cause not yet proven — do not run it on a machine you are
+    # logged into unless you have read docs and accept that risk.
+    if os.environ.get("ORBIT_PTY_ALLOW_KILL_TESTS") != "1":
+        print("refusing to run: this suite exercises process-group kills and\n"
+              "closes terminals; a run on 2026-10-08 preceded a desktop logout.\n"
+              "Set ORBIT_PTY_ALLOW_KILL_TESTS=1 to run it anyway.")
+        sys.exit(2)
 
     # Fresh ORBIT home.
     subprocess.run(["rm", "-rf", args.home], check=False)
@@ -631,67 +643,78 @@ def main():
         except subprocess.TimeoutExpired:
             sb.terminate()
 
-    # ── Mouse selection test (per-pane isolation) ────────────────────────────────
-    print("\n== Mouse selection test ==")
+    # ── Panel isolation (herdr-style): mouse, selection, zoom, typing z ──────────
+    print("\n== Panel isolation test ==")
     sb = PtySession(
         [args.binary, "--home", args.home, "--model", args.model],
-        env=env, timeout=20, rows=30, cols=110,
+        env=env, timeout=20, rows=40, cols=150,
     )
     ok, bootbuf = sb.wait_for("ORBIT", timeout=15)
-    check("boots TUI for mouse test", ok)
+    check("boots TUI for isolation test", ok)
     if ok:
-        time.sleep(0.8)
-        # The boot path must own the mouse (TerminalGuard::enter enables
-        # SGR capture). Regression guard: the enable sequences must be in
-        # the boot stream — not only echo, the app consuming mouse events
-        # depends on it.
-        # §12.4 (docs/tui/PROMPT.md): mouse capture stays OFF — the
-        # terminal's native selection owns the mouse. Assert no capture.
-        has_enable = any(x in sb.raw_log for x in (b"?1000h", b"?1006h", b"?1002h", b"?1015h"))
-        check("mouse capture stays off (native selection)", not has_enable,
-              "mouse-enable sequence in boot stream (violates §12.4)")
-        # Type a prompt so the transcript has content, then drag across it.
+        time.sleep(2.6)  # past the startup unfold
+        sb.read(0.5)
+        # The app owns the mouse (SGR capture): selection is per panel.
+        has_enable = any(x in sb.raw_log for x in (b"?1000h", b"?1002h", b"?1006h"))
+        check("mouse capture is on (per-panel selection)", has_enable,
+              "no mouse-enable sequence in the boot stream")
+        # The letter z types in the Conversation.
+        sb.type("zebra zoom")
+        time.sleep(0.8); sb.read(0.5)
+        check("z types in the conversation composer",
+              "zebra zoom" in sb.screen_text(), sb.screen_text()[-300:])
+        for _ in range(10):
+            sb.key("backspace")
+        time.sleep(0.3)
         sb.type("hello world test")
         sb.key("enter")
-        # Wait for the stream to finish so the transcript has text to
-        # select (dragging during streaming selects empty rows).
         end = time.time() + 25
         while time.time() < end:
             r = sb.read(0.3)
             if "done" in sb.clean(r).lower():
                 break
         time.sleep(1.0)
-        # Drag across the ACTUAL user-text row (found on the emulated
-        # screen — the §8 layout bottom-anchors the transcript, so the
-        # text row varies with content). SGR mouse: ESC [ < b ; c ; r M/m.
-        # Pace the events: the app processes one frame per event; a burst
-        # can coalesce in the PTY buffer.
         def sgr(button, col, row, release=False):
             m = "m" if release else "M"
             sb.write(f"\x1b[<{button};{col};{row}{m}".encode())
         screen = sb.screen_text().split("\n")
-        user_row = next(
-            (i for i, l in enumerate(screen) if "hello world" in l), None)
+        user_row = next((i for i, l in enumerate(screen) if "hello world" in l), None)
         if user_row is None:
-            check("selection copies via OSC 52", False,
-                  "user text row not found on screen")
+            check("selection copies via OSC 52", False, "user text row not found")
         else:
-            r = user_row + 1  # SGR rows are 1-based
-            sgr(0, 30, r)             # left press on the user line
+            r = user_row + 1
+            raw0 = len(sb.raw_log)
+            hcol = screen[user_row].index("hello") + 1   # 1-based column of the text
+            sgr(0, hcol, r)            # press at the start of the conversation text
             time.sleep(0.4); sb.read(0.4)
-            sgr(32, 45, r)            # drag along the line
-            time.sleep(0.6); sb.read(0.6)
-            sgr(0, 45, r, True)       # release
-            time.sleep(1.0)
-            raw = sb.read(2.0)
-            # OSC 52 should appear (selection copy).
-            # With capture off (§12.4), SGR drags never reach the app —
-            # selection is the host terminal's. No OSC 52 is expected;
-            # assert the app kept running and ignored the drag bytes.
-            check("native selection (no OSC 52 leak)", "\x1b]52;" not in raw,
-                  "app emitted OSC 52 under no-capture")
+            sgr(32, 140, r)            # drag far to the right, into the Terminal panel
+            time.sleep(0.4); sb.read(0.4)
+            sgr(0, 140, r, True)       # release
+            time.sleep(1.0); sb.read(1.0)
+            tail = sb.raw_log[raw0:].decode("utf-8", "replace")
+            import base64 as _b64, re as _re
+            m52 = _re.search(r"\x1b\]52;c;([A-Za-z0-9+/=]+)\x07", tail)
+            check("selection copies via OSC 52", m52 is not None, tail[-200:])
+            if m52:
+                copied = _b64.b64decode(m52.group(1)).decode("utf-8", "replace")
+                check("selection stays inside its panel",
+                      "hello world" in copied and "No commands" not in copied
+                      and "Terminal" not in copied and "Changes" not in copied,
+                      repr(copied))
+        # Click the Terminal panel to focus it; `z` zooms it (the other panels go).
+        sgr(0, 120, 8); sgr(0, 120, 8, True)
+        time.sleep(0.6); sb.read(0.5)
+        sb.key("z")
+        time.sleep(0.8); sb.read(0.5)
+        zoomed = sb.screen_text()
+        check("z zooms the focused panel", "ZOOM" in zoomed and "Changes" not in zoomed,
+              zoomed[:400])
+        sb.key("z")
+        time.sleep(0.8); sb.read(0.5)
+        check("z again restores the layout", "Changes" in sb.screen_text())
         sb.key("ctrl+d")
         time.sleep(0.5)
+        sb.key("y")
 
     # ── 8. Shell bang: !cmd runs via the Bash tool's full path ─────────────
     # Gate 1: "!sleep 5" must surface the approval card (never a silent

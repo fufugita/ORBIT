@@ -876,7 +876,7 @@ fn worker_main(
                         .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
                 );
                 orbit_hud_tui::emit_tool_started(&ctx.sender, "Bash", &command);
-                let result = crate::tool_runtime::execute_call(
+                let (result, _) = crate::tool_runtime::execute_call(
                     &config.home,
                     &config.session_id,
                     &decision_id,
@@ -888,7 +888,7 @@ fn worker_main(
                     &config.scope,
                     &tool_cx,
                 )
-                .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+                .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
                 let outcome = classify_tool_result(&result);
                 orbit_hud_tui::emit_tool_finished(&ctx.sender, "Bash", outcome);
             }
@@ -1187,8 +1187,9 @@ pub fn run_tui_turn(
                 added,
                 removed,
                 checkpoint_id: _,
+                hunks,
             } => {
-                orbit_hud_tui::emit_file_changed(sender, &path, added, removed);
+                orbit_hud_tui::emit_file_changed(sender, &path, added, removed, hunks.clone());
             }
             E::SubagentStarted {
                 agent_id,
@@ -1362,7 +1363,7 @@ impl TuiToolExecutor {
         let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
         let mut approval_channel =
             TuiApprovalChannel::new(self.sender.clone(), self.approvals.clone());
-        let result = crate::tool_runtime::execute_call(
+        let (result, file_change) = crate::tool_runtime::execute_call(
             &self.home,
             &self.session_id,
             &decision_id,
@@ -1374,11 +1375,22 @@ impl TuiToolExecutor {
             &self.scope,
             &self.tool_cx,
         )
-        .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+        .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
         // Classify the result into a ToolOutcome: a refusal must render
         // as `⊘ denied by you`, not a red `✕ failed` (§11.5 rule 4).
         let outcome = classify_tool_result(&result);
         orbit_hud_tui::emit_tool_finished(&self.sender, &call.name, outcome);
+        // M11: a checkpointed write carries a real diff to the Changes
+        // panel — true counts plus bounded hunks, never invented.
+        if let Some(fc) = file_change {
+            orbit_hud_tui::emit_file_changed(
+                &self.sender,
+                &fc.path,
+                fc.added,
+                fc.removed,
+                fc.hunks,
+            );
+        }
         orbit_engine::ToolRoundResult {
             call_id: call.id.clone(),
             content: result,

@@ -21,6 +21,22 @@ use serde::{Deserialize, Serialize};
 
 // ── Events: harness → frontend ──────────────────────────────────────────────
 
+/// One unified-diff hunk: `@@ -a,b +c,d @@` plus the marked lines.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffHunk {
+    /// 1-based start line in the OLD file.
+    pub old_start: u32,
+    /// Line count in the OLD file.
+    pub old_lines: u32,
+    /// 1-based start line in the NEW file.
+    pub new_start: u32,
+    /// Line count in the NEW file.
+    pub new_lines: u32,
+    /// The hunk's lines with their marker (` `, `-`, `+`) — marker and
+    /// text split so the panel can colour without re-parsing.
+    pub lines: Vec<(char, String)>,
+}
+
 /// Something the harness reports to the UI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -127,12 +143,18 @@ pub enum FrontendEvent {
         reason: String,
     },
     /// A file changed on disk (the Changes panel): path, added and
-    /// removed counts, checkpoint id.
+    /// removed counts, checkpoint id, and — when the change came from a
+    /// checkpointed write — bounded unified hunks (context 2, first 4
+    /// hunks, 6 lines each) so the panel can show a real diff. `None`
+    /// for events produced without a "before" (the honest case: the
+    /// panel then says so instead of inventing one).
     FileChanged {
         path: String,
         added: u32,
         removed: u32,
         checkpoint_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hunks: Option<Vec<DiffHunk>>,
     },
     /// A subagent started (agent arcs): id, name, task, model.
     SubagentStarted {

@@ -365,12 +365,20 @@ pub fn emit_tool_finished(sender: &BusSender, name: &str, outcome: crate::state:
     });
 }
 
-/// Emit a changed file (path and line counts).
-pub fn emit_file_changed(sender: &BusSender, path: &str, added: u32, removed: u32) {
+/// Emit a changed file: path, line counts, and — for a checkpointed
+/// write — the real bounded hunks (M11).
+pub fn emit_file_changed(
+    sender: &BusSender,
+    path: &str,
+    added: u32,
+    removed: u32,
+    hunks: Option<Vec<orbit_frontend_protocol::DiffHunk>>,
+) {
     sender.send(Msg::FileChanged {
         path: safe_text(path),
         added,
         removed,
+        hunks,
     });
 }
 

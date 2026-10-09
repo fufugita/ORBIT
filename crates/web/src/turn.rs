@@ -448,7 +448,7 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
                 action_rx: self.action_rx.clone(),
                 state: self.state.clone(),
             };
-            let result = orbit_cli::tool_runtime::execute_call(
+            let (result, file_change) = orbit_cli::tool_runtime::execute_call(
                 &self.home,
                 &self.session_id,
                 &decision_id,
@@ -460,8 +460,27 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
                 &self.scope,
                 &self.tool_cx,
             )
-            .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+            .unwrap_or_else(|e| {
+                (
+                    serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    None,
+                )
+            });
             let _ok = result.contains("\"ok\":true");
+            // M11: forward the real diff (counts + bounded hunks) to
+            // the web frontend's changes feed.
+            if let Some(fc) = file_change {
+                self.state.emit(
+                    "file_changed",
+                    serde_json::json!({
+                        "path": fc.path,
+                        "added": fc.added,
+                        "removed": fc.removed,
+                        "checkpoint_id": fc.checkpoint_id,
+                        "hunks": fc.hunks,
+                    }),
+                );
+            }
             // MD gate 2: the engine's tool_finished_full IS the stream.
             results.push(orbit_engine::ToolRoundResult {
                 call_id: call.id.clone(),

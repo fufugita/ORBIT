@@ -153,6 +153,10 @@ pub struct TranscriptLine {
     pub finished_ms: Option<u64>,
     /// When the call started (duration = finish − start).
     pub started_ms: Option<u64>,
+    /// The AGENT card's subagent id (M16): SubagentStarted attaches it
+    /// to the most recent running Task/Agent card, and progress updates
+    /// land on this line — the card then shows what its agent is doing.
+    pub agent_id: Option<String>,
 }
 
 impl Default for TranscriptLine {
@@ -167,6 +171,7 @@ impl Default for TranscriptLine {
             arrivals: Vec::new(),
             finished_ms: None,
             started_ms: None,
+            agent_id: None,
         }
     }
 }

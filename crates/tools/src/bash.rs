@@ -637,10 +637,71 @@ fn kill_tree(pid: i32) {
         if !is_descendant_of(p, pid) {
             continue;
         }
+        audit_kill("KILL-pid", p, "sent (validated descendant)");
         let _ = std::process::Command::new("kill")
             .arg("-KILL")
             .arg(p.to_string())
             .status();
+    }
+}
+
+/// Why a group kill is refused, or `Ok` when `pid` may be signalled.
+/// `pid` must be a LIVE DESCENDANT of this process (`me`) that leads its
+/// own process group. Being a group leader is not enough — an unrelated
+/// leader, or one of our own ancestors (the session manager, the shell,
+/// the terminal emulator), would also pass that test and a group signal
+/// to it takes the whole session down. Pure: reads /proc, sends nothing.
+fn group_kill_verdict(pid: i32, me: i32) -> Result<(), &'static str> {
+    if pid <= 1 {
+        return Err("pid <= 1");
+    }
+    if pid == me {
+        return Err("our own pid");
+    }
+    if is_ancestor_of(pid, me) {
+        return Err("an ancestor of this process");
+    }
+    if !is_descendant_of(pid, me) {
+        return Err("not a live descendant of this process");
+    }
+    match live_pgrp(pid) {
+        Some(pgrp) if pgrp == pid => Ok(()),
+        Some(_) => Err("not a process-group leader"),
+        None => Err("already gone"),
+    }
+}
+
+#[cfg(test)]
+fn group_kill_allowed(pid: i32, me: i32) -> bool {
+    group_kill_verdict(pid, me).is_ok()
+}
+
+/// Append one line per kill decision to `$ORBIT_HOME/kill-audit.log`
+/// (falling back to the temp dir): time, who asked, the target, and the
+/// verdict. A refusal is as important as a signal — if a session is ever
+/// taken down again, this file says whether orbit sent it.
+fn audit_kill(action: &str, pid: i32, verdict: &str) {
+    use std::io::Write;
+    let dir = std::env::var_os("ORBIT_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("kill-audit.log");
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let me = std::process::id();
+    let pgrp = live_pgrp(me as i32).unwrap_or(-1);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            f,
+            "{secs:.3} orbit_pid={me} orbit_pgrp={pgrp} {action} target={pid} {verdict}"
+        );
     }
 }
 
@@ -651,14 +712,12 @@ fn kill_process_group(pid: i32) -> bool {
     // require the LIVE pgid from /proc/{pid}/stat to match — a pid that
     // exited and was reused would otherwise TERM an unrelated process
     // group (observed taking down the entire user session).
-    if pid <= 1 {
-        return false;
-    }
-    let Some(pgrp) = live_pgrp(pid) else {
-        return false; // already dead
-    };
-    if pgrp != pid {
-        return false; // not the group leader — never signal -pid
+    match group_kill_verdict(pid, std::process::id() as i32) {
+        Ok(()) => audit_kill("TERM-group", pid, "sent"),
+        Err(why) => {
+            audit_kill("TERM-group", pid, &format!("refused: {why}"));
+            return false;
+        }
     }
     Command::new("kill")
         .arg("-TERM")
@@ -690,4 +749,68 @@ pub fn background_commands() -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod group_kill_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    fn me() -> i32 {
+        std::process::id() as i32
+    }
+
+    fn ppid_of(pid: i32) -> i32 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let (_, rest) = stat.rsplit_once(')').unwrap();
+        rest.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn refuses_init_ourselves_and_every_ancestor() {
+        assert!(!group_kill_allowed(0, me()));
+        assert!(!group_kill_allowed(1, me()));
+        assert!(!group_kill_allowed(-5, me()));
+        assert!(!group_kill_allowed(me(), me()), "never our own group");
+        // Walk up the real ancestry (shell, terminal, session manager…):
+        // not one of them may be signalled, whatever it leads.
+        let mut cur = me();
+        for _ in 0..16 {
+            cur = ppid_of(cur);
+            if cur <= 1 {
+                break;
+            }
+            assert!(
+                !group_kill_allowed(cur, me()),
+                "ancestor {cur} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_an_unrelated_group_leader() {
+        // A process we did not start, even though it is a real, live
+        // process: our parent's sibling set is not ours. pid 2 (kthreadd)
+        // is unrelated on Linux; either way it must not be allowed.
+        assert!(!group_kill_allowed(2, me()));
+    }
+
+    #[test]
+    fn allows_only_our_own_group_leader_child() {
+        // Spawn a harmless sleeper as its own group leader, ask the
+        // guard (no signal is sent through it), then end it with the
+        // standard library's single-pid kill.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        assert!(group_kill_allowed(pid, me()), "our own group-leader child");
+        // The same pid is refused when asked about as someone else's child.
+        assert!(!group_kill_allowed(pid, pid + 100_000));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!group_kill_allowed(pid, me()), "gone → refused");
+    }
 }

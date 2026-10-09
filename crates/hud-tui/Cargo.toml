@@ -14,6 +14,7 @@ description = "TUI front-end for ORBIT (ratatui + crossterm)"
 [dependencies]
 chrono.workspace = true
 orbit-hud = { path = "../hud" }
+orbit-frontend-protocol = { path = "../frontend-protocol" }
 ratatui.workspace = true
 crossterm.workspace = true
 toml.workspace = true

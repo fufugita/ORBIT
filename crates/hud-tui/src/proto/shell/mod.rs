@@ -23,7 +23,7 @@ use crate::proto::core::Tier;
 use crate::proto::layout::{Node, Preset, View};
 use crate::proto::panels::split_areas;
 use crate::proto::scenario::Scenario;
-use canvas::Cv;
+use canvas::{clip_text, mix, Cv};
 use motion::{ease_in_out, ease_out, prog, secs};
 use ratatui::layout::Rect;
 
@@ -170,6 +170,77 @@ impl Fx {
     }
 }
 
+/// A text selection: the panel it belongs to and the two screen cells
+/// that bound it. Isolation lives here — it never leaves its panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub panel: usize,
+    pub a: (u16, u16),
+    pub b: (u16, u16),
+}
+
+/// A panel's content cells: inside the border and below the header band.
+pub fn content_rect(r: Rect) -> Rect {
+    Rect {
+        x: r.x + 2,
+        y: r.y + 2,
+        width: r.width.saturating_sub(4),
+        height: r.height.saturating_sub(3),
+    }
+}
+
+impl Selection {
+    /// The selected spans as `(x, y, width)` rows, clamped to `inner`
+    /// and read as a stream: the first row from the anchor to the edge,
+    /// middle rows whole, the last row up to the other end.
+    pub fn rows(&self, inner: Rect) -> Vec<(i32, i32, i32)> {
+        if inner.width == 0 || inner.height == 0 {
+            return Vec::new();
+        }
+        let clamp = |p: (u16, u16)| {
+            (
+                p.0.clamp(inner.x, inner.right() - 1),
+                p.1.clamp(inner.y, inner.bottom() - 1),
+            )
+        };
+        let (mut p, mut q) = (clamp(self.a), clamp(self.b));
+        if (q.1, q.0) < (p.1, p.0) {
+            std::mem::swap(&mut p, &mut q);
+        }
+        (p.1..=q.1)
+            .map(|y| {
+                let x0 = if y == p.1 { p.0 } else { inner.x };
+                let x1 = if y == q.1 { q.0 } else { inner.right() - 1 };
+                (x0 as i32, y as i32, (x1 as i32 - x0 as i32 + 1).max(1))
+            })
+            .collect()
+    }
+}
+
+/// The final panel rectangles for hit-testing the mouse: `(index, outer
+/// rect, view)` as drawn once any glide has settled.
+pub fn panel_rects(area: Rect, app: &App) -> Vec<(usize, Rect, View)> {
+    let (areas, _) = layout(area, &app.tree, app.sidebar && !app.zoom);
+    let focus = app.focus.min(areas.len().saturating_sub(1));
+    if area.width < 120 || app.zoom {
+        return vec![(
+            focus,
+            Rect {
+                x: 1,
+                y: 1,
+                width: area.width.saturating_sub(2),
+                height: area.height.saturating_sub(2),
+            },
+            areas.get(focus).map(|a| a.1).unwrap_or(View::Conversation),
+        )];
+    }
+    areas
+        .into_iter()
+        .enumerate()
+        .map(|(i, (r, v))| (i, r, v))
+        .collect()
+}
+
 /// A toast to show.
 pub struct ToastIn<'a> {
     pub text: &'a str,
@@ -185,8 +256,17 @@ pub struct DrawIn<'a> {
     pub composer: &'a str,
     pub now_ms: u64,
     pub reduced: bool,
+    /// Colour effects off (the spec): under 16 colours or no colour,
+    /// shimmer/fades/flashes switch off at the source — glyph motion
+    /// (typing, reveals, stars) is unaffected and stays on `reduced`.
+    pub mono: bool,
     pub tier: Tier,
     pub scroll_offset: usize,
+    /// One scroll offset per panel (reading order): the wheel and
+    /// PgUp/PgDn move only the panel they are aimed at.
+    pub scrolls: &'a [usize],
+    /// The text selection, bound to one panel.
+    pub selection: Option<Selection>,
     pub brand: crate::proto::welcome::BrandTier,
     pub toast: Option<ToastIn<'a>>,
     pub overlay: Option<overlays::Overlay<'a>>,
@@ -224,16 +304,22 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
     let sh = inp.app;
     let now = secs(inp.now_ms);
     let red = inp.reduced;
-    let one_at_a_time = area.width < 120;
+    let narrow = area.width < 120;
+    // A zoomed panel fills the screen the way a narrow one does.
+    let one_at_a_time = narrow || sh.zoom;
     {
         let mut cv = Cv::new(f.buffer_mut());
         cv.fill(0, 0, w, h, pal::APP);
 
-        let (new_areas, side_w) = layout(area, &sh.tree, sh.sidebar);
+        let (new_areas, side_w) = layout(area, &sh.tree, sh.sidebar && !sh.zoom);
         let focus = sh.focus.min(new_areas.len().saturating_sub(1));
 
         // M21: panel rectangles glide from the old layout to the new.
         let mut rects: Vec<(Rect, View)> = new_areas.clone();
+        // The closing panel's ghost: old rects whose view vanished
+        // shrink to their centre and fade — a close should feel like
+        // the panel leaving, not the neighbours sliding over nothing.
+        let mut ghosts: Vec<(Rect, View, f32)> = Vec::new();
         if let (Some(t0), Some(prev)) = (inp.fx.layout_ms, &inp.fx.prev_tree) {
             let p = ease_in_out(prog(now, Some(secs(t0)), 0.24, red));
             if p < 1.0 {
@@ -254,6 +340,20 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
                         (lerp_rect(from, *nr, p), *v)
                     })
                     .collect();
+                // Old views with no surviving same-view panel are the
+                // closed one(s): a view can appear at most once, so
+                // absence means closed.
+                for (or, ov) in &old {
+                    if !new_areas.iter().any(|(_, v)| v == ov) {
+                        let to = Rect {
+                            x: or.x + or.width / 2,
+                            y: or.y + or.height / 2,
+                            width: 1,
+                            height: 1,
+                        };
+                        ghosts.push((lerp_rect(*or, to, p), *ov, 1.0 - p));
+                    }
+                }
             }
         }
 
@@ -280,7 +380,7 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
         };
 
         // Top bar.
-        let switcher = one_at_a_time.then(|| {
+        let switcher = narrow.then(|| {
             new_areas
                 .iter()
                 .enumerate()
@@ -298,29 +398,16 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
                 preset: preset_index(sh.current_preset()),
                 approval_pending: s.approval_pending.is_some(),
                 now_ms: inp.now_ms,
+                mono: inp.mono,
                 reduced: red,
                 switcher,
                 focus_idx: focus,
                 cwd: bars::cwd_label(),
                 branch: bars::branch_label(),
                 saved_ms: inp.fx.saved_ms,
+                zoom: sh.zoom,
             },
         );
-
-        if side_w > 0 {
-            side::draw(
-                &mut cv,
-                Rect {
-                    x: 0,
-                    y: 1,
-                    width: side_w,
-                    height: area.height.saturating_sub(2),
-                },
-                s,
-                inp.now_ms,
-                red,
-            );
-        }
 
         // M01: at launch the conversation unfolds first (320 ms), the
         // other panels 120 ms apart after it.
@@ -329,6 +416,37 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
             .position(|a| a.1 == View::Conversation)
             .unwrap_or(0);
         let animate_start = inp.brand == crate::proto::welcome::BrandTier::Anim && !red;
+
+        if side_w > 0 {
+            // The sidebar fades in over 260 ms at launch — the
+            // conversation unfolds into it, so it arrives just before.
+            let side_reveal = if animate_start {
+                ease_out((now / 0.26).clamp(0.0, 1.0))
+            } else {
+                1.0
+            };
+            let side_rect = Rect {
+                x: 0,
+                y: 1,
+                width: side_w,
+                height: area.height.saturating_sub(2),
+            };
+            if side_reveal >= 1.0 {
+                side::draw(&mut cv, side_rect, s, inp.now_ms, red, inp.mono);
+            } else {
+                cv.veil(
+                    0,
+                    1,
+                    side_w as i32,
+                    side_rect.height as i32,
+                    pal::SIDEBAR,
+                    1.0 - side_reveal,
+                );
+                cv.clipped(side_rect, |cv| {
+                    side::draw(cv, side_rect, s, inp.now_ms, red, inp.mono);
+                });
+            }
+        }
 
         // Panels.
         let heavy_ms = inp.fx.focus_ms;
@@ -371,10 +489,15 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
                             s,
                             now_ms: inp.now_ms,
                             reduced: red,
+                            mono: inp.mono,
                             composer: inp.composer,
                             focused: *i == focus,
                             focus_fx: focus_in,
-                            scroll_offset: inp.scroll_offset,
+                            scroll_offset: inp
+                                .scrolls
+                                .get(*i)
+                                .copied()
+                                .unwrap_or(inp.scroll_offset),
                             num: i + 1,
                             brand: inp.brand,
                         },
@@ -388,14 +511,52 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
                             s,
                             now_ms: inp.now_ms,
                             reduced: red,
+                            mono: inp.mono,
                             focused: *i == focus,
                             focus_fx: focus_in,
                             num: i + 1,
                             agent: &sh.tree.agent_at(*i),
+                            scroll: inp.scrolls.get(*i).copied().unwrap_or(0),
                         },
                     );
                 }
             });
+        }
+
+        // The closing panel's ghost: a fading flat card behind the
+        // gliding survivors — read as the panel shrinking away.
+        for (r, view, fade) in &ghosts {
+            if *fade <= 0.02 {
+                continue;
+            }
+            let col = view_colour(*view);
+            cv.clipped(*r, |cv| {
+                cv.fill(
+                    r.x as i32,
+                    r.y as i32,
+                    r.width as i32,
+                    r.height as i32,
+                    mix(pal::PANEL, col, 0.25 * fade),
+                );
+                let title = clip_text(view.title(), r.width as i32 - 4);
+                cv.text(
+                    r.x as i32 + 2,
+                    r.y as i32,
+                    &title,
+                    mix(pal::FAINT, col, *fade),
+                    Some(mix(pal::PANEL, col, 0.25 * fade)),
+                );
+            });
+        }
+
+        // The selection is bound to one panel: it is clamped to that
+        // panel's content and drawn only inside it.
+        if let Some(sel) = &inp.selection {
+            if let Some((_, r, _)) = areas.iter().find(|(i, _, _)| *i == sel.panel) {
+                for (x, y, w) in sel.rows(content_rect(*r)) {
+                    cv.wash(x, y, w, 1, canvas::mix(pal::PANEL, pal::CYAN, 0.32));
+                }
+            }
         }
 
         // M22: arranging dims every panel and shows its number big.
@@ -428,6 +589,7 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
             s,
             inp.now_ms,
             red,
+            inp.mono,
             fv == View::Conversation,
             matches!(fv, View::Changes | View::Review),
             sh.arranging,
@@ -478,7 +640,10 @@ mod tests {
                     now_ms: 5_000,
                     reduced: true,
                     tier: Tier::TrueColor,
+                    mono: false,
                     scroll_offset: 0,
+                    scrolls: &[],
+                    selection: None,
                     brand: crate::proto::welcome::BrandTier::Static,
                     toast: None,
                     overlay: None,
@@ -543,6 +708,7 @@ mod tests {
             path: "crates/export/src/restore.rs".into(),
             added: 3,
             removed: 1,
+            hunks: None,
         }];
         s.tasks = vec![
             TaskRow {
@@ -655,7 +821,10 @@ mod tests {
                     now_ms,
                     reduced: false,
                     tier,
+                    mono: tier >= Tier::T16,
                     scroll_offset: 0,
+                    scrolls: &[],
+                    selection: None,
                     brand: crate::proto::welcome::BrandTier::Static,
                     toast,
                     overlay: ov,
@@ -841,5 +1010,123 @@ mod tests {
                 .count();
             assert_eq!(rgb, 0, "no true-colour cells left under {tier:?} ({ok})");
         }
+    }
+
+    #[test]
+    fn zoom_shows_only_the_focused_panel_with_a_zoom_pill() {
+        let mut app = App::new(std::path::PathBuf::new(), true);
+        app.focus = 2; // Terminal
+        app.zoom = true;
+        let out = render(&app, &Scenario::new(), 164, 48);
+        assert!(out.contains("ZOOM"), "{out}");
+        assert!(out.contains("No commands yet"), "{out}");
+        assert!(
+            !out.contains("No changes yet"),
+            "other panels are gone\n{out}"
+        );
+        let rects = panel_rects(Rect::new(0, 0, 164, 48), &app);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, 2);
+        assert_eq!(rects[0].1.width, 162, "the panel fills the screen");
+    }
+
+    #[test]
+    fn a_selection_never_leaves_its_panel() {
+        let app = App::new(std::path::PathBuf::new(), true);
+        let rects = panel_rects(Rect::new(0, 0, 164, 48), &app);
+        let (_, conv, _) = rects[1];
+        let inner = content_rect(conv);
+        // Dragged far outside — into the neighbouring panel and off the
+        // bottom of the screen: every selected row stays inside `inner`.
+        let sel = Selection {
+            panel: 1,
+            a: (inner.x + 3, inner.y + 4),
+            b: (163, 47),
+        };
+        let rows = sel.rows(inner);
+        assert!(!rows.is_empty());
+        for (x, y, w) in rows {
+            assert!(
+                x >= inner.x as i32 && x + w <= inner.right() as i32,
+                "x range {x}+{w}"
+            );
+            assert!(y >= inner.y as i32 && y < inner.bottom() as i32, "row {y}");
+        }
+        // The other direction (anchor right/below the end) reads the same.
+        let rev = Selection {
+            a: sel.b,
+            b: sel.a,
+            ..sel
+        };
+        assert_eq!(rev.rows(inner), sel.rows(inner));
+    }
+
+    #[test]
+    fn each_panel_scrolls_alone() {
+        use crate::proto::scenario::{LineKind, ToolState, TranscriptLine};
+        let app = App::new(std::path::PathBuf::new(), true);
+        let mut s = Scenario::new();
+        for i in 0..40 {
+            s.transcript.push(TranscriptLine {
+                kind: LineKind::User,
+                text: format!("message number {i}"),
+                ..Default::default()
+            });
+        }
+        s.tool_output = (0..60).map(|i| format!("out line {i}")).collect();
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::Tool,
+            text: "cargo test".into(),
+            tool_name: "bash".into(),
+            tool_state: ToolState::Running,
+            ..Default::default()
+        });
+        let draw_with = |scrolls: &[usize]| {
+            let mut term = ratatui::Terminal::new(TestBackend::new(164, 48)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &DrawIn {
+                        app: &app,
+                        fx: &Fx::default(),
+                        scenario: &s,
+                        composer: "",
+                        now_ms: 5_000,
+                        reduced: true,
+                        tier: Tier::TrueColor,
+                        mono: false,
+                        scroll_offset: 0,
+                        scrolls,
+                        selection: None,
+                        brand: crate::proto::welcome::BrandTier::Static,
+                        toast: None,
+                        overlay: None,
+                    },
+                )
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            let side = |x0: u16, x1: u16| {
+                (0..48u16)
+                    .map(|y| {
+                        (x0..x1)
+                            .map(|x| buf[(x, y)].symbol().to_string())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            (side(53, 112), side(113, 164))
+        };
+        let (conv0, term0) = draw_with(&[0, 0, 0]);
+        // Scroll ONLY the conversation (panel index 1): the terminal panel
+        // must not change at all.
+        let (conv1, term1) = draw_with(&[0, 9, 0]);
+        assert_ne!(conv0, conv1, "the conversation moved");
+        assert_eq!(term0, term1, "the terminal panel did not");
+        // And the other way round.
+        let (conv2, term2) = draw_with(&[0, 0, 5]);
+        assert_eq!(conv0, conv2, "the conversation did not move");
+        assert_ne!(term0, term2, "the terminal panel did");
     }
 }

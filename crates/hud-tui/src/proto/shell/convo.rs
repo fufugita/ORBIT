@@ -21,6 +21,9 @@ pub struct ConvIn<'a> {
     pub s: &'a Scenario,
     pub now_ms: u64,
     pub reduced: bool,
+    /// Colour effects off (16 colours or less): shimmer and the
+    /// fresh-ink fade switch off.
+    pub mono: bool,
     pub composer: &'a str,
     pub focused: bool,
     pub focus_fx: super::frame::FocusFx,
@@ -149,7 +152,7 @@ fn user_rows(l: &TranscriptLine, w: i32) -> Vec<Row> {
         .collect()
 }
 
-fn orbit_rows(l: &TranscriptLine, w: i32, live: bool, now_ms: u64, reduced: bool) -> Vec<Row> {
+fn orbit_rows(l: &TranscriptLine, w: i32, live: bool, now_ms: u64, reduced: bool, mono: bool) -> Vec<Row> {
     let time = l.time.clone().unwrap_or_default();
     let arrivals = l.arrivals.clone();
     let last_data = arrivals.last().map(|a| a.1);
@@ -183,7 +186,7 @@ fn orbit_rows(l: &TranscriptLine, w: i32, live: bool, now_ms: u64, reduced: bool
                     // M06 fresh ink: a chunk lands near white and fades
                     // to ink in 450 ms, ease-out.
                     let t0 = arrivals.iter().rev().find(|a| a.0 <= k).map(|a| secs(a.1));
-                    let fade = ease_out(prog(secs(now_ms), t0, 0.45, reduced));
+                    let fade = ease_out(prog(secs(now_ms), t0, 0.45, reduced || mono));
                     let fg = mix(mix(WHITE, CYAN, 0.35), INK, fade);
                     cv.text(x + 4 + (k - a) as i32, y, &plain[k].to_string(), fg, bg);
                 }
@@ -205,12 +208,12 @@ fn orbit_rows(l: &TranscriptLine, w: i32, live: bool, now_ms: u64, reduced: bool
         .collect()
 }
 
-fn think_rows(model: String, since_ms: u64, now_ms: u64, reduced: bool) -> Vec<Row> {
+fn think_rows(model: String, since_ms: u64, now_ms: u64, reduced: bool, mono: bool) -> Vec<Row> {
     vec![Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
         let now = secs(now_ms);
         cv.bold(x + 2, y, star_at(now, 2.0, reduced), CYAN, None);
         let label = format!("waiting for {model}");
-        cv.spans(x + 4, y, &shimmer(&label, now, CYAN, reduced), None);
+        cv.spans(x + 4, y, &shimmer(&label, now, CYAN, reduced || mono), None);
         let el = now_ms.saturating_sub(since_ms) / 1000;
         if el >= 1 {
             cv.text(
@@ -254,14 +257,14 @@ fn report_rows(text: String, ended_ms: Option<u64>, now_ms: u64, reduced: bool) 
     }) as RowFn)]
 }
 
-fn card_rows(l: &TranscriptLine, w: i32, now_ms: u64, reduced: bool) -> Vec<Row> {
+fn card_rows(l: &TranscriptLine, w: i32, now_ms: u64, reduced: bool, mono: bool) -> Vec<Row> {
     let kind = kind_of(&l.tool_name);
     let st = l.tool_state;
     let now = secs(now_ms);
     let started = l.started_ms.map(secs);
     let finished = l.finished_ms.map(secs);
     // M10 settle: the stripe turns cyan → green (or red) in 300 ms.
-    let settle = prog(now, finished, 0.3, reduced);
+    let settle = prog(now, finished, 0.3, reduced || mono);
     let stripe = match st {
         ToolState::Done => mix(CYAN, GREEN, settle),
         ToolState::Failed => mix(CYAN, RED, settle),
@@ -279,11 +282,18 @@ fn card_rows(l: &TranscriptLine, w: i32, now_ms: u64, reduced: bool) -> Vec<Row>
         .unwrap_or_else(|| l.meta.clone());
     let is_bash = kind == "BASH";
     let k2 = kind.clone();
+    // M16: the AGENT card's live sub-status, cloned before row1 moves
+    // `meta` — the running card shows what its subagent is doing.
+    let sub_status = if kind == "AGENT" && st == ToolState::Running && !meta.is_empty() {
+        Some(meta.clone())
+    } else {
+        None
+    };
     let row1: RowFn = Box::new(move |cv: &mut Cv, x: i32, y: i32| {
         cv.fill(x, y, w, 1, RAISE);
         cv.text(x, y, "▌", stripe, Some(RAISE));
         // M07: the kind chip flashes for 250 ms as the call starts.
-        let chip_flash = flash(now, started, 0.25, reduced);
+        let chip_flash = flash(now, started, 0.25, reduced || mono);
         let mut xx = if is_bash {
             cv.put(
                 x + 1,
@@ -321,7 +331,7 @@ fn card_rows(l: &TranscriptLine, w: i32, now_ms: u64, reduced: bool) -> Vec<Row>
             ]),
             ToolState::Done => right.extend([
                 Seg::new(sep, MUTED),
-                Seg::bold("✓", mix(WHITE, GREEN, prog(now, finished, 0.25, reduced))),
+                Seg::bold("✓", mix(WHITE, GREEN, prog(now, finished, 0.25, reduced || mono))),
             ]),
             ToolState::Failed => right.extend([
                 Seg::new(sep, MUTED),
@@ -365,6 +375,17 @@ fn card_rows(l: &TranscriptLine, w: i32, now_ms: u64, reduced: bool) -> Vec<Row>
         cv.spans(x + w - 1 - rw, y, &right, Some(RAISE));
     });
     let mut rows: Vec<Row> = vec![Some(row1)];
+    // M16: a running AGENT card carries a sub-status line — what its
+    // subagent is doing right now (the meta the progress events keep
+    // fresh). The card stops being a black box while it runs.
+    if let Some(sub) = sub_status {
+        rows.push(Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
+            cv.fill(x, y, w, 1, RAISE);
+            cv.text(x, y, "▌", stripe, Some(RAISE));
+            cv.text(x + 2, y, "┆", MUTED, Some(RAISE));
+            cv.text(x + 4, y, &clip_text(&sub, w - 6), MUTED, Some(RAISE));
+        }) as RowFn));
+    }
     if st == ToolState::Running {
         let comet_col = if kind == "AGENT" { MAGENTA } else { CYAN };
         rows.push(Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
@@ -401,9 +422,9 @@ fn transcript_rows(inp: &ConvIn, w: i32) -> Vec<Row> {
             LineKind::User => ("user", user_rows(l, w)),
             LineKind::Model => {
                 let live = s.turn_live && s.visible_output && Some(i) == last_model;
-                ("orbit", orbit_rows(l, w, live, inp.now_ms, inp.reduced))
+                ("orbit", orbit_rows(l, w, live, inp.now_ms, inp.reduced, inp.mono))
             }
-            LineKind::Tool => ("card", card_rows(l, w, inp.now_ms, inp.reduced)),
+            LineKind::Tool => ("card", card_rows(l, w, inp.now_ms, inp.reduced, inp.mono)),
             LineKind::System => ("note", note_rows(l, w)),
             LineKind::Queued => ("note", queued_rows(l, w)),
         };
@@ -426,6 +447,7 @@ fn transcript_rows(inp: &ConvIn, w: i32) -> Vec<Row> {
             s.turn_started_ms,
             inp.now_ms,
             inp.reduced,
+            inp.mono,
         ));
     } else if let Some(r) = &s.turn_report {
         if !s.turn_live {

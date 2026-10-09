@@ -2666,6 +2666,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "crossterm",
+ "orbit-frontend-protocol",
  "orbit-hud",
  "ratatui",
  "rustix",

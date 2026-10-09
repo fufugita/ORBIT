@@ -17,9 +17,13 @@ pub struct PaneIn<'a> {
     pub s: &'a Scenario,
     pub now_ms: u64,
     pub reduced: bool,
+    /// Colour effects off (16 colours or less): flashes switch off.
+    pub mono: bool,
     pub focused: bool,
     pub focus_fx: super::frame::FocusFx,
     pub num: usize,
+    /// Rows scrolled up from the newest (this panel only).
+    pub scroll: usize,
     /// For an Agent panel, which agent it follows (empty = any).
     pub agent: &'a str,
 }
@@ -132,7 +136,7 @@ fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             // M11: the changed row flashes for 600 ms and its counters
             // count up in 300 ms.
             let changed = inp.s.file_changed_ms.get(i).copied().filter(|t| *t > 0).map(secs);
-            let fl = flash(secs(inp.now_ms), changed, 0.6, inp.reduced);
+            let fl = flash(secs(inp.now_ms), changed, 0.6, inp.reduced || inp.mono);
             let roll = ease_out(prog(secs(inp.now_ms), changed, 0.3, inp.reduced));
             let base = if sel { tint(VIOLET, PANEL, 0.12) } else { PANEL };
             let bg = mix(base, tint(VIOLET, PANEL, 0.35), fl);
@@ -225,8 +229,8 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         cv.bold(x + 2, top, &clip_text(&l.text, w - 2), INK, Some(INSET));
         let lines = &s.tool_output;
         let avail = (bottom - top - 1).max(0) as usize;
-        let start = lines.len().saturating_sub(avail);
-        for (i, line) in lines.iter().skip(start).enumerate() {
+        let start = lines.len().saturating_sub(avail + inp.scroll.min(lines.len()));
+        for (i, line) in lines.iter().skip(start).take(avail).enumerate() {
             cv.text(x, top + 1 + i as i32, &clip_text(line, w), INK2, Some(INSET));
         }
     });
@@ -298,7 +302,7 @@ fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 .copied()
                 .filter(|c| *c > 0)
                 .map(secs);
-            let fl = flash(secs(inp.now_ms), changed, 0.45, inp.reduced);
+            let fl = flash(secs(inp.now_ms), changed, 0.45, inp.reduced || inp.mono);
             let (g, gc) = if t.status == "done" {
                 ("✓", mix(GREEN, WHITE, fl))
             } else if active {
@@ -371,8 +375,10 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             inner.width as i32,
             inner.height as i32,
         );
-        let start = rows.len().saturating_sub(h as usize);
-        for (i, l) in rows.iter().skip(start).enumerate() {
+        let start = rows
+            .len()
+            .saturating_sub(h as usize + inp.scroll.min(rows.len()));
+        for (i, l) in rows.iter().skip(start).take(h as usize).enumerate() {
             let yy = y + i as i32;
             let (g, gc) = l.tool_state.glyph_parts();
             let gcol = match gc {

@@ -34,6 +34,8 @@ pub enum Overlay {
     Help,
     /// The quit card (§11.7).
     Quit,
+    /// The full diff of the Changes panel's selected file (M11).
+    Diff,
 }
 
 /// A toast (§9.13): muted text, optional green ✓, 3 s.
@@ -57,6 +59,11 @@ pub struct Tui {
     pub fx: super::shell::Fx,
     /// The colour tier the screen is mapped to.
     pub tier: super::core::Tier,
+    /// Rows scrolled up, per panel (reading order): the wheel and
+    /// PgUp/PgDn move only the panel they are aimed at.
+    pub scrolls: Vec<usize>,
+    /// The text selection — bound to one panel, never crossing it.
+    pub selection: Option<super::shell::Selection>,
 }
 
 impl Default for Tui {
@@ -76,6 +83,32 @@ impl Tui {
             app: super::app::App::new(std::path::PathBuf::new(), false),
             fx: super::shell::Fx::default(),
             tier: super::core::Tier::TrueColor,
+            scrolls: Vec::new(),
+            selection: None,
+        }
+    }
+
+    /// Scroll the focused panel by `delta` rows (positive = back in time).
+    pub fn scroll_by(&mut self, delta: isize) {
+        let i = self.app.focus;
+        if self.scrolls.len() <= i {
+            self.scrolls.resize(i + 1, 0);
+        }
+        self.scrolls[i] = (self.scrolls[i] as isize + delta).max(0) as usize;
+    }
+
+    /// Scroll the panel at index `i` (the one under the pointer).
+    pub fn scroll_panel(&mut self, i: usize, delta: isize) {
+        if self.scrolls.len() <= i {
+            self.scrolls.resize(i + 1, 0);
+        }
+        self.scrolls[i] = (self.scrolls[i] as isize + delta).max(0) as usize;
+    }
+
+    /// Follow the newest rows again in the focused panel.
+    pub fn scroll_follow(&mut self) {
+        if let Some(s) = self.scrolls.get_mut(self.app.focus) {
+            *s = 0;
         }
     }
 
@@ -126,7 +159,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
 
     // §12.4: mouse capture stays off (the terminal's native
     // selection owns the mouse).
-    let mut guard = match crate::terminal::TerminalGuard::enter_with(false) {
+    let mut guard = match crate::terminal::TerminalGuard::enter_with(true) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("orbit-tui: cannot enter terminal: {e}");
@@ -165,6 +198,8 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                 std::env::var("TERM").ok().as_deref(),
             ),
         },
+        scrolls: Vec::new(),
+        selection: None,
     };
     tui.sync_focus();
 
@@ -186,8 +221,6 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     let mut want_copy_mode = false;
     // The Sessions push (§8.2 Medium): Shift-Tab from Conversation.
     let mut sessions_pushed = false;
-    // Transcript scroll: rows above the bottom (0 = following).
-    let mut scroll_offset: usize = 0;
     // The last sent prompt (§11.3): ⏎ on an empty composer resends
     // it after a failed turn.
     let mut last_prompt: Option<String> = None;
@@ -215,6 +248,8 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     let boot_ms = Instant::now();
     let mut last_drawn = String::new();
     let mut overlay_dirty = true;
+    // The last frame drawn: a selection copies its text from here.
+    let mut last_buf: Option<ratatui::buffer::Buffer> = None;
 
     loop {
         let timeout = UI_TICK
@@ -258,7 +293,6 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                         &mut pending_leader,
                         &mut want_copy_mode,
                         &mut sessions_pushed,
-                        &mut scroll_offset,
                         &mut last_prompt,
                     );
                     let snap_after =
@@ -267,6 +301,25 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                     if quit {
                         break;
                     }
+                }
+                Event::Mouse(m) => {
+                    overlay_dirty = true;
+                    let size = guard.terminal.size().unwrap_or_default();
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    let snap_before =
+                        super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
+                    if overlay.is_none() {
+                        if let Some(text) = handle_mouse(m, &mut tui, area, last_buf.as_ref()) {
+                            toast = Some(Toast {
+                                text,
+                                ok: true,
+                                shown_ms: now_ms,
+                            });
+                        }
+                    }
+                    let snap_after =
+                        super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
+                    tui.fx.observe(&snap_before, &snap_after, now_ms);
                 }
                 Event::Resize(w, h) => {
                     let _ = guard.terminal.resize(Rect {
@@ -295,7 +348,15 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
             // Drain the bus into the scenario.
             let msgs_before = scenario.state_version();
             while let Some(msg) = bus.try_recv() {
-                apply_msg(msg, &mut scenario, now_ms);
+                if let Some(text) = apply_msg(msg, &mut scenario, now_ms) {
+                    // The agent-done toast (§9.13): replaces any current
+                    // toast — the newest event wins.
+                    toast = Some(Toast {
+                        text,
+                        ok: true,
+                        shown_ms: now_ms,
+                    });
+                }
             }
             let bus_dirty = scenario.state_version() != msgs_before;
             // The queue (§11.4): when the turn ends and prompts are
@@ -350,7 +411,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
             {
                 last_drawn.clone_from(&composer);
                 overlay_dirty = false;
-                guard
+                let done = guard
                     .terminal
                     .draw(|f| {
                         draw(
@@ -363,10 +424,16 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                             palette_sel,
                             toast.as_ref(),
                             sessions_pushed,
-                            scroll_offset,
+                            0,
                         );
                     })
-                    .unwrap();
+                    .ok();
+                let Some(done) = done else {
+                    // The terminal is gone (closed window, dead PTY): leave the
+                    // loop and let the normal shutdown run — never panic here.
+                    break;
+                };
+                last_buf = Some(done.buffer.clone());
             }
             // Toast expiry (§9.13): 3 s.
             if let Some(t) = &toast {
@@ -426,7 +493,6 @@ fn handle_key(
     pending_leader: &mut Option<char>,
     want_copy_mode: &mut bool,
     sessions_pushed: &mut bool,
-    scroll_offset: &mut usize,
     last_prompt: &mut Option<String>,
 ) -> bool {
     let prev_key_ms = scenario.last_key_ms;
@@ -504,6 +570,10 @@ fn handle_key(
                 _ => {}
             }
             return false;
+        }
+        Some(Overlay::Diff) => {
+            // Any key closes the diff: it's a look, not a mode.
+            *overlay = None;
         }
         None => {}
     }
@@ -585,6 +655,11 @@ fn handle_key(
             KeyCode::Esc => Some(super::app::Key::Esc),
             KeyCode::Enter => Some(super::app::Key::Enter),
             KeyCode::Tab => Some(super::app::Key::Tab),
+            // `y` while arranging: the plain-text transcript view (copy mode).
+            KeyCode::Char('y') => {
+                *want_copy_mode = true;
+                None
+            }
             KeyCode::Char(ch) => Some(super::app::Key::Char(ch)),
             _ => None,
         };
@@ -606,18 +681,33 @@ fn handle_key(
         return false;
     }
 
-    // z is a leader: z y enters copy mode (§11.2).
-    if tui.focus == Focus::Conversation && k.code == KeyCode::Char('z') {
-        *pending_leader = Some('z');
-        return false;
-    }
-    if *pending_leader == Some('z') {
-        *pending_leader = None;
-        if k.code == KeyCode::Char('y') {
-            *want_copy_mode = true;
+    // A key press clears the selection (the next click starts another).
+    tui.selection = None;
+
+    // Scrolling belongs to the focused panel alone.
+    match k.code {
+        KeyCode::PageUp => {
+            tui.scroll_by(8);
             return false;
         }
+        KeyCode::PageDown => {
+            tui.scroll_by(-8);
+            return false;
+        }
+        KeyCode::End if composer.is_empty() || tui.focus != Focus::Conversation => {
+            tui.scroll_follow();
+            return false;
+        }
+        _ => {}
     }
+
+    // `z` zooms the focused panel — except in the Conversation, where it
+    // is just a letter (zoom there is `esc` then `z`).
+    if k.code == KeyCode::Char('z') && k.modifiers.is_empty() && tui.focus != Focus::Conversation {
+        tui.app.zoom = !tui.app.zoom;
+        return false;
+    }
+    let _ = pending_leader;
 
     // Focus keys (§11.1).
     match k.code {
@@ -710,6 +800,7 @@ fn handle_key(
                         *sessions_pushed = true;
                     }
                 } else if !composer.trim().is_empty() && !composer.starts_with('/') {
+                    tui.scroll_follow();
                     let text = composer.trim().to_string();
                     composer.clear();
                     history.insert(0, text.clone());
@@ -793,15 +884,6 @@ fn handle_key(
                     composer.clear();
                 }
             }
-            KeyCode::PageUp => {
-                *scroll_offset += 8;
-            }
-            KeyCode::PageDown => {
-                *scroll_offset = scroll_offset.saturating_sub(8);
-            }
-            KeyCode::End => {
-                *scroll_offset = 0;
-            }
 
             _ => {}
         }
@@ -834,6 +916,15 @@ fn handle_key(
                 tui.app.focus = i;
                 tui.sync_focus();
             }
+        }
+        // M11: ⏎ on the Changes panel shows the selected file's real
+        // diff — the hunks the FileChanged event carried.
+        KeyCode::Enter
+            if tui.app.focused_view() == super::layout::View::Changes
+                && !scenario.file_changes.is_empty() =>
+        {
+            tui.fx.overlay_ms = now_ms;
+            *overlay = Some(Overlay::Diff);
         }
         KeyCode::Char('/') => *overlay = Some(Overlay::Palette),
         KeyCode::Char('?') => *overlay = Some(Overlay::Help),
@@ -1034,8 +1125,9 @@ fn run_command(
     open
 }
 
-/// FrontendEvent-shaped Msgs → the scenario reducer.
-fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
+/// FrontendEvent-shaped Msgs → the scenario reducer. Returns a toast
+/// to show (the agent-done note, §9.13) — the event loop owns toasts.
+fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Option<String> {
     use crate::msg::Msg;
     // Every message may start a motion: keep redrawing for a second.
     scenario.motion_until_ms = now_ms + 1000;
@@ -1244,17 +1336,21 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
             path,
             added,
             removed,
+            hunks,
         } => {
-            // One row per file; later edits to it add to its totals.
+            // One row per file; later edits to it add to its totals
+            // and replace its hunks with the latest change's.
             match scenario.file_changes.iter_mut().find(|f| f.path == path) {
                 Some(f) => {
                     f.added += added;
                     f.removed += removed;
+                    f.hunks = hunks.clone();
                 }
                 None => scenario.file_changes.push(super::panels::FileChangeRow {
                     path: path.clone(),
                     added,
                     removed,
+                    hunks: hunks.clone(),
                 }),
             }
             // The row flashes (M11): note when its file last changed.
@@ -1270,7 +1366,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
         }
         Msg::SubagentStarted { id, name, task } => {
             scenario.agents.insert(
-                id,
+                id.clone(),
                 super::scenario::Agent {
                     name,
                     action: task,
@@ -1280,19 +1376,42 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
                 },
             );
             scenario.agents_running = scenario.agents.values().filter(|a| !a.done).count();
+            // M16: attach the subagent to its Task card — the most
+            // recent running Task/Agent line — so the card can show a
+            // live sub-status of what its agent is doing.
+            if let Some(card) = scenario.transcript.iter_mut().rev().find(|l| {
+                l.kind == LineKind::Tool
+                    && matches!(l.tool_name.as_str(), "Task" | "Agent")
+                    && l.tool_state == super::scenario::ToolState::Running
+            }) {
+                card.agent_id = Some(id);
+            }
         }
         Msg::SubagentProgress { id, action } => {
             if let Some(a) = scenario.agents.get_mut(&id) {
-                a.action = action;
+                a.action = action.clone();
+            }
+            // The card's sub-status (M16): what its agent is doing now.
+            if let Some(card) = scenario
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|l| l.agent_id.as_deref() == Some(id.as_str()))
+            {
+                card.meta = action;
             }
         }
         Msg::SubagentFinished { id, report } => {
+            let name = scenario.agents.get(&id).map(|a| a.name.clone());
             if let Some(a) = scenario.agents.get_mut(&id) {
                 a.action = report;
                 a.done = true;
                 a.done_ms = Some(now_ms);
             }
             scenario.agents_running = scenario.agents.values().filter(|a| !a.done).count();
+            // The agent-done toast (§9.13): a finished subagent must
+            // not pass silently — the operator may be looking away.
+            return name.map(|n| format!("agent {n} done"));
         }
         Msg::Usage {
             used_tokens,
@@ -1358,6 +1477,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) {
         }
         _ => {}
     }
+    None
 }
 
 // ── The draw (§8, §9) ─────────────────────────────────────────────
@@ -1405,6 +1525,17 @@ pub fn draw(
         Some(Overlay::Quit) => Some(Ov::Quit {
             turn_live: scenario.turn_live,
         }),
+        Some(Overlay::Diff) => {
+            // The Changes panel's first (selected) file — the row the
+            // ⏎ hint promises. No rows, no overlay.
+            scenario.file_changes.first().map(|f| Ov::Diff {
+                path: f.path.as_str(),
+                added: f.added,
+                removed: f.removed,
+                hunks: &f.hunks,
+                opened_ms: tui.fx.overlay_ms,
+            })
+        }
         None => None,
     };
     super::shell::draw(
@@ -1415,8 +1546,17 @@ pub fn draw(
             scenario,
             composer,
             now_ms: tui.tick_ms,
+            // Colour-effect gating (the spec): shimmer, fades and flashes
+            // are COLOUR motion — they switch off under 16 colours or no
+            // colour, at the source, instead of running in true colour
+            // and being coarsened by the tier map after the fact. This
+            // gates only those effects; glyph motion (typing, reveals,
+            // stars, comets) works in mono and stays on `reduced`.
+            mono: tui.tier >= super::core::Tier::T16,
             reduced: tui.reduced,
             tier: tui.tier,
+            scrolls: &tui.scrolls,
+            selection: tui.selection,
             scroll_offset,
             brand: tui.brand_tier,
             toast: toast.map(|t| super::shell::ToastIn {
@@ -1429,6 +1569,111 @@ pub fn draw(
     );
 }
 
+/// The mouse, with every gesture bound to the panel under the pointer
+/// (herdr-style isolation): a click focuses it; the wheel scrolls it alone;
+/// a drag selects inside it and is clamped to its content; releasing copies
+/// that panel's text — and only that — through OSC 52.
+fn handle_mouse(
+    m: crossterm::event::MouseEvent,
+    tui: &mut Tui,
+    area: Rect,
+    last: Option<&ratatui::buffer::Buffer>,
+) -> Option<String> {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (col, row) = (m.column, m.row);
+    let rects = super::shell::panel_rects(area, &tui.app);
+    let under = rects
+        .iter()
+        .find(|(_, r, _)| col >= r.x && col < r.right() && row >= r.y && row < r.bottom());
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            tui.selection = None;
+            if row == 0 {
+                // The layout tabs in the top bar.
+                if let Some(p) = super::shell::bars::preset_at(col as i32) {
+                    tui.app.apply_preset(p);
+                    tui.app.save_yours();
+                    tui.sync_focus();
+                }
+                return None;
+            }
+            if let Some((i, r, _)) = under {
+                if *i != tui.app.focus {
+                    tui.app.focus = *i;
+                    tui.sync_focus();
+                }
+                let inner = super::shell::content_rect(*r);
+                if col >= inner.x && col < inner.right() && row >= inner.y && row < inner.bottom() {
+                    tui.selection = Some(super::shell::Selection {
+                        panel: *i,
+                        a: (col, row),
+                        b: (col, row),
+                    });
+                }
+            }
+            None
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(sel) = &mut tui.selection {
+                sel.b = (col, row);
+            }
+            None
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let sel = tui.selection?;
+            if sel.a == sel.b {
+                tui.selection = None;
+                return None;
+            }
+            let (_, r, _) = rects.iter().find(|(i, _, _)| *i == sel.panel)?;
+            let buf = last?;
+            let text = selected_text(buf, &sel, *r);
+            if text.is_empty() {
+                return None;
+            }
+            let _ = std::io::Write::write_all(
+                &mut std::io::stdout(),
+                crate::selection::osc52_sequence(&text).as_bytes(),
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            Some(format!("copied {} characters", text.chars().count()))
+        }
+        MouseEventKind::ScrollUp => {
+            if let Some((i, _, _)) = under {
+                tui.scroll_panel(*i, 3);
+            }
+            None
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some((i, _, _)) = under {
+                tui.scroll_panel(*i, -3);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The text of a selection, read from the drawn frame, inside its panel.
+fn selected_text(
+    buf: &ratatui::buffer::Buffer,
+    sel: &super::shell::Selection,
+    panel: Rect,
+) -> String {
+    let inner = super::shell::content_rect(panel);
+    sel.rows(inner)
+        .into_iter()
+        .map(|(x, y, w)| {
+            (x..x + w)
+                .map(|cx| buf[(cx as u16, y as u16)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The overlay as a small code for change detection (0 none).
 fn overlay_code(o: Option<Overlay>) -> u8 {
     match o {
@@ -1436,5 +1681,6 @@ fn overlay_code(o: Option<Overlay>) -> u8 {
         Some(Overlay::Palette) => 1,
         Some(Overlay::Help) => 2,
         Some(Overlay::Quit) => 3,
+        Some(Overlay::Diff) => 4,
     }
 }

@@ -31,7 +31,7 @@ fn section(cv: &mut Cv, x: i32, y: i32, w: i32, label: &str, col: Rgb, count: Op
     }
 }
 
-pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool) {
+pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool, mono: bool) {
     let (x, y, w, h) = (r.x as i32, r.y as i32, r.width as i32, r.height as i32);
     cv.fill(x, y, w, h, SIDEBAR);
     cv.clipped(r, |cv| {
@@ -152,7 +152,7 @@ pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool) {
                     Seg::new("working", CYAN),
                 ]
             };
-            let done_flash = flash(secs(now_ms), a.done_ms.map(secs), 0.6, reduced);
+            let done_flash = flash(secs(now_ms), a.done_ms.map(secs), 0.6, reduced || mono);
             let col = if a.done { GREEN } else { CYAN };
             cv.bold(x + 2, yy, "●", CYAN, Some(SIDEBAR));
             cv.put(

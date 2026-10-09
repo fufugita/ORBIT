@@ -430,6 +430,7 @@ mod tests {
             path: "src/main.rs".into(),
             added: 12,
             removed: 3,
+            hunks: None,
         });
         let lines = changes(&s);
         let t: String = lines
@@ -541,4 +542,7 @@ pub struct FileChangeRow {
     pub path: String,
     pub added: u32,
     pub removed: u32,
+    /// The latest change's bounded hunks (M11): None = no "before"
+    /// existed, so there is no honest diff to show.
+    pub hunks: Option<Vec<orbit_frontend_protocol::DiffHunk>>,
 }

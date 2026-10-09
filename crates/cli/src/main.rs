@@ -1461,7 +1461,7 @@ impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-            let result = tool_runtime::execute_call(
+            let (result, _) = tool_runtime::execute_call(
                 &self.home,
                 &self.session_id,
                 &decision_id,
@@ -1473,7 +1473,7 @@ impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
                 &self.scope,
                 &self.tool_cx,
             )
-            .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+            .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
             results.push(orbit_engine::ToolRoundResult {
                 call_id: call.id.clone(),
                 content: result,
@@ -2066,7 +2066,7 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
             // `tool-round-{round}-{index}` ids repeated every turn, so
             // ledger records could not be tied to their turn).
             let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-            let result = tool_runtime::execute_call(
+            let (result, _) = tool_runtime::execute_call(
                 &self.home,
                 &self.session_id,
                 &decision_id,
@@ -2078,7 +2078,7 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
                 &self.scope,
                 &self.tool_cx,
             )
-            .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e }).to_string());
+            .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
             results.push(orbit_engine::ToolRoundResult {
                 call_id: call.id.clone(),
                 content: result,

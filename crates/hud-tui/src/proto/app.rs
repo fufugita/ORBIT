@@ -29,6 +29,8 @@ pub struct App {
     pub picker: Option<Picker>,
     /// The sidebar (b).
     pub sidebar: bool,
+    /// The focused panel fills the whole screen (`z`).
+    pub zoom: bool,
     /// The star clock (the one stateful animation).
     pub star: StarClock,
     /// Reduced motion (`reduced = true` in tui.toml): every animation
@@ -77,6 +79,7 @@ impl App {
             arranging: false,
             picker: None,
             sidebar: tree == Node::preset(Preset::Build),
+            zoom: false,
             star: StarClock::new(),
             reduced,
             tick_ms: 0,
@@ -99,6 +102,7 @@ impl App {
             arranging: self.arranging,
             picker: self.picker,
             sidebar: self.sidebar,
+            zoom: self.zoom,
             star: self.star,
             reduced: self.reduced,
             tick_ms: self.tick_ms,
@@ -127,6 +131,15 @@ impl App {
         } else {
             (self.focus + n - 1) % n
         };
+    }
+
+    /// Switch to a preset (a click on its tab): the tree, the sidebar
+    /// that goes with it, focus on the first panel.
+    pub fn apply_preset(&mut self, p: Preset) {
+        self.tree = Node::preset(p);
+        self.sidebar = p == Preset::Build;
+        self.zoom = false;
+        self.focus = Self::conversation_index(&self.tree).unwrap_or(0);
     }
 
     /// The view the focus is on.
@@ -250,6 +263,10 @@ impl App {
                     kind: PickerKind::Change,
                     direction: Direction::Right,
                 });
+                false
+            }
+            'z' => {
+                self.zoom = !self.zoom;
                 false
             }
             'x' => {
