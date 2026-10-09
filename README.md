@@ -1,16 +1,106 @@
-# ORBIT
+<p align="center">
+  <img src="docs/tui/img/logo.png" alt="ORBIT" width="420">
+</p>
 
-**The harness that orbits around you.**
+<h3 align="center">The harness that orbits around you.</h3>
 
-ORBIT is an open-source AI orchestration harness where the user is the locus
-of authority. Natural-language or typed directives become typed, confirmed,
-Ledger-recorded grants; the harness enforces the user's declared policy,
-proves what it did, and protects the user's information with a strict,
-non-overridable compliance kernel.
+<p align="center">
+  <a href="https://www.rust-lang.org"><img alt="Rust 1.94" src="https://img.shields.io/badge/rust-1.94-orange"></a>
+  <a href="#license"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <img alt="no unsafe" src="https://img.shields.io/badge/unsafe-forbidden-success">
+</p>
+
+---
+
+<p align="center">
+  <img src="docs/tui/media/orbit-demo.gif" alt="ORBIT TUI: a full turn — prompt, streaming reply, tool call, result" width="640">
+</p>
+
+<p align="center"><sub>A full turn in the ORBIT terminal UI: the user asks, the model streams its reply,
+tool calls run as live cards, and everything lands in the Ledger.</sub></p>
+
+ORBIT is an open-source AI orchestration harness where **you are the locus of
+authority**. Natural-language or typed directives become typed, confirmed,
+Ledger-recorded grants; the harness enforces your declared policy, proves what
+it did, and protects your information with a strict, non-overridable
+compliance kernel.
 
 > **Prove what your agent did. Replay it differently. Route it cheaper.**
 
----
+## Why ORBIT
+
+Most agent harnesses make you trust them. ORBIT is built so you don't have to:
+
+| | |
+|---|---|
+| **Prove** | Every turn is a hash-chained Ledger event. `orbit verify-ledger` checks the chain; `orbit replay --dry` re-plans the same work without dispatching a single request. |
+| **Protect** | A non-overridable kernel: credentials, keys, hashes and internal identifiers never leave your machine. Prompt bytes never enter the Ledger, exports, logs, or HUD. Untrusted quoted/tool/provider content can never become user authority. |
+| **Route** | Declare providers in `providers.toml`; the gateway resolves the right one at dispatch time, with four-gate admission and bounded retry. Credentials are referenced by environment-variable *name*, never stored. |
+
+## The terminal UI
+
+The default front-end is a motion-first ratatui TUI — a conversation that
+*feels* alive: replies type in at 240 characters per second, fresh ink fades
+from white to ink, tool calls run as live cards, and the whole thing degrades
+gracefully from 24-bit colour down to monochrome without losing information.
+
+<p align="center">
+  <img src="docs/tui/img/wide_idle.png" alt="The wide layout: sessions rail, conversation, workspace rail" width="640">
+</p>
+
+<p align="center"><sub>Wide layout — sessions rail, conversation, workspace rail.</sub></p>
+
+<p align="center">
+  <img src="docs/tui/img/wide_approval.png" alt="A tool call asking for approval" width="640">
+</p>
+
+<p align="center"><sub>Tool approval: <code>y</code> allow once, <code>R</code> always-this-session (Ledger-logged,
+revocable), <code>n</code>/<code>Esc</code> deny.</sub></p>
+
+<p align="center">
+  <img src="docs/tui/img/wide_streaming.png" alt="A streaming reply with fresh ink" width="640">
+</p>
+
+<p align="center"><sub>Streaming: the newest chunk lands near-white and settles to ink in 450 ms.</sub></p>
+
+The layout is yours to arrange — split, swap, resize, save — and it survives
+restarts:
+
+<p align="center">
+  <img src="docs/tui/img/layouts.png" alt="Layout presets and the arrange mode" width="440">
+</p>
+
+<p align="center"><sub>Arranging: <code>h j k l</code> move, <code>H J K L</code> swap, <code>v</code>/<code>s</code> split, <code>[ ]</code> cycle presets.</sub></p>
+
+Colour is negotiated with the terminal, not assumed. Sixteen tiers from
+true-colour to mono, each a hand-tuned palette — and colour *effects*
+(shimmer, fades, flashes) switch off under 16 colours while glyph motion
+keeps running:
+
+<p align="center">
+  <img src="docs/tui/img/tiers.png" alt="The colour tiers" width="440">
+</p>
+
+<p align="center">
+  <img src="docs/tui/img/palette.png" alt="The command palette" width="640">
+</p>
+
+<p align="center"><sub>The command palette (<code>⌘K</code>-style, but it's <code>Ctrl+P</code> because terminals).</sub></p>
+
+And it fits whatever terminal you have:
+
+<p align="center">
+  <img src="docs/tui/img/compact.png" alt="Compact layout" width="380">
+  <img src="docs/tui/img/narrow.png" alt="Narrow layout" width="240">
+</p>
+
+<p align="center"><sub>Compact and narrow layouts; below 40×10 the UI becomes a single honest notice.</sub></p>
+
+> **Try it without building anything.** The interactive prototype —
+> [`docs/tui/prototype.html`](docs/tui/prototype.html) — is a self-contained
+> canvas simulation of the TUI (open it in any browser). It has a live
+> prototype tab, a motion gallery where every animation loops side by side,
+> and the full spec.
 
 ## Status
 
@@ -250,6 +340,7 @@ CC0-1.0; anything else fails the check.
 ├── deploy/            mock provider deployment
 ├── scripts/           build, e2e, fuzz, packaging scripts
 ├── fuzz/              coverage-guided fuzzing
+├── docs/              design docs, TUI spec + prototype
 ├── Cargo.toml         workspace manifest
 ├── deny.toml          cargo-deny policy
 └── rust-toolchain.toml
