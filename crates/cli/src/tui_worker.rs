@@ -1546,6 +1546,12 @@ impl TuiToolExecutor {
             )
         });
         self.tool_cx.set_output_sink(None);
+        // The model's task list changed: the Plan panel lists it.
+        if matches!(call.name.as_str(), "TaskCreate" | "TaskUpdate")
+            && !orbit_tools::result_is_error(&result)
+        {
+            orbit_hud_tui::emit_tasks(&self.sender, orbit_tools::tasks::snapshot(&self.tool_cx));
+        }
         // Classify the result into a ToolOutcome: a refusal must render
         // as `⊘ denied by you`, not a red `✕ failed` (§11.5 rule 4).
         let outcome = classify_tool_result(&result);

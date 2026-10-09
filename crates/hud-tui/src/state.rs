@@ -1065,7 +1065,7 @@ impl App {
             }
             // The live terminal belongs to the prototype screen's
             // Terminal panel; the v1 HUD has no such panel.
-            Msg::ToolOutput { .. } => {}
+            Msg::ToolOutput { .. } | Msg::TasksUpdate(_) => {}
             Msg::ToolCallStarted { name, summary, .. } => {
                 self.turn_tool_count += 1;
                 // Display-only: push transcript lines + set tool state. Do NOT

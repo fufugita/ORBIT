@@ -35,9 +35,9 @@ pub use approval::{ApprovalRegistry, ApprovalResponse};
 pub use bridge::{
     emit_cost, emit_error, emit_file_changed, emit_ledger_appended, emit_mode_changed,
     emit_plan_ready, emit_response_finished, emit_status, emit_subagent_finished,
-    emit_subagent_progress, emit_subagent_started, emit_text, emit_tool_finished, emit_tool_output,
-    emit_tool_started, emit_turn_cost, emit_usage, emit_workspace, safe_text, safe_text_probe,
-    sanitize_glyphs, strip_cot, terminal_safe, CotStripper,
+    emit_subagent_progress, emit_subagent_started, emit_tasks, emit_text, emit_tool_finished,
+    emit_tool_output, emit_tool_started, emit_turn_cost, emit_usage, emit_workspace, safe_text,
+    safe_text_probe, sanitize_glyphs, strip_cot, terminal_safe, CotStripper,
 };
 pub use state::RedactionKind;
 pub use worker::{CommandSink, WorkerCommand, WorkerCtx, WorkerSpawner};

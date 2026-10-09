@@ -43,9 +43,16 @@ pub fn kind_of(name: &str) -> String {
         "write" | "write_file" | "create" | "create_file" => "WRITE",
         "bash" | "shell" | "run" | "exec" | "run_command" | "terminal" => "BASH",
         "task" | "agent" | "subagent" | "spawn_agent" => "AGENT",
-        "todo" | "todowrite" | "tasks" | "task_create" | "task_update" => "TASKS",
-        "fetch" | "web_fetch" | "websearch" | "web_search" => "FETCH",
-        "ask" | "ask_user" => "ASK",
+        "todo" | "todowrite" | "tasks" | "task_create" | "task_update" | "taskcreate"
+        | "taskupdate" | "tasklist" => "TASKS",
+        "taskstop" => "STOP",
+        "fetch" | "web_fetch" | "webfetch" => "FETCH",
+        "websearch" | "web_search" => "WEB",
+        "notebookedit" => "EDIT",
+        "ask" | "ask_user" | "askuserquestion" => "ASK",
+        "exitplanmode" => "PLAN",
+        // A tool from an MCP server: `mcp__<server>__<tool>`.
+        _ if n.starts_with("mcp__") => "MCP",
         _ => return n.chars().take(5).collect::<String>().to_ascii_uppercase(),
     };
     k.to_string()
@@ -53,10 +60,11 @@ pub fn kind_of(name: &str) -> String {
 
 fn kind_colour(kind: &str) -> Rgb {
     match kind {
-        "READ" | "GREP" | "GLOB" | "FETCH" => BLUE,
+        "READ" | "GREP" | "GLOB" | "FETCH" | "WEB" => BLUE,
         "EDIT" | "WRITE" => VIOLET,
-        "BASH" => AMBER,
-        "AGENT" | "ASK" => MAGENTA,
+        "BASH" | "STOP" => AMBER,
+        "TASKS" => CYAN,
+        "AGENT" | "ASK" | "PLAN" => MAGENTA,
         _ => INK2,
     }
 }
@@ -858,4 +866,39 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
             }
         },
     );
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::kind_of;
+
+    /// The chip is read at a glance: the REAL tool names (CamelCase), not
+    /// just snake_case aliases, map to a short readable label — `TaskCreate`
+    /// used to read `TASKC`.
+    #[test]
+    fn real_tool_names_get_readable_chips() {
+        for (tool, chip) in [
+            ("Read", "READ"),
+            ("Glob", "GLOB"),
+            ("Grep", "GREP"),
+            ("Edit", "EDIT"),
+            ("Write", "WRITE"),
+            ("Bash", "BASH"),
+            ("TaskCreate", "TASKS"),
+            ("TaskUpdate", "TASKS"),
+            ("TaskList", "TASKS"),
+            ("TaskStop", "STOP"),
+            ("WebFetch", "FETCH"),
+            ("WebSearch", "WEB"),
+            ("NotebookEdit", "EDIT"),
+            ("AskUserQuestion", "ASK"),
+            ("ExitPlanMode", "PLAN"),
+            ("Agent", "AGENT"),
+            ("mcp__github__create_issue", "MCP"),
+        ] {
+            assert_eq!(kind_of(tool), chip, "{tool}");
+        }
+        // Anything unknown still shows its name, clipped.
+        assert_eq!(kind_of("Skill"), "SKILL");
+    }
 }

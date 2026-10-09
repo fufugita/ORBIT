@@ -356,6 +356,15 @@ pub fn emit_tool_started(sender: &BusSender, call_id: &str, name: &str, summary:
     });
 }
 
+/// Emit the session's task list for the Plan panel (titles display-safe).
+pub fn emit_tasks(sender: &BusSender, tasks: Vec<(String, String)>) {
+    let tasks = tasks
+        .into_iter()
+        .map(|(title, status)| (safe_text(&title), status))
+        .collect();
+    sender.send(Msg::TasksUpdate(tasks));
+}
+
 /// Emit one line of a running command's live output (display-safe).
 pub fn emit_tool_output(sender: &BusSender, call_id: &str, line: &str) {
     sender.send(Msg::ToolOutput {

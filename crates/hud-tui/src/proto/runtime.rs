@@ -1126,6 +1126,33 @@ fn run_command(
     open
 }
 
+/// Replace the Plan panel's rows. A row whose title or state changed
+/// flashes for 450 ms (M17); unchanged rows keep their old stamp.
+fn set_plan(scenario: &mut Scenario, rows: Vec<super::panels::TaskRow>, now_ms: u64) {
+    let before: Vec<(String, String)> = scenario
+        .tasks
+        .iter()
+        .map(|t| (t.title.clone(), t.status.clone()))
+        .collect();
+    let old_stamps = std::mem::take(&mut scenario.task_changed_ms);
+    scenario.task_changed_ms = rows
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let same = before
+                .get(i)
+                .map(|(title, st)| *title == t.title && *st == t.status)
+                .unwrap_or(false);
+            if same {
+                old_stamps.get(i).copied().unwrap_or(0)
+            } else {
+                now_ms
+            }
+        })
+        .collect();
+    scenario.tasks = rows;
+}
+
 /// FrontendEvent-shaped Msgs → the scenario reducer. Returns a toast
 /// to show (the agent-done note, §9.13) — the event loop owns toasts.
 fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Option<String> {
@@ -1396,42 +1423,43 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             });
         }
         Msg::WorkspaceUpdate(ws) => {
-            // The Plan panel lists the worker's plan, state by state.
-            let before: Vec<(String, String)> = scenario
-                .tasks
-                .iter()
-                .map(|t| (t.title.clone(), t.status.clone()))
-                .collect();
-            scenario.tasks = ws
-                .plan
-                .iter()
-                .map(|t| super::panels::TaskRow {
-                    title: t.title.clone(),
-                    status: match t.state {
-                        crate::state::TaskState::Done => "done",
-                        crate::state::TaskState::Active => "active",
+            // The worker's workspace carries the reactor phase; its plan
+            // is empty today, and an empty plan must not wipe the tasks
+            // TasksUpdate filled. A non-empty plan still lists state by
+            // state.
+            if !ws.plan.is_empty() {
+                let rows = ws
+                    .plan
+                    .iter()
+                    .map(|t| super::panels::TaskRow {
+                        title: t.title.clone(),
+                        status: match t.state {
+                            crate::state::TaskState::Done => "done",
+                            crate::state::TaskState::Active => "active",
+                            _ => "pending",
+                        }
+                        .to_string(),
+                    })
+                    .collect();
+                set_plan(scenario, rows, now_ms);
+            }
+        }
+        Msg::TasksUpdate(tasks) => {
+            // TaskCreate / TaskUpdate: the Plan panel lists the model's
+            // own task list.
+            let rows = tasks
+                .into_iter()
+                .map(|(title, status)| super::panels::TaskRow {
+                    title,
+                    status: match status.as_str() {
+                        "done" => "done",
+                        "in_progress" => "active",
                         _ => "pending",
                     }
                     .to_string(),
                 })
                 .collect();
-            // M17: a row whose state changed flashes for 450 ms.
-            scenario.task_changed_ms = scenario
-                .tasks
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let same = before
-                        .get(i)
-                        .map(|(title, st)| *title == t.title && *st == t.status)
-                        .unwrap_or(false);
-                    if same {
-                        scenario.task_changed_ms.get(i).copied().unwrap_or(0)
-                    } else {
-                        now_ms
-                    }
-                })
-                .collect();
+            set_plan(scenario, rows, now_ms);
         }
         Msg::FileChanged {
             path,
@@ -1966,5 +1994,64 @@ mod tool_card_tests {
             s.activity(),
             crate::proto::scenario::Activity::Approval(t) if t == "Edit"
         ));
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::msg::Msg;
+
+    fn tasks(rows: &[(&str, &str)]) -> Msg {
+        Msg::TasksUpdate(
+            rows.iter()
+                .map(|(t, s)| (t.to_string(), s.to_string()))
+                .collect(),
+        )
+    }
+
+    /// TaskCreate/TaskUpdate fill the Plan panel; it used to say "Nothing
+    /// planned yet" for ever because no event carried the list.
+    #[test]
+    fn the_plan_panel_lists_the_models_tasks() {
+        let mut s = Scenario::new();
+        apply_msg(
+            tasks(&[("Fix add", "pending"), ("Run tests", "pending")]),
+            &mut s,
+            10,
+        );
+        assert_eq!(s.tasks.len(), 2);
+        assert_eq!(s.tasks[0].status, "pending");
+        apply_msg(
+            tasks(&[("Fix add", "in_progress"), ("Run tests", "pending")]),
+            &mut s,
+            20,
+        );
+        assert_eq!(s.tasks[0].status, "active");
+        apply_msg(
+            tasks(&[("Fix add", "done"), ("Run tests", "pending")]),
+            &mut s,
+            30,
+        );
+        assert_eq!(s.tasks[0].status, "done");
+        // Only the row that changed flashes.
+        assert_eq!(s.task_changed_ms, vec![30, 10]);
+    }
+
+    /// The worker's workspace update carries the reactor phase and an
+    /// empty plan: it must not wipe the tasks.
+    #[test]
+    fn a_phase_update_does_not_wipe_the_plan() {
+        let mut s = Scenario::new();
+        apply_msg(tasks(&[("Fix add", "pending")]), &mut s, 10);
+        apply_msg(
+            Msg::WorkspaceUpdate(crate::state::Workspace {
+                phase_index: 2,
+                ..Default::default()
+            }),
+            &mut s,
+            20,
+        );
+        assert_eq!(s.tasks.len(), 1, "the plan survives a phase change");
     }
 }

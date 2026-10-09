@@ -49,6 +49,10 @@ pub enum Msg {
         name: String,
         summary: String,
     },
+    /// The session's task list changed (TaskCreate/TaskUpdate): the Plan
+    /// panel lists these, `(title, status)` in creation order, status
+    /// pending | in_progress | done.
+    TasksUpdate(Vec<(String, String)>),
     /// One line of a running command's live output, for the Terminal
     /// panel. Already display-safe.
     ToolOutput { call_id: String, line: String },
