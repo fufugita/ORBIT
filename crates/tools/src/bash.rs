@@ -43,19 +43,12 @@ pub const READONLY_ALLOWLIST: &[&str] = &[
     "tree",
 ];
 
-/// Is this command on the read-only allowlist? Prefix match on the
-/// first word(s).
+/// Is this command on the read-only allowlist? Matched by words, and
+/// only for a plain command: a line that chains, pipes, redirects or
+/// substitutes (`ls && rm x`), or an allowlisted command with a flag
+/// that runs or writes (`find -delete`, `rg --pre`), is not read-only.
 pub fn is_readonly_command(cmd: &str) -> bool {
-    let trimmed = cmd.trim();
-    // A redirection or pipe operator makes the command side-effectful
-    // (echo x > f writes a file; cat f | sh executes) — it loses
-    // read-only classification no matter what the first word is.
-    if trimmed.contains('>') || trimmed.contains(">>") || trimmed.contains('|') {
-        return false;
-    }
-    READONLY_ALLOWLIST
-        .iter()
-        .any(|a| trimmed == *a || trimmed.starts_with(&format!("{a} ")))
+    crate::shellcmd::is_readonly(cmd, READONLY_ALLOWLIST)
 }
 
 /// Does the command touch a deny-read path (S2)? The sandbox masks

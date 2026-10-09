@@ -29,6 +29,7 @@ pub mod notebook;
 pub mod permissions;
 pub mod sandbox;
 pub mod scan;
+pub mod shellcmd;
 pub mod tasks;
 pub mod webfetch;
 pub mod websearch;
