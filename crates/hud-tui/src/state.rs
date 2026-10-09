@@ -636,6 +636,10 @@ pub enum ToolOutcome {
     /// Blocked before running (unknown tool, non-interactive without
     /// consent): `⊖` amber + `blocked` meta.
     Blocked,
+    /// Stopped by the operator's interrupt (Esc), or cut off because the
+    /// turn ended before it reported: `⊘` muted + `cancelled`. Neither
+    /// a failure nor a denial.
+    Cancelled,
 }
 
 /// Why the bridge rejected a text chunk (D7). Names the gate, not the text.
@@ -1059,7 +1063,10 @@ impl App {
                 self.turn_in_flight = false;
                 self.dirty.set(DirtyFlags::TRANSCRIPT | DirtyFlags::STATUS);
             }
-            Msg::ToolCallStarted { name, summary } => {
+            // The live terminal belongs to the prototype screen's
+            // Terminal panel; the v1 HUD has no such panel.
+            Msg::ToolOutput { .. } => {}
+            Msg::ToolCallStarted { name, summary, .. } => {
                 self.turn_tool_count += 1;
                 // Display-only: push transcript lines + set tool state. Do NOT
                 // push a pending approval here — the real call_id arrives later
@@ -1079,6 +1086,7 @@ impl App {
             Msg::ToolCallFinished {
                 name,
                 outcome: outcome_of_call,
+                ..
             } => {
                 // Dismiss the FIRST pending approval that was resolved. The
                 // worker sends ApprovalRequested (with a real call_id) for
@@ -1115,6 +1123,7 @@ impl App {
                     ToolOutcome::Failed => "failed",
                     ToolOutcome::Denied => "denied",
                     ToolOutcome::Blocked => "blocked",
+                    ToolOutcome::Cancelled => "cancelled",
                 };
                 self.push_activity("tool", format!("{name} · {verdict}"));
                 // Note: we never render model-supplied rationale; only status.
@@ -1125,6 +1134,7 @@ impl App {
                     // names the decision, not a failure word.
                     ToolOutcome::Denied => format!("tool {name}: denied by you"),
                     ToolOutcome::Blocked => format!("tool {name}: blocked"),
+                    ToolOutcome::Cancelled => format!("tool {name}: cancelled"),
                 };
                 self.dirty
                     .set(DirtyFlags::APPROVAL | DirtyFlags::STATUS | DirtyFlags::TRANSCRIPT);
@@ -1940,6 +1950,8 @@ mod tests {
             priced: true,
         });
         app.reduce(Msg::ToolCallFinished {
+            call_id: String::new(),
+            fact: String::new(),
             name: "shell".into(),
             outcome: ToolOutcome::Ok,
         });
@@ -2043,6 +2055,7 @@ mod tests {
         // fake id and the worker never unblocks (deadlock).
         let mut app = App::new();
         app.reduce(Msg::ToolCallStarted {
+            call_id: String::new(),
             name: "calculator".into(),
             summary: "calculator(expression)".into(),
         });
@@ -2054,6 +2067,7 @@ mod tests {
     fn approval_requested_pushes_real_call_id() {
         let mut app = App::new();
         app.reduce(Msg::ToolCallStarted {
+            call_id: String::new(),
             name: "calculator".into(),
             summary: "calculator(expression)".into(),
         });
@@ -2076,6 +2090,7 @@ mod tests {
         // ToolCallFinished dismisses the head of the queue.
         let mut app = App::new();
         app.reduce(Msg::ToolCallStarted {
+            call_id: String::new(),
             name: "calculator".into(),
             summary: "calculator(expression)".into(),
         });
@@ -2088,6 +2103,8 @@ mod tests {
         });
         assert_eq!(app.pending_approvals.len(), 1);
         app.reduce(Msg::ToolCallFinished {
+            call_id: String::new(),
+            fact: String::new(),
             name: "calculator".into(),
             outcome: ToolOutcome::Ok,
         });
@@ -2103,10 +2120,13 @@ mod tests {
         // carries Denied (rendered `⊘ denied by you`, never red `✕`).
         let mut app = App::new();
         app.reduce(Msg::ToolCallStarted {
+            call_id: String::new(),
             name: "shell".into(),
             summary: "rm -rf /tmp/scratch".into(),
         });
         app.reduce(Msg::ToolCallFinished {
+            call_id: String::new(),
+            fact: String::new(),
             name: "shell".into(),
             outcome: ToolOutcome::Denied,
         });
@@ -2130,6 +2150,7 @@ mod tests {
         let mut app = App::new();
         for (i, call_id) in ["call-1", "call-2"].iter().enumerate() {
             app.reduce(Msg::ToolCallStarted {
+                call_id: String::new(),
                 name: "ssh".into(),
                 summary: format!("run command #{i}"),
             });
@@ -2143,6 +2164,8 @@ mod tests {
         }
         assert_eq!(app.pending_approvals.len(), 2);
         app.reduce(Msg::ToolCallFinished {
+            call_id: String::new(),
+            fact: String::new(),
             name: "ssh".into(),
             outcome: ToolOutcome::Ok,
         });
@@ -2177,6 +2200,7 @@ mod tests {
         // showing Running/AwaitingApproval forever.
         let mut app = App::new();
         app.reduce(Msg::ToolCallStarted {
+            call_id: String::new(),
             name: "calculator".into(),
             summary: "calculator(expression)".into(),
         });

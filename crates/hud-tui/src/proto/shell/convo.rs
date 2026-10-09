@@ -276,7 +276,7 @@ fn card_rows(l: &TranscriptLine, w: i32, now_ms: u64, reduced: bool, mono: bool)
         ToolState::Done => mix(CYAN, GREEN, settle),
         ToolState::Failed => mix(CYAN, RED, settle),
         ToolState::AwaitingYou => MAGENTA,
-        ToolState::Denied | ToolState::Queued => RULE_HI,
+        ToolState::Denied | ToolState::Queued | ToolState::Cancelled => RULE_HI,
         ToolState::Blocked => AMBER,
         ToolState::Running => CYAN,
     };
@@ -355,6 +355,11 @@ fn card_rows(l: &TranscriptLine, w: i32, now_ms: u64, reduced: bool, mono: bool)
                 Seg::new(sep, MUTED),
                 Seg::bold("⊖ ", AMBER),
                 Seg::new("blocked", AMBER),
+            ]),
+            ToolState::Cancelled => right.extend([
+                Seg::new(sep, MUTED),
+                Seg::bold("⊘ ", MUTED),
+                Seg::new("cancelled", MUTED),
             ]),
             ToolState::Queued => right.extend([Seg::new("◌ ", MUTED), Seg::new("queued", MUTED)]),
         }
@@ -451,7 +456,14 @@ fn transcript_rows(inp: &ConvIn, w: i32) -> Vec<Row> {
         rows.extend(r);
         prev = Some(kind);
     }
-    if s.turn_live && !s.visible_output {
+    // Honest waiting (design law 5): the row says the MODEL is awaited
+    // only when it is. While an approval is open, a tool runs or a
+    // subagent works, the row is absent — the card, the tool line and
+    // the status bar already say what is happening.
+    if matches!(
+        s.activity(),
+        super::super::scenario::Activity::WaitingModel(_)
+    ) {
         if !rows.is_empty() {
             rows.push(None);
         }
@@ -486,7 +498,11 @@ struct Approval {
     risk: u8,
     dir: String,
     mode: String,
-    note: Option<String>,
+    /// The decision keys are disabled while the person types (§9.14):
+    /// the border row says so INSTEAD of showing them.
+    armed: bool,
+    /// `1 of N` when approvals are queued.
+    queue_note: Option<String>,
     shown_ms: u64,
 }
 
@@ -497,13 +513,9 @@ fn approval_of(s: &Scenario, now_ms: u64) -> Option<Approval> {
         .clone()
         .unwrap_or_else(|| format!("{tool}()"));
     let last_typing = s.last_key_ms;
-    let note = if now_ms.saturating_sub(last_typing) < 1000 && last_typing > 0 {
-        Some("paused while you type".to_string())
-    } else if s.approval_queue.len() > 1 {
-        Some(format!("1 of {}", s.approval_queue.len()))
-    } else {
-        None
-    };
+    let armed = now_ms.saturating_sub(last_typing) < 1000 && last_typing > 0;
+    let queue_note =
+        (s.approval_queue.len() > 1).then(|| format!("1 of {}", s.approval_queue.len()));
     Some(Approval {
         tool,
         action,
@@ -513,7 +525,8 @@ fn approval_of(s: &Scenario, now_ms: u64) -> Option<Approval> {
             .permission_mode
             .clone()
             .unwrap_or_else(|| "default".into()),
-        note,
+        armed,
+        queue_note,
         shown_ms: s.approval_shown_ms,
     })
 }
@@ -634,7 +647,13 @@ fn draw_approval(
     cv.text(x + 3, yy, "mode", MUTED, Some(RAISE));
     cv.text(x + 14, yy, &ap.mode, INK2, Some(RAISE));
     yy += 2;
-    // Keys.
+    // Keys — drawn on the bottom border row. While the person is typing
+    // they are disabled (§9.14) and the border says so in their place;
+    // drawing both put the note over the key labels.
+    if ap.armed {
+        cv.text(x + 3, yy, " paused while you type ", MUTED, Some(RAISE));
+        return h;
+    }
     let mut kx = x + 3;
     for (k, lab) in [
         ("y", "allow once"),
@@ -646,7 +665,8 @@ fn draw_approval(
         kx += 3;
     }
     let esc = "esc deny";
-    cv.bold(x + w - 3 - text_width(esc), yy, "esc", INK2, Some(RAISE));
+    let esc_x = x + w - 3 - text_width(esc);
+    cv.bold(esc_x, yy, "esc", INK2, Some(RAISE));
     cv.text(
         x + w - 3 - text_width(" deny"),
         yy,
@@ -654,8 +674,13 @@ fn draw_approval(
         FAINT,
         Some(RAISE),
     );
-    if let Some(n) = &ap.note {
-        cv.text(x + 3, y + h - 1, &format!(" {n} "), MUTED, Some(RAISE));
+    // `1 of N`, between the keys and `esc deny` when there is room.
+    if let Some(n) = &ap.queue_note {
+        let t = format!(" {n} ");
+        let nx = esc_x - 2 - text_width(&t);
+        if nx > kx {
+            cv.text(nx, yy, &t, MUTED, Some(RAISE));
+        }
     }
     h
 }

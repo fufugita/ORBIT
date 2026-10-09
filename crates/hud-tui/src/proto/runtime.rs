@@ -1007,6 +1007,7 @@ fn copy_mode(guard: &mut crate::terminal::TerminalGuard, scenario: &Scenario) {
                     ToolState::AwaitingYou => ": awaiting you".into(),
                     ToolState::Queued => ": queued".into(),
                     ToolState::Blocked => ": blocked".into(),
+                    ToolState::Cancelled => ": cancelled".into(),
                 };
                 if t.is_empty() {
                     println!("tool {} {}{}", l.tool_name, l.text, state);
@@ -1152,8 +1153,19 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 }),
             }
         }
-        Msg::ToolCallStarted { name, summary } => {
-            scenario.running.insert(name.clone(), name.clone());
+        Msg::ToolCallStarted {
+            call_id,
+            name,
+            summary,
+        } => {
+            // Lines and the activity row are keyed by the call's id; a
+            // front-end that sends none (empty id) falls back to name.
+            let key = if call_id.is_empty() {
+                name.clone()
+            } else {
+                call_id.clone()
+            };
+            scenario.running.insert(key, name.clone());
             scenario.apply("tool_started_full", 0);
             // The tool line (§9.8): glyph + name + the display-safe
             // argument (the summary without `name(` … `)`).
@@ -1161,46 +1173,112 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 .strip_prefix(&format!("{name}("))
                 .and_then(|s| s.strip_suffix(')'))
                 .unwrap_or(summary.as_str());
-            // The engine announces a call twice (the plain start, then
-            // the one carrying its target): one card, not two.
+            // One card per call: the card is found by the call's id (or,
+            // with no id, by tool and target). The engine announces a
+            // call before it runs, so a repeat only fills a missing
+            // target.
             if let Some(open) = scenario.transcript.iter_mut().rev().find(|l| {
                 l.kind == LineKind::Tool
-                    && l.tool_name == name
                     && l.tool_state == super::scenario::ToolState::Running
-                    && (l.text.is_empty() || l.text == arg)
+                    && if call_id.is_empty() {
+                        l.tool_name == name && (l.text.is_empty() || l.text == arg)
+                    } else {
+                        l.call_id == call_id
+                    }
             }) {
                 if open.text.is_empty() {
                     open.text = arg.to_string();
                 }
             } else {
                 scenario.turn_tools += 1;
+                // The Terminal panel tapes the newest command: a new
+                // Bash call starts a clean tape.
+                if name == "Bash" {
+                    scenario.tool_output.clear();
+                }
                 scenario.transcript.push(TranscriptLine {
                     kind: LineKind::Tool,
                     text: arg.to_string(),
                     tool_name: name.clone(),
+                    call_id: call_id.clone(),
                     tool_state: super::scenario::ToolState::Running,
                     started_ms: Some(now_ms),
                     ..Default::default()
                 });
             }
         }
-        Msg::ToolCallFinished { name, outcome } => {
-            scenario.running.remove(&name);
+        Msg::ToolOutput { call_id, line } => {
+            // Live output of the newest Bash call, for the Terminal
+            // panel. Bounded: the panel shows a tail.
+            let newest_bash_is_it = scenario
+                .transcript
+                .iter()
+                .rev()
+                .find(|l| l.kind == LineKind::Tool && l.tool_name == "Bash")
+                .map(|l| call_id.is_empty() || l.call_id == call_id)
+                .unwrap_or(false);
+            if newest_bash_is_it {
+                scenario.tool_output.push(line);
+                const TAPE_MAX: usize = 400;
+                if scenario.tool_output.len() > TAPE_MAX {
+                    let drop = scenario.tool_output.len() - TAPE_MAX;
+                    scenario.tool_output.drain(..drop);
+                }
+            }
+        }
+        Msg::ToolCallFinished {
+            call_id,
+            name,
+            outcome,
+            fact,
+        } => {
+            let key = if call_id.is_empty() {
+                name.clone()
+            } else {
+                call_id.clone()
+            };
+            scenario.running.remove(&key);
             scenario.apply("tool_finished_full", 0);
-            for l in scenario.transcript.iter_mut().rev() {
-                if l.kind == LineKind::Tool && l.tool_name == name {
-                    // §9.8: the final state comes only from the
-                    // worker's outcome (never optimistic).
+            // By id when there is one; by name (the newest open card of
+            // that tool) when there is not.
+            let found = scenario.transcript.iter_mut().rev().find(|l| {
+                l.kind == LineKind::Tool
+                    && if call_id.is_empty() {
+                        l.tool_name == name
+                    } else {
+                        l.call_id == call_id
+                    }
+            });
+            if let Some(l) = found {
+                // §9.8: the final state comes only from the worker's
+                // outcome (never optimistic), and a settled card keeps
+                // the state it settled in.
+                let open = matches!(
+                    l.tool_state,
+                    super::scenario::ToolState::Running
+                        | super::scenario::ToolState::Queued
+                        | super::scenario::ToolState::AwaitingYou
+                );
+                if open || call_id.is_empty() {
                     l.finished_ms = Some(now_ms);
                     let dur = l
                         .started_ms
                         .map(|st| now_ms.saturating_sub(st))
                         .unwrap_or(0);
                     let (ds, _) = format_duration(dur);
+                    // A true fact about the result leads the meta
+                    // (`212 lines · 0.1s`); none → just the duration.
+                    let lead = |word: &str| {
+                        if fact.is_empty() {
+                            format!("{word} · {ds}")
+                        } else {
+                            format!("{fact} · {ds}")
+                        }
+                    };
                     match outcome {
                         crate::state::ToolOutcome::Ok => {
                             l.tool_state = super::scenario::ToolState::Done;
-                            l.meta = format!("done · {ds}");
+                            l.meta = lead("done");
                         }
                         crate::state::ToolOutcome::Denied => {
                             l.tool_state = super::scenario::ToolState::Denied;
@@ -1208,14 +1286,23 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                         }
                         crate::state::ToolOutcome::Failed => {
                             l.tool_state = super::scenario::ToolState::Failed;
-                            l.meta = format!("failed · {ds}");
+                            // The card already says "failed": the meta
+                            // carries the fact and the time, not the word.
+                            l.meta = if fact.is_empty() {
+                                ds.clone()
+                            } else {
+                                format!("{fact} · {ds}")
+                            };
                         }
                         crate::state::ToolOutcome::Blocked => {
                             l.tool_state = super::scenario::ToolState::Blocked;
                             l.meta = "blocked · unknown tool".into();
                         }
+                        crate::state::ToolOutcome::Cancelled => {
+                            l.tool_state = super::scenario::ToolState::Cancelled;
+                            l.meta = ds.clone();
+                        }
                     }
-                    break;
                 }
             }
         }
@@ -1228,12 +1315,15 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
         } => {
             scenario.approval_risk = risk;
             scenario.approval_dir = working_dir;
+            // apply() first: it stamps a placeholder name, which the
+            // real tool name must replace (the status line read
+            // "approval needed · tool").
+            scenario.apply("approval_requested", 0);
             scenario.approval_pending = Some(tool_name.clone());
             scenario.approval_call_id = Some(call_id.clone());
             scenario.approval_queue.push(tool_name.clone());
             scenario.approval_summary = Some(summary.clone());
             scenario.approval_shown_ms = now_ms;
-            scenario.apply("approval_requested", 0);
         }
         Msg::ResponseFinished {
             output_tokens,
@@ -1241,6 +1331,17 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             cost_microcents,
             ..
         } => {
+            // A turn that is over leaves no card "running": a call that
+            // never reported (Esc, an error, the round guard) was cut
+            // off, and says so.
+            for l in scenario.transcript.iter_mut() {
+                if l.kind == LineKind::Tool && l.tool_state == super::scenario::ToolState::Running {
+                    l.tool_state = super::scenario::ToolState::Cancelled;
+                    l.finished_ms = Some(now_ms);
+                    l.meta = String::new();
+                }
+            }
+            scenario.running.clear();
             scenario.turns += 1;
             scenario.input_tokens += input_tokens;
             scenario.output_tokens += output_tokens;
@@ -1682,5 +1783,188 @@ fn overlay_code(o: Option<Overlay>) -> u8 {
         Some(Overlay::Help) => 2,
         Some(Overlay::Quit) => 3,
         Some(Overlay::Diff) => 4,
+    }
+}
+
+#[cfg(test)]
+mod tool_card_tests {
+    use super::*;
+    use crate::msg::Msg;
+    use crate::state::ToolOutcome;
+
+    fn started(id: &str, name: &str, summary: &str) -> Msg {
+        Msg::ToolCallStarted {
+            call_id: id.into(),
+            name: name.into(),
+            summary: summary.into(),
+        }
+    }
+
+    fn finished(id: &str, name: &str, outcome: ToolOutcome, fact: &str) -> Msg {
+        Msg::ToolCallFinished {
+            call_id: id.into(),
+            name: name.into(),
+            outcome,
+            fact: fact.into(),
+        }
+    }
+
+    fn tools(s: &Scenario) -> Vec<&TranscriptLine> {
+        s.transcript
+            .iter()
+            .filter(|l| l.kind == LineKind::Tool)
+            .collect()
+    }
+
+    /// The bug the live TUI showed: the engine's start carried the real
+    /// target ("**/*.py") and the executor's carried an argument name
+    /// ("pattern"). Two summaries, one call: one card, and it settles.
+    #[test]
+    fn one_card_per_call_even_when_the_summaries_differ() {
+        let mut s = Scenario::new();
+        apply_msg(started("c1", "Glob", "**/*.py"), &mut s, 10);
+        apply_msg(started("c1", "Glob", "Glob(pattern)"), &mut s, 20);
+        assert_eq!(tools(&s).len(), 1, "one card for one call");
+        assert_eq!(s.turn_tools, 1, "and the turn counts one tool, not two");
+        assert_eq!(tools(&s)[0].text, "**/*.py", "the first target wins");
+        apply_msg(
+            finished("c1", "Glob", ToolOutcome::Ok, "3 files"),
+            &mut s,
+            50,
+        );
+        let l = tools(&s)[0];
+        assert_eq!(l.tool_state, ToolState::Done);
+        assert!(l.meta.starts_with("3 files · "), "{}", l.meta);
+        assert!(s.running.is_empty());
+    }
+
+    /// Two calls of one tool in a round settle each its own card, in the
+    /// order they finish — not newest-first.
+    #[test]
+    fn two_calls_of_one_tool_settle_by_id() {
+        let mut s = Scenario::new();
+        apply_msg(started("a", "Bash", "echo one"), &mut s, 1);
+        apply_msg(started("b", "Bash", "echo two"), &mut s, 2);
+        assert_eq!(tools(&s).len(), 2);
+        apply_msg(finished("a", "Bash", ToolOutcome::Ok, ""), &mut s, 30);
+        let cards = tools(&s);
+        assert_eq!(cards[0].tool_state, ToolState::Done, "a settled");
+        assert_eq!(cards[1].tool_state, ToolState::Running, "b still runs");
+        apply_msg(
+            finished("b", "Bash", ToolOutcome::Failed, "exit 2"),
+            &mut s,
+            40,
+        );
+        let cards = tools(&s);
+        assert_eq!(cards[1].tool_state, ToolState::Failed);
+        assert!(cards[1].meta.starts_with("exit 2 · "), "{}", cards[1].meta);
+    }
+
+    /// The engine's own verdict arrives after the executor's richer one;
+    /// a settled card keeps the state it settled in.
+    #[test]
+    fn a_settled_card_keeps_its_state() {
+        let mut s = Scenario::new();
+        apply_msg(started("c", "Edit", "calc.py"), &mut s, 1);
+        apply_msg(finished("c", "Edit", ToolOutcome::Denied, ""), &mut s, 5);
+        apply_msg(finished("c", "", ToolOutcome::Failed, ""), &mut s, 9);
+        assert_eq!(tools(&s)[0].tool_state, ToolState::Denied);
+    }
+
+    /// A turn that ends (Esc, an error, the round guard) leaves no card
+    /// "running" for ever: a call that never reported was cut off.
+    #[test]
+    fn a_finished_turn_leaves_no_card_running() {
+        let mut s = Scenario::new();
+        apply_msg(started("c", "Bash", "sleep 100"), &mut s, 1);
+        apply_msg(
+            Msg::ResponseFinished {
+                output: String::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: 0,
+            },
+            &mut s,
+            900,
+        );
+        assert_eq!(tools(&s)[0].tool_state, ToolState::Cancelled);
+        assert!(s.running.is_empty());
+    }
+
+    #[test]
+    fn bash_output_fills_the_terminal_tape_for_the_newest_command() {
+        let mut s = Scenario::new();
+        apply_msg(started("old", "Bash", "echo old"), &mut s, 1);
+        apply_msg(
+            Msg::ToolOutput {
+                call_id: "old".into(),
+                line: "old line".into(),
+            },
+            &mut s,
+            2,
+        );
+        assert_eq!(s.tool_output, vec!["old line"]);
+        // A new command starts a clean tape; late lines of the old one
+        // do not leak into it.
+        apply_msg(started("new", "Bash", "echo new"), &mut s, 3);
+        assert!(s.tool_output.is_empty());
+        apply_msg(
+            Msg::ToolOutput {
+                call_id: "old".into(),
+                line: "stale".into(),
+            },
+            &mut s,
+            4,
+        );
+        apply_msg(
+            Msg::ToolOutput {
+                call_id: "new".into(),
+                line: "fresh".into(),
+            },
+            &mut s,
+            5,
+        );
+        assert_eq!(s.tool_output, vec!["fresh"]);
+    }
+
+    #[test]
+    fn the_tape_keeps_a_bounded_tail() {
+        let mut s = Scenario::new();
+        apply_msg(started("c", "Bash", "yes"), &mut s, 1);
+        for i in 0..1000 {
+            apply_msg(
+                Msg::ToolOutput {
+                    call_id: "c".into(),
+                    line: format!("line {i}"),
+                },
+                &mut s,
+                2,
+            );
+        }
+        assert_eq!(s.tool_output.len(), 400);
+        assert_eq!(s.tool_output.last().map(String::as_str), Some("line 999"));
+    }
+
+    /// The status line read "approval needed · tool": apply() stamped a
+    /// placeholder over the real name.
+    #[test]
+    fn an_approval_names_the_tool() {
+        let mut s = Scenario::new();
+        apply_msg(
+            Msg::ApprovalRequested {
+                call_id: "c".into(),
+                tool_name: "Edit".into(),
+                summary: "Edit(calc.py)".into(),
+                risk: 2,
+                working_dir: "/tmp".into(),
+            },
+            &mut s,
+            1,
+        );
+        assert_eq!(s.approval_pending.as_deref(), Some("Edit"));
+        assert!(matches!(
+            s.activity(),
+            crate::proto::scenario::Activity::Approval(t) if t == "Edit"
+        ));
     }
 }

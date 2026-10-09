@@ -347,21 +347,83 @@ pub fn emit_mode_changed(sender: &BusSender, mode: &str) {
 }
 
 /// Emit a tool-call-started event with a display-safe summary.
-pub fn emit_tool_started(sender: &BusSender, name: &str, summary: &str) {
+pub fn emit_tool_started(sender: &BusSender, call_id: &str, name: &str, summary: &str) {
     let safe_summary = safe_text(summary);
     sender.send(Msg::ToolCallStarted {
+        call_id: call_id.to_string(),
         name: name.to_string(),
         summary: safe_summary,
     });
 }
 
+/// Emit one line of a running command's live output (display-safe).
+pub fn emit_tool_output(sender: &BusSender, call_id: &str, line: &str) {
+    sender.send(Msg::ToolOutput {
+        call_id: call_id.to_string(),
+        line: terminal_safe(line),
+    });
+}
+
+/// Display-safe form of one line of command output, for the Terminal
+/// panel. Secret VALUES are redacted (the line stays); ANSI escape
+/// sequences are removed whole — dropping only the ESC byte would leave
+/// `[1;31m` on screen; tabs become spaces; other control characters go.
+/// Unlike [`safe_text`] it does not reject chat-shaped markers such as
+/// `prompt:` — a build log may legitimately say anything.
+pub fn terminal_safe(line: &str) -> String {
+    let redacted = orbit_hud::redact_secret_values(line);
+    let mut out = String::with_capacity(redacted.len());
+    let mut chars = redacted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameter and intermediate bytes, then one final
+                // byte in 0x40..=0x7E.
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or the string terminator (ESC \).
+                Some(']') => {
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other escape is a two-byte sequence.
+                _ => {}
+            },
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Emit a tool-call-finished event. The outcome distinguishes an operator
 /// denial and a pre-run block from a genuine tool failure (§11.5 rule 4:
 /// a `Denied` outcome keeps `⊘`, never a red `✕`).
-pub fn emit_tool_finished(sender: &BusSender, name: &str, outcome: crate::state::ToolOutcome) {
+pub fn emit_tool_finished(
+    sender: &BusSender,
+    call_id: &str,
+    name: &str,
+    outcome: crate::state::ToolOutcome,
+    fact: &str,
+) {
     sender.send(Msg::ToolCallFinished {
+        call_id: call_id.to_string(),
         name: name.to_string(),
         outcome,
+        fact: safe_text(fact),
     });
 }
 
@@ -608,13 +670,41 @@ mod tests {
     }
 
     #[test]
+    fn terminal_safe_strips_whole_escape_sequences_and_keeps_chat_words() {
+        // The colour codes go entirely (not just the ESC byte).
+        assert_eq!(terminal_safe("\u{1b}[1;31merror\u{1b}[0m: no"), "error: no");
+        // An OSC title is dropped whole, BEL- or ST-terminated.
+        assert_eq!(terminal_safe("\u{1b}]0;title\u{7}ok"), "ok");
+        assert_eq!(terminal_safe("\u{1b}]0;title\u{1b}\\ok"), "ok");
+        // Tabs line up as spaces; carriage returns vanish.
+        assert_eq!(terminal_safe("a\tb\r"), "a    b");
+        // A build log may say "prompt:" and print URLs.
+        assert_eq!(
+            terminal_safe("prompt: fetching https://example.com/x"),
+            "prompt: fetching https://example.com/x"
+        );
+    }
+
+    #[test]
+    fn terminal_safe_redacts_secret_values_but_keeps_the_line() {
+        let out = terminal_safe("token=ghp_0123456789abcdef0123456789abcdef0123 done");
+        assert!(!out.contains("ghp_0123"), "{out}");
+        assert!(out.contains("done"), "{out}");
+    }
+
+    #[test]
     fn emit_tool_started_gates_summary() {
         let (bus, sender) = Bus::new();
-        emit_tool_started(&sender, "calculator", "calculator(expression)");
+        emit_tool_started(&sender, "call-1", "calculator", "calculator(expression)");
         let msgs = drain(&bus);
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
-            Msg::ToolCallStarted { name, summary } => {
+            Msg::ToolCallStarted {
+                call_id,
+                name,
+                summary,
+            } => {
+                assert_eq!(call_id, "call-1");
                 assert_eq!(name, "calculator");
                 assert_eq!(summary, "calculator(expression)");
             }

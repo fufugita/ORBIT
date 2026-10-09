@@ -89,6 +89,30 @@ pub fn clip_text(s: &str, n: i32) -> String {
     out
 }
 
+/// Clip a path to `n` cells from the LEFT, with a leading `…`: the end
+/// of a path (the file name) is the part that identifies it, so it is
+/// what must survive.
+pub fn clip_path(s: &str, n: i32) -> String {
+    if n <= 0 {
+        return String::new();
+    }
+    if text_width(s) <= n {
+        return s.to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for ch in s.chars().rev() {
+        let w = ch.width().unwrap_or(0) as i32;
+        if used + w > n - 1 {
+            break;
+        }
+        tail.push(ch);
+        used += w;
+    }
+    tail.reverse();
+    format!("…{}", tail.into_iter().collect::<String>())
+}
+
 /// The canvas: a buffer plus a clip rectangle.
 pub struct Cv<'a> {
     pub buf: &'a mut Buffer,
@@ -282,6 +306,21 @@ mod tests {
     fn clip_adds_ellipsis() {
         assert_eq!(clip_text("abcdefgh", 5), "abcd…");
         assert_eq!(clip_text("abc", 5), "abc");
+    }
+
+    #[test]
+    fn clip_path_keeps_the_file_name() {
+        assert_eq!(clip_path("src/calc.py", 20), "src/calc.py");
+        let long = "/tmp/orbit-shot-ohez8kxv/fixture/deep/dir/calc.py";
+        let clipped = clip_path(long, 16);
+        assert_eq!(text_width(&clipped), 16);
+        assert!(
+            clipped.starts_with('…') && clipped.ends_with("calc.py"),
+            "{clipped}"
+        );
+        // clip_text keeps the START, which is the part that loses the name.
+        assert!(!clip_text(long, 16).ends_with("calc.py"));
+        assert_eq!(clip_path("abc", 0), "");
     }
 
     #[test]

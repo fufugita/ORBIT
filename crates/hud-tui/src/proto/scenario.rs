@@ -141,6 +141,9 @@ pub struct TranscriptLine {
     /// `{glyph} {name}  {arg}` with right-aligned meta.
     pub tool_name: String,
     pub tool_state: ToolState,
+    /// Tool lines: the engine's id for the call. Start and finish find
+    /// their card by it, so two calls of one tool never share a line.
+    pub call_id: String,
     /// User/model turns: the submit/settle time (`HH:MM`), shown
     /// right-aligned on the first row (§9.4/§9.5).
     pub time: Option<String>,
@@ -166,6 +169,7 @@ impl Default for TranscriptLine {
             text: String::new(),
             tool_name: String::new(),
             tool_state: ToolState::Queued,
+            call_id: String::new(),
             time: None,
             meta: String::new(),
             arrivals: Vec::new(),
@@ -187,6 +191,8 @@ pub enum ToolState {
     Failed,
     Denied,
     Blocked,
+    /// Stopped by Esc, or cut off when the turn ended.
+    Cancelled,
 }
 
 impl ToolState {
@@ -201,6 +207,7 @@ impl ToolState {
             ToolState::Failed => ("✕", Token::Red),
             ToolState::Denied => ("⊘", Token::Muted),
             ToolState::Blocked => ("⊖", Token::Amber),
+            ToolState::Cancelled => ("⊘", Token::Muted),
         }
     }
 }

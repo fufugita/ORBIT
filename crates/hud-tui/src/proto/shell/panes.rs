@@ -2,7 +2,7 @@
 //! Context, Review and Agent. Each draws only what the engine has
 //! actually sent; an empty panel shows the prototype's empty state.
 
-use super::canvas::{clip_text, mix, text_width, tint, Cv, Seg};
+use super::canvas::{clip_path, clip_text, mix, text_width, tint, Cv, Seg};
 use super::convo::kind_of;
 use super::frame::{badge, empty_state, panel_frame, BadgeState, FrameSpec};
 use super::motion::{ease_out, flash, prog, pulse, secs};
@@ -155,7 +155,7 @@ fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             cv.put(
                 x + 4,
                 yy,
-                &clip_text(&f.path, w - 14),
+                &clip_path(&f.path, w - 14),
                 if sel { INK } else { INK2 },
                 Some(bg),
                 if sel { Modifier::BOLD } else { Modifier::empty() },
@@ -536,7 +536,7 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             cv.put(
                 x + 2,
                 yy,
-                &clip_text(&f.path, lw - 4 - text_width(&cnt)),
+                &clip_path(&f.path, lw - 4 - text_width(&cnt)),
                 if sel { INK } else { INK2 },
                 bg,
                 if sel {
@@ -553,7 +553,7 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         let rx = x + lw + 2;
         let rw = w - lw - 2;
         if let Some(f) = files.first() {
-            cv.bold(rx, y, &clip_text(&f.path, rw), BLUE, None);
+            cv.bold(rx, y, &clip_path(&f.path, rw), BLUE, None);
             cv.text(
                 rx,
                 y + 2,

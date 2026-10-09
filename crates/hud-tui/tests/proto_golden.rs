@@ -297,3 +297,75 @@ fn fresh_ink_fades_from_near_white_to_ink() {
     assert_ne!(fresh, settled, "the ink fades");
     assert_eq!(settled, ratatui::style::Color::Rgb(0xEE, 0xEA, 0xF5));
 }
+
+#[test]
+fn the_waiting_row_appears_only_while_the_model_is_awaited() {
+    // Design law 5 (honesty): "waiting for <model>" is true only while
+    // the model is what the turn waits on. It kept ticking over an open
+    // approval card, where the person is the one being waited on.
+    let tui = Tui::new();
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "make the tests pass".into(),
+        ..Default::default()
+    });
+    s.turn_live = true;
+    let waiting = render(&tui, &s, 164, 48);
+    assert!(waiting.contains("waiting for glm-5.2"), "{waiting}");
+
+    s.approval_pending = Some("Edit".into());
+    let approval = render(&tui, &s, 164, 48);
+    assert!(!approval.contains("waiting for glm-5.2"), "{approval}");
+
+    s.approval_pending = None;
+    s.running.insert("c1".into(), "Bash".into());
+    let running = render(&tui, &s, 164, 48);
+    assert!(!running.contains("waiting for glm-5.2"), "{running}");
+}
+
+#[test]
+fn an_armed_approval_border_replaces_the_keys_instead_of_overdrawing_them() {
+    // §9.14: while the person is typing the decision keys are disabled
+    // and the border reads "paused while you type". The note used to be
+    // drawn over the key labels (`paused while you type low this
+    // session`), leaving remnants of "allow this session".
+    let mut tui = Tui::new();
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "make the tests pass".into(),
+        ..Default::default()
+    });
+    s.turn_live = true;
+    s.approval_pending = Some("Edit".into());
+    s.approval_queue.push("Edit".into());
+    s.approval_summary = Some("Edit(calc.py)".into());
+    s.approval_risk = 2;
+    s.approval_shown_ms = 4_000;
+
+    // Armed: a key was pressed 300 ms ago.
+    tui.tick_ms = 5_000;
+    s.last_key_ms = 4_700;
+    let armed = render(&tui, &s, 164, 48);
+    let border = armed
+        .lines()
+        .find(|l| l.contains("paused while you type"))
+        .unwrap_or_else(|| panic!("the armed card must say so:\n{armed}"));
+    assert!(!border.contains("allow once"), "{border}");
+    assert!(
+        !border.contains("session"),
+        "no key-label remnants: {border}"
+    );
+
+    // Not armed: the keys are there and the note is not.
+    s.last_key_ms = 0;
+    let live = render(&tui, &s, 164, 48);
+    assert!(!live.contains("paused while you type"), "{live}");
+    let keys = live
+        .lines()
+        .find(|l| l.contains("allow once"))
+        .unwrap_or_else(|| panic!("the keys must show:\n{live}"));
+    assert!(keys.contains("allow this session"), "{keys}");
+    assert!(keys.contains("deny"), "{keys}");
+}

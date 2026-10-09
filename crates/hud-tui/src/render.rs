@@ -690,6 +690,9 @@ fn render_conversation(
                         (false, Some(ToolOutcome::Blocked)) => {
                             (g.blocked, p.amber, p.ink2, "blocked".into(), p.amber)
                         }
+                        (false, Some(ToolOutcome::Cancelled)) => {
+                            (g.denied, p.muted, p.ink2, "cancelled".into(), p.muted)
+                        }
                         (false, None) => (g.pending, p.faint, p.ink2, String::new(), p.faint),
                     };
                 let mut spans = vec![

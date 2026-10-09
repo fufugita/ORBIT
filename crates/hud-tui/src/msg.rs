@@ -40,8 +40,18 @@ pub enum Msg {
         output_tokens: u64,
         cost_microcents: u64,
     },
-    /// A tool call started (name + display-safe argument summary).
-    ToolCallStarted { name: String, summary: String },
+    /// A tool call started: the call's id (lines are keyed by it, so two
+    /// calls of one tool never share a card), the tool name and a
+    /// display-safe argument summary. An empty `call_id` (a front-end
+    /// that has none) falls back to matching by name.
+    ToolCallStarted {
+        call_id: String,
+        name: String,
+        summary: String,
+    },
+    /// One line of a running command's live output, for the Terminal
+    /// panel. Already display-safe.
+    ToolOutput { call_id: String, line: String },
     /// The operator answered an approval card (§12): `once`, `session` or
     /// `denied`. Records the Activity `grant` row (§9.16) and the tool-line
     /// marker (◆ once / ◈ session).
@@ -54,8 +64,12 @@ pub enum Msg {
     /// unknown-tool block (deny-by-default), so the transcript never shows
     /// a red `✕ failed` for a refusal.
     ToolCallFinished {
+        call_id: String,
         name: String,
         outcome: crate::state::ToolOutcome,
+        /// A short true fact about the result ("212 lines", "exit 1"),
+        /// or empty when the result carries none.
+        fact: String,
     },
     /// An error from the backend (provider failure, etc.).
     BackendError(String),

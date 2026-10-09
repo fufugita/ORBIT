@@ -875,7 +875,8 @@ fn worker_main(
                     std::env::current_dir()
                         .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
                 );
-                orbit_hud_tui::emit_tool_started(&ctx.sender, "Bash", &command);
+                orbit_hud_tui::emit_tool_started(&ctx.sender, &call.id, "Bash", &command);
+                tool_cx.set_output_sink(Some(live_output_sink(&ctx.sender, &call.id)));
                 let (result, _) = crate::tool_runtime::execute_call(
                     &config.home,
                     &config.session_id,
@@ -894,8 +895,10 @@ fn worker_main(
                         None,
                     )
                 });
+                tool_cx.set_output_sink(None);
                 let outcome = classify_tool_result(&result);
-                orbit_hud_tui::emit_tool_finished(&ctx.sender, "Bash", outcome);
+                let fact = result_fact("Bash", &result);
+                orbit_hud_tui::emit_tool_finished(&ctx.sender, &call.id, "Bash", outcome, &fact);
             }
             WorkerCommand::ModCommand(mod_name, cmd_name) => {
                 // A mod command runs its body as a normal prompt turn.
@@ -1000,17 +1003,156 @@ impl TuiApprovalChannel {
 /// means the tool genuinely ran and failed. A refusal must never render as
 /// a red `✕ failed` card (§11.5 rule 4, `denied_is_not_failed`).
 fn classify_tool_result(result: &str) -> orbit_hud_tui::state::ToolOutcome {
-    if result.contains("\"ok\":true") {
-        orbit_hud_tui::state::ToolOutcome::Ok
-    } else if orbit_tools::result_is_denial(result) {
+    use orbit_hud_tui::state::ToolOutcome;
+    if orbit_tools::result_is_denial(result) {
         // C4: the typed flag — every policy refusal carries it, so the
         // substring lists are gone (they missed new denial sites).
-        orbit_hud_tui::state::ToolOutcome::Denied
+        ToolOutcome::Denied
     } else if result.contains("unknown tool (deny-by-default)") {
-        orbit_hud_tui::state::ToolOutcome::Blocked
+        ToolOutcome::Blocked
+    } else if result_is_cancelled(result) {
+        // The operator's Esc: neither a failure nor a denial.
+        ToolOutcome::Cancelled
+    } else if !orbit_tools::result_is_error(result) {
+        // E4: the typed verdict — the payload's own top-level `ok`, not
+        // a substring (a Bash command that prints `"ok":true` and exits
+        // 1 is a failure).
+        ToolOutcome::Ok
     } else {
-        orbit_hud_tui::state::ToolOutcome::Failed
+        ToolOutcome::Failed
     }
+}
+
+/// Did the operator's interrupt end this call? The Bash tool answers a
+/// cancelled run with the typed error `cancelled by user`.
+fn result_is_cancelled(result: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(|e| e == "cancelled by user")
+        })
+        .unwrap_or(false)
+}
+
+/// A short, true fact about a tool result for its card — what the
+/// result itself says, never a guess. Empty when it has nothing worth a
+/// column (the card then shows only the duration).
+fn result_fact(tool: &str, result: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(result) else {
+        return String::new();
+    };
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("{n} {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let truncated = v
+        .get("truncated")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    match tool {
+        "Read" => v
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|c| {
+                let n = c.lines().count();
+                if v.get("partial").and_then(|p| p.as_bool()).unwrap_or(false) {
+                    format!("{n} lines · partial")
+                } else {
+                    plural(n, "line", "lines")
+                }
+            })
+            .unwrap_or_default(),
+        "Glob" | "Grep" => v
+            .get("matches")
+            .and_then(|m| m.as_array())
+            .map(|m| {
+                let (one, many) = if tool == "Glob" {
+                    ("file", "files")
+                } else {
+                    ("match", "matches")
+                };
+                if truncated {
+                    format!("{}+ {many}", m.len())
+                } else {
+                    plural(m.len(), one, many)
+                }
+            })
+            .unwrap_or_default(),
+        "Bash" => {
+            if v.get("backgrounded")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+            {
+                "background".to_string()
+            } else {
+                match v.get("exit_code").and_then(|c| c.as_i64()) {
+                    Some(0) | None => String::new(),
+                    Some(c) => format!("exit {c}"),
+                }
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// The target as the operator should read it: a path under the working
+/// directory is shown relative to it, and one under $HOME as `~/…`, so a
+/// long absolute prefix never pushes the file name off the card.
+fn display_target(kind: &str, target: &str) -> String {
+    if !matches!(kind, "Read" | "Write" | "Edit" | "NotebookEdit") {
+        return target.to_string();
+    }
+    display_path(target)
+}
+
+fn display_path(path: &str) -> String {
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(rest) = path.strip_prefix(cwd.to_string_lossy().as_ref()) {
+            if let Some(rest) = rest.strip_prefix('/') {
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Some(rest) = path.strip_prefix(home.to_string_lossy().as_ref()) {
+            if rest.starts_with('/') {
+                return format!("~{rest}");
+            }
+        }
+    }
+    path.to_string()
+}
+
+/// Live command output for the Terminal panel: every line up to a cap,
+/// then one honest notice. A runaway command must not flood the UI bus;
+/// its full output stays in the call's log file.
+fn live_output_sink(sender: &BusSender, call_id: &str) -> orbit_tools::OutputSink {
+    const MAX_LIVE_LINES: usize = 3000;
+    let sender = sender.clone();
+    let call_id = call_id.to_string();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::sync::Arc::new(move |line: &str| {
+        let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < MAX_LIVE_LINES {
+            orbit_hud_tui::emit_tool_output(&sender, &call_id, line);
+        } else if n == MAX_LIVE_LINES {
+            orbit_hud_tui::emit_tool_output(
+                &sender,
+                &call_id,
+                "… more output; the full log is kept with the session's outputs",
+            );
+        }
+    })
 }
 
 impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
@@ -1126,7 +1268,9 @@ pub fn run_tui_turn(
                     ws.phase_index = 2; // act
                     orbit_hud_tui::emit_workspace(sender, ws.clone());
                 }
-                orbit_hud_tui::emit_tool_started(sender, &name, &summary);
+                // No card here: ToolStartedFull carries the call's id and
+                // target, and the card is keyed by that id.
+                let _ = (name, summary);
             }
             E::CostUpdated { total_microcents } => {
                 // D5: report the TURN's running cost; the committed total
@@ -1168,24 +1312,32 @@ pub fn run_tui_turn(
                 kind,
                 target,
             } => {
-                orbit_hud_tui::emit_tool_started(sender, &kind, &target);
-                let _ = call_id;
+                orbit_hud_tui::emit_tool_started(
+                    sender,
+                    &call_id,
+                    &kind,
+                    &display_target(&kind, &target),
+                );
             }
             E::ToolOutput { call_id, line } => {
-                orbit_hud_tui::emit_status(sender, &format!("┃ {line}"));
-                let _ = call_id;
+                orbit_hud_tui::emit_tool_output(sender, &call_id, &line);
             }
             E::ToolFinishedFull {
-                call_id: _,
+                call_id,
                 ok,
                 result_fact,
             } => {
+                // The executor reports each call as it finishes, with the
+                // typed outcome (denied / cancelled / failed) and a real
+                // fact; the screen keeps the state a card settled in. This
+                // is the fallback for calls no executor of ours ran
+                // (a subagent's): the engine's verdict settles them.
                 let outcome = if ok {
                     orbit_hud_tui::state::ToolOutcome::Ok
                 } else {
                     orbit_hud_tui::state::ToolOutcome::Failed
                 };
-                orbit_hud_tui::emit_tool_finished(sender, &result_fact, outcome);
+                orbit_hud_tui::emit_tool_finished(sender, &call_id, "", outcome, &result_fact);
             }
             E::FileChanged {
                 path,
@@ -1194,7 +1346,13 @@ pub fn run_tui_turn(
                 checkpoint_id: _,
                 hunks,
             } => {
-                orbit_hud_tui::emit_file_changed(sender, &path, added, removed, hunks.clone());
+                orbit_hud_tui::emit_file_changed(
+                    sender,
+                    &display_path(&path),
+                    added,
+                    removed,
+                    hunks.clone(),
+                );
             }
             E::SubagentStarted {
                 agent_id,
@@ -1327,14 +1485,13 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
                     if crate::tools::is_read_only(&call.name) {
                         results.push(self.run_one(call));
                     } else {
-                        let args = crate::tools::parse_arguments(&call.arguments)
-                            .unwrap_or(serde_json::Value::Null);
-                        let summary = crate::tools::safe_call_summary(&call.name, &args);
-                        orbit_hud_tui::emit_tool_started(&self.sender, &call.name, &summary);
+                        // The engine announced the call; settle its card.
                         orbit_hud_tui::emit_tool_finished(
                             &self.sender,
+                            &call.id,
                             &call.name,
                             orbit_hud_tui::state::ToolOutcome::Denied,
+                            "",
                         );
                         results.push(orbit_engine::ToolRoundResult {
                             call_id: call.id.clone(),
@@ -1356,11 +1513,9 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
 
 impl TuiToolExecutor {
     fn run_one(&mut self, call: &orbit_engine::PendingToolCall) -> orbit_engine::ToolRoundResult {
-        // Display-safe summary first.
-        let args =
-            crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
-        let summary = crate::tools::safe_call_summary(&call.name, &args);
-        orbit_hud_tui::emit_tool_started(&self.sender, &call.name, &summary);
+        // No start event here: the engine announced this call, with its
+        // target, before the round ran, and the card is keyed by the
+        // call's id. This function owns the live output and the finish.
 
         // Per-call ULID decision ids (defect fix: the old
         // `tool-round-{round}-{index}` ids repeated every turn, so
@@ -1368,6 +1523,10 @@ impl TuiToolExecutor {
         let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
         let mut approval_channel =
             TuiApprovalChannel::new(self.sender.clone(), self.approvals.clone());
+        // A running command's output lines go to the Terminal panel as
+        // they arrive.
+        self.tool_cx
+            .set_output_sink(Some(live_output_sink(&self.sender, &call.id)));
         let (result, file_change) = crate::tool_runtime::execute_call(
             &self.home,
             &self.session_id,
@@ -1386,16 +1545,23 @@ impl TuiToolExecutor {
                 None,
             )
         });
+        self.tool_cx.set_output_sink(None);
         // Classify the result into a ToolOutcome: a refusal must render
         // as `⊘ denied by you`, not a red `✕ failed` (§11.5 rule 4).
         let outcome = classify_tool_result(&result);
-        orbit_hud_tui::emit_tool_finished(&self.sender, &call.name, outcome);
+        // A true fact for the card: the change's size for a write, else
+        // what the result itself says.
+        let fact = file_change
+            .as_ref()
+            .map(|fc| format!("+{} −{}", fc.added, fc.removed))
+            .unwrap_or_else(|| result_fact(&call.name, &result));
+        orbit_hud_tui::emit_tool_finished(&self.sender, &call.id, &call.name, outcome, &fact);
         // M11: a checkpointed write carries a real diff to the Changes
         // panel — true counts plus bounded hunks, never invented.
         if let Some(fc) = file_change {
             orbit_hud_tui::emit_file_changed(
                 &self.sender,
-                &fc.path,
+                &display_path(&fc.path),
                 fc.added,
                 fc.removed,
                 fc.hunks,
