@@ -516,6 +516,48 @@ fn scenario_a1_anthropic_wire() {
         !ended.is_empty() && ended[0]["input_tokens"].as_u64().unwrap_or(0) >= 100,
         "input_tokens parsed from message_start.usage (B7)"
     );
+    // 4. A provider that reports usage gets its counts on the egress row
+    //    the Activity panel shows.
+    let egress: Vec<&str> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("ledger_appended")
+                && e.get("kind").and_then(|k| k.as_str()) == Some("egress")
+        })
+        .filter_map(|e| e.get("summary").and_then(|s| s.as_str()))
+        .collect();
+    assert!(
+        egress.first().is_some_and(|s| s.contains("100 in")),
+        "the egress row carries the reported usage: {egress:?}"
+    );
+}
+
+// ── G1: a provider that reports no usage ───────────────────────────
+// Fails before the fix: the Activity row for the request read
+// "mock-model · 0 in / 0 out", as if the call had cost nothing.
+#[test]
+fn scenario_g1_egress_row_without_usage() {
+    let script: serde_json::Value = serde_json::json!({"main": [{"text": "ok"}]});
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let (events, code) = run_p(&mock, &home, &fix.path, "hello", &[]);
+    assert_eq!(code, 0, "the turn completes: {events:?}");
+
+    let egress: Vec<&str> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("ledger_appended")
+                && e.get("kind").and_then(|k| k.as_str()) == Some("egress")
+        })
+        .filter_map(|e| e.get("summary").and_then(|s| s.as_str()))
+        .collect();
+    assert_eq!(
+        egress,
+        ["mock-model"],
+        "no reported usage means the row names the model and claims no counts"
+    );
 }
 
 // ── P1: the permission matrix ──────────────────────────────────────

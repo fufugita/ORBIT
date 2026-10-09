@@ -195,6 +195,25 @@ fn gate2_scripted_session_through_engine() {
     }
     assert!(egress[0].0 < egress[1].0, "the chain only grows");
 
+    // This provider reports usage, and the row says what each round used.
+    let summaries: Vec<&str> =
+        collected
+            .iter()
+            .filter_map(|e| match e {
+                orbit_frontend_protocol::FrontendEvent::LedgerAppended {
+                    kind, summary, ..
+                } if kind == "egress" => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(summaries.len(), 2);
+    for row in &summaries {
+        assert!(
+            row.starts_with("test-model \u{b7} ") && row.contains(" in / "),
+            "the egress row names the model and the usage: {row:?}"
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

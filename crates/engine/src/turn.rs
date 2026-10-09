@@ -529,10 +529,16 @@ fn dispatch_with_retry(
                         record_count: orbit_ledger::count_records(&home.join("ledger")),
                         head_digest: digest.clone(),
                         kind: "egress".into(),
-                        summary: format!(
-                            "{} · {} in / {} out",
-                            config.model, o.input_tokens, o.output_tokens
-                        ),
+                        // A provider that reported no usage is not a request
+                        // that cost nothing: say the model, not "0 in / 0 out".
+                        summary: if o.input_tokens == 0 && o.output_tokens == 0 {
+                            config.model.clone()
+                        } else {
+                            format!(
+                                "{} · {} in / {} out",
+                                config.model, o.input_tokens, o.output_tokens
+                            )
+                        },
                     });
                 }
                 return Ok(o);
