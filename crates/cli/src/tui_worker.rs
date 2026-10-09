@@ -181,6 +181,16 @@ fn worker_main(
         priced: boot_priced,
     });
 
+    // The sandbox is a readiness fact the welcome screen must not hide:
+    // measured once, shown as it is.
+    orbit_hud_tui::emit_readiness(
+        &ctx.sender,
+        vec![(
+            sandbox_report().confined,
+            sandbox_report().readiness.clone(),
+        )],
+    );
+
     // Boot with a resumed session, if any.
     if config.initial_transcript.is_empty() && config.initial_turns == 0 {
         // Fresh chat — nothing to restore.
@@ -1023,6 +1033,55 @@ fn classify_tool_result(result: &str) -> orbit_hud_tui::state::ToolOutcome {
     }
 }
 
+/// What the shell sandbox is on this machine, measured once per process
+/// (the probe runs a real bubblewrap canary): whether commands are
+/// confined, the rows an approval card shows, and the welcome screen's
+/// readiness line.
+struct SandboxReport {
+    confined: bool,
+    /// `(label, value)` rows for the approval card — short enough to
+    /// fit a card without clipping.
+    facts: Vec<(String, String)>,
+    /// The welcome screen's READY row.
+    readiness: String,
+}
+
+fn sandbox_report() -> &'static SandboxReport {
+    static REPORT: std::sync::OnceLock<SandboxReport> = std::sync::OnceLock::new();
+    REPORT.get_or_init(|| {
+        use orbit_tools::sandbox::{SandboxStatus, ShellSandbox};
+        match ShellSandbox::probe() {
+            SandboxStatus::Confined => SandboxReport {
+                confined: true,
+                facts: vec![
+                    ("sandbox".into(), "confined · no network".into()),
+                    (
+                        "writes".into(),
+                        "this project and a session temp dir only".into(),
+                    ),
+                ],
+                readiness: "sandbox · bubblewrap".into(),
+            },
+            SandboxStatus::Unavailable(why) => SandboxReport {
+                confined: false,
+                facts: vec![(
+                    "sandbox".into(),
+                    "NONE — runs with your full permissions".into(),
+                )],
+                readiness: format!("sandbox · off ({why}) — every command asks"),
+            },
+            SandboxStatus::Unsupported => SandboxReport {
+                confined: false,
+                facts: vec![(
+                    "sandbox".into(),
+                    "NONE — no sandbox on this platform".into(),
+                )],
+                readiness: "sandbox · none on this platform — every command asks".into(),
+            },
+        }
+    })
+}
+
 /// Did the operator's interrupt end this call? The Bash tool answers a
 /// cancelled run with the typed error `cancelled by user`.
 fn result_is_cancelled(result: &str) -> bool {
@@ -1164,6 +1223,13 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
         // Register a oneshot channel for this call.
         let (tx, rx) = mpsc::channel();
         self.approvals.register(&req.call_id, tx);
+        // The facts the card shows, measured, never assumed: what a Bash
+        // command can touch, and (from the request) what an edit changes.
+        let mut facts = Vec::new();
+        if req.tool_name == "Bash" {
+            facts.extend(sandbox_report().facts.iter().cloned());
+        }
+        orbit_hud_tui::emit_approval_detail(&self.sender, &req.call_id, facts, req.preview.clone());
         // Post the request to the bus — the reducer renders an approval card.
         self.sender.send(Msg::ApprovalRequested {
             call_id: req.call_id.clone(),

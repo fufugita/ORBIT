@@ -508,6 +508,10 @@ struct Approval {
     risk: u8,
     dir: String,
     mode: String,
+    /// Real facts the backend supplied (the sandbox state): `(label, value)`.
+    facts: Vec<(String, String)>,
+    /// The lines an edit would change: `- ` removed, `+ ` added.
+    preview: Vec<String>,
     /// The decision keys are disabled while the person types (§9.14):
     /// the border row says so INSTEAD of showing them.
     armed: bool,
@@ -535,6 +539,8 @@ fn approval_of(s: &Scenario, now_ms: u64) -> Option<Approval> {
             .permission_mode
             .clone()
             .unwrap_or_else(|| "default".into()),
+        facts: s.approval_facts.clone(),
+        preview: s.approval_preview.clone(),
         armed,
         queue_note,
         shown_ms: s.approval_shown_ms,
@@ -542,9 +548,10 @@ fn approval_of(s: &Scenario, now_ms: u64) -> Option<Approval> {
 }
 
 fn approval_height(ap: &Approval) -> i32 {
-    // border, header, gap, action, gap, [facts], gap, keys, border
-    let facts = if ap.dir.is_empty() { 1 } else { 2 };
-    7 + facts
+    // border, header, gap, action, [preview], gap, [facts], gap, keys+border
+    // directory (when known), mode, the backend's facts, and the grant.
+    let facts = if ap.dir.is_empty() { 2 } else { 3 } + ap.facts.len();
+    (7 + facts + ap.preview.len()) as i32
 }
 
 fn draw_approval(
@@ -632,9 +639,9 @@ fn draw_approval(
         Some(rcol),
         Modifier::BOLD,
     );
-    // Action inset.
+    // Action inset (and, for an edit, the lines it changes).
     let mut yy = y + 3;
-    cv.fill(x + 2, yy, w - 4, 1, INSET);
+    cv.fill(x + 2, yy, w - 4, 1 + ap.preview.len() as i32, INSET);
     let is_cmd = matches!(ap.tool.to_ascii_lowercase().as_str(), "bash" | "shell");
     if is_cmd {
         let cmd = ap
@@ -647,8 +654,21 @@ fn draw_approval(
     } else {
         cv.bold(x + 3, yy, &clip_text(&ap.action, w - 6), BLUE, Some(INSET));
     }
-    yy += 2;
-    // Facts.
+    yy += 1;
+    for line in &ap.preview {
+        // `- ` removed (red), `+ ` added (green), anything else context.
+        let (marker, colour) = match line.chars().next() {
+            Some('-') => ("-", RED),
+            Some('+') => ("+", GREEN),
+            _ => (" ", MUTED),
+        };
+        let body = line.get(1..).unwrap_or("").trim_start_matches(' ');
+        cv.bold(x + 3, yy, marker, colour, Some(INSET));
+        cv.text(x + 5, yy, &clip_text(body, w - 9), colour, Some(INSET));
+        yy += 1;
+    }
+    yy += 1;
+    // Facts: only values the backend measured.
     if !ap.dir.is_empty() {
         cv.text(x + 3, yy, "directory", MUTED, Some(RAISE));
         cv.text(x + 14, yy, &clip_text(&ap.dir, w - 17), INK2, Some(RAISE));
@@ -656,6 +676,28 @@ fn draw_approval(
     }
     cv.text(x + 3, yy, "mode", MUTED, Some(RAISE));
     cv.text(x + 14, yy, &ap.mode, INK2, Some(RAISE));
+    yy += 1;
+    for (label, value) in &ap.facts {
+        cv.text(x + 3, yy, &clip_text(label, 10), MUTED, Some(RAISE));
+        // No sandbox is the one fact that must not read like the others.
+        let unconfined = value.starts_with("NONE");
+        if unconfined {
+            cv.bold(x + 14, yy, &clip_text(value, w - 17), AMBER, Some(RAISE));
+        } else {
+            cv.text(x + 14, yy, &clip_text(value, w - 17), INK2, Some(RAISE));
+        }
+        yy += 1;
+    }
+    // What `R` really grants (design law 6: a session grant displays
+    // its actual, broader scope — never implied to be this one call).
+    cv.text(x + 3, yy, "R grants", MUTED, Some(RAISE));
+    cv.text(
+        x + 14,
+        yy,
+        &clip_text(&format!("every {} call, until you quit", ap.tool), w - 17),
+        INK2,
+        Some(RAISE),
+    );
     yy += 2;
     // Keys — drawn on the bottom border row. While the person is typing
     // they are disabled (§9.14) and the border says so in their place;
@@ -664,30 +706,47 @@ fn draw_approval(
         cv.text(x + 3, yy, " paused while you type ", MUTED, Some(RAISE));
         return h;
     }
+    // Two groups on the border row: the grants on the left, the refusal
+    // anchored at the right (`n  esc deny`). Laying the refusal out
+    // explicitly matters: it used to hide behind the right-aligned
+    // `esc deny` only because a longer `R` label happened to push it
+    // exactly there.
+    let esc = "esc deny";
+    let deny_w = 3 + 1 + text_width(esc); // [ n ] esc deny
+    let deny_x = x + w - 3 - deny_w;
+    // `R` grants the WHOLE tool for the session (design law 6: scope
+    // honesty) — say so, in the longest wording that fits before the
+    // refusal. Fixed parts: [ y ] allow once · [ R ] <label>.
+    let fixed = (3 + 1 + text_width("allow once")) + 3 + (3 + 1);
+    let room = deny_x - (x + 3) - 3 - fixed;
+    let session_label = [
+        format!("allow all {} this session", ap.tool),
+        format!("allow all {} for session", ap.tool),
+        format!("allow all {}", ap.tool),
+        "allow session".to_string(),
+    ]
+    .into_iter()
+    .find(|l| text_width(l) <= room)
+    .unwrap_or_else(|| "allow all".to_string());
     let mut kx = x + 3;
-    for (k, lab) in [
-        ("y", "allow once"),
-        ("R", "allow this session"),
-        ("n", "deny"),
-    ] {
+    for (k, lab) in [("y", "allow once"), ("R", session_label.as_str())] {
         kx = keycap(cv, kx, yy, k, k == "y");
         kx = cv.text(kx + 1, yy, lab, INK2, Some(RAISE));
         kx += 3;
     }
-    let esc = "esc deny";
-    let esc_x = x + w - 3 - text_width(esc);
-    cv.bold(esc_x, yy, "esc", INK2, Some(RAISE));
+    let after_n = keycap(cv, deny_x, yy, "n", false);
+    cv.bold(after_n + 1, yy, "esc", INK2, Some(RAISE));
     cv.text(
-        x + w - 3 - text_width(" deny"),
+        after_n + 1 + text_width("esc"),
         yy,
         " deny",
         FAINT,
         Some(RAISE),
     );
-    // `1 of N`, between the keys and `esc deny` when there is room.
+    // `1 of N`, between the grants and the refusal when there is room.
     if let Some(n) = &ap.queue_note {
         let t = format!(" {n} ");
-        let nx = esc_x - 2 - text_width(&t);
+        let nx = deny_x - 2 - text_width(&t);
         if nx > kx {
             cv.text(nx, yy, &t, MUTED, Some(RAISE));
         }

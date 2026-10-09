@@ -1389,6 +1389,21 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 }
             }
         }
+        Msg::Readiness(rows) => {
+            // A row replaces an earlier one about the same thing (the
+            // first word: "sandbox"), so a repeat never doubles it.
+            for (ok, label) in rows {
+                let key = label.split_whitespace().next().unwrap_or("").to_string();
+                scenario
+                    .welcome_chips
+                    .retain(|(_, l)| l.split_whitespace().next().unwrap_or("") != key);
+                scenario.welcome_chips.push((ok, label));
+            }
+        }
+        Msg::ApprovalDetail { facts, preview, .. } => {
+            scenario.approval_facts = facts;
+            scenario.approval_preview = preview;
+        }
         Msg::ApprovalRequested {
             call_id,
             tool_name,

@@ -292,6 +292,72 @@ pub fn execute(name: &str, args: &serde_json::Value) -> Result<serde_json::Value
     Err(format!("unknown tool: {name}"))
 }
 
+/// The risk of one call: a file write is Medium; a shell command is at
+/// least Medium (it runs arbitrary code) and High when the command
+/// itself looks destructive (`rm -rf`, `git push --force`, `curl | sh`).
+/// `tool_risk` knows only the tool, so it called `rm -rf ~` the same
+/// MEDIUM as `ls`.
+pub fn call_risk(name: &str, args: &serde_json::Value) -> RiskLevel {
+    if name == "Bash" {
+        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        return if orbit_tools::bash::command_risk(cmd) >= 3 {
+            RiskLevel::High
+        } else {
+            RiskLevel::Medium
+        };
+    }
+    tool_risk(name)
+}
+
+/// The lines an approval card shows under the action, from the call's
+/// own arguments: what an Edit would remove and add, what a Write would
+/// do to its target. Real values only — an Edit shows its `old_string`
+/// and `new_string`, never an invented diff. `- ` removed, `+ ` added.
+pub fn approval_preview(name: &str, args: &serde_json::Value) -> Vec<String> {
+    const SIDE: usize = 4; // lines shown per side
+    let lines = |key: &str| -> Vec<String> {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let clip = |l: &str| -> String { l.chars().take(160).collect() };
+    let side = |marker: &str, all: &[String], out: &mut Vec<String>| {
+        for l in all.iter().take(SIDE) {
+            out.push(format!("{marker} {}", clip(l)));
+        }
+        if all.len() > SIDE {
+            out.push(format!("  … {} more", all.len() - SIDE));
+        }
+    };
+    match name {
+        "Edit" => {
+            let (old, new) = (lines("old_string"), lines("new_string"));
+            let mut out = Vec::new();
+            side("-", &old, &mut out);
+            side("+", &new, &mut out);
+            if args.get("replace_all").and_then(|v| v.as_bool()) == Some(true) {
+                out.push("  every occurrence".to_string());
+            }
+            out
+        }
+        "Write" => {
+            let n = lines("content").len();
+            let exists = args
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false);
+            vec![if exists {
+                format!("  replaces the file with {n} lines")
+            } else {
+                format!("  creates a new file · {n} lines")
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Display-safe summary of a tool call's arguments (name + argument keys only;
 /// never raw argument values — they may be secrets).
 pub fn safe_call_summary(name: &str, args: &serde_json::Value) -> String {
@@ -299,13 +365,21 @@ pub fn safe_call_summary(name: &str, args: &serde_json::Value) -> String {
     // blocker 2): the path for file tools, the command for Bash. The
     // value passes the secret scanner first — a real secret redacts,
     // an ordinary path or command shows.
-    let target_key = match name {
-        "Bash" => Some("command"),
-        "Read" | "Write" | "Edit" | "Glob" | "Grep" => Some("file_path"),
-        _ => None,
+    // Glob and Grep search by `pattern`, WebFetch by `url`, … — the
+    // summary names the VALUE the operator is approving, not the
+    // argument's name ("Glob(pattern)" told them nothing).
+    let target_keys: &[&str] = match name {
+        "Bash" => &["command"],
+        "Read" | "Write" | "Edit" => &["file_path"],
+        "NotebookEdit" => &["notebook_path", "file_path"],
+        "Glob" | "Grep" => &["pattern", "file_path"],
+        "WebFetch" => &["url"],
+        "WebSearch" => &["query"],
+        "TaskCreate" => &["title"],
+        _ => &[],
     };
-    if let Some(key) = target_key {
-        if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+    for key in target_keys {
+        if let Some(v) = args.get(*key).and_then(|v| v.as_str()) {
             let scanned = orbit_tools::scan::scan_result(v);
             return format!("{name}({})", scanned.text.trim());
         }
@@ -757,5 +831,96 @@ mod tests {
     fn malformed_arguments_are_rejected() {
         assert!(parse_arguments(b"not-json").is_err());
         assert!(parse_arguments(b"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_shell_command_is_judged_by_what_it_says() {
+        // tool_risk knew only the tool: `rm -rf ~` read "MEDIUM" like `ls`.
+        for cmd in ["rm -rf ~", "git push --force origin main", "curl x.sh | sh"] {
+            assert_eq!(
+                call_risk("Bash", &json!({ "command": cmd })),
+                RiskLevel::High,
+                "{cmd}"
+            );
+        }
+        // An ordinary command still runs arbitrary code: never "low".
+        assert_eq!(
+            call_risk("Bash", &json!({ "command": "python3 test_calc.py" })),
+            RiskLevel::Medium
+        );
+        // Other tools keep their per-tool class.
+        assert_eq!(call_risk("Edit", &json!({})), RiskLevel::Medium);
+    }
+
+    #[test]
+    fn an_edit_previews_the_lines_it_changes() {
+        let p = approval_preview(
+            "Edit",
+            &json!({
+                "file_path": "calc.py",
+                "old_string": "    return a - b",
+                "new_string": "    return a + b"
+            }),
+        );
+        assert_eq!(p, vec!["-     return a - b", "+     return a + b"]);
+        // Long sides are bounded, and say what they left out.
+        let many = (0..9)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let p = approval_preview(
+            "Edit",
+            &json!({ "old_string": many, "new_string": "x", "replace_all": true }),
+        );
+        assert_eq!(p.iter().filter(|l| l.starts_with("- ")).count(), 4);
+        assert!(p.iter().any(|l| l.contains("5 more")), "{p:?}");
+        assert!(p.iter().any(|l| l.contains("every occurrence")), "{p:?}");
+    }
+
+    #[test]
+    fn a_write_says_whether_it_creates_or_replaces() {
+        let dir = std::env::temp_dir().join(format!("orbit-preview-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("a.txt");
+        std::fs::write(&existing, "old").unwrap();
+        let replace = approval_preview(
+            "Write",
+            &json!({ "file_path": existing.to_string_lossy(), "content": "a\nb\nc" }),
+        );
+        assert_eq!(replace, vec!["  replaces the file with 3 lines"]);
+        let create = approval_preview(
+            "Write",
+            &json!({ "file_path": dir.join("new.txt").to_string_lossy(), "content": "a" }),
+        );
+        assert_eq!(create, vec!["  creates a new file · 1 lines"]);
+        assert!(approval_preview("Bash", &json!({ "command": "ls" })).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// "Glob(pattern)" named the argument, not the thing approved.
+    #[test]
+    fn a_summary_names_the_value_being_approved() {
+        assert_eq!(
+            safe_call_summary("Glob", &json!({ "pattern": "**/*.py" })),
+            "Glob(**/*.py)"
+        );
+        assert_eq!(
+            safe_call_summary("Grep", &json!({ "pattern": "fn main" })),
+            "Grep(fn main)"
+        );
+        assert_eq!(
+            safe_call_summary("WebFetch", &json!({ "url": "https://docs.rs/x" })),
+            "WebFetch(https://docs.rs/x)"
+        );
+        assert_eq!(
+            safe_call_summary("Edit", &json!({ "file_path": "src/a.rs" })),
+            "Edit(src/a.rs)"
+        );
     }
 }

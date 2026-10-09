@@ -70,6 +70,9 @@ pub struct ApprovalRequest {
     /// it, never infers it). §6.15: the risk badge lives here so the
     /// approval card can draw ▰▰▱ without classifying on its own.
     pub risk: crate::tools::RiskLevel,
+    /// The lines the call would change, for the card (an Edit's removed
+    /// and added lines) — from the call's own arguments.
+    pub preview: Vec<String>,
 }
 
 /// Approval channel — how the operator is asked to approve a tool call.
@@ -322,7 +325,8 @@ pub fn execute_call(
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
                 summary: safe_call_summary(call),
-                risk: crate::tools::tool_risk(&call.name),
+                risk: crate::tools::call_risk(&call.name, &args_preview),
+                preview: crate::tools::approval_preview(&call.name, &args_preview),
             },
             auto_tools,
         )

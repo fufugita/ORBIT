@@ -49,6 +49,20 @@ pub enum Msg {
         name: String,
         summary: String,
     },
+    /// Readiness rows the front-end cannot measure itself (the sandbox):
+    /// `(ok, label)`, added to the welcome screen's READY list.
+    Readiness(Vec<(bool, String)>),
+    /// Facts and a preview for the approval that follows (same call id),
+    /// from real data only: the sandbox state of a command, the lines an
+    /// edit changes. Sent just before `ApprovalRequested`.
+    ApprovalDetail {
+        call_id: String,
+        /// `(label, value)` rows for the card.
+        facts: Vec<(String, String)>,
+        /// Lines shown under the action: `- ` removed, `+ ` added,
+        /// anything else context.
+        preview: Vec<String>,
+    },
     /// The session's task list changed (TaskCreate/TaskUpdate): the Plan
     /// panel lists these, `(title, status)` in creation order, status
     /// pending | in_progress | done.

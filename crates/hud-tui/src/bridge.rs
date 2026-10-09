@@ -356,6 +356,33 @@ pub fn emit_tool_started(sender: &BusSender, call_id: &str, name: &str, summary:
     });
 }
 
+/// Emit extra readiness rows for the welcome screen (display-safe).
+pub fn emit_readiness(sender: &BusSender, rows: Vec<(bool, String)>) {
+    sender.send(Msg::Readiness(
+        rows.into_iter()
+            .map(|(ok, label)| (ok, safe_text(&label)))
+            .collect(),
+    ));
+}
+
+/// Emit the facts and preview of the approval about to be requested
+/// (display-safe: secret values redacted, control sequences removed).
+pub fn emit_approval_detail(
+    sender: &BusSender,
+    call_id: &str,
+    facts: Vec<(String, String)>,
+    preview: Vec<String>,
+) {
+    sender.send(Msg::ApprovalDetail {
+        call_id: call_id.to_string(),
+        facts: facts
+            .into_iter()
+            .map(|(k, v)| (safe_text(&k), safe_text(&v)))
+            .collect(),
+        preview: preview.iter().map(|l| terminal_safe(l)).collect(),
+    });
+}
+
 /// Emit the session's task list for the Plan panel (titles display-safe).
 pub fn emit_tasks(sender: &BusSender, tasks: Vec<(String, String)>) {
     let tasks = tasks

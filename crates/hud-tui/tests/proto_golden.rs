@@ -199,9 +199,14 @@ fn approval_card_needs_you_with_risk_facts_and_keys() {
         "{out}"
     );
     assert!(out.contains("/home/hanu/src/orbit"), "{out}");
+    // `R` says its true scope: every call of the tool, this session.
     assert!(
-        out.contains("allow once") && out.contains("allow this session"),
+        out.contains("allow once") && out.contains("allow all shell"),
         "{out}"
+    );
+    assert!(
+        out.contains("R grants") && out.contains("every shell call, until you quit"),
+        "the card states what R grants: {out}"
     );
     assert!(out.contains("esc deny"), "{out}");
     // The card replaces the composer.
@@ -366,7 +371,7 @@ fn an_armed_approval_border_replaces_the_keys_instead_of_overdrawing_them() {
         .lines()
         .find(|l| l.contains("allow once"))
         .unwrap_or_else(|| panic!("the keys must show:\n{live}"));
-    assert!(keys.contains("allow this session"), "{keys}");
+    assert!(keys.contains("allow all Edit"), "{keys}");
     assert!(keys.contains("deny"), "{keys}");
 }
 
@@ -423,4 +428,74 @@ fn typing_a_slash_opens_the_command_list_above_the_composer() {
     // Not a command: no list.
     let plain = shot("fix the bug", 0);
     assert!(!plain.contains("↑↓ choose"), "{plain}");
+}
+
+#[test]
+fn the_approval_card_shows_the_edit_the_sandbox_and_the_true_grant_scope() {
+    // Authority at the moment of consequence (design law 6): what an
+    // edit would change, whether a command is confined, and what `R`
+    // really grants — all from the request, never inferred.
+    let mut tui = Tui::new();
+    tui.tick_ms = 9_000;
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "make the tests pass".into(),
+        ..Default::default()
+    });
+    s.turn_live = true;
+    s.approval_pending = Some("Edit".into());
+    s.approval_queue.push("Edit".into());
+    s.approval_summary = Some("Edit(calc.py)".into());
+    s.approval_risk = 2;
+    s.approval_shown_ms = 1_000;
+    s.approval_preview = vec!["-     return a - b".into(), "+     return a + b".into()];
+    let edit = render(&tui, &s, 164, 48);
+    assert!(
+        edit.contains("Edit(calc.py)") || edit.contains("calc.py"),
+        "{edit}"
+    );
+    assert!(
+        edit.contains("return a - b") && edit.contains("return a + b"),
+        "{edit}"
+    );
+    assert!(
+        edit.contains("allow all Edit"),
+        "the grant says its scope: {edit}"
+    );
+
+    // A command: the sandbox fact, in words; unconfined must stand out.
+    s.approval_pending = Some("Bash".into());
+    s.approval_queue = vec!["Bash".into()];
+    s.approval_summary = Some("Bash(python3 test_calc.py)".into());
+    s.approval_preview.clear();
+    s.approval_facts = vec![("sandbox".into(), "confined · no network".into())];
+    let bash = render(&tui, &s, 164, 48);
+    assert!(
+        bash.contains("sandbox") && bash.contains("confined · no network"),
+        "{bash}"
+    );
+    assert!(bash.contains("allow all Bash"), "{bash}");
+    s.approval_facts = vec![(
+        "sandbox".into(),
+        "NONE — runs with your full permissions".into(),
+    )];
+    let bare = render(&tui, &s, 164, 48);
+    assert!(
+        bare.contains("NONE — runs with your full permissions"),
+        "{bare}"
+    );
+}
+
+#[test]
+fn the_welcome_lists_the_sandbox_among_what_is_ready() {
+    let mut tui = Tui::new();
+    tui.brand_tier = orbit_hud_tui::proto::welcome::BrandTier::Static;
+    let mut s = base_scenario();
+    s.welcome_chips = vec![
+        (true, "trust root".into()),
+        (false, "sandbox · off — every command asks".into()),
+    ];
+    let out = render(&tui, &s, 164, 48);
+    assert!(out.contains("sandbox · off — every command asks"), "{out}");
 }

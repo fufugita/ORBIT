@@ -66,6 +66,11 @@ pub struct Scenario {
     /// The pending approval's backend-classified risk (0..=3) and the
     /// directory the call runs in (§9.14 facts — real values only).
     pub approval_risk: u8,
+    /// Real facts for the pending approval's card (the sandbox state of
+    /// a command): `(label, value)`.
+    pub approval_facts: Vec<(String, String)>,
+    /// The lines an edit or write would change, for the card.
+    pub approval_preview: Vec<String>,
     /// Ledger records appended this session (the top bar's `●` chip).
     pub ledger_count: Option<u64>,
     /// The screen animates until this tick (ms): bumped by every
@@ -419,6 +424,8 @@ impl Scenario {
             "approval_resolved" => {
                 self.approval_pending = None;
                 self.approval_call_id = None;
+                self.approval_facts.clear();
+                self.approval_preview.clear();
             }
             "compacting" => self.compacting = true,
             "compacted" => self.compacting = false,
