@@ -1,5 +1,7 @@
 # ORBIT TUI: build prompt
 
+> **Status (9 Oct 2026).** The layout this prompt describes (§8: Sessions rail, Conversation, Workspace rail) was replaced by the panel layout in [`../roadmap/orbit-roadmap.md`](../roadmap/orbit-roadmap.md), "The TUI: isolated panels". The glyph, honesty and motion rules here still stand. The screens in `img/` and `golden/` render this prompt's design, not the current binary; what the binary draws today is in [`shots/`](shots/).
+
 > **For the person handing this over.** Give the agent this whole file plus every PNG listed in §2 (they are in `docs/tui/img/`) and the golden text frames in `docs/tui/golden/`. If the agent works inside the ORBIT repository, those paths already resolve. Otherwise attach the images and golden files with the same file names. Everything below this box is written to the agent.
 
 ---

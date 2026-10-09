@@ -7,12 +7,20 @@
 > authoritative: this spec changes presentation, not process model, approval
 > pipeline, or display-safety seams.
 >
-> Provenance: winning entry in a two-model design review (vs a competing
-> desktop-app spec and TUI mockups). Amended with four concrete contributions
-> from the competing TUI mockups, marked **[GPT-AMEND]** below.
+> Provenance: the entry chosen in the 2026-09-26 design review (against an
+> alternative desktop-app spec and TUI mockups). Four contributions from the
+> alternative TUI mockups were adopted and are marked **[AMEND]** below.
 > Rendered reference with color swatches and 11 PNG renders at real terminal
-> sizes (150×44, 80×30): preserved alongside this file (original HTML
-> deliverable).
+> sizes (150×44, 80×30): preserved alongside this file as
+> `renders-reference.zip` (the original HTML deliverable).
+>
+> **Where this spec and the running UI differ, the running UI wins (9 Oct 2026).**
+> Its layout is the panel layout in
+> [`../roadmap/orbit-roadmap.md`](../roadmap/orbit-roadmap.md), "The TUI:
+> isolated panels", not the Sessions rail / Conversation / Workspace rail
+> layout of §8, and it draws a box around every panel, not around the approval
+> card alone. The images in `img/` are renders of this spec, not screenshots of
+> the product; what the binary draws today is in [`shots/`](shots/).
 
 # ORBIT TUI ✦ visual system
 
@@ -2048,31 +2056,31 @@ The layout is the name. You sit at the centre with the brightest ink, and everyt
 
 Take the logo off and the product is still recognisable: circles for work, diamonds for authority, honest counters instead of theatre, and a quiet white-and-magenta grid built around your conversation. It isn't a dashboard of equally loud panes, and it isn't another sparkle-and-spinner AI CLI.
 
-Source: docs/tui/DESIGN.md on branch claude/sweet-maxwell-csjqp5 of the ORBIT repository. The Markdown there is the normative copy; this page adds colour swatches and larger renders.
+The Markdown in this file is the normative copy; the HTML reference with colour swatches and larger renders is `renders-reference.zip`.
 ---
 
-# Amendments from the competing TUI mockups (2026-09-26)
+# Amendments from alternative TUI mockups (2026-09-26)
 
-Four concrete contributions adopted from the losing entry. Each strengthens §6.15 or the workspace rail:
+Four concrete contributions adopted from an alternative entry. Each strengthens §6.15 or the workspace rail:
 
-1. **[GPT-AMEND] Scope-honesty line in the approval card.** Under the facts
+1. **[AMEND] Scope-honesty line in the approval card.** Under the facts
    grid, one mandatory line whenever a session-wide grant would be broader
    than the request: `Session permission covers <tool>, not only this
    command.` Never let a session grant be implied to be scoped to the current
    target. (Mirrors the desktop spec's session-grant scope-honesty rule.)
 
-2. **[GPT-AMEND] Exact command + working directory rendering.** The "exact
+2. **[AMEND] Exact command + working directory rendering.** The "exact
    action" in §6.15 renders as the verbatim command (e.g.
    `git push origin HEAD:refs/heads/retry-fix`) followed by
    `Working directory: /work/orbit` — both in full, both never truncated, both
    subject to the scroll-to-review rule.
 
-3. **[GPT-AMEND] Evidence counters in the Workspace rail.** The workspace rail
+3. **[AMEND] Evidence counters in the Workspace rail.** The workspace rail
    shows a compact evidence summary block (Tests 42/42 · Lint 0 warnings ·
    CI not run) — counters only from structured verification events; "not run"
    is a valid, honest value, never omitted.
 
-4. **[GPT-AMEND] Post-decision line under the approval card.** While a
+4. **[AMEND] Post-decision line under the approval card.** While a
    decision is pending, the line under the keys row reads
    `Action not executed · no approval option is preselected` — making both
    facts explicit until a verdict is applied.
