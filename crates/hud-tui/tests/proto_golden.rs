@@ -564,3 +564,65 @@ fn a_reply_shows_its_markdown_as_style_not_as_markup() {
     let plain = mods_of("It is");
     assert!(!plain.contains(Modifier::BOLD) && !plain.contains(Modifier::ITALIC));
 }
+
+#[test]
+fn a_wrapped_bullet_hangs_under_its_text_and_a_wrapped_quote_keeps_its_gutter() {
+    // The continuation row of a long item used to start under its marker,
+    // and a long quote lost its `│` after the first row.
+    let tui = Tui::new();
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "list it".into(),
+        ..Default::default()
+    });
+    let item: String = (1..=40)
+        .map(|n| format!("w{n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::Model,
+        text: format!("- {item}\n\n> {item}"),
+        ..Default::default()
+    });
+    let screen = render(&tui, &s, 100, 40);
+    let rows: Vec<&str> = screen.lines().collect();
+    let col = |row: &str, pat: &str| row.find(pat).map(|b| row[..b].chars().count());
+
+    // The bullet: the next row's text starts two columns after the bullet.
+    let y = rows
+        .iter()
+        .position(|r| r.contains("\u{2022} w1 w2"))
+        .unwrap_or_else(|| panic!("no bullet row:\n{screen}"));
+    let bullet = col(rows[y], "\u{2022}").unwrap();
+    let next = rows[y + 1];
+    let text_col = next
+        .chars()
+        .position(|c| c.is_alphanumeric())
+        .unwrap_or_else(|| panic!("no continuation row:\n{screen}"));
+    assert_eq!(
+        text_col,
+        bullet + 2,
+        "the item hangs under its text:\n{screen}"
+    );
+
+    // The quote: the next row carries the gutter in the same column.
+    let y = rows
+        .iter()
+        .position(|r| r.contains("\u{2502} w1 w2"))
+        .unwrap_or_else(|| panic!("no quote row:\n{screen}"));
+    let gutter = col(rows[y], "\u{2502} w1").unwrap();
+    let next = rows[y + 1];
+    assert_eq!(
+        next.chars().nth(gutter),
+        Some('\u{2502}'),
+        "the continuation row keeps the gutter:\n{screen}"
+    );
+    assert_eq!(
+        next.chars()
+            .skip(gutter + 1)
+            .position(|c| c.is_alphanumeric()),
+        Some(1),
+        "and its text sits after the gutter:\n{screen}"
+    );
+}

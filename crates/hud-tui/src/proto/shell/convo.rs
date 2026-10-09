@@ -162,6 +162,109 @@ fn user_rows(l: &TranscriptLine, w: i32) -> Vec<Row> {
         .collect()
 }
 
+/// One displayed row of a reply: the chars it holds, and how a
+/// continuation row of a list item or a quote sits.
+#[derive(Debug, PartialEq, Eq)]
+struct ReplyRow {
+    a: usize,
+    b: usize,
+    /// Columns a continuation row is indented: under the item's text, not
+    /// under its marker. 0 on the first row of a line.
+    hang: usize,
+    /// A continuation row of a quote repeats its `│` gutter.
+    gutter: bool,
+}
+
+/// How far a wrapped line's later rows hang, and whether they carry the
+/// quote gutter: a bullet or number hangs under its text, a quote under
+/// the text after `│ `. Code is never a list.
+fn hang_of(line: &[char], sty: &[super::md::Sty]) -> (usize, bool) {
+    let indent = line.iter().take_while(|c| **c == ' ').count();
+    let rest = &line[indent..];
+    let Some(first) = sty.get(indent) else {
+        return (0, false);
+    };
+    if first.code {
+        return (0, false);
+    }
+    if first.quote && rest.first() == Some(&'│') {
+        return (indent + 2, true);
+    }
+    if rest.first() == Some(&'•') && rest.get(1) == Some(&' ') {
+        return (indent + 2, false);
+    }
+    let digits = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+    if (1..=3).contains(&digits)
+        && rest.get(digits) == Some(&'.')
+        && rest.get(digits + 1) == Some(&' ')
+    {
+        return (indent + digits + 2, false);
+    }
+    (0, false)
+}
+
+/// Word-wrap one line (no newline in it) into char ranges: `first`
+/// columns on the first row, `rest` on the others. A word longer than a
+/// row is split; spaces at a break are dropped.
+fn wrap_line(chars: &[char], first: usize, rest: usize) -> Vec<(usize, usize)> {
+    let n = chars.len();
+    if n == 0 {
+        return vec![(0, 0)];
+    }
+    let mut out = Vec::new();
+    let (mut i, mut w) = (0usize, first.max(1));
+    while i < n {
+        let mut end = (i + w).min(n);
+        if end < n && chars[end] != ' ' {
+            if let Some(sp) = chars[i..end].iter().rposition(|&c| c == ' ') {
+                if sp > 0 {
+                    end = i + sp;
+                }
+            }
+        }
+        out.push((i, end));
+        i = end;
+        while i < n && chars[i] == ' ' {
+            i += 1;
+        }
+        w = rest.max(1);
+    }
+    out
+}
+
+/// The rows of a displayed reply at `width` columns. A line that ends in
+/// a newline makes one row per wrapped piece; the empty line after the
+/// final newline makes none, as before.
+fn reply_rows(plain: &[char], sty: &[super::md::Sty], width: usize) -> Vec<ReplyRow> {
+    let mut rows = Vec::new();
+    let mut start = 0usize;
+    loop {
+        let end = plain[start..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(plain.len(), |p| start + p);
+        if start == plain.len() && start > 0 {
+            break; // nothing after the last newline
+        }
+        let line = &plain[start..end];
+        let (hang, gutter) = hang_of(line, &sty[start..end]);
+        let hang = hang.min(width.saturating_sub(1));
+        for (k, (ra, rb)) in wrap_line(line, width, width - hang).into_iter().enumerate() {
+            rows.push(ReplyRow {
+                a: start + ra,
+                b: start + rb,
+                hang: if k == 0 { 0 } else { hang },
+                gutter: k > 0 && gutter,
+            });
+        }
+        if end >= plain.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    rows
+}
+
 fn orbit_rows(
     l: &TranscriptLine,
     w: i32,
@@ -183,13 +286,14 @@ fn orbit_rows(
         .collect();
     let last_data = arrivals.last().map(|a| a.1);
     let (plain, sty) = (md.plain, md.sty);
-    let text: String = plain.iter().collect();
-    let lines = wrap_ranges(&text, w - 5 - if time.is_empty() { 0 } else { 7 });
+    let width = (w - 5 - if time.is_empty() { 0 } else { 7 }).max(1) as usize;
+    let lines = reply_rows(&plain, &sty, width);
     let n = lines.len();
     lines
         .into_iter()
         .enumerate()
-        .map(|(i, (a, b))| {
+        .map(|(i, row)| {
+            let (a, b, hang, gutter) = (row.a, row.b, row.hang as i32, row.gutter);
             let plain = plain.clone();
             let sty = sty.clone();
             let time = time.clone();
@@ -206,6 +310,9 @@ fn orbit_rows(
                             None,
                         );
                     }
+                }
+                if gutter {
+                    cv.text(x + 4 + hang - 2, y, "│", MUTED, None);
                 }
                 for k in a..b.min(plain.len()) {
                     let st = sty[k];
@@ -232,7 +339,7 @@ fn orbit_rows(
                     let fade = ease_out(prog(secs(now_ms), t0, 0.45, reduced || mono));
                     let fg = mix(mix(WHITE, CYAN, 0.35), target, fade);
                     cv.put(
-                        x + 4 + (k - a) as i32,
+                        x + 4 + hang + (k - a) as i32,
                         y,
                         &plain[k].to_string(),
                         fg,
@@ -251,7 +358,7 @@ fn orbit_rows(
                         CYAN
                     };
                     let end = (b.saturating_sub(a)) as i32;
-                    cv.text(x + 4 + end, y, "▍", col, None);
+                    cv.text(x + 4 + hang + end, y, "▍", col, None);
                 }
             }) as RowFn)
         })
@@ -1062,5 +1169,83 @@ mod kind_tests {
         }
         // Anything unknown still shows its name, clipped.
         assert_eq!(kind_of("Skill"), "SKILL");
+    }
+}
+
+#[cfg(test)]
+mod reply_row_tests {
+    use super::*;
+    use crate::proto::shell::md::rich_styled;
+
+    fn rows(markdown: &str, width: usize) -> (Vec<char>, Vec<ReplyRow>) {
+        let md = rich_styled(markdown);
+        let rows = reply_rows(&md.plain, &md.sty, width);
+        (md.plain, rows)
+    }
+
+    fn pieces(plain: &[char], rows: &[ReplyRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| plain[r.a..r.b].iter().collect())
+            .collect()
+    }
+
+    /// A bullet or a number that wraps continues under its text.
+    #[test]
+    fn a_wrapped_list_item_hangs_under_its_text() {
+        let (plain, r) = rows("- aaa bbb ccc ddd", 10);
+        assert_eq!(pieces(&plain, &r), ["• aaa bbb", "ccc ddd"]);
+        assert_eq!((r[0].hang, r[1].hang), (0, 2));
+        assert!(!r[1].gutter);
+
+        // `1. ` hangs 3, `10. ` hangs 4, a nested item keeps its indent.
+        let (_, r) = rows("1. aaa bbb ccc ddd eee", 10);
+        assert_eq!(r[1].hang, 3);
+        let (_, r) = rows("10. aaa bbb ccc ddd eee", 10);
+        assert_eq!(r[1].hang, 4);
+        let (_, r) = rows("  - aaa bbb ccc ddd eee", 12);
+        assert_eq!(r[1].hang, 4);
+    }
+
+    /// A quote that wraps repeats its gutter on every row.
+    #[test]
+    fn a_wrapped_quote_repeats_its_gutter() {
+        let (plain, r) = rows("> aaa bbb ccc ddd", 10);
+        assert_eq!(pieces(&plain, &r), ["│ aaa bbb", "ccc ddd"]);
+        assert_eq!((r[1].hang, r[1].gutter), (2, true));
+        assert!(!r[0].gutter);
+    }
+
+    /// Code and prose that merely look like a list do not hang.
+    #[test]
+    fn code_and_plain_prose_do_not_hang() {
+        let (_, r) = rows("```\n• aaa bbb ccc ddd eee\n```", 10);
+        assert!(r.iter().all(|row| row.hang == 0), "{r:?}");
+        let (_, r) = rows("aaa bbb ccc ddd eee fff", 10);
+        assert!(r.iter().all(|row| row.hang == 0), "{r:?}");
+        // `2024. A year` has four digits: not a numbered item.
+        let (_, r) = rows("2024. aaa bbb ccc ddd eee", 10);
+        assert!(r.iter().all(|row| row.hang == 0), "{r:?}");
+    }
+
+    /// Blank lines stay rows; the empty line after the last newline and
+    /// an empty reply behave as before.
+    #[test]
+    fn blank_lines_and_the_end_of_the_text() {
+        let (plain, r) = rows("a\n\nb", 10);
+        assert_eq!(pieces(&plain, &r), ["a", "", "b"]);
+        let (plain, r) = rows("abc\n", 10);
+        assert_eq!(pieces(&plain, &r), ["abc"]);
+        let (_, r) = rows("", 10);
+        assert_eq!(r.len(), 1);
+    }
+
+    /// A word longer than the row is split, and a hang wider than the
+    /// row cannot starve it of columns.
+    #[test]
+    fn long_words_split_and_a_huge_hang_is_capped() {
+        let (plain, r) = rows("abcdefghijkl", 5);
+        assert_eq!(pieces(&plain, &r), ["abcde", "fghij", "kl"]);
+        let (_, r) = rows("- aaa bbb", 2);
+        assert!(r.iter().all(|row| row.hang < 2), "{r:?}");
     }
 }
