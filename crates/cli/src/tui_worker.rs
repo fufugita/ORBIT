@@ -217,7 +217,9 @@ fn worker_main(
     // memory files, mods. Sent as the System message; never
     // re-inserted per request (that broke caching and edited-history
     // replay). Rebuilt only when the enabled mods set changes.
-    let mut system_prompt = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+    let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+    tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+    let mut system_prompt = built.text;
 
     // Send identity to the TUI so the status bar shows model/provider/session.
     // D18: priced=false makes the status bar show `cost n/a` for models
@@ -724,8 +726,10 @@ fn worker_main(
                         // The frozen prompt rebuilds so the next turn
                         // carries the new mods set (append-only: the
                         // change arrives as a new prompt, never an edit).
-                        system_prompt =
+                        let built =
                             build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                        tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                        system_prompt = built.text;
                         ctx.sender.send(Msg::SystemMessage(format!(
                             "mod {name}: {}",
                             if now_on { "enabled" } else { "disabled" }
@@ -739,8 +743,9 @@ fn worker_main(
             WorkerCommand::RefreshMods => {
                 mods = crate::mods::load_all(&config.home);
                 mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
-                system_prompt =
-                    build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                system_prompt = built.text;
                 ctx.sender.send(Msg::SystemMessage(format!(
                     "mods reloaded: {} installed, {} enabled",
                     mods.len(),
@@ -1403,6 +1408,8 @@ pub fn run_tui_turn(
     // deltas is still caught (D6).
     let mut cot = orbit_hud_tui::CotStripper::new();
     let mut first_round_seen = false;
+    // The size a running compaction started from, for its "before → after".
+    let mut compact_from: u64 = 0;
     let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
         use orbit_frontend_protocol::FrontendEvent as E;
         match ev {
@@ -1420,7 +1427,8 @@ pub fn run_tui_turn(
                 used_tokens,
                 window_tokens,
             } => {
-                orbit_hud_tui::emit_compaction(sender, true);
+                compact_from = used_tokens;
+                orbit_hud_tui::emit_compaction(sender, true, used_tokens);
                 orbit_hud_tui::emit_activity(
                     sender,
                     "compaction",
@@ -1429,15 +1437,20 @@ pub fn run_tui_turn(
                     None,
                 );
             }
-            E::Compacted { summary } => {
-                orbit_hud_tui::emit_compaction(sender, false);
+            E::Compacted {
+                summary,
+                after_tokens,
+            } => {
+                orbit_hud_tui::emit_compaction(sender, false, after_tokens);
+                let _ = summary;
                 orbit_hud_tui::emit_activity(
                     sender,
                     "compaction",
                     "compacted",
                     &format!(
-                        "older turns replaced by a {}-char summary",
-                        summary.chars().count()
+                        "~{} → ~{} tokens",
+                        orbit_hud_tui::tokens_short(compact_from),
+                        orbit_hud_tui::tokens_short(after_tokens)
                     ),
                     None,
                 );
@@ -1568,8 +1581,9 @@ pub fn run_tui_turn(
             E::Usage {
                 used_tokens,
                 window_tokens,
+                breakdown,
             } => {
-                orbit_hud_tui::emit_usage(sender, used_tokens, window_tokens);
+                orbit_hud_tui::emit_usage(sender, used_tokens, window_tokens, breakdown);
             }
             E::LedgerAppended {
                 record_count,
@@ -1610,6 +1624,7 @@ pub fn run_tui_turn(
         tools: crate::tools::session_tool_definitions(&config.home),
         session_id: config.session_id.clone(),
         system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
+        memory_bytes: tool_cx.ext::<MemoryBytes>().map_or(0, |m| m.0),
         // The model's window: auto-compaction triggers at 90% of
         // window minus the output reserve (phase 4).
         window_tokens: crate::context_window_for(&config.home, &config.model),
@@ -1808,7 +1823,7 @@ fn build_session_prompt(
     model: &str,
     mods: &[crate::mods::Mod],
     mods_enabled: &[String],
-) -> String {
+) -> orbit_engine::context::SystemPrompt {
     let defs = crate::tools::session_tool_definitions(home);
     let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     let mods_directive = crate::mods::system_directive(mods, mods_enabled);
@@ -1819,8 +1834,12 @@ fn build_session_prompt(
         &tool_names,
         &mods_directive,
     )
-    .text
 }
+
+/// How many bytes of the session's frozen system prompt are project
+/// instructions: kept on the tool context so each turn can tell the engine
+/// (and so the Context panel can name them).
+struct MemoryBytes(usize);
 
 /// The short id the status line shows: the first eight characters of
 /// the id proper, without the `session-` tag every stored id carries.

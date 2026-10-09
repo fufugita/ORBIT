@@ -920,7 +920,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
 
 /// Build the session's frozen system prompt for the REPL / headless
 /// paths (same shape as the TUI worker's).
-fn build_session_prompt(home: &Path, model: &str) -> String {
+fn build_session_prompt(home: &Path, model: &str) -> orbit_engine::context::SystemPrompt {
     let defs = tools::session_tool_definitions(home);
     let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     let mods = orbit_cli::mods::load_all(home);
@@ -933,7 +933,6 @@ fn build_session_prompt(home: &Path, model: &str) -> String {
         &tool_names,
         &mods_directive,
     )
-    .text
 }
 
 /// `orbit -p "<prompt>"` — headless one-shot with tools.
@@ -1198,13 +1197,15 @@ fn cmd_headless(args: &[String]) -> i32 {
             eprintln!("orbit: {tool} denied: {reason}");
         }
     };
+    let session_prompt = build_session_prompt(&home, &model);
     let options = orbit_engine::TurnOptions {
         tools: tools::session_tool_definitions(&home),
         max_rounds,
         // The frozen system prompt: the model learns the working
         // directory, the platform, ORBIT.md and the tools (review
         // blocker 5).
-        system_directive: Some(build_session_prompt(&home, &model)),
+        memory_bytes: session_prompt.memory_bytes,
+        system_directive: Some(session_prompt.text),
         window_tokens: orbit_cli::context_window_for(&home, &model),
         request_stem: "orbit-p".into(),
         session_id: session_id.clone(),
@@ -1958,9 +1959,11 @@ fn cmd_chat(args: &[String]) -> i32 {
                 _ => {}
             }
         };
+        let session_prompt = build_session_prompt(&home, &model);
         let options = orbit_engine::TurnOptions {
             tools: tools::session_tool_definitions(&home),
-            system_directive: Some(build_session_prompt(&home, &model)),
+            memory_bytes: session_prompt.memory_bytes,
+            system_directive: Some(session_prompt.text),
             window_tokens: orbit_cli::context_window_for(&home, &model),
             request_stem: "orbit-repl".into(),
             session_id: session.clone(),

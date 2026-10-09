@@ -1114,6 +1114,30 @@ fn now_hhmmss() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
+/// The Context panel's numbers as one line, for `/usage`: what the window
+/// is made of (estimates), what is free, and where compaction starts.
+fn context_summary(s: &Scenario) -> Option<String> {
+    use super::shell::panes::tokens_short as k;
+    let bd = s.ctx_breakdown?;
+    if s.window_tokens == 0 {
+        return None;
+    }
+    let free = s
+        .window_tokens
+        .saturating_sub(bd.system + bd.tools + bd.memory + bd.messages);
+    Some(format!(
+        "context {} of {} · system ~{} · tools ~{} · memory ~{} · messages ~{} · free ~{} · compacts at ~{} of messages",
+        k(s.used_tokens),
+        k(s.window_tokens),
+        k(bd.system),
+        k(bd.tools),
+        k(bd.memory),
+        k(bd.messages),
+        k(free),
+        k(bd.compact_at),
+    ))
+}
+
 /// Duration per §7.3: tenths below 10 s, else whole seconds, else m:ss.
 pub(crate) fn format_duration(ms: u64) -> (String, f64) {
     let t = (ms + 50) / 100;
@@ -1237,6 +1261,10 @@ fn run_command(
                     scenario.turns, scenario.input_tokens, scenario.output_tokens
                 ),
             );
+            // The same numbers the Context panel draws.
+            if let Some(line) = context_summary(scenario) {
+                notice(scenario, line);
+            }
             None
         }
         "/models" => {
@@ -1481,8 +1509,21 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 }
             }
         }
-        Msg::Compaction { running } => {
+        Msg::Compaction { running, tokens } => {
             scenario.apply(if running { "compacting" } else { "compacted" }, 0);
+            if running {
+                scenario.compacting_from = Some(tokens);
+            } else if let Some(before) = scenario.compacting_from.take() {
+                scenario.compactions.push(super::scenario::CompactionRow {
+                    time: now_hhmmss(),
+                    before,
+                    after: tokens,
+                });
+                const COMPACTIONS_MAX: usize = 20;
+                if scenario.compactions.len() > COMPACTIONS_MAX {
+                    scenario.compactions.remove(0);
+                }
+            }
         }
         Msg::Activity {
             kind,
@@ -1749,7 +1790,9 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
         Msg::Usage {
             used_tokens,
             window_tokens,
+            breakdown,
         } => {
+            scenario.ctx_breakdown = breakdown;
             let now_ctx = scenario.ctx_eased(now_ms);
             scenario.ctx_from = now_ctx;
             scenario.ctx_to = if window_tokens > 0 {
@@ -2581,12 +2624,26 @@ mod activity_tests {
     fn compaction_shows_in_the_status_while_it_runs() {
         let mut s = Scenario::new();
         s.turn_live = true;
-        apply_msg(Msg::Compaction { running: true }, &mut s, 1);
+        apply_msg(
+            Msg::Compaction {
+                running: true,
+                tokens: 150_000,
+            },
+            &mut s,
+            1,
+        );
         assert!(matches!(
             s.activity(),
             crate::proto::scenario::Activity::Compacting
         ));
-        apply_msg(Msg::Compaction { running: false }, &mut s, 2);
+        apply_msg(
+            Msg::Compaction {
+                running: false,
+                tokens: 9_000,
+            },
+            &mut s,
+            2,
+        );
         assert!(!matches!(
             s.activity(),
             crate::proto::scenario::Activity::Compacting
@@ -3136,5 +3193,134 @@ mod subagent_tests {
         let a = &s.agents["a1"];
         assert!(a.done && !a.ok);
         assert_eq!(a.report, "ORBIT-E0403 credential_rejected");
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use crate::msg::Msg;
+    use orbit_frontend_protocol::ContextBreakdown;
+
+    fn breakdown() -> ContextBreakdown {
+        ContextBreakdown {
+            system: 3_200,
+            tools: 6_100,
+            memory: 12_400,
+            messages: 54_000,
+            compact_at: 144_000,
+            reserve: 16_000,
+        }
+    }
+
+    #[test]
+    fn usage_keeps_the_breakdown_the_engine_measured() {
+        let mut s = Scenario::new();
+        apply_msg(
+            Msg::Usage {
+                used_tokens: 80_000,
+                window_tokens: 200_000,
+                breakdown: Some(breakdown()),
+            },
+            &mut s,
+            1,
+        );
+        assert_eq!(s.ctx_breakdown, Some(breakdown()));
+        // A later event without one (an older producer) clears it: the
+        // panel must not keep drawing parts that no longer add up.
+        apply_msg(
+            Msg::Usage {
+                used_tokens: 81_000,
+                window_tokens: 200_000,
+                breakdown: None,
+            },
+            &mut s,
+            2,
+        );
+        assert_eq!(s.ctx_breakdown, None);
+    }
+
+    /// A compaction is a row of history: when, and from how much to how
+    /// much. A finish with no start (never announced) adds nothing.
+    #[test]
+    fn a_compaction_is_remembered_with_its_sizes() {
+        let mut s = Scenario::new();
+        apply_msg(
+            Msg::Compaction {
+                running: false,
+                tokens: 5,
+            },
+            &mut s,
+            1,
+        );
+        assert!(s.compactions.is_empty(), "a finish nobody started");
+        apply_msg(
+            Msg::Compaction {
+                running: true,
+                tokens: 180_000,
+            },
+            &mut s,
+            2,
+        );
+        apply_msg(
+            Msg::Compaction {
+                running: false,
+                tokens: 12_000,
+            },
+            &mut s,
+            3,
+        );
+        assert_eq!(s.compactions.len(), 1);
+        let c = &s.compactions[0];
+        assert_eq!((c.before, c.after), (180_000, 12_000));
+        assert_eq!(c.time.len(), 8, "HH:MM:SS");
+        assert!(s.compacting_from.is_none());
+    }
+
+    #[test]
+    fn the_history_keeps_the_last_twenty() {
+        let mut s = Scenario::new();
+        for i in 0..30u64 {
+            apply_msg(
+                Msg::Compaction {
+                    running: true,
+                    tokens: 1000 + i,
+                },
+                &mut s,
+                1,
+            );
+            apply_msg(
+                Msg::Compaction {
+                    running: false,
+                    tokens: 10 + i,
+                },
+                &mut s,
+                2,
+            );
+        }
+        assert_eq!(s.compactions.len(), 20);
+        assert_eq!(s.compactions[0].before, 1010, "the oldest ten went");
+    }
+
+    /// `/usage` prints the numbers the panel draws.
+    #[test]
+    fn the_summary_matches_the_panel() {
+        let mut s = Scenario::new();
+        assert_eq!(context_summary(&s), None, "nothing measured yet");
+        s.window_tokens = 200_000;
+        s.used_tokens = 80_000;
+        s.ctx_breakdown = Some(breakdown());
+        let line = context_summary(&s).unwrap();
+        for want in [
+            "context 80k of 200k",
+            "system ~3.2k",
+            "tools ~6.1k",
+            "memory ~12.4k",
+            "messages ~54k",
+            "free ~124k",
+            "compacts at ~144k",
+        ] {
+            assert!(line.contains(want), "missing {want:?}: {line}");
+        }
     }
 }

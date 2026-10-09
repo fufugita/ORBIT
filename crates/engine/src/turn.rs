@@ -36,6 +36,10 @@ pub struct TurnOptions {
     /// re-inserted per request (that broke caching and edited-history
     /// replay). Plan mode appends its read-only posture here.
     pub system_directive: Option<String>,
+    /// How many bytes of `system_directive` are project instructions (the
+    /// memory files), so the context meter can name them apart from the
+    /// rest. 0 = not separated.
+    pub memory_bytes: usize,
     /// Request-id stem for ledger records (e.g. "orbit-tui", "orbit-p").
     pub request_stem: String,
     /// The model's context window (phase 4: compaction threshold =
@@ -48,6 +52,33 @@ pub struct TurnOptions {
     /// compacting (the recursion loops when the window is small — the
     /// summary request alone can cross the threshold).
     pub compacting: bool,
+}
+
+/// What the next request is made of, in estimated tokens (~4 bytes each):
+/// the front-end's meter shows it beside the provider's single total. None
+/// without a window — there is nothing to compare against.
+pub fn context_breakdown(
+    options: &TurnOptions,
+    transcript: &[ChatMessage],
+) -> Option<orbit_frontend_protocol::ContextBreakdown> {
+    let window = options.window_tokens?;
+    let directive_bytes = options.system_directive.as_deref().map_or(0, str::len);
+    let memory_bytes = options.memory_bytes.min(directive_bytes);
+    // What a definition costs on the wire: its name, description and schema.
+    let tool_bytes: usize = options
+        .tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+        .sum();
+    let usable = window.saturating_sub(options.output_reserve_tokens);
+    Some(orbit_frontend_protocol::ContextBreakdown {
+        system: ((directive_bytes - memory_bytes) / 4) as u64,
+        tools: (tool_bytes / 4) as u64,
+        memory: (memory_bytes / 4) as u64,
+        messages: estimate_transcript_tokens(transcript),
+        compact_at: usable / 10 * 9,
+        reserve: options.output_reserve_tokens,
+    })
 }
 
 /// Rough token estimate for a transcript: ~4 chars per token across
@@ -93,6 +124,7 @@ impl Default for TurnOptions {
             // Phase 3 moves the tool runtime into the engine.
             tools: Vec::new(),
             system_directive: None,
+            memory_bytes: 0,
             session_id: format!("s-{}", ulid::Ulid::new()),
             request_stem: "orbit-engine".into(),
             window_tokens: None,
@@ -230,10 +262,12 @@ pub fn run_turn(
                     crate::hooks::HookEvent::PostCompact,
                     &serde_json::json!({ "summary_bytes": summary.len() }),
                 );
+                let after = estimate_transcript_tokens(transcript);
                 events(FrontendEvent::Compacted {
                     summary: summary.clone(),
+                    after_tokens: after,
                 });
-                compacted_at = Some(estimate_transcript_tokens(transcript));
+                compacted_at = Some(after);
             }
         }
 
@@ -271,6 +305,7 @@ pub fn run_turn(
             events(FrontendEvent::Usage {
                 used_tokens: o.context_tokens.max(estimate_transcript_tokens(transcript)),
                 window_tokens: w,
+                breakdown: context_breakdown(options, transcript),
             });
         }
 
@@ -715,6 +750,58 @@ mod tests {
 
     fn target(name: &str, args: serde_json::Value) -> String {
         call_target(name, args.to_string().as_bytes())
+    }
+
+    fn tool(name: &str, desc: &str) -> orbit_adapter::types::ToolDefinition {
+        orbit_adapter::types::ToolDefinition {
+            name: name.into(),
+            description: desc.into(),
+            parameters: serde_json::json!({"type": "object"}),
+            schema_digest: orbit_adapter::types::Sha256Digest("0".repeat(64)),
+        }
+    }
+
+    /// The parts of the context, in estimated tokens (~4 bytes each), and
+    /// the line where compaction starts. The system text is split from the
+    /// memory the front-end measured; the conversation is the transcript's.
+    #[test]
+    fn the_context_breakdown_names_its_parts() {
+        let options = TurnOptions {
+            system_directive: Some("s".repeat(4_000)),
+            memory_bytes: 1_200,
+            tools: vec![tool("Read", &"d".repeat(360))],
+            window_tokens: Some(100_000),
+            output_reserve_tokens: 10_000,
+            ..Default::default()
+        };
+        let transcript = vec![user_message("m".repeat(800))];
+        let b = context_breakdown(&options, &transcript).expect("a window is set");
+        assert_eq!(b.system, 700, "(4000 - 1200 memory) / 4");
+        assert_eq!(b.memory, 300, "1200 / 4");
+        let wire = ("Read".len() + 360 + r#"{"type":"object"}"#.len()) / 4;
+        assert_eq!(b.tools, wire as u64);
+        assert_eq!(b.messages, 225, "800 bytes + an eighth, over four");
+        assert_eq!(b.compact_at, 81_000, "90% of (100k - 10k)");
+        assert_eq!(b.reserve, 10_000);
+    }
+
+    #[test]
+    fn without_a_window_there_is_nothing_to_compare() {
+        assert!(context_breakdown(&TurnOptions::default(), &[]).is_none());
+    }
+
+    /// A memory size larger than the directive (a stale value) cannot
+    /// make the system share underflow.
+    #[test]
+    fn a_stale_memory_size_cannot_underflow() {
+        let options = TurnOptions {
+            system_directive: Some("x".repeat(100)),
+            memory_bytes: 5_000,
+            window_tokens: Some(1_000),
+            ..Default::default()
+        };
+        let b = context_breakdown(&options, &[]).unwrap();
+        assert_eq!((b.system, b.memory), (0, 25));
     }
 
     #[test]

@@ -1027,6 +1027,21 @@ def main():
     pump(s6, 0.6)
     t = s6.screen_text()
     check("] moves to the next command", "boom: it failed" in t and "exit 3" in t, t[:1200])
+    # Swap the first panel to Context (esc, 1, p, 6): what fills the window.
+    s6.key("esc")
+    pump(s6, 0.5)
+    s6.type("1")
+    pump(s6, 0.4)
+    s6.type("p")
+    pump(s6, 0.5)
+    s6.type("6")
+    pump(s6, 0.6)
+    s6.key("esc")
+    pump(s6, 0.8)
+    t = s6.screen_text()
+    check("the Context panel names what fills the window",
+          all(w in t for w in ("system", "tools", "memory", "messages", "free")), t[:1400])
+    check("…and where compaction starts", "compacts at" in t and "of 200k tokens" in t, t[:1400])
     s6.terminate()
     try:
         os.killpg(mock6.pid, signal.SIGTERM)

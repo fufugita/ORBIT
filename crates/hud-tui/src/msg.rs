@@ -51,7 +51,9 @@ pub enum Msg {
     },
     /// The context is being compacted (`true`) or has been (`false`): the
     /// status line shows the amber "compacting context" while it runs.
-    Compaction { running: bool },
+    /// `tokens` is the conversation's estimated size: before the compaction
+    /// when it starts, after it when it ends.
+    Compaction { running: bool, tokens: u64 },
     /// Something for the Activity panel: a ledger record the session just
     /// appended (`digest` set) or a notable runtime event (a request, a
     /// compaction, a retry). Display-safe.
@@ -272,10 +274,12 @@ pub enum Msg {
         report: String,
         ok: bool,
     },
-    /// Context usage: tokens in use and the model's window.
+    /// Context usage: tokens in use and the model's window, and (when the
+    /// engine measured it) what the use is made of.
     Usage {
         used_tokens: u64,
         window_tokens: u64,
+        breakdown: Option<orbit_frontend_protocol::ContextBreakdown>,
     },
     /// The ledger grew: the record count after the append.
     LedgerAppended { record_count: u64 },

@@ -612,6 +612,28 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
     });
 }
 
+/// Tokens as a person reads them: `842`, `3.2k`, `54k`, `1.2M`.
+pub fn tokens_short(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=9_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        10_000..=99_999 => {
+            let k = n as f64 / 1_000.0;
+            if (k - k.round()).abs() < 0.05 {
+                format!("{}k", k.round() as u64)
+            } else {
+                format!("{k:.1}k")
+            }
+        }
+        100_000..=999_999 => format!("{}k", (n + 500) / 1_000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// The Context panel: what the window is made of, where compaction starts,
+/// and what compactions did. The parts are the engine's estimates (a
+/// provider reports one total, never the parts) and say so; the total in
+/// the header is the provider's.
 fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
     let s = inp.s;
     let ctx = if s.window_tokens > 0 {
@@ -633,7 +655,12 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         height: inner.height,
     };
     cv.clipped(clip, |cv| {
-        let (x, y, w) = (inner.x as i32, inner.y as i32, inner.width as i32);
+        let (x, y, w, h) = (
+            inner.x as i32,
+            inner.y as i32,
+            inner.width as i32,
+            inner.height as i32,
+        );
         if s.window_tokens == 0 {
             empty_state(
                 cv,
@@ -645,30 +672,175 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             );
             return;
         }
-        let bw = (w - 2).max(4);
-        let k = (ctx * bw as f32).round() as i32;
+        let window = s.window_tokens;
+        let bw = (w - 1).max(4);
+        // Cells for `n` tokens, over the window.
+        let cells = |n: u64| ((n as f64 / window as f64) * bw as f64).round() as i32;
+        // The provider's own total, plain.
         cv.text(
             x,
-            y + 1,
-            &"▰".repeat(k as usize),
-            mix(CYAN, if ctx > 0.85 { AMBER } else { CYAN }, ctx),
-            None,
-        );
-        cv.text(x + k, y + 1, &"▱".repeat((bw - k) as usize), RULE_HI, None);
-        cv.text(
-            x,
-            y + 3,
-            &format!("{} of {} tokens", s.used_tokens, s.window_tokens),
+            y,
+            &clip_text(
+                &format!("{} of {} tokens", tokens_short(s.used_tokens), tokens_short(window)),
+                w,
+            ),
             INK2,
             None,
         );
+        let mut yy = y + 1;
+        let Some(bd) = s.ctx_breakdown else {
+            // No breakdown (a producer that does not measure it): the
+            // total alone, as the provider reported it.
+            let k = (ctx * bw as f32).round() as i32;
+            cv.text(
+                x,
+                yy,
+                &"▰".repeat(k as usize),
+                mix(CYAN, if ctx > 0.85 { AMBER } else { CYAN }, ctx),
+                None,
+            );
+            cv.text(x + k, yy, &"▱".repeat((bw - k) as usize), RULE_HI, None);
+            cv.text(
+                x,
+                yy + 2,
+                &format!("{} of {} tokens", s.used_tokens, window),
+                INK2,
+                None,
+            );
+            cv.text(
+                x,
+                yy + 4,
+                &format!("in {}  out {}", s.input_tokens, s.output_tokens),
+                MUTED,
+                None,
+            );
+            return;
+        };
+        let parts: [(&str, u64, Rgb); 4] = [
+            ("system", bd.system, BLUE),
+            ("tools", bd.tools, CYAN),
+            ("memory", bd.memory, VIOLET),
+            ("messages", bd.messages, MAGENTA),
+        ];
+        let measured: u64 = parts.iter().map(|p| p.1).sum();
+        // The estimates can undershoot the provider's own count (different
+        // tokenizer): say so rather than hide the gap, once it is visible.
+        let other = s.used_tokens.saturating_sub(measured);
+        let other = if other * 20 >= window { other } else { 0 };
+        let total = measured + other;
+        // The stacked bar: every part at least a cell wide when it is not
+        // empty, the rest free.
+        let mut x_cur = x;
+        let mut left = bw;
+        let mut stack: Vec<(u64, Rgb)> = parts.iter().map(|(_, n, c)| (*n, *c)).collect();
+        if other > 0 {
+            stack.push((other, FAINT));
+        }
+        for (n, col) in stack {
+            if n == 0 || left == 0 {
+                continue;
+            }
+            let c = cells(n).clamp(1, left);
+            cv.text(x_cur, yy, &"█".repeat(c as usize), col, None);
+            x_cur += c;
+            left -= c;
+        }
+        cv.text(x_cur, yy, &"░".repeat(left as usize), RULE_HI, None);
+        // Where compaction starts: the conversation reaching `compact_at`
+        // on top of everything that is always sent.
+        let fixed = bd.system + bd.tools + bd.memory;
+        let marker_at = fixed + bd.compact_at;
+        if bd.compact_at > 0 {
+            let mx = x + cells(marker_at.min(window)).clamp(0, bw - 1);
+            cv.bold(mx, yy + 1, "▲", AMBER, None);
+        }
+        yy += 3;
+        // The legend: the parts, then what is left.
+        let mut rows: Vec<(&str, u64, Rgb)> = parts.to_vec();
+        if other > 0 {
+            rows.push(("other", other, FAINT));
+        }
+        for (name, n, col) in &rows {
+            let pct = (*n as f64 / window as f64 * 100.0).round() as u32;
+            let num = format!("~{}", tokens_short(*n));
+            cv.text(x, yy, "■", *col, None);
+            cv.text(x + 2, yy, name, INK2, None);
+            cv.text(x + w - 5 - text_width(&num), yy, &num, INK, None);
+            cv.text(x + w - 4, yy, &format!("{pct:>3}%"), MUTED, None);
+            yy += 1;
+        }
+        let free = window.saturating_sub(total);
+        let num = format!("~{}", tokens_short(free));
+        cv.text(x, yy, "□", RULE_HI, None);
+        cv.text(x + 2, yy, "free", INK2, None);
+        cv.text(x + w - 5 - text_width(&num), yy, &num, INK, None);
         cv.text(
-            x,
-            y + 5,
-            &format!("in {}  out {}", s.input_tokens, s.output_tokens),
+            x + w - 4,
+            yy,
+            &format!(
+                "{:>3}%",
+                (free as f64 / window as f64 * 100.0).round() as u32
+            ),
             MUTED,
             None,
         );
+        yy += 2;
+        if bd.compact_at > 0 {
+            // The number first: it is what a narrow panel must not cut.
+            cv.text(
+                x,
+                yy,
+                &clip_text(&format!("▲ compacts at ~{}", tokens_short(bd.compact_at)), w),
+                MUTED,
+                None,
+            );
+            yy += 1;
+            let why = format!(
+                "when the conversation alone reaches this: 90% of the window, less {} kept for the answer",
+                tokens_short(bd.reserve)
+            );
+            let chars: Vec<char> = why.chars().collect();
+            for (a, b) in wrap_ranges(&why, w - 2).into_iter().take(3) {
+                let line: String = chars[a..b].iter().collect();
+                cv.text(x + 2, yy, &line, FAINT, None);
+                yy += 1;
+            }
+            yy += 1;
+        }
+        cv.text(
+            x,
+            yy,
+            &clip_text(
+                &format!("provider: {} in · {} out", s.input_tokens, s.output_tokens),
+                w,
+            ),
+            FAINT,
+            None,
+        );
+        yy += 1;
+        cv.text(x, yy, &clip_text("the parts are estimates", w), FAINT, None);
+        yy += 2;
+        // What compaction did, newest last.
+        if !s.compactions.is_empty() && yy + 2 < y + h {
+            cv.text(x, yy, "COMPACTED", FAINT, None);
+            yy += 1;
+            let room = (y + h - yy).max(0) as usize;
+            let skip = s.compactions.len().saturating_sub(room);
+            for c in s.compactions.iter().skip(skip) {
+                cv.text(x, yy, &c.time, FAINT, None);
+                cv.text(
+                    x + 9,
+                    yy,
+                    &clip_text(
+                        &format!("~{} → ~{}", tokens_short(c.before), tokens_short(c.after)),
+                        w - 9,
+                    ),
+                    INK2,
+                    None,
+                );
+                yy += 1;
+            }
+        }
     });
 }
 

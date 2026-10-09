@@ -1262,6 +1262,135 @@ mod tests {
         assert!(!out.contains("done · 0.1s"), "{out}");
     }
 
+    /// A screen with just the Context panel.
+    fn context_app() -> App {
+        let mut a = App::new(std::path::PathBuf::new(), true);
+        a.tree = crate::proto::layout::Node::Panel {
+            view: View::Context,
+            agent: String::new(),
+        };
+        a
+    }
+
+    fn measured() -> Scenario {
+        let mut s = busy();
+        s.window_tokens = 200_000;
+        s.used_tokens = 80_000;
+        s.input_tokens = 120_000;
+        s.output_tokens = 3_400;
+        s.ctx_breakdown = Some(orbit_frontend_protocol::ContextBreakdown {
+            system: 3_200,
+            tools: 6_100,
+            memory: 12_400,
+            messages: 54_000,
+            compact_at: 144_000,
+            reserve: 16_000,
+        });
+        s
+    }
+
+    /// What fills the window: each part named with its estimated size, the
+    /// free remainder, and where compaction starts. It used to show only a
+    /// bar and "N of M tokens".
+    #[test]
+    fn the_context_panel_names_what_fills_the_window() {
+        let out = render(&context_app(), &measured(), 100, 40);
+        for want in [
+            "system",
+            "~3.2k",
+            "tools",
+            "~6.1k",
+            "memory",
+            "~12.4k",
+            "messages",
+            "~54k",
+            "free",
+            "~124k",
+            "80k of 200k tokens",
+            "▲ compacts at ~144k",
+            "90% of the window, less 16k kept for the answer",
+            "provider: 120000 in · 3400 out",
+            "the parts are estimates",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert!(
+            out.contains('█') && out.contains('░') && out.contains('▲'),
+            "{out}"
+        );
+    }
+
+    /// The parts add up to what the bar shows: never wider than the window.
+    #[test]
+    fn the_context_bar_is_never_wider_than_the_window() {
+        let mut s = measured();
+        // Estimates that overshoot the window (a transcript the estimate
+        // overcounts): the bar still fits and free is zero, not negative.
+        s.ctx_breakdown.as_mut().unwrap().messages = 500_000;
+        let out = render(&context_app(), &s, 100, 40);
+        assert!(out.contains("free") && out.contains("~0"), "{out}");
+        let bar = out
+            .lines()
+            .find(|l| l.contains('█'))
+            .expect("a bar row")
+            .to_string();
+        assert!(bar.chars().filter(|c| *c == '░').count() == 0, "{bar}");
+    }
+
+    #[test]
+    fn compactions_are_listed_with_their_sizes() {
+        let mut s = measured();
+        s.compactions.push(crate::proto::scenario::CompactionRow {
+            time: "14:02:11".into(),
+            before: 180_000,
+            after: 12_000,
+        });
+        let out = render(&context_app(), &s, 100, 44);
+        for want in ["COMPACTED", "14:02:11", "~180k → ~12k"] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+    }
+
+    /// A side column cannot hold the explanation on one line: the number
+    /// stays whole and leads, the explanation wraps.
+    #[test]
+    fn a_narrow_context_panel_keeps_the_number_whole() {
+        let out = render(&context_app(), &measured(), 50, 40);
+        assert!(out.contains("▲ compacts at ~144k"), "{out}");
+        for word in ["conversation", "alone", "kept", "answer"] {
+            assert!(out.contains(word), "the explanation lost {word:?}\n{out}");
+        }
+    }
+
+    /// Without a breakdown (a producer that does not measure it) the
+    /// panel says only what it knows: the provider's total.
+    #[test]
+    fn without_a_breakdown_the_panel_shows_only_the_total() {
+        let mut s = measured();
+        s.ctx_breakdown = None;
+        let out = render(&context_app(), &s, 100, 40);
+        assert!(out.contains("80k of 200k tokens"), "{out}");
+        assert!(!out.contains("compacts at"), "{out}");
+        assert!(!out.contains("memory"), "{out}");
+    }
+
+    #[test]
+    fn tokens_read_as_people_write_them() {
+        use panes::tokens_short;
+        for (n, want) in [
+            (0, "0"),
+            (842, "842"),
+            (3_200, "3.2k"),
+            (9_999, "10.0k"),
+            (12_400, "12.4k"),
+            (54_000, "54k"),
+            (124_000, "124k"),
+            (1_250_000, "1.2M"),
+        ] {
+            assert_eq!(tokens_short(n), want, "{n}");
+        }
+    }
+
     /// In a side column a record takes two lines: the OUTCOME and the proof
     /// hash on the first (nothing a long command can clip), the target
     /// under it.

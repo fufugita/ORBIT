@@ -356,9 +356,10 @@ pub fn emit_tool_started(sender: &BusSender, call_id: &str, name: &str, summary:
     });
 }
 
-/// Emit the start or end of a context compaction.
-pub fn emit_compaction(sender: &BusSender, running: bool) {
-    sender.send(Msg::Compaction { running });
+/// Emit the start or end of a context compaction (`tokens`: the
+/// conversation's estimated size before it starts, after it ends).
+pub fn emit_compaction(sender: &BusSender, running: bool, tokens: u64) {
+    sender.send(Msg::Compaction { running, tokens });
 }
 
 /// Emit one Activity row (display-safe): a ledger record (with its
@@ -527,10 +528,16 @@ pub fn emit_subagent_finished(sender: &BusSender, id: &str, report: &str, ok: bo
 }
 
 /// Emit context usage (tokens in use, the model's window).
-pub fn emit_usage(sender: &BusSender, used_tokens: u64, window_tokens: u64) {
+pub fn emit_usage(
+    sender: &BusSender,
+    used_tokens: u64,
+    window_tokens: u64,
+    breakdown: Option<orbit_frontend_protocol::ContextBreakdown>,
+) {
     sender.send(Msg::Usage {
         used_tokens,
         window_tokens,
+        breakdown,
     });
 }
 

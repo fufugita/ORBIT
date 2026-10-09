@@ -46,6 +46,13 @@ pub struct Scenario {
     pub tape_sel: Option<usize>,
     /// The Activity panel's rows, oldest first (capped).
     pub activity: Vec<ActivityRow>,
+    /// What the context is made of (the engine's estimate), when it said.
+    pub ctx_breakdown: Option<orbit_frontend_protocol::ContextBreakdown>,
+    /// Compactions this session, oldest first (capped): when, and the
+    /// conversation's estimated size before and after.
+    pub compactions: Vec<CompactionRow>,
+    /// The size a running compaction started from.
+    pub compacting_from: Option<u64>,
     /// Context meter (Usage): tokens in use, the window, when shown.
     pub used_tokens: u64,
     pub window_tokens: u64,
@@ -156,6 +163,16 @@ pub struct ActivityRow {
     pub fact: String,
     /// The ledger record's own hash, when the row is a record.
     pub digest: Option<String>,
+}
+
+/// One finished compaction, for the Context panel's history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionRow {
+    /// Local wall-clock `HH:MM:SS` when it finished.
+    pub time: String,
+    /// The conversation's estimated tokens before and after.
+    pub before: u64,
+    pub after: u64,
 }
 
 /// How many lines one tape keeps, and how many tapes the panel keeps.

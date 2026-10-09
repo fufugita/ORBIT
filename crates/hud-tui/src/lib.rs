@@ -40,6 +40,7 @@ pub use bridge::{
     emit_tool_started, emit_turn_cost, emit_usage, emit_workspace, safe_text, safe_text_probe,
     sanitize_glyphs, strip_cot, terminal_safe, CotStripper,
 };
+pub use proto::shell::panes::tokens_short;
 pub use state::RedactionKind;
 pub use worker::{CommandSink, WorkerCommand, WorkerCtx, WorkerSpawner};
 
