@@ -852,7 +852,14 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         vec![Seg::new("none", MUTED)]
     } else {
         vec![
-            Seg::new(format!("{} files  ", files.len()), MUTED),
+            Seg::new(
+                format!(
+                    "{} file{}  ",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                ),
+                MUTED,
+            ),
             Seg::bold(format!("+{add}"), GREEN),
             Seg::bold(format!(" −{del}"), RED),
         ]

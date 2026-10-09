@@ -563,7 +563,10 @@ pub fn compute_readiness(home: &std::path::Path) -> Vec<ReadinessRow> {
         .unwrap_or(0);
     rows.push(ReadinessRow {
         ok: segs > 0,
-        label: format!("ledger · {segs} segments"),
+        label: format!(
+            "ledger · {segs} segment{}",
+            if segs == 1 { "" } else { "s" }
+        ),
     });
     // Provider · model: the CLI exports the ACTIVE pair before the
     // in-process TUI starts (ORBIT_ACTIVE_MODEL / ORBIT_ACTIVE_PROVIDER).
@@ -2566,5 +2569,33 @@ mod approvals_denied_tests {
         app.reduce(approval());
         app.reduce(Msg::ApprovalsDenied);
         assert_eq!(app.tool_state, ToolState::Idle);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    /// The ledger row counts segments by what is on disk, and a single
+    /// segment is not "1 segments".
+    #[test]
+    fn the_ledger_readiness_row_counts_segments_in_the_singular() {
+        let home = std::env::temp_dir().join(format!("orbit-ready-{}", std::process::id()));
+        let segs = home.join("ledger/segments");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&segs).unwrap();
+        let label = |home: &std::path::Path| {
+            compute_readiness(home)
+                .into_iter()
+                .find(|r| r.label.starts_with("ledger"))
+                .map(|r| (r.ok, r.label))
+                .unwrap()
+        };
+        assert_eq!(label(&home), (false, "ledger · 0 segments".to_string()));
+        std::fs::write(segs.join("0000"), b"x").unwrap();
+        assert_eq!(label(&home), (true, "ledger · 1 segment".to_string()));
+        std::fs::write(segs.join("0001"), b"x").unwrap();
+        assert_eq!(label(&home), (true, "ledger · 2 segments".to_string()));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

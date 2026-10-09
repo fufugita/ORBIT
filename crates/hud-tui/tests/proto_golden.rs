@@ -876,3 +876,28 @@ fn the_approval_card_keeps_its_parts_apart_at_every_width() {
         "a wide card spells the grant and the refusal out"
     );
 }
+
+#[test]
+fn the_review_header_counts_files_in_the_singular() {
+    // "1 files +1 −1" read like a typo in the review layout.
+    use orbit_hud_tui::proto::layout::Preset;
+    use orbit_hud_tui::proto::panels::FileChangeRow;
+    let mut tui = Tui::new();
+    tui.app.apply_preset(Preset::Review);
+    let mut s = base_scenario();
+    let file = |path: &str| FileChangeRow {
+        path: path.into(),
+        added: 1,
+        removed: 1,
+        hunks: None,
+    };
+    s.file_changes = vec![file("calc.py")];
+    let one = render(&tui, &s, 164, 48);
+    assert!(
+        one.contains("1 file  ") && !one.contains("1 files"),
+        "{one}"
+    );
+    s.file_changes = vec![file("calc.py"), file("util.py")];
+    let two = render(&tui, &s, 164, 48);
+    assert!(two.contains("2 files"), "{two}");
+}
