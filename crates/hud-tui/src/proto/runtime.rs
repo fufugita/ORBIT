@@ -637,56 +637,14 @@ fn handle_key(
 
     // The approval card (§9.14/§11.5): while a request is pending it
     // owns the keyboard.
-    if let Some(call_id) = scenario.approval_call_id.clone() {
-        // A decision key does nothing while disabled (§11.5): the
-        // arming timer is 1000 ms since the last keypress.
-        // The 1000 ms window runs to the PREVIOUS key: this key
-        // press itself must not re-arm the card it decides (§9.14).
-        let armed_disabled = now_ms.saturating_sub(prev_key_ms) < 1000;
-        let response = match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') if !armed_disabled => {
-                Some(crate::ApprovalResponse::Allow)
-            }
-            KeyCode::Char('R') if !armed_disabled => Some(crate::ApprovalResponse::AllowSession),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if !armed_disabled => {
-                Some(crate::ApprovalResponse::Deny)
-            }
-            _ => None,
-        };
-        if let Some(resp) = response {
-            let allowed = matches!(
-                resp,
-                crate::ApprovalResponse::Allow | crate::ApprovalResponse::AllowSession
-            );
-            if allowed {
-                // Allowed: the call runs now.
-                for l in scenario.transcript.iter_mut().rev() {
-                    if l.kind == LineKind::Tool
-                        && l.call_id == call_id
-                        && l.tool_state == super::scenario::ToolState::AwaitingYou
-                    {
-                        l.tool_state = super::scenario::ToolState::Running;
-                        break;
-                    }
-                }
-            }
-            let delivered = approvals.resolve(&call_id, resp);
-            scenario.approval_queue.remove(0);
-            if !delivered {
-                // §11.5.3: the worker is gone — drop the request and
-                // note it.
-                scenario.transcript.push(TranscriptLine {
-                    kind: LineKind::System,
-                    text: "approval could not be delivered · the turn has ended".into(),
-                    ..Default::default()
-                });
-                scenario.apply("approval_resolved", 0);
-            } else if scenario.approval_queue.is_empty() {
-                scenario.apply("approval_resolved", 0);
-            } else {
-                scenario.approval_shown_ms = now_ms;
-            }
+    if scenario.approval_call_id.is_some() {
+        // `?` opens the key help over the card, as the status line says;
+        // while a denial's note is being typed it is only a character.
+        if k.code == KeyCode::Char('?') && scenario.approval_note.is_none() {
+            *overlay = Some(Overlay::Help);
+            return false;
         }
+        approval_key(k, scenario, approvals, prev_key_ms, now_ms);
         return false;
     }
 
@@ -1561,9 +1519,15 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 scenario.welcome_chips.push((ok, label));
             }
         }
-        Msg::ApprovalDetail { facts, preview, .. } => {
+        Msg::ApprovalDetail {
+            call_id,
+            facts,
+            preview,
+            grant,
+        } => {
             scenario.approval_facts = facts;
             scenario.approval_preview = preview;
+            scenario.approval_grant = grant.map(|g| (call_id, g));
         }
         Msg::ApprovalRequested {
             call_id,
@@ -2207,6 +2171,141 @@ fn selected_text(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The keys of the approval card while a request is pending: `y` once, `s`
+/// this session, `a` always, `R` the whole tool, `n` a denial with a note,
+/// esc a denial without. The decision keys are disabled for a second after
+/// the last keypress so typing cannot answer the card (§9.14).
+fn approval_key(
+    k: crossterm::event::KeyEvent,
+    scenario: &mut Scenario,
+    approvals: &ApprovalRegistry,
+    prev_key_ms: u64,
+    now_ms: u64,
+) {
+    let Some(call_id) = scenario.approval_call_id.clone() else {
+        return;
+    };
+    // `n` opened the note field: the denial waits for ⏎ (with the
+    // note) or esc (without), and nothing else answers the card.
+    if let Some(note) = scenario.approval_note.as_mut() {
+        let outcome = match k.code {
+            KeyCode::Enter => Some(Some(std::mem::take(note))),
+            KeyCode::Esc => Some(None),
+            KeyCode::Backspace => {
+                note.pop();
+                None
+            }
+            KeyCode::Char(c)
+                if !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                note.push(c);
+                None
+            }
+            _ => None,
+        };
+        if let Some(note) = outcome {
+            scenario.approval_note = None;
+            finish_approval(scenario, approvals, &call_id, Answer::Deny(note), now_ms);
+        }
+        return;
+    }
+    // A decision key does nothing while disabled (§11.5): the
+    // arming timer is 1000 ms since the last keypress.
+    // The 1000 ms window runs to the PREVIOUS key: this key
+    // press itself must not re-arm the card it decides (§9.14).
+    let armed_disabled = now_ms.saturating_sub(prev_key_ms) < 1000;
+    // `s` and `a` answer only for the rule the card showed; `a` only
+    // where it can be saved.
+    let offer = scenario.offered_grant().cloned();
+    let answer = if armed_disabled {
+        None
+    } else {
+        match k.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                Some(Answer::Response(crate::ApprovalResponse::Allow))
+            }
+            KeyCode::Char('s') if offer.is_some() => {
+                Some(Answer::Response(crate::ApprovalResponse::AllowRule))
+            }
+            KeyCode::Char('a') if offer.as_ref().is_some_and(|g| g.can_save) => {
+                Some(Answer::Response(crate::ApprovalResponse::AllowRuleAlways))
+            }
+            KeyCode::Char('R') => Some(Answer::Response(crate::ApprovalResponse::AllowSession)),
+            // `n` denies, and asks for a word on why (optional).
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                scenario.approval_note = Some(String::new());
+                None
+            }
+            KeyCode::Esc => Some(Answer::Deny(None)),
+            _ => None,
+        }
+    };
+    if let Some(answer) = answer {
+        finish_approval(scenario, approvals, &call_id, answer, now_ms);
+    }
+}
+
+/// How the operator answered the approval card.
+enum Answer {
+    Response(crate::ApprovalResponse),
+    /// A denial, with the note typed for it (None: no note).
+    Deny(Option<String>),
+}
+
+/// Deliver an answer to the parked worker and tidy the card: a call that
+/// was allowed shows as running, the queue moves on, and an answer that
+/// cannot be delivered (the worker is gone) says so.
+fn finish_approval(
+    scenario: &mut Scenario,
+    approvals: &crate::ApprovalRegistry,
+    call_id: &str,
+    answer: Answer,
+    now_ms: u64,
+) {
+    let allowed = matches!(
+        answer,
+        Answer::Response(
+            crate::ApprovalResponse::Allow
+                | crate::ApprovalResponse::AllowSession
+                | crate::ApprovalResponse::AllowRule
+                | crate::ApprovalResponse::AllowRuleAlways
+        )
+    );
+    if allowed {
+        // Allowed: the call runs now.
+        for l in scenario.transcript.iter_mut().rev() {
+            if l.kind == LineKind::Tool
+                && l.call_id == call_id
+                && l.tool_state == super::scenario::ToolState::AwaitingYou
+            {
+                l.tool_state = super::scenario::ToolState::Running;
+                break;
+            }
+        }
+    }
+    let delivered = match answer {
+        Answer::Response(r) => approvals.resolve(call_id, r),
+        Answer::Deny(Some(note)) => approvals.resolve_denial_with_note(call_id, &note),
+        Answer::Deny(None) => approvals.resolve(call_id, crate::ApprovalResponse::Deny),
+    };
+    scenario.approval_queue.remove(0);
+    if !delivered {
+        // §11.5.3: the worker is gone — drop the request and note it.
+        scenario.transcript.push(TranscriptLine {
+            kind: LineKind::System,
+            text: "approval could not be delivered · the turn has ended".into(),
+            ..Default::default()
+        });
+        scenario.apply("approval_resolved", 0);
+    } else if scenario.approval_queue.is_empty() {
+        scenario.apply("approval_resolved", 0);
+    } else {
+        scenario.approval_shown_ms = now_ms;
+    }
 }
 
 /// The overlay as a small code for change detection (0 none).
@@ -2930,6 +3029,197 @@ mod click_tests {
                 hit.click,
                 super::super::shell::hits::Click::Key(KeyCode::Char('y'), _)
             )));
+    }
+
+    /// A card with a pending request, a registered worker to answer, and
+    /// the rule `s` and `a` would remember.
+    fn parked(
+        can_save: bool,
+        offered: bool,
+    ) -> (
+        Scenario,
+        ApprovalRegistry,
+        std::sync::mpsc::Receiver<crate::ApprovalResponse>,
+    ) {
+        let mut s = with_approval();
+        s.approval_call_id = Some("c1".into());
+        s.approval_queue = vec!["Edit".into()];
+        if offered {
+            s.approval_grant = Some((
+                "c1".into(),
+                crate::ApprovalGrant {
+                    rule: "Edit(calc.py)".into(),
+                    can_save,
+                },
+            ));
+        }
+        let reg = ApprovalRegistry::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        reg.register("c1", tx);
+        (s, reg, rx)
+    }
+
+    fn press(s: &mut Scenario, reg: &ApprovalRegistry, code: KeyCode, at_ms: u64) {
+        // The previous key was long ago: the card is armed.
+        approval_key(
+            crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
+            s,
+            reg,
+            at_ms.saturating_sub(5_000),
+            at_ms,
+        );
+    }
+
+    /// `s` and `a` answer for the rule the card showed; without one, or
+    /// where it cannot be saved, they do nothing.
+    #[test]
+    fn s_and_a_answer_only_for_a_rule_that_was_offered() {
+        use crate::ApprovalResponse as R;
+        for (key, can_save, offered, want) in [
+            ('y', true, true, Some(R::Allow)),
+            ('s', true, true, Some(R::AllowRule)),
+            ('a', true, true, Some(R::AllowRuleAlways)),
+            ('R', true, true, Some(R::AllowSession)),
+            ('a', false, true, None),
+            ('s', false, false, None),
+            ('a', true, false, None),
+        ] {
+            let (mut s, reg, rx) = parked(can_save, offered);
+            press(&mut s, &reg, KeyCode::Char(key), 10_000);
+            assert_eq!(
+                rx.try_recv().ok(),
+                want,
+                "key {key:?}, can_save {can_save}, offered {offered}"
+            );
+            assert_eq!(
+                s.approval_call_id.is_some(),
+                want.is_none(),
+                "card state for {key:?}"
+            );
+        }
+        // Esc denies at once, without a note.
+        let (mut s, reg, rx) = parked(true, true);
+        press(&mut s, &reg, KeyCode::Esc, 10_000);
+        assert_eq!(rx.try_recv().ok(), Some(R::Deny));
+        assert_eq!(reg.take_note("c1"), None);
+    }
+
+    /// `n` opens a field for a word on why; ⏎ sends it, esc skips it; the
+    /// call is denied either way, and nothing else answers meanwhile.
+    #[test]
+    fn n_asks_for_a_note_and_the_denial_carries_it() {
+        use crate::ApprovalResponse as R;
+        let (mut s, reg, rx) = parked(true, true);
+        press(&mut s, &reg, KeyCode::Char('n'), 10_000);
+        assert_eq!(s.approval_note.as_deref(), Some(""));
+        assert!(rx.try_recv().is_err(), "n alone does not answer");
+        // `y` is text in the field now, not an approval.
+        for c in "use y not n".chars() {
+            press(&mut s, &reg, KeyCode::Char(c), 10_100);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "typing in the field answered the card"
+        );
+        press(&mut s, &reg, KeyCode::Backspace, 10_200);
+        press(&mut s, &reg, KeyCode::Char('!'), 10_300);
+        press(&mut s, &reg, KeyCode::Enter, 10_400);
+        assert_eq!(rx.try_recv().ok(), Some(R::Deny));
+        assert_eq!(reg.take_note("c1").as_deref(), Some("use y not !"));
+        assert!(s.approval_note.is_none() && s.approval_call_id.is_none());
+
+        // esc in the field: denied, no note.
+        let (mut s, reg, rx) = parked(true, true);
+        press(&mut s, &reg, KeyCode::Char('n'), 10_000);
+        press(&mut s, &reg, KeyCode::Char('x'), 10_100);
+        press(&mut s, &reg, KeyCode::Esc, 10_200);
+        assert_eq!(rx.try_recv().ok(), Some(R::Deny));
+        assert_eq!(reg.take_note("c1"), None);
+
+        // ⏎ with nothing typed is a plain denial.
+        let (mut s, reg, rx) = parked(true, true);
+        press(&mut s, &reg, KeyCode::Char('n'), 10_000);
+        press(&mut s, &reg, KeyCode::Enter, 10_100);
+        assert_eq!(rx.try_recv().ok(), Some(R::Deny));
+        assert_eq!(reg.take_note("c1"), None);
+    }
+
+    /// The help names every approval key in full: its columns are narrow
+    /// and a line that does not fit is cut with an ellipsis, which for a
+    /// line about what a key grants hides the part that matters.
+    #[test]
+    fn the_help_names_every_approval_key_without_clipping() {
+        let mut tui = fresh_tui();
+        for (w, h) in [(120u16, 40u16), (164, 48), (94, 40)] {
+            let text = frame(&mut tui, &Scenario::new(), "", Some(Overlay::Help), w, h).join("\n");
+            for line in [
+                "allow once",
+                "this kind of call, session",
+                "same, saved in this folder",
+                "the whole tool, session",
+                "deny, with a word on why",
+            ] {
+                assert!(
+                    text.contains(line),
+                    "{w}x{h}: {line:?} missing or clipped:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// A rule derived for another call is not offered: the card must never
+    /// name one rule while `s` grants another.
+    #[test]
+    fn a_rule_for_another_call_is_not_offered() {
+        let detail = |call: &str| Msg::ApprovalDetail {
+            call_id: call.into(),
+            facts: vec![],
+            preview: vec![],
+            grant: Some(crate::ApprovalGrant {
+                rule: "Edit(other.py)".into(),
+                can_save: true,
+            }),
+        };
+        let mut s = with_approval(); // the card is about c1
+        apply_msg(detail("c2"), &mut s, 3);
+        assert!(s.offered_grant().is_none(), "c2's rule on c1's card");
+        let reg = ApprovalRegistry::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        reg.register("c1", tx);
+        press(&mut s, &reg, KeyCode::Char('s'), 10_000);
+        press(&mut s, &reg, KeyCode::Char('a'), 10_000);
+        assert!(
+            rx.try_recv().is_err(),
+            "s or a answered for another call's rule"
+        );
+        // The same detail, for the call that is asking, is offered.
+        apply_msg(detail("c1"), &mut s, 4);
+        assert_eq!(
+            s.offered_grant().map(|g| g.rule.as_str()),
+            Some("Edit(other.py)")
+        );
+    }
+
+    /// The decision keys are disabled for a second after the last
+    /// keypress: typing cannot answer the card, and `n` cannot open the
+    /// field by accident either.
+    #[test]
+    fn the_new_keys_obey_the_arming_delay() {
+        for key in ['y', 's', 'a', 'R', 'n'] {
+            let (mut s, reg, rx) = parked(true, true);
+            approval_key(
+                crossterm::event::KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                &mut s,
+                &reg,
+                9_800, // the previous key, 200 ms ago
+                10_000,
+            );
+            assert!(rx.try_recv().is_err(), "{key:?} answered inside the delay");
+            assert!(
+                s.approval_note.is_none(),
+                "{key:?} opened the field inside the delay"
+            );
+        }
     }
 
     /// A card that has just appeared answers no click for 700 ms.

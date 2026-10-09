@@ -509,7 +509,18 @@ pub fn status_line(
         ("esc", "arrange")
     };
     let hints: Vec<(&str, &str)> = if s.approval_pending.is_some() {
-        vec![("y", "allow"), ("n", "deny"), ("?", "keys")]
+        // `s` is offered only for a call with a rule to remember: the hint
+        // says so rather than promising a key that would do nothing.
+        if s.offered_grant().is_some() {
+            vec![
+                ("y", "allow"),
+                ("s", "session"),
+                ("n", "deny"),
+                ("?", "keys"),
+            ]
+        } else {
+            vec![("y", "allow"), ("n", "deny"), ("?", "keys")]
+        }
     } else if focus_is_diff {
         vec![("j/k", "file"), ("z", "zoom"), esc, ("i", "back to ORBIT")]
     } else if !focus_is_conversation {

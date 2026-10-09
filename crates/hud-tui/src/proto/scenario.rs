@@ -85,6 +85,11 @@ pub struct Scenario {
     pub approval_facts: Vec<(String, String)>,
     /// The lines an edit or write would change, for the card.
     pub approval_preview: Vec<String>,
+    /// The rule `s` and `a` would remember, with the call it was derived
+    /// for. Read it through [`Scenario::offered_grant`].
+    pub approval_grant: Option<(String, crate::msg::ApprovalGrant)>,
+    /// The note being typed with a denial (`n` opened the field), if any.
+    pub approval_note: Option<String>,
     /// Ledger records appended this session (the top bar's `●` chip).
     pub ledger_count: Option<u64>,
     /// The screen animates until this tick (ms): bumped by every
@@ -327,6 +332,15 @@ pub enum Activity {
 impl Scenario {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The rule `s` and `a` would remember for the call the card is asking
+    /// about. A rule derived for another call (its detail arrived late or
+    /// out of order) is not offered: the card must never name one rule
+    /// while a key grants another (design law 6).
+    pub fn offered_grant(&self) -> Option<&crate::msg::ApprovalGrant> {
+        let (call, grant) = self.approval_grant.as_ref()?;
+        (self.approval_call_id.as_deref() == Some(call.as_str())).then_some(grant)
     }
 
     /// The star state for the current scenario (§10.1's table, first
@@ -612,6 +626,8 @@ impl Scenario {
                 self.approval_call_id = None;
                 self.approval_facts.clear();
                 self.approval_preview.clear();
+                self.approval_grant = None;
+                self.approval_note = None;
             }
             "compacting" => self.compacting = true,
             "compacted" => self.compacting = false,

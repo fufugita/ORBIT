@@ -1056,11 +1056,17 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
 pub struct TuiApprovalChannel {
     sender: BusSender,
     approvals: ApprovalRegistry,
+    /// The call the last question was about, to fetch its denial note.
+    last_call: Option<String>,
 }
 
 impl TuiApprovalChannel {
     pub fn new(sender: BusSender, approvals: ApprovalRegistry) -> Self {
-        Self { sender, approvals }
+        Self {
+            sender,
+            approvals,
+            last_call: None,
+        }
     }
 }
 
@@ -1318,7 +1324,18 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
         if req.tool_name == "Bash" {
             facts.extend(sandbox_report().facts.iter().cloned());
         }
-        orbit_hud_tui::emit_approval_detail(&self.sender, &req.call_id, facts, req.preview.clone());
+        let grant = req.grant.as_ref().map(|g| orbit_hud_tui::ApprovalGrant {
+            rule: g.rule.clone(),
+            can_save: g.can_save,
+        });
+        orbit_hud_tui::emit_approval_detail(
+            &self.sender,
+            &req.call_id,
+            facts,
+            req.preview.clone(),
+            grant,
+        );
+        self.last_call = Some(req.call_id.clone());
         // Post the request to the bus — the reducer renders an approval card.
         self.sender.send(Msg::ApprovalRequested {
             call_id: req.call_id.clone(),
@@ -1329,14 +1346,25 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         });
-        // Park until the operator responds (y/n/R). Esc handled as deny.
+        // Park until the operator responds (y/s/a/R/n). Esc handled as deny.
         match rx.recv() {
             Ok(ApprovalResponse::Allow) => crate::tool_runtime::ApprovalVerdict::AllowOnce,
             Ok(ApprovalResponse::AllowSession) => {
                 crate::tool_runtime::ApprovalVerdict::AllowSession
             }
+            Ok(ApprovalResponse::AllowRule) => {
+                crate::tool_runtime::ApprovalVerdict::AllowRuleSession
+            }
+            Ok(ApprovalResponse::AllowRuleAlways) => {
+                crate::tool_runtime::ApprovalVerdict::AllowRuleAlways
+            }
             Ok(ApprovalResponse::Deny) | Err(_) => crate::tool_runtime::ApprovalVerdict::Deny,
         }
+    }
+
+    fn take_note(&mut self) -> Option<String> {
+        let call = self.last_call.take()?;
+        self.approvals.take_note(&call)
     }
 }
 

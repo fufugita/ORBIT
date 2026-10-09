@@ -901,3 +901,166 @@ fn the_review_header_counts_files_in_the_singular() {
     let two = render(&tui, &s, 164, 48);
     assert!(two.contains("2 files"), "{two}");
 }
+
+fn rule_scenario(can_save: bool) -> Scenario {
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "run the tests".into(),
+        ..Default::default()
+    });
+    s.turn_live = true;
+    s.approval_pending = Some("Bash".into());
+    s.approval_queue.push("Bash".into());
+    s.approval_summary = Some("Bash(cargo test --release)".into());
+    s.approval_risk = 2;
+    s.approval_shown_ms = 1_000;
+    s.approval_facts = vec![("sandbox".into(), "confined · no network".into())];
+    s.approval_call_id = Some("c1".into());
+    s.approval_grant = Some((
+        "c1".into(),
+        orbit_hud_tui::ApprovalGrant {
+            rule: "Bash(cargo test *)".into(),
+            can_save,
+        },
+    ));
+    s
+}
+
+#[test]
+fn a_rule_derived_for_another_call_is_not_named_on_the_card() {
+    // The card is about c1; the only rule on hand was derived for c2. It is
+    // not shown, `s` is not offered, and the card falls back to saying what
+    // `R` would grant.
+    let mut tui = Tui::new();
+    tui.tick_ms = 9_000;
+    let mut s = rule_scenario(true);
+    s.approval_grant.as_mut().unwrap().0 = "c2".into();
+    let out = render(&tui, &s, 164, 48);
+    assert!(
+        !out.contains("s grants") && !out.contains("a grants") && !out.contains("cargo test *"),
+        "{out}"
+    );
+    assert!(out.contains("R grants"), "{out}");
+}
+
+#[test]
+fn the_approval_card_names_the_rule_that_s_and_a_would_remember() {
+    let mut tui = Tui::new();
+    tui.tick_ms = 9_000;
+
+    // A rule that can be saved: both keys, each saying what it grants.
+    let s = rule_scenario(true);
+    let out = render(&tui, &s, 164, 48);
+    assert!(
+        out.contains("s grants") && out.contains("Bash(cargo test *), this session"),
+        "{out}"
+    );
+    assert!(
+        out.contains("a grants") && out.contains("saved in .orbit/settings.local.toml"),
+        "{out}"
+    );
+    // The middle panel of the three-column layout is narrow: the short
+    // wordings. A single panel has room for the long ones.
+    for label in ["once", "session", "always", "deny"] {
+        assert!(out.contains(label), "key label {label:?}:\n{out}");
+    }
+    let single = render(&tui, &s, 100, 40);
+    for label in ["allow once", "this session", "always", "esc deny"] {
+        assert!(single.contains(label), "key label {label:?}:\n{single}");
+    }
+    // `R` still works but is not recommended: it is off the card, and the
+    // row that described it is replaced by the two that name the rule.
+    assert!(
+        !out.contains("R grants") && !out.contains("allow all Bash"),
+        "{out}"
+    );
+
+    // A rule in a folder that is not trusted can only be for the session.
+    let out = render(&tui, &rule_scenario(false), 164, 48);
+    assert!(
+        out.contains("s grants") && !out.contains("a grants"),
+        "{out}"
+    );
+    assert!(!out.contains("always"), "{out}");
+
+    // No rule on offer: the card is what it was: `R` and its scope.
+    let mut s = rule_scenario(true);
+    s.approval_grant = None;
+    let out = render(&tui, &s, 164, 48);
+    assert!(
+        out.contains("R grants") && !out.contains("s grants"),
+        "{out}"
+    );
+}
+
+#[test]
+fn the_note_field_replaces_the_keys_while_a_denial_waits_for_its_reason() {
+    let mut tui = Tui::new();
+    tui.tick_ms = 9_000;
+    let mut s = rule_scenario(true);
+    s.approval_note = Some("use make test instead".into());
+    let out = render(&tui, &s, 164, 48);
+    assert!(out.contains("because: use make test instead"), "{out}");
+    assert!(out.contains("send") && out.contains("skip"), "{out}");
+    // The grant keys are not on offer while the field is open.
+    assert!(!out.contains("always"), "{out}");
+    assert!(!out.contains("allow once"), "{out}");
+    // A long note shows its end, where the cursor is.
+    s.approval_note = Some(format!("{} the end", "word ".repeat(40)));
+    let out = render(&tui, &s, 100, 40);
+    assert!(out.contains("the end"), "{out}");
+}
+
+#[test]
+fn the_card_with_a_rule_keeps_its_parts_apart_at_every_width() {
+    // Four key groups where there were three: they give up words in order
+    // and never overlap, down to the keys alone. `R` is not among them.
+    let mut tui = Tui::new();
+    tui.tick_ms = 9_000;
+    let s = rule_scenario(true);
+    for width in [40u16, 44, 48, 56, 64, 80, 100, 119, 120, 164] {
+        let out = render(&tui, &s, width, 40);
+        let rows: Vec<&str> = out.lines().collect();
+        let keys = rows
+            .iter()
+            .find(|r| r.contains('\u{2517}') && r.contains(" y "))
+            .unwrap_or_else(|| panic!("{width}: no key row:\n{out}"));
+        let at = |pat: &str| keys.find(pat);
+        let (iy, is, ia, inn) = (at(" y "), at(" s "), at(" a "), at(" n "));
+        assert!(
+            iy.is_some() && iy < is && is < ia && ia < inn && inn.is_some(),
+            "{width}: keys out of order or missing:\n{keys}"
+        );
+        assert!(at(" R ").is_none(), "{width}: R on the card:\n{keys}");
+        let between = |a: usize, b: usize, na: &str| -> String {
+            keys[a + na.len()..b]
+                .trim_matches(|c: char| c == '\u{2501}' || c == ' ')
+                .to_string()
+        };
+        let y_label = between(iy.unwrap(), is.unwrap(), " y ");
+        let s_label = between(is.unwrap(), ia.unwrap(), " s ");
+        let a_label = between(ia.unwrap(), inn.unwrap(), " a ");
+        assert!(
+            ["allow once", "once", ""].contains(&y_label.as_str()),
+            "{width}: {y_label:?}\n{keys}"
+        );
+        assert!(
+            ["this session", "session", ""].contains(&s_label.as_str()),
+            "{width}: {s_label:?}\n{keys}"
+        );
+        assert!(
+            ["always", ""].contains(&a_label.as_str()),
+            "{width}: {a_label:?}\n{keys}"
+        );
+        // A single panel from 80 columns has room for every word. From 120
+        // the layout is three columns and the card sits in the narrow
+        // middle one, so it may be down to the keys alone there.
+        if (80..120).contains(&width) {
+            assert!(
+                s_label == "this session" && a_label == "always",
+                "{width}:\n{keys}"
+            );
+        }
+    }
+}

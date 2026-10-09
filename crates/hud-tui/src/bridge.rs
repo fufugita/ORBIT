@@ -395,8 +395,14 @@ pub fn emit_approval_detail(
     call_id: &str,
     facts: Vec<(String, String)>,
     preview: Vec<String>,
+    grant: Option<crate::msg::ApprovalGrant>,
 ) {
+    // The rule is shown as written, or not at all: if display-safety would
+    // change a character of it, the card would name a different rule than
+    // the one `s` grants.
+    let grant = grant.filter(|g| safe_text(&g.rule) == g.rule && terminal_safe(&g.rule) == g.rule);
     sender.send(Msg::ApprovalDetail {
+        grant,
         call_id: call_id.to_string(),
         facts: facts
             .into_iter()

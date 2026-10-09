@@ -692,6 +692,10 @@ struct Approval {
     /// `1 of N` when approvals are queued.
     queue_note: Option<String>,
     shown_ms: u64,
+    /// The rule `s` and `a` would remember for this call, when there is one.
+    grant: Option<crate::msg::ApprovalGrant>,
+    /// The note being typed with a denial: `n` opened the field.
+    note: Option<String>,
 }
 
 fn approval_of(s: &Scenario, now_ms: u64) -> Option<Approval> {
@@ -718,13 +722,20 @@ fn approval_of(s: &Scenario, now_ms: u64) -> Option<Approval> {
         armed,
         queue_note,
         shown_ms: s.approval_shown_ms,
+        grant: s.offered_grant().cloned(),
+        note: s.approval_note.clone(),
     })
 }
 
 fn approval_height(ap: &Approval) -> i32 {
     // border, header, gap, action, [preview], gap, [facts], gap, keys+border
-    // directory (when known), mode, the backend's facts, and the grant.
-    let facts = if ap.dir.is_empty() { 2 } else { 3 } + ap.facts.len();
+    // directory (when known), mode, the backend's facts, and what the
+    // grant keys would remember: `s` (and `a`), or `R`.
+    let grant_rows = match &ap.grant {
+        Some(g) => 1 + usize::from(g.can_save),
+        None => 1,
+    };
+    let facts = usize::from(!ap.dir.is_empty()) + 1 + ap.facts.len() + grant_rows;
     (7 + facts + ap.preview.len()) as i32
 }
 
@@ -873,24 +884,106 @@ fn draw_approval(
         }
         yy += 1;
     }
-    // What `R` really grants (design law 6: a session grant displays
-    // its actual, broader scope — never implied to be this one call).
-    cv.text(x + 3, yy, "R grants", MUTED, Some(RAISE));
-    // The scope is the point of the row, so a narrow card shortens the
-    // wording and keeps the word that bounds it rather than clipping it.
+    // What the grant keys really grant (design law 6: a grant displays its
+    // actual scope — never implied to be this one call). With a rule on
+    // offer, `s` and `a` name it; `R` stays on the key row, labelled with
+    // the whole tool. With none, `R` is the only grant and says so here.
     let room = w - 17;
-    let grant = [
-        format!("every {} call, until you quit", ap.tool),
-        format!("every {} call, this session", ap.tool),
-        format!("all {}, this session", ap.tool),
-        format!("all {}, session", ap.tool),
-        "all, session".to_string(),
-    ]
-    .into_iter()
-    .find(|g| text_width(g) <= room)
-    .unwrap_or_else(|| clip_text("all, session", room));
-    cv.text(x + 14, yy, &grant, INK2, Some(RAISE));
-    yy += 2;
+    if let Some(g) = &ap.grant {
+        cv.text(x + 3, yy, "s grants", MUTED, Some(RAISE));
+        let shown = [format!("{}, this session", g.rule), g.rule.clone()]
+            .into_iter()
+            .find(|v| text_width(v) <= room)
+            .unwrap_or_else(|| clip_text(&g.rule, room));
+        cv.text(x + 14, yy, &shown, INK2, Some(RAISE));
+        yy += 1;
+        if g.can_save {
+            cv.text(x + 3, yy, "a grants", MUTED, Some(RAISE));
+            let shown = [
+                "same, saved in .orbit/settings.local.toml".to_string(),
+                "same, saved in this folder".to_string(),
+                "same, saved".to_string(),
+            ]
+            .into_iter()
+            .find(|v| text_width(v) <= room)
+            .unwrap_or_else(|| clip_text("same, saved", room));
+            cv.text(x + 14, yy, &shown, INK2, Some(RAISE));
+            yy += 1;
+        }
+    } else {
+        cv.text(x + 3, yy, "R grants", MUTED, Some(RAISE));
+        // The scope is the point of the row, so a narrow card shortens the
+        // wording and keeps the word that bounds it rather than clipping it.
+        let grant = [
+            format!("every {} call, until you quit", ap.tool),
+            format!("every {} call, this session", ap.tool),
+            format!("all {}, this session", ap.tool),
+            format!("all {}, session", ap.tool),
+            "all, session".to_string(),
+        ]
+        .into_iter()
+        .find(|g| text_width(g) <= room)
+        .unwrap_or_else(|| clip_text("all, session", room));
+        cv.text(x + 14, yy, &grant, INK2, Some(RAISE));
+        yy += 1;
+    }
+    yy += 1;
+    // The note field: `n` opened it. The denial waits for ⏎ (send the note)
+    // or esc (deny without one); nothing else answers the card meanwhile.
+    if let Some(note) = &ap.note {
+        let key = |code: crossterm::event::KeyCode| {
+            super::hits::Click::Key(code, crossterm::event::KeyModifiers::NONE)
+        };
+        let n_end = keycap(cv, x + 3, yy, "n", false);
+        let from = x + 3;
+        cv.hit(
+            from,
+            yy,
+            n_end - from,
+            1,
+            key(crossterm::event::KeyCode::Esc),
+        );
+        // The hints on the right: ⏎ send · esc skip (or just the keys).
+        let hints: [&[(&str, &str, crossterm::event::KeyCode)]; 2] = [
+            &[
+                ("⏎", "send", crossterm::event::KeyCode::Enter),
+                ("esc", "skip", crossterm::event::KeyCode::Esc),
+            ],
+            &[
+                ("⏎", "", crossterm::event::KeyCode::Enter),
+                ("esc", "", crossterm::event::KeyCode::Esc),
+            ],
+        ];
+        let width_of = |hs: &[(&str, &str, crossterm::event::KeyCode)]| {
+            hs.iter()
+                .map(|(k, l, _)| text_width(k) + if l.is_empty() { 0 } else { 1 + text_width(l) })
+                .sum::<i32>()
+                + 2 * (hs.len() as i32 - 1)
+        };
+        let label = "because: ";
+        let hs = hints
+            .iter()
+            .find(|hs| width_of(hs) + 3 + 1 + text_width(label) + 6 <= w - 6)
+            .copied()
+            .unwrap_or(hints[1]);
+        let mut hx = x + w - 3 - width_of(hs);
+        for (k, l, code) in hs {
+            let from = hx;
+            hx = cv.bold(hx, yy, k, INK2, Some(RAISE));
+            if !l.is_empty() {
+                hx = cv.text(hx + 1, yy, l, FAINT, Some(RAISE));
+            }
+            cv.hit(from, yy, hx - from, 1, key(*code));
+            hx += 2;
+        }
+        let tx = cv.text(n_end + 1, yy, label, MUTED, Some(RAISE));
+        let room = (x + w - 3 - width_of(hs) - 2 - tx - 1).max(1) as usize;
+        let chars: Vec<char> = note.chars().collect();
+        let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
+        let end = cv.bold(tx, yy, &shown, INK, Some(RAISE));
+        cv.text(end, yy, "▏", MAGENTA, Some(RAISE));
+        return h;
+    }
     // Keys — drawn on the bottom border row. While the person is typing
     // they are disabled (§9.14) and the border says so in their place;
     // drawing both put the note over the key labels.
@@ -898,17 +991,19 @@ fn draw_approval(
         cv.text(x + 3, yy, " paused while you type ", MUTED, Some(RAISE));
         return h;
     }
-    // Two groups on the border row: the grants on the left, the refusal
+    // Groups on the border row: the grants on the left, the refusal
     // anchored at the right (`n  esc deny`). Laying the refusal out
     // explicitly matters: it used to hide behind the right-aligned
     // `esc deny` only because a longer `R` label happened to push it
     // exactly there.
     //
-    // `R` grants the WHOLE tool for the session (design law 6: scope
-    // honesty), so say so in the longest wording that fits. When the card
-    // is too narrow for all three groups at full length the words shrink
-    // (`once`, `session`, `deny`), and below that only the keys stay;
-    // groups never overlap.
+    // With a rule on offer the grants are `y` once, `s` this session and
+    // `a` always (when it can be saved): `R`, the whole tool, still works
+    // and is in the help, but the card does not recommend it. Without a
+    // rule `R` is the one grant and says it is the whole tool (design law
+    // 6: scope honesty). When the card is too narrow for every group at
+    // full length the words shrink (`once`, `session`, `deny`), and below
+    // that only the keys stay; groups never overlap.
     let cap = |label: &str| {
         3 + if label.is_empty() {
             0
@@ -917,30 +1012,74 @@ fn draw_approval(
         }
     };
     let avail = w - 6; // from x + 3 to x + w - 3
-    let session_labels = [
-        format!("allow all {} this session", ap.tool),
-        format!("allow all {} for session", ap.tool),
-        format!("allow all {}", ap.tool),
-        "allow session".to_string(),
-        "session".to_string(),
-        "all".to_string(),
-    ];
-    let wordings: [(&str, &str, &[String]); 3] = [
-        ("allow once", "esc deny", &session_labels[..5]),
-        ("once", "deny", &session_labels[3..]),
-        ("", "", &[]),
-    ];
-    let (y_label, n_label, r_label) = wordings
-        .iter()
-        .find_map(|(yl, nl, rs)| {
-            if rs.is_empty() {
-                return Some((*yl, *nl, String::new()));
+    let tool = &ap.tool;
+    let has_a = ap.grant.as_ref().is_some_and(|g| g.can_save);
+    // `(y, s, a, R, n)` labels, longest wording first.
+    let wordings: Vec<[String; 5]> = if ap.grant.is_some() {
+        [
+            ("allow once", "this session", "always", "esc deny"),
+            ("allow once", "session", "always", "esc deny"),
+            ("once", "session", "always", "deny"),
+            ("", "", "", ""),
+        ]
+        .into_iter()
+        .map(|(y, s, a, n)| [y.into(), s.into(), a.into(), String::new(), n.into()])
+        .collect()
+    } else {
+        let long = [
+            format!("allow all {tool} this session"),
+            format!("allow all {tool} for session"),
+            format!("allow all {tool}"),
+            "allow session".to_string(),
+            "session".to_string(),
+        ];
+        let mut v: Vec<[String; 5]> = long
+            .iter()
+            .map(|r| {
+                [
+                    "allow once".into(),
+                    String::new(),
+                    String::new(),
+                    r.clone(),
+                    "esc deny".into(),
+                ]
+            })
+            .collect();
+        for r in ["allow session", "session", "all"] {
+            v.push([
+                "once".into(),
+                String::new(),
+                String::new(),
+                r.into(),
+                "deny".into(),
+            ]);
+        }
+        v.push(Default::default());
+        v
+    };
+    let left = |wd: &[String; 5]| -> Vec<(&'static str, String)> {
+        let mut g = vec![("y", wd[0].clone())];
+        if ap.grant.is_some() {
+            g.push(("s", wd[1].clone()));
+            if has_a {
+                g.push(("a", wd[2].clone()));
             }
-            rs.iter()
-                .find(|r| cap(yl) + 3 + cap(r) + 3 + cap(nl) <= avail)
-                .map(|r| (*yl, *nl, r.clone()))
-        })
-        .unwrap_or(("", "", String::new()));
+        } else {
+            g.push(("R", wd[3].clone()));
+        }
+        g
+    };
+    let fits = |wd: &[String; 5]| {
+        let groups = left(wd);
+        groups.iter().map(|(_, l)| cap(l)).sum::<i32>() + 3 * groups.len() as i32 + cap(&wd[4])
+            <= avail
+    };
+    let chosen = wordings
+        .iter()
+        .find(|wd| fits(wd))
+        .cloned()
+        .unwrap_or_default();
+    let n_label = chosen[4].as_str();
     let deny_w = cap(n_label);
     let deny_x = x + w - 3 - deny_w;
     // Each is clickable as the key it shows: the click goes through the
@@ -952,11 +1091,11 @@ fn draw_approval(
         )
     };
     let mut kx = x + 3;
-    for (k, lab) in [("y", y_label), ("R", r_label.as_str())] {
+    for (k, lab) in left(&chosen) {
         let from = kx;
         kx = keycap(cv, kx, yy, k, k == "y");
         if !lab.is_empty() {
-            kx = cv.text(kx + 1, yy, lab, INK2, Some(RAISE));
+            kx = cv.text(kx + 1, yy, &lab, INK2, Some(RAISE));
         }
         cv.hit(from, yy, kx - from, 1, key(k.chars().next().unwrap_or('y')));
         kx += 3;

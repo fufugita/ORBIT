@@ -9,6 +9,17 @@
 use crate::input::KeyAction;
 use crate::state::ApprovalDecision;
 
+/// The rule an approval card offers to remember (`s` for the session, `a`
+/// for good), as the backend derived it from the call: shown as written,
+/// so what the key grants is what the card says.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApprovalGrant {
+    /// `Bash(cargo test *)`.
+    pub rule: String,
+    /// Whether `a` can write it down: the folder is trusted.
+    pub can_save: bool,
+}
+
 /// A message processed by the reducer (`App::reduce`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
@@ -76,6 +87,8 @@ pub enum Msg {
         /// Lines shown under the action: `- ` removed, `+ ` added,
         /// anything else context.
         preview: Vec<String>,
+        /// The rule `s` and `a` would remember, when there is one.
+        grant: Option<ApprovalGrant>,
     },
     /// The session's task list changed (TaskCreate/TaskUpdate): the Plan
     /// panel lists these, `(title, status)` in creation order, status

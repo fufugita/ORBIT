@@ -15,7 +15,12 @@ use std::sync::{mpsc, Mutex};
 pub enum ApprovalResponse {
     Allow,
     Deny,
+    /// `R`: the whole tool, this session.
     AllowSession,
+    /// `s`: this kind of call (the rule the card showed), this session.
+    AllowRule,
+    /// `a`: the same, and remembered in the folder's local settings.
+    AllowRuleAlways,
 }
 
 /// Shared registry of pending approval response channels.
@@ -27,6 +32,8 @@ pub enum ApprovalResponse {
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalRegistry {
     pending: std::sync::Arc<Mutex<HashMap<String, mpsc::Sender<ApprovalResponse>>>>,
+    /// The note typed with a denial, by call id, until the worker takes it.
+    notes: std::sync::Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl ApprovalRegistry {
@@ -55,6 +62,32 @@ impl ApprovalRegistry {
         } else {
             false
         }
+    }
+
+    /// Deny a pending approval and leave a note for the worker to hand to
+    /// the model as the reason. An empty note is a plain denial.
+    pub fn resolve_denial_with_note(&self, call_id: &str, note: &str) -> bool {
+        let note = note.trim();
+        if !note.is_empty() {
+            self.notes
+                .lock()
+                .expect("approval notes lock poisoned")
+                .insert(call_id.to_string(), note.to_string());
+        }
+        let delivered = self.resolve(call_id, ApprovalResponse::Deny);
+        if !delivered {
+            // Nobody is waiting to read it.
+            self.take_note(call_id);
+        }
+        delivered
+    }
+
+    /// Take the note left with a denial, once.
+    pub fn take_note(&self, call_id: &str) -> Option<String> {
+        self.notes
+            .lock()
+            .expect("approval notes lock poisoned")
+            .remove(call_id)
     }
 
     /// True if there are any pending approvals.
@@ -110,6 +143,30 @@ mod tests {
         reg.register("call-2", tx);
         reg.resolve("call-2", ApprovalResponse::Deny);
         assert_eq!(rx.recv().unwrap(), ApprovalResponse::Deny);
+    }
+
+    /// A denial's note is handed over once, to the worker that was
+    /// waiting; one that nobody can read is not kept.
+    #[test]
+    fn a_denial_note_is_handed_over_once_and_never_kept_for_nobody() {
+        let reg = ApprovalRegistry::new();
+        let (tx, rx) = mpsc::channel();
+        reg.register("call-n", tx);
+        assert!(reg.resolve_denial_with_note("call-n", "  use make instead  "));
+        assert_eq!(rx.recv().unwrap(), ApprovalResponse::Deny);
+        assert_eq!(reg.take_note("call-n").as_deref(), Some("use make instead"));
+        assert_eq!(reg.take_note("call-n"), None, "taken once");
+
+        // A blank note is a plain denial.
+        let (tx, rx) = mpsc::channel();
+        reg.register("call-b", tx);
+        assert!(reg.resolve_denial_with_note("call-b", "   "));
+        assert_eq!(rx.recv().unwrap(), ApprovalResponse::Deny);
+        assert_eq!(reg.take_note("call-b"), None);
+
+        // No worker is waiting: nothing is delivered, and nothing is left.
+        assert!(!reg.resolve_denial_with_note("gone", "too late"));
+        assert_eq!(reg.take_note("gone"), None);
     }
 
     #[test]

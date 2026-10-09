@@ -358,8 +358,13 @@ fn help(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduced: boo
             "APPROVALS",
             vec![
                 ("y", "allow once"),
-                ("R", "allow this tool for the session"),
-                ("n  esc", "deny"),
+                // The columns clip a description at 29 cells, and the
+                // scope is the part of these lines that must not be cut.
+                ("s", "this kind of call, session"),
+                ("a", "same, saved in this folder"),
+                ("R", "the whole tool, session"),
+                ("n", "deny, with a word on why"),
+                ("esc", "deny"),
             ],
         ),
         (

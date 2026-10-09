@@ -3,7 +3,7 @@
 
 Spawns the real `orbit` binary in a PTY and drives it with keystrokes,
 verifying: boot-to-typing focus, streaming (mock provider), slash commands
-(/help /model /clear /usage), tool approval (y/n), Ctrl+C cancel, Ctrl+D quit,
+(/help /model /clear /usage), tool approval (y/s/a/n), Ctrl+C cancel, Ctrl+D quit,
 SIGHUP, resize — and a clean exit with the terminal state restored.
 
 Usage:
@@ -1048,6 +1048,178 @@ def main():
     except Exception:
         mock6.terminate()
     _shutil.rmtree(work6, ignore_errors=True)
+
+    # ── 5i. Grants: s remembers a kind of call, a keeps it, n says why ─────
+    # `s` allows the calls that match the rule the card offered
+    # (Bash(git init *)) for the rest of the session: a second matching call
+    # runs without a card, one that does not match still asks. `a` also writes
+    # the rule to the folder's local settings (only once the folder is
+    # trusted), and a NEW process reads it back. `n` opens a field and what is
+    # typed comes back to the model as the denial's reason. Before this the
+    # only way not to be asked again was `R`: every Bash command until quit.
+    def on_screen(sess, needle, secs):
+        """Wait until `needle` is on the emulated screen NOW (wait_for also
+        matches anything ever written, which cannot tell one card from the
+        next)."""
+        end_at = time.time() + secs
+        while time.time() < end_at:
+            sess.read(0.3)
+            if needle in sess.screen_text():
+                return True
+        return False
+
+    def grant_session(work, script, tag, trust=False):
+        """A TUI on a scripted provider, working in `work`. Returns
+        (session, mock, request_log)."""
+        script_path = os.path.join(work, f"script-{tag}.json")
+        with open(script_path, "w") as fh:
+            _json.dump(script, fh)
+        _ss = _socket.socket()
+        _ss.bind(("127.0.0.1", 0))
+        port = _ss.getsockname()[1]
+        _ss.close()
+        log = os.path.join(work, f"req-{tag}.jsonl")
+        mock = subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+             "--port", str(port), "--script", script_path, "--log", log],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        time.sleep(0.8)
+        home = os.path.join(work, "home")
+        if not os.path.isdir(home):
+            subprocess.run([args.binary, "init", "--home", home, "--no-provider"],
+                           capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home))
+        if trust:
+            subprocess.run([args.binary, "--home", home, "folder", "trust", work],
+                           capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home))
+        with open(os.path.join(home, "providers.toml"), "w") as fh:
+            fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port}"\n'
+                     '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+        sess = PtySession([args.binary, "--home", home, "--model", "scripted"],
+                          env={"ORBIT_HOME": home}, timeout=20, rows=48, cols=164, cwd=work)
+        sess.wait_for("ORBIT", timeout=15)
+        pump(sess, 2.6)
+        return sess, mock, log
+
+    def end_grant_session(sess, mock):
+        sess.terminate()
+        try:
+            os.killpg(mock.pid, signal.SIGTERM)
+        except Exception:
+            mock.terminate()
+
+    def git_dir(work, name):
+        return os.path.isdir(os.path.join(work, name, ".git"))
+
+    # An untrusted folder: `s` is offered and `a` is not.
+    work7 = _tempfile.mkdtemp(prefix="orbit-pty-grant-")
+    script7 = {"main": [
+        {"tools": [{"name": "Bash", "args": {"command": "git init pty-a"}}]},
+        {"tools": [{"name": "Bash", "args": {"command": "git init pty-b"}}]},
+        {"tools": [{"name": "Bash", "args": {"command": "touch pty-c"}}]},
+        {"text": "Grant round finished."},
+    ]}
+    s7, mock7, log7 = grant_session(work7, script7, "s")
+    s7.type("go")
+    s7.key("enter")
+    card = on_screen(s7, "Allow Bash", 20)
+    t = s7.screen_text()
+    check("the card names the rule that s would remember",
+          card and "s grants" in t and "Bash(git init *)" in t, t[-600:])
+    check("…and does not offer to save it in a folder that is not trusted",
+          "a grants" not in t and "R grants" not in t, t[-600:])
+    # `?` opens the key help over the card (the status line says so), and it
+    # documents the new keys; closing it leaves the card to answer.
+    s7.type("?")
+    helped = on_screen(s7, "this kind of call, session", 5)
+    t = s7.screen_text()
+    check("? opens the key help over the card, and it lists s, a and n in full",
+          helped and "same, saved in this folder" in t and "deny, with a word on why" in t, t)
+    s7.key("esc")
+    pump(s7, 0.8)
+    check("closing the help leaves the card waiting for an answer",
+          "Allow Bash" in s7.screen_text() and not os.path.isdir(os.path.join(work7, "pty-a")),
+          s7.screen_text()[-600:])
+    pump(s7, 1.6)  # §9.14: the card ignores keys for a second after the last one
+    s7.key("s")
+    # The second `git init` matches the rule, so it raises no card; the next
+    # card is the `touch`, which does not.
+    asked_touch = on_screen(s7, "touch pty-c", 25)
+    t = s7.screen_text()
+    check("the call the person allowed ran", git_dir(work7, "pty-a"))
+    check("a second call matching the rule ran without asking",
+          asked_touch and git_dir(work7, "pty-b"), t[-600:])
+    check("a call that does not match still asks", asked_touch and "Allow Bash" in t, t[-600:])
+    pump(s7, 1.6)
+    s7.key("n")
+    field = on_screen(s7, "because", 5)
+    check("n opens a field for a word on why", field, s7.screen_text()[-600:])
+    s7.type("use make instead")
+    s7.key("enter")
+    finished = on_screen(s7, "Grant round finished", 30)
+    check("a denial with a note lets the round finish", finished, s7.screen_text()[-600:])
+    check("the denied call never ran", not os.path.exists(os.path.join(work7, "pty-c")))
+    try:
+        sent = open(log7).read()
+    except OSError:
+        sent = ""
+    check("the note reached the model as the reason",
+          "denied by the operator: use make instead" in sent, sent[-600:])
+    end_grant_session(s7, mock7)
+    _shutil.rmtree(work7, ignore_errors=True)
+
+    # A trusted folder: `a` saves the rule, and a new process reads it back.
+    work8 = _tempfile.mkdtemp(prefix="orbit-pty-always-")
+    script8a = {"main": [
+        {"tools": [{"name": "Bash", "args": {"command": "git init pty-a"}}]},
+        {"text": "Saved round finished."},
+    ]}
+    s8, mock8, _ = grant_session(work8, script8a, "a1", trust=True)
+    s8.type("go")
+    s8.key("enter")
+    card = on_screen(s8, "Allow Bash", 20)
+    t = s8.screen_text()
+    check("in a trusted folder the card also offers to save the rule",
+          card and "a grants" in t and "settings.local.toml" in t, t[-600:])
+    pump(s8, 1.6)
+    s8.key("a")
+    done = on_screen(s8, "Saved round finished", 30)
+    check("a lets the call run", done and git_dir(work8, "pty-a"), s8.screen_text()[-600:])
+    local = os.path.join(work8, ".orbit", "settings.local.toml")
+    try:
+        saved = open(local).read()
+    except OSError:
+        saved = ""
+    check("a wrote the rule to the folder's local settings",
+          "Bash(git init *)" in saved, saved)
+    try:
+        ignored = open(os.path.join(work8, ".orbit", ".gitignore")).read()
+    except OSError:
+        ignored = ""
+    check("…and keeps that file out of version control",
+          "settings.local.toml" in ignored, ignored)
+    end_grant_session(s8, mock8)
+
+    script8b = {"main": [
+        {"tools": [{"name": "Bash", "args": {"command": "git init pty-b"}}]},
+        {"text": "Second session finished."},
+    ]}
+    s9, mock9, _ = grant_session(work8, script8b, "a2")
+    s9.type("go")
+    s9.key("enter")
+    asked = False
+    done = False
+    end_at = time.time() + 30
+    while time.time() < end_at:
+        pump(s9, 0.3)
+        txt = s9.screen_text()
+        asked = asked or "Allow Bash" in txt
+        if "Second session finished" in txt:
+            done = True
+            break
+    check("a new session, same folder, runs the saved rule's call without asking",
+          done and not asked and git_dir(work8, "pty-b"), s9.screen_text()[-600:])
+    end_grant_session(s9, mock9)
+    _shutil.rmtree(work8, ignore_errors=True)
 
     # ── 6. /sessions + /resume round-trip ──────────────────────────────────
     # A completed turn (the tool turn above) saved a session file.
