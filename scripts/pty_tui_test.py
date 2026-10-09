@@ -44,7 +44,7 @@ def check(name: str, cond: bool, detail: str = ""):
 
 
 class PtySession:
-    def __init__(self, cmd, env=None, timeout=30, rows=30, cols=100):
+    def __init__(self, cmd, env=None, timeout=30, rows=30, cols=100, cwd=None):
         self.timeout = timeout
         self.master, self.slave = pty.openpty()
         # Set the PTY window size BEFORE spawning so the TUI gets a real
@@ -67,6 +67,7 @@ class PtySession:
             stdout=self.slave,
             stderr=self.slave,
             env=full_env,
+            cwd=cwd,
             close_fds=True,
             start_new_session=True,
         )
@@ -288,6 +289,9 @@ def main():
     ap.add_argument("--gate", default="http://127.0.0.1:8088")
     ap.add_argument("--token", default="test-token")
     args = ap.parse_args()
+    # Absolute: some sessions run in another working directory.
+    args.binary = os.path.abspath(args.binary)
+    args.mock = os.path.abspath(args.mock)
 
     # This suite runs real tool calls (Bash under bwrap, Esc → kill of a
     # process group) and deliberately kills terminals. On 2026-10-07/08 a
@@ -551,6 +555,68 @@ def main():
     s.key("enter")
     ok, buf = s.wait_for("slow", timeout=30)
     check("next prompt works after esc", ok, buf[-200:])
+
+    # ── 5c. Esc skips the calls that have not started ─────────────────────
+    # A round with TWO Bash calls (scripts/scripted_mock.py). Esc during the
+    # first must stop the second from ever starting: only the call in flight
+    # used to be killed, and the next one ran to completion.
+    import json as _json
+    import shutil as _shutil
+    import socket as _socket
+    import tempfile as _tempfile
+    work2 = _tempfile.mkdtemp(prefix="orbit-pty-2call-")
+    marker2 = os.path.join(work2, "second-ran")
+    script2 = {"main": [
+        {"tools": [
+            {"name": "Bash", "args": {"command": "sleep 30"}},
+            {"name": "Bash", "args": {"command": f"touch {marker2}"}},
+        ]},
+        {"text": "back to normal"},
+    ]}
+    with open(os.path.join(work2, "script.json"), "w") as fh:
+        _json.dump(script2, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port2 = _ss.getsockname()[1]
+    _ss.close()
+    mock2 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port2), "--script", os.path.join(work2, "script.json"),
+         "--log", os.path.join(work2, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home2 = os.path.join(work2, "home")
+    subprocess.run([args.binary, "init", "--home", home2, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home2))
+    with open(os.path.join(home2, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port2}"\n'
+                 '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+    s2 = PtySession([args.binary, "--home", home2, "--model", "scripted"],
+                    env={"ORBIT_HOME": home2}, timeout=20, rows=30, cols=110, cwd=work2)
+    s2.wait_for("ORBIT", timeout=15)
+    s2.type("go")
+    s2.key("enter")
+    ok, _ = s2.wait_for("Allow Bash", timeout=20)  # the FIRST call asks
+    time.sleep(1.6)  # §9.14 arming window
+    s2.key("y")
+    time.sleep(1.5)  # `sleep 30` is running
+    s2.key("esc")
+    ok_cancel, _ = s2.wait_for("cancelled", timeout=15)
+    time.sleep(1.0)
+    check("esc cancels a two-call round", ok_cancel)
+    check("the call that had not started never ran", not os.path.exists(marker2))
+    check("the skipped call raised no approval card",
+          "Allow Bash" not in s2.screen_text(), s2.screen_text()[-300:])
+    s2.type("again")
+    s2.key("enter")
+    ok_next, buf = s2.wait_for("back to normal", timeout=25)
+    check("next prompt works after a two-call esc", ok_next, buf[-200:])
+    s2.terminate()
+    try:
+        os.killpg(mock2.pid, signal.SIGTERM)
+    except Exception:
+        mock2.terminate()
+    _shutil.rmtree(work2, ignore_errors=True)
 
     # ── 6. /sessions + /resume round-trip ──────────────────────────────────
     # A completed turn (the tool turn above) saved a session file.

@@ -198,6 +198,10 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
             "denied: the command touches a deny-read path (credentials never reach a provider)",
         );
     }
+    // Esc already pressed: nothing new starts after the person said stop.
+    if cx.is_cancelled() {
+        return ToolResult::err("cancelled by user");
+    }
 
     let output_path = cx
         .outputs_dir()
@@ -297,8 +301,7 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
                 // kill the whole process group and report the call as
                 // cancelled, keeping the transcript valid for the next
                 // turn.
-                if crate::interrupt::is_cancelled() && !crate::interrupt::kill_fired() {
-                    crate::interrupt::set_kill_fired();
+                if cx.is_cancelled() {
                     // Esc (MD §The agent loop): kill the tool's whole
                     // process tree. TERM to the group first (graceful),
                     // then KILL: the sandbox re-execs bwrap in a new
@@ -368,6 +371,9 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
         return ToolResult::denied(
             "the command touches a deny-read path (credentials never reach a provider)",
         );
+    }
+    if cx.is_cancelled() {
+        return ToolResult::err("cancelled by user");
     }
 
     let output_path = cx
@@ -1189,5 +1195,150 @@ mod output_tests {
         assert_eq!(v["exit_code"], 3);
         assert_eq!(v["ok"], false);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn cx() -> (ToolContext, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("orbit-cancel-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (
+            ToolContext::new(dir.clone(), "cancel-test".into(), dir.clone()),
+            dir,
+        )
+    }
+
+    fn check(flag: &Arc<AtomicBool>) -> crate::CancelCheck {
+        let f = flag.clone();
+        Arc::new(move || f.load(Ordering::SeqCst))
+    }
+
+    /// The cancel state was one process-wide slot: Esc in one session
+    /// killed another session's command, and a subagent finishing cleared
+    /// its parent's. It belongs to the context.
+    #[test]
+    fn cancelling_one_context_kills_its_command_and_not_anothers() {
+        let (a, da) = cx();
+        let (b, db) = cx();
+        let (fa, fb) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        a.push_cancel_check(check(&fa));
+        b.push_cancel_check(check(&fb));
+        let ta = std::thread::spawn(move || run_command("sleep 30", 60, &a));
+        let tb = std::thread::spawn(move || run_command("sleep 30", 60, &b));
+        std::thread::sleep(Duration::from_millis(700)); // both are running
+        let t0 = std::time::Instant::now();
+        fa.store(true, Ordering::SeqCst);
+        let ra = ta.join().unwrap();
+        assert!(
+            ra.payload.contains("cancelled"),
+            "A must say cancelled: {}",
+            ra.payload
+        );
+        assert!(t0.elapsed() < Duration::from_secs(10), "A died promptly");
+        // B, in another context, is still running a second later.
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(!tb.is_finished(), "B must not be touched by A's Esc");
+        fb.store(true, Ordering::SeqCst);
+        let rb = tb.join().unwrap();
+        assert!(rb.payload.contains("cancelled"), "{}", rb.payload);
+        let _ = std::fs::remove_dir_all(da);
+        let _ = std::fs::remove_dir_all(db);
+    }
+
+    /// A nested turn installs its own check and puts the parent's back.
+    #[test]
+    fn a_nested_turn_restores_its_parents_check() {
+        let (cx, dir) = cx();
+        assert!(!cx.is_cancelled(), "no turn running: never cancelled");
+        let (parent, child) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        cx.push_cancel_check(check(&parent));
+        cx.push_cancel_check(check(&child)); // a nested turn begins
+        child.store(true, Ordering::SeqCst);
+        assert!(cx.is_cancelled(), "the nested turn's own cancel works");
+        cx.pop_cancel_check(); // it ends
+        assert!(!cx.is_cancelled(), "its cancel leaves with it");
+        parent.store(true, Ordering::SeqCst);
+        assert!(cx.is_cancelled(), "and the parent's is live again");
+        cx.pop_cancel_check();
+        assert!(!cx.is_cancelled(), "no turn left: not cancelled");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Esc is "stop": a command that would start after it does not.
+    #[test]
+    fn nothing_starts_after_cancel() {
+        let (cx, dir) = cx();
+        cx.push_cancel_check(Arc::new(|| true));
+        let marker = dir.join("ran");
+        let cmd = format!("touch {}", marker.display());
+        for r in [
+            run_command(&cmd, 10, &cx),
+            run_command_backgrounded(&cmd, &cx),
+        ] {
+            assert!(r.payload.contains("cancelled by user"), "{}", r.payload);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "the command must not have run");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Esc during a command kills the whole tree, orphans included
+    /// (ported from the process-wide-slot era; the property is unchanged).
+    #[test]
+    fn a_cancelled_turn_kills_the_running_command_and_leaves_no_orphan() {
+        let (cx, dir) = cx();
+        let flag = Arc::new(AtomicBool::new(false));
+        cx.push_cancel_check(check(&flag));
+        let f = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            f.store(true, Ordering::SeqCst);
+        });
+        let baseline: Vec<String> = pids_of("sleep");
+        let t0 = std::time::Instant::now();
+        // A grandchild that would outlive its parent shell.
+        let r = run_command("sleep 31 & sleep 32 && echo done", 60, &cx);
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "cancel must kill the child promptly (took {:?})",
+            t0.elapsed()
+        );
+        assert!(r.payload.contains("cancelled"), "{}", r.payload);
+        let mut leaked = Vec::new();
+        for _ in 0..30 {
+            leaked = pids_of("sleep")
+                .into_iter()
+                .filter(|p| !baseline.contains(p))
+                .collect();
+            if leaked.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(leaked.is_empty(), "orphans survived the Esc: {leaked:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn pids_of(name: &str) -> Vec<String> {
+        let o = std::process::Command::new("pgrep")
+            .arg("-x")
+            .arg(name)
+            .output()
+            .expect("pgrep");
+        String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .map(String::from)
+            .collect()
     }
 }

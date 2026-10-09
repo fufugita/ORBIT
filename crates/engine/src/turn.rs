@@ -329,12 +329,11 @@ pub fn run_turn(
         // Esc (MD §The agent loop): install the turn's cancel-checker
         // so long-running tool children (Bash) die with the stream.
         // Cleared after the round so a later turn starts clean.
-        let cancel_for_tools = cancel.clone();
-        orbit_tools::interrupt::set_cancel_check(Some(std::sync::Arc::new(move || {
-            cancel_for_tools.is_cancelled()
-        })));
+        // The turn's token is current for the round's tools, then the
+        // previous one (a parent turn's) is again.
+        executor.begin_cancel_scope(cancel);
         let results = executor.execute(&o.tool_calls, round);
-        orbit_tools::interrupt::set_cancel_check(None);
+        executor.end_cancel_scope();
         for r in &results {
             // A result fact for the settle animation: first small
             // truth in the payload (lines, tests, exit code).

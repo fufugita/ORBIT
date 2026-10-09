@@ -465,7 +465,14 @@ pub fn execute_call(
             return Ok((output, None));
         }
         let turn_config = subagent_turn_config(home);
-        let output = match crate::tools::execute_task(home, agent, prompt, &turn_config, approval) {
+        let output = match crate::tools::execute_task(
+            home,
+            agent,
+            prompt,
+            &turn_config,
+            approval,
+            tool_cx.cancel_check(),
+        ) {
             Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
             Err(e) => tool_error(&e),
         };
@@ -686,6 +693,48 @@ fn sandbox_refusal() -> String {
 
 fn tool_error(msg: &str) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
+}
+
+/// A round's tools are about to run: make the turn's token the current
+/// cancel check of this session's tool context. Every executor's
+/// `begin_cancel_scope` is this; `end_cancel_scope` is `pop_cancel_check`.
+pub fn begin_cancel_scope(cx: &orbit_tools::ToolContext, token: &orbit_provider_http::CancelToken) {
+    let token = token.clone();
+    cx.push_cancel_check(std::sync::Arc::new(move || token.is_cancelled()));
+}
+
+/// The answer for a call that never ran because the person pressed Esc
+/// first. Typed (`error == "cancelled by user"`), so a front-end shows
+/// "⊘ cancelled", not a failure, and the transcript stays valid.
+pub fn cancelled_result(call: &crate::PendingToolCall) -> orbit_engine::ToolRoundResult {
+    orbit_engine::ToolRoundResult {
+        call_id: call.id.clone(),
+        content: tool_error("cancelled by user"),
+    }
+}
+
+/// Run a round's calls in order. Once the turn is cancelled, the calls
+/// that have not started are answered "cancelled by user" WITHOUT
+/// running: after the person says stop nothing else executes (a second
+/// Bash command used to run to completion, because only the one in
+/// flight was killed). `on_skip` lets a front-end settle the skipped
+/// call's card.
+pub fn run_until_cancelled(
+    cx: &orbit_tools::ToolContext,
+    calls: &[crate::PendingToolCall],
+    mut run: impl FnMut(&crate::PendingToolCall) -> orbit_engine::ToolRoundResult,
+    mut on_skip: impl FnMut(&crate::PendingToolCall),
+) -> Vec<orbit_engine::ToolRoundResult> {
+    let mut results = Vec::with_capacity(calls.len());
+    for call in calls {
+        if cx.is_cancelled() {
+            on_skip(call);
+            results.push(cancelled_result(call));
+        } else {
+            results.push(run(call));
+        }
+    }
+    results
 }
 
 /// A permission refusal (C4): the typed `denied` flag marks "policy or
@@ -1002,9 +1051,11 @@ impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
         calls: &[crate::PendingToolCall],
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
-        calls
-            .iter()
-            .map(|call| {
+        let cx = self.tool_cx.clone();
+        run_until_cancelled(
+            &cx,
+            calls,
+            |call| {
                 let decision_id = ulid::Ulid::new().to_string();
                 let (content, _) = execute_call(
                     &self.home,
@@ -1023,8 +1074,17 @@ impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
                     call_id: call.id.clone(),
                     content,
                 }
-            })
-            .collect()
+            },
+            |_| {},
+        )
+    }
+
+    fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+        begin_cancel_scope(&self.tool_cx, token);
+    }
+
+    fn end_cancel_scope(&mut self) {
+        self.tool_cx.pop_cancel_check();
     }
 }
 
@@ -1461,5 +1521,105 @@ mod tests {
         // The first call's verdict should be "operator approved" (the R grant
         // is applied, and the reason reflects approval).
         assert!(ledger.contains("operator approved") || ledger.contains("R-grant"));
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn call(i: u32) -> crate::PendingToolCall {
+        crate::PendingToolCall {
+            index: i,
+            id: format!("c{i}"),
+            name: "Bash".into(),
+            arguments: br#"{"command":"true"}"#.to_vec(),
+        }
+    }
+
+    fn cx() -> orbit_tools::ToolContext {
+        let d = std::env::temp_dir();
+        orbit_tools::ToolContext::new(d.clone(), "cancel-test".into(), d)
+    }
+
+    /// After Esc, only the call in flight was killed; the next calls of
+    /// the round still ran (a second Bash command ran to completion).
+    /// Now the rest are answered "cancelled by user" and never start.
+    #[test]
+    fn calls_after_esc_do_not_run_and_say_so() {
+        let cx = cx();
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = flag.clone();
+        cx.push_cancel_check(Arc::new(move || f.load(Ordering::SeqCst)));
+        let calls = [call(0), call(1), call(2)];
+        let (mut ran, mut skipped) = (Vec::new(), Vec::new());
+        let results = run_until_cancelled(
+            &cx,
+            &calls,
+            |c| {
+                ran.push(c.id.clone());
+                // Esc arrives while the first call is running.
+                flag.store(true, Ordering::SeqCst);
+                orbit_engine::ToolRoundResult {
+                    call_id: c.id.clone(),
+                    content: r#"{"ok":false,"error":"cancelled by user"}"#.into(),
+                }
+            },
+            |c| skipped.push(c.id.clone()),
+        );
+        assert_eq!(ran, ["c0"], "only the call in flight ran");
+        assert_eq!(skipped, ["c1", "c2"], "the rest were skipped, in order");
+        assert_eq!(
+            results.len(),
+            3,
+            "every call gets a result: the transcript stays valid"
+        );
+        for r in &results[1..] {
+            assert!(orbit_tools::result_is_error(&r.content));
+            assert!(
+                !orbit_tools::result_is_denial(&r.content),
+                "not a policy refusal"
+            );
+            assert!(r.content.contains("cancelled by user"));
+        }
+        assert_eq!(results[1].call_id, "c1");
+    }
+
+    #[test]
+    fn without_a_cancel_every_call_runs() {
+        let cx = cx();
+        let calls = [call(0), call(1)];
+        let mut ran = 0;
+        let results = run_until_cancelled(
+            &cx,
+            &calls,
+            |c| {
+                ran += 1;
+                orbit_engine::ToolRoundResult {
+                    call_id: c.id.clone(),
+                    content: "{}".into(),
+                }
+            },
+            |_| panic!("nothing is skipped"),
+        );
+        assert_eq!((ran, results.len()), (2, 2));
+    }
+
+    /// The scope helper points a context at the token and pops cleanly.
+    #[test]
+    fn a_cancel_scope_follows_the_token_and_closes() {
+        let cx = cx();
+        let token = orbit_provider_http::CancelToken::new();
+        begin_cancel_scope(&cx, &token);
+        assert!(!cx.is_cancelled());
+        token.cancel();
+        assert!(
+            cx.is_cancelled(),
+            "cancelling the token cancels the context"
+        );
+        cx.pop_cancel_check();
+        assert!(!cx.is_cancelled(), "the scope is closed");
     }
 }

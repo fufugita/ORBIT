@@ -25,7 +25,6 @@ pub mod askuser;
 pub mod bash;
 pub mod executor;
 pub mod fs_tools;
-pub mod interrupt;
 pub mod notebook;
 pub mod permissions;
 pub mod sandbox;
@@ -65,6 +64,10 @@ pub trait Tool: Send + Sync {
 /// never block in it.
 pub type OutputSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Has this turn been cancelled (Esc)? Polled by long-running tools —
+/// Bash — between waits. The engine's turn token sits behind it.
+pub type CancelCheck = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// What a tool execution needs: paths, session identity, spill dir.
 /// Cloned per tool call; the read-before-edit state is shared (an
 /// interior-mutex) so every tool call in a session sees the same map.
@@ -74,6 +77,10 @@ pub struct ToolContext {
     /// front-end's live terminal). Shared by every clone of the
     /// context; the executor points it at the current call.
     output_sink: std::sync::Arc<std::sync::Mutex<Option<OutputSink>>>,
+    /// The cancel checks of the turns running on this context, innermost
+    /// last. Per context — not per process — so one session's Esc cannot
+    /// reach another's commands. Shared by every clone.
+    cancel: std::sync::Arc<std::sync::Mutex<Vec<CancelCheck>>>,
     /// The current turn's checkpoint id (E7): minted once per user
     /// prompt, shared by every Write/Edit in that turn — /rewind
     /// restores a turn, not a single call. Reset by the front-end at
@@ -102,7 +109,39 @@ impl ToolContext {
             )),
             turn_checkpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             output_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cancel: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// A turn starts running tools on this context: its cancel check
+    /// becomes the current one. Pair with [`pop_cancel_check`]; a nested
+    /// turn pushes its own and pops it, and its parent's is current
+    /// again.
+    ///
+    /// [`pop_cancel_check`]: ToolContext::pop_cancel_check
+    pub fn push_cancel_check(&self, check: CancelCheck) {
+        if let Ok(mut g) = self.cancel.lock() {
+            g.push(check);
+        }
+    }
+
+    /// The turn that pushed the current check has finished its tools.
+    pub fn pop_cancel_check(&self) {
+        if let Ok(mut g) = self.cancel.lock() {
+            g.pop();
+        }
+    }
+
+    /// The current cancel check, if a turn is running tools (a handle a
+    /// helper thread can poll — a subagent's watcher does).
+    pub fn cancel_check(&self) -> Option<CancelCheck> {
+        self.cancel.lock().ok().and_then(|g| g.last().cloned())
+    }
+
+    /// Whether the current turn was cancelled. A context no turn is
+    /// running on is never cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_check().map(|f| f()).unwrap_or(false)
     }
 
     /// Route a running command's output lines to `sink` (the live

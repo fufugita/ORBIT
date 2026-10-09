@@ -175,6 +175,46 @@ fn task_tool_definition() -> ToolDefinition {
     }
 }
 
+/// Keeps a child turn's cancel token in step with its parent's check: a
+/// helper thread polls the check every 50 ms and cancels the token when
+/// it fires. Dropping the link stops the thread, so it never outlives
+/// the child turn.
+pub struct CancelLink {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for CancelLink {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Make `child` follow `parent` (see [`CancelLink`]). No parent check:
+/// nothing to follow, no thread.
+pub fn link_cancel(
+    parent: Option<orbit_tools::CancelCheck>,
+    child: &orbit_provider_http::CancelToken,
+) -> CancelLink {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = parent.map(|check| {
+        let (child, stop) = (child.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if check() {
+                    child.cancel();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    });
+    CancelLink { stop, handle }
+}
+
 /// Execute the Task tool: run a subagent as a nested engine turn.
 /// `turn_config` carries the provider/gate/model the session already
 /// uses; the subagent's own tool set comes from its definition.
@@ -184,6 +224,9 @@ pub fn execute_task(
     prompt: &str,
     turn_config: &orbit_engine::TurnConfig,
     approval: &mut dyn crate::tool_runtime::ApprovalChannel,
+    // The parent turn's cancel check: Esc on the parent must stop the
+    // subagent too.
+    parent_cancel: Option<orbit_tools::CancelCheck>,
 ) -> Result<serde_json::Value, String> {
     let trusted = {
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -217,7 +260,11 @@ pub fn execute_task(
     // A fresh transcript: the subagent does not see the parent's
     // conversation, only its prompt.
     let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
+    // The subagent's own token follows the parent's: it used to be a
+    // fresh token nobody could cancel, so Esc during a subagent stopped
+    // neither its stream nor its commands.
     let cancel = orbit_provider_http::CancelToken::new();
+    let _link = link_cancel(parent_cancel, &cancel);
     let options = orbit_engine::TurnOptions {
         tools: sub_tools,
         max_rounds: agent.max_turns,
@@ -922,5 +969,45 @@ mod approval_tests {
             safe_call_summary("Edit", &json!({ "file_path": "src/a.rs" })),
             "Edit(src/a.rs)"
         );
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// The subagent's token was a fresh one nobody could cancel: Esc on
+    /// the parent stopped neither its stream nor its commands.
+    #[test]
+    fn a_subagent_follows_its_parents_cancel() {
+        let parent = Arc::new(AtomicBool::new(false));
+        let p = parent.clone();
+        let child = orbit_provider_http::CancelToken::new();
+        let _link = link_cancel(Some(Arc::new(move || p.load(Ordering::SeqCst))), &child);
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!child.is_cancelled(), "not cancelled while the parent runs");
+        parent.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        while !child.is_cancelled() && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(child.is_cancelled(), "the child follows the parent's Esc");
+    }
+
+    /// The watcher never outlives the child turn, and costs nothing when
+    /// there is no parent to follow.
+    #[test]
+    fn dropping_the_link_stops_the_watcher_promptly() {
+        let child = orbit_provider_http::CancelToken::new();
+        let link = link_cancel(Some(Arc::new(|| false)), &child);
+        let t0 = Instant::now();
+        drop(link);
+        assert!(t0.elapsed() < Duration::from_secs(1), "joined quickly");
+        assert!(!child.is_cancelled());
+        // No parent: no thread to join.
+        drop(link_cancel(None, &child));
     }
 }

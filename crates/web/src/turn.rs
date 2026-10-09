@@ -437,57 +437,68 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
         calls: &[orbit_engine::PendingToolCall],
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            // MD gate 2: no private tool events — the engine's
-            // tool_started_full / tool_finished_full ARE the stream.
-            // Per-call ULID decision ids (defect fix: the old
-            // `tool-round-{round}-{index}` ids repeated every turn).
-            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-            let mut approval_channel = WebApprovalChannel {
-                action_rx: self.action_rx.clone(),
-                state: self.state.clone(),
-            };
-            let (result, file_change) = orbit_cli::tool_runtime::execute_call(
-                &self.home,
-                &self.session_id,
-                &decision_id,
-                call,
-                self.auto_tools,
-                true,
-                &mut approval_channel,
-                &mut self.auto_grants,
-                &self.scope,
-                &self.tool_cx,
-            )
-            .unwrap_or_else(|e| {
-                (
-                    serde_json::json!({ "ok": false, "error": e }).to_string(),
-                    None,
+        let cx = self.tool_cx.clone();
+        orbit_cli::tool_runtime::run_until_cancelled(
+            &cx,
+            calls,
+            |call| {
+                // MD gate 2: no private tool events — the engine's
+                // tool_started_full / tool_finished_full ARE the stream.
+                // Per-call ULID decision ids (defect fix: the old
+                // `tool-round-{round}-{index}` ids repeated every turn).
+                let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+                let mut approval_channel = WebApprovalChannel {
+                    action_rx: self.action_rx.clone(),
+                    state: self.state.clone(),
+                };
+                let (result, file_change) = orbit_cli::tool_runtime::execute_call(
+                    &self.home,
+                    &self.session_id,
+                    &decision_id,
+                    call,
+                    self.auto_tools,
+                    true,
+                    &mut approval_channel,
+                    &mut self.auto_grants,
+                    &self.scope,
+                    &self.tool_cx,
                 )
-            });
-            let _ok = result.contains("\"ok\":true");
-            // M11: forward the real diff (counts + bounded hunks) to
-            // the web frontend's changes feed.
-            if let Some(fc) = file_change {
-                self.state.emit(
-                    "file_changed",
-                    serde_json::json!({
-                        "path": fc.path,
-                        "added": fc.added,
-                        "removed": fc.removed,
-                        "checkpoint_id": fc.checkpoint_id,
-                        "hunks": fc.hunks,
-                    }),
-                );
-            }
-            // MD gate 2: the engine's tool_finished_full IS the stream.
-            results.push(orbit_engine::ToolRoundResult {
-                call_id: call.id.clone(),
-                content: result,
-            });
-        }
-        results
+                .unwrap_or_else(|e| {
+                    (
+                        serde_json::json!({ "ok": false, "error": e }).to_string(),
+                        None,
+                    )
+                });
+                // M11: forward the real diff (counts + bounded hunks) to
+                // the web frontend's changes feed.
+                if let Some(fc) = file_change {
+                    self.state.emit(
+                        "file_changed",
+                        serde_json::json!({
+                            "path": fc.path,
+                            "added": fc.added,
+                            "removed": fc.removed,
+                            "checkpoint_id": fc.checkpoint_id,
+                            "hunks": fc.hunks,
+                        }),
+                    );
+                }
+                // MD gate 2: the engine's tool_finished_full IS the stream.
+                orbit_engine::ToolRoundResult {
+                    call_id: call.id.clone(),
+                    content: result,
+                }
+            },
+            |_| {},
+        )
+    }
+
+    fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+        orbit_cli::tool_runtime::begin_cancel_scope(&self.tool_cx, token);
+    }
+
+    fn end_cancel_scope(&mut self) {
+        self.tool_cx.pop_cancel_check();
     }
 }
 

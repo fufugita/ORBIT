@@ -1536,20 +1536,30 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
         calls: &[orbit_engine::PendingToolCall],
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
+        // After Esc the calls that have not started do not run: they are
+        // answered "cancelled by user" and their cards settle at once.
+        let cx = self.tool_cx.clone();
+        let sender = self.sender.clone();
+        let on_skip = move |call: &orbit_engine::PendingToolCall| {
+            orbit_hud_tui::emit_tool_finished(
+                &sender,
+                &call.id,
+                &call.name,
+                orbit_hud_tui::state::ToolOutcome::Cancelled,
+                "",
+            );
+        };
         // Plan mode: read-only tools run (the model researches while
         // planning); everything else is denied with a notice — no
         // prompt, no execution. Read-only classification is
         // backend-authoritative (tools::is_read_only).
-        if self.plan_mode {
-            let blocked: Vec<&_> = calls
-                .iter()
-                .filter(|c| !crate::tools::is_read_only(&c.name))
-                .collect();
-            if !blocked.is_empty() {
-                let mut results = Vec::with_capacity(calls.len());
-                for call in calls {
+        if self.plan_mode && calls.iter().any(|c| !crate::tools::is_read_only(&c.name)) {
+            return crate::tool_runtime::run_until_cancelled(
+                &cx,
+                calls,
+                |call| {
                     if crate::tools::is_read_only(&call.name) {
-                        results.push(self.run_one(call));
+                        self.run_one(call)
                     } else {
                         // The engine announced the call; settle its card.
                         orbit_hud_tui::emit_tool_finished(
@@ -1559,21 +1569,24 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
                             orbit_hud_tui::state::ToolOutcome::Denied,
                             "",
                         );
-                        results.push(orbit_engine::ToolRoundResult {
+                        orbit_engine::ToolRoundResult {
                             call_id: call.id.clone(),
                             content: r#"{"ok":false,"error":"plan mode: read-only — this tool is blocked until the plan is approved"}"#.into(),
-                        });
+                        }
                     }
-                }
-                return results;
-            }
+                },
+                on_skip,
+            );
         }
+        crate::tool_runtime::run_until_cancelled(&cx, calls, |c| self.run_one(c), on_skip)
+    }
 
-        let mut results = Vec::with_capacity(calls.len());
-        for c in calls {
-            results.push(self.run_one(c));
-        }
-        results
+    fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+        crate::tool_runtime::begin_cancel_scope(&self.tool_cx, token);
+    }
+
+    fn end_cancel_scope(&mut self) {
+        self.tool_cx.pop_cancel_check();
     }
 }
 

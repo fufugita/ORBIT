@@ -64,6 +64,15 @@ pub trait ToolExecutor {
     /// Run the calls produced by round `round`. Returns the tool
     /// results in the model's order.
     fn execute(&mut self, calls: &[PendingToolCall], round: u32) -> Vec<ToolRoundResult>;
+
+    /// The turn is about to run a round's tools: its cancel token is now
+    /// the current one. An executor that runs cancellable work (Bash)
+    /// points its tool context at the token; the default ignores it.
+    fn begin_cancel_scope(&mut self, _token: &orbit_provider_http::CancelToken) {}
+
+    /// The round's tools are done; the previous token (a parent turn's,
+    /// when this was a subagent) is current again.
+    fn end_cancel_scope(&mut self) {}
 }
 
 /// One executed tool call: the provider call id + the JSON payload

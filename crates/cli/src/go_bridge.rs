@@ -559,60 +559,87 @@ impl orbit_engine::ToolExecutor for GoToolExecutor {
         calls: &[orbit_engine::PendingToolCall],
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            let args =
-                crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
-            let summary = crate::tools::safe_call_summary(&call.name, &args);
-            emit(
-                &self.stream,
-                &serde_json::json!({
-                    "type": "tool_call_started",
-                    "call_id": call.id,
-                    "name": call.name,
-                    "summary": summary,
-                }),
-            );
+        let cx = self.tool_cx.clone();
+        let stream = self.stream.clone();
+        crate::tool_runtime::run_until_cancelled(
+            &cx,
+            calls,
+            |call| {
+                let args = crate::tools::parse_arguments(&call.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                let summary = crate::tools::safe_call_summary(&call.name, &args);
+                emit(
+                    &self.stream,
+                    &serde_json::json!({
+                        "type": "tool_call_started",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "summary": summary,
+                    }),
+                );
 
-            // Per-call ULID decision ids (defect fix: the old
-            // `tool-round-{round}-{index}` ids repeated every turn).
-            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-            let mut approval_channel = GoApprovalChannel {
-                rx: self.action_rx.clone(),
-            };
-            let result = crate::tool_runtime::execute_call(
-                &self.home,
-                &self.session_id,
-                &decision_id,
-                call,
-                self.auto_tools,
-                true,
-                &mut approval_channel,
-                &mut self.auto_grants,
-                &self.scope,
-                &self.tool_cx,
-            )
-            .unwrap_or_else(|e| {
-                (
-                    serde_json::json!({ "ok": false, "error": e }).to_string(),
-                    None,
+                // Per-call ULID decision ids (defect fix: the old
+                // `tool-round-{round}-{index}` ids repeated every turn).
+                let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+                let mut approval_channel = GoApprovalChannel {
+                    rx: self.action_rx.clone(),
+                };
+                let result = crate::tool_runtime::execute_call(
+                    &self.home,
+                    &self.session_id,
+                    &decision_id,
+                    call,
+                    self.auto_tools,
+                    true,
+                    &mut approval_channel,
+                    &mut self.auto_grants,
+                    &self.scope,
+                    &self.tool_cx,
                 )
-            });
-            let ok = result.0.contains("\"ok\":true");
-            emit(
-                &self.stream,
-                &serde_json::json!({
-                    "type": "tool_call_finished",
-                    "call_id": call.id,
-                    "name": call.name,
-                    "ok": ok,
-                }),
-            );
-            results.push(orbit_engine::ToolRoundResult {
-                call_id: call.id.clone(),
-                content: result.0,
-            });
-        }
-        results
+                .unwrap_or_else(|e| {
+                    (
+                        serde_json::json!({ "ok": false, "error": e }).to_string(),
+                        None,
+                    )
+                });
+                // E4: the typed verdict (a substring match called a
+                // failing command that printed `"ok":true` a success).
+                let ok = !orbit_tools::result_is_error(&result.0);
+                emit(
+                    &self.stream,
+                    &serde_json::json!({
+                        "type": "tool_call_finished",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "ok": ok,
+                    }),
+                );
+                orbit_engine::ToolRoundResult {
+                    call_id: call.id.clone(),
+                    content: result.0,
+                }
+            },
+            |call| {
+                // A call skipped after Esc still gets its finish, so the
+                // Go front-end settles the card it opened.
+                emit(
+                    &stream,
+                    &serde_json::json!({
+                        "type": "tool_call_finished",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "ok": false,
+                    }),
+                );
+            },
+        )
+    }
+
+    fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+        crate::tool_runtime::begin_cancel_scope(&self.tool_cx, token);
+    }
+
+    fn end_cancel_scope(&mut self) {
+        self.tool_cx.pop_cancel_check();
     }
 }

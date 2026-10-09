@@ -1458,33 +1458,45 @@ impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
         calls: &[orbit_engine::PendingToolCall],
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-            let (result, _) = tool_runtime::execute_call(
-                &self.home,
-                &self.session_id,
-                &decision_id,
-                call,
-                self.auto_tools,
-                false, // non-interactive: dontAsk semantics
-                &mut tool_runtime::StdApprovalChannel::new(false),
-                &mut tool_runtime::AutoGrants::new(),
-                &self.scope,
-                &self.tool_cx,
-            )
-            .unwrap_or_else(|e| {
-                (
-                    serde_json::json!({ "ok": false, "error": e }).to_string(),
-                    None,
+        let cx = self.tool_cx.clone();
+        tool_runtime::run_until_cancelled(
+            &cx,
+            calls,
+            |call| {
+                let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+                let (result, _) = tool_runtime::execute_call(
+                    &self.home,
+                    &self.session_id,
+                    &decision_id,
+                    call,
+                    self.auto_tools,
+                    false, // non-interactive: dontAsk semantics
+                    &mut tool_runtime::StdApprovalChannel::new(false),
+                    &mut tool_runtime::AutoGrants::new(),
+                    &self.scope,
+                    &self.tool_cx,
                 )
-            });
-            results.push(orbit_engine::ToolRoundResult {
-                call_id: call.id.clone(),
-                content: result,
-            });
-        }
-        results
+                .unwrap_or_else(|e| {
+                    (
+                        serde_json::json!({ "ok": false, "error": e }).to_string(),
+                        None,
+                    )
+                });
+                orbit_engine::ToolRoundResult {
+                    call_id: call.id.clone(),
+                    content: result,
+                }
+            },
+            |_| {},
+        )
+    }
+
+    fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+        tool_runtime::begin_cancel_scope(&self.tool_cx, token);
+    }
+
+    fn end_cancel_scope(&mut self) {
+        self.tool_cx.pop_cancel_check();
     }
 }
 
@@ -2054,47 +2066,59 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
         calls: &[orbit_engine::PendingToolCall],
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            // Update the read-only current_session snapshot before execution.
-            tools::SESSION_SNAPSHOT.with(|s| {
-                *s.borrow_mut() = tools::SessionSnapshot {
-                    session_id: self.session_id.clone(),
-                    model: self.model.clone(),
-                    provider: self.provider_id.clone(),
-                    turns: self.turns,
-                    input_tokens: self.total_input,
-                    output_tokens: self.total_output,
-                };
-            });
-            // Per-call ULID decision ids (defect fix: the old
-            // `tool-round-{round}-{index}` ids repeated every turn, so
-            // ledger records could not be tied to their turn).
-            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-            let (result, _) = tool_runtime::execute_call(
-                &self.home,
-                &self.session_id,
-                &decision_id,
-                call,
-                self.auto_tools,
-                self.interactive,
-                &mut self.approval_channel,
-                &mut self.auto_grants,
-                &self.scope,
-                &self.tool_cx,
-            )
-            .unwrap_or_else(|e| {
-                (
-                    serde_json::json!({ "ok": false, "error": e }).to_string(),
-                    None,
+        let cx = self.tool_cx.clone();
+        tool_runtime::run_until_cancelled(
+            &cx,
+            calls,
+            |call| {
+                // Update the read-only current_session snapshot before execution.
+                tools::SESSION_SNAPSHOT.with(|s| {
+                    *s.borrow_mut() = tools::SessionSnapshot {
+                        session_id: self.session_id.clone(),
+                        model: self.model.clone(),
+                        provider: self.provider_id.clone(),
+                        turns: self.turns,
+                        input_tokens: self.total_input,
+                        output_tokens: self.total_output,
+                    };
+                });
+                // Per-call ULID decision ids (defect fix: the old
+                // `tool-round-{round}-{index}` ids repeated every turn, so
+                // ledger records could not be tied to their turn).
+                let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+                let (result, _) = tool_runtime::execute_call(
+                    &self.home,
+                    &self.session_id,
+                    &decision_id,
+                    call,
+                    self.auto_tools,
+                    self.interactive,
+                    &mut self.approval_channel,
+                    &mut self.auto_grants,
+                    &self.scope,
+                    &self.tool_cx,
                 )
-            });
-            results.push(orbit_engine::ToolRoundResult {
-                call_id: call.id.clone(),
-                content: result,
-            });
-        }
-        results
+                .unwrap_or_else(|e| {
+                    (
+                        serde_json::json!({ "ok": false, "error": e }).to_string(),
+                        None,
+                    )
+                });
+                orbit_engine::ToolRoundResult {
+                    call_id: call.id.clone(),
+                    content: result,
+                }
+            },
+            |_| {},
+        )
+    }
+
+    fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+        tool_runtime::begin_cancel_scope(&self.tool_cx, token);
+    }
+
+    fn end_cancel_scope(&mut self) {
+        self.tool_cx.pop_cancel_check();
     }
 }
 
