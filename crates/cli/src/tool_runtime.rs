@@ -972,6 +972,13 @@ fn execute_wave1(
                     let _ = cps.snapshot_file(&turn_cp, &path);
                     before = Some((path, pre, turn_cp));
                 }
+            } else if call.name == "Write" {
+                // A file created from nothing is still a change — a diff
+                // against an empty "before". (There is nothing to
+                // snapshot: the checkpoint restores what existed.) It used
+                // to leave no event at all, so a new file never reached
+                // the Changes or Review panel.
+                before = Some((path, Vec::new(), cx.turn_checkpoint_id()));
             }
         }
     }
@@ -1433,6 +1440,84 @@ mod tests {
             ledger.contains("\"status\":\"denied\""),
             "denied verdict must record status=denied, got: {ledger}"
         );
+    }
+
+    fn write_once(
+        home: &std::path::Path,
+        cx: &orbit_tools::ToolContext,
+        args: &[u8],
+    ) -> (String, Option<FileChange>) {
+        let mut ch = FixedChannel(ApprovalVerdict::AllowOnce);
+        execute_call(
+            home,
+            "s1",
+            "d1",
+            &make_call("Write", args),
+            false,
+            true,
+            &mut ch,
+            &mut AutoGrants::new(),
+            &PermissionScope::default(),
+            cx,
+        )
+        .unwrap()
+    }
+
+    /// A file created from nothing is a change. It used to leave no event
+    /// at all, so the commonest thing an agent does never reached the
+    /// Changes or Review panel.
+    #[test]
+    fn a_created_file_is_reported_as_a_change() {
+        let home = test_home("new-file");
+        let dir = home.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, change) = write_once(
+            &home,
+            &test_cx(&dir),
+            br#"{"file_path":"notes.txt","content":"one\ntwo\n"}"#,
+        );
+        assert!(out.contains("\"ok\":true"), "{out}");
+        let change = change.expect("a created file is a change");
+        assert!(change.path.ends_with("notes.txt"), "{}", change.path);
+        assert_eq!((change.added, change.removed), (2, 0));
+        let hunks = change.hunks.expect("a diff against an empty before");
+        assert!(hunks[0].lines.iter().all(|(m, _)| *m == '+'));
+    }
+
+    /// Overwriting keeps diffing against what was there.
+    #[test]
+    fn overwriting_a_file_diffs_against_its_old_content() {
+        let home = test_home("overwrite");
+        let dir = home.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "a\nb\n").unwrap();
+        // An existing file must be read in full, in this session, first.
+        let cx = test_cx(&dir);
+        let read = orbit_tools::registry()
+            .into_iter()
+            .find(|t| t.name() == "Read")
+            .unwrap()
+            .run(&serde_json::json!({ "file_path": "f.txt" }), &cx);
+        assert!(!read.is_error, "{}", read.payload);
+        let (out, change) = write_once(&home, &cx, br#"{"file_path":"f.txt","content":"a\nc\n"}"#);
+        let change = change.unwrap_or_else(|| panic!("an overwrite is a change: {out}"));
+        assert_eq!((change.added, change.removed), (1, 1));
+    }
+
+    /// A write that failed changed nothing: no event.
+    #[test]
+    fn a_failed_write_is_not_a_change() {
+        let home = test_home("failed-write");
+        let dir = home.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plain"), "x").unwrap();
+        // `plain` is a file, so nothing can be created under it.
+        let (_, change) = write_once(
+            &home,
+            &test_cx(&dir),
+            br#"{"file_path":"plain/inside.txt","content":"y"}"#,
+        );
+        assert!(change.is_none());
     }
 
     #[test]

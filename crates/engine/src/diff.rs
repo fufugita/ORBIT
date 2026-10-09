@@ -63,6 +63,11 @@ fn ops(old: &str, new: &str) -> Vec<Op> {
 }
 
 fn split_lines(s: &str) -> Vec<&str> {
+    // An empty file has NO lines (not one empty line): a file created
+    // from nothing is pure insertion, not "one blank line replaced".
+    if s.is_empty() {
+        return Vec::new();
+    }
     let mut v: Vec<&str> = s.split('\n').collect();
     // A trailing newline produces an empty last element — drop it; a
     // file not ending in newline keeps its last partial line.
@@ -172,6 +177,10 @@ pub fn hunks(old: &str, new: &str) -> Option<Vec<DiffHunk>> {
                 }
             }
         }
+        // The header describes the hunk as it IS, before the display
+        // bound cuts its lines (the cut is marked in the lines).
+        let old_count = lines.iter().filter(|(m, _)| *m != '+').count() as u32;
+        let new_count = lines.iter().filter(|(m, _)| *m != '-').count() as u32;
         // Bound the lines inside the hunk: keep the head, mark the cut.
         if lines.len() > MAX_LINES {
             let head: Vec<(char, String)> = lines[..MAX_LINES - 1].to_vec();
@@ -179,12 +188,20 @@ pub fn hunks(old: &str, new: &str) -> Option<Vec<DiffHunk>> {
             bounded.push(('…', format!("{} more lines", lines.len() - MAX_LINES + 1)));
             lines = bounded;
         }
-        let old_count = lines.iter().filter(|(m, _)| *m != '+').count() as u32;
-        let new_count = lines.iter().filter(|(m, _)| *m != '-').count() as u32;
+        // Unified-diff convention: an empty range starts at the line
+        // BEFORE it (`-0,0` for a file created from nothing).
         out.push(DiffHunk {
-            old_start: os.max(1),
+            old_start: if old_count == 0 {
+                os.saturating_sub(1)
+            } else {
+                os.max(1)
+            },
             old_lines: old_count,
-            new_start: ns.max(1),
+            new_start: if new_count == 0 {
+                ns.saturating_sub(1)
+            } else {
+                ns.max(1)
+            },
             new_lines: new_count,
             lines,
         });
@@ -200,6 +217,39 @@ pub fn hunks(old: &str, new: &str) -> Option<Vec<DiffHunk>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file created from nothing is a diff against an EMPTY file: all
+    /// lines added, none removed, and the header says `-0,0`.
+    #[test]
+    fn a_new_file_is_pure_insertion() {
+        assert_eq!(counts("", "one\ntwo\n"), (2, 0));
+        let h = hunks("", "one\ntwo\n").unwrap();
+        assert_eq!(h.len(), 1);
+        assert!(h[0].lines.iter().all(|(m, _)| *m == '+'));
+        assert_eq!(
+            (
+                h[0].old_start,
+                h[0].old_lines,
+                h[0].new_start,
+                h[0].new_lines
+            ),
+            (0, 0, 1, 2)
+        );
+        // …and emptying a file is pure deletion.
+        assert_eq!(counts("one\ntwo\n", ""), (0, 2));
+    }
+
+    /// The header counts the hunk's real extent, not the few lines the
+    /// display bound kept: 40 new lines read `+1,40`, with the cut marked.
+    #[test]
+    fn a_cut_hunk_keeps_its_true_header() {
+        let new: String = (0..40).map(|i| format!("n{i}\n")).collect();
+        let h = hunks("", &new).unwrap();
+        assert_eq!((h[0].old_lines, h[0].new_lines), (0, 40));
+        assert!(h[0].lines.len() <= MAX_LINES);
+        assert_eq!(h[0].lines.last().map(|(m, _)| *m), Some('…'));
+        assert_eq!(counts("", &new), (40, 0), "totals stay true too");
+    }
 
     #[test]
     fn identical_is_none() {
