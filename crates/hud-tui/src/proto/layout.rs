@@ -694,7 +694,10 @@ mod tests {
         assert!(t.resize(1, Axis::Width, 1) || t.resize(1, Axis::Width, -1));
         assert_ne!(t, before, "width changed through the ancestor");
         let mut v = Node::preset(Preset::Build);
-        assert!(v.resize(1, Axis::Height, 1), "height uses its own Down split");
+        assert!(
+            v.resize(1, Axis::Height, 1),
+            "height uses its own Down split"
+        );
     }
 
     #[test]

@@ -782,7 +782,9 @@ fn execute_wave1(
         // S3 binds on every path that would RUN the command: a plain
         // allow, and the ask-collapse (the operator approved the call
         // — but not running it bare on a sandbox-less machine).
-        orbit_tools::permissions::Verdict::Allow if !sandbox_up => return (sandbox_refusal(), None),
+        orbit_tools::permissions::Verdict::Allow if !sandbox_up => {
+            return (sandbox_refusal(), None)
+        }
         orbit_tools::permissions::Verdict::Allow => {}
         orbit_tools::permissions::Verdict::Deny(reason) => {
             return (tool_denial(&reason), None);

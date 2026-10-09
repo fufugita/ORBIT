@@ -77,14 +77,8 @@ fn split_lines(s: &str) -> Vec<&str> {
 /// cut to a panel's line budget.
 pub fn counts(old: &str, new: &str) -> (u32, u32) {
     let script = ops(old, new);
-    let ins = script
-        .iter()
-        .filter(|op| matches!(op, Op::Ins(_)))
-        .count() as u32;
-    let del = script
-        .iter()
-        .filter(|op| matches!(op, Op::Del(_)))
-        .count() as u32;
+    let ins = script.iter().filter(|op| matches!(op, Op::Ins(_))).count() as u32;
+    let del = script.iter().filter(|op| matches!(op, Op::Del(_))).count() as u32;
     (ins, del)
 }
 
@@ -115,10 +109,7 @@ pub fn hunks(old: &str, new: &str) -> Option<Vec<DiffHunk>> {
                 continue;
             }
             // A same-run shorter than 2*CONTEXT+1 joins the hunks.
-            let run = script[end..]
-                .iter()
-                .take_while(|op| !is_chg(op))
-                .count();
+            let run = script[end..].iter().take_while(|op| !is_chg(op)).count();
             if run <= 2 * CONTEXT {
                 end += run;
             } else {
@@ -237,7 +228,13 @@ mod tests {
     fn far_apart_changes_make_two_hunks() {
         let old: String = (0..30).map(|i| format!("l{i}\n")).collect();
         let new: String = (0..30)
-            .map(|i| if i == 1 || i == 28 { format!("X{i}\n") } else { format!("l{i}\n") })
+            .map(|i| {
+                if i == 1 || i == 28 {
+                    format!("X{i}\n")
+                } else {
+                    format!("l{i}\n")
+                }
+            })
             .collect();
         let h = hunks(&old, &new).unwrap();
         assert_eq!(h.len(), 2);
@@ -259,7 +256,13 @@ mod tests {
     fn max_hunks_respected() {
         let old: String = (0..60).map(|i| format!("l{i}\n")).collect();
         let new: String = (0..60)
-            .map(|i| if i % 10 == 0 { format!("X{i}\n") } else { format!("l{i}\n") })
+            .map(|i| {
+                if i % 10 == 0 {
+                    format!("X{i}\n")
+                } else {
+                    format!("l{i}\n")
+                }
+            })
             .collect();
         let h = hunks(&old, &new).unwrap();
         assert_eq!(h.len(), MAX_HUNKS);

@@ -592,7 +592,12 @@ impl orbit_engine::ToolExecutor for GoToolExecutor {
                 &self.scope,
                 &self.tool_cx,
             )
-            .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
+            .unwrap_or_else(|e| {
+                (
+                    serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    None,
+                )
+            });
             let ok = result.0.contains("\"ok\":true");
             emit(
                 &self.stream,

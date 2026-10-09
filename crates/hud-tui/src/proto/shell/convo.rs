@@ -152,7 +152,14 @@ fn user_rows(l: &TranscriptLine, w: i32) -> Vec<Row> {
         .collect()
 }
 
-fn orbit_rows(l: &TranscriptLine, w: i32, live: bool, now_ms: u64, reduced: bool, mono: bool) -> Vec<Row> {
+fn orbit_rows(
+    l: &TranscriptLine,
+    w: i32,
+    live: bool,
+    now_ms: u64,
+    reduced: bool,
+    mono: bool,
+) -> Vec<Row> {
     let time = l.time.clone().unwrap_or_default();
     let arrivals = l.arrivals.clone();
     let last_data = arrivals.last().map(|a| a.1);
@@ -331,7 +338,10 @@ fn card_rows(l: &TranscriptLine, w: i32, now_ms: u64, reduced: bool, mono: bool)
             ]),
             ToolState::Done => right.extend([
                 Seg::new(sep, MUTED),
-                Seg::bold("✓", mix(WHITE, GREEN, prog(now, finished, 0.25, reduced || mono))),
+                Seg::bold(
+                    "✓",
+                    mix(WHITE, GREEN, prog(now, finished, 0.25, reduced || mono)),
+                ),
             ]),
             ToolState::Failed => right.extend([
                 Seg::new(sep, MUTED),
@@ -422,7 +432,10 @@ fn transcript_rows(inp: &ConvIn, w: i32) -> Vec<Row> {
             LineKind::User => ("user", user_rows(l, w)),
             LineKind::Model => {
                 let live = s.turn_live && s.visible_output && Some(i) == last_model;
-                ("orbit", orbit_rows(l, w, live, inp.now_ms, inp.reduced, inp.mono))
+                (
+                    "orbit",
+                    orbit_rows(l, w, live, inp.now_ms, inp.reduced, inp.mono),
+                )
             }
             LineKind::Tool => ("card", card_rows(l, w, inp.now_ms, inp.reduced, inp.mono)),
             LineKind::System => ("note", note_rows(l, w)),

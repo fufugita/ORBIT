@@ -237,7 +237,12 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                     mix(
                         GREEN,
                         WHITE,
-                        flash(secs(tb.now_ms), s.ledger_ms.map(secs), 0.35, tb.reduced || tb.mono),
+                        flash(
+                            secs(tb.now_ms),
+                            s.ledger_ms.map(secs),
+                            0.35,
+                            tb.reduced || tb.mono,
+                        ),
                     ),
                 ),
                 Seg::new(group_thousands(n), INK2),

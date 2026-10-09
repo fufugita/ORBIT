@@ -888,7 +888,12 @@ fn worker_main(
                     &config.scope,
                     &tool_cx,
                 )
-                .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
+                .unwrap_or_else(|e| {
+                    (
+                        serde_json::json!({ "ok": false, "error": e }).to_string(),
+                        None,
+                    )
+                });
                 let outcome = classify_tool_result(&result);
                 orbit_hud_tui::emit_tool_finished(&ctx.sender, "Bash", outcome);
             }
@@ -1375,7 +1380,12 @@ impl TuiToolExecutor {
             &self.scope,
             &self.tool_cx,
         )
-        .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
+        .unwrap_or_else(|e| {
+            (
+                serde_json::json!({ "ok": false, "error": e }).to_string(),
+                None,
+            )
+        });
         // Classify the result into a ToolOutcome: a refusal must render
         // as `⊘ denied by you`, not a red `✕ failed` (§11.5 rule 4).
         let outcome = classify_tool_result(&result);
