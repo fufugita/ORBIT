@@ -27,7 +27,15 @@ pub enum ApprovalVerdict {
     Deny,
     /// Always-allow this tool for the rest of the session (session-scoped,
     /// per-tool-name, ledger-logged, revocable). Does NOT bypass `is_known_tool`.
+    /// The whole tool: kept as `R` for one release beside the narrower
+    /// grants below.
     AllowSession,
+    /// `s`: allow the calls that match the rule the card offered
+    /// (`Bash(cargo test *)`), for this session.
+    AllowRuleSession,
+    /// `a`: the same rule, and remember it in this folder's local settings
+    /// so later sessions need not ask.
+    AllowRuleAlways,
 }
 
 thread_local! {
@@ -56,6 +64,21 @@ fn hhmm_now() -> String {
     format!("{h:02}:{m:02}")
 }
 
+/// The rule the card offers to remember for a call: not the whole tool
+/// (`R`), but this kind of call. Derived from the call by the backend, so
+/// the card shows exactly what `s` and `a` would grant (design law 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantOffer {
+    /// The rule as it is written in a settings file: `Bash(cargo test *)`.
+    pub rule: String,
+    /// The tool the rule is about, and its pattern: `Bash`, `cargo test *`.
+    pub tool: String,
+    pub pattern: String,
+    /// Whether `a` can save it: the folder is trusted, so its local
+    /// settings are read back.
+    pub can_save: bool,
+}
+
 /// A pending tool call awaiting approval — the data the channel sees.
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
@@ -73,6 +96,9 @@ pub struct ApprovalRequest {
     /// The lines the call would change, for the card (an Edit's removed
     /// and added lines) — from the call's own arguments.
     pub preview: Vec<String>,
+    /// What `s` and `a` would remember, when there is something narrower
+    /// than the whole tool to offer.
+    pub grant: Option<GrantOffer>,
 }
 
 /// Approval channel — how the operator is asked to approve a tool call.
@@ -83,20 +109,35 @@ pub trait ApprovalChannel: Send {
     /// The `auto_tools` flag is true when `--auto-tools` was granted up front
     /// (in which case the channel may skip the prompt and return `AllowOnce`).
     fn ask(&mut self, req: &ApprovalRequest, auto_tools: bool) -> ApprovalVerdict;
+
+    /// The note typed with a denial ("use `make test` instead"), taken
+    /// once after `ask` returned `Deny`. It goes to the model as the
+    /// reason; it is never written to the ledger.
+    fn take_note(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// The standard stdin-based approval channel (REPL behavior, unchanged).
 pub struct StdApprovalChannel {
     interactive: bool,
+    note: Option<String>,
 }
 
 impl StdApprovalChannel {
     pub fn new(interactive: bool) -> Self {
-        Self { interactive }
+        Self {
+            interactive,
+            note: None,
+        }
     }
 }
 
 impl ApprovalChannel for StdApprovalChannel {
+    fn take_note(&mut self) -> Option<String> {
+        self.note.take()
+    }
+
     fn ask(&mut self, req: &ApprovalRequest, auto_tools: bool) -> ApprovalVerdict {
         if auto_tools {
             return ApprovalVerdict::AllowOnce;
@@ -107,8 +148,18 @@ impl ApprovalChannel for StdApprovalChannel {
         // Plain grammar (§11.4): words not glyphs, risk in words, the
         // choices spelled out. Same grammar as the TUI's copy mode.
         use std::io::Write;
+        let rules = match &req.grant {
+            Some(g) if g.can_save => {
+                format!(
+                    "s allow {} this session, a always allow {}, ",
+                    g.rule, g.rule
+                )
+            }
+            Some(g) => format!("s allow {} this session, ", g.rule),
+            None => String::new(),
+        };
         print!(
-            "approval needed: {} ({} risk). y allow once, R allow {} this session, n deny: ",
+            "approval needed: {} ({} risk). y allow once, {rules}R allow all {} this session, n deny: ",
             req.summary,
             req.risk.as_str(),
             req.tool_name
@@ -118,10 +169,24 @@ impl ApprovalChannel for StdApprovalChannel {
         if std::io::stdin().read_line(&mut line).is_err() {
             return ApprovalVerdict::Deny;
         }
-        match line.trim().to_ascii_lowercase().as_str() {
+        // `R` is capital in the card; the line reader folds case, and a
+        // lower-case `r` has always meant the same thing here.
+        let answer = line.trim().to_ascii_lowercase();
+        match answer.as_str() {
             "y" | "yes" => ApprovalVerdict::AllowOnce,
             "r" => ApprovalVerdict::AllowSession,
-            _ => ApprovalVerdict::Deny,
+            "s" if req.grant.is_some() => ApprovalVerdict::AllowRuleSession,
+            "a" if req.grant.is_some() => ApprovalVerdict::AllowRuleAlways,
+            _ => {
+                // `n use make instead`: whatever follows the n is the note.
+                self.note = line
+                    .trim()
+                    .strip_prefix(['n', 'N'])
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string);
+                ApprovalVerdict::Deny
+            }
         }
     }
 }
@@ -131,6 +196,10 @@ impl ApprovalChannel for StdApprovalChannel {
 #[derive(Debug, Clone, Default)]
 pub struct AutoGrants {
     tools: std::collections::HashSet<String>,
+    /// Allow rules granted with `s` or `a` this session: this kind of
+    /// call, not the whole tool. Read like a settings rule, so a Bash rule
+    /// never covers a chained line.
+    rules: Vec<orbit_tools::permissions::PermissionRule>,
 }
 
 /// The session's permission scope (S5): the mode and the operator's
@@ -194,6 +263,25 @@ impl AutoGrants {
         self.tools.insert(tool_name.to_string());
     }
 
+    /// Grant a rule for the rest of the session: `Bash` / `cargo test *`.
+    pub fn grant_rule(&mut self, tool: &str, pattern: &str) {
+        let rule = orbit_tools::permissions::PermissionRule {
+            tool: tool.to_string(),
+            pattern: pattern.to_string(),
+            effect: orbit_tools::permissions::RuleEffectSerde::Allow,
+        };
+        if !self.rules.contains(&rule) {
+            self.rules.push(rule);
+        }
+    }
+
+    /// Does a rule granted this session cover this call's key?
+    pub fn rule_granted(&self, tool: &str, argument: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.tool == tool && orbit_tools::permissions::rule_matches(r, argument))
+    }
+
     /// Revoke the R-grant for this tool (e.g. operator pressed `n`).
     pub fn revoke(&mut self, tool_name: &str) {
         self.tools.remove(tool_name);
@@ -203,6 +291,7 @@ impl AutoGrants {
     #[allow(dead_code)] // wired to `/revoke` and the TUI status control in PR-D
     pub fn revoke_all(&mut self) {
         self.tools.clear();
+        self.rules.clear();
     }
 
     /// List currently granted tool names (for the status bar display).
@@ -287,10 +376,15 @@ pub fn execute_call(
     // Determine the verdict:
     // 1. Unknown tool → always deny (fail-closed, even with --auto-tools / R).
     // 2. Persistent deny rule → deny, no prompt.
-    // 3. Persistent allow rule → allow once, no prompt (durable R-grant).
-    // 4. --auto-tools → allow once (up-front consent for pure built-ins).
-    // 5. Session R-grant → allow once (session-scoped, per-tool).
-    // 6. Otherwise → ask the approval channel.
+    // 3. A deny rule or plan mode in the pattern layer → deny. No consent
+    //    and no grant outranks it: this check comes BEFORE them, so the
+    //    ledger records a refusal as a refusal (the tool layer would have
+    //    refused it anyway).
+    // 4. Persistent allow rule → allow once, no prompt (durable R-grant).
+    // 5. --auto-tools → allow once (up-front consent for pure built-ins).
+    // 6. Session grant (the whole tool with R, or a rule with s / a)
+    //    → allow once.
+    // 7. Otherwise → ask the approval channel.
     // Unknown tools always deny (fail-closed, even with --auto-tools / R).
     // Persistent rules (permissions.toml) sit between unknown-tool denial
     // and everything else — deny rules are a durable fail-closed, allow
@@ -301,20 +395,30 @@ pub fn execute_call(
         crate::permissions::PermissionRules::default()
     });
     let rule_verdict = rules.verdict(&call.name);
+    // The call's permission key, for rules granted this session.
+    let call_key = orbit_tools::registry()
+        .into_iter()
+        .find(|t| t.name() == call.name)
+        .map(|t| t.permission_key(&args_preview));
+    let rule_granted = call_key
+        .as_ref()
+        .is_some_and(|k| grants.rule_granted(&k.tool, &k.pattern));
+    let mut offer: Option<GrantOffer> = None;
     let verdict = if !known || rule_verdict == crate::permissions::RuleVerdict::Deny {
+        ApprovalVerdict::Deny
+    } else if matches!(pattern_verdict, PatternOutcome::Deny(_)) {
+        // A pattern deny rule (or plan mode refusing a write) is final.
         ApprovalVerdict::Deny
     } else if rule_verdict == crate::permissions::RuleVerdict::Allow
         || auto_tools
         || grants.is_granted(&call.name)
+        || rule_granted
         // B4: the mode/pattern layer allows it outright (read-only in
         // default mode, edits in acceptEdits, an allow rule from
         // --allowedTools or settings.toml).
         || pattern_verdict == PatternOutcome::Allow
     {
         ApprovalVerdict::AllowOnce
-    } else if matches!(pattern_verdict, PatternOutcome::Deny(_)) {
-        // A pattern deny rule (or plan mode refusing a write) is final.
-        ApprovalVerdict::Deny
     } else {
         // E9: PermissionRequest fires when the operator is asked to
         // decide (hooks can observe, not replace, the ask).
@@ -326,6 +430,7 @@ pub fn execute_call(
                 "summary": safe_call_summary(call),
             }),
         );
+        offer = grant_offer(home, scope, &tool_cx.working_dir, &call.name, &args_preview);
         approval.ask(
             &ApprovalRequest {
                 call_id: call.id.clone(),
@@ -333,16 +438,31 @@ pub fn execute_call(
                 summary: safe_call_summary(call),
                 risk: crate::tools::call_risk(&call.name, &args_preview),
                 preview: crate::tools::approval_preview(&call.name, &args_preview),
+                grant: offer.clone(),
             },
             auto_tools,
         )
     };
 
-    // Apply R-grant side effects.
+    // Apply the grant's side effects. `s` and `a` remember the rule the
+    // card offered (nothing, if none was: the key did not mean anything);
+    // `a` also writes it to the folder's local settings, and if that
+    // cannot be done the rule is still good for this session and the
+    // record says so.
+    let mut saved: Option<bool> = None;
     let allowed = match verdict {
         ApprovalVerdict::AllowOnce => true,
         ApprovalVerdict::AllowSession => {
             grants.grant(&call.name);
+            true
+        }
+        ApprovalVerdict::AllowRuleSession | ApprovalVerdict::AllowRuleAlways => {
+            if let Some(o) = &offer {
+                grants.grant_rule(&o.tool, &o.pattern);
+                if verdict == ApprovalVerdict::AllowRuleAlways {
+                    saved = Some(o.can_save && save_rule(&tool_cx.working_dir, &o.rule).is_ok());
+                }
+            }
             true
         }
         ApprovalVerdict::Deny => {
@@ -351,28 +471,45 @@ pub fn execute_call(
             false
         }
     };
+    // The note typed with a denial: the model's reason, not the ledger's.
+    let note = if allowed {
+        None
+    } else {
+        approval.take_note().filter(|n| !n.trim().is_empty())
+    };
 
     let reason = if !known {
         "unknown tool (deny-by-default)"
     } else if rule_verdict == crate::permissions::RuleVerdict::Deny {
         "denied by persistent rule (permissions.toml)"
+    } else if let PatternOutcome::Deny(r) = &pattern_verdict {
+        // B4: the mode/pattern layer denied (a deny rule, or plan mode
+        // refusing a write) — its reason is the honest one.
+        r
     } else if rule_verdict == crate::permissions::RuleVerdict::Allow {
         "allowed by persistent rule (permissions.toml)"
     } else if auto_tools {
         "allowed by --auto-tools up-front consent"
     } else if grants.is_granted(&call.name) && !matches!(verdict, ApprovalVerdict::Deny) {
         "allowed by session R-grant"
-    } else if let PatternOutcome::Deny(r) = &pattern_verdict {
-        // B4: the mode/pattern layer denied (a deny rule, or plan mode
-        // refusing a write) — its reason is the honest one.
-        r
+    } else if rule_granted {
+        "allowed by a rule granted this session"
     } else if !interactive && !auto_tools {
         // B4: headless is not an error — the call needs one of the
         // headless allow paths (--auto-tools, a rule, --allowedTools)
         // and the denial says so.
         "non-interactive tool call requires --auto-tools or an allow rule (--allowedTools / settings.toml)"
+    } else if verdict == ApprovalVerdict::AllowRuleSession {
+        "operator approved: rule granted for this session"
+    } else if verdict == ApprovalVerdict::AllowRuleAlways {
+        match saved {
+            Some(true) => "operator approved: rule saved to local settings",
+            _ => "operator approved: rule granted for this session (could not be saved)",
+        }
     } else if allowed {
         "operator approved"
+    } else if note.is_some() {
+        "operator denied (with a note)"
     } else {
         "operator denied"
     };
@@ -419,7 +556,10 @@ pub fn execute_call(
     drop(writer);
 
     if !allowed {
-        let output = tool_denial(reason);
+        let output = match &note {
+            Some(n) => tool_denial(&format!("denied by the operator: {n}")),
+            None => tool_denial(reason),
+        };
         // D9: a denial is not an error — audits must be able to tell an
         // operator refusal apart from a tool that ran and failed.
         record_result(
@@ -637,6 +777,65 @@ pub fn execute_call(
     // checkpointed writes (Write/Edit through execute_wave1) carry a
     // FileChange.
     Ok((output, None))
+}
+
+/// The rule `s` and `a` would remember for this call, or None when there
+/// is nothing narrower than the whole tool to offer.
+///
+/// Offered only where the card asks at all (default and acceptEdits: in
+/// the other modes nothing is asked, so nothing is remembered). For a
+/// Bash command the rule comes from [`orbit_tools::shellcmd::grant_pattern`]
+/// (a wildcard only for the verb of a known multiplexer, the exact line
+/// otherwise); for a tool keyed by a path or a host it is exactly that
+/// key. A tool with no key, or a key containing a `*` (which the rule
+/// language would read as a wildcard), offers nothing.
+fn grant_offer(
+    home: &Path,
+    scope: &PermissionScope,
+    project: &Path,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<GrantOffer> {
+    use orbit_tools::permissions::{rule_matches, PermissionMode, PermissionRule, RuleEffectSerde};
+    if !matches!(
+        scope.mode,
+        PermissionMode::Default | PermissionMode::AcceptEdits
+    ) {
+        return None;
+    }
+    let tool = orbit_tools::registry()
+        .into_iter()
+        .find(|t| t.name() == tool_name)?;
+    let key = tool.permission_key(args);
+    let pattern = if key.tool == "Bash" {
+        orbit_tools::shellcmd::grant_pattern(&key.pattern)?.0
+    } else if key.pattern.is_empty() || key.pattern.contains('*') {
+        return None;
+    } else {
+        key.pattern.clone()
+    };
+    // The offer must cover the call it is offered for, or it is a lie.
+    let rule = PermissionRule {
+        tool: key.tool.clone(),
+        pattern: pattern.clone(),
+        effect: RuleEffectSerde::Allow,
+    };
+    if !rule_matches(&rule, &key.pattern) {
+        return None;
+    }
+    Some(GrantOffer {
+        rule: format!("{}({})", key.tool, pattern),
+        tool: key.tool,
+        pattern,
+        can_save: orbit_tools::permissions::FolderTrust::new(home.to_path_buf())
+            .is_trusted(project),
+    })
+}
+
+/// Write an `a` grant to the project's local settings. The project is the
+/// session's working directory (the one `load_rules` reads from).
+fn save_rule(project: &Path, rule: &str) -> Result<(), String> {
+    orbit_tools::executor::add_local_allow_rule(project, rule).map(|_| ())
 }
 
 /// Layer-2 outcome for the pre-check (B4): what would the mode/pattern
@@ -1998,5 +2197,419 @@ mod bash_rule_tests {
         );
         assert!(matches!(v, PatternOutcome::Deny(_)));
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod deny_beats_grant_tests {
+    use super::*;
+
+    fn home(tag: &str) -> std::path::PathBuf {
+        let h = std::env::temp_dir().join(format!("orbit-denygrant-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        std::fs::create_dir_all(h.join("work")).unwrap();
+        h
+    }
+
+    fn run(
+        home: &std::path::Path,
+        call: &crate::PendingToolCall,
+        auto_tools: bool,
+        grants: &mut AutoGrants,
+        scope: &PermissionScope,
+    ) -> String {
+        let mut ch = StdApprovalChannel::new(false);
+        let cx = orbit_tools::ToolContext::new(home.to_path_buf(), "s1".into(), home.join("work"));
+        execute_call(
+            home, "s1", "d1", call, auto_tools, false, &mut ch, grants, scope, &cx,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn call(name: &str, args: &[u8]) -> crate::PendingToolCall {
+        crate::PendingToolCall {
+            index: 0,
+            id: "c1".into(),
+            name: name.into(),
+            arguments: args.to_vec(),
+        }
+    }
+
+    /// A deny rule is final: no up-front consent and no session grant
+    /// outranks it (roadmap: deny, then ask, then allow; a grant can never
+    /// override a deny).
+    #[test]
+    fn a_deny_rule_beats_auto_tools_and_a_session_grant() {
+        let scope = PermissionScope::from_flags(None, None, Some("Write"));
+        // --auto-tools
+        let h = home("auto");
+        let out = run(
+            &h,
+            &call("Write", br#"{"file_path":"out.txt","content":"x"}"#),
+            true,
+            &mut AutoGrants::new(),
+            &scope,
+        );
+        assert!(
+            !h.join("work/out.txt").exists(),
+            "--auto-tools wrote past a deny rule: {out}"
+        );
+        // An R grant made earlier in the session.
+        let h = home("grant");
+        let mut grants = AutoGrants::new();
+        grants.grant("Write");
+        let out = run(
+            &h,
+            &call("Write", br#"{"file_path":"out.txt","content":"x"}"#),
+            false,
+            &mut grants,
+            &scope,
+        );
+        assert!(
+            !h.join("work/out.txt").exists(),
+            "a session grant wrote past a deny rule: {out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+    use orbit_tools::permissions::{FolderTrust, PermissionMode};
+
+    fn dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("orbit-grants-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let project = base.join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        (home, project)
+    }
+
+    fn call(name: &str, args: &[u8]) -> crate::PendingToolCall {
+        crate::PendingToolCall {
+            index: 0,
+            id: "c1".into(),
+            name: name.into(),
+            arguments: args.to_vec(),
+        }
+    }
+
+    /// Answers from a script and keeps what it was asked.
+    struct Scripted {
+        answers: Vec<ApprovalVerdict>,
+        asked: Vec<ApprovalRequest>,
+        note: Option<String>,
+    }
+    impl Scripted {
+        fn new(answers: &[ApprovalVerdict]) -> Self {
+            Self {
+                answers: answers.iter().rev().copied().collect(),
+                asked: Vec::new(),
+                note: None,
+            }
+        }
+    }
+    impl ApprovalChannel for Scripted {
+        fn ask(&mut self, req: &ApprovalRequest, _auto: bool) -> ApprovalVerdict {
+            self.asked.push(req.clone());
+            self.answers.pop().unwrap_or(ApprovalVerdict::Deny)
+        }
+        fn take_note(&mut self) -> Option<String> {
+            self.note.take()
+        }
+    }
+
+    fn run(
+        home: &std::path::Path,
+        project: &std::path::Path,
+        c: &crate::PendingToolCall,
+        ch: &mut Scripted,
+        grants: &mut AutoGrants,
+        scope: &PermissionScope,
+    ) -> String {
+        let cx =
+            orbit_tools::ToolContext::new(home.to_path_buf(), "s1".into(), project.to_path_buf());
+        execute_call(home, "s1", "d1", c, false, true, ch, grants, scope, &cx)
+            .unwrap()
+            .0
+    }
+
+    fn ledger_text(home: &std::path::Path) -> String {
+        let mut text = String::new();
+        for e in std::fs::read_dir(home.join("ledger/segments"))
+            .unwrap()
+            .flatten()
+        {
+            text.push_str(&String::from_utf8_lossy(
+                &std::fs::read(e.path()).unwrap_or_default(),
+            ));
+        }
+        text
+    }
+
+    #[test]
+    fn what_the_card_offers_is_narrow_and_only_where_it_asks() {
+        let (home, project) = dirs("offer");
+        let scope = PermissionScope::default();
+        let offer = |tool: &str, args: serde_json::Value| {
+            grant_offer(&home, &scope, &project, tool, &args).map(|o| o.rule)
+        };
+        let bash = |c: &str| offer("Bash", serde_json::json!({ "command": c }));
+        assert_eq!(
+            bash("cargo test --release"),
+            Some("Bash(cargo test *)".into())
+        );
+        assert_eq!(bash("git status"), Some("Bash(git status *)".into()));
+        // Anything that runs what it is given, or reaches out: the line.
+        assert_eq!(
+            bash("python3 test_calc.py"),
+            Some("Bash(python3 test_calc.py)".into())
+        );
+        assert_eq!(
+            bash("git push origin main"),
+            Some("Bash(git push origin main)".into())
+        );
+        assert_eq!(
+            bash("cargo test && rm x"),
+            Some("Bash(cargo test && rm x)".into())
+        );
+        // A literal star has no spelling in a rule: nothing to offer.
+        assert_eq!(bash("rm *.o"), None);
+        // Tools keyed by a path or a host.
+        assert_eq!(
+            offer(
+                "Write",
+                serde_json::json!({ "file_path": "out.txt", "content": "x" })
+            ),
+            Some("Write(out.txt)".into())
+        );
+        assert_eq!(
+            offer(
+                "Edit",
+                serde_json::json!({ "file_path": "src/a.rs", "old_string": "a", "new_string": "b" })
+            ),
+            Some("Edit(src/a.rs)".into())
+        );
+        assert_eq!(
+            offer(
+                "Write",
+                serde_json::json!({ "file_path": "*.txt", "content": "x" })
+            ),
+            None
+        );
+        assert_eq!(
+            offer("calculator", serde_json::json!({ "expression": "1+1" })),
+            None
+        );
+        // Where nothing is asked, nothing is offered.
+        for mode in [
+            PermissionMode::Plan,
+            PermissionMode::DontAsk,
+            PermissionMode::Bypass,
+        ] {
+            let scope = PermissionScope {
+                mode,
+                ..Default::default()
+            };
+            assert!(
+                grant_offer(
+                    &home,
+                    &scope,
+                    &project,
+                    "Bash",
+                    &serde_json::json!({ "command": "ls x" })
+                )
+                .is_none(),
+                "{mode:?}"
+            );
+        }
+        let scope = PermissionScope {
+            mode: PermissionMode::AcceptEdits,
+            ..Default::default()
+        };
+        assert!(grant_offer(
+            &home,
+            &scope,
+            &project,
+            "Bash",
+            &serde_json::json!({ "command": "ls x" })
+        )
+        .is_some());
+    }
+
+    /// `a` is offered as savable only in a folder that is trusted, since
+    /// only there is the file read back.
+    #[test]
+    fn saving_is_offered_only_in_a_trusted_folder() {
+        let (home, project) = dirs("trustoffer");
+        let args = serde_json::json!({ "command": "cargo test" });
+        let scope = PermissionScope::default();
+        let o = grant_offer(&home, &scope, &project, "Bash", &args).unwrap();
+        assert!(!o.can_save);
+        FolderTrust::new(home.clone()).trust(&project).unwrap();
+        let o = grant_offer(&home, &scope, &project, "Bash", &args).unwrap();
+        assert!(o.can_save);
+        assert_eq!(
+            (o.tool.as_str(), o.pattern.as_str()),
+            ("Bash", "cargo test *")
+        );
+    }
+
+    #[test]
+    fn s_remembers_the_rule_for_this_session_and_only_the_rule() {
+        let (home, project) = dirs("session");
+        let scope = PermissionScope::default();
+        let mut grants = AutoGrants::new();
+        let mut ch = Scripted::new(&[ApprovalVerdict::AllowRuleSession]);
+        let w = |p: &str| {
+            call(
+                "Write",
+                format!(r#"{{"file_path":"{p}","content":"x"}}"#).as_bytes(),
+            )
+        };
+        // First call: asked, answered `s`.
+        run(&home, &project, &w("out.txt"), &mut ch, &mut grants, &scope);
+        assert_eq!(ch.asked.len(), 1);
+        assert_eq!(
+            ch.asked[0].grant.as_ref().map(|g| g.rule.as_str()),
+            Some("Write(out.txt)")
+        );
+        assert!(project.join("out.txt").exists());
+        // The same call again: no question.
+        std::fs::remove_file(project.join("out.txt")).unwrap();
+        run(&home, &project, &w("out.txt"), &mut ch, &mut grants, &scope);
+        assert_eq!(ch.asked.len(), 1, "a granted rule asked again");
+        assert!(project.join("out.txt").exists());
+        // Another file: a new question (the channel's script is out, so it
+        // denies).
+        run(
+            &home,
+            &project,
+            &w("other.txt"),
+            &mut ch,
+            &mut grants,
+            &scope,
+        );
+        assert_eq!(ch.asked.len(), 2);
+        assert!(!project.join("other.txt").exists());
+        // The ledger holds neither the path nor the rule text.
+        let ledger = ledger_text(&home);
+        assert!(
+            !ledger.contains("out.txt") && !ledger.contains("Write(out.txt)"),
+            "{ledger}"
+        );
+        assert!(ledger.contains("rule granted for this session"), "{ledger}");
+        assert!(
+            ledger.contains("allowed by a rule granted this session"),
+            "{ledger}"
+        );
+    }
+
+    /// A rule granted for `cargo test *` is for that command, not for a
+    /// line that merely starts with it.
+    #[test]
+    fn a_session_rule_does_not_carry_a_chained_line() {
+        let mut grants = AutoGrants::new();
+        grants.grant_rule("Bash", "cargo test *");
+        assert!(grants.rule_granted("Bash", "cargo test --release"));
+        assert!(!grants.rule_granted("Bash", "cargo test; rm -rf ~"));
+        assert!(!grants.rule_granted("Bash", "cargo build"));
+        assert!(!grants.rule_granted("Write", "cargo test --release"));
+        grants.revoke_all();
+        assert!(!grants.rule_granted("Bash", "cargo test --release"));
+    }
+
+    /// A deny rule outranks a rule granted a moment ago.
+    #[test]
+    fn a_deny_rule_beats_a_rule_grant() {
+        let (home, project) = dirs("denygrant");
+        let scope = PermissionScope::from_flags(None, None, Some("Write(out.txt)"));
+        let mut grants = AutoGrants::new();
+        grants.grant_rule("Write", "out.txt");
+        let mut ch = Scripted::new(&[]);
+        let out = run(
+            &home,
+            &project,
+            &call("Write", br#"{"file_path":"out.txt","content":"x"}"#),
+            &mut ch,
+            &mut grants,
+            &scope,
+        );
+        assert!(!project.join("out.txt").exists(), "{out}");
+        assert!(ch.asked.is_empty(), "a denied call is not asked about");
+        assert!(ledger_text(&home).contains("\"allowed\":false"));
+    }
+
+    #[test]
+    fn a_saves_the_rule_in_a_trusted_folder_and_says_so_when_it_cannot() {
+        // Trusted: the file is written.
+        let (home, project) = dirs("save");
+        FolderTrust::new(home.clone()).trust(&project).unwrap();
+        let scope = PermissionScope::default();
+        let mut ch = Scripted::new(&[ApprovalVerdict::AllowRuleAlways]);
+        run(
+            &home,
+            &project,
+            &call("Write", br#"{"file_path":"out.txt","content":"x"}"#),
+            &mut ch,
+            &mut AutoGrants::new(),
+            &scope,
+        );
+        let saved = std::fs::read_to_string(project.join(".orbit/settings.local.toml")).unwrap();
+        assert!(saved.contains("Write(out.txt)"), "{saved}");
+        assert!(ledger_text(&home).contains("rule saved to local settings"));
+
+        // Not trusted: the rule holds for the session, nothing is written,
+        // and the record does not claim otherwise.
+        let (home, project) = dirs("nosave");
+        let mut ch = Scripted::new(&[ApprovalVerdict::AllowRuleAlways]);
+        let mut grants = AutoGrants::new();
+        run(
+            &home,
+            &project,
+            &call("Write", br#"{"file_path":"out.txt","content":"x"}"#),
+            &mut ch,
+            &mut grants,
+            &scope,
+        );
+        assert!(!project.join(".orbit").exists());
+        assert!(grants.rule_granted("Write", "out.txt"));
+        assert!(ledger_text(&home).contains("could not be saved"));
+    }
+
+    /// The note typed with `n` is the model's reason. It is not the
+    /// ledger's: what an operator types stays out of it.
+    #[test]
+    fn a_denial_note_reaches_the_model_and_not_the_ledger() {
+        let (home, project) = dirs("note");
+        let mut ch = Scripted::new(&[ApprovalVerdict::Deny]);
+        ch.note = Some("use make test instead".into());
+        let out = run(
+            &home,
+            &project,
+            &call("Write", br#"{"file_path":"out.txt","content":"x"}"#),
+            &mut ch,
+            &mut AutoGrants::new(),
+            &PermissionScope::default(),
+        );
+        assert!(out.contains("use make test instead"), "{out}");
+        assert!(!project.join("out.txt").exists());
+        let ledger = ledger_text(&home);
+        assert!(!ledger.contains("make test"), "{ledger}");
+        assert!(ledger.contains("operator denied (with a note)"), "{ledger}");
+        // No note: the plain reason.
+        let mut ch = Scripted::new(&[ApprovalVerdict::Deny]);
+        let out = run(
+            &home,
+            &project,
+            &call("Write", br#"{"file_path":"out.txt","content":"x"}"#),
+            &mut ch,
+            &mut AutoGrants::new(),
+            &PermissionScope::default(),
+        );
+        assert!(out.contains("operator denied"), "{out}");
     }
 }

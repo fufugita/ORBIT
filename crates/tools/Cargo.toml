@@ -20,6 +20,8 @@ tokio.workspace = true
 regex.workspace = true
 ignore.workspace = true
 toml = { workspace = true }
+# Edits a person's settings file in place, keeping their comments.
+toml_edit = { workspace = true }
 # Signals go through kill(2) itself (safe API, no `unsafe`): never through
 # /usr/bin/kill, whose operand parsing is not safe for process groups.
 rustix = { workspace = true, features = ["process"] }
