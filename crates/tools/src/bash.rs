@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use rustix::process::{Pid, Signal};
+
 /// Default timeout before a command moves to the background.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Hard maximum for a foreground command.
@@ -530,9 +532,10 @@ impl Tool for TaskStopTool {
 /// verified by walking its /proc PPID chain upward. The children-list
 /// walk in kill_tree can only ever *enumerate* descendants, but between
 /// enumeration and the kill a pid may exit and be REUSED by an
-/// unrelated process (observed 2026-10-07: a recycled pid TERMed the
-/// whole user session via `kill -TERM -{pid}`). Re-validating ancestry
-/// immediately before each signal closes that window.
+/// unrelated process. Re-validating ancestry immediately before each
+/// signal closes that window. (Defence in depth: the 2026-10 session
+/// kills were not pid reuse but `/usr/bin/kill` mangling a negative
+/// operand — see [`send_pid_signal`].)
 fn is_descendant_of(pid: i32, root: i32) -> bool {
     let mut cur = pid;
     for _ in 0..64 {
@@ -593,8 +596,7 @@ fn is_ancestor_of(anc: i32, pid: i32) -> bool {
 /// Needed because the sandbox re-execs bwrap in a new session, putting
 /// the payload outside the spawned child's process group.
 ///
-/// Guards (2026-10-07, after a recycled-pid kill TERMed the user's whole
-/// session): never signal pid <= 1, ourselves, our own ancestors (the
+/// Guards: never signal pid <= 1, ourselves, our own ancestors (the
 /// session supervisor survives every kill path), or any pid whose live
 /// /proc ancestry can not be confirmed as descending from the original
 /// child.
@@ -638,10 +640,12 @@ fn kill_tree(pid: i32) {
             continue;
         }
         audit_kill("KILL-pid", p, "sent (validated descendant)");
-        let _ = std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(p.to_string())
-            .status();
+        if let Err(e) = send_pid_signal(p, Signal::KILL) {
+            // ESRCH is the normal "already gone"; anything else is news.
+            if e.raw_os_error() != Some(rustix::io::Errno::SRCH.raw_os_error()) {
+                audit_kill("KILL-pid", p, &format!("failed: {e}"));
+            }
+        }
     }
 }
 
@@ -706,12 +710,10 @@ fn audit_kill(action: &str, pid: i32, verdict: &str) {
 }
 
 fn kill_process_group(pid: i32) -> bool {
-    use std::process::Command;
-    // kill -TERM -<pgid>: the child was spawned with process_group(0),
-    // so its PID IS its pgid. Guard (2026-10-07): refuse pid <= 1 and
-    // require the LIVE pgid from /proc/{pid}/stat to match — a pid that
-    // exited and was reused would otherwise TERM an unrelated process
-    // group (observed taking down the entire user session).
+    // The child was spawned with process_group(0), so its PID IS its
+    // pgid. Refuse pid <= 1 and require the LIVE pgid from
+    // /proc/{pid}/stat to match: a pid that exited and was reused must
+    // not carry a group signal to an unrelated group.
     match group_kill_verdict(pid, std::process::id() as i32) {
         Ok(()) => audit_kill("TERM-group", pid, "sent"),
         Err(why) => {
@@ -719,12 +721,51 @@ fn kill_process_group(pid: i32) -> bool {
             return false;
         }
     }
-    Command::new("kill")
-        .arg("-TERM")
-        .arg(format!("-{pid}"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    match send_group_signal(pid, Signal::TERM) {
+        Ok(()) => true,
+        Err(e) => {
+            audit_kill("TERM-group", pid, &format!("failed: {e}"));
+            false
+        }
+    }
+}
+
+/// Signal one process with kill(2) itself.
+///
+/// Signals never go through `/usr/bin/kill`. procps-ng 4.0.4 (Ubuntu
+/// 24.04, Mint 22) reads one digit of a negative operand, so
+/// `kill -TERM -1670` is `kill(-1, SIGTERM)` — every process the user
+/// owns, the desktop session's manager included — and `-53` is `-5`,
+/// some other group. That, not pid reuse, is what took whole sessions
+/// down on 2026-10-07 and 2026-10-08. A syscall has no operand parser.
+fn send_pid_signal(pid: i32, sig: Signal) -> std::io::Result<()> {
+    let pid = signal_target(pid)?;
+    rustix::process::kill_process(pid, sig).map_err(std::io::Error::from)
+}
+
+/// Signal every member of process group `pgid` with kill(2) itself (see
+/// [`send_pid_signal`] for why not `/usr/bin/kill`).
+fn send_group_signal(pgid: i32, sig: Signal) -> std::io::Result<()> {
+    let pgid = signal_target(pgid)?;
+    rustix::process::kill_process_group(pgid, sig).map_err(std::io::Error::from)
+}
+
+/// A pid/pgid that may be signalled at all. pid 0 names our own group;
+/// as a group, pid 1 is `kill(-1, …)` — every process the caller may
+/// signal; pid 1 itself is init. No tool child is any of them.
+fn signal_target(raw: i32) -> std::io::Result<Pid> {
+    if raw <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to signal pid/pgid {raw}"),
+        ));
+    }
+    Pid::from_raw(raw).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid pid/pgid {raw}"),
+        )
+    })
 }
 
 /// The live process-group id of `pid` from /proc, or None if gone.
@@ -812,5 +853,102 @@ mod group_kill_tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!group_kill_allowed(pid, me()), "gone → refused");
+    }
+
+    #[test]
+    fn signal_target_refuses_what_is_never_a_tool_child() {
+        // pid 0 is our own group; as a group, pid 1 is kill(-1, …) —
+        // everything the caller may signal. Refused before any syscall.
+        for raw in [i32::MIN, -1500, -5, -1, 0, 1] {
+            assert!(signal_target(raw).is_err(), "{raw} must be refused");
+            assert!(send_group_signal(raw, Signal::TERM).is_err());
+            assert!(send_pid_signal(raw, Signal::KILL).is_err());
+        }
+        assert!(signal_target(2).is_ok());
+    }
+
+    /// No source file in this crate may shell out to a `kill` binary
+    /// (see `send_pid_signal`). Reintroducing it is how an Esc — or a
+    /// test run — takes the desktop session down, so a test says so.
+    #[test]
+    fn nothing_in_this_crate_shells_out_to_kill() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        // Built from parts so this file does not match itself.
+        let needles = [
+            format!("Command::new(\"{}\")", "kill"),
+            format!("Command::new(\"{}\")", "pkill"),
+            format!("Command::new(\"{}\")", "killall"),
+        ];
+        let mut files = Vec::new();
+        rs_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(!files.is_empty());
+        let mut hits = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            for n in &needles {
+                if text.contains(n.as_str()) {
+                    hits.push(format!("{}: {n}", f.display()));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "signal with kill(2), not a binary: {hits:?}"
+        );
+    }
+
+    /// The regression behind the October session kills. Signalling a
+    /// group by running `kill -TERM -<pgid>` is wrong on procps-ng
+    /// 4.0.4 (Ubuntu 24.04, Mint 22): it reads one digit of a negative
+    /// operand, so `-1670` becomes `-1` — every process the user owns —
+    /// and `-53` becomes `-5`, some other group. The group we mean must
+    /// die, and a process outside it must not notice.
+    #[test]
+    fn a_group_kill_reaches_exactly_that_group() {
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = victim.id() as i32;
+
+        let sent = kill_process_group(pgid);
+
+        let mut died = false;
+        for _ in 0..60 {
+            if matches!(victim.try_wait(), Ok(Some(_))) {
+                died = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let bystander_alive = matches!(bystander.try_wait(), Ok(None));
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        let _ = victim.kill();
+        let _ = victim.wait();
+
+        assert!(sent, "the TERM must be delivered to group {pgid}");
+        assert!(died, "group {pgid} must be dead after the TERM");
+        assert!(
+            bystander_alive,
+            "a process outside group {pgid} must survive it"
+        );
     }
 }

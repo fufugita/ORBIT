@@ -2901,6 +2901,7 @@ dependencies = [
  "orbit-frontend-protocol",
  "regex",
  "reqwest",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "serde",
