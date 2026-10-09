@@ -60,11 +60,20 @@ pub trait Tool: Send + Sync {
     fn run(&self, input: &serde_json::Value, cx: &ToolContext) -> ToolResult;
 }
 
+/// Live tool output: called once per complete output line, in arrival
+/// order, from a reader thread — never the caller's. Keep it cheap and
+/// never block in it.
+pub type OutputSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// What a tool execution needs: paths, session identity, spill dir.
 /// Cloned per tool call; the read-before-edit state is shared (an
 /// interior-mutex) so every tool call in a session sees the same map.
 #[derive(Clone)]
 pub struct ToolContext {
+    /// Where a running command's output lines go as they arrive (the
+    /// front-end's live terminal). Shared by every clone of the
+    /// context; the executor points it at the current call.
+    output_sink: std::sync::Arc<std::sync::Mutex<Option<OutputSink>>>,
     /// The current turn's checkpoint id (E7): minted once per user
     /// prompt, shared by every Write/Edit in that turn — /rewind
     /// restores a turn, not a single call. Reset by the front-end at
@@ -92,7 +101,21 @@ impl ToolContext {
                 std::collections::HashMap::new(),
             )),
             turn_checkpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            output_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Route a running command's output lines to `sink` (the live
+    /// terminal), or stop routing with `None`.
+    pub fn set_output_sink(&self, sink: Option<OutputSink>) {
+        if let Ok(mut g) = self.output_sink.lock() {
+            *g = sink;
+        }
+    }
+
+    /// The current live-output sink, if a front-end installed one.
+    pub fn output_sink(&self) -> Option<OutputSink> {
+        self.output_sink.lock().ok().and_then(|g| g.clone())
     }
 
     /// The turn's checkpoint id (E7): minted on first write of the

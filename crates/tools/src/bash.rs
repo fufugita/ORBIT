@@ -251,16 +251,24 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
         }
     };
 
+    // Drain both pipes from the moment the command starts. The pipe
+    // buffer is 64 KiB: a command that writes more blocks in write(2)
+    // until somebody reads, so reading only after exit stalled every
+    // verbose build or test run until the timeout. The readers also
+    // keep the output file current (Read can open it while the command
+    // runs) and feed the front-end's live terminal.
+    let capture = Capture::start(&mut child, &output_path, cx.output_sink());
+
     // Wait with a timeout, polling.
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = child.stdout.take();
-                let stderr = child.stderr.take();
-                let (out, err) = read_pipes(stdout, stderr);
-                let combined = format!("{out}{err}");
-                let _ = std::fs::write(&output_path, &combined);
+                // The readers hit EOF as the command's last writer
+                // closes; a detached grandchild can hold a pipe open, so
+                // wait briefly rather than for ever.
+                capture.settle(Duration::from_millis(500));
+                let combined = capture.text(&output_path);
                 let scanned = crate::scan::scan_result(&combined);
                 let text = if scanned.redactions.is_empty() {
                     combined
@@ -308,8 +316,11 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
                     // — only the tree walk reaches them.
                     kill_process_group(pid);
                     kill_tree(pid);
-                    drop(child.stdout.take());
-                    drop(child.stderr.take());
+                    // Reap the child off-thread; the readers end by
+                    // themselves once every writer is dead.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
                     return ToolResult::err("cancelled by user");
                 }
                 if std::time::Instant::now() >= deadline {
@@ -326,24 +337,16 @@ pub fn run_command(command: &str, timeout_secs: u64, cx: &ToolContext) -> ToolRe
                             started: std::time::Instant::now(),
                         });
                     }
-                    // Spawn a reaper that writes the output when done.
-                    let path = output_path.clone();
+                    // The readers keep appending to the output file by
+                    // themselves; this thread only reaps the child.
                     std::thread::spawn(move || {
-                        let out = child.wait_with_output();
-                        if let Ok(o) = out {
-                            let combined = format!(
-                                "{}{}",
-                                String::from_utf8_lossy(&o.stdout),
-                                String::from_utf8_lossy(&o.stderr)
-                            );
-                            let _ = std::fs::write(&path, combined);
-                        }
+                        let _ = child.wait();
                     });
                     return ToolResult::ok(json!({
                         "ok": true,
                         "backgrounded": true,
                         "task_id": id,
-                        "note": format!("command still running after {timeout_secs}s; output will land in {}", output_path.display()),
+                        "note": format!("command still running after {timeout_secs}s; output is being written to {}", output_path.display()),
                     }));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -387,7 +390,7 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
             .process_group(0);
         cmd.spawn()
     };
-    let child = if sandboxed {
+    let mut child = if sandboxed {
         let mut wrapped = sandbox.wrap(command, &cx.working_dir);
         match spawn(&mut wrapped) {
             Ok(c) => c,
@@ -418,16 +421,11 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
             started: std::time::Instant::now(),
         });
     }
-    let path = output_path.clone();
+    // The readers write the output file as the command runs, so Read can
+    // open it at once; this thread only reaps the child.
+    let _capture = Capture::start(&mut child, &output_path, None);
     std::thread::spawn(move || {
-        if let Ok(o) = child.wait_with_output() {
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            let _ = std::fs::write(&path, combined);
-        }
+        let _ = child.wait();
     });
     ToolResult::ok(json!({
         "ok": true,
@@ -438,32 +436,147 @@ pub fn run_command_backgrounded(command: &str, cx: &ToolContext) -> ToolResult {
     }))
 }
 
-fn read_pipes(
-    stdout: Option<std::process::ChildStdout>,
-    stderr: Option<std::process::ChildStderr>,
-) -> (String, String) {
-    use std::io::Read;
-    fn read_pipe(mut p: Option<std::process::ChildStdout>) -> String {
-        match p.as_mut() {
-            Some(s) => {
-                let mut buf = String::new();
-                let _ = s.read_to_string(&mut buf);
-                buf
-            }
-            None => String::new(),
+/// Output kept in memory per command. More goes only to the output
+/// file (and the file is capped too): the model gets a preview and the
+/// path, never an unbounded string.
+const MEM_CAP: usize = 8 * 1024 * 1024;
+const FILE_CAP: u64 = 64 * 1024 * 1024;
+/// A line longer than this reaches the live sink in pieces.
+const LINE_CAP: usize = 4096;
+
+/// What a running command wrote to stdout and stderr, in arrival order,
+/// drained on reader threads from the moment it starts.
+struct Capture {
+    buf: std::sync::Arc<Mutex<Vec<u8>>>,
+    truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Capture {
+    /// Take the child's pipes and start draining them. Bytes land in a
+    /// bounded buffer, in the output file as they arrive, and — as
+    /// complete lines — in `sink`.
+    fn start(
+        child: &mut std::process::Child,
+        file_path: &std::path::Path,
+        sink: Option<crate::OutputSink>,
+    ) -> Capture {
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let truncated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file_path)
+            .ok()
+            .map(|f| std::sync::Arc::new(Mutex::new((f, 0u64))));
+        let mut readers = Vec::new();
+        if let Some(p) = child.stdout.take() {
+            readers.push(pump(p, &buf, &truncated, &file, &sink));
+        }
+        if let Some(p) = child.stderr.take() {
+            readers.push(pump(p, &buf, &truncated, &file, &sink));
+        }
+        Capture {
+            buf,
+            truncated,
+            readers,
         }
     }
-    fn read_pipe_err(mut p: Option<std::process::ChildStderr>) -> String {
-        match p.as_mut() {
-            Some(s) => {
-                let mut buf = String::new();
-                let _ = s.read_to_string(&mut buf);
-                buf
-            }
-            None => String::new(),
+
+    /// Give the readers up to `grace` to reach EOF. After the command
+    /// exits they do, unless a detached grandchild still holds a pipe
+    /// open — then take what has arrived rather than wait for it.
+    fn settle(&self, grace: Duration) {
+        let end = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < end && self.readers.iter().any(|h| !h.is_finished()) {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
-    (read_pipe(stdout), read_pipe_err(stderr))
+
+    /// Everything captured so far, as text (bytes that are not UTF-8
+    /// become U+FFFD instead of erasing the output).
+    fn text(&self, file_path: &std::path::Path) -> String {
+        let mut s = match self.buf.lock() {
+            Ok(g) => String::from_utf8_lossy(&g).into_owned(),
+            Err(_) => String::new(),
+        };
+        if self.truncated.load(std::sync::atomic::Ordering::SeqCst) {
+            s.push_str(&format!(
+                "\n[output truncated at {} MiB; the log file holds more: {}]\n",
+                MEM_CAP / (1024 * 1024),
+                file_path.display()
+            ));
+        }
+        s
+    }
+}
+
+/// Drain one pipe on its own thread (see [`Capture`]).
+fn pump<R: std::io::Read + Send + 'static>(
+    mut src: R,
+    buf: &std::sync::Arc<Mutex<Vec<u8>>>,
+    truncated: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    file: &Option<std::sync::Arc<Mutex<(std::fs::File, u64)>>>,
+    sink: &Option<crate::OutputSink>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::Write;
+    let buf = buf.clone();
+    let truncated = truncated.clone();
+    let file = file.clone();
+    let sink = sink.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        // The line being assembled for the live sink.
+        let mut pending: Vec<u8> = Vec::new();
+        let emit = |line: &[u8]| {
+            if let Some(sink) = &sink {
+                let text = String::from_utf8_lossy(line);
+                sink(text.trim_end_matches('\r'));
+            }
+        };
+        loop {
+            match src.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let bytes = &chunk[..n];
+                    if let Ok(mut b) = buf.lock() {
+                        let room = MEM_CAP.saturating_sub(b.len());
+                        if room < bytes.len() {
+                            truncated.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        b.extend_from_slice(&bytes[..bytes.len().min(room)]);
+                    }
+                    if let Some(f) = &file {
+                        if let Ok(mut g) = f.lock() {
+                            if g.1 < FILE_CAP {
+                                let _ = g.0.write_all(bytes);
+                                g.1 += n as u64;
+                            }
+                        }
+                    }
+                    if sink.is_some() {
+                        for &b in bytes {
+                            if b == b'\n' {
+                                emit(&pending);
+                                pending.clear();
+                            } else {
+                                pending.push(b);
+                                if pending.len() >= LINE_CAP {
+                                    emit(&pending);
+                                    pending.clear();
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if !pending.is_empty() {
+            emit(&pending);
+        }
+    })
 }
 
 /// The environment a Bash child may see: an explicit allowlist, never
@@ -950,5 +1063,131 @@ mod group_kill_tests {
             bystander_alive,
             "a process outside group {pgid} must survive it"
         );
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    fn cx() -> (ToolContext, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("orbit-bash-out-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (
+            ToolContext::new(dir.clone(), "bash-output-test".into(), dir.clone()),
+            dir,
+        )
+    }
+
+    fn payload(r: &ToolResult) -> serde_json::Value {
+        serde_json::from_str(&r.payload).expect("payload is JSON")
+    }
+
+    /// The pipes are only ever read after the child exits, so a command
+    /// that writes more than the pipe buffer (64 KiB) blocks in write(2)
+    /// and never exits: every verbose build or test run sat there until
+    /// the timeout. `seq` writes about 2 MB.
+    #[test]
+    fn a_chatty_command_does_not_stall() {
+        let (cx, dir) = cx();
+        let t0 = std::time::Instant::now();
+        let r = run_command("seq 1 300000", 6, &cx);
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "a chatty command must finish, not sit until the timeout (took {took:?}): {}",
+            r.payload.chars().take(300).collect::<String>()
+        );
+        let v = payload(&r);
+        assert_eq!(
+            v["ok"],
+            true,
+            "{}",
+            r.payload.chars().take(300).collect::<String>()
+        );
+        assert!(v.get("backgrounded").is_none(), "it finished: {v}");
+        // Too long to inline: spilled to a file that holds the whole run.
+        let spilled = r.spilled_to.expect("2 MB of output spills to a file");
+        let all = std::fs::read_to_string(spilled).unwrap();
+        assert!(all.contains("300000"), "the last line must be there");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `read_to_string` fails on a byte that is not UTF-8 and leaves the
+    /// buffer empty, so one stray byte used to erase a command's output.
+    #[test]
+    fn output_that_is_not_utf8_is_kept() {
+        let (cx, dir) = cx();
+        let r = run_command(r"printf 'before \377\376 after'", 10, &cx);
+        let v = payload(&r);
+        let out = v["output"].as_str().unwrap_or_default();
+        assert!(out.contains("before"), "output kept: {v}");
+        assert!(out.contains("after"), "output kept: {v}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The live terminal: complete lines, in arrival order, the last one
+    /// even without a trailing newline.
+    #[test]
+    fn live_output_reaches_the_sink_line_by_line() {
+        let (cx, dir) = cx();
+        let lines = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink_lines = lines.clone();
+        cx.set_output_sink(Some(std::sync::Arc::new(move |l: &str| {
+            sink_lines.lock().unwrap().push(l.to_string());
+        })));
+        let r = run_command(r"printf 'a\nb\r\nc'", 10, &cx);
+        assert_eq!(payload(&r)["ok"], true, "{}", r.payload);
+        assert_eq!(*lines.lock().unwrap(), vec!["a", "b", "c"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A backgrounded command's log can be read while it is still
+    /// running (it used to be written once, at exit).
+    #[test]
+    fn a_backgrounded_command_logs_as_it_runs() {
+        let (cx, dir) = cx();
+        let r = run_command_backgrounded("echo first; sleep 3; echo second", &cx);
+        let v = payload(&r);
+        let task = v["task_id"].as_str().expect("task id").to_string();
+        let log = {
+            let note = v["note"].as_str().unwrap();
+            std::path::PathBuf::from(note.rsplit_once("land in ").map(|x| x.1).unwrap_or(note))
+        };
+        let mut seen_first = false;
+        for _ in 0..100 {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("first") {
+                seen_first = true;
+                assert!(
+                    !text.contains("second"),
+                    "second is still 3 s away: {text:?}"
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let stop = TaskStopTool.run(&json!({ "task_id": task }), &cx);
+        assert!(
+            seen_first,
+            "the log must show `first` while the command runs"
+        );
+        assert!(!stop.is_error, "{}", stop.payload);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stdout_and_stderr_are_both_captured() {
+        let (cx, dir) = cx();
+        let r = run_command("echo to-stdout; echo to-stderr 1>&2; exit 3", 10, &cx);
+        let v = payload(&r);
+        let out = v["output"].as_str().unwrap_or_default();
+        assert!(
+            out.contains("to-stdout") && out.contains("to-stderr"),
+            "{v}"
+        );
+        assert_eq!(v["exit_code"], 3);
+        assert_eq!(v["ok"], false);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
