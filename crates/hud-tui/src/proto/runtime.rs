@@ -1,6 +1,7 @@
 //! The prototype runtime (DR-20): the event loop that owns the
-//! keyboard, the bus and the draw. The layout is a pure function of
-//! the terminal size (§8) — no user tree, no arrange mode.
+//! keyboard, the bus and the draw. The layout is the user's panel tree
+//! (presets, arrange mode, saved to `tui.toml`); the screen is a pure
+//! function of that tree, the scenario and the tick.
 
 use std::time::{Duration, Instant};
 

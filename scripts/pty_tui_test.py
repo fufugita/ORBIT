@@ -290,15 +290,23 @@ def main():
     args = ap.parse_args()
 
     # This suite runs real tool calls (Bash under bwrap, Esc → kill of a
-    # process group) and deliberately kills terminals. On 2026-10-08 a run
-    # was followed within a second by SIGTERM to the user manager and a
-    # full desktop logout (journal: "Received SIGTERM from PID … (kill)").
-    # Root cause not yet proven — do not run it on a machine you are
-    # logged into unless you have read docs and accept that risk.
+    # process group) and deliberately kills terminals. On 2026-10-07/08 a
+    # run was followed within a second by SIGTERM to the user manager and
+    # a full desktop logout (journal: "Received SIGTERM from PID … (kill)").
+    # Root cause (found 2026-10-09, fixed in crates/tools/src/bash.rs):
+    # orbit stopped a tool's process group with `/usr/bin/kill -TERM
+    # -<pgid>`, and procps-ng 4.0.4 reads ONE digit of a negative operand
+    # — `-1670` became `kill(-1, SIGTERM)`, every process the user owns.
+    # Orbit now signals with kill(2) itself. The gate stays as defence in
+    # depth: this suite really does kill process groups, so run it inside
+    # a PID namespace on a machine you are logged into:
+    #   unshare --user --map-current-user --pid --fork --mount-proc \
+    #     --kill-child env ORBIT_PTY_ALLOW_KILL_TESTS=1 python3 ...
     if os.environ.get("ORBIT_PTY_ALLOW_KILL_TESTS") != "1":
         print("refusing to run: this suite exercises process-group kills and\n"
-              "closes terminals; a run on 2026-10-08 preceded a desktop logout.\n"
-              "Set ORBIT_PTY_ALLOW_KILL_TESTS=1 to run it anyway.")
+              "closes terminals. The cause of the 2026-10 desktop logouts is\n"
+              "fixed, but run it in a PID namespace (see the comment above)\n"
+              "and set ORBIT_PTY_ALLOW_KILL_TESTS=1.")
         sys.exit(2)
 
     # Fresh ORBIT home.
