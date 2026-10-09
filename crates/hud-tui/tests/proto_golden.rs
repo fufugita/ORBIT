@@ -626,3 +626,121 @@ fn a_wrapped_bullet_hangs_under_its_text_and_a_wrapped_quote_keeps_its_gutter() 
         "and its text sits after the gutter:\n{screen}"
     );
 }
+
+#[test]
+fn a_fenced_block_is_a_band_with_its_language_on_the_first_row() {
+    // The language tag used to be dropped and the code only had a
+    // background behind its own characters.
+    let tui = Tui::new();
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "show it".into(),
+        ..Default::default()
+    });
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::Model,
+        text: "Here:\n```rust\nlet a = 1;\n\nlet b = 2;\n```\nafter".into(),
+        ..Default::default()
+    });
+    let mut term = ratatui::Terminal::new(TestBackend::new(164, 48)).unwrap();
+    term.draw(|f| draw(f, &tui, &s, "", None, "", 0, None, false, 0))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows: Vec<String> = (0..48u16)
+        .map(|y| {
+            (0..164u16)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        })
+        .collect();
+    let screen = rows.join("\n");
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"))
+    };
+    let col_of = |y: usize, needle: &str| {
+        let byte = rows[y].find(needle).unwrap();
+        rows[y][..byte].chars().count() as u16
+    };
+
+    let first = row_of("let a = 1;");
+    assert_eq!(row_of("let b = 2;"), first + 2, "a blank line stays a row");
+    let tag = col_of(first, "rust");
+    let end_of_code = col_of(first, "let a = 1;") + "let a = 1;".len() as u16;
+    assert!(tag > end_of_code + 2, "the tag is right-aligned:\n{screen}");
+    assert_eq!(rows.iter().filter(|r| r.contains("rust")).count(), 1);
+
+    // The band runs under the whole row, blank line included, and stops
+    // with the block.
+    let band = buf[(end_of_code + 1, first as u16)].bg;
+    for y in [first, first + 1, first + 2] {
+        assert_eq!(
+            buf[(tag - 2, y as u16)].bg,
+            band,
+            "band on row {y}:\n{screen}"
+        );
+    }
+    let after = row_of("after");
+    assert_ne!(buf[(tag - 2, after as u16)].bg, band, "no band after it");
+    let intro = row_of("Here:");
+    assert_ne!(buf[(tag - 2, intro as u16)].bg, band, "no band before it");
+}
+
+#[test]
+fn a_pipe_table_is_drawn_as_a_grid_that_fits_the_panel() {
+    // Tables used to print their raw pipes and `|---|` row.
+    use ratatui::style::Modifier;
+    let tui = Tui::new();
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "table please".into(),
+        ..Default::default()
+    });
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::Model,
+        text: "| file | change |\n|------|--------|\n| calc.py | +1 -1 |\n| a_rather_long_file_name_that_is_wider_than_the_panel_allows_for.py | +20 -3 |".into(),
+        ..Default::default()
+    });
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, 40)).unwrap();
+    term.draw(|f| draw(f, &tui, &s, "", None, "", 0, None, false, 0))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows: Vec<String> = (0..40u16)
+        .map(|y| {
+            (0..80u16)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        })
+        .collect();
+    let screen = rows.join("\n");
+    assert!(!screen.contains("|---"), "the rule row is drawn:\n{screen}");
+    assert!(!screen.contains("| file"), "no raw pipes:\n{screen}");
+
+    let head = rows
+        .iter()
+        .position(|r| r.contains("file") && r.contains("change"))
+        .unwrap_or_else(|| panic!("no header row:\n{screen}"));
+    // A rule under the header, the junction under the column divider.
+    // (Char columns, not byte offsets: the glyphs are multi-byte.)
+    let at = |row: &str, c: char| row.chars().position(|x| x == c);
+    let divider = at(&rows[head], '\u{2502}').expect("a divider in the header");
+    assert_eq!(
+        at(&rows[head + 1], '\u{253c}'),
+        Some(divider),
+        "the rule's junction sits under the divider:\n{screen}"
+    );
+    // Every body row has its divider in the same place, the long name is
+    // clipped with an ellipsis, and nothing runs past the panel.
+    assert_eq!(at(&rows[head + 2], '\u{2502}'), Some(divider), "{screen}");
+    assert_eq!(at(&rows[head + 3], '\u{2502}'), Some(divider), "{screen}");
+    assert!(rows[head + 3].contains('\u{2026}'), "clipped:\n{screen}");
+    assert!(rows[head + 3].contains("+20 -3"), "{screen}");
+    // The header is bold.
+    let col = rows[head][..rows[head].find("file").unwrap()]
+        .chars()
+        .count() as u16;
+    assert!(buf[(col, head as u16)].modifier.contains(Modifier::BOLD));
+}

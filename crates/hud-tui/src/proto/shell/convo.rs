@@ -278,7 +278,9 @@ fn orbit_rows(
     // meant kept as per-character style. Streaming arrival offsets count
     // raw chars; map them onto the displayed ones so the fresh-ink fade
     // keeps its place when markers drop.
-    let md = super::md::rich_styled(&l.text);
+    let width = (w - 5 - if time.is_empty() { 0 } else { 7 }).max(1) as usize;
+    let md = super::md::rich_styled_fit(&l.text, width);
+    let labels = md.labels.clone();
     let arrivals: Vec<(usize, u64)> = l
         .arrivals
         .iter()
@@ -286,7 +288,6 @@ fn orbit_rows(
         .collect();
     let last_data = arrivals.last().map(|a| a.1);
     let (plain, sty) = (md.plain, md.sty);
-    let width = (w - 5 - if time.is_empty() { 0 } else { 7 }).max(1) as usize;
     let lines = reply_rows(&plain, &sty, width);
     let n = lines.len();
     lines
@@ -294,6 +295,13 @@ fn orbit_rows(
         .enumerate()
         .map(|(i, row)| {
             let (a, b, hang, gutter) = (row.a, row.b, row.hang as i32, row.gutter);
+            // A line of a fenced block is a band across the panel, with
+            // the block's language tag right-aligned on its first row.
+            let band = sty.get(a).is_some_and(|st| st.block);
+            let tag = labels
+                .iter()
+                .find(|(at, _)| *at == a && (i > 0 || time.is_empty()))
+                .map(|(_, t)| t.clone());
             let plain = plain.clone();
             let sty = sty.clone();
             let time = time.clone();
@@ -313,6 +321,16 @@ fn orbit_rows(
                 }
                 if gutter {
                     cv.text(x + 4 + hang - 2, y, "│", MUTED, None);
+                }
+                if band {
+                    cv.fill(x + 3, y, w - 5, 1, RAISE2);
+                    if let Some(tag) = &tag {
+                        let at = x + w - 3 - text_width(tag);
+                        // Only where the code leaves room for it.
+                        if at > x + 4 + (b - a) as i32 + 1 {
+                            cv.text(at, y, tag, MUTED, Some(RAISE2));
+                        }
+                    }
                 }
                 for k in a..b.min(plain.len()) {
                     let st = sty[k];
