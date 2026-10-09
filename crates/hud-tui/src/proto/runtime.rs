@@ -600,6 +600,22 @@ fn handle_key(
             _ => None,
         };
         if let Some(resp) = response {
+            let allowed = matches!(
+                resp,
+                crate::ApprovalResponse::Allow | crate::ApprovalResponse::AllowSession
+            );
+            if allowed {
+                // Allowed: the call runs now.
+                for l in scenario.transcript.iter_mut().rev() {
+                    if l.kind == LineKind::Tool
+                        && l.call_id == call_id
+                        && l.tool_state == super::scenario::ToolState::AwaitingYou
+                    {
+                        l.tool_state = super::scenario::ToolState::Running;
+                        break;
+                    }
+                }
+            }
             let delivered = approvals.resolve(&call_id, resp);
             scenario.approval_queue.remove(0);
             if !delivered {
@@ -1351,6 +1367,17 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.approval_queue.push(tool_name.clone());
             scenario.approval_summary = Some(summary.clone());
             scenario.approval_shown_ms = now_ms;
+            // The call is not running: it waits for the person. Its card
+            // says so (◇ needs you) and stops animating — a "running"
+            // comet over an open approval was both a lie and a redraw at
+            // 60 fps for as long as the person took to answer.
+            if let Some(l) = scenario.transcript.iter_mut().rev().find(|l| {
+                l.kind == LineKind::Tool
+                    && l.call_id == call_id
+                    && l.tool_state == super::scenario::ToolState::Running
+            }) {
+                l.tool_state = super::scenario::ToolState::AwaitingYou;
+            }
         }
         Msg::ResponseFinished {
             output_tokens,
@@ -2053,5 +2080,57 @@ mod plan_tests {
             20,
         );
         assert_eq!(s.tasks.len(), 1, "the plan survives a phase change");
+    }
+}
+
+#[cfg(test)]
+mod approval_card_tests {
+    use super::*;
+    use crate::msg::Msg;
+
+    /// A call that is waiting for the person is not "running": its card
+    /// says "needs you", and the outcome still settles it from there.
+    #[test]
+    fn a_call_awaiting_approval_is_not_running() {
+        let mut s = Scenario::new();
+        apply_msg(
+            Msg::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "Edit".into(),
+                summary: "calc.py".into(),
+            },
+            &mut s,
+            1,
+        );
+        apply_msg(
+            Msg::ApprovalRequested {
+                call_id: "c1".into(),
+                tool_name: "Edit".into(),
+                summary: "Edit(calc.py)".into(),
+                risk: 2,
+                working_dir: "/tmp".into(),
+            },
+            &mut s,
+            2,
+        );
+        let card = |s: &Scenario| {
+            s.transcript
+                .iter()
+                .find(|l| l.kind == LineKind::Tool)
+                .map(|l| l.tool_state)
+                .unwrap()
+        };
+        assert_eq!(card(&s), ToolState::AwaitingYou);
+        apply_msg(
+            Msg::ToolCallFinished {
+                call_id: "c1".into(),
+                name: "Edit".into(),
+                outcome: crate::state::ToolOutcome::Denied,
+                fact: String::new(),
+            },
+            &mut s,
+            9,
+        );
+        assert_eq!(card(&s), ToolState::Denied);
     }
 }

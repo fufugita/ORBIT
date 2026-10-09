@@ -403,9 +403,18 @@ impl Scenario {
                 // engine time if the runtime passes it, else the
                 // caller updates the field directly.
             }
-            "tool_started_full" => self.visible_output = false,
+            "tool_started_full" => {
+                // The first output of ANY kind ends M9: an agentic turn
+                // usually opens with a tool call, not text, and the
+                // welcome orbit must not animate behind it.
+                self.first_prompt_waiting = false;
+                self.visible_output = false;
+            }
             "tool_finished_full" => self.visible_output = false,
-            "approval_requested" => self.approval_pending = Some("tool".into()),
+            "approval_requested" => {
+                self.first_prompt_waiting = false;
+                self.approval_pending = Some("tool".into());
+            }
             "approval_requested_full" => {}
             "approval_resolved" => {
                 self.approval_pending = None;
@@ -464,6 +473,22 @@ mod tests {
 
         s.apply("turn_ended", 400);
         assert_eq!(s.star_state(), StarState::StillMagenta); // done/ready
+    }
+
+    /// M9 (the welcome orbit while the first prompt waits) ends at the
+    /// first visible output — a tool card or an approval, not only text.
+    /// A turn that opens with a tool call used to keep the hero and its
+    /// 60 fps animation up for the whole tool phase.
+    #[test]
+    fn the_first_tool_ends_the_welcome_wait() {
+        for ev in ["text_delta", "tool_started_full", "approval_requested"] {
+            let mut s = Scenario::new();
+            s.first_prompt_waiting = true;
+            s.apply("round_started", 0);
+            assert!(s.first_prompt_waiting, "still waiting before any output");
+            s.apply(ev, 10);
+            assert!(!s.first_prompt_waiting, "{ev} ends the welcome wait");
+        }
     }
 
     #[test]
