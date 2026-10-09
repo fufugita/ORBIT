@@ -2108,7 +2108,8 @@ fn handle_mouse(
                 Some(Click::Dismiss | Click::Inert | Click::Palette(_)) => {
                     return MouseOutcome::None;
                 }
-                None => {}
+                // `at` never returns a text span; matched for completeness.
+                Some(Click::Text) | None => {}
             }
             if row == 0 {
                 return MouseOutcome::None;
@@ -2150,7 +2151,7 @@ fn handle_mouse(
             let Some(buf) = last else {
                 return MouseOutcome::None;
             };
-            let text = selected_text(buf, &sel, *r);
+            let text = selected_text(buf, &sel, *r, &tui.hits);
             if text.is_empty() {
                 return MouseOutcome::None;
             }
@@ -2178,16 +2179,27 @@ fn handle_mouse(
 }
 
 /// The text of a selection, read from the drawn frame, inside its panel.
+///
+/// A row that marked where its words sit (a turn in the Conversation)
+/// gives up the rest: the gutter marks and the timestamp are not what
+/// anyone selects. What is copied is the text as displayed, markup
+/// already turned into style; the other rows are read whole.
 fn selected_text(
     buf: &ratatui::buffer::Buffer,
     sel: &super::shell::Selection,
     panel: Rect,
+    hits: &[super::shell::hits::Hit],
 ) -> String {
     let inner = super::shell::content_rect(panel);
     sel.rows(inner)
         .into_iter()
         .map(|(x, y, w)| {
-            (x..x + w)
+            let (mut from, mut to) = (x, x + w);
+            if let Some((sx, ex)) = super::shell::hits::text_span(hits, y as u16, inner) {
+                from = from.max(sx as i32);
+                to = to.min(ex as i32);
+            }
+            (from..to.max(from))
                 .map(|cx| buf[(cx as u16, y as u16)].symbol().to_string())
                 .collect::<String>()
                 .trim_end()
@@ -2705,6 +2717,43 @@ mod click_tests {
             .collect()
     }
 
+    /// What dragging across `from`..`to` copies in the panel under `from`:
+    /// the frame is drawn, the selection made as the mouse would make it,
+    /// and the text read the way the release reads it.
+    fn copied(
+        tui: &mut Tui,
+        s: &Scenario,
+        from: (u16, u16),
+        to: (u16, u16),
+        w: u16,
+        h: u16,
+    ) -> String {
+        tui.reduced = true;
+        tui.tick_ms = tui.tick_ms.max(5_000);
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut hits = Vec::new();
+        let done = term
+            .draw(|f| {
+                hits = draw_with_hits(f, tui, s, "", None, "", 0, None, false, 0);
+            })
+            .unwrap();
+        tui.hits = hits;
+        let buf = done.buffer.clone();
+        let rects = super::super::shell::panel_rects(Rect::new(0, 0, w, h), &tui.app);
+        let (idx, r, _) = rects
+            .iter()
+            .find(|(_, r, _)| {
+                from.0 >= r.x && from.0 < r.right() && from.1 >= r.y && from.1 < r.bottom()
+            })
+            .expect("the drag starts in a panel");
+        let sel = super::super::shell::Selection {
+            panel: *idx,
+            a: from,
+            b: to,
+        };
+        selected_text(&buf, &sel, *r, &tui.hits)
+    }
+
     /// Where `needle` is on screen (column, row) — the click goes where
     /// the person would aim: at the words.
     fn at(rows: &[String], needle: &str) -> (u16, u16) {
@@ -2823,6 +2872,39 @@ mod click_tests {
             key_of(click(&mut tui, at(&rows, "esc deny"), false, w, h)),
             KeyCode::Char('n')
         );
+    }
+
+    /// Dragging across a turn copies its words. The `▎ ›` and `✦` that
+    /// mark who spoke, and the time beside the first row, stay out.
+    #[test]
+    fn a_selection_copies_the_words_of_a_turn_and_not_its_gutter() {
+        let (w, h) = (100, 30);
+        let mut tui = fresh_tui();
+        let mut s = Scenario::new();
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::User,
+            text: "make the tests pass".into(),
+            time: Some("16:46".into()),
+            ..Default::default()
+        });
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::Model,
+            text: "## Summary\n\nIt is **done**.\n\n> a quote".into(),
+            time: Some("16:46".into()),
+            ..Default::default()
+        });
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        let (c0, r0) = at(&rows, "make the tests");
+        let (c1, r1) = at(&rows, "a quote");
+        // From the gutter mark of the first row to past the last word.
+        let text = copied(&mut tui, &s, (c0 - 4, r0), (c1 + 20, r1), w, h);
+        assert_eq!(
+            text,
+            "make the tests pass\n\nSummary\n\nIt is done.\n\n\u{2502} a quote"
+        );
+        for mark in ["\u{258e}", "\u{203a}", "\u{2726}", "16:46"] {
+            assert!(!text.contains(mark), "{mark:?} copied:\n{text}");
+        }
     }
 
     /// While the person is typing the card shows no buttons at all (it says

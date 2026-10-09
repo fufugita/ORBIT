@@ -37,6 +37,10 @@ pub enum Click {
     /// A part of an overlay that answers to nothing (its frame, its
     /// text): the click stays inside the box and neither acts nor closes.
     Inert,
+    /// Not a click target. Marks where the words of a row sit, so a mouse
+    /// selection copies the words and leaves out the gutter marks and the
+    /// timestamp beside them. `at` never returns it.
+    Text,
 }
 
 /// A clickable region of the last frame.
@@ -52,9 +56,27 @@ pub fn at(hits: &[Hit], col: u16, row: u16) -> Option<Click> {
     hits.iter()
         .rev()
         .find(|h| {
-            col >= h.rect.x && col < h.rect.right() && row >= h.rect.y && row < h.rect.bottom()
+            h.click != Click::Text
+                && col >= h.rect.x
+                && col < h.rect.right()
+                && row >= h.rect.y
+                && row < h.rect.bottom()
         })
         .map(|h| h.click)
+}
+
+/// Where the words of `row` sit inside `panel`, as `(start, end)` columns,
+/// when the row marked them.
+pub fn text_span(hits: &[Hit], row: u16, panel: Rect) -> Option<(u16, u16)> {
+    hits.iter()
+        .rev()
+        .find(|h| {
+            h.click == Click::Text
+                && h.rect.y == row
+                && h.rect.x >= panel.x
+                && h.rect.right() <= panel.right()
+        })
+        .map(|h| (h.rect.x, h.rect.right()))
 }
 
 /// The key a hint's key text names, when it names exactly one. Composite

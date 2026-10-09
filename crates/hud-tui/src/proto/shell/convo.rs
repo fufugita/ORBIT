@@ -157,6 +157,11 @@ fn user_rows(l: &TranscriptLine, w: i32) -> Vec<Row> {
                         m,
                     );
                 }
+                // The words, for a selection: not the `▎ ›` or the time.
+                let words: String = plain[a.min(plain.len())..b.min(plain.len())]
+                    .iter()
+                    .collect();
+                cv.hit(x + 4, y, text_width(&words), 1, super::hits::Click::Text);
             }) as RowFn)
         })
         .collect()
@@ -365,6 +370,17 @@ fn orbit_rows(
                         mods,
                     );
                 }
+                // The words, for a selection: not the `✦` or the time.
+                let words: String = plain[a.min(plain.len())..b.min(plain.len())]
+                    .iter()
+                    .collect();
+                cv.hit(
+                    x + 4 + hang,
+                    y,
+                    text_width(&words),
+                    1,
+                    super::hits::Click::Text,
+                );
                 if live && i + 1 == n {
                     // The caret breathes at 0.9 Hz after 400 ms without data.
                     let idle = last_data

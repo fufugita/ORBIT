@@ -95,7 +95,9 @@ Terminal, Plan, Activity, Context, Review or an Agent), `x` closes one,
 returns to typing. The layout is saved in `tui.toml` and survives restarts.
 The mouse works on what you can see: click a panel to focus it, a layout tab
 to switch, a file to select it, an approval chip to answer; the wheel scrolls
-the panel under the pointer. `?` lists every key, `/` lists the slash
+the panel under the pointer. Dragging inside a panel selects what is
+displayed (a turn's words, without its gutter marks or timestamp) and copies
+it on release through OSC 52, so your terminal has to allow that. `?` lists every key, `/` lists the slash
 commands, `:` opens the command palette, and a line that starts with `!` runs
 a command of your own.
 
