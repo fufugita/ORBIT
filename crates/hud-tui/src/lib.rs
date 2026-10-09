@@ -18,6 +18,7 @@ mod coalesce;
 pub mod format;
 pub mod glyphs;
 pub mod input;
+pub mod model;
 pub mod msg;
 pub mod plain;
 pub mod proto;
