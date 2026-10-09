@@ -58,15 +58,16 @@ reply. <b>Terminal</b> keeps a tape per command, with its output and outcome.</s
 Reads run freely; edits and commands ask first. The approval card says what
 you are approving (an Edit's diff, or the command with its directory, the
 permission mode, whether the sandbox confines it and where it may write) and
-what `R` would grant:
+the rule that remembering the choice would add:
 
 <p align="center">
-  <img src="docs/tui/shots/approval.png" alt="An approval card for a shell command, with directory, mode, sandbox, writes and what R grants" width="860">
+  <img src="docs/tui/shots/approval.png" alt="An approval card for a shell command, with directory, mode, sandbox, writes and the rule that s would grant" width="860">
 </p>
 
-<p align="center"><sub>Approving a shell command. <code>y</code> allows it once, <code>n</code> or <code>Esc</code>
-denies, and <code>R</code> allows every <code>Bash</code> call until you quit, which the card spells out.
-An Edit's card shows its diff in the same place.</sub></p>
+<p align="center"><sub>Approving a shell command. <code>y</code> allows it once. <code>s</code> allows the calls the
+named rule matches (here the exact command) for the rest of the session; in a trusted folder <code>a</code>
+also saves the rule in <code>.orbit/settings.local.toml</code>. <code>n</code> denies and asks for a word on why, which goes back
+to the model; <code>Esc</code> denies without one. An Edit's card shows its diff in the same place.</sub></p>
 
 <p align="center">
   <img src="docs/tui/shots/streaming.png" alt="A command still running: its output streams into the Terminal panel" width="860">
@@ -189,10 +190,17 @@ content can never become user authority.
   `$ORBIT_HOME/tui.toml`.
 - **Tool calling with approval** — reads run freely, edits and commands ask.
   The card shows an Edit's diff, a command's directory, the permission mode,
-  the sandbox state and exactly what `R` grants. `y` allows once, `n` or
-  `Esc` denies, `R` allows that tool for the rest of the session (for Bash
-  that is every command until you quit). Every decision is a Ledger record,
-  and a session grant never bypasses the known-tool check.
+  the sandbox state and the rule a grant would add. `y` allows once. `s`
+  allows the calls that rule matches for the session, and `a` also saves it
+  in the folder's `.orbit/settings.local.toml` (offered only in a trusted
+  folder). For Bash the rule is a known tool's verb with a wildcard
+  (`Bash(cargo test *)`), except for verbs that run code or publish
+  (`cargo run`, `git push`), and the exact command for anything else or for
+  a line with an operator in it. `n` denies and takes a word on why, which
+  goes back to the model; `Esc` denies without one. `R` still allows the
+  whole tool for the session; it is in the help, and on the card only when
+  no narrower rule can be offered. Every decision is a Ledger record, and a
+  grant never outranks a deny rule or bypasses the known-tool check.
 - **Sandboxed shell** — on Linux, Bash runs under bubblewrap with no network
   and writes limited to the project and a session temp directory. Where the
   sandbox is unavailable, Bash is refused (read-only commands excepted)
@@ -367,7 +375,10 @@ the words `cargo test` and anything after them; an allow rule never covers
 a line that chains, pipes or redirects (`;`, `&&`, `|`, `>`, `$(…)`), and a
 deny rule fires on any part of such a line. A project's own settings can
 only make ORBIT stricter: their allow rules apply once you have trusted the
-folder with `orbit folder trust`.
+folder with `orbit folder trust`. The `a` key on the approval card adds an
+allow rule to `.orbit/settings.local.toml`, only in a trusted folder. If
+`.orbit/` has no `.gitignore` it gets one naming that file, so a grant meant
+for one machine is not committed by accident.
 
 ### `tui.toml`
 
