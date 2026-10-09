@@ -67,6 +67,10 @@ pub struct Tui {
     pub selection: Option<super::shell::Selection>,
     /// The highlighted row of the `/` command list.
     pub completion_sel: usize,
+    /// What the last frame drew as clickable, in drawing order. The mouse
+    /// is answered from this and nothing else, so a click can only reach
+    /// what is on screen.
+    pub hits: Vec<super::shell::hits::Hit>,
 }
 
 impl Default for Tui {
@@ -89,6 +93,7 @@ impl Tui {
             scrolls: Vec::new(),
             selection: None,
             completion_sel: 0,
+            hits: Vec::new(),
         }
     }
 
@@ -161,8 +166,8 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         }
     };
 
-    // §12.4: mouse capture stays off (the terminal's native
-    // selection owns the mouse).
+    // Mouse capture is ON: the app owns the mouse (click, wheel, per-panel
+    // selection). Shift+drag still reaches the terminal's own selection.
     let mut guard = match crate::terminal::TerminalGuard::enter_with(true) {
         Ok(g) => g,
         Err(e) => {
@@ -205,6 +210,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         scrolls: Vec::new(),
         selection: None,
         completion_sel: 0,
+        hits: Vec::new(),
     };
     tui.sync_focus();
 
@@ -253,6 +259,9 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     let boot_ms = Instant::now();
     let mut last_drawn = String::new();
     let mut overlay_dirty = true;
+    // A key a click stands for, handled on the next turn of the loop as
+    // if it had been typed.
+    let mut injected: Option<Event> = None;
     // The last frame drawn: a selection copies its text from here.
     let mut last_buf: Option<ratatui::buffer::Buffer> = None;
 
@@ -266,10 +275,13 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         // fail with EIO — swallow nothing: treat any input error as
         // "terminal gone" and quit at once (the same rule as SIGHUP).
         // unwrap_or(false) here would busy-loop the EIO at 100% CPU.
-        let ev = match event::poll(timeout) {
-            Ok(true) => event::read().ok(),
-            Ok(false) => None,
-            Err(_) => break,
+        let ev = match injected.take() {
+            Some(e) => Some(e),
+            None => match event::poll(timeout) {
+                Ok(true) => event::read().ok(),
+                Ok(false) => None,
+                Err(_) => break,
+            },
         };
         if let Some(ev) = ev {
             match ev {
@@ -313,13 +325,43 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                     let area = Rect::new(0, 0, size.width, size.height);
                     let snap_before =
                         super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
-                    if overlay.is_none() {
-                        if let Some(text) = handle_mouse(m, &mut tui, area, last_buf.as_ref()) {
+                    let modal = overlay.is_some() || tui.app.picker.is_some();
+                    match handle_mouse(m, &mut tui, area, last_buf.as_ref(), modal) {
+                        MouseOutcome::None => {}
+                        MouseOutcome::Toast(text) => {
                             toast = Some(Toast {
                                 text,
                                 ok: true,
                                 shown_ms: now_ms,
                             });
+                        }
+                        MouseOutcome::Key(_) if card_just_appeared(&scenario, now_ms) => {}
+                        MouseOutcome::Key(k) => injected = Some(Event::Key(k)),
+                        MouseOutcome::File(i) => {
+                            // A click selects; a click on the selected file
+                            // opens its diff, like ⏎.
+                            if click_file(&mut scenario, i) {
+                                tui.fx.overlay_ms = now_ms;
+                                overlay = Some(Overlay::Diff);
+                            }
+                        }
+                        // A row of the `/` list completes into the composer
+                        // (Tab); ⏎ then runs it — a click never runs a
+                        // command on its own.
+                        MouseOutcome::Slash(i) => {
+                            completion_sel = i;
+                            injected = Some(Event::Key(crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Tab,
+                                crossterm::event::KeyModifiers::NONE,
+                            )));
+                        }
+                        // The palette is a menu: a click runs the row (⏎).
+                        MouseOutcome::Palette(i) => {
+                            palette_sel = i;
+                            injected = Some(Event::Key(crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Enter,
+                                crossterm::event::KeyModifiers::NONE,
+                            )));
                         }
                     }
                     let snap_after =
@@ -417,10 +459,11 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                 last_drawn.clone_from(&composer);
                 overlay_dirty = false;
                 tui.completion_sel = completion_sel;
+                let mut frame_hits = Vec::new();
                 let done = guard
                     .terminal
                     .draw(|f| {
-                        draw(
+                        frame_hits = draw_with_hits(
                             f,
                             &tui,
                             &scenario,
@@ -440,6 +483,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                     break;
                 };
                 last_buf = Some(done.buffer.clone());
+                tui.hits = frame_hits;
             }
             // Toast expiry (§9.13): 3 s.
             if let Some(t) = &toast {
@@ -1782,6 +1826,35 @@ pub fn draw(
     sessions_pushed: bool,
     scroll_offset: usize,
 ) {
+    let _ = draw_with_hits(
+        f,
+        tui,
+        scenario,
+        composer,
+        overlay,
+        palette_query,
+        palette_sel,
+        toast,
+        sessions_pushed,
+        scroll_offset,
+    );
+}
+
+/// `draw`, returning what the frame made clickable (the runtime keeps
+/// the last frame's regions to answer the mouse).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_with_hits(
+    f: &mut ratatui::Frame,
+    tui: &Tui,
+    scenario: &Scenario,
+    composer: &str,
+    overlay: Option<Overlay>,
+    palette_query: &str,
+    palette_sel: usize,
+    toast: Option<&Toast>,
+    sessions_pushed: bool,
+    scroll_offset: usize,
+) -> Vec<super::shell::hits::Hit> {
     let _ = sessions_pushed;
     let area = f.area();
     // The size notice (§9.23): below 40 × 10 it is the whole screen.
@@ -1794,7 +1867,7 @@ pub fn draw(
         let mut out = vec![star];
         out.extend(lines);
         f.render_widget(Paragraph::new(out), area);
-        return;
+        return Vec::new();
     }
     use super::shell::overlays::Overlay as Ov;
     let ov = match overlay {
@@ -1827,7 +1900,7 @@ pub fn draw(
         }
         None => None,
     };
-    super::shell::draw(
+    super::shell::draw_with_hits(
         f,
         &super::shell::DrawIn {
             app: &tui.app,
@@ -1856,20 +1929,64 @@ pub fn draw(
             }),
             overlay: ov,
         },
-    );
+    )
+}
+
+/// A click on changed file `i`. Returns true when it should open that
+/// file's diff (it was already the selected one), like ⏎; otherwise it
+/// only selects it.
+fn click_file(scenario: &mut Scenario, i: usize) -> bool {
+    if scenario.selected_file() == Some(i) {
+        return true;
+    }
+    scenario.file_sel = i;
+    scenario.hunk_sel = 0;
+    false
+}
+
+/// An approval card that appeared less than 700 ms ago answers no click:
+/// a click aimed at what was under the pointer a moment earlier must not
+/// land on a button that has just materialised there and approve a call.
+fn card_just_appeared(scenario: &Scenario, now_ms: u64) -> bool {
+    scenario.approval_call_id.is_some() && now_ms.saturating_sub(scenario.approval_shown_ms) < 700
+}
+
+/// What a mouse event asks the event loop to do beyond updating `Tui`.
+#[derive(Debug, PartialEq)]
+enum MouseOutcome {
+    None,
+    /// Text was copied: say so.
+    Toast(String),
+    /// A clicked hint: press its key through the key handler.
+    Key(crossterm::event::KeyEvent),
+    /// A click on row `i` of the changed-files list.
+    File(usize),
+    /// A click on row `i` of the `/` command list.
+    Slash(usize),
+    /// A click on row `i` of the command palette.
+    Palette(usize),
 }
 
 /// The mouse, with every gesture bound to the panel under the pointer
-/// (herdr-style isolation): a click focuses it; the wheel scrolls it alone;
-/// a drag selects inside it and is clamped to its content; releasing copies
-/// that panel's text — and only that — through OSC 52.
+/// (herdr-style isolation): a click focuses it, or presses what it
+/// clicked; the wheel scrolls it alone; a drag selects inside it and is
+/// clamped to its content; releasing copies that panel's text — and only
+/// that — through OSC 52.
+///
+/// What a click lands on comes from the regions the LAST FRAME drew
+/// (`tui.hits`), so it can only reach what was on screen. A modal (an
+/// overlay or the picker) answers only its own controls; a click anywhere
+/// else on it closes it. A clicked key hint is the key press itself: it
+/// goes through the key handler, with every guard that has.
 fn handle_mouse(
     m: crossterm::event::MouseEvent,
     tui: &mut Tui,
     area: Rect,
     last: Option<&ratatui::buffer::Buffer>,
-) -> Option<String> {
-    use crossterm::event::{MouseButton, MouseEventKind};
+    modal: bool,
+) -> MouseOutcome {
+    use super::shell::hits::{self, Click};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     let (col, row) = (m.column, m.row);
     let rects = super::shell::panel_rects(area, &tui.app);
     let under = rects
@@ -1878,14 +1995,71 @@ fn handle_mouse(
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             tui.selection = None;
-            if row == 0 {
-                // The layout tabs in the top bar.
-                if let Some(p) = super::shell::bars::preset_at(col as i32) {
-                    tui.app.apply_preset(p);
-                    tui.app.save_yours();
-                    tui.sync_focus();
+            let click = hits::at(&tui.hits, col, row);
+            if modal {
+                return match click {
+                    Some(Click::Dismiss) => {
+                        MouseOutcome::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    }
+                    Some(Click::Key(code, mods)) => MouseOutcome::Key(KeyEvent::new(code, mods)),
+                    Some(Click::Palette(i)) => MouseOutcome::Palette(i),
+                    _ => MouseOutcome::None,
+                };
+            }
+            // A control belongs to the panel it is drawn in: the key it
+            // presses, or the row it picks, must reach THAT panel, not
+            // whichever one happened to have focus.
+            let focus_under = |tui: &mut Tui| {
+                if let Some((i, _, _)) = under {
+                    if *i != tui.app.focus {
+                        tui.app.focus = *i;
+                        tui.sync_focus();
+                    }
                 }
-                return None;
+            };
+            match click {
+                Some(Click::Key(code, mods)) => {
+                    focus_under(tui);
+                    return MouseOutcome::Key(KeyEvent::new(code, mods));
+                }
+                Some(Click::File(i)) => {
+                    focus_under(tui);
+                    return MouseOutcome::File(i);
+                }
+                Some(Click::Slash(i)) => {
+                    focus_under(tui);
+                    return MouseOutcome::Slash(i);
+                }
+                Some(Click::Panel(i)) => {
+                    if i < tui.app.panel_count() && i != tui.app.focus {
+                        tui.app.focus = i;
+                        tui.sync_focus();
+                    }
+                    return MouseOutcome::None;
+                }
+                Some(Click::Preset(i)) => {
+                    use super::layout::Preset;
+                    let presets = [
+                        Preset::Columns,
+                        Preset::Build,
+                        Preset::Agents,
+                        Preset::Review,
+                    ];
+                    if let Some(p) = presets.get(i) {
+                        tui.app.apply_preset(*p);
+                        tui.app.save_yours();
+                        tui.sync_focus();
+                    }
+                    return MouseOutcome::None;
+                }
+                // Modal-only regions: nothing is open, nothing to do.
+                Some(Click::Dismiss | Click::Inert | Click::Palette(_)) => {
+                    return MouseOutcome::None;
+                }
+                None => {}
+            }
+            if row == 0 {
+                return MouseOutcome::None;
             }
             if let Some((i, r, _)) = under {
                 if *i != tui.app.focus {
@@ -1901,46 +2075,53 @@ fn handle_mouse(
                     });
                 }
             }
-            None
+            MouseOutcome::None
         }
+        _ if modal => MouseOutcome::None,
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(sel) = &mut tui.selection {
                 sel.b = (col, row);
             }
-            None
+            MouseOutcome::None
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            let sel = tui.selection?;
+            let Some(sel) = tui.selection else {
+                return MouseOutcome::None;
+            };
             if sel.a == sel.b {
                 tui.selection = None;
-                return None;
+                return MouseOutcome::None;
             }
-            let (_, r, _) = rects.iter().find(|(i, _, _)| *i == sel.panel)?;
-            let buf = last?;
+            let Some((_, r, _)) = rects.iter().find(|(i, _, _)| *i == sel.panel) else {
+                return MouseOutcome::None;
+            };
+            let Some(buf) = last else {
+                return MouseOutcome::None;
+            };
             let text = selected_text(buf, &sel, *r);
             if text.is_empty() {
-                return None;
+                return MouseOutcome::None;
             }
             let _ = std::io::Write::write_all(
                 &mut std::io::stdout(),
                 crate::selection::osc52_sequence(&text).as_bytes(),
             );
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            Some(format!("copied {} characters", text.chars().count()))
+            MouseOutcome::Toast(format!("copied {} characters", text.chars().count()))
         }
         MouseEventKind::ScrollUp => {
             if let Some((i, _, _)) = under {
                 tui.scroll_panel(*i, 3);
             }
-            None
+            MouseOutcome::None
         }
         MouseEventKind::ScrollDown => {
             if let Some((i, _, _)) = under {
                 tui.scroll_panel(*i, -3);
             }
-            None
+            MouseOutcome::None
         }
-        _ => None,
+        _ => MouseOutcome::None,
     }
 }
 
@@ -2339,5 +2520,434 @@ mod activity_tests {
             s.activity(),
             crate::proto::scenario::Activity::Compacting
         ));
+    }
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::*;
+    use crate::msg::Msg;
+    use crate::proto::layout::Preset;
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::backend::TestBackend;
+
+    /// A Tui whose layout lives in a throwaway home: a click on a layout
+    /// tab SAVES the layout, and an empty home would write it into the
+    /// working directory — where the next test (and the repo) would find it.
+    fn fresh_tui() -> Tui {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "orbit-click-tests-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut tui = Tui::new();
+        tui.app = super::super::app::App::new(home, true);
+        tui.sync_focus();
+        tui
+    }
+
+    /// Draw one frame, keep its clickable regions on `tui` (as the loop
+    /// does) and return the screen as rows of text.
+    fn frame(
+        tui: &mut Tui,
+        s: &Scenario,
+        composer: &str,
+        overlay: Option<Overlay>,
+        w: u16,
+        h: u16,
+    ) -> Vec<String> {
+        // Settled: overlays and panels animate in, and a frame at tick 0
+        // would show none of it.
+        tui.reduced = true;
+        tui.tick_ms = tui.tick_ms.max(5_000);
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut hits = Vec::new();
+        let done = term
+            .draw(|f| {
+                hits = draw_with_hits(f, tui, s, composer, overlay, "", 0, None, false, 0);
+            })
+            .unwrap();
+        tui.hits = hits;
+        let buf = done.buffer.clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    /// Where `needle` is on screen (column, row) — the click goes where
+    /// the person would aim: at the words.
+    fn at(rows: &[String], needle: &str) -> (u16, u16) {
+        for (y, r) in rows.iter().enumerate() {
+            if let Some(b) = r.find(needle) {
+                return (r[..b].chars().count() as u16, y as u16);
+            }
+        }
+        panic!("no {needle:?} on screen\n{}", rows.join("\n"));
+    }
+
+    fn click(tui: &mut Tui, (col, row): (u16, u16), modal: bool, w: u16, h: u16) -> MouseOutcome {
+        let m = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(m, tui, Rect::new(0, 0, w, h), None, modal)
+    }
+
+    fn key_of(o: MouseOutcome) -> KeyCode {
+        match o {
+            MouseOutcome::Key(k) => k.code,
+            other => panic!("expected a key, got {other:?}"),
+        }
+    }
+
+    fn with_approval() -> Scenario {
+        let mut s = Scenario::new();
+        apply_msg(
+            Msg::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "Edit".into(),
+                summary: "calc.py".into(),
+            },
+            &mut s,
+            1,
+        );
+        apply_msg(
+            Msg::ApprovalRequested {
+                call_id: "c1".into(),
+                tool_name: "Edit".into(),
+                summary: "Edit(calc.py)".into(),
+                risk: 2,
+                working_dir: "/tmp".into(),
+            },
+            &mut s,
+            2,
+        );
+        s
+    }
+
+    /// A key hint is the key it names: clicking `⏎ send` presses Enter.
+    #[test]
+    fn a_clicked_hint_presses_the_key_it_names() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let rows = frame(&mut tui, &Scenario::new(), "", None, w, h);
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "⏎ send"), false, w, h)),
+            KeyCode::Enter
+        );
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "send"), false, w, h)),
+            KeyCode::Enter,
+            "the label too"
+        );
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "@ file"), false, w, h)),
+            KeyCode::Char('@')
+        );
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "⇧tab"), false, w, h)),
+            KeyCode::BackTab
+        );
+    }
+
+    /// A hint that names several keys has no one key to press: clicking
+    /// it is the same as clicking the panel it sits in.
+    #[test]
+    fn a_composite_hint_is_not_a_button() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        tui.app.focus = 0;
+        let mut s = Scenario::new();
+        s.file_changes = vec![crate::proto::panels::FileChangeRow {
+            path: "a.rs".into(),
+            added: 1,
+            removed: 0,
+            hunks: None,
+        }];
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        // The Changes footer reads `j/k file   ⏎ full diff`.
+        let o = click(&mut tui, at(&rows, "j/k"), false, w, h);
+        assert_eq!(o, MouseOutcome::None);
+    }
+
+    /// The approval card's three buttons are the keys y, R and n, so the
+    /// card's own guards (the typing pause, the settle delay) apply.
+    #[test]
+    fn the_approval_buttons_are_y_r_and_n() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let s = with_approval();
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "allow once"), false, w, h)),
+            KeyCode::Char('y')
+        );
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "allow all Edit"), false, w, h)),
+            KeyCode::Char('R')
+        );
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "esc deny"), false, w, h)),
+            KeyCode::Char('n')
+        );
+    }
+
+    /// While the person is typing the card shows no buttons at all (it says
+    /// "paused while you type"), so there is nothing to click.
+    #[test]
+    fn a_paused_card_has_no_buttons() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let mut s = with_approval();
+        s.last_key_ms = 5_000;
+        tui.tick_ms = 5_100;
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        assert!(
+            rows.iter().any(|r| r.contains("paused while you type")),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(!rows.iter().any(|r| r.contains("allow once")));
+        // No card button — the status line keeps its own `y allow`, which
+        // goes through the same key handler and the same pause.
+        assert!(!tui.hits.iter().any(|hit| hit.rect.y < h - 1
+            && matches!(
+                hit.click,
+                super::super::shell::hits::Click::Key(KeyCode::Char('y'), _)
+            )));
+    }
+
+    /// A card that has just appeared answers no click for 700 ms.
+    #[test]
+    fn a_card_that_just_appeared_answers_no_click() {
+        let mut s = with_approval();
+        s.approval_call_id = Some("c1".into());
+        s.approval_shown_ms = 10_000;
+        assert!(card_just_appeared(&s, 10_300));
+        assert!(!card_just_appeared(&s, 10_700));
+        s.approval_call_id = None;
+        assert!(!card_just_appeared(&s, 10_100), "no card, no guard");
+    }
+
+    /// An overlay answers only its own controls: a click anywhere else on
+    /// it closes it, and what is drawn behind it cannot be clicked through.
+    #[test]
+    fn a_modal_swallows_clicks_aimed_behind_it() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let s = Scenario::new();
+        // Closed: the composer hint is a button.
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        let send = at(&rows, "⏎ send");
+        assert_eq!(key_of(click(&mut tui, send, false, w, h)), KeyCode::Enter);
+        // Open: the same spot closes the palette instead of sending.
+        let rows = frame(&mut tui, &s, "", Some(Overlay::Palette), w, h);
+        assert_eq!(key_of(click(&mut tui, send, true, w, h)), KeyCode::Esc);
+        // Inside the palette box, off any row: nothing happens.
+        let filter = at(&rows, "type to filter");
+        assert_eq!(click(&mut tui, filter, true, w, h), MouseOutcome::None);
+        // A row runs that command.
+        let first = at(&rows, "/help");
+        assert!(matches!(
+            click(&mut tui, first, true, w, h),
+            MouseOutcome::Palette(_)
+        ));
+    }
+
+    /// Under the diff overlay, a click anywhere closes it ("a look, not a
+    /// mode"), including on the text.
+    #[test]
+    fn a_click_closes_the_diff_overlay() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let mut s = Scenario::new();
+        s.file_changes = vec![crate::proto::panels::FileChangeRow {
+            path: "a.rs".into(),
+            added: 1,
+            removed: 0,
+            hunks: None,
+        }];
+        let rows = frame(&mut tui, &s, "", Some(Overlay::Diff), w, h);
+        let o = click(&mut tui, at(&rows, "no diff captured"), true, w, h);
+        assert_eq!(key_of(o), KeyCode::Esc);
+    }
+
+    /// The quit card's buttons are y and n.
+    #[test]
+    fn the_quit_card_buttons_are_y_and_n() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let rows = frame(&mut tui, &Scenario::new(), "", Some(Overlay::Quit), w, h);
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "quit"), true, w, h)),
+            KeyCode::Char('y')
+        );
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "stay"), true, w, h)),
+            KeyCode::Char('n')
+        );
+    }
+
+    /// While arranging, the panels are dimmed and numbered: their hints
+    /// are not buttons (a click focuses the panel), but the arrange bar's
+    /// own keys are.
+    #[test]
+    fn arranging_leaves_only_the_arrange_bar_clickable() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        tui.app.key(crate::proto::app::Key::Esc);
+        assert!(tui.app.arranging);
+        let rows = frame(&mut tui, &Scenario::new(), "", None, w, h);
+        // Behind the veil, the composer's hint is just a panel to focus.
+        assert_eq!(
+            click(&mut tui, at(&rows, "⏎ send"), false, w, h),
+            MouseOutcome::None
+        );
+        // The arrange bar names real keys.
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "split right"), false, w, h)),
+            KeyCode::Char('v')
+        );
+        assert_eq!(
+            key_of(click(&mut tui, at(&rows, "back"), false, w, h)),
+            KeyCode::Char('i')
+        );
+    }
+
+    /// A key hint inside a panel goes to THAT panel: clicking `⏎ full diff`
+    /// on the Changes panel while the composer has focus must not press
+    /// Enter into the composer (it would send the draft).
+    #[test]
+    fn a_hint_focuses_its_panel_before_its_key() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let mut s = Scenario::new();
+        s.file_changes = vec![crate::proto::panels::FileChangeRow {
+            path: "a.rs".into(),
+            added: 1,
+            removed: 0,
+            hunks: None,
+        }];
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        let conv = tui.app.focus;
+        assert_eq!(
+            tui.app.focused_view(),
+            crate::proto::layout::View::Conversation
+        );
+        let o = click(&mut tui, at(&rows, "full diff"), false, w, h);
+        assert_eq!(key_of(o), KeyCode::Enter);
+        assert_ne!(
+            tui.app.focus, conv,
+            "focus moved to the Changes panel first"
+        );
+        assert_eq!(tui.app.focused_view(), crate::proto::layout::View::Changes);
+    }
+
+    /// The top bar's layout tabs apply their preset.
+    #[test]
+    fn a_layout_tab_applies_its_preset() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let rows = frame(&mut tui, &Scenario::new(), "", None, w, h);
+        let review = at(&rows, "review");
+        assert_eq!(review.1, 0, "the tab is in the top bar");
+        click(&mut tui, review, false, w, h);
+        assert_eq!(tui.app.current_preset(), Some(Preset::Review));
+    }
+
+    /// On a narrow screen the top bar is a panel switcher: a tab focuses
+    /// its panel (it used to apply a layout preset by column arithmetic
+    /// meant for the wide bar).
+    #[test]
+    fn a_switcher_tab_focuses_its_panel() {
+        let (w, h) = (100, 30);
+        let mut tui = fresh_tui();
+        let before = tui.app.current_preset();
+        let rows = frame(&mut tui, &Scenario::new(), "", None, w, h);
+        let tab = at(&rows, "Terminal");
+        assert_eq!(tab.1, 0);
+        click(&mut tui, tab, false, w, h);
+        assert_eq!(tui.app.focused_view(), crate::proto::layout::View::Terminal);
+        assert_eq!(tui.app.current_preset(), before, "no preset was applied");
+    }
+
+    fn two_files() -> Scenario {
+        let mut s = Scenario::new();
+        let row = |p: &str, a| crate::proto::panels::FileChangeRow {
+            path: p.into(),
+            added: a,
+            removed: 0,
+            hunks: None,
+        };
+        s.file_changes = vec![row("src/first.rs", 3), row("src/second.rs", 7)];
+        s
+    }
+
+    /// A row of the files list is a click target in both panels that list
+    /// files; the first click selects, a click on the selected row opens it.
+    #[test]
+    fn a_file_row_selects_and_a_second_click_opens_the_diff() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        tui.app.apply_preset(Preset::Review);
+        let mut s = two_files();
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        let row = rows
+            .iter()
+            .position(|r| r.contains("src/second.rs") && r.contains("+7"))
+            .map(|y| (at(&rows, "src/second.rs").0, y as u16))
+            .expect("second file's row");
+        let o = click(&mut tui, row, false, w, h);
+        assert_eq!(o, MouseOutcome::File(1));
+        assert_eq!(tui.app.focused_view(), crate::proto::layout::View::Review);
+        assert!(!click_file(&mut s, 1), "first click only selects");
+        assert_eq!(s.selected_file(), Some(1));
+        assert!(
+            click_file(&mut s, 1),
+            "a click on the selected row opens its diff"
+        );
+        assert!(!click_file(&mut s, 0));
+        assert_eq!((s.selected_file(), s.hunk_sel), (Some(0), 0));
+    }
+
+    /// A row of the `/` list is a click target, indexed in the WHOLE list.
+    #[test]
+    fn a_slash_row_is_a_target() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let rows = frame(&mut tui, &Scenario::new(), "/he", None, w, h);
+        let list = super::super::chrome::slash_list("/he");
+        let (idx, (cmd, _)) = list
+            .iter()
+            .enumerate()
+            .find(|(_, (c, _))| *c == "/help")
+            .expect("/help matches /he");
+        let o = click(&mut tui, at(&rows, cmd), false, w, h);
+        assert_eq!(o, MouseOutcome::Slash(idx));
+    }
+
+    /// Wheel and drag still belong to the panel under the pointer.
+    #[test]
+    fn the_wheel_still_scrolls_the_panel_under_it() {
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        frame(&mut tui, &Scenario::new(), "", None, w, h);
+        let m = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 80,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(m, &mut tui, Rect::new(0, 0, w, h), None, false);
+        assert!(tui.scrolls.contains(&3), "{:?}", tui.scrolls);
+        // …but not while an overlay is up.
+        let before = tui.scrolls.clone();
+        handle_mouse(m, &mut tui, Rect::new(0, 0, w, h), None, true);
+        assert_eq!(tui.scrolls, before);
     }
 }

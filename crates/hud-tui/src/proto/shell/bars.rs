@@ -114,6 +114,7 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     if let Some(panels) = &tb.switcher {
         for (num, title, attn) in panels {
             let on = *num - 1 == tb.focus_idx;
+            let from = x;
             if on {
                 x = cv.put(
                     x,
@@ -140,11 +141,13 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                     x = cv.put(x, 0, "◆ ", MAGENTA, Some(bg_at(x)), Modifier::BOLD);
                 }
             }
+            cv.hit(from, 0, x - from, 1, super::hits::Click::Panel(*num - 1));
             x += 1;
         }
     } else {
         for (i, name) in PRESET_TABS.iter().enumerate() {
             let label = format!(" {name} ");
+            let from = x;
             if tb.preset == Some(i) {
                 let pb = tint(MAGENTA, TOPBAR, 1.0);
                 x = cv.put(x, 0, &label, ON_ACCENT, Some(pb), Modifier::BOLD);
@@ -154,6 +157,7 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             } else {
                 x = cv.text(x, 0, &label, MUTED, Some(bg_at(x)));
             }
+            cv.hit(from, 0, x - from, 1, super::hits::Click::Preset(i));
             x += 1;
         }
         if tb.preset.is_none() {
@@ -474,23 +478,23 @@ pub fn status_line(
     x = cv.spans(x, y, &parts, Some(bg));
     cv.text(x, y, " ", INK, Some(bg));
 
+    // Esc stops a running turn wherever focus is; only when none runs does
+    // it start arranging.
+    let esc = if s.is_turning() {
+        ("esc", "stop")
+    } else {
+        ("esc", "arrange")
+    };
     let hints: Vec<(&str, &str)> = if s.approval_pending.is_some() {
         vec![("y", "allow"), ("n", "deny"), ("?", "keys")]
     } else if focus_is_diff {
-        vec![
-            ("j/k", "file"),
-            ("z", "zoom"),
-            ("esc", "arrange"),
-            ("i", "back to ORBIT"),
-        ]
+        vec![("j/k", "file"), ("z", "zoom"), esc, ("i", "back to ORBIT")]
     } else if !focus_is_conversation {
-        vec![("z", "zoom"), ("esc", "arrange"), ("i", "back to ORBIT")]
+        vec![("z", "zoom"), esc, ("i", "back to ORBIT")]
     } else if s.turn_live {
-        vec![
-            ("esc", "arrange panels"),
-            ("⌃c", "interrupt"),
-            ("?", "keys"),
-        ]
+        // While a turn runs Esc stops it (it cannot arrange), and ⌃c opens
+        // the quit card — it does not interrupt anything.
+        vec![("esc", "stop"), ("⌃c", "quit"), ("?", "keys")]
     } else {
         vec![("esc", "arrange panels"), (":", "commands"), ("?", "keys")]
     };

@@ -193,6 +193,26 @@ class PtySession:
             self.write(ch.encode())
             time.sleep(0.005)
 
+    def find_text(self, needle):
+        """(col, row) of `needle` on the emulated screen, or None. Built from
+        the cell grid, so a wide glyph earlier on a row cannot shift it."""
+        if self.screen is None:
+            return None
+        for y in range(self.screen.lines):
+            row = self.screen.buffer[y]
+            text = "".join((row[x].data or " ") for x in range(self.screen.columns))
+            i = text.find(needle)
+            if i >= 0:
+                return (i, y)
+        return None
+
+    def click(self, col, row):
+        """A left click at 0-based (col, row): an SGR mouse press and release
+        (what the terminal sends once the app enables mouse reporting)."""
+        self.write(f"\x1b[<0;{col + 1};{row + 1}M".encode())
+        time.sleep(0.03)
+        self.write(f"\x1b[<0;{col + 1};{row + 1}m".encode())
+
     def resize(self, rows, cols):
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         os.kill(self.proc.pid, signal.SIGWINCH)
@@ -720,6 +740,136 @@ def main():
     except Exception:
         mock3.terminate()
     _shutil.rmtree(work3, ignore_errors=True)
+
+    # ── 5e. The whole flow with the mouse ─────────────────────────────────
+    # Approve by clicking the card's buttons, switch layout from the top
+    # bar, select a file and open its diff by clicking, close the overlay
+    # by clicking outside it, and complete a `/` command by clicking its
+    # row. A clicked hint is the key it names, so every guard of the key
+    # applies — and what is drawn behind a modal cannot be clicked.
+    work4 = _tempfile.mkdtemp(prefix="orbit-pty-mouse-")
+    with open(os.path.join(work4, "calc.py"), "w") as fh:
+        fh.write("def add(a, b):\n    return a - b\n")
+    script4 = {"main": [
+        {"tools": [{"name": "Read", "args": {"file_path": os.path.join(work4, "calc.py")}}]},
+        {"tools": [{"name": "Edit", "args": {
+            "file_path": os.path.join(work4, "calc.py"),
+            "old_string": "return a - b", "new_string": "return a + b"}}]},
+        {"tools": [{"name": "Write", "args": {
+            "file_path": os.path.join(work4, "notes.txt"),
+            "content": "remember: add() was subtracting\n"}}]},
+        {"text": "Done: fixed add() and left a note."},
+    ]}
+    with open(os.path.join(work4, "script.json"), "w") as fh:
+        _json.dump(script4, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port4 = _ss.getsockname()[1]
+    _ss.close()
+    mock4 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port4), "--script", os.path.join(work4, "script.json"),
+         "--log", os.path.join(work4, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home4 = os.path.join(work4, "home")
+    subprocess.run([args.binary, "init", "--home", home4, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home4))
+    with open(os.path.join(home4, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port4}"\n'
+                 '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+    s4 = PtySession([args.binary, "--home", home4, "--model", "scripted"],
+                    env={"ORBIT_HOME": home4}, timeout=20, rows=48, cols=164, cwd=work4)
+    s4.wait_for("ORBIT", timeout=15)
+    pump(s4, 2.6)
+    s4.type("fix add")
+    s4.key("enter")
+    clicked = []
+    done4 = False
+    for _ in range(80):
+        pump(s4, 0.5)
+        txt = s4.screen_text()
+        if "left a note" in txt:
+            done4 = True
+            break
+        # The buttons are drawn only once the card has settled and the typing
+        # pause is over; the Edit approval uses the session button.
+        target = None
+        if "allow all Edit" in txt:
+            target = "allow all Edit"
+        elif "allow once" in txt:
+            target = "allow once"
+        if target:
+            pump(s4, 1.2)
+            pos = s4.find_text(target)
+            if pos:
+                s4.click(*pos)
+                clicked.append(target)
+                pump(s4, 0.8)
+    check("a round's approvals answered by clicking the card's buttons",
+          done4 and len(clicked) >= 2 and "allow once" in clicked,
+          f"{clicked}\n{s4.screen_text()[-400:]}")
+    # The top bar's `review` tab applies that layout.
+    pos = s4.find_text("review")
+    check("the review tab is in the top bar", pos is not None and pos[1] == 0, str(pos))
+    if pos:
+        s4.click(*pos)
+        pump(s4, 1.0)
+    t = s4.screen_text()
+    check("clicking the review tab switches to that layout",
+          "FILES" in t and "calc.py" in t and "notes.txt" in t, t[:1200])
+    # Click the second file's row: the pane follows (a created file: -0,0).
+    pos = None
+    for y in range(s4.screen.lines):
+        row = "".join((s4.screen.buffer[y][x].data or " ") for x in range(s4.screen.columns))
+        if "notes.txt" in row and "+1" in row:
+            pos = (row.find("notes.txt"), y)
+            break
+    check("the second file is listed", pos is not None, t[:800])
+    if pos:
+        s4.click(*pos)
+        pump(s4, 0.8)
+    t = s4.screen_text()
+    check("clicking a file row selects it and shows its diff",
+          "@@ -0,0 +1,1 @@" in t and "remember: add() was subtracting" in t, t[:1500])
+    if pos:
+        s4.click(*pos)
+        pump(s4, 1.0)
+    t = s4.screen_text()
+    check("clicking the selected file opens its full diff", "esc close" in t, t[:1500])
+    # Outside the overlay: closes it and does nothing behind it.
+    s4.click(2, 3)
+    pump(s4, 0.8)
+    t = s4.screen_text()
+    check("clicking outside the overlay closes it", "esc close" not in t, t[:800])
+    # A `/` row completes into the composer. The review layout has none:
+    # click back to the columns layout, then click into the composer.
+    pos = s4.find_text("columns")
+    check("the columns tab is in the top bar", pos is not None and pos[1] == 0, str(pos))
+    if pos:
+        s4.click(*pos)
+        pump(s4, 1.0)
+    pos = s4.find_text("Ask ORBIT")
+    check("the composer is back", pos is not None, s4.screen_text()[-600:])
+    if pos:
+        s4.click(*pos)  # clicking a panel focuses it
+        pump(s4, 0.5)
+    s4.type("/he")
+    pump(s4, 0.6)
+    pos = s4.find_text("/help")
+    check("the / list shows /help for `/he`", pos is not None, s4.screen_text()[-900:])
+    if pos:
+        s4.click(*pos)
+        pump(s4, 0.6)
+    t = s4.screen_text()
+    check("clicking a / row completes it into the composer (it does not run it)",
+          "/help " in t and "COMMANDS" not in t, t[-700:])
+    s4.terminate()
+    try:
+        os.killpg(mock4.pid, signal.SIGTERM)
+    except Exception:
+        mock4.terminate()
+    _shutil.rmtree(work4, ignore_errors=True)
 
     # ── 6. /sessions + /resume round-trip ──────────────────────────────────
     # A completed turn (the tool turn above) saved a session file.

@@ -87,8 +87,13 @@ pub fn keyhints(cv: &mut Cv, x: i32, y: i32, pairs: &[(&str, &str)], bg: Option<
         if i > 0 {
             x += 3;
         }
+        let from = x;
         x = cv.put(x, y, k, INK2, bg, Modifier::BOLD);
         x = cv.text(x + 1, y, l, FAINT, bg);
+        // Clicking a hint presses the key it names (when it names one).
+        if let Some((code, mods)) = super::hits::parse_key(k) {
+            cv.hit(from, y, x - from, 1, super::hits::Click::Key(code, mods));
+        }
     }
     x
 }

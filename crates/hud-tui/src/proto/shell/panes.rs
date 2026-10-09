@@ -139,6 +139,7 @@ fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         let first = (selected + 1).saturating_sub(rows);
         for (i, f) in files.iter().enumerate().skip(first).take(rows) {
             let yy = inner.y as i32 + (i - first) as i32;
+            cv.hit(r.x as i32 + 1, yy, r.width as i32 - 2, 1, super::hits::Click::File(i));
             let sel = i == selected;
             // M11: the changed row flashes for 600 ms and its counters
             // count up in 300 ms.
@@ -203,7 +204,7 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         View::Terminal,
         inp,
         b,
-        vec![("j/k", "scroll"), ("⌃c", "stop")],
+        vec![("j/k", "scroll")],
         vec![],
     ) else {
         return;
@@ -609,6 +610,7 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         let first = (selected + 1).saturating_sub(rows);
         for (i, f) in files.iter().enumerate().skip(first).take(rows) {
             let yy = y + 1 + (i - first) as i32;
+            cv.hit(x, yy, lw, 1, super::hits::Click::File(i));
             let sel = i == selected;
             let bg = if sel {
                 Some(tint(VIOLET, PANEL, 0.12))

@@ -113,16 +113,22 @@ pub fn clip_path(s: &str, n: i32) -> String {
     format!("…{}", tail.into_iter().collect::<String>())
 }
 
-/// The canvas: a buffer plus a clip rectangle.
+/// The canvas: a buffer plus a clip rectangle, and the clickable regions
+/// drawn so far (shared by every clipped view of the same canvas).
 pub struct Cv<'a> {
     pub buf: &'a mut Buffer,
     pub clip: Rect,
+    hits: std::rc::Rc<std::cell::RefCell<Vec<super::hits::Hit>>>,
 }
 
 impl<'a> Cv<'a> {
     pub fn new(buf: &'a mut Buffer) -> Self {
         let clip = buf.area;
-        Cv { buf, clip }
+        Cv {
+            buf,
+            clip,
+            hits: Default::default(),
+        }
     }
 
     /// Run `f` with the clip narrowed to `r` (intersected).
@@ -131,8 +137,49 @@ impl<'a> Cv<'a> {
         let mut inner = Cv {
             buf: &mut *self.buf,
             clip: inter,
+            hits: std::rc::Rc::clone(&self.hits),
         };
         f(&mut inner)
+    }
+
+    /// Mark the cells `(x, y, w, h)` clickable: a click there does `click`.
+    /// Only the part inside the clip counts — a control scrolled or clipped
+    /// out of sight must not be clickable where it cannot be seen.
+    pub fn hit(&mut self, x: i32, y: i32, w: i32, h: i32, click: super::hits::Click) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (x0, y0) = (x.max(0), y.max(0));
+        let (x1, y1) = ((x + w).max(0), (y + h).max(0));
+        let want = Rect {
+            x: x0.min(u16::MAX as i32) as u16,
+            y: y0.min(u16::MAX as i32) as u16,
+            width: (x1 - x0).clamp(0, u16::MAX as i32) as u16,
+            height: (y1 - y0).clamp(0, u16::MAX as i32) as u16,
+        };
+        let rect = self.clip.intersection(want);
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        self.hits
+            .borrow_mut()
+            .push(super::hits::Hit { rect, click });
+    }
+
+    /// How many regions exist now, to drop the ones drawn after this
+    /// point with `truncate_hits`.
+    pub fn hit_mark(&self) -> usize {
+        self.hits.borrow().len()
+    }
+
+    /// Forget the regions drawn since `mark`.
+    pub fn truncate_hits(&mut self, mark: usize) {
+        self.hits.borrow_mut().truncate(mark);
+    }
+
+    /// The regions drawn so far, in drawing order (later = on top).
+    pub fn take_hits(&mut self) -> Vec<super::hits::Hit> {
+        std::mem::take(&mut *self.hits.borrow_mut())
     }
 
     fn inside(&self, x: i32, y: i32) -> bool {

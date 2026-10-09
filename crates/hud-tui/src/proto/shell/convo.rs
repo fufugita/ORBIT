@@ -761,21 +761,32 @@ fn draw_approval(
     .into_iter()
     .find(|l| text_width(l) <= room)
     .unwrap_or_else(|| "allow all".to_string());
+    // Each is clickable as the key it shows: the click goes through the
+    // same handler, so the arming delay and the mode rules apply to it.
+    let key = |c: char| {
+        super::hits::Click::Key(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE,
+        )
+    };
     let mut kx = x + 3;
     for (k, lab) in [("y", "allow once"), ("R", session_label.as_str())] {
+        let from = kx;
         kx = keycap(cv, kx, yy, k, k == "y");
         kx = cv.text(kx + 1, yy, lab, INK2, Some(RAISE));
+        cv.hit(from, yy, kx - from, 1, key(k.chars().next().unwrap_or('y')));
         kx += 3;
     }
     let after_n = keycap(cv, deny_x, yy, "n", false);
     cv.bold(after_n + 1, yy, "esc", INK2, Some(RAISE));
-    cv.text(
+    let deny_end = cv.text(
         after_n + 1 + text_width("esc"),
         yy,
         " deny",
         FAINT,
         Some(RAISE),
     );
+    cv.hit(deny_x, yy, deny_end - deny_x, 1, key('n'));
     // `1 of N`, between the grants and the refusal when there is room.
     if let Some(n) = &ap.queue_note {
         let t = format!(" {n} ");
@@ -816,7 +827,7 @@ fn draw_composer(cv: &mut Cv, x: i32, y: i32, w: i32, inp: &ConvIn) {
     let hints: Vec<(&str, &str)> = if s.turn_live {
         vec![
             ("⏎", "queue"),
-            ("esc", "arrange"),
+            ("esc", "stop"),
             ("⇧⏎", "newline"),
             ("@", "file"),
             ("/", "commands"),
@@ -1001,6 +1012,8 @@ fn draw_completion(
     }
     for (i, (cmd, desc)) in shown.iter().enumerate() {
         let yy = top + i as i32;
+        // The window scrolls: the row's index is in the whole list.
+        cv.hit(x, yy, w, 1, super::hits::Click::Slash(start + i));
         let on = start + i == sel;
         let bg = if on {
             tint(MAGENTA, RAISE, 0.14)

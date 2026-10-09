@@ -11,6 +11,7 @@ pub mod canvas;
 pub mod convo;
 pub mod diffrows;
 pub mod frame;
+pub mod hits;
 pub mod mark;
 pub mod md;
 pub mod motion;
@@ -302,6 +303,12 @@ fn layout(area: Rect, tree: &Node, sidebar: bool) -> (Vec<(Rect, View)>, u16) {
 
 /// Draw the whole screen into `f`.
 pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
+    let _ = draw_with_hits(f, inp);
+}
+
+/// Draw the whole screen into `f` and return what the frame made
+/// clickable, in drawing order (later = on top).
+pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
     let area = f.area();
     let (w, h) = (area.width as i32, area.height as i32);
     let s = inp.scenario;
@@ -311,7 +318,7 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
     let narrow = area.width < 120;
     // A zoomed panel fills the screen the way a narrow one does.
     let one_at_a_time = narrow || sh.zoom;
-    {
+    let hits = {
         let mut cv = Cv::new(f.buffer_mut());
         cv.fill(0, 0, w, h, pal::APP);
 
@@ -453,6 +460,7 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
         }
 
         // Panels.
+        let panel_hits = cv.hit_mark();
         let heavy_ms = inp.fx.focus_ms;
         for (i, r, view) in &areas {
             // M20: the heavy border grows from the panel number both
@@ -528,6 +536,13 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
             });
         }
 
+        // While arranging, the panels are dimmed and numbered: a click
+        // focuses one (the runtime does that), it does not press the keys
+        // of a footer hint under the veil.
+        if sh.arranging {
+            cv.truncate_hits(panel_hits);
+        }
+
         // The closing panel's ghost: a fading flat card behind the
         // gliding survivors — read as the panel shrinking away.
         for (r, view, fade) in &ghosts {
@@ -601,6 +616,13 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
         );
 
         // Overlays on top: the picker, the palette/help/quit card, the toast.
+        // A modal swallows the clicks aimed at what is behind it: this
+        // region sits under the overlay's own, so only the overlay's
+        // controls (drawn after) answer, and a click anywhere else closes
+        // it.
+        if sh.picker.is_some() || inp.overlay.is_some() {
+            cv.hit(0, 0, w, h, hits::Click::Dismiss);
+        }
         if sh.picker.is_some() {
             overlays::picker(&mut cv, w, h, inp.fx.picker_ms, inp.now_ms, red);
         }
@@ -612,8 +634,10 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
                 &mut cv, w, h, t.text, t.ok, t.shown_ms, 3000, inp.now_ms, red,
             );
         }
-    }
+        cv.take_hits()
+    };
     tier::apply(f.buffer_mut(), inp.tier);
+    hits
 }
 
 fn view_colour(v: View) -> canvas::Rgb {

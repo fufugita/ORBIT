@@ -283,9 +283,9 @@ impl TerminalGuard {
         Self::enter_with(true)
     }
 
-    /// `mouse_capture = false` follows §12.4 (the MD's prototype:
-    /// mouse capture stays off — the terminal's native selection owns
-    /// the mouse).
+    /// `mouse_capture = true` (what the TUI uses) hands the mouse to the
+    /// app: clicks, the wheel, and per-panel selection. `false` leaves it
+    /// to the terminal's own selection.
     pub fn enter_with(mouse_capture: bool) -> Result<Self, String> {
         // NOTE: no locale forcing. Forcing LANG/LC_ALL to en_US.UTF-8 hides
         // non-UTF-8 terminals (H-7 hard downgrade); the glyph set is chosen

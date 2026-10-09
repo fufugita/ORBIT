@@ -271,6 +271,7 @@ fn palette(
             height: reveal.max(0) as u16,
         },
         |cv| {
+            cv.hit(x, y, w, h, super::hits::Click::Inert);
             cv.fill(x + 2, y + 1, w - 4, 1, INSET);
             cv.bold(x + 3, y + 1, "›", MAGENTA, Some(INSET));
             let e = cv.text(x + 5, y + 1, query, INK, Some(INSET));
@@ -287,6 +288,7 @@ fn palette(
             }
             for (i, (cmd, desc)) in items.iter().take(9).enumerate() {
                 let ry = y + 3 + i as i32;
+                cv.hit(x + 1, ry, w - 2, 1, super::hits::Click::Palette(i));
                 let on = i == sel;
                 let q: Vec<char> = query
                     .trim_start_matches('/')
@@ -454,11 +456,17 @@ fn quit(cv: &mut Cv, sw: i32, sh: i32, turn_live: bool) {
             Some(RAISE),
         );
     }
+    cv.hit(x, y, w, h, super::hits::Click::Inert);
     let ky = y + h - 2;
     let mut kx = x + 3;
     for (k, l, hot) in [("y", "quit", true), ("n", "stay", false)] {
+        let from = kx;
         kx = super::frame::keycap(cv, kx, ky, k, hot);
-        kx = cv.text(kx + 1, ky, l, INK2, Some(RAISE)) + 3;
+        kx = cv.text(kx + 1, ky, l, INK2, Some(RAISE));
+        if let Some((code, mods)) = super::hits::parse_key(k) {
+            cv.hit(from, ky, kx - from, 1, super::hits::Click::Key(code, mods));
+        }
+        kx += 3;
     }
 }
 
@@ -481,8 +489,22 @@ pub fn picker(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduce
             height: reveal.max(0) as u16,
         },
         |cv| {
+            cv.hit(x, y, bw, bh, super::hits::Click::Inert);
             for (i, v) in views.iter().enumerate() {
                 let yy = y + 2 + i as i32;
+                // A row picks its view, like the digit that names it.
+                if let Some(d) = char::from_digit(i as u32 + 1, 10) {
+                    cv.hit(
+                        x + 2,
+                        yy,
+                        bw - 4,
+                        1,
+                        super::hits::Click::Key(
+                            crossterm::event::KeyCode::Char(d),
+                            crossterm::event::KeyModifiers::NONE,
+                        ),
+                    );
+                }
                 let col = ident(*v);
                 cv.put(
                     x + 3,
