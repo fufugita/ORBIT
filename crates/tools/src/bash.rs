@@ -148,11 +148,14 @@ impl Tool for BashTool {
     }
     fn permission_key(&self, input: &serde_json::Value) -> crate::PermissionKey {
         let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        // The rule pattern is the first word (Bash(git *) style).
-        let first = cmd.split_whitespace().next().unwrap_or("");
+        // The whole line, as typed: a rule such as `Bash(cargo test *)`
+        // is about the words of the command, and an operator in the line
+        // (`; && |` and the rest) is what decides whether an allow rule may
+        // speak for it. The first word alone made `Bash(cargo test *)`
+        // unmatchable and let `Bash(cargo *)` allow `cargo x; anything`.
         crate::PermissionKey {
             tool: "Bash".into(),
-            pattern: first.to_string(),
+            pattern: cmd.trim().to_string(),
         }
     }
     fn run(&self, input: &serde_json::Value, cx: &ToolContext) -> ToolResult {
