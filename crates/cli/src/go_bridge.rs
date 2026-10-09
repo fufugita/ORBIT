@@ -554,6 +554,10 @@ struct GoToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for GoToolExecutor {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        crate::tool_runtime::remember_turn_config(&self.tool_cx, config);
+    }
+
     fn execute(
         &mut self,
         calls: &[orbit_engine::PendingToolCall],

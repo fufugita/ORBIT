@@ -1738,3 +1738,71 @@ fn scenario_c4_denial_is_typed_not_silent() {
         "C4: the denial reason reached the provider:\n{content}"
     );
 }
+
+// ── SA1: a subagent runs on the SESSION's provider ─────────────────
+// The Task tool derived its provider from ORBIT_GATE_URL / ORBIT_MODEL
+// and otherwise from a hard-coded 127.0.0.1:4001 and `glm-5.2`, so a
+// subagent never reached the gateway or model the session was using:
+// it failed (or, worse, went to whatever listened on 4001).
+#[test]
+fn scenario_sa1_subagent_runs_on_the_sessions_provider() {
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Task", "args": {
+                "agent": "Explore",
+                "prompt": "SUBAGENT: find where add() is defined\nthen report"}}]},
+            {"text": "the explorer is done"}],
+        "SUBAGENT:": [
+            {"tools": [{"name": "Read", "args": {"file_path": "calc.py"}}]},
+            {"text": "add() is defined in calc.py and it subtracts."}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let (events, _code) = run_p(&mock, &home, &fix.path, "go", &["--auto-tools"]);
+
+    // The subagent's requests reached THIS mock, on the session's model.
+    let reqs = mock.requests();
+    let sub: Vec<&serde_json::Value> = reqs
+        .iter()
+        .filter(|r| {
+            r["body"]["messages"]
+                .as_array()
+                .and_then(|m| m.iter().find(|m| m["role"] == "user"))
+                .and_then(|m| m["content"].as_str())
+                .is_some_and(|c| c.starts_with("SUBAGENT:"))
+        })
+        .collect();
+    assert_eq!(
+        sub.len(),
+        2,
+        "the subagent made a Read round and a final round on the session's gateway: {reqs:#?}"
+    );
+    for r in &sub {
+        assert_eq!(
+            r["body"]["model"], "mock-model",
+            "the subagent runs on the session's model, not a default"
+        );
+    }
+    // Its report came back to the parent as the Task result.
+    let last = reqs.last().expect("the parent's final request");
+    let tool_msg = last["body"]["messages"]
+        .as_array()
+        .and_then(|m| m.iter().rev().find(|m| m["role"] == "tool"))
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("");
+    assert!(
+        tool_msg.contains("it subtracts"),
+        "the Task result carries the subagent's report: {tool_msg}"
+    );
+    // The card says WHICH agent, and what it was asked.
+    let started = events
+        .iter()
+        .find(|e| e["type"] == "tool_started_full" && e["kind"] == "Task")
+        .expect("a tool_started_full for the Task call");
+    assert_eq!(
+        started["target"], "Explore · SUBAGENT: find where add() is defined",
+        "{started}"
+    );
+}

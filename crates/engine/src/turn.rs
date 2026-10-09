@@ -102,6 +102,40 @@ impl Default for TurnOptions {
     }
 }
 
+/// The one-line target a front-end shows for a call: the command, the
+/// path, the pattern — or, for a subagent, who and what. It reaches the
+/// screen and the stream (`stream-json` lands in CI logs), so it passes the
+/// secret scanner first, like every other summary of a call.
+fn call_target(name: &str, arguments: &[u8]) -> String {
+    let Ok(args) = serde_json::from_slice::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    let get = |key: &str| args.get(key).and_then(|v| v.as_str());
+    let raw = if matches!(name, "Task" | "Agent") {
+        let who = get("agent")
+            .or_else(|| get("agent_type"))
+            .or_else(|| get("subagent_type"))
+            .unwrap_or("");
+        let task = get("prompt")
+            .and_then(|p| p.lines().map(str::trim).find(|l| !l.is_empty()))
+            .unwrap_or("");
+        match (who.is_empty(), task.is_empty()) {
+            (false, false) => format!("{who} · {task}"),
+            (false, true) => who.to_string(),
+            (true, _) => task.to_string(),
+        }
+    } else {
+        get("command")
+            .or_else(|| get("file_path"))
+            .or_else(|| get("path"))
+            .or_else(|| get("pattern"))
+            .or_else(|| get("prompt"))
+            .map(String::from)
+            .unwrap_or_default()
+    };
+    orbit_tools::scan::scan_result(&raw).text
+}
+
 /// Run one prompt through the engine loop, updating `transcript` in
 /// place (the caller owns persistence). `cancel` is checked between
 /// rounds and during streaming (the provider layer aborts mid-stream).
@@ -125,6 +159,7 @@ pub fn run_turn(
         &serde_json::json!({ "prompt": prompt }),
     );
 
+    executor.begin_turn(config);
     transcript.push(user_message(prompt));
 
     let mut report = TurnReport::default();
@@ -304,26 +339,12 @@ pub fn run_turn(
 
         // The TUI's tool-line motion (M07/M08/M09/M10): the full
         // start (kind + target) before execution, the finish with a
-        // result fact after. Targets are display-safe (the CLI
-        // executor's summaries pass the secret scanner before this).
+        // result fact after.
         for tc in &o.tool_calls {
-            let target = String::from_utf8_lossy(&tc.arguments)
-                .parse::<serde_json::Value>()
-                .ok()
-                .and_then(|a| {
-                    a.get("command")
-                        .or_else(|| a.get("file_path"))
-                        .or_else(|| a.get("path"))
-                        .or_else(|| a.get("pattern"))
-                        .or_else(|| a.get("prompt"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                })
-                .unwrap_or_default();
             events(FrontendEvent::ToolStartedFull {
                 call_id: tc.id.clone(),
                 kind: tc.name.clone(),
-                target,
+                target: call_target(&tc.name, &tc.arguments),
             });
         }
         // Esc (MD §The agent loop): install the turn's cancel-checker
@@ -690,5 +711,69 @@ mod tests {
         assert!(is_retryable("ORBIT-E0407"));
         assert!(!is_retryable("ORBIT-E0402")); // auth: never retry
         assert!(!is_retryable("ORBIT-E0401")); // bad url: never retry
+    }
+
+    fn target(name: &str, args: serde_json::Value) -> String {
+        call_target(name, args.to_string().as_bytes())
+    }
+
+    #[test]
+    fn a_call_names_its_command_path_or_pattern() {
+        assert_eq!(
+            target("Bash", serde_json::json!({"command": "ls -la"})),
+            "ls -la"
+        );
+        assert_eq!(
+            target("Read", serde_json::json!({"file_path": "/a/b.rs"})),
+            "/a/b.rs"
+        );
+        assert_eq!(
+            target("Glob", serde_json::json!({"pattern": "**/*.py"})),
+            "**/*.py"
+        );
+        assert_eq!(
+            target("calculator", serde_json::json!({"expression": "1+1"})),
+            ""
+        );
+        assert_eq!(call_target("Bash", b"not json"), "");
+    }
+
+    /// A target reaches the screen and the `stream-json` events (CI logs):
+    /// a token in a command must not travel with it.
+    #[test]
+    fn a_target_never_carries_a_secret() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let t = target(
+            "Bash",
+            serde_json::json!({"command": format!("curl -H 'x-api-key: {secret}' https://api")}),
+        );
+        assert!(!t.contains(secret), "{t}");
+        assert!(
+            t.starts_with("curl"),
+            "the rest of the command still shows: {t}"
+        );
+    }
+
+    /// A subagent call says which agent and what it was asked.
+    #[test]
+    fn a_subagent_call_names_the_agent_and_the_task() {
+        assert_eq!(
+            target(
+                "Task",
+                serde_json::json!({"agent": "Explore", "prompt": "find add()\nthen report"})
+            ),
+            "Explore · find add()"
+        );
+        assert_eq!(
+            target(
+                "Agent",
+                serde_json::json!({"agent_type": "plan", "prompt": "outline"})
+            ),
+            "plan · outline"
+        );
+        assert_eq!(
+            target("Task", serde_json::json!({"prompt": "just do it"})),
+            "just do it"
+        );
     }
 }

@@ -265,7 +265,13 @@ pub enum Msg {
     /// A subagent's current action.
     SubagentProgress { id: String, action: String },
     /// A subagent finished with its report.
-    SubagentFinished { id: String, report: String },
+    /// `ok` is whether the subagent completed (false: it failed or was
+    /// stopped); `report` is its final words, or why it stopped.
+    SubagentFinished {
+        id: String,
+        report: String,
+        ok: bool,
+    },
     /// Context usage: tokens in use and the model's window.
     Usage {
         used_tokens: u64,

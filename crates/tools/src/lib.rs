@@ -102,6 +102,18 @@ pub struct ToolContext {
     /// last. Per context — not per process — so one session's Esc cannot
     /// reach another's commands. Shared by every clone.
     cancel: std::sync::Arc<std::sync::Mutex<Vec<CancelCheck>>>,
+    /// Values a front-end attaches for the code that runs its tools, by
+    /// type (the turn's provider configuration, a subagent observer). The
+    /// tools crate knows none of these types; it only carries them. Shared
+    /// by every clone, so what the session sets, a call sees.
+    extensions: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                std::any::TypeId,
+                std::sync::Arc<dyn std::any::Any + Send + Sync>,
+            >,
+        >,
+    >,
     /// The current turn's checkpoint id (E7): minted once per user
     /// prompt, shared by every Write/Edit in that turn — /rewind
     /// restores a turn, not a single call. Reset by the front-end at
@@ -132,7 +144,23 @@ impl ToolContext {
             output_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cancel: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             ledger_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            extensions: Default::default(),
         }
+    }
+
+    /// Attach `value` to this context, replacing an earlier value of the
+    /// same type.
+    pub fn set_ext<T: std::any::Any + Send + Sync>(&self, value: T) {
+        if let Ok(mut g) = self.extensions.lock() {
+            g.insert(std::any::TypeId::of::<T>(), std::sync::Arc::new(value));
+        }
+    }
+
+    /// The attached value of type `T`, if any.
+    pub fn ext<T: std::any::Any + Send + Sync>(&self) -> Option<std::sync::Arc<T>> {
+        let g = self.extensions.lock().ok()?;
+        let any = g.get(&std::any::TypeId::of::<T>())?.clone();
+        any.downcast::<T>().ok()
     }
 
     /// Announce every ledger record this session appends to `sink`.
@@ -618,6 +646,39 @@ pub fn resolve_path(cx: &ToolContext, p: &str) -> PathBuf {
         path.to_path_buf()
     } else {
         cx.working_dir.join(path)
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    struct Marker(u32);
+    struct Other;
+
+    fn cx() -> ToolContext {
+        ToolContext::new("/h".into(), "s".into(), "/w".into())
+    }
+
+    /// A value is found by its type, replaced by a later one, and shared by
+    /// every clone — what the session sets, a call's clone sees.
+    #[test]
+    fn a_value_is_found_by_type_and_shared_by_clones() {
+        let cx = cx();
+        assert!(cx.ext::<Marker>().is_none());
+        cx.set_ext(Marker(1));
+        let call = cx.clone();
+        assert_eq!(call.ext::<Marker>().as_deref(), Some(&Marker(1)));
+        assert!(call.ext::<Other>().is_none(), "another type is not found");
+        cx.set_ext(Marker(2));
+        assert_eq!(
+            call.ext::<Marker>().as_deref(),
+            Some(&Marker(2)),
+            "replaced"
+        );
+        // A different context has its own.
+        assert!(self::cx().ext::<Marker>().is_none());
     }
 }
 

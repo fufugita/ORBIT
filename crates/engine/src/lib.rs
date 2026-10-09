@@ -65,6 +65,13 @@ pub trait ToolExecutor {
     /// results in the model's order.
     fn execute(&mut self, calls: &[PendingToolCall], round: u32) -> Vec<ToolRoundResult>;
 
+    /// The turn is starting with this provider configuration (gateway,
+    /// model, credential, pricing). A tool that starts a nested turn — a
+    /// subagent — must run on the SAME provider as the session; the
+    /// executor keeps the configuration where its tools can reach it. The
+    /// default ignores it.
+    fn begin_turn(&mut self, _config: &TurnConfig) {}
+
     /// The turn is about to run a round's tools: its cancel token is now
     /// the current one. An executor that runs cancellable work (Bash)
     /// points its tool context at the token; the default ignores it.

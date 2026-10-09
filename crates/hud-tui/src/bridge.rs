@@ -518,10 +518,11 @@ pub fn emit_subagent_progress(sender: &BusSender, id: &str, action: &str) {
     });
 }
 
-pub fn emit_subagent_finished(sender: &BusSender, id: &str, report: &str) {
+pub fn emit_subagent_finished(sender: &BusSender, id: &str, report: &str, ok: bool) {
     sender.send(Msg::SubagentFinished {
         id: id.to_string(),
         report: safe_text(report),
+        ok,
     });
 }
 

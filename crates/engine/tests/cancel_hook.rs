@@ -55,9 +55,17 @@ struct StackExecutor {
     turn: CancelToken,
     log: Vec<&'static str>,
     top_cancelled_inside: Option<bool>,
+    model: String,
+    gate: String,
 }
 
 impl ToolExecutor for StackExecutor {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        self.log.push("turn");
+        self.model = config.model.clone();
+        self.gate = config.gate.clone();
+    }
+
     fn execute(&mut self, calls: &[PendingToolCall], _round: u32) -> Vec<ToolRoundResult> {
         self.log.push("execute");
         // The current token is the turn's: cancelling the turn shows
@@ -116,6 +124,8 @@ fn the_engine_scopes_the_turn_token_around_each_rounds_tools() {
         turn: turn.clone(),
         log: Vec::new(),
         top_cancelled_inside: None,
+        model: String::new(),
+        gate: String::new(),
     };
     let mut transcript: Vec<ChatMessage> = Vec::new();
     let mut events = |_ev: orbit_frontend_protocol::FrontendEvent| {};
@@ -135,8 +145,15 @@ fn the_engine_scopes_the_turn_token_around_each_rounds_tools() {
 
     assert_eq!(
         executor.log,
-        ["begin", "execute", "end"],
-        "the turn's token is current for the round's tools, then it is not"
+        ["turn", "begin", "execute", "end"],
+        "the executor is told the turn's configuration first, then the \
+         turn's token is current for the round's tools, then it is not"
+    );
+    assert_eq!(executor.model, "test-model", "the turn's own model");
+    assert!(
+        executor.gate.starts_with("http://127.0.0.1:"),
+        "the turn's own gateway: {}",
+        executor.gate
     );
     assert_eq!(
         executor.top_cancelled_inside,

@@ -2,7 +2,7 @@
 //! Context, Review and Agent. Each draws only what the engine has
 //! actually sent; an empty panel shows the prototype's empty state.
 
-use super::canvas::{clip_path, clip_text, mix, text_width, tint, Cv, Rgb, Seg};
+use super::canvas::{clip_path, clip_text, mix, text_width, tint, wrap_ranges, Cv, Rgb, Seg};
 use super::convo::kind_of;
 use super::diffrows;
 use super::frame::{badge, empty_state, panel_frame, BadgeState, FrameSpec};
@@ -712,7 +712,8 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
     let mine: Vec<_> = s
         .agents
         .values()
-        .filter(|a| inp.agent.is_empty() || a.name == inp.agent)
+        // "Explore" (the agent's own name) shows in the panel named "explore".
+        .filter(|a| inp.agent.is_empty() || a.name.eq_ignore_ascii_case(inp.agent))
         .collect();
     let b = if mine.iter().any(|a| !a.done) {
         badge(BadgeState::Working, None, inp.now_ms, inp.reduced)
@@ -761,24 +762,84 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             );
             return;
         }
-        let (x, y, w) = (inner.x as i32, inner.y as i32, inner.width as i32);
-        for (i, a) in mine.iter().enumerate() {
-            let yy = y + i as i32 * 3;
+        let (x, y, w, h) = (
+            inner.x as i32,
+            inner.y as i32,
+            inner.width as i32,
+            inner.height as i32,
+        );
+        // One block per agent: who and how long, what it was asked, then
+        // what it is doing — or, once it has finished, what it reported.
+        //
+        //   ◜ Explore                                    12s
+        //     find where add() is defined
+        //     ▸ Read calc.py
+        let mut yy = y;
+        for a in &mine {
+            if yy >= y + h {
+                break;
+            }
             // M15: arcs turn at 10 fps.
             let arc = if inp.reduced {
                 "●"
             } else {
                 ["◜", "◝", "◞", "◟"][((secs(inp.now_ms) * 10.0) as usize) & 3]
             };
-            cv.bold(
-                x,
-                yy,
-                if a.done { "✓" } else { arc },
-                if a.done { GREEN } else { CYAN },
-                None,
+            let (glyph, gcol) = match (a.done, a.ok) {
+                (false, _) => (arc, CYAN),
+                (true, true) => ("✓", GREEN),
+                (true, false) => ("✕", RED),
+            };
+            let (dur, _) = crate::proto::runtime::format_duration(
+                a.done_ms.unwrap_or(inp.now_ms).saturating_sub(a.started_ms),
             );
-            cv.bold(x + 2, yy, &clip_text(&a.name, w - 3), INK, None);
-            cv.text(x + 2, yy + 1, &clip_text(&a.action, w - 3), MUTED, None);
+            let (status, scol) = match (a.done, a.ok) {
+                (false, _) => (dur, MUTED),
+                (true, true) => (format!("done · {dur}"), GREEN),
+                (true, false) => (format!("failed · {dur}"), RED),
+            };
+            let sw = text_width(&status);
+            cv.bold(x, yy, glyph, gcol, None);
+            cv.bold(x + 2, yy, &clip_text(&a.name, w - 5 - sw), INK, None);
+            cv.text(x + w - sw, yy, &status, scol, None);
+            yy += 1;
+            if !a.task.is_empty() {
+                cv.text(x + 2, yy, &clip_text(&a.task, w - 3), MUTED, None);
+                yy += 1;
+            }
+            if !a.done {
+                let (line, col) = if a.action.is_empty() {
+                    ("starting…".to_string(), FAINT)
+                } else {
+                    (format!("▸ {}", a.action), INK2)
+                };
+                cv.text(x + 2, yy, &clip_text(&line, w - 3), col, None);
+                yy += 1;
+            } else {
+                // Its report, wrapped, at most four lines.
+                let report = a.report.trim();
+                let (text, col) = if report.is_empty() {
+                    ("(no report)", FAINT)
+                } else if a.ok {
+                    (report, INK2)
+                } else {
+                    (report, RED)
+                };
+                let chars: Vec<char> = text.chars().collect();
+                let lines = wrap_ranges(text, w - 3);
+                for (n, (s, e)) in lines.iter().take(4).enumerate() {
+                    if yy >= y + h {
+                        break;
+                    }
+                    let mut line: String = chars[*s..*e].iter().collect();
+                    if n == 3 && lines.len() > 4 {
+                        line = clip_text(&format!("{line}…"), w - 3);
+                    }
+                    cv.text(x + 2, yy, &line, col, None);
+                    yy += 1;
+                }
+            }
+            yy += 1; // a gap between agents
         }
     });
 }

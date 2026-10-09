@@ -1453,6 +1453,10 @@ struct HeadlessToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        tool_runtime::remember_turn_config(&self.tool_cx, config);
+    }
+
     fn execute(
         &mut self,
         calls: &[orbit_engine::PendingToolCall],
@@ -2061,6 +2065,10 @@ struct ReplToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for ReplToolExecutor {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        tool_runtime::remember_turn_config(&self.tool_cx, config);
+    }
+
     fn execute(
         &mut self,
         calls: &[orbit_engine::PendingToolCall],

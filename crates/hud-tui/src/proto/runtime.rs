@@ -1699,8 +1699,11 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 id.clone(),
                 super::scenario::Agent {
                     name,
-                    action: task,
+                    task,
+                    action: String::new(),
+                    report: String::new(),
                     done: false,
+                    ok: true,
                     started_ms: now_ms,
                     done_ms: None,
                 },
@@ -1731,17 +1734,18 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 card.meta = action;
             }
         }
-        Msg::SubagentFinished { id, report } => {
+        Msg::SubagentFinished { id, report, ok } => {
             let name = scenario.agents.get(&id).map(|a| a.name.clone());
             if let Some(a) = scenario.agents.get_mut(&id) {
-                a.action = report;
+                a.report = report;
+                a.ok = ok;
                 a.done = true;
                 a.done_ms = Some(now_ms);
             }
             scenario.agents_running = scenario.agents.values().filter(|a| !a.done).count();
             // The agent-done toast (§9.13): a finished subagent must
             // not pass silently — the operator may be looking away.
-            return name.map(|n| format!("agent {n} done"));
+            return name.map(|n| format!("agent {n} {}", if ok { "done" } else { "failed" }));
         }
         Msg::Usage {
             used_tokens,
@@ -2949,5 +2953,87 @@ mod click_tests {
         let before = tui.scrolls.clone();
         handle_mouse(m, &mut tui, Rect::new(0, 0, w, h), None, true);
         assert_eq!(tui.scrolls, before);
+    }
+}
+
+#[cfg(test)]
+mod subagent_tests {
+    use super::*;
+    use crate::msg::Msg;
+
+    fn start(s: &mut Scenario, now: u64) {
+        apply_msg(
+            Msg::SubagentStarted {
+                id: "a1".into(),
+                name: "Explore".into(),
+                task: "find where add() is defined".into(),
+            },
+            s,
+            now,
+        );
+    }
+
+    /// A subagent is listed with what it was asked, what it is doing, and
+    /// — once it ends — what it reported. The task used to be overwritten
+    /// by the first progress line and the report by nothing at all.
+    #[test]
+    fn a_subagent_has_a_task_an_action_and_a_report() {
+        let mut s = Scenario::new();
+        start(&mut s, 1_000);
+        let a = &s.agents["a1"];
+        assert_eq!(a.task, "find where add() is defined");
+        assert!(a.action.is_empty(), "nothing started yet");
+        assert!(!a.done && a.ok);
+        assert_eq!(s.agents_running, 1);
+
+        apply_msg(
+            Msg::SubagentProgress {
+                id: "a1".into(),
+                action: "Read calc.py".into(),
+            },
+            &mut s,
+            2_000,
+        );
+        let a = &s.agents["a1"];
+        assert_eq!(a.action, "Read calc.py");
+        assert_eq!(a.task, "find where add() is defined", "the task stays");
+
+        let toast = apply_msg(
+            Msg::SubagentFinished {
+                id: "a1".into(),
+                report: "add() is in calc.py".into(),
+                ok: true,
+            },
+            &mut s,
+            4_000,
+        );
+        assert_eq!(toast.as_deref(), Some("agent Explore done"));
+        let a = &s.agents["a1"];
+        assert!(a.done && a.ok);
+        assert_eq!(a.report, "add() is in calc.py");
+        assert_eq!(a.action, "Read calc.py", "its last action is kept");
+        assert_eq!(a.done_ms, Some(4_000));
+        assert_eq!(s.agents_running, 0);
+    }
+
+    /// A subagent that failed or was stopped says so: the toast and the
+    /// panel must not call it done.
+    #[test]
+    fn a_failed_subagent_is_not_called_done() {
+        let mut s = Scenario::new();
+        start(&mut s, 1_000);
+        let toast = apply_msg(
+            Msg::SubagentFinished {
+                id: "a1".into(),
+                report: "ORBIT-E0403 credential_rejected".into(),
+                ok: false,
+            },
+            &mut s,
+            2_000,
+        );
+        assert_eq!(toast.as_deref(), Some("agent Explore failed"));
+        let a = &s.agents["a1"];
+        assert!(a.done && !a.ok);
+        assert_eq!(a.report, "ORBIT-E0403 credential_rejected");
     }
 }

@@ -131,16 +131,37 @@ fn session_tool_context(config: &TuiTurnConfig, sender: &BusSender) -> orbit_too
         config.session_id.clone(),
         std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
     );
-    let sender = sender.clone();
+    let ledger_sender = sender.clone();
     cx.set_ledger_sink(Some(std::sync::Arc::new(
         move |n: &orbit_tools::LedgerNote| {
             orbit_hud_tui::emit_activity(
-                &sender,
+                &ledger_sender,
                 n.kind,
                 &display_summary(&n.target),
                 &n.fact,
                 Some(&n.digest),
             );
+        },
+    )));
+    // A subagent the session starts shows in the Agent panels and on its
+    // Task card as it works.
+    let agent_sender = sender.clone();
+    cx.set_ext(crate::tool_runtime::SubagentObserver(std::sync::Arc::new(
+        move |u: &crate::tool_runtime::SubagentUpdate| {
+            use crate::tool_runtime::SubagentUpdate as U;
+            match u {
+                U::Started { id, name, task } => {
+                    orbit_hud_tui::emit_subagent_started(&agent_sender, id, name, task)
+                }
+                U::Progress { id, action } => orbit_hud_tui::emit_subagent_progress(
+                    &agent_sender,
+                    id,
+                    &display_summary(action),
+                ),
+                U::Finished { id, ok, report } => {
+                    orbit_hud_tui::emit_subagent_finished(&agent_sender, id, report, *ok)
+                }
+            }
         },
     )));
     cx
@@ -1539,7 +1560,7 @@ pub fn run_tui_turn(
                 orbit_hud_tui::emit_subagent_progress(sender, &agent_id, &action);
             }
             E::SubagentFinished { agent_id, report } => {
-                orbit_hud_tui::emit_subagent_finished(sender, &agent_id, &report);
+                orbit_hud_tui::emit_subagent_finished(sender, &agent_id, &report, true);
             }
             E::ModeChanged { mode } => {
                 orbit_hud_tui::emit_mode_changed(sender, &mode);
@@ -1647,6 +1668,10 @@ struct TuiToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for TuiToolExecutor {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        crate::tool_runtime::remember_turn_config(&self.tool_cx, config);
+    }
+
     fn execute(
         &mut self,
         calls: &[orbit_engine::PendingToolCall],

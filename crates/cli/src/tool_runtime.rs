@@ -508,7 +508,8 @@ pub fn execute_call(
             )?;
             return Ok((output, None));
         }
-        let turn_config = subagent_turn_config(home);
+        let turn_config = session_subagent_config(tool_cx, home);
+        let observer = tool_cx.ext::<SubagentObserver>();
         let output = match crate::tools::execute_task(
             home,
             agent,
@@ -516,6 +517,7 @@ pub fn execute_call(
             &turn_config,
             approval,
             tool_cx.cancel_check(),
+            observer.as_deref().map(|o| &*o.0),
         ) {
             Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
             Err(e) => tool_error(&e),
@@ -1122,6 +1124,12 @@ pub struct SubagentExecutor<'a> {
 }
 
 impl<'a> SubagentExecutor<'a> {
+    /// The subagent's id: also the session id of its ledger records, so
+    /// what a front-end shows can be matched to the chain.
+    pub fn id(&self) -> &str {
+        &self.session_id
+    }
+
     pub fn new(home: std::path::PathBuf, approval: &'a mut dyn ApprovalChannel) -> Self {
         let session_id = format!("subagent-{}", ulid::Ulid::new());
         let working_dir =
@@ -1139,6 +1147,10 @@ impl<'a> SubagentExecutor<'a> {
 }
 
 impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        remember_turn_config(&self.tool_cx, config);
+    }
+
     fn execute(
         &mut self,
         calls: &[crate::PendingToolCall],
@@ -1181,9 +1193,60 @@ impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
     }
 }
 
-/// Derive the TurnConfig for a subagent from the same sources the
-/// front-ends use (env + providers.toml), so provider/gate/model match
-/// the parent session.
+/// The provider configuration of the turn a session is running (gateway,
+/// model, credential, pricing), kept on the session's tool context. A
+/// subagent runs on THIS, not on whatever the environment names.
+pub struct SessionTurnConfig(pub orbit_engine::TurnConfig);
+
+/// Keep the running turn's provider configuration where its tools can
+/// reach it. Every front-end's executor does this when the engine starts a
+/// turn (`ToolExecutor::begin_turn`).
+pub fn remember_turn_config(cx: &orbit_tools::ToolContext, config: &orbit_engine::TurnConfig) {
+    cx.set_ext(SessionTurnConfig(config.clone()));
+}
+
+/// What a subagent is doing, for a front-end that shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentUpdate {
+    Started {
+        id: String,
+        name: String,
+        task: String,
+    },
+    /// The subagent started a tool call (or a new round): what it is doing.
+    Progress { id: String, action: String },
+    /// Its turn ended: `ok` is whether it completed, `report` its final
+    /// words (or the error that stopped it).
+    Finished {
+        id: String,
+        ok: bool,
+        report: String,
+    },
+}
+
+/// Where a front-end wants subagent updates; attached to its tool context
+/// with `set_ext`.
+#[derive(Clone)]
+pub struct SubagentObserver(pub std::sync::Arc<dyn Fn(&SubagentUpdate) + Send + Sync>);
+
+/// The configuration a subagent runs on: the SESSION's (same gateway,
+/// model, credential and pricing as the turn that called it), without
+/// sampling overrides (E8: subagents inherit none). Only a context that
+/// was never told (a test, a bare executor) falls back to the environment.
+fn session_subagent_config(cx: &orbit_tools::ToolContext, home: &Path) -> orbit_engine::TurnConfig {
+    match cx.ext::<SessionTurnConfig>() {
+        Some(session) => {
+            let mut config = session.0.clone();
+            config.sampling = None;
+            config
+        }
+        None => subagent_turn_config(home),
+    }
+}
+
+/// Derive a TurnConfig for a subagent from the environment alone
+/// (ORBIT_GATE_URL, ORBIT_MODEL, …). Only the fallback: a session's own
+/// configuration (`SessionTurnConfig`) is what a subagent normally runs on.
 pub fn subagent_turn_config(_home: &Path) -> orbit_engine::TurnConfig {
     let gate = std::env::var("ORBIT_GATE_URL").unwrap_or_else(|_| "http://127.0.0.1:4001".into());
     let model = std::env::var("ORBIT_MODEL").unwrap_or_else(|_| "glm-5.2".into());
@@ -1228,6 +1291,55 @@ mod tests {
             "test-session".into(),
             work_dir.to_path_buf(),
         )
+    }
+
+    fn session_config(model: &str) -> orbit_engine::TurnConfig {
+        orbit_engine::TurnConfig {
+            provider_id: "mine".into(),
+            gate: "https://gateway.example:8443/v1".into(),
+            model: model.into(),
+            kind: orbit_engine::ProviderKind::Anthropic,
+            credential_env: Some("MY_KEY".into()),
+            pricing: None,
+            max_output_tokens: 4096,
+            sampling: Some((Some(0.2), None)),
+        }
+    }
+
+    /// A subagent runs on the SESSION's provider, model and credential; it
+    /// used to read ORBIT_GATE_URL / ORBIT_MODEL, which only `-p` exports, and
+    /// otherwise fall back to a hard-coded gateway and model.
+    #[test]
+    fn a_subagent_inherits_the_sessions_provider() {
+        let cx = test_cx(&test_home("sub-inherit"));
+        remember_turn_config(&cx, &session_config("m1"));
+        let c = session_subagent_config(&cx, std::path::Path::new("/h"));
+        assert_eq!(c.gate, "https://gateway.example:8443/v1");
+        assert_eq!(c.model, "m1");
+        assert_eq!(c.provider_id, "mine");
+        assert_eq!(c.credential_env.as_deref(), Some("MY_KEY"));
+        assert_eq!(c.kind, orbit_engine::ProviderKind::Anthropic);
+        assert_eq!(c.max_output_tokens, 4096);
+        // E8: sampling overrides are the session's, not the subagent's.
+        assert!(c.sampling.is_none());
+        // The next turn (after /model) is what the next subagent runs on.
+        remember_turn_config(&cx, &session_config("m2"));
+        assert_eq!(
+            session_subagent_config(&cx, std::path::Path::new("/h")).model,
+            "m2"
+        );
+    }
+
+    /// Only a context nobody told (a test, a bare executor) reads the
+    /// environment.
+    #[test]
+    fn a_bare_context_falls_back_to_the_environment() {
+        let cx = test_cx(&test_home("sub-bare"));
+        let c = session_subagent_config(&cx, std::path::Path::new("/h"));
+        assert_eq!(
+            c.gate,
+            subagent_turn_config(std::path::Path::new("/h")).gate
+        );
     }
 
     /// A channel that always returns the given verdict (for tests).

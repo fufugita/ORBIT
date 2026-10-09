@@ -1065,6 +1065,105 @@ mod tests {
         );
     }
 
+    fn agent(
+        name: &str,
+        task: &str,
+        action: &str,
+        done: Option<(bool, &str)>,
+    ) -> crate::proto::scenario::Agent {
+        crate::proto::scenario::Agent {
+            name: name.into(),
+            task: task.into(),
+            action: action.into(),
+            report: done.map(|(_, r)| r.to_string()).unwrap_or_default(),
+            done: done.is_some(),
+            ok: done.map(|(ok, _)| ok).unwrap_or(true),
+            started_ms: 1_500,
+            done_ms: done.map(|_| 3_500),
+        }
+    }
+
+    /// A running subagent shows who, for how long, what it was asked, and
+    /// what it is doing right now.
+    #[test]
+    fn the_agent_panel_shows_a_running_subagent() {
+        let mut s = busy();
+        s.agents.insert(
+            "a1".into(),
+            agent(
+                "Explore",
+                "find where add() is defined",
+                "Read calc.py",
+                None,
+            ),
+        );
+        let out = render(&app_with(Preset::Agents), &s, 164, 48);
+        for want in [
+            "Agent · explore",
+            "Explore",
+            "3.5s",
+            "find where add() is defined",
+            "▸ Read calc.py",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        // The panel named `review` shows nobody else's agent.
+        assert!(out.contains("No agent yet"), "{out}");
+    }
+
+    /// A finished subagent shows its report, wrapped; a failed one says
+    /// failed, in words and a glyph.
+    #[test]
+    fn the_agent_panel_shows_how_it_ended() {
+        let mut s = busy();
+        s.agents.insert(
+            "a1".into(),
+            agent(
+                "Explore",
+                "find add()",
+                "Read calc.py",
+                Some((
+                    true,
+                    "add() is defined in calc.py and it subtracts instead of adding.",
+                )),
+            ),
+        );
+        let out = render(&app_with(Preset::Agents), &s, 164, 48);
+        for want in ["✓", "done · 2.0s", "subtracts instead", "find add()"] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert!(
+            !out.contains("▸ Read calc.py"),
+            "a finished agent shows its report, not its last action"
+        );
+
+        let mut f = busy();
+        f.agents.insert(
+            "a1".into(),
+            agent(
+                "Explore",
+                "find add()",
+                "",
+                Some((false, "ORBIT-E0403 credential_rejected")),
+            ),
+        );
+        let out = render(&app_with(Preset::Agents), &f, 164, 48);
+        for want in ["✕", "failed · 2.0s", "credential_rejected"] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+    }
+
+    /// The panel is named in lower case ("explore"), the agent in its own
+    /// ("Explore"): they still match.
+    #[test]
+    fn an_agent_panel_matches_its_agent_whatever_the_case() {
+        let mut s = busy();
+        s.agents
+            .insert("a1".into(), agent("explore", "t", "", None));
+        let out = render(&app_with(Preset::Agents), &s, 164, 48);
+        assert!(out.contains("starting…"), "{out}");
+    }
+
     /// In a side column a record takes two lines: the OUTCOME and the proof
     /// hash on the first (nothing a long command can clip), the target
     /// under it.

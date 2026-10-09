@@ -432,6 +432,10 @@ struct WebToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for WebToolExecutor {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        orbit_cli::tool_runtime::remember_turn_config(&self.tool_cx, config);
+    }
+
     fn execute(
         &mut self,
         calls: &[orbit_engine::PendingToolCall],

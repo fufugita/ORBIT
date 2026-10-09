@@ -259,8 +259,15 @@ pub enum LineKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agent {
     pub name: String,
+    /// What it was asked to do (its prompt's first line).
+    pub task: String,
+    /// What it is doing now (its latest tool call); empty until it starts one.
     pub action: String,
+    /// Its final words once it has finished, or why it stopped.
+    pub report: String,
     pub done: bool,
+    /// Whether it completed: false when it failed or was stopped.
+    pub ok: bool,
     /// When it started / finished (M15, M16).
     pub started_ms: u64,
     pub done_ms: Option<u64>,

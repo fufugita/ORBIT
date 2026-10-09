@@ -871,6 +871,98 @@ def main():
         mock4.terminate()
     _shutil.rmtree(work4, ignore_errors=True)
 
+    # ── 5f. A subagent runs on the session's provider, and shows ───────────
+    # The Task tool took its gateway and model from ORBIT_GATE_URL/ORBIT_MODEL
+    # and otherwise from 127.0.0.1:4001 / glm-5.2. Only `-p` exports those, so
+    # in the TUI a subagent never reached the session's provider: it failed,
+    # and no event ever told the Agent panel it existed.
+    work5 = _tempfile.mkdtemp(prefix="orbit-pty-agent-")
+    with open(os.path.join(work5, "calc.py"), "w") as fh:
+        fh.write("def add(a, b):\n    return a - b\n")
+    script5 = {
+        "main": [
+            {"tools": [{"name": "Task", "args": {
+                "agent": "Explore",
+                "prompt": "SUBAGENT: find where add() is defined"}}]},
+            {"text": "The explorer is done."},
+        ],
+        "SUBAGENT:": [
+            {"tools": [{"name": "Read", "args": {"file_path": os.path.join(work5, "calc.py")}}]},
+            {"text": "add() is defined in calc.py and it subtracts."},
+        ],
+    }
+    with open(os.path.join(work5, "script.json"), "w") as fh:
+        _json.dump(script5, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port5 = _ss.getsockname()[1]
+    _ss.close()
+    mock5 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port5), "--script", os.path.join(work5, "script.json"),
+         "--log", os.path.join(work5, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home5 = os.path.join(work5, "home")
+    subprocess.run([args.binary, "init", "--home", home5, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home5))
+    with open(os.path.join(home5, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port5}"\n'
+                 '[[provider.models]]\nid = "scripted-sa"\ncontext_window = 200000\n')
+    # Neither variable is set: the session's own configuration must be used.
+    env5 = {k: v for k, v in os.environ.items() if k not in ("ORBIT_GATE_URL", "ORBIT_MODEL", "ORBIT_PROVIDER")}
+    env5["ORBIT_HOME"] = home5
+    s5 = PtySession([args.binary, "--home", home5, "--model", "scripted-sa"],
+                    env=env5, timeout=20, rows=48, cols=164, cwd=work5)
+    s5.wait_for("ORBIT", timeout=15)
+    pump(s5, 2.6)
+    s5.type("explore")
+    s5.key("enter")
+    done5 = False
+    for _ in range(80):
+        pump(s5, 0.5)
+        txt = s5.screen_text()
+        if "explorer is done" in txt:
+            done5 = True
+            break
+        if "allow once" in txt or "Allow " in txt:
+            pump(s5, 1.4)
+            s5.key("y")
+            pump(s5, 0.6)
+    check("a round that starts a subagent completes in the TUI", done5, s5.screen_text()[-400:])
+    reqs5 = []
+    try:
+        with open(os.path.join(work5, "req.jsonl")) as fh:
+            reqs5 = [_json.loads(l) for l in fh if l.strip()]
+    except OSError:
+        pass
+    def _first_user(r):
+        for m in r.get("body", {}).get("messages", []):
+            if m.get("role") == "user":
+                c = m.get("content")
+                return c if isinstance(c, str) else ""
+        return ""
+    sub5 = [r for r in reqs5 if _first_user(r).startswith("SUBAGENT:")]
+    check("the subagent's requests reached the session's gateway",
+          len(sub5) == 2, f"{len(reqs5)} requests, {len(sub5)} from the subagent")
+    check("…on the session's model",
+          bool(sub5) and all(r["body"].get("model") == "scripted-sa" for r in sub5),
+          str([r["body"].get("model") for r in sub5]))
+    # The Agent panel knows it: click the agents layout tab.
+    pos = s5.find_text("agents")
+    if pos and pos[1] == 0:
+        s5.click(*pos)
+        pump(s5, 1.0)
+    t = s5.screen_text()
+    check("the Agent panel shows the subagent, finished",
+          "Explore" in t and "done" in t and "subtracts" in t, t[:1400])
+    s5.terminate()
+    try:
+        os.killpg(mock5.pid, signal.SIGTERM)
+    except Exception:
+        mock5.terminate()
+    _shutil.rmtree(work5, ignore_errors=True)
+
     # ── 6. /sessions + /resume round-trip ──────────────────────────────────
     # A completed turn (the tool turn above) saved a session file.
     # The worker emits "session_id model=X turns=X" as a SystemMessage.
