@@ -464,7 +464,23 @@ fn dispatch_with_retry(
             &options.session_id,
         );
         match result {
-            Ok(o) => return Ok(o),
+            Ok(o) => {
+                // The egress record was durable BEFORE the request left
+                // (GW-04); tell the front-end its hash, now that the round
+                // has finished, so the proof surface lists it.
+                if let Some(digest) = &o.egress_digest {
+                    events(FrontendEvent::LedgerAppended {
+                        record_count: orbit_ledger::count_records(&home.join("ledger")),
+                        head_digest: digest.clone(),
+                        kind: "egress".into(),
+                        summary: format!(
+                            "{} · {} in / {} out",
+                            config.model, o.input_tokens, o.output_tokens
+                        ),
+                    });
+                }
+                return Ok(o);
+            }
             Err((code, msg)) if is_retryable(code) && attempt < options.max_attempts => {
                 // Exponential backoff with jitter: 1s, 2s, 4s, … capped
                 // at 32s; ~8 attempts span about two minutes.

@@ -256,7 +256,7 @@ pub fn execute_call(
     let arguments_sha256 = hex::encode(Sha256::digest(&call.arguments));
     let mut writer = LedgerWriter::open(&home.join("ledger"), "orbit-tool".into(), "0.1.0")
         .map_err(|e| format!("open ledger: {e}"))?;
-    writer
+    let intent_digest = writer
         .append(LedgerEvent::ToolIntent(ToolIntent {
             session_id: session_id.into(),
             decision_id: decision_id.into(),
@@ -266,6 +266,12 @@ pub fn execute_call(
             arguments_bytes: call.arguments.len() as u64,
         }))
         .map_err(|e| format!("record tool intent: {e}"))?;
+    tool_cx.note_ledger(orbit_tools::LedgerNote {
+        kind: "intent",
+        target: safe_call_summary(call),
+        fact: "requested".to_string(),
+        digest: intent_digest,
+    });
     // LedgerWriter::append is the durability boundary (append+fsync), so no
     // execution may happen before the call returns successfully.
 
@@ -370,7 +376,7 @@ pub fn execute_call(
     } else {
         "operator denied"
     };
-    writer
+    let verdict_digest = writer
         .append(LedgerEvent::ToolVerdict(ToolVerdict {
             session_id: session_id.into(),
             decision_id: decision_id.into(),
@@ -380,6 +386,12 @@ pub fn execute_call(
             reason: reason.into(),
         }))
         .map_err(|e| format!("record tool verdict: {e}"))?;
+    tool_cx.note_ledger(orbit_tools::LedgerNote {
+        kind: "verdict",
+        target: safe_call_summary(call),
+        fact: format!("{} — {reason}", if allowed { "allowed" } else { "denied" }),
+        digest: verdict_digest,
+    });
 
     // Plain grammar (§11.4): the verdict is one stamped line on stdout —
     // words not glyphs, greppable, screen-reader friendly. Only in plain
@@ -410,7 +422,15 @@ pub fn execute_call(
         let output = tool_denial(reason);
         // D9: a denial is not an error — audits must be able to tell an
         // operator refusal apart from a tool that ran and failed.
-        record_result(home, session_id, decision_id, call, "denied", &output)?;
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            "denied",
+            &output,
+            tool_cx,
+        )?;
         return Ok((output, None));
     }
 
@@ -418,7 +438,15 @@ pub fn execute_call(
         Ok(v) => v,
         Err(e) => {
             let output = tool_error(&e);
-            record_result(home, session_id, decision_id, call, "error", &output)?;
+            record_result(
+                home,
+                session_id,
+                decision_id,
+                call,
+                "error",
+                &output,
+                tool_cx,
+            )?;
             return Ok((output, None));
         }
     };
@@ -439,7 +467,15 @@ pub fn execute_call(
         } else {
             "ok"
         };
-        record_result(home, session_id, decision_id, call, status, &output)?;
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            status,
+            &output,
+            tool_cx,
+        )?;
         return Ok((output, None));
     }
 
@@ -461,7 +497,15 @@ pub fn execute_call(
             .unwrap_or("");
         if prompt.is_empty() {
             let output = tool_error("Task/Agent requires a 'prompt'");
-            record_result(home, session_id, decision_id, call, "error", &output)?;
+            record_result(
+                home,
+                session_id,
+                decision_id,
+                call,
+                "error",
+                &output,
+                tool_cx,
+            )?;
             return Ok((output, None));
         }
         let turn_config = subagent_turn_config(home);
@@ -483,7 +527,15 @@ pub fn execute_call(
         } else {
             "ok"
         };
-        record_result(home, session_id, decision_id, call, status, &output)?;
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            status,
+            &output,
+            tool_cx,
+        )?;
         return Ok((output, None));
     }
 
@@ -497,7 +549,15 @@ pub fn execute_call(
         } else {
             "ok"
         };
-        record_result(home, session_id, decision_id, call, status, &output)?;
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            status,
+            &output,
+            tool_cx,
+        )?;
         return Ok((output, None));
     }
 
@@ -525,7 +585,15 @@ pub fn execute_call(
                 &serde_json::json!({ "tool": call.name, "ok": false }),
             );
         }
-        record_result(home, session_id, decision_id, call, status, &output)?;
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            status,
+            &output,
+            tool_cx,
+        )?;
         return Ok((output, file_change));
     }
 
@@ -536,7 +604,15 @@ pub fn execute_call(
     };
     if output.len() > MAX_RESULT_BYTES {
         let truncated = tool_error("tool result exceeds 64 KiB");
-        record_result(home, session_id, decision_id, call, "error", &truncated)?;
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            "error",
+            &truncated,
+            tool_cx,
+        )?;
         return Ok((truncated, None));
     }
     let status = if orbit_tools::result_is_denial(&output) {
@@ -546,7 +622,15 @@ pub fn execute_call(
     } else {
         "ok"
     };
-    record_result(home, session_id, decision_id, call, status, &output)?;
+    record_result(
+        home,
+        session_id,
+        decision_id,
+        call,
+        status,
+        &output,
+        tool_cx,
+    )?;
     // Legacy tools (Bash/Glob/...) don't snapshot, so no diff — only
     // checkpointed writes (Write/Edit through execute_wave1) carry a
     // FileChange.
@@ -647,6 +731,7 @@ fn record_result(
     call: &crate::PendingToolCall,
     status: &str,
     output: &str,
+    tool_cx: &orbit_tools::ToolContext,
 ) -> Result<(), String> {
     let mut writer = reopen_writer(home)?;
     let head = writer
@@ -660,14 +745,15 @@ fn record_result(
             output_bytes: output.len() as u64,
         }))
         .map_err(|e| format!("record tool result: {e}"))?;
-    // The proof chip's heartbeat (M19): every append is a visible
-    // pulse. Emitted where the writer lives; the ledger crate itself
+    // The proof surface's heartbeat (M19): every append is announced to
+    // the front-end where the writer lives; the ledger crate itself
     // stays a pure library.
-    if plain_output_enabled() {
-        // (the TUI worker prints its own events; plain mode stays
-        // quiet here — the head digest is already on the summary line)
-        let _ = head;
-    }
+    tool_cx.note_ledger(orbit_tools::LedgerNote {
+        kind: "result",
+        target: safe_call_summary(call),
+        fact: status.to_string(),
+        digest: head,
+    });
     Ok(())
 }
 
@@ -1143,6 +1229,55 @@ mod tests {
         fn ask(&mut self, _req: &ApprovalRequest, _auto: bool) -> ApprovalVerdict {
             self.0
         }
+    }
+
+    /// The proof surface hears every record as it lands, in order, with the
+    /// record's own hash — so what the Activity panel shows can be checked
+    /// against the chain. (The sink was declared, never wired.)
+    #[test]
+    fn every_ledger_record_is_announced_in_order_with_its_hash() {
+        let home = test_home("announce");
+        let call = make_call("calculator", br#"{"expression":"2*(3+4)"}"#);
+        let cx = test_cx(&home.join("work"));
+        let heard =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<orbit_tools::LedgerNote>::new()));
+        let sink = heard.clone();
+        cx.set_ledger_sink(Some(std::sync::Arc::new(
+            move |n: &orbit_tools::LedgerNote| {
+                sink.lock().unwrap().push(n.clone());
+            },
+        )));
+        let mut ch = FixedChannel(ApprovalVerdict::Deny); // auto-tools: not asked
+        execute_call(
+            &home,
+            "s1",
+            "d1",
+            &call,
+            true,
+            false,
+            &mut ch,
+            &mut AutoGrants::new(),
+            &PermissionScope::default(),
+            &cx,
+        )
+        .unwrap();
+        let heard = heard.lock().unwrap();
+        let kinds: Vec<&str> = heard.iter().map(|n| n.kind).collect();
+        assert_eq!(kinds, ["intent", "verdict", "result"]);
+        assert!(heard[1].fact.starts_with("allowed — "), "{}", heard[1].fact);
+        assert_eq!(heard[2].fact, "ok");
+        assert!(heard.iter().all(|n| n.target.starts_with("calculator")));
+        // The digests ARE the chain: each is a real record's hash and the
+        // last is the ledger's head.
+        let (records, head) = orbit_ledger::verify_ledger(&home.join("ledger")).unwrap();
+        for n in heard.iter() {
+            assert!(
+                records.iter().any(|r| r.self_hash == n.digest),
+                "{} is not in the ledger",
+                n.digest
+            );
+        }
+        assert_eq!(heard.last().unwrap().digest, head);
     }
 
     #[test]

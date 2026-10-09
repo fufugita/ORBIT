@@ -64,6 +64,24 @@ pub trait Tool: Send + Sync {
 /// never block in it.
 pub type OutputSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// One record the session just appended to the ledger, as a front-end's
+/// proof surface (the Activity panel, the ledger chip) shows it.
+#[derive(Debug, Clone)]
+pub struct LedgerNote {
+    /// `intent`, `verdict` or `result`.
+    pub kind: &'static str,
+    /// What it is about: the call's one-line summary (`Edit(calc.py)`).
+    pub target: String,
+    /// The recorded fact: `allowed — operator approved`, `ok`, …
+    pub fact: String,
+    /// The record's own hash — the chain head right after this append.
+    pub digest: String,
+}
+
+/// Called once per ledger record the session appends, on the thread that
+/// appended it. Keep it cheap.
+pub type LedgerSink = std::sync::Arc<dyn Fn(&LedgerNote) + Send + Sync>;
+
 /// Has this turn been cancelled (Esc)? Polled by long-running tools —
 /// Bash — between waits. The engine's turn token sits behind it.
 pub type CancelCheck = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
@@ -77,6 +95,9 @@ pub struct ToolContext {
     /// front-end's live terminal). Shared by every clone of the
     /// context; the executor points it at the current call.
     output_sink: std::sync::Arc<std::sync::Mutex<Option<OutputSink>>>,
+    /// Where the ledger records this session appends are announced (the
+    /// proof surface). Shared by every clone.
+    ledger_sink: std::sync::Arc<std::sync::Mutex<Option<LedgerSink>>>,
     /// The cancel checks of the turns running on this context, innermost
     /// last. Per context — not per process — so one session's Esc cannot
     /// reach another's commands. Shared by every clone.
@@ -110,6 +131,23 @@ impl ToolContext {
             turn_checkpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             output_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cancel: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            ledger_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Announce every ledger record this session appends to `sink`.
+    pub fn set_ledger_sink(&self, sink: Option<LedgerSink>) {
+        if let Ok(mut g) = self.ledger_sink.lock() {
+            *g = sink;
+        }
+    }
+
+    /// Tell the front-end a record was just appended (no-op without a
+    /// sink).
+    pub fn note_ledger(&self, note: LedgerNote) {
+        let sink = self.ledger_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink(&note);
         }
     }
 

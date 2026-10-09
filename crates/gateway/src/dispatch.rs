@@ -62,6 +62,11 @@ pub struct EgressReservation {
     pub destination_digest: String,
     pub egress_category: String,
     pub policy_snapshot_id: String,
+    /// The hash of the `EgressIntent` record this reservation wrote (the
+    /// chain head right after it was appended); empty when no record was
+    /// written (the intent could not be made durable).
+    #[serde(default)]
+    pub intent_digest: String,
 }
 
 /// The dispatch engine: wires admission → egress fsync → adapter.
@@ -238,6 +243,7 @@ impl DispatchEngine {
                             destination_digest: tuple.digest(),
                             egress_category: "model_inference".into(),
                             policy_snapshot_id: "pol".into(),
+                            intent_digest: String::new(),
                         },
                     ))
                 }
@@ -365,6 +371,7 @@ impl DispatchEngine {
                             destination_digest: tuple.digest(),
                             egress_category: "model_inference".into(),
                             policy_snapshot_id: "pol".into(),
+                            intent_digest: String::new(),
                         },
                     ))
                 }
@@ -445,7 +452,7 @@ impl DispatchEngine {
             capability_card_proofs: None,
         };
         // EgressIntent requires fsync-before-ACK by the ledger's own policy.
-        writer.append(LedgerEvent::EgressIntent(intent))?;
+        let intent_digest = writer.append(LedgerEvent::EgressIntent(intent))?;
         // Caller is responsible for the writer's lifecycle (close → fsync).
         Ok(EgressReservation {
             decision_id: decision_id.into(),
@@ -453,6 +460,7 @@ impl DispatchEngine {
             destination_digest: tuple.digest(),
             egress_category: "model_inference".into(),
             policy_snapshot_id: "pol".into(),
+            intent_digest,
         })
     }
 

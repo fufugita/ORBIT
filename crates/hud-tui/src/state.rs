@@ -1068,6 +1068,8 @@ impl App {
             Msg::ToolOutput { .. }
             | Msg::TasksUpdate(_)
             | Msg::ApprovalDetail { .. }
+            | Msg::Activity { .. }
+            | Msg::Compaction { .. }
             | Msg::Readiness(_) => {}
             Msg::ToolCallStarted { name, summary, .. } => {
                 self.turn_tool_count += 1;

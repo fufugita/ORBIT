@@ -175,9 +175,17 @@ pub enum FrontendEvent {
         window_tokens: u64,
     },
     /// A record was appended to the ledger (the proof chip's dot).
+    /// `record_count` is the whole ledger's total and `head_digest` the
+    /// chain head right after the append. `kind` and `summary` (additive:
+    /// absent from older producers) say what the record is, so the
+    /// Activity panel can list it: `egress` / `<model> · <tokens>`.
     LedgerAppended {
         record_count: u64,
         head_digest: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        kind: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
     },
 }
 

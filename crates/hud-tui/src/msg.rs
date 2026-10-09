@@ -49,6 +49,18 @@ pub enum Msg {
         name: String,
         summary: String,
     },
+    /// The context is being compacted (`true`) or has been (`false`): the
+    /// status line shows the amber "compacting context" while it runs.
+    Compaction { running: bool },
+    /// Something for the Activity panel: a ledger record the session just
+    /// appended (`digest` set) or a notable runtime event (a request, a
+    /// compaction, a retry). Display-safe.
+    Activity {
+        kind: String,
+        target: String,
+        fact: String,
+        digest: Option<String>,
+    },
     /// Readiness rows the front-end cannot measure itself (the sandbox):
     /// `(ok, label)`, added to the welcome screen's READY list.
     Readiness(Vec<(bool, String)>),

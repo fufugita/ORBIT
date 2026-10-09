@@ -734,6 +734,22 @@ mod tests {
             ..Default::default()
         });
         s.tool_output = vec!["running 6 tests".into()];
+        s.activity = vec![
+            crate::proto::scenario::ActivityRow {
+                time: "14:02:11".into(),
+                kind: "verdict".into(),
+                target: "Bash(cargo test -p orbit-export)".into(),
+                fact: "allowed — operator approved".into(),
+                digest: Some("a1b2c3d4e5f6".into()),
+            },
+            crate::proto::scenario::ActivityRow {
+                time: "14:02:16".into(),
+                kind: "result".into(),
+                target: "Bash(cargo test -p orbit-export)".into(),
+                fact: "ok".into(),
+                digest: Some("0f9e8d7c6b5a".into()),
+            },
+        ];
         s
     }
 
@@ -769,8 +785,63 @@ mod tests {
     #[test]
     fn review_preset_lists_files_beside_plan_and_activity() {
         let out = render(&app_with(Preset::Review), &busy(), 164, 48);
-        for want in ["Review", "FILES", "Plan", "1/2 done", "Activity", "BASH"] {
+        for want in [
+            "Review",
+            "FILES",
+            "Plan",
+            "1/2 done",
+            "Activity",
+            "2 events",
+            "allowed",
+            "Bash(cargo test",
+            "#a1b2c3",
+            "#0f9e8d",
+        ] {
             assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+    }
+
+    /// In a side column a record takes two lines: the OUTCOME and the proof
+    /// hash on the first (nothing a long command can clip), the target
+    /// under it.
+    #[test]
+    fn activity_in_a_side_column_leads_with_the_outcome() {
+        let out = render(&app_with(Preset::Review), &busy(), 164, 48);
+        let lines: Vec<&str> = out.lines().collect();
+        let i = lines
+            .iter()
+            .position(|l| l.contains("allowed"))
+            .unwrap_or_else(|| panic!("no verdict row\n{out}"));
+        assert!(lines[i].contains("14:02:11"), "time\n{}", lines[i]);
+        assert!(
+            lines[i].contains("#a1b2c3"),
+            "hash on the same line\n{}",
+            lines[i]
+        );
+        assert!(
+            lines[i + 1].contains("Bash(cargo test"),
+            "target on the next line\n{}",
+            lines[i + 1]
+        );
+    }
+
+    /// Given room (a zoomed panel, a big terminal) every record is ONE
+    /// line: time, kind, outcome, target, reason and hash together.
+    #[test]
+    fn activity_given_room_is_one_line_per_record() {
+        let out = render(&app_with(Preset::Review), &busy(), 300, 48);
+        let row = out
+            .lines()
+            .find(|l| l.contains("allowed"))
+            .unwrap_or_else(|| panic!("no verdict row\n{out}"));
+        for want in [
+            "14:02:11",
+            "allowed",
+            "Bash(cargo test -p orbit-export)",
+            "operator approved",
+            "#a1b2c3",
+        ] {
+            assert!(row.contains(want), "missing {want:?}\n{row}");
         }
     }
 

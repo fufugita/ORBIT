@@ -2,7 +2,7 @@
 //! Context, Review and Agent. Each draws only what the engine has
 //! actually sent; an empty panel shows the prototype's empty state.
 
-use super::canvas::{clip_path, clip_text, mix, text_width, tint, Cv, Seg};
+use super::canvas::{clip_path, clip_text, mix, text_width, tint, Cv, Rgb, Seg};
 use super::convo::kind_of;
 use super::frame::{badge, empty_state, panel_frame, BadgeState, FrameSpec};
 use super::motion::{ease_out, flash, prog, pulse, secs};
@@ -340,14 +340,56 @@ fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
     });
 }
 
+/// The glyph and colour of an Activity row, from what it is and what it
+/// says. Green is reserved for outcomes the ledger backs (design law 4);
+/// magenta marks an authority decision (law 2).
+fn activity_tone(kind: &str, fact: &str) -> (&'static str, Rgb) {
+    match kind {
+        "intent" => ("→", FAINT),
+        "verdict" if fact.starts_with("allowed") => ("◆", MAGENTA),
+        "verdict" => ("⊘", MUTED),
+        "result" => match fact {
+            "ok" => ("✓", GREEN),
+            "denied" => ("⊘", MUTED),
+            _ => ("✕", RED),
+        },
+        "egress" | "request" => ("↗", CYAN),
+        "compaction" | "retry" => ("◌", AMBER),
+        _ => ("∙", MUTED),
+    }
+}
+
+/// What an Activity row says: the HEADLINE (the outcome a reader scans
+/// for) and the secondary detail that follows the target.
+///
+///   verdict  `allowed — operator approved` → `allowed`, `operator approved`
+///   result   `ok` / `denied` / `error`    → itself, no detail
+///   intent   `requested` is noise         → `intent`, no detail
+///   others   (egress, compaction, retry)  → their kind, the fact as detail
+fn activity_parts(a: &crate::proto::scenario::ActivityRow) -> (String, String) {
+    match a.kind.as_str() {
+        "verdict" => match a.fact.split_once(" — ") {
+            Some((head, why)) => (head.to_string(), why.to_string()),
+            None => (a.fact.clone(), String::new()),
+        },
+        "result" => (a.fact.clone(), String::new()),
+        "intent" => ("intent".to_string(), String::new()),
+        _ => (a.kind.clone(), a.fact.clone()),
+    }
+}
+
 fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
     let s = inp.s;
-    let rows: Vec<&crate::proto::scenario::TranscriptLine> = s
-        .transcript
-        .iter()
-        .filter(|l| l.kind == LineKind::Tool)
-        .collect();
-    let b = vec![Seg::bold(format!("{} events", rows.len()), GREEN)];
+    let rows = &s.activity;
+    let proof = rows.iter().filter(|a| a.digest.is_some()).count();
+    let b = if rows.is_empty() {
+        vec![Seg::new("none", FAINT)]
+    } else {
+        vec![
+            Seg::bold(format!("{} events", rows.len()), GREEN),
+            Seg::new(format!(" · {proof} on the ledger"), MUTED),
+        ]
+    };
     let Some(inner) = frame(cv, r, View::Activity, inp, b, vec![], vec![]) else {
         return;
     };
@@ -365,7 +407,7 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 "◌",
                 GREEN,
                 "No activity yet",
-                "Every tool call and decision is listed here as it happens.",
+                "Every request, decision and result is listed here as it is recorded. Ledger records carry their hash.",
             );
             return;
         }
@@ -375,29 +417,55 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             inner.width as i32,
             inner.height as i32,
         );
+        // A wide panel (zoomed, or a big terminal) gives every record one
+        // line; a side column gives it two, because time, kind, outcome,
+        // target and hash do not fit on one:
+        //   14:02:11 ◆ allowed                       #a1b2c3
+        //            Bash(cargo test -p orbit-export) · operator approved
+        // The HEADLINE is the outcome (`allowed`, `ok`, `denied`), so the
+        // thing worth reading is on the first line and cannot be clipped
+        // off by a long command.
+        let wide = w >= 84;
+        let per = if wide { 1usize } else { 2 };
+        let visible = (h as usize / per).max(1);
         let start = rows
             .len()
-            .saturating_sub(h as usize + inp.scroll.min(rows.len()));
-        for (i, l) in rows.iter().skip(start).take(h as usize).enumerate() {
-            let yy = y + i as i32;
-            let (g, gc) = l.tool_state.glyph_parts();
-            let gcol = match gc {
-                crate::proto::core::Token::Cyan => CYAN,
-                crate::proto::core::Token::Red => RED,
-                crate::proto::core::Token::Amber => AMBER,
-                crate::proto::core::Token::Magenta => MAGENTA,
-                _ => GREEN,
+            .saturating_sub(visible + inp.scroll.min(rows.len()));
+        for (i, a) in rows.iter().skip(start).take(visible).enumerate() {
+            let y0 = y + (i * per) as i32;
+            let (g, gcol) = activity_tone(&a.kind, &a.fact);
+            let (head, detail) = activity_parts(a);
+            cv.text(x, y0, &a.time, FAINT, None);
+            cv.bold(x + 9, y0, g, gcol, None);
+            let hash = a
+                .digest
+                .as_deref()
+                .map(|d| format!("#{}", d.chars().take(6).collect::<String>()));
+            let hash_w = hash.as_ref().map_or(0, |h| text_width(h) + 1);
+            if let Some(h) = &hash {
+                cv.text(x + w - text_width(h), y0, h, FAINT, None);
+            }
+            let body = if detail.is_empty() {
+                a.target.clone()
+            } else {
+                format!("{} · {}", a.target, detail)
             };
-            cv.text(x, yy, g, gcol, None);
-            let k = kind_of(&l.tool_name);
-            let x2 = cv.bold(x + 2, yy, &k, INK, None);
-            cv.text(
-                x2 + 1,
-                yy,
-                &clip_text(&l.text, w - 4 - text_width(&k)),
-                MUTED,
-                None,
-            );
+            if wide {
+                // Glyph and colour already say what kind of record it is;
+                // the headline column carries the outcome.
+                let bx = x + 11 + 10;
+                cv.bold(x + 11, y0, &clip_text(&head, 9), gcol, None);
+                cv.text(bx, y0, &clip_text(&body, x + w - bx - hash_w - 1), INK, None);
+            } else {
+                cv.bold(
+                    x + 11,
+                    y0,
+                    &clip_text(&head, w - 11 - hash_w - 1),
+                    gcol,
+                    None,
+                );
+                cv.text(x + 9, y0 + 1, &clip_text(&body, w - 9), INK, None);
+            }
         }
     });
 }
@@ -642,4 +710,53 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             cv.text(x + 2, yy + 1, &clip_text(&a.action, w - 3), MUTED, None);
         }
     });
+}
+
+#[cfg(test)]
+mod activity_row_tests {
+    use super::*;
+    use crate::proto::scenario::ActivityRow;
+
+    fn row(kind: &str, fact: &str) -> ActivityRow {
+        ActivityRow {
+            time: "14:02:11".into(),
+            kind: kind.into(),
+            target: "Edit(calc.py)".into(),
+            fact: fact.into(),
+            digest: Some("a1b2c3d4".into()),
+        }
+    }
+
+    /// The outcome is the headline; the reason follows the target. A
+    /// long command can clip the reason, never the verdict.
+    #[test]
+    fn a_verdict_leads_with_allowed_or_denied() {
+        assert_eq!(
+            activity_parts(&row("verdict", "allowed — operator approved")),
+            ("allowed".to_string(), "operator approved".to_string())
+        );
+        assert_eq!(
+            activity_parts(&row("verdict", "denied — plan mode is read-only")),
+            ("denied".to_string(), "plan mode is read-only".to_string())
+        );
+        assert_eq!(
+            activity_parts(&row("verdict", "denied")),
+            ("denied".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn results_intents_and_runtime_events_read_plainly() {
+        assert_eq!(activity_parts(&row("result", "ok")).0, "ok");
+        assert_eq!(activity_parts(&row("result", "denied")).0, "denied");
+        assert_eq!(
+            activity_parts(&row("intent", "requested")),
+            ("intent".to_string(), String::new()),
+            "\"requested\" says nothing the kind does not"
+        );
+        assert_eq!(
+            activity_parts(&row("egress", "gpt · 5 in / 3 out")),
+            ("egress".to_string(), "gpt · 5 in / 3 out".to_string())
+        );
+    }
 }

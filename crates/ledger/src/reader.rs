@@ -80,6 +80,40 @@ pub fn verify_ledger(dir: &Path) -> Result<(Vec<ReadRecord>, String), LedgerErro
     Ok((records, prev))
 }
 
+/// How many records the ledger holds, by walking the frame lengths of
+/// every segment — no decoding, no hash checks (that is `verify_ledger`'s
+/// job), so it is cheap enough to show on a status chip at startup. A
+/// torn trailing frame is not counted; an unreadable segment counts as
+/// empty.
+pub fn count_records(dir: &Path) -> u64 {
+    let segments_dir = dir.join("segments");
+    let mut count = 0u64;
+    let Ok(rd) = std::fs::read_dir(&segments_dir) else {
+        return 0;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".log") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(e.path()) else {
+            continue;
+        };
+        let mut off = 0usize;
+        while off + 4 <= bytes.len() {
+            let len =
+                u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+                    as usize;
+            if off + 4 + len > bytes.len() {
+                break; // torn frame
+            }
+            off += 4 + len;
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Re-derive the chain head by scanning all existing segments.
 ///
 /// This is the ONLY authority for `LedgerWriter::open()`'s chain head — a
@@ -202,6 +236,35 @@ mod tests {
         let (records, head) = verify_ledger(&d).unwrap();
         assert!(records.len() >= 2, "segment header + transitions");
         assert_eq!(head.len(), 64);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The chip's total: the frame walk agrees with the verifying reader,
+    /// ignores a torn tail, and an absent ledger is zero.
+    #[test]
+    fn count_records_matches_the_verified_chain() {
+        assert_eq!(count_records(&tmpdir("absent")), 0);
+        let d = tmpdir("count");
+        let mut w = LedgerWriter::open(&d, "w".into(), "0.1.0").unwrap();
+        for _ in 0..3 {
+            w.append(LedgerEvent::PhaseTransition(PhaseTransition {
+                session_id: "s".into(),
+                from: Phase::Init,
+                to: Phase::Plan,
+                checkpoint_seq: None,
+            }))
+            .unwrap();
+        }
+        w.close().unwrap();
+        let (records, _) = verify_ledger(&d).unwrap();
+        assert_eq!(count_records(&d), records.len() as u64);
+        // A torn frame at the tail is not a record.
+        let seg = d.join("segments").join("0000000000000000.log");
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+        f.write_all(&[0x00, 0x00, 0x00, 0x40, 0x01]).unwrap();
+        drop(f);
+        assert_eq!(count_records(&d), records.len() as u64);
         let _ = std::fs::remove_dir_all(&d);
     }
 

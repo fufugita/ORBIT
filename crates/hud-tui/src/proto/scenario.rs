@@ -39,6 +39,8 @@ pub struct Scenario {
     pub file_changes: Vec<crate::proto::panels::FileChangeRow>,
     /// The Terminal panel's output tail (ToolOutput lines).
     pub tool_output: Vec<String>,
+    /// The Activity panel's rows, oldest first (capped).
+    pub activity: Vec<ActivityRow>,
     /// Context meter (Usage): tokens in use, the window, when shown.
     pub used_tokens: u64,
     pub window_tokens: u64,
@@ -126,6 +128,24 @@ pub struct Scenario {
     /// The reactor phase (§6.10): 0 orient … 4 respond — the
     /// workspace stepper.
     pub phase: usize,
+}
+
+/// One row of the Activity panel: something that happened, in order. The
+/// ledger-backed rows (`digest` set) are the proof surface: each carries
+/// the hash of the record it announces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityRow {
+    /// Local wall-clock `HH:MM:SS` when it landed.
+    pub time: String,
+    /// `intent` / `verdict` / `result` (ledger records) or `request` /
+    /// `compaction` / `retry` (runtime events).
+    pub kind: String,
+    /// What it is about (`Edit(calc.py)`, `api.example.com`).
+    pub target: String,
+    /// The recorded fact (`allowed — operator approved`, `ok`).
+    pub fact: String,
+    /// The ledger record's own hash, when the row is a record.
+    pub digest: Option<String>,
 }
 
 /// The M5 turn report: ✓ done · 41s · 3 tools · +$0.0031.

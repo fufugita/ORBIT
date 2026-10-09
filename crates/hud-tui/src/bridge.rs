@@ -356,6 +356,28 @@ pub fn emit_tool_started(sender: &BusSender, call_id: &str, name: &str, summary:
     });
 }
 
+/// Emit the start or end of a context compaction.
+pub fn emit_compaction(sender: &BusSender, running: bool) {
+    sender.send(Msg::Compaction { running });
+}
+
+/// Emit one Activity row (display-safe): a ledger record (with its
+/// digest) or a notable runtime event.
+pub fn emit_activity(
+    sender: &BusSender,
+    kind: &str,
+    target: &str,
+    fact: &str,
+    digest: Option<&str>,
+) {
+    sender.send(Msg::Activity {
+        kind: kind.to_string(),
+        target: terminal_safe(target),
+        fact: terminal_safe(fact),
+        digest: digest.map(str::to_string),
+    });
+}
+
 /// Emit extra readiness rows for the welcome screen (display-safe).
 pub fn emit_readiness(sender: &BusSender, rows: Vec<(bool, String)>) {
     sender.send(Msg::Readiness(

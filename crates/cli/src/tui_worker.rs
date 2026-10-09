@@ -120,6 +120,32 @@ pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
     })
 }
 
+/// The session's tool context: ONE per session (rebuilt on resume), not
+/// per turn, so what a Read recorded still lets the next prompt's Edit
+/// through (B2: the executor used to build a fresh one every turn). It
+/// is wired to the proof surface: every ledger record the session
+/// appends is announced to the Activity panel and counted by the chip.
+fn session_tool_context(config: &TuiTurnConfig, sender: &BusSender) -> orbit_tools::ToolContext {
+    let cx = orbit_tools::ToolContext::new(
+        config.home.clone(),
+        config.session_id.clone(),
+        std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+    );
+    let sender = sender.clone();
+    cx.set_ledger_sink(Some(std::sync::Arc::new(
+        move |n: &orbit_tools::LedgerNote| {
+            orbit_hud_tui::emit_activity(
+                &sender,
+                n.kind,
+                &display_summary(&n.target),
+                &n.fact,
+                Some(&n.digest),
+            );
+        },
+    )));
+    cx
+}
+
 /// The worker's event loop — waits for prompts, runs turns, reports results.
 /// Each turn gets a fresh CancelToken installed in the shared slot so the
 /// TUI's Ctrl+C can abort the in-flight stream.
@@ -130,6 +156,12 @@ fn worker_main(
 ) {
     let mut transcript: Vec<ChatMessage> = config.initial_transcript.clone();
     let mut turns: u64 = config.initial_turns;
+    let mut tool_cx = session_tool_context(&config, &ctx.sender);
+    // The ledger chip's total: the records already in the chain.
+    orbit_hud_tui::emit_ledger_appended(
+        &ctx.sender,
+        orbit_ledger::count_records(&config.home.join("ledger")),
+    );
     // D9 (§13.5 rule 5): the session file must carry CUMULATIVE totals —
     // resumed values plus everything this run adds. Tracking them per-turn
     // only (as run_tui_turn does) made every save overwrite the history.
@@ -241,6 +273,7 @@ fn worker_main(
                     &plan_directive,
                     true,
                     &mut scope,
+                    &tool_cx,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
@@ -290,6 +323,7 @@ fn worker_main(
                     &directive,
                     false,
                     &mut scope,
+                    &tool_cx,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
@@ -446,6 +480,7 @@ fn worker_main(
                         turns = s.turns;
                         config.session_id = s.session_id.clone();
                         config.model = s.model.clone();
+                        tool_cx = session_tool_context(&config, &ctx.sender);
                         let lines = session_to_transcript_lines(&s.transcript);
                         ctx.sender.send(Msg::TranscriptLoaded {
                             lines,
@@ -879,12 +914,9 @@ fn worker_main(
                 let decision_id = format!("bang-{}", ulid::Ulid::new());
                 let mut approval_channel =
                     TuiApprovalChannel::new(ctx.sender.clone(), ctx.approvals.clone());
-                let tool_cx = orbit_tools::ToolContext::new(
-                    config.home.clone(),
-                    config.session_id.clone(),
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
-                );
+                // The session's context: its ledger sink announces the
+                // `!` command's records like any other call's.
+                let tool_cx = tool_cx.clone();
                 orbit_hud_tui::emit_tool_started(&ctx.sender, &call.id, "Bash", &command);
                 tool_cx.set_output_sink(Some(live_output_sink(&ctx.sender, &call.id)));
                 let (result, _) = crate::tool_runtime::execute_call(
@@ -1082,6 +1114,21 @@ fn sandbox_report() -> &'static SandboxReport {
     })
 }
 
+/// Set the proof chip's total from the ledger itself. Several writers
+/// append (tool calls, provider requests, subagents); announcing each one
+/// keeps the chip live, and this keeps it TRUE — it cannot drift from
+/// what `orbit ledger verify` would count.
+fn resync_ledger_chip(home: &std::path::Path, sender: &BusSender) {
+    orbit_hud_tui::emit_ledger_appended(sender, orbit_ledger::count_records(&home.join("ledger")));
+}
+
+/// The host part of a gateway URL, for display (`http://127.0.0.1:4001/v1`
+/// → `127.0.0.1:4001`).
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
 /// Did the operator's interrupt end this call? The Bash tool answers a
 /// cancelled run with the typed error `cancelled by user`.
 fn result_is_cancelled(result: &str) -> bool {
@@ -1167,6 +1214,22 @@ fn display_target(kind: &str, target: &str) -> String {
         return target.to_string();
     }
     display_path(target)
+}
+
+/// A call summary (`Edit(/proj/src/a.rs)`) with a file tool's path shown
+/// the way the Changes panel shows it: relative to the project. Other
+/// summaries (a Bash command line) are shown as recorded.
+fn display_summary(summary: &str) -> String {
+    for name in ["Read", "Write", "Edit", "NotebookEdit"] {
+        if let Some(arg) = summary
+            .strip_prefix(name)
+            .and_then(|r| r.strip_prefix('('))
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            return format!("{name}({})", display_path(arg));
+        }
+    }
+    summary.to_string()
 }
 
 fn display_path(path: &str) -> String {
@@ -1277,7 +1340,12 @@ pub fn run_tui_turn(
     // worker loop's SetMode command updates config.scope in place —
     // no process env, no per-call reads.
     scope: &mut crate::tool_runtime::PermissionScope,
+    // The session's tool context (see `session_tool_context`).
+    tool_cx: &orbit_tools::ToolContext,
 ) -> Result<(bool, u64, u64, u64, String), String> {
+    // One checkpoint per prompt (E7): /rewind restores a turn. The context
+    // is the session's now, so the turn boundary is marked here.
+    tool_cx.reset_turn_checkpoint();
     // Resolve provider / pricing from config (same as REPL).
     let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
     let provider = cfg.provider_for_model(&config.model);
@@ -1327,6 +1395,32 @@ pub fn run_tui_turn(
                     first_round_seen = true;
                 }
             }
+            E::Compacting {
+                used_tokens,
+                window_tokens,
+            } => {
+                orbit_hud_tui::emit_compaction(sender, true);
+                orbit_hud_tui::emit_activity(
+                    sender,
+                    "compaction",
+                    "compacting context",
+                    &format!("{used_tokens} of {window_tokens} tokens"),
+                    None,
+                );
+            }
+            E::Compacted { summary } => {
+                orbit_hud_tui::emit_compaction(sender, false);
+                orbit_hud_tui::emit_activity(
+                    sender,
+                    "compaction",
+                    "compacted",
+                    &format!(
+                        "older turns replaced by a {}-char summary",
+                        summary.chars().count()
+                    ),
+                    None,
+                );
+            }
             E::ToolStarted { name, summary } => {
                 if !first_round_seen {
                     // Engine events can arrive before the first round
@@ -1355,9 +1449,19 @@ pub fn run_tui_turn(
                     sender,
                     &format!("retry {attempt} in {retry_in_ms}ms — {reason}"),
                 );
+                orbit_hud_tui::emit_activity(
+                    sender,
+                    "retry",
+                    &format!("attempt {attempt}"),
+                    &format!("in {retry_in_ms} ms — {reason}"),
+                    None,
+                );
+                // The failed attempt still wrote its egress record.
+                resync_ledger_chip(&config.home, sender);
             }
             E::Error { message } => {
                 orbit_hud_tui::emit_error(sender, &message);
+                resync_ledger_chip(&config.home, sender);
             }
             E::Status { text } => {
                 orbit_hud_tui::emit_status(sender, &text);
@@ -1365,6 +1469,7 @@ pub fn run_tui_turn(
             E::TurnEnded { interrupted, .. } => {
                 ws.phase_index = 4; // respond
                 orbit_hud_tui::emit_workspace(sender, ws.clone());
+                resync_ledger_chip(&config.home, sender);
                 if interrupted {
                     // The visible cancel: the MD's loop contract says a
                     // cancelled turn keeps the transcript valid — say so.
@@ -1404,6 +1509,8 @@ pub fn run_tui_turn(
                     orbit_hud_tui::state::ToolOutcome::Failed
                 };
                 orbit_hud_tui::emit_tool_finished(sender, &call_id, "", outcome, &result_fact);
+                // The result record is on the chain by now.
+                resync_ledger_chip(&config.home, sender);
             }
             E::FileChanged {
                 path,
@@ -1445,8 +1552,21 @@ pub fn run_tui_turn(
             }
             E::LedgerAppended {
                 record_count,
-                head_digest: _,
+                head_digest,
+                kind,
+                summary,
             } => {
+                // The row first (it counts one on the chip), then the
+                // ledger's own total, which is the authority.
+                if !kind.is_empty() {
+                    orbit_hud_tui::emit_activity(
+                        sender,
+                        &kind,
+                        &host_of(&resolved_gate),
+                        &summary,
+                        Some(&head_digest),
+                    );
+                }
                 orbit_hud_tui::emit_ledger_appended(sender, record_count);
             }
             _ => {}
@@ -1462,11 +1582,7 @@ pub fn run_tui_turn(
         approvals: approvals.clone(),
         auto_grants: std::mem::take(auto_grants),
         scope: std::mem::take(scope),
-        tool_cx: orbit_tools::ToolContext::new(
-            config.home.clone(),
-            config.session_id.clone(),
-            std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
-        ),
+        tool_cx: tool_cx.clone(),
     };
 
     let options = orbit_engine::TurnOptions {
@@ -1699,5 +1815,148 @@ mod short_session_id_tests {
     fn drops_the_session_tag() {
         assert_eq!(short_session_id("session-01J8ZK4QX2M7C9RT"), "01J8ZK4Q");
         assert_eq!(short_session_id("deadbeefcafe"), "deadbeef");
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn config(home: &std::path::Path) -> TuiTurnConfig {
+        TuiTurnConfig {
+            home: home.to_path_buf(),
+            session_id: "session-test".into(),
+            gate: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            provider_id: "p".into(),
+            auto_tools: true,
+            scope: Default::default(),
+            initial_transcript: Vec::new(),
+            initial_turns: 0,
+            initial_input_tokens: 0,
+            initial_output_tokens: 0,
+            initial_cost_microcents: 0,
+        }
+    }
+
+    #[test]
+    fn a_file_tools_path_is_shown_relative_and_a_command_is_left_alone() {
+        let cwd = std::env::current_dir().unwrap();
+        let inside = format!("Edit({}/src/a.rs)", cwd.display());
+        assert_eq!(display_summary(&inside), "Edit(src/a.rs)");
+        // Outside the project: shown as it is (never guessed shorter).
+        assert_eq!(display_summary("Read(/etc/hosts)"), "Read(/etc/hosts)");
+        // A command line is the recorded fact; its paths are not rewritten.
+        let cmd = format!("Bash(cat {}/a.txt)", cwd.display());
+        assert_eq!(display_summary(&cmd), cmd);
+        assert_eq!(display_summary("Glob(**/*.py)"), "Glob(**/*.py)");
+    }
+
+    #[test]
+    fn host_of_strips_the_scheme_and_path() {
+        assert_eq!(host_of("http://127.0.0.1:4001/v1"), "127.0.0.1:4001");
+        assert_eq!(host_of("https://api.example.com"), "api.example.com");
+        assert_eq!(host_of("localhost:8080/x"), "localhost:8080");
+    }
+
+    /// The session's context announces every ledger record it appends to
+    /// the UI bus, with the record's hash: what the Activity panel shows.
+    #[test]
+    fn the_session_context_feeds_the_activity_panel() {
+        let home = std::env::temp_dir().join(format!("orbit-sess-ctx-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let cx = session_tool_context(&config(&home), &sender);
+        let call = orbit_engine::PendingToolCall {
+            index: 0,
+            id: "c1".into(),
+            name: "calculator".into(),
+            arguments: br#"{"expression":"1+1"}"#.to_vec(),
+        };
+        struct Never;
+        impl crate::tool_runtime::ApprovalChannel for Never {
+            fn ask(
+                &mut self,
+                _: &crate::tool_runtime::ApprovalRequest,
+                _: bool,
+            ) -> crate::tool_runtime::ApprovalVerdict {
+                panic!("auto-tools: never asked")
+            }
+        }
+        crate::tool_runtime::execute_call(
+            &home,
+            "session-test",
+            "d1",
+            &call,
+            true,
+            false,
+            &mut Never,
+            &mut crate::tool_runtime::AutoGrants::new(),
+            &crate::tool_runtime::PermissionScope::default(),
+            &cx,
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        while let Some(m) = bus.try_recv() {
+            if let orbit_hud_tui::msg::Msg::Activity { kind, digest, .. } = m {
+                got.push((kind, digest));
+            }
+        }
+        let kinds: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, ["intent", "verdict", "result"]);
+        assert!(got
+            .iter()
+            .all(|(_, d)| d.as_ref().is_some_and(|d| d.len() == 64)));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// What a Read recorded in one prompt still lets the next prompt's
+    /// Edit through: the context belongs to the session, and each prompt
+    /// gets its own checkpoint.
+    #[test]
+    fn read_before_edit_survives_into_the_next_prompt() {
+        let home = std::env::temp_dir().join(format!("orbit-sess-rbe-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (_bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let cx = session_tool_context(&config(&home), &sender);
+        let file = home.join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        // Prompt 1: the model reads the file in full.
+        let read = orbit_tools::registry()
+            .into_iter()
+            .find(|t| t.name() == "Read")
+            .unwrap()
+            .run(
+                &serde_json::json!({ "file_path": file.to_string_lossy() }),
+                &cx,
+            );
+        assert!(!read.is_error, "{}", read.payload);
+        let first_checkpoint = cx.turn_checkpoint_id();
+        // Prompt 2 (a new turn on the SAME session context): the edit is
+        // allowed, and it gets a fresh checkpoint.
+        cx.reset_turn_checkpoint();
+        let edit = orbit_tools::registry()
+            .into_iter()
+            .find(|t| t.name() == "Edit")
+            .unwrap()
+            .run(
+                &serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "hello",
+                    "new_string": "world"
+                }),
+                &cx,
+            );
+        assert!(
+            !edit.is_error,
+            "an Edit after a Read in an earlier prompt: {}",
+            edit.payload
+        );
+        assert_ne!(
+            cx.turn_checkpoint_id(),
+            first_checkpoint,
+            "one checkpoint per prompt"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

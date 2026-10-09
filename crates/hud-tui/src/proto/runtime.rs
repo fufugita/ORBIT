@@ -1011,6 +1011,10 @@ fn now_hhmm() -> String {
     chrono::Local::now().format("%H:%M").to_string()
 }
 
+fn now_hhmmss() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
 /// Duration per §7.3: tenths below 10 s, else whole seconds, else m:ss.
 pub(crate) fn format_duration(ms: u64) -> (String, f64) {
     let t = (ms + 50) / 100;
@@ -1388,6 +1392,34 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                         }
                     }
                 }
+            }
+        }
+        Msg::Compaction { running } => {
+            scenario.apply(if running { "compacting" } else { "compacted" }, 0);
+        }
+        Msg::Activity {
+            kind,
+            target,
+            fact,
+            digest,
+        } => {
+            // A ledger-backed row is one more record in the chain: the
+            // chip counts it and pulses (M19).
+            if digest.is_some() {
+                scenario.ledger_count = Some(scenario.ledger_count.unwrap_or(0) + 1);
+                scenario.ledger_ms = Some(now_ms);
+            }
+            scenario.activity.push(super::scenario::ActivityRow {
+                time: now_hhmmss(),
+                kind,
+                target,
+                fact,
+                digest,
+            });
+            const ACTIVITY_MAX: usize = 500;
+            if scenario.activity.len() > ACTIVITY_MAX {
+                let drop = scenario.activity.len() - ACTIVITY_MAX;
+                scenario.activity.drain(..drop);
             }
         }
         Msg::Readiness(rows) => {
@@ -2189,5 +2221,78 @@ mod approval_card_tests {
             9,
         );
         assert_eq!(card(&s), ToolState::Denied);
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use crate::msg::Msg;
+
+    fn row(kind: &str, digest: Option<&str>) -> Msg {
+        Msg::Activity {
+            kind: kind.into(),
+            target: "Edit(calc.py)".into(),
+            fact: "ok".into(),
+            digest: digest.map(str::to_string),
+        }
+    }
+
+    /// The Activity panel lists what happened, in order, and a ledger
+    /// record is counted by the chip and pulses it; a runtime event
+    /// (a request, a retry) is a row but not a record.
+    #[test]
+    fn rows_arrive_in_order_and_only_records_count_on_the_chip() {
+        let mut s = Scenario::new();
+        apply_msg(Msg::LedgerAppended { record_count: 10 }, &mut s, 1);
+        apply_msg(row("intent", Some("aaaa")), &mut s, 2);
+        apply_msg(row("request", None), &mut s, 3);
+        apply_msg(row("verdict", Some("bbbb")), &mut s, 4);
+        let kinds: Vec<&str> = s.activity.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["intent", "request", "verdict"]);
+        assert_eq!(s.ledger_count, Some(12), "two records landed on top of 10");
+        assert_eq!(s.ledger_ms, Some(4), "the chip pulsed at the last record");
+        assert_eq!(s.activity[0].digest.as_deref(), Some("aaaa"));
+        assert_eq!(s.activity[0].time.len(), 8, "HH:MM:SS");
+    }
+
+    #[test]
+    fn the_activity_list_keeps_a_bounded_tail() {
+        let mut s = Scenario::new();
+        for i in 0..600 {
+            apply_msg(
+                Msg::Activity {
+                    kind: "result".into(),
+                    target: format!("call {i}"),
+                    fact: "ok".into(),
+                    digest: None,
+                },
+                &mut s,
+                1,
+            );
+        }
+        assert_eq!(s.activity.len(), 500);
+        assert_eq!(
+            s.activity.last().map(|a| a.target.as_str()),
+            Some("call 599")
+        );
+    }
+
+    /// Compaction used to be invisible: no message carried it, so the
+    /// status line's amber "compacting context" could never show.
+    #[test]
+    fn compaction_shows_in_the_status_while_it_runs() {
+        let mut s = Scenario::new();
+        s.turn_live = true;
+        apply_msg(Msg::Compaction { running: true }, &mut s, 1);
+        assert!(matches!(
+            s.activity(),
+            crate::proto::scenario::Activity::Compacting
+        ));
+        apply_msg(Msg::Compaction { running: false }, &mut s, 2);
+        assert!(!matches!(
+            s.activity(),
+            crate::proto::scenario::Activity::Compacting
+        ));
     }
 }

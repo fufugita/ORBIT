@@ -820,6 +820,7 @@ fn gate2_one_loop_same_event_stream() {
             matches!(
                 k.as_str(),
                 "round_started"
+                    | "ledger_appended"
                     | "cost_updated"
                     | "tool_started"
                     | "tool_started_full"

@@ -36,6 +36,10 @@ pub struct TurnOutcome {
     /// plus cache tokens, provider-normalised. NOT a sum over rounds —
     /// the context meter shows instantaneous occupancy, not traffic.
     pub context_tokens: u64,
+    /// The hash of the `EgressIntent` ledger record written before this
+    /// round left the machine — what the Activity panel shows beside the
+    /// request. `None` when the round recorded nothing.
+    pub egress_digest: Option<String>,
 }
 
 /// The provider kind selects the adapter: `openai-compatible` (default),
@@ -341,7 +345,8 @@ pub fn run_dispatch(
         })
         .map_err(|e| (e.code, e.message))?;
 
-    let (outcome, _reservation) = result;
+    let (outcome, reservation) = result;
+    let egress_digest = Some(reservation.intent_digest).filter(|d| !d.is_empty());
     match outcome {
         orbit_gateway::DispatchOutcome::Completed(r) => {
             let output: String = r
@@ -438,6 +443,7 @@ pub fn run_dispatch(
                 context_tokens: usage.input_tokens
                     + usage.cache_read_tokens
                     + usage.cache_write_tokens,
+                egress_digest,
             })
         }
         // E1: a refusal without a usable message and without a
