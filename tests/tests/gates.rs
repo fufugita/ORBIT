@@ -777,7 +777,13 @@ fn gate2_one_loop_same_event_stream() {
             }
         }
     });
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Wait for the SSE stream to be live (the server speaks as soon as it
+    // is connected) instead of sleeping and hoping: under load a fixed
+    // pause raced the connect and the gate saw an empty stream.
+    let live_by = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while sse_frames.lock().unwrap().is_empty() && std::time::Instant::now() < live_by {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 
     // The same prompt over the WS actions endpoint (raw client).
     {
@@ -804,7 +810,17 @@ fn gate2_one_loop_same_event_stream() {
             frame.push(b ^ mask[i % 4]);
         }
         sock.write_all(&frame).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(3000));
+        // The turn is over when the stream says so, not after a guess.
+        let done_by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !sse_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(k, _)| k == "turn_ended")
+            && std::time::Instant::now() < done_by
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     let _ = web.kill();
     std::thread::sleep(std::time::Duration::from_millis(300));
