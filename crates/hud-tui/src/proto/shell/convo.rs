@@ -751,8 +751,34 @@ fn draw_approval(
         edge,
         Some(RAISE),
     );
-    // Header band.
+    // Header band: what it is, what is asked, how risky. In a narrow card
+    // the risk badge gives up words before the title is overdrawn.
     cv.fill(x + 1, y + 1, w - 2, 1, MAGENTA);
+    let (risk_word, filled, rcol, rfg) = match ap.risk {
+        0 => ("LOW", 1, GREEN, ON_ACCENT),
+        1 => ("LOW", 1, GREEN, ON_ACCENT),
+        2 => ("MEDIUM", 2, AMBER, ON_ACCENT),
+        _ => ("HIGH", 3, RED, WHITE),
+    };
+    let bars = format!("{}{}", "▰".repeat(filled), "▱".repeat(3 - filled));
+    let badges = [
+        format!(" {bars} {risk_word} RISK "),
+        format!(" {bars} {risk_word} "),
+        format!(" {risk_word} "),
+        format!(" {bars} "),
+    ];
+    let inner = w - 4;
+    let title_w = text_width(&format!("Allow {}?", ap.tool));
+    let left_w = text_width("◆ NEEDS YOU");
+    let (gap, rt) = [3, 1]
+        .into_iter()
+        .find_map(|gap| {
+            badges
+                .iter()
+                .find(|b| left_w + gap + title_w + 1 + text_width(b) <= inner)
+                .map(|b| (gap, b.clone()))
+        })
+        .unwrap_or((1, badges[3].clone()));
     let mut tx = cv.put(
         x + 2,
         y + 1,
@@ -761,34 +787,19 @@ fn draw_approval(
         Some(MAGENTA),
         Modifier::BOLD,
     );
+    // The title ends before the badge starts, with its `?` kept.
+    let title_room = (inner - left_w - gap - 1 - text_width(&rt)).max(7);
+    let tool = clip_text(&ap.tool, (title_room - 7).max(1));
     tx = cv.put(
-        tx + 3,
+        tx + gap,
         y + 1,
         "Allow ",
         ON_ACCENT,
         Some(MAGENTA),
         Modifier::empty(),
     );
-    tx = cv.put(
-        tx,
-        y + 1,
-        &ap.tool,
-        ON_ACCENT,
-        Some(MAGENTA),
-        Modifier::BOLD,
-    );
+    tx = cv.put(tx, y + 1, &tool, ON_ACCENT, Some(MAGENTA), Modifier::BOLD);
     cv.put(tx, y + 1, "?", ON_ACCENT, Some(MAGENTA), Modifier::empty());
-    let (risk_word, filled, rcol, rfg) = match ap.risk {
-        0 => ("LOW", 1, GREEN, ON_ACCENT),
-        1 => ("LOW", 1, GREEN, ON_ACCENT),
-        2 => ("MEDIUM", 2, AMBER, ON_ACCENT),
-        _ => ("HIGH", 3, RED, WHITE),
-    };
-    let rt = format!(
-        " {}{} {risk_word} RISK ",
-        "▰".repeat(filled),
-        "▱".repeat(3 - filled)
-    );
     cv.put(
         x + w - 2 - text_width(&rt),
         y + 1,
@@ -849,13 +860,20 @@ fn draw_approval(
     // What `R` really grants (design law 6: a session grant displays
     // its actual, broader scope — never implied to be this one call).
     cv.text(x + 3, yy, "R grants", MUTED, Some(RAISE));
-    cv.text(
-        x + 14,
-        yy,
-        &clip_text(&format!("every {} call, until you quit", ap.tool), w - 17),
-        INK2,
-        Some(RAISE),
-    );
+    // The scope is the point of the row, so a narrow card shortens the
+    // wording and keeps the word that bounds it rather than clipping it.
+    let room = w - 17;
+    let grant = [
+        format!("every {} call, until you quit", ap.tool),
+        format!("every {} call, this session", ap.tool),
+        format!("all {}, this session", ap.tool),
+        format!("all {}, session", ap.tool),
+        "all, session".to_string(),
+    ]
+    .into_iter()
+    .find(|g| text_width(g) <= room)
+    .unwrap_or_else(|| clip_text("all, session", room));
+    cv.text(x + 14, yy, &grant, INK2, Some(RAISE));
     yy += 2;
     // Keys — drawn on the bottom border row. While the person is typing
     // they are disabled (§9.14) and the border says so in their place;
@@ -869,23 +887,46 @@ fn draw_approval(
     // explicitly matters: it used to hide behind the right-aligned
     // `esc deny` only because a longer `R` label happened to push it
     // exactly there.
-    let esc = "esc deny";
-    let deny_w = 3 + 1 + text_width(esc); // [ n ] esc deny
-    let deny_x = x + w - 3 - deny_w;
+    //
     // `R` grants the WHOLE tool for the session (design law 6: scope
-    // honesty) — say so, in the longest wording that fits before the
-    // refusal. Fixed parts: [ y ] allow once · [ R ] <label>.
-    let fixed = (3 + 1 + text_width("allow once")) + 3 + (3 + 1);
-    let room = deny_x - (x + 3) - 3 - fixed;
-    let session_label = [
+    // honesty), so say so in the longest wording that fits. When the card
+    // is too narrow for all three groups at full length the words shrink
+    // (`once`, `session`, `deny`), and below that only the keys stay;
+    // groups never overlap.
+    let cap = |label: &str| {
+        3 + if label.is_empty() {
+            0
+        } else {
+            1 + text_width(label)
+        }
+    };
+    let avail = w - 6; // from x + 3 to x + w - 3
+    let session_labels = [
         format!("allow all {} this session", ap.tool),
         format!("allow all {} for session", ap.tool),
         format!("allow all {}", ap.tool),
         "allow session".to_string(),
-    ]
-    .into_iter()
-    .find(|l| text_width(l) <= room)
-    .unwrap_or_else(|| "allow all".to_string());
+        "session".to_string(),
+        "all".to_string(),
+    ];
+    let wordings: [(&str, &str, &[String]); 3] = [
+        ("allow once", "esc deny", &session_labels[..5]),
+        ("once", "deny", &session_labels[3..]),
+        ("", "", &[]),
+    ];
+    let (y_label, n_label, r_label) = wordings
+        .iter()
+        .find_map(|(yl, nl, rs)| {
+            if rs.is_empty() {
+                return Some((*yl, *nl, String::new()));
+            }
+            rs.iter()
+                .find(|r| cap(yl) + 3 + cap(r) + 3 + cap(nl) <= avail)
+                .map(|r| (*yl, *nl, r.clone()))
+        })
+        .unwrap_or(("", "", String::new()));
+    let deny_w = cap(n_label);
+    let deny_x = x + w - 3 - deny_w;
     // Each is clickable as the key it shows: the click goes through the
     // same handler, so the arming delay and the mode rules apply to it.
     let key = |c: char| {
@@ -895,22 +936,29 @@ fn draw_approval(
         )
     };
     let mut kx = x + 3;
-    for (k, lab) in [("y", "allow once"), ("R", session_label.as_str())] {
+    for (k, lab) in [("y", y_label), ("R", r_label.as_str())] {
         let from = kx;
         kx = keycap(cv, kx, yy, k, k == "y");
-        kx = cv.text(kx + 1, yy, lab, INK2, Some(RAISE));
+        if !lab.is_empty() {
+            kx = cv.text(kx + 1, yy, lab, INK2, Some(RAISE));
+        }
         cv.hit(from, yy, kx - from, 1, key(k.chars().next().unwrap_or('y')));
         kx += 3;
     }
     let after_n = keycap(cv, deny_x, yy, "n", false);
-    cv.bold(after_n + 1, yy, "esc", INK2, Some(RAISE));
-    let deny_end = cv.text(
-        after_n + 1 + text_width("esc"),
-        yy,
-        " deny",
-        FAINT,
-        Some(RAISE),
-    );
+    let mut deny_end = after_n;
+    if n_label == "esc deny" {
+        cv.bold(after_n + 1, yy, "esc", INK2, Some(RAISE));
+        deny_end = cv.text(
+            after_n + 1 + text_width("esc"),
+            yy,
+            " deny",
+            FAINT,
+            Some(RAISE),
+        );
+    } else if !n_label.is_empty() {
+        deny_end = cv.text(after_n + 1, yy, n_label, FAINT, Some(RAISE));
+    }
     cv.hit(deny_x, yy, deny_end - deny_x, 1, key('n'));
     // `1 of N`, between the grants and the refusal when there is room.
     if let Some(n) = &ap.queue_note {

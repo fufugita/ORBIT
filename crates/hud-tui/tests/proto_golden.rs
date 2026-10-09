@@ -775,3 +775,104 @@ fn the_top_bar_never_cuts_a_tab_in_half_to_make_room_for_the_cost() {
     let bar = screen.lines().next().unwrap();
     assert!(!bar.contains("Changes"), "{bar}");
 }
+
+#[test]
+fn the_approval_card_keeps_its_parts_apart_at_every_width() {
+    // At 120 columns the middle panel is ~36 wide: the title "Allow Bash?"
+    // ran under the risk badge ("Allow B ▰▰▱ MEDIUM RISK") and the `R`
+    // label ran into `n esc deny` ("R all n aesc deny"). The parts give up
+    // words in a fixed order instead of overlapping.
+    let mut tui = Tui::new();
+    tui.tick_ms = 9_000;
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "run the tests".into(),
+        ..Default::default()
+    });
+    s.turn_live = true;
+    s.approval_pending = Some("Bash".into());
+    s.approval_queue.push("Bash".into());
+    s.approval_summary = Some("Bash(python3 test_calc.py)".into());
+    s.approval_risk = 2;
+    s.approval_shown_ms = 1_000;
+    s.approval_facts = vec![("sandbox".into(), "confined · no network".into())];
+    let r_labels = [
+        "allow all Bash this session",
+        "allow all Bash for session",
+        "allow all Bash",
+        "allow session",
+        "session",
+        "all",
+        "",
+    ];
+    let mut seen_full = false;
+    for width in [40u16, 44, 48, 52, 60, 70, 80, 100, 119, 120, 140, 164] {
+        let out = render(&tui, &s, width, 36);
+        let rows: Vec<&str> = out.lines().collect();
+        let head = rows
+            .iter()
+            .find(|r| r.contains("NEEDS YOU"))
+            .unwrap_or_else(|| panic!("{width}: no card header:\n{out}"));
+        assert!(
+            head.contains("Allow Bash?") || (head.contains("Allow ") && head.contains("?")),
+            "{width}: the title survives:\n{head}"
+        );
+        assert!(
+            head.contains("MEDIUM") || head.contains("\u{25b0}\u{25b0}\u{25b1}"),
+            "{width}: the risk survives:\n{head}"
+        );
+        // What `R` grants keeps the word that bounds it, however narrow.
+        let grants = rows
+            .iter()
+            .find(|r| r.contains("R grants"))
+            .unwrap_or_else(|| panic!("{width}: no `R grants` row:\n{out}"));
+        assert!(
+            grants.contains("session") || grants.contains("quit"),
+            "{width}: the scope is clipped away:\n{grants}"
+        );
+        let keys = rows
+            .iter()
+            .find(|r| r.contains('\u{2517}') && r.contains(" y "))
+            .unwrap_or_else(|| panic!("{width}: no key row:\n{out}"));
+        let between = |a: &str, b: &str| -> String {
+            let from = keys.find(a).unwrap() + a.len();
+            let to = from
+                + keys[from..]
+                    .find(b)
+                    .unwrap_or_else(|| panic!("{width}: {b:?} after {a:?}:\n{keys}"));
+            keys[from..to]
+                .trim_matches(|c: char| c == '\u{2501}' || c == ' ')
+                .to_string()
+        };
+        let y_label = between(" y ", " R ");
+        let r_label = between(" R ", " n ");
+        let n_at = keys.find(" n ").unwrap() + 3;
+        // The card ends at its corner; other panels may follow on the row.
+        let n_label = keys[n_at..]
+            .split('\u{251b}')
+            .next()
+            .unwrap()
+            .trim_matches(|c: char| c == '\u{2501}' || c == ' ')
+            .to_string();
+        assert!(
+            ["allow once", "once", ""].contains(&y_label.as_str()),
+            "{width}: {y_label:?}\n{keys}"
+        );
+        assert!(
+            r_labels.contains(&r_label.as_str()),
+            "{width}: {r_label:?}\n{keys}"
+        );
+        assert!(
+            ["esc deny", "deny", ""].contains(&n_label.as_str()),
+            "{width}: {n_label:?}\n{keys}"
+        );
+        if width >= 120 {
+            seen_full |= r_label.starts_with("allow all Bash") && n_label == "esc deny";
+        }
+    }
+    assert!(
+        seen_full,
+        "a wide card spells the grant and the refusal out"
+    );
+}
