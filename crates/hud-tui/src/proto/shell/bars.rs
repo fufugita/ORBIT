@@ -1,6 +1,6 @@
 //! The top bar (row 0) and the status line (last row).
 
-use super::canvas::{mix, segs_width, tint, Cv, Rgb, Seg};
+use super::canvas::{mix, segs_width, text_width, tint, Cv, Rgb, Seg};
 use super::frame::{keyhints, pill, pill_width};
 use super::motion::{ease_in_out, flash, prog, secs, shimmer, star_at};
 use super::pal::*;
@@ -112,6 +112,25 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     }
     let mut x = 12;
     if let Some(panels) = &tb.switcher {
+        // One panel at a time: the tabs sit left, the facts right. When the
+        // names of every tab would run into the cost chip, the tabs that
+        // are not open shrink to their number.
+        let tab_w = |num: &usize, title: &str, attn: bool, open: bool, short: bool| {
+            let attn_w = if attn { 2 } else { 0 };
+            if open {
+                text_width(&format!(" {num} {title} ")) + attn_w
+            } else if short {
+                text_width(&format!(" {num} ")) + attn_w
+            } else {
+                text_width(&format!(" {num} ")) + text_width(&format!("{title} ")) + attn_w
+            }
+        };
+        let full: i32 = panels
+            .iter()
+            .map(|(n, t, a)| tab_w(n, t, *a, *n - 1 == tb.focus_idx, false) + 1)
+            .sum();
+        const COST_CHIP: i32 = 10;
+        let short = x + full > w - 2 - COST_CHIP;
         for (num, title, attn) in panels {
             let on = *num - 1 == tb.focus_idx;
             let from = x;
@@ -136,7 +155,9 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                     Some(bg_at(x)),
                     Modifier::BOLD,
                 );
-                x = cv.text(x, 0, &format!("{title} "), MUTED, Some(bg_at(x)));
+                if !short {
+                    x = cv.text(x, 0, &format!("{title} "), MUTED, Some(bg_at(x)));
+                }
                 if *attn {
                     x = cv.put(x, 0, "◆ ", MAGENTA, Some(bg_at(x)), Modifier::BOLD);
                 }
@@ -267,7 +288,9 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     }
     let cw =
         |c: &(Vec<Seg>, Option<Rgb>, u8)| segs_width(&c.0) + if c.1.is_some() { 2 } else { 0 } + 1;
-    while chips.len() > 1 && chips.iter().map(cw).sum::<i32>() - 1 > w - 2 - x {
+    // A chip that cannot fit is dropped, the last one too: drawn anyway it
+    // would run over the tabs.
+    while !chips.is_empty() && chips.iter().map(cw).sum::<i32>() - 1 > w - 2 - x {
         let lo = chips
             .iter()
             .enumerate()

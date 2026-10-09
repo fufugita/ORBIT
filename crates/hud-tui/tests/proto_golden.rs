@@ -744,3 +744,34 @@ fn a_pipe_table_is_drawn_as_a_grid_that_fits_the_panel() {
         .count() as u16;
     assert!(buf[(col, head as u16)].modifier.contains(Modifier::BOLD));
 }
+
+#[test]
+fn the_top_bar_never_cuts_a_tab_in_half_to_make_room_for_the_cost() {
+    // At 60 columns "3 Terminal" ran under the cost chip and read
+    // "3 Termi $0.000". Tabs that are not open give up their name first.
+    let tui = Tui::new();
+    let s = base_scenario();
+    for width in [60u16, 70, 80, 100, 119] {
+        let screen = render(&tui, &s, width, 24);
+        let bar = screen.lines().next().unwrap();
+        assert!(
+            bar.contains("Terminal") || !bar.contains("Termi"),
+            "{width}: a tab is whole or reduced to its number:\n{bar}"
+        );
+        assert!(
+            bar.contains("2 Conversation"),
+            "{width}: the open tab keeps its name:\n{bar}"
+        );
+    }
+    // With room, every name stays.
+    let screen = render(&tui, &s, 119, 24);
+    let bar = screen.lines().next().unwrap();
+    assert!(
+        bar.contains("1 Changes") && bar.contains("3 Terminal"),
+        "{bar}"
+    );
+    // Without it, the ones that are not open are numbers.
+    let screen = render(&tui, &s, 60, 24);
+    let bar = screen.lines().next().unwrap();
+    assert!(!bar.contains("Changes"), "{bar}");
+}
