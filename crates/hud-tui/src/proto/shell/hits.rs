@@ -25,6 +25,8 @@ pub enum Click {
     Slash(usize),
     /// Run row `index` of the command palette.
     Palette(usize),
+    /// Show tape `index` in the Terminal panel (a command's tab).
+    Tape(usize),
     /// Focus panel `index` (the switcher tab of a narrow screen).
     Panel(usize),
     /// Apply layout preset `index` (the top bar's tabs).

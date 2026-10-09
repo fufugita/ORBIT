@@ -758,7 +758,10 @@ mod tests {
             meta: "done · 4.8s".into(),
             ..Default::default()
         });
-        s.tool_output = vec!["running 6 tests".into()];
+        s.tapes = vec![crate::proto::scenario::Tape {
+            lines: vec!["running 6 tests".into()],
+            ..Default::default()
+        }];
         s.activity = vec![
             crate::proto::scenario::ActivityRow {
                 time: "14:02:11".into(),
@@ -1164,6 +1167,101 @@ mod tests {
         assert!(out.contains("starting…"), "{out}");
     }
 
+    /// Two finished commands, each with its own card and tape.
+    fn two_commands() -> Scenario {
+        use crate::proto::scenario::{LineKind, Tape, ToolState, TranscriptLine};
+        let mut s = Scenario::new();
+        let card = |id: &str, cmd: &str, state, meta: &str| TranscriptLine {
+            kind: LineKind::Tool,
+            text: cmd.into(),
+            tool_name: "Bash".into(),
+            call_id: id.into(),
+            tool_state: state,
+            meta: meta.into(),
+            ..Default::default()
+        };
+        s.transcript.push(card(
+            "t1",
+            "cargo test -p orbit",
+            ToolState::Failed,
+            "exit 101 · 2.3s",
+        ));
+        s.transcript
+            .push(card("t2", "ls -la", ToolState::Done, "done · 0.1s"));
+        s.tapes = vec![
+            Tape {
+                call_id: "t1".into(),
+                lines: vec!["error[E0599]: no method named `frob`".into()],
+                dropped: 0,
+            },
+            Tape {
+                call_id: "t2".into(),
+                lines: vec!["total 0".into(), "drwxr-xr-x 2 me me 40 .".into()],
+                dropped: 0,
+            },
+        ];
+        s
+    }
+
+    /// The Terminal keeps a tab per command and shows the newest one's
+    /// output: it used to show one tape, wiped by every new command.
+    #[test]
+    fn the_terminal_has_a_tab_per_command() {
+        let s = two_commands();
+        let out = render(&App::new(std::path::PathBuf::new(), true), &s, 164, 48);
+        // Numbered tabs: the first (failed) command, then the lit second one
+        // spelling out its command; the full line sits under the strip.
+        for want in ["✕1", "✓2 ls -la", "$ ls -la", "total 0", "done · 0.1s"] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert!(
+            !out.contains("E0599"),
+            "the other command's output waits on its tab\n{out}"
+        );
+        assert!(
+            out.contains("[ ] command"),
+            "the footer says how to switch\n{out}"
+        );
+    }
+
+    /// Picking the first tab shows that command's output and how it ended
+    /// (`exit N · duration`) on the last row, without scrolling.
+    #[test]
+    fn a_picked_tape_shows_its_output_and_how_it_ended() {
+        let mut s = two_commands();
+        s.pick_tape(0);
+        let out = render(&App::new(std::path::PathBuf::new(), true), &s, 164, 48);
+        for want in [
+            "$ cargo test -p orbit",
+            "error[E0599]",
+            "✕",
+            "exit 101 · 2.3s",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert!(!out.contains("total 0"), "{out}");
+    }
+
+    #[test]
+    fn a_tape_says_what_the_bound_cut() {
+        let mut s = two_commands();
+        s.tapes[1].dropped = 600;
+        let out = render(&App::new(std::path::PathBuf::new(), true), &s, 164, 48);
+        assert!(out.contains("… 600 earlier lines not kept"), "{out}");
+    }
+
+    /// While a command runs there is no outcome yet, so the last row is
+    /// not claimed.
+    #[test]
+    fn a_running_command_has_no_outcome_row() {
+        let mut s = two_commands();
+        s.transcript[1].tool_state = crate::proto::scenario::ToolState::Running;
+        s.transcript[1].meta.clear();
+        let out = render(&App::new(std::path::PathBuf::new(), true), &s, 164, 48);
+        assert!(out.contains("$ ls -la") && out.contains("total 0"), "{out}");
+        assert!(!out.contains("done · 0.1s"), "{out}");
+    }
+
     /// In a side column a record takes two lines: the OUTCOME and the proof
     /// hash on the first (nothing a long command can clip), the target
     /// under it.
@@ -1513,7 +1611,10 @@ mod tests {
                 ..Default::default()
             });
         }
-        s.tool_output = (0..60).map(|i| format!("out line {i}")).collect();
+        s.tapes = vec![crate::proto::scenario::Tape {
+            lines: (0..60).map(|i| format!("out line {i}")).collect(),
+            ..Default::default()
+        }];
         s.transcript.push(TranscriptLine {
             kind: LineKind::Tool,
             text: "cargo test".into(),

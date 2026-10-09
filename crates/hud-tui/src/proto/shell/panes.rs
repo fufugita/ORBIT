@@ -181,10 +181,108 @@ fn last_shell(s: &Scenario) -> Option<&crate::proto::scenario::TranscriptLine> {
         .find(|l| l.kind == LineKind::Tool && kind_of(&l.tool_name) == "BASH")
 }
 
+/// The card of the command a tape belongs to (matched by call id): it
+/// holds the command line, how it ended and how long it took. A tape whose
+/// card cannot be found (a bare `┃` status line carried no id) is the
+/// newest command's, so the newest tape falls back to the newest card.
+fn tape_card(s: &Scenario, i: usize) -> Option<&crate::proto::scenario::TranscriptLine> {
+    let id = &s.tapes[i].call_id;
+    s.transcript
+        .iter()
+        .rev()
+        .find(|l| l.kind == LineKind::Tool && !id.is_empty() && &l.call_id == id)
+        .or_else(|| (i + 1 == s.tapes.len()).then(|| last_shell(s)).flatten())
+}
+
+/// The glyph and colour a command's state shows (the card's own, §9.8).
+fn tape_tone(state: ToolState) -> (&'static str, Rgb) {
+    match state {
+        ToolState::Running => ("◐", AMBER),
+        ToolState::Done => ("✓", GREEN),
+        ToolState::Failed => ("✕", RED),
+        ToolState::AwaitingYou => ("◆", MAGENTA),
+        ToolState::Cancelled | ToolState::Denied | ToolState::Blocked => ("⊘", MUTED),
+        ToolState::Queued => ("◌", MUTED),
+    }
+}
+
+/// What a tab says of its command: the command itself, whitespace
+/// squeezed, cut to fit. (Its first two words alone told `python3 -c "…"`
+/// from `python3 -c "…"` not at all.)
+fn tape_label(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The Terminal's tab strip: one tab per command, numbered, so every one
+/// fits and none is mistaken for another (commands often share a long
+/// prefix). Only the SELECTED tab spells out its command, in whatever room
+/// the others leave; the full line is under the strip. As many tabs as fit
+/// are shown with the selected one always in view (`‹ ›` mark what is cut).
+/// Every tab is a click target.
+fn terminal_tabs(cv: &mut Cv, x: i32, y: i32, w: i32, s: &Scenario, sel: usize) {
+    let n = s.tapes.len();
+    let states: Vec<ToolState> = (0..n)
+        .map(|i| tape_card(s, i).map(|c| c.tool_state).unwrap_or_default())
+        .collect();
+    // " ✓12 " — a space, the glyph, the number, a space — and a gap.
+    let digits = |i: usize| (i + 1).to_string().len() as i32;
+    let compact = |i: usize| 3 + digits(i) + 1;
+    let room = (w - 2).max(1);
+    let (mut lo, mut hi) = (sel, sel);
+    let mut used = compact(sel);
+    loop {
+        if lo > 0 && used + compact(lo - 1) <= room {
+            lo -= 1;
+            used += compact(lo);
+        } else if hi + 1 < n && used + compact(hi + 1) <= room {
+            hi += 1;
+            used += compact(hi);
+        } else {
+            break;
+        }
+    }
+    // What is left after every compact tab is the selected tab's label.
+    let label = tape_card(s, sel)
+        .map(|c| tape_label(&c.text))
+        .unwrap_or_default();
+    let spare = (room - used - 1).max(0);
+    let label = if spare >= 4 {
+        clip_text(&label, spare)
+    } else {
+        String::new()
+    };
+    let mut cx = x;
+    if lo > 0 {
+        cx = cv.text(cx, y, "‹", FAINT, None);
+    }
+    for (i, state) in states.iter().enumerate().take(hi + 1).skip(lo) {
+        let (g, col) = tape_tone(*state);
+        let from = cx;
+        if i == sel {
+            let text = if label.is_empty() {
+                format!(" {g}{} ", i + 1)
+            } else {
+                format!(" {g}{} {label} ", i + 1)
+            };
+            cx = cv.put(cx, y, &text, ON_ACCENT, Some(col), Modifier::BOLD);
+        } else {
+            cx = cv.text(cx, y, " ", MUTED, None);
+            cx = cv.bold(cx, y, g, col, None);
+            cx = cv.text(cx, y, &format!("{} ", i + 1), MUTED, None);
+        }
+        cv.hit(from, y, cx - from, 1, super::hits::Click::Tape(i));
+        cx += 1;
+    }
+    if hi + 1 < n {
+        cv.text(x + w - 1, y, "›", FAINT, None);
+    }
+}
+
 fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
     let s = inp.s;
-    let sh = last_shell(s);
-    let b = match sh {
+    let sel = s.selected_tape();
+    let card = sel.and_then(|i| tape_card(s, i));
+    let b = match card {
         None => vec![Seg::new("none", FAINT)],
         Some(l) => match l.tool_state {
             ToolState::Running => badge(BadgeState::Running, None, inp.now_ms, inp.reduced),
@@ -198,15 +296,12 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             _ => badge(BadgeState::Idle, None, inp.now_ms, inp.reduced),
         },
     };
-    let Some(inner) = frame(
-        cv,
-        r,
-        View::Terminal,
-        inp,
-        b,
-        vec![("j/k", "scroll")],
-        vec![],
-    ) else {
+    let footer = if s.tapes.len() > 1 {
+        vec![("j/k", "scroll"), ("[ ]", "command")]
+    } else {
+        vec![("j/k", "scroll")]
+    };
+    let Some(inner) = frame(cv, r, View::Terminal, inp, b, footer, vec![]) else {
         return;
     };
     let clip = Rect {
@@ -216,7 +311,7 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         height: inner.height,
     };
     cv.clipped(clip, |cv| {
-        let Some(l) = sh else {
+        let (Some(sel), true) = (sel, !s.tapes.is_empty()) else {
             empty_state(
                 cv,
                 inner,
@@ -227,27 +322,50 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             );
             return;
         };
+        let tape = &s.tapes[sel];
         let (x, y, w, h) = (inner.x as i32, inner.y as i32, inner.width as i32, inner.height as i32);
-        // The command tab.
-        let (g, bg) = match l.tool_state {
-            ToolState::Running => ("◐", AMBER),
-            ToolState::Done => ("✓", GREEN),
-            ToolState::Failed => ("✕", RED),
-            _ => ("◌", MUTED),
-        };
-        let cmd: String = l.text.split(' ').take(2).collect::<Vec<_>>().join(" ");
-        cv.put(x, y, &format!(" {g} {} ", clip_text(&cmd, 18)), ON_ACCENT, Some(bg), Modifier::BOLD);
-        // Output inset.
+        // The command tabs.
+        terminal_tabs(cv, x, y, w, s, sel);
+        // Output inset: the full command line, then the tape.
         let top = y + 2;
         let bottom = y + h - 1;
         cv.fill(r.x as i32 + 1, top - 1, r.width as i32 - 2, (bottom - top + 1).max(0), INSET);
+        let command = card.map(|c| c.text.as_str()).unwrap_or("");
         cv.bold(x, top, "$ ", AMBER, Some(INSET));
-        cv.bold(x + 2, top, &clip_text(&l.text, w - 2), INK, Some(INSET));
-        let lines = &s.tool_output;
-        let avail = (bottom - top - 1).max(0) as usize;
-        let start = lines.len().saturating_sub(avail + inp.scroll.min(lines.len()));
-        for (i, line) in lines.iter().skip(start).take(avail).enumerate() {
-            cv.text(x, top + 1 + i as i32, &clip_text(line, w), INK2, Some(INSET));
+        cv.bold(x + 2, top, &clip_text(command, w - 2), INK, Some(INSET));
+        // How it ended takes the last row, so the person need not scroll
+        // to learn whether it worked.
+        let ended = card.filter(|c| {
+            !matches!(
+                c.tool_state,
+                ToolState::Running | ToolState::Queued | ToolState::AwaitingYou
+            )
+        });
+        let reserve = if ended.is_some() { 1 } else { 0 };
+        let avail = (bottom - top - 1 - reserve).max(0) as usize;
+        let note = (tape.dropped > 0).then(|| format!("… {} earlier lines not kept", tape.dropped));
+        let rows: Vec<(&str, Rgb)> = note
+            .iter()
+            .map(|n| (n.as_str(), FAINT))
+            .chain(tape.lines.iter().map(|l| (l.as_str(), INK2)))
+            .collect();
+        let start = rows.len().saturating_sub(avail + inp.scroll.min(rows.len()));
+        for (i, (line, col)) in rows.iter().skip(start).take(avail).enumerate() {
+            cv.text(x, top + 1 + i as i32, &clip_text(line, w), *col, Some(INSET));
+        }
+        if let Some(c) = ended {
+            let (g, col) = tape_tone(c.tool_state);
+            let what = if c.meta.is_empty() {
+                match c.tool_state {
+                    ToolState::Denied => "denied".to_string(),
+                    ToolState::Cancelled => "cancelled".to_string(),
+                    _ => String::new(),
+                }
+            } else {
+                c.meta.clone()
+            };
+            cv.bold(x, bottom, g, col, Some(INSET));
+            cv.text(x + 2, bottom, &clip_text(&what, w - 2), col, Some(INSET));
         }
     });
 }

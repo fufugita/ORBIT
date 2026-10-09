@@ -37,8 +37,13 @@ pub struct Scenario {
     pub tasks: Vec<crate::proto::panels::TaskRow>,
     /// The Changes panel's rows (FileChanged).
     pub file_changes: Vec<crate::proto::panels::FileChangeRow>,
-    /// The Terminal panel's output tail (ToolOutput lines).
-    pub tool_output: Vec<String>,
+    /// The Terminal panel's tapes, oldest first: one per Bash call, holding
+    /// the output the card does not (the card, found by `call_id`, holds
+    /// the command and how it ended).
+    pub tapes: Vec<Tape>,
+    /// The tape the Terminal shows; `None` follows the newest, so a new
+    /// command takes the panel unless the person is reading an older one.
+    pub tape_sel: Option<usize>,
     /// The Activity panel's rows, oldest first (capped).
     pub activity: Vec<ActivityRow>,
     /// Context meter (Usage): tokens in use, the window, when shown.
@@ -151,6 +156,21 @@ pub struct ActivityRow {
     pub fact: String,
     /// The ledger record's own hash, when the row is a record.
     pub digest: Option<String>,
+}
+
+/// How many lines one tape keeps, and how many tapes the panel keeps.
+pub const TAPE_MAX_LINES: usize = 400;
+pub const TAPE_MAX: usize = 20;
+
+/// One command's output in the Terminal panel. Only the lines live here;
+/// the command, its state and its duration are the transcript card's
+/// (matched by `call_id`), so the two cannot disagree.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Tape {
+    pub call_id: String,
+    pub lines: Vec<String>,
+    /// Lines cut from the front to keep the bound (the panel says so).
+    pub dropped: usize,
 }
 
 /// The M5 turn report: ✓ done · 41s · 3 tools · +$0.0031.
@@ -303,7 +323,12 @@ impl Scenario {
             + self.running.len() as u64
             + self.approval_queue.len() as u64
             + self.approval_summary.is_some() as u64
-            + self.tool_output.len() as u64
+            + self
+                .tapes
+                .iter()
+                .map(|t| t.lines.len() + t.dropped)
+                .sum::<usize>() as u64
+            + self.tapes.len() as u64
             + (self.turn_live as u64)
             + (self.last_failed as u64)
     }
@@ -315,6 +340,71 @@ impl Scenario {
         let p = (now_ms.saturating_sub(self.ctx_ms) as f32 / 300.0).clamp(0.0, 1.0);
         let e = 1.0 - (1.0 - p).powi(3);
         self.ctx_from + (self.ctx_to - self.ctx_from) * e
+    }
+
+    /// The tape the Terminal shows: the newest unless one was picked.
+    pub fn selected_tape(&self) -> Option<usize> {
+        match self.tapes.len() {
+            0 => None,
+            n => Some(self.tape_sel.map_or(n - 1, |i| i.min(n - 1))),
+        }
+    }
+
+    /// Pick the previous (`-1`) or next (`+1`) tape. Landing on the newest
+    /// goes back to following it.
+    pub fn move_tape_selection(&mut self, delta: isize) {
+        let Some(cur) = self.selected_tape() else {
+            return;
+        };
+        let last = self.tapes.len() - 1;
+        let next = (cur as isize + delta).clamp(0, last as isize) as usize;
+        self.tape_sel = if next == last { None } else { Some(next) };
+    }
+
+    /// Show tape `i` (a click on its tab).
+    pub fn pick_tape(&mut self, i: usize) {
+        let last = self.tapes.len().saturating_sub(1);
+        self.tape_sel = if i >= last { None } else { Some(i) };
+    }
+
+    /// A Bash call starts: it gets its own tape. The panel follows it
+    /// unless the person is reading an older one.
+    pub fn start_tape(&mut self, call_id: &str) {
+        if !call_id.is_empty() && self.tapes.iter().any(|t| t.call_id == call_id) {
+            return;
+        }
+        let following = self.tape_sel.is_none();
+        self.tapes.push(Tape {
+            call_id: call_id.to_string(),
+            ..Default::default()
+        });
+        if self.tapes.len() > TAPE_MAX {
+            self.tapes.remove(0);
+            // Indexes shifted down by one.
+            self.tape_sel = self.tape_sel.and_then(|i| i.checked_sub(1));
+        }
+        if following {
+            self.tape_sel = None;
+        }
+    }
+
+    /// One line of a command's output, to ITS tape (a late line of an
+    /// older command still lands on that command's tape, not the newest).
+    pub fn push_tape_line(&mut self, call_id: &str, line: String) {
+        let tape = if call_id.is_empty() {
+            self.tapes.last_mut()
+        } else {
+            self.tapes.iter_mut().find(|t| t.call_id == call_id)
+        };
+        let Some(tape) = tape else {
+            return;
+        };
+        tape.lines.push(line);
+        if tape.lines.len() > TAPE_MAX_LINES {
+            let cut = tape.lines.len() - TAPE_MAX_LINES;
+            tape.lines.drain(..cut);
+            tape.dropped += cut;
+        }
     }
 
     /// The selected changed file's index, clamped to the list (files

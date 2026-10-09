@@ -963,6 +963,77 @@ def main():
         mock5.terminate()
     _shutil.rmtree(work5, ignore_errors=True)
 
+    # ── 5h. The Terminal keeps a tape per command ──────────────────────────
+    # One tape used to hold only the newest command and was wiped by the
+    # next one, so a failing command's output vanished as soon as anything
+    # else ran. Two commands, the second failing: both stay readable.
+    work6 = _tempfile.mkdtemp(prefix="orbit-pty-tapes-")
+    script6 = {"main": [
+        {"tools": [{"name": "Bash", "args": {
+            "command": "python3 -c \"print('first command ran')\"", "description": "one"}}]},
+        {"tools": [{"name": "Bash", "args": {
+            "command": "python3 -c \"import sys; print('boom: it failed'); sys.exit(3)\"",
+            "description": "two"}}]},
+        {"text": "All commands finished."},
+    ]}
+    with open(os.path.join(work6, "script.json"), "w") as fh:
+        _json.dump(script6, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port6 = _ss.getsockname()[1]
+    _ss.close()
+    mock6 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port6), "--script", os.path.join(work6, "script.json"),
+         "--log", os.path.join(work6, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home6 = os.path.join(work6, "home")
+    subprocess.run([args.binary, "init", "--home", home6, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home6))
+    with open(os.path.join(home6, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port6}"\n'
+                 '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+    s6 = PtySession([args.binary, "--home", home6, "--model", "scripted"],
+                    env={"ORBIT_HOME": home6}, timeout=20, rows=48, cols=164, cwd=work6)
+    s6.wait_for("ORBIT", timeout=15)
+    pump(s6, 2.6)
+    s6.type("run both")
+    s6.key("enter")
+    done6 = False
+    for _ in range(80):
+        pump(s6, 0.5)
+        txt = s6.screen_text()
+        if "All commands finished" in txt:
+            done6 = True
+            break
+        if "allow once" in txt or "Allow " in txt:
+            pump(s6, 1.4)
+            s6.key("y")
+            pump(s6, 0.6)
+    check("a round with two commands completes", done6, s6.screen_text()[-400:])
+    t = s6.screen_text()
+    check("the Terminal shows the newest command's output and its exit code",
+          "boom: it failed" in t and "exit 3" in t, t[:1200])
+    check("…and a numbered tab for each command", "✓1" in t and "✕2" in t, t[:600])
+    pos = s6.find_text("✓1")
+    if pos:
+        s6.click(*pos)
+        pump(s6, 0.8)
+    t = s6.screen_text()
+    check("clicking the first tab shows the first command's output, kept",
+          "first command ran" in t and "boom: it failed" not in t, t[:1200])
+    s6.type("]")
+    pump(s6, 0.6)
+    t = s6.screen_text()
+    check("] moves to the next command", "boom: it failed" in t and "exit 3" in t, t[:1200])
+    s6.terminate()
+    try:
+        os.killpg(mock6.pid, signal.SIGTERM)
+    except Exception:
+        mock6.terminate()
+    _shutil.rmtree(work6, ignore_errors=True)
+
     # ── 6. /sessions + /resume round-trip ──────────────────────────────────
     # A completed turn (the tool turn above) saved a session file.
     # The worker emits "session_id model=X turns=X" as a SystemMessage.

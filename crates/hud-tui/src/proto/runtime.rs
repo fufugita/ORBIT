@@ -355,6 +355,10 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                                 crossterm::event::KeyModifiers::NONE,
                             )));
                         }
+                        MouseOutcome::Tape(i) => {
+                            scenario.pick_tape(i);
+                            tui.scroll_follow(); // the other command is read from its end
+                        }
                         // The palette is a menu: a click runs the row (⏎).
                         MouseOutcome::Palette(i) => {
                             palette_sel = i;
@@ -1052,6 +1056,15 @@ fn handle_key(
         KeyCode::Char('p') if tui.app.focused_view() == super::layout::View::Review => {
             scenario.move_hunk_selection(-1);
         }
+        // The Terminal keeps a tape per command: [ ] pick one.
+        KeyCode::Char('[') if tui.app.focused_view() == super::layout::View::Terminal => {
+            scenario.move_tape_selection(-1);
+            tui.scroll_follow();
+        }
+        KeyCode::Char(']') if tui.app.focused_view() == super::layout::View::Terminal => {
+            scenario.move_tape_selection(1);
+            tui.scroll_follow();
+        }
         // Panels that only scroll: j/k move a line (PgUp/PgDn a page).
         KeyCode::Char('j') | KeyCode::Down
             if matches!(
@@ -1255,6 +1268,8 @@ fn run_command(
         "/clear" => {
             let _ = command_sink.send(WorkerCommand::Compact);
             scenario.transcript.clear();
+            scenario.tapes.clear();
+            scenario.tape_sel = None;
             notice(
                 scenario,
                 "conversation cleared · earlier turns are no longer sent to the model".into(),
@@ -1365,10 +1380,10 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 }
             } else {
                 scenario.turn_tools += 1;
-                // The Terminal panel tapes the newest command: a new
-                // Bash call starts a clean tape.
+                // The Terminal panel keeps a tape per command: a new Bash
+                // call starts its own.
                 if name == "Bash" {
-                    scenario.tool_output.clear();
+                    scenario.start_tape(&call_id);
                 }
                 scenario.transcript.push(TranscriptLine {
                     kind: LineKind::Tool,
@@ -1382,23 +1397,9 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             }
         }
         Msg::ToolOutput { call_id, line } => {
-            // Live output of the newest Bash call, for the Terminal
-            // panel. Bounded: the panel shows a tail.
-            let newest_bash_is_it = scenario
-                .transcript
-                .iter()
-                .rev()
-                .find(|l| l.kind == LineKind::Tool && l.tool_name == "Bash")
-                .map(|l| call_id.is_empty() || l.call_id == call_id)
-                .unwrap_or(false);
-            if newest_bash_is_it {
-                scenario.tool_output.push(line);
-                const TAPE_MAX: usize = 400;
-                if scenario.tool_output.len() > TAPE_MAX {
-                    let drop = scenario.tool_output.len() - TAPE_MAX;
-                    scenario.tool_output.drain(..drop);
-                }
-            }
+            // Live output of a Bash call, to that call's tape (the
+            // Terminal panel). Bounded per tape.
+            scenario.push_tape_line(&call_id, line);
         }
         Msg::ToolCallFinished {
             call_id,
@@ -1595,10 +1596,8 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             }
         }
         Msg::Status(text) if text.starts_with("┃ ") => {
-            // Streamed tool output: the Terminal panel's lines.
-            scenario
-                .tool_output
-                .push(text.trim_start_matches("┃ ").to_string());
+            // Streamed tool output (no call id): the newest tape.
+            scenario.push_tape_line("", text.trim_start_matches("┃ ").to_string());
         }
         Msg::Status(text) if text.starts_with("retry ") => {
             // `retry {n} in {ms}ms — {reason}`: the backoff countdown (M27).
@@ -1969,6 +1968,8 @@ enum MouseOutcome {
     Slash(usize),
     /// A click on row `i` of the command palette.
     Palette(usize),
+    /// A click on the tab of the Terminal's tape `i`.
+    Tape(usize),
 }
 
 /// The mouse, with every gesture bound to the panel under the pointer
@@ -2033,6 +2034,10 @@ fn handle_mouse(
                 Some(Click::Slash(i)) => {
                     focus_under(tui);
                     return MouseOutcome::Slash(i);
+                }
+                Some(Click::Tape(i)) => {
+                    focus_under(tui);
+                    return MouseOutcome::Tape(i);
                 }
                 Some(Click::Panel(i)) => {
                     if i < tui.app.panel_count() && i != tui.app.focus {
@@ -2265,44 +2270,45 @@ mod tool_card_tests {
         assert!(s.running.is_empty());
     }
 
+    fn lines(s: &Scenario, call_id: &str) -> Vec<String> {
+        s.tapes
+            .iter()
+            .find(|t| t.call_id == call_id)
+            .map(|t| t.lines.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every Bash call has its own tape: a new command does not erase the
+    /// last one's output, and a late line of an older command lands on ITS
+    /// tape (it used to be dropped, because only the newest command was
+    /// taped).
     #[test]
-    fn bash_output_fills_the_terminal_tape_for_the_newest_command() {
+    fn each_bash_call_has_its_own_tape() {
         let mut s = Scenario::new();
+        let out = |id: &str, line: &str| Msg::ToolOutput {
+            call_id: id.into(),
+            line: line.into(),
+        };
         apply_msg(started("old", "Bash", "echo old"), &mut s, 1);
-        apply_msg(
-            Msg::ToolOutput {
-                call_id: "old".into(),
-                line: "old line".into(),
-            },
-            &mut s,
-            2,
-        );
-        assert_eq!(s.tool_output, vec!["old line"]);
-        // A new command starts a clean tape; late lines of the old one
-        // do not leak into it.
+        apply_msg(out("old", "old line"), &mut s, 2);
+        assert_eq!(lines(&s, "old"), ["old line"]);
         apply_msg(started("new", "Bash", "echo new"), &mut s, 3);
-        assert!(s.tool_output.is_empty());
-        apply_msg(
-            Msg::ToolOutput {
-                call_id: "old".into(),
-                line: "stale".into(),
-            },
-            &mut s,
-            4,
-        );
-        apply_msg(
-            Msg::ToolOutput {
-                call_id: "new".into(),
-                line: "fresh".into(),
-            },
-            &mut s,
-            5,
-        );
-        assert_eq!(s.tool_output, vec!["fresh"]);
+        assert_eq!(lines(&s, "old"), ["old line"], "the first tape is kept");
+        assert!(lines(&s, "new").is_empty(), "the new one starts empty");
+        apply_msg(out("old", "late"), &mut s, 4);
+        apply_msg(out("new", "fresh"), &mut s, 5);
+        assert_eq!(lines(&s, "old"), ["old line", "late"]);
+        assert_eq!(lines(&s, "new"), ["fresh"]);
+        // A tool that is not Bash has no tape.
+        apply_msg(started("g", "Glob", "*.rs"), &mut s, 6);
+        assert_eq!(s.tapes.len(), 2);
+        // Output for a call nobody started is dropped, not misfiled.
+        apply_msg(out("ghost", "x"), &mut s, 7);
+        assert_eq!(s.tapes.iter().map(|t| t.lines.len()).sum::<usize>(), 3);
     }
 
     #[test]
-    fn the_tape_keeps_a_bounded_tail() {
+    fn a_tape_keeps_a_bounded_tail_and_says_what_it_dropped() {
         let mut s = Scenario::new();
         apply_msg(started("c", "Bash", "yes"), &mut s, 1);
         for i in 0..1000 {
@@ -2315,8 +2321,69 @@ mod tool_card_tests {
                 2,
             );
         }
-        assert_eq!(s.tool_output.len(), 400);
-        assert_eq!(s.tool_output.last().map(String::as_str), Some("line 999"));
+        let t = &s.tapes[0];
+        assert_eq!(t.lines.len(), 400);
+        assert_eq!(t.lines.last().map(String::as_str), Some("line 999"));
+        assert_eq!(t.dropped, 600, "the cut is counted");
+    }
+
+    /// The panel keeps the last 20 commands.
+    #[test]
+    fn the_panel_keeps_a_bounded_number_of_tapes() {
+        let mut s = Scenario::new();
+        for i in 0..30 {
+            apply_msg(started(&format!("c{i}"), "Bash", "true"), &mut s, i);
+        }
+        assert_eq!(s.tapes.len(), 20);
+        assert_eq!(s.tapes[0].call_id, "c10", "the oldest went");
+        assert_eq!(s.tapes[19].call_id, "c29");
+    }
+
+    /// The panel follows the newest command; reading an older one pins it
+    /// there until you come back to the newest.
+    #[test]
+    fn a_tape_picked_stays_picked_while_new_commands_run() {
+        let mut s = Scenario::new();
+        for id in ["a", "b", "c"] {
+            apply_msg(started(id, "Bash", "true"), &mut s, 1);
+        }
+        assert_eq!(s.selected_tape(), Some(2), "follows the newest");
+        s.move_tape_selection(-1);
+        s.move_tape_selection(-1);
+        assert_eq!(s.selected_tape(), Some(0));
+        apply_msg(started("d", "Bash", "true"), &mut s, 2);
+        assert_eq!(
+            s.selected_tape(),
+            Some(0),
+            "a new command does not yank it away"
+        );
+        s.move_tape_selection(1);
+        s.move_tape_selection(1);
+        s.move_tape_selection(1);
+        assert_eq!(s.selected_tape(), Some(3));
+        assert!(
+            s.tape_sel.is_none(),
+            "landing on the newest follows it again"
+        );
+        apply_msg(started("e", "Bash", "true"), &mut s, 3);
+        assert_eq!(s.selected_tape(), Some(4));
+        s.pick_tape(1);
+        assert_eq!(s.selected_tape(), Some(1));
+        s.pick_tape(99);
+        assert!(s.tape_sel.is_none());
+    }
+
+    /// A pinned tape stays on the same command when the oldest is dropped.
+    #[test]
+    fn dropping_the_oldest_tape_keeps_the_pick_on_its_command() {
+        let mut s = Scenario::new();
+        for i in 0..20 {
+            apply_msg(started(&format!("c{i}"), "Bash", "true"), &mut s, 1);
+        }
+        s.pick_tape(5);
+        apply_msg(started("c20", "Bash", "true"), &mut s, 2);
+        let i = s.selected_tape().unwrap();
+        assert_eq!(s.tapes[i].call_id, "c5");
     }
 
     /// The status line read "approval needed · tool": apply() stamped a
@@ -2917,6 +2984,40 @@ mod click_tests {
         );
         assert!(!click_file(&mut s, 0));
         assert_eq!((s.selected_file(), s.hunk_sel), (Some(0), 0));
+    }
+
+    /// A command's tab in the Terminal is a click target.
+    #[test]
+    fn a_terminal_tab_selects_its_command() {
+        use crate::proto::scenario::{LineKind, Tape, ToolState, TranscriptLine};
+        let (w, h) = (164, 48);
+        let mut tui = fresh_tui();
+        let mut s = Scenario::new();
+        for (id, cmd) in [("t1", "cargo test"), ("t2", "ls -la")] {
+            s.transcript.push(TranscriptLine {
+                kind: LineKind::Tool,
+                text: cmd.into(),
+                tool_name: "Bash".into(),
+                call_id: id.into(),
+                tool_state: ToolState::Done,
+                ..Default::default()
+            });
+            s.tapes.push(Tape {
+                call_id: id.into(),
+                ..Default::default()
+            });
+        }
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        // Numbered tabs: `✓1` is the first command's, `✓2 ls -la` the lit one.
+        let first = at(&rows, "✓1");
+        let o = click(&mut tui, first, false, w, h);
+        assert_eq!(o, MouseOutcome::Tape(0));
+        assert_eq!(tui.app.focused_view(), crate::proto::layout::View::Terminal);
+        s.pick_tape(0);
+        assert_eq!(s.selected_tape(), Some(0));
+        let rows = frame(&mut tui, &s, "", None, w, h);
+        let second = at(&rows, "✓2");
+        assert_eq!(click(&mut tui, second, false, w, h), MouseOutcome::Tape(1));
     }
 
     /// A row of the `/` list is a click target, indexed in the WHOLE list.
