@@ -618,6 +618,109 @@ def main():
         mock2.terminate()
     _shutil.rmtree(work2, ignore_errors=True)
 
+    # ── 5d. Review: pick a file, read its real diff, open the full diff ───
+    # A round that edits one file and CREATES another (scripts/scripted_mock.py).
+    # The Changes/Review panels used to miss a created file entirely, Review's
+    # diff pane was a fixed sentence, and the footers advertised j/k, n/p and
+    # "revert" with nothing behind them.
+    work3 = _tempfile.mkdtemp(prefix="orbit-pty-review-")
+    with open(os.path.join(work3, "calc.py"), "w") as fh:
+        fh.write("def add(a, b):\n    return a - b\n")
+    script3 = {"main": [
+        {"tools": [{"name": "Read", "args": {"file_path": os.path.join(work3, "calc.py")}}]},
+        {"tools": [{"name": "Edit", "args": {
+            "file_path": os.path.join(work3, "calc.py"),
+            "old_string": "return a - b", "new_string": "return a + b"}}]},
+        {"tools": [{"name": "Write", "args": {
+            "file_path": os.path.join(work3, "notes.txt"),
+            "content": "remember: add() was subtracting\n"}}]},
+        {"text": "Done: fixed add() and left a note."},
+    ]}
+    with open(os.path.join(work3, "script.json"), "w") as fh:
+        _json.dump(script3, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port3 = _ss.getsockname()[1]
+    _ss.close()
+    mock3 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port3), "--script", os.path.join(work3, "script.json"),
+         "--log", os.path.join(work3, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home3 = os.path.join(work3, "home")
+    subprocess.run([args.binary, "init", "--home", home3, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home3))
+    with open(os.path.join(home3, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port3}"\n'
+                 '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+    s3 = PtySession([args.binary, "--home", home3, "--model", "scripted"],
+                    env={"ORBIT_HOME": home3}, timeout=20, rows=48, cols=164, cwd=work3)
+    # The TUI paints continuously; a harness that sleeps without reading
+    # the PTY lets the output back up until the app's writes block. Every
+    # wait in this scenario therefore DRAINS the terminal.
+    def pump(sess, secs):
+        end_at = time.time() + secs
+        while time.time() < end_at:
+            sess.read(min(0.3, max(0.05, end_at - time.time())))
+
+    s3.wait_for("ORBIT", timeout=15)
+    pump(s3, 2.6)  # past the startup window, so the first keys are not lost
+    s3.type("fix add")
+    s3.key("enter")
+    done3 = False
+    for _ in range(60):  # three approval cards, then the closing text
+        pump(s3, 0.5)
+        txt = s3.screen_text()
+        if "left a note" in txt:
+            done3 = True
+            break
+        if "Allow " in txt:
+            pump(s3, 1.6)  # §9.14 arming window
+            s3.key("y")
+            pump(s3, 0.6)
+    check("a round that edits one file and creates another completes", done3,
+          s3.screen_text()[-300:])
+    # Esc arranges; `]` x3 reaches the review layout; Esc again leaves
+    # arranging with focus still on the Review panel.
+    s3.key("esc")
+    pump(s3, 0.5)
+    for _ in range(3):
+        s3.type("]")
+        pump(s3, 0.6)
+    s3.key("esc")
+    pump(s3, 0.6)
+    t = s3.screen_text()
+    check("review lists both files, the created one too",
+          "calc.py" in t and "notes.txt" in t and "2 files" in t, t[-600:])
+    check("review draws the selected file's real hunk, not a placeholder",
+          "@@ -1,2 +1,2 @@" in t and "return a + b" in t and "The diff appears here" not in t,
+          t[:1500])
+    check("the footer names no key that does nothing",
+          "revert" not in t and "j/k" in t and "n/p" in t, t[-400:])
+    s3.type("j")
+    pump(s3, 0.6)
+    t = s3.screen_text()
+    check("j moves to the created file and shows it as an addition",
+          "@@ -0,0 +1,1 @@" in t and "remember: add() was subtracting" in t, t[:1500])
+    s3.key("enter")
+    pump(s3, 1.0)
+    t = s3.screen_text()
+    check("enter opens the SELECTED file's full diff",
+          "esc close" in t and t.count("remember: add() was subtracting") >= 2, t[:2000])
+    s3.key("esc")
+    pump(s3, 0.5)
+    s3.type("k")
+    pump(s3, 0.5)
+    t = s3.screen_text()
+    check("k moves back to the first file", "hunk 1/1" in t and "return a + b" in t, t[:1500])
+    s3.terminate()
+    try:
+        os.killpg(mock3.pid, signal.SIGTERM)
+    except Exception:
+        mock3.terminate()
+    _shutil.rmtree(work3, ignore_errors=True)
+
     # ── 6. /sessions + /resume round-trip ──────────────────────────────────
     # A completed turn (the tool turn above) saved a session file.
     # The worker emits "session_id model=X turns=X" as a SystemMessage.

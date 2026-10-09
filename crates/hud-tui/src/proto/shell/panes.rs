@@ -4,10 +4,12 @@
 
 use super::canvas::{clip_path, clip_text, mix, text_width, tint, Cv, Rgb, Seg};
 use super::convo::kind_of;
+use super::diffrows;
 use super::frame::{badge, empty_state, panel_frame, BadgeState, FrameSpec};
 use super::motion::{ease_out, flash, prog, pulse, secs};
 use super::pal::*;
 use crate::proto::layout::View;
+use crate::proto::panels::FileChangeRow;
 use crate::proto::scenario::{LineKind, Scenario, ToolState};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -106,7 +108,7 @@ fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         View::Changes,
         inp,
         b,
-        vec![("j/k", "file"), ("⏎", "full diff"), ("u", "revert file")],
+        vec![("j/k", "file"), ("⏎", "full diff")],
         vec![],
     ) else {
         return;
@@ -130,9 +132,14 @@ fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             return;
         }
         let (x, w) = (inner.x as i32, inner.width as i32);
-        for (i, f) in files.iter().enumerate() {
-            let yy = inner.y as i32 + i as i32;
-            let sel = i == 0;
+        // The window follows the selection, so `j` past the last visible
+        // row scrolls instead of selecting something off screen.
+        let selected = inp.s.selected_file().unwrap_or(0);
+        let rows = (inner.height as usize).max(1);
+        let first = (selected + 1).saturating_sub(rows);
+        for (i, f) in files.iter().enumerate().skip(first).take(rows) {
+            let yy = inner.y as i32 + (i - first) as i32;
+            let sel = i == selected;
             // M11: the changed row flashes for 600 ms and its counters
             // count up in 300 ms.
             let changed = inp.s.file_changed_ms.get(i).copied().filter(|t| *t > 0).map(secs);
@@ -190,7 +197,15 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             _ => badge(BadgeState::Idle, None, inp.now_ms, inp.reduced),
         },
     };
-    let Some(inner) = frame(cv, r, View::Terminal, inp, b, vec![("⌃c", "stop")], vec![]) else {
+    let Some(inner) = frame(
+        cv,
+        r,
+        View::Terminal,
+        inp,
+        b,
+        vec![("j/k", "scroll"), ("⌃c", "stop")],
+        vec![],
+    ) else {
         return;
     };
     let clip = Rect {
@@ -244,7 +259,7 @@ fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
     } else {
         vec![Seg::bold(format!("{done}/{} done", tasks.len()), CYAN)]
     };
-    let Some(inner) = frame(cv, r, View::Plan, inp, b, vec![("j/k", "step")], vec![]) else {
+    let Some(inner) = frame(cv, r, View::Plan, inp, b, vec![], vec![]) else {
         return;
     };
     let clip = Rect {
@@ -390,7 +405,15 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             Seg::new(format!(" · {proof} on the ledger"), MUTED),
         ]
     };
-    let Some(inner) = frame(cv, r, View::Activity, inp, b, vec![], vec![]) else {
+    let Some(inner) = frame(
+        cv,
+        r,
+        View::Activity,
+        inp,
+        b,
+        vec![("j/k", "scroll")],
+        vec![],
+    ) else {
         return;
     };
     let clip = Rect {
@@ -549,7 +572,7 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         View::Review,
         inp,
         b,
-        vec![("j/k", "file"), ("n/p", "hunk"), ("u", "revert hunk")],
+        vec![("j/k", "file"), ("n/p", "hunk"), ("⏎", "full diff")],
         vec![],
     ) else {
         return;
@@ -581,12 +604,12 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         // Files on the left, the selected file on the right.
         let lw = (w * 2 / 5).clamp(24, 40).min(w - 10);
         cv.text(x, y, "FILES", FAINT, None);
-        for (i, f) in files.iter().enumerate() {
-            let yy = y + 1 + i as i32;
-            if yy >= y + h {
-                break;
-            }
-            let sel = i == 0;
+        let selected = inp.s.selected_file().unwrap_or(0);
+        let rows = ((h - 1).max(1)) as usize;
+        let first = (selected + 1).saturating_sub(rows);
+        for (i, f) in files.iter().enumerate().skip(first).take(rows) {
+            let yy = y + 1 + (i - first) as i32;
+            let sel = i == selected;
             let bg = if sel {
                 Some(tint(VIOLET, PANEL, 0.12))
             } else {
@@ -620,20 +643,66 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         }
         let rx = x + lw + 2;
         let rw = w - lw - 2;
-        if let Some(f) = files.first() {
-            cv.bold(rx, y, &clip_path(&f.path, rw), BLUE, None);
+        if let Some(i) = inp.s.selected_file() {
+            review_diff(cv, rx, y, rw, h, &files[i], inp.s.selected_hunk());
+        }
+    });
+}
+
+/// The Review panel's right pane: the selected file's real hunks, from the
+/// current one down. Says plainly when the engine had nothing to diff
+/// against — it never shows a placeholder as if it were a diff.
+fn review_diff(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, f: &FileChangeRow, hunk: usize) {
+    match &f.hunks {
+        None => {
+            cv.bold(x, y, &clip_path(&f.path, w), BLUE, None);
+            cv.text(x, y + 2, "◌ no diff captured", MUTED, None);
             cv.text(
-                rx,
-                y + 2,
+                x,
+                y + 3,
                 &clip_text(
-                    "The diff appears here once the engine sends hunks for this change.",
-                    rw,
+                    "this change arrived without a \"before\" to diff against",
+                    w,
                 ),
-                MUTED,
+                FAINT,
                 None,
             );
         }
-    });
+        Some(hs) if hs.is_empty() => {
+            cv.bold(x, y, &clip_path(&f.path, w), BLUE, None);
+            cv.text(x, y + 2, "◌ no visible changes", MUTED, None);
+            cv.text(
+                x,
+                y + 3,
+                &clip_text("the edit touched only lines the bounds cut", w),
+                FAINT,
+                None,
+            );
+        }
+        Some(hs) => {
+            let counter = format!("hunk {}/{}", hunk + 1, hs.len());
+            let cw = text_width(&counter);
+            cv.bold(x, y, &clip_path(&f.path, w - cw - 2), BLUE, None);
+            cv.text(x + w - cw, y, &counter, FAINT, None);
+            let (rows, starts) = diffrows::rows(hs);
+            let top = starts[hunk.min(starts.len() - 1)];
+            let room = (h - 2).max(1) as usize;
+            let left = rows.len() - top;
+            // When the hunk (and the ones after it) do not fit, give the
+            // last row to "N more" instead of cutting a line mid-thought.
+            let shown = if left > room { room - 1 } else { left };
+            diffrows::draw(cv, x, y + 2, w, &rows[top..top + shown], PANEL);
+            if left > shown {
+                cv.text(
+                    x,
+                    y + 2 + shown as i32,
+                    &clip_text(&format!("… {} more · ⏎ full diff", left - shown), w),
+                    FAINT,
+                    None,
+                );
+            }
+        }
+    }
 }
 
 fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {

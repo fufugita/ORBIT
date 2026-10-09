@@ -9,6 +9,7 @@
 pub mod bars;
 pub mod canvas;
 pub mod convo;
+pub mod diffrows;
 pub mod frame;
 pub mod mark;
 pub mod md;
@@ -799,6 +800,245 @@ mod tests {
         ] {
             assert!(out.contains(want), "missing {want:?}\n{out}");
         }
+    }
+
+    /// The screen with the diff overlay open on `file`.
+    fn render_diff_overlay(file: &crate::proto::panels::FileChangeRow, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        let s = busy();
+        let app = App::new(std::path::PathBuf::new(), true);
+        term.draw(|f| {
+            draw(
+                f,
+                &DrawIn {
+                    app: &app,
+                    fx: &Fx::default(),
+                    scenario: &s,
+                    composer: "",
+                    completion_sel: 0,
+                    now_ms: 5_000,
+                    reduced: true,
+                    tier: Tier::TrueColor,
+                    mono: false,
+                    scroll_offset: 0,
+                    scrolls: &[],
+                    selection: None,
+                    brand: crate::proto::welcome::BrandTier::Static,
+                    toast: None,
+                    overlay: Some(overlays::Overlay::Diff {
+                        path: &file.path,
+                        added: file.added,
+                        removed: file.removed,
+                        hunks: &file.hunks,
+                        opened_ms: 0,
+                    }),
+                },
+            )
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn row_of(out: &str, needle: &str) -> usize {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no row with {needle:?}\n{out}"))
+    }
+
+    /// The overlay's hint used to share a row with the last diff line
+    /// (box height and footer row agreed on the same row).
+    #[test]
+    fn the_diff_overlay_footer_sits_below_the_last_line() {
+        let f = &two_files().file_changes[0];
+        let out = render_diff_overlay(f, 110, 40);
+        let last = row_of(&out, "+ new_tail()");
+        let hint = row_of(&out, "esc close");
+        let border = row_of(&out, "┗");
+        assert!(
+            last < hint && hint < border,
+            "{last} {hint} {border}\n{out}"
+        );
+    }
+
+    /// With no diff to show the box holds both note lines — they used to
+    /// be drawn over its bottom border.
+    #[test]
+    fn the_diff_overlay_note_stays_inside_the_box() {
+        let f = &two_files().file_changes[1]; // hunks: None
+        let out = render_diff_overlay(f, 110, 40);
+        let note = row_of(&out, "◌ no diff captured");
+        let why = row_of(&out, "without a \"before\"");
+        let hint = row_of(&out, "esc close");
+        let border = row_of(&out, "┗");
+        assert!(note < why && why < hint && hint < border, "{out}");
+    }
+
+    /// A short terminal cannot hold the whole diff: the last row says how
+    /// much is cut instead of dropping lines silently.
+    #[test]
+    fn the_diff_overlay_in_a_short_terminal_says_what_is_cut() {
+        let many: Vec<(char, String)> = (0..40).map(|i| ('+', format!("line {i}"))).collect();
+        let f = crate::proto::panels::FileChangeRow {
+            path: "big.rs".into(),
+            added: 40,
+            removed: 0,
+            hunks: Some(vec![orbit_frontend_protocol::DiffHunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 40,
+                lines: many,
+            }]),
+        };
+        let out = render_diff_overlay(&f, 110, 20);
+        assert!(out.contains("more lines"), "{out}");
+        assert!(!out.contains("line 39"), "{out}");
+        assert!(
+            row_of(&out, "more lines") < row_of(&out, "esc close"),
+            "{out}"
+        );
+    }
+
+    fn hunk(start: u32, lines: &[(char, &str)]) -> orbit_frontend_protocol::DiffHunk {
+        orbit_frontend_protocol::DiffHunk {
+            old_start: start,
+            old_lines: 1,
+            new_start: start,
+            new_lines: 1,
+            lines: lines.iter().map(|(m, t)| (*m, t.to_string())).collect(),
+        }
+    }
+
+    fn two_files() -> Scenario {
+        use crate::proto::panels::FileChangeRow;
+        let mut s = busy();
+        s.file_changes = vec![
+            FileChangeRow {
+                path: "src/a.rs".into(),
+                added: 2,
+                removed: 2,
+                hunks: Some(vec![
+                    hunk(
+                        3,
+                        &[
+                            (' ', "fn keep() {}"),
+                            ('-', "let x = 1;"),
+                            ('+', "let x = 2;"),
+                        ],
+                    ),
+                    hunk(40, &[('-', "old_tail()"), ('+', "new_tail()")]),
+                ]),
+            },
+            FileChangeRow {
+                path: "src/b.rs".into(),
+                added: 1,
+                removed: 0,
+                hunks: None,
+            },
+        ];
+        s
+    }
+
+    /// The Review panel used to print a fixed sentence under the file name
+    /// whether or not the engine had sent hunks. It draws the selected
+    /// file's real hunks, from the current one, and says which of how many.
+    #[test]
+    fn review_draws_the_selected_files_real_hunks() {
+        let mut s = two_files();
+        let out = render(&app_with(Preset::Review), &s, 164, 48);
+        assert!(!out.contains("The diff appears here"), "{out}");
+        for want in [
+            "src/a.rs",
+            "hunk 1/2",
+            "@@ -3,1 +3,1 @@",
+            "fn keep() {}",
+            "- let x = 1;",
+            "+ let x = 2;",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        // `n`: the second hunk leads, the first is scrolled off.
+        s.move_hunk_selection(1);
+        let out = render(&app_with(Preset::Review), &s, 164, 48);
+        assert!(
+            out.contains("hunk 2/2") && out.contains("@@ -40,1 +40,1 @@"),
+            "{out}"
+        );
+        assert!(out.contains("+ new_tail()"), "{out}");
+        assert!(!out.contains("let x = 2;"), "{out}");
+    }
+
+    /// `j` moves the selection to the next file and the pane follows. A
+    /// file with no captured "before" says so plainly.
+    #[test]
+    fn review_follows_the_file_selection_and_is_honest_without_hunks() {
+        let mut s = two_files();
+        s.move_file_selection(1);
+        let out = render(&app_with(Preset::Review), &s, 164, 48);
+        assert!(out.contains("◌ no diff captured"), "{out}");
+        assert!(!out.contains("let x = 2;"), "{out}");
+        // The selection bar is on b.rs, not a.rs.
+        // (The path also heads the right pane; the list row carries counts.)
+        let row = |name: &str, counts: &str| {
+            out.lines()
+                .find(|l| l.contains(name) && l.contains(counts))
+                .unwrap_or_else(|| panic!("no list row for {name}\n{out}"))
+                .to_string()
+        };
+        assert!(
+            row("src/b.rs", "+1").contains('▌'),
+            "{}",
+            row("src/b.rs", "+1")
+        );
+        assert!(
+            !row("src/a.rs", "+2").contains('▌'),
+            "{}",
+            row("src/a.rs", "+2")
+        );
+    }
+
+    /// A hunk longer than the pane gives its last row to "N more" instead
+    /// of cutting a line off silently.
+    #[test]
+    fn review_says_how_much_more_there_is() {
+        use crate::proto::panels::FileChangeRow;
+        let mut s = busy();
+        let many: Vec<(char, String)> = (0..80).map(|i| ('+', format!("line {i}"))).collect();
+        s.file_changes = vec![FileChangeRow {
+            path: "big.rs".into(),
+            added: 80,
+            removed: 0,
+            hunks: Some(vec![orbit_frontend_protocol::DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 80,
+                lines: many,
+            }]),
+        }];
+        let out = render(&app_with(Preset::Review), &s, 164, 30);
+        assert!(out.contains("more · ⏎ full diff"), "{out}");
+        assert!(out.contains("line 0") && !out.contains("line 79"), "{out}");
+    }
+
+    /// The footers only advertise keys that do something.
+    #[test]
+    fn panel_footers_name_only_keys_that_work() {
+        let s = two_files();
+        let out = render(&app_with(Preset::Review), &s, 164, 48);
+        assert!(!out.contains("revert"), "no revert exists yet\n{out}");
+        assert!(
+            !out.contains("step"),
+            "the plan has no step selection\n{out}"
+        );
     }
 
     /// In a side column a record takes two lines: the OUTCOME and the proof

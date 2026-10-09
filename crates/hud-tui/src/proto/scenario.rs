@@ -93,6 +93,11 @@ pub struct Scenario {
     /// parallel to `tasks` / `file_changes`.
     pub task_changed_ms: Vec<u64>,
     pub file_changed_ms: Vec<u64>,
+    /// The Changes / Review panels' selected file (`j`/`k`) and the
+    /// Review panel's current hunk of it (`n`/`p`). Not clamped on
+    /// write: read through `selected_file` / `selected_hunk`.
+    pub file_sel: usize,
+    pub hunk_sel: usize,
     /// Rate-limit backoff: retry at this tick, and for how long it
     /// started (M27).
     pub backoff_until_ms: Option<u64>,
@@ -303,6 +308,53 @@ impl Scenario {
         let p = (now_ms.saturating_sub(self.ctx_ms) as f32 / 300.0).clamp(0.0, 1.0);
         let e = 1.0 - (1.0 - p).powi(3);
         self.ctx_from + (self.ctx_to - self.ctx_from) * e
+    }
+
+    /// The selected changed file's index, clamped to the list (files
+    /// only ever grow, but a cleared session empties it).
+    pub fn selected_file(&self) -> Option<usize> {
+        match self.file_changes.len() {
+            0 => None,
+            n => Some(self.file_sel.min(n - 1)),
+        }
+    }
+
+    /// The Review panel's current hunk of the selected file, clamped.
+    pub fn selected_hunk(&self) -> usize {
+        let n = self
+            .selected_file()
+            .and_then(|i| self.file_changes[i].hunks.as_ref())
+            .map_or(0, Vec::len);
+        self.hunk_sel.min(n.saturating_sub(1))
+    }
+
+    /// Move the file selection (`j` = +1, `k` = -1); stops at the ends.
+    /// A different file starts at its first hunk.
+    pub fn move_file_selection(&mut self, delta: isize) {
+        let Some(cur) = self.selected_file() else {
+            return;
+        };
+        let last = self.file_changes.len() - 1;
+        let next = (cur as isize + delta).clamp(0, last as isize) as usize;
+        if next != cur {
+            self.file_sel = next;
+            self.hunk_sel = 0;
+        } else {
+            self.file_sel = cur;
+        }
+    }
+
+    /// Move the hunk selection within the selected file; stops at the ends.
+    pub fn move_hunk_selection(&mut self, delta: isize) {
+        let cur = self.selected_hunk();
+        let n = self
+            .selected_file()
+            .and_then(|i| self.file_changes[i].hunks.as_ref())
+            .map_or(0, Vec::len);
+        if n == 0 {
+            return;
+        }
+        self.hunk_sel = (cur as isize + delta).clamp(0, n as isize - 1) as usize;
     }
 
     pub fn is_turning(&self) -> bool {
@@ -543,5 +595,68 @@ mod tests {
         assert_eq!(s.star_state(), StarState::StillRed);
         s.apply("round_started", 200);
         assert!(matches!(s.star_state(), StarState::Turning { .. }));
+    }
+
+    fn file(path: &str, hunks: Option<usize>) -> crate::proto::panels::FileChangeRow {
+        crate::proto::panels::FileChangeRow {
+            path: path.into(),
+            added: 1,
+            removed: 1,
+            hunks: hunks.map(|n| {
+                (0..n)
+                    .map(|i| orbit_frontend_protocol::DiffHunk {
+                        old_start: i as u32 * 10 + 1,
+                        old_lines: 1,
+                        new_start: i as u32 * 10 + 1,
+                        new_lines: 1,
+                        lines: vec![('-', "a".into()), ('+', "b".into())],
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// `j`/`k` stop at the ends instead of wrapping or running off, and a
+    /// different file starts at its first hunk.
+    #[test]
+    fn file_selection_stops_at_the_ends_and_resets_the_hunk() {
+        let mut s = Scenario::new();
+        s.move_file_selection(1); // nothing to select: harmless
+        assert_eq!(s.selected_file(), None);
+        s.file_changes = vec![file("a", Some(3)), file("b", Some(2)), file("c", None)];
+        assert_eq!(s.selected_file(), Some(0));
+        s.move_file_selection(-1);
+        assert_eq!(s.selected_file(), Some(0), "k stops at the first");
+        s.move_hunk_selection(1);
+        s.move_hunk_selection(1);
+        assert_eq!(s.selected_hunk(), 2);
+        s.move_hunk_selection(1);
+        assert_eq!(s.selected_hunk(), 2, "n stops at the last hunk");
+        s.move_file_selection(1);
+        assert_eq!(s.selected_file(), Some(1));
+        assert_eq!(
+            s.selected_hunk(),
+            0,
+            "another file starts at its first hunk"
+        );
+        s.move_file_selection(5);
+        assert_eq!(s.selected_file(), Some(2), "j stops at the last");
+        s.move_hunk_selection(1); // a file without hunks: nothing to walk
+        assert_eq!(s.selected_hunk(), 0);
+    }
+
+    /// A later edit replaces a file's hunks; a selection that pointed past
+    /// the new, shorter list must not index out of range.
+    #[test]
+    fn a_hunk_selection_survives_its_file_losing_hunks() {
+        let mut s = Scenario::new();
+        s.file_changes = vec![file("a", Some(3))];
+        s.hunk_sel = 2;
+        s.file_changes[0].hunks = Some(vec![]);
+        assert_eq!(s.selected_hunk(), 0);
+        s.file_changes[0].hunks = None;
+        assert_eq!(s.selected_hunk(), 0);
+        s.file_sel = 9;
+        assert_eq!(s.selected_file(), Some(0), "an out-of-range file clamps");
     }
 }

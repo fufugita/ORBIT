@@ -974,14 +974,56 @@ fn handle_key(
                 tui.sync_focus();
             }
         }
-        // M11: ⏎ on the Changes panel shows the selected file's real
-        // diff — the hunks the FileChanged event carried.
+        // M11: ⏎ on the Changes or Review panel shows the selected file's
+        // real diff — the hunks the FileChanged event carried.
         KeyCode::Enter
-            if tui.app.focused_view() == super::layout::View::Changes
-                && !scenario.file_changes.is_empty() =>
+            if matches!(
+                tui.app.focused_view(),
+                super::layout::View::Changes | super::layout::View::Review
+            ) && !scenario.file_changes.is_empty() =>
         {
             tui.fx.overlay_ms = now_ms;
             *overlay = Some(Overlay::Diff);
+        }
+        // j/k pick the file, n/p walk the Review panel's hunks.
+        KeyCode::Char('j') | KeyCode::Down
+            if matches!(
+                tui.app.focused_view(),
+                super::layout::View::Changes | super::layout::View::Review
+            ) =>
+        {
+            scenario.move_file_selection(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if matches!(
+                tui.app.focused_view(),
+                super::layout::View::Changes | super::layout::View::Review
+            ) =>
+        {
+            scenario.move_file_selection(-1);
+        }
+        KeyCode::Char('n') if tui.app.focused_view() == super::layout::View::Review => {
+            scenario.move_hunk_selection(1);
+        }
+        KeyCode::Char('p') if tui.app.focused_view() == super::layout::View::Review => {
+            scenario.move_hunk_selection(-1);
+        }
+        // Panels that only scroll: j/k move a line (PgUp/PgDn a page).
+        KeyCode::Char('j') | KeyCode::Down
+            if matches!(
+                tui.app.focused_view(),
+                super::layout::View::Activity | super::layout::View::Terminal
+            ) =>
+        {
+            tui.scroll_by(-1);
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if matches!(
+                tui.app.focused_view(),
+                super::layout::View::Activity | super::layout::View::Terminal
+            ) =>
+        {
+            tui.scroll_by(1);
         }
         KeyCode::Char('/') => *overlay = Some(Overlay::Palette),
         KeyCode::Char('?') => *overlay = Some(Overlay::Help),
@@ -1770,15 +1812,18 @@ pub fn draw(
             turn_live: scenario.turn_live,
         }),
         Some(Overlay::Diff) => {
-            // The Changes panel's first (selected) file — the row the
-            // ⏎ hint promises. No rows, no overlay.
-            scenario.file_changes.first().map(|f| Ov::Diff {
-                path: f.path.as_str(),
-                added: f.added,
-                removed: f.removed,
-                hunks: &f.hunks,
-                opened_ms: tui.fx.overlay_ms,
-            })
+            // The selected file — the row the ⏎ hint promises. No rows,
+            // no overlay.
+            scenario
+                .selected_file()
+                .map(|i| &scenario.file_changes[i])
+                .map(|f| Ov::Diff {
+                    path: f.path.as_str(),
+                    added: f.added,
+                    removed: f.removed,
+                    hunks: &f.hunks,
+                    opened_ms: tui.fx.overlay_ms,
+                })
         }
         None => None,
     };
