@@ -560,6 +560,44 @@ fn scenario_g1_egress_row_without_usage() {
     );
 }
 
+// ── F2: folder trust round trip ────────────────────────────────────
+// A folder is untrusted until a person says otherwise, and the verb
+// works with the home flag in either place.
+#[test]
+fn scenario_f2_folder_trust_round_trip() {
+    let base = TempDir::new().expect("tempdir");
+    let home = base.path().join("home");
+    let project = base.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let run = |args: &[&str]| -> serde_json::Value {
+        let out = Command::new(orbit_binary())
+            .args(args)
+            .output()
+            .expect("run orbit");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("json")
+    };
+    let (h, p) = (home.to_str().unwrap(), project.to_str().unwrap());
+    assert_eq!(run(&["--home", h, "folder", "status", p])["trusted"], false);
+    assert_eq!(run(&["folder", "trust", p, "--home", h])["trusted"], true);
+    assert_eq!(run(&["--home", h, "folder", "status", p])["trusted"], true);
+    assert_eq!(
+        run(&["folder", "untrust", p, "--home", h])["trusted"],
+        false
+    );
+    assert_eq!(run(&["--home", h, "folder", "status", p])["trusted"], false);
+    let bad = Command::new(orbit_binary())
+        .args(["folder", "bogus"])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success(), "an unknown sub-command is an error");
+}
+
 // ── P1: the permission matrix ──────────────────────────────────────
 // Fails on 1310e73-era code: B4 (two contradicting layers — read-only
 // tools ask, --allowedTools without --auto-tools is refused, acceptEdits

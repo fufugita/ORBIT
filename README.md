@@ -267,6 +267,7 @@ orbit replay --dry     verify + emit a no-dispatch replay plan
 orbit export --to      encrypt an age bundle
 orbit restore          restore into a fresh namespace
 orbit mod install|list|allow-issuer   signed mods
+orbit folder trust|untrust|status     let a folder's own settings loosen permissions
 orbit version          build + evidence facts (computed, no fixed claims)
 orbit web              start the browser harness
 ```
@@ -352,6 +353,21 @@ The pricing unit is microdollars per million tokens (the old key names
 `*_per_million_microcents` still parse — they were mislabeled; the values
 always meant microdollars). Sampling (`temperature`, `top_p`) is sent only
 when a model sets it.
+
+### Permission rules
+
+`[permissions]` tables in `$ORBIT_HOME/settings.toml` and in a project's
+`.orbit/settings.toml` and `.orbit/settings.local.toml` take lists of
+`allow`, `ask` and `deny` rules, such as `Bash(cargo test *)`,
+`Edit(/src/**)` or `WebFetch(domain:docs.rs)`. A deny anywhere wins over an
+allow anywhere.
+
+A Bash rule is read against the whole command line. `cargo test *` means
+the words `cargo test` and anything after them; an allow rule never covers
+a line that chains, pipes or redirects (`;`, `&&`, `|`, `>`, `$(…)`), and a
+deny rule fires on any part of such a line. A project's own settings can
+only make ORBIT stricter: their allow rules apply once you have trusted the
+folder with `orbit folder trust`.
 
 ### `tui.toml`
 

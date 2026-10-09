@@ -144,6 +144,10 @@ fn print_human_help() {
         ("restore", "restore into a fresh namespace"),
         ("version", "release evidence (claims + hashes)"),
         ("mod install/list/allow-issuer", "signed mod management"),
+        (
+            "folder trust/untrust/status",
+            "let a folder's own settings loosen permissions",
+        ),
         ("help [--json]", "this help (JSON vocabulary with --json)"),
     ] {
         println!("    {name:<28} {desc}");
@@ -247,6 +251,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "ask" => cmd_ask(&home, args),
         "models" | "list-models" => cmd_models(&home, args),
         "mod" => cmd_mod(&home, args),
+        "folder" => cmd_folder(&home, args),
         "version" => Ok(serde_json::to_value(orbit_cli::version_evidence(
             env!("CARGO_PKG_VERSION"),
             &build_commit(),
@@ -274,6 +279,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "mod install <pkg> --manifest <m>  install a signed mod",
                 "mod list                        installed mods",
                 "mod allow-issuer <hex-key>       trust a mod issuer",
+                "folder trust|untrust|status [DIR]  trust a folder's own settings",
                 "web           start the browser harness (orbit-web bridge)"
             ]
         })),
@@ -2247,6 +2253,67 @@ fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
             format!("unknown mod subcommand {other:?} (install, list, allow-issuer)"),
         )),
     }
+}
+
+/// `orbit folder trust|untrust|status [DIR]`: whether a folder's own
+/// settings (`.orbit/settings.toml`, `.orbit/settings.local.toml`,
+/// hooks, skills, MCP servers) may loosen what ORBIT does. A folder is
+/// untrusted until a person says otherwise; its deny and ask rules apply
+/// either way, since they only make ORBIT stricter.
+fn cmd_folder(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    // The words that are not flags (or the value of one): `folder`, the
+    // sub-command, the directory. Flags may come first (`--home X folder
+    // status`) or last.
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if matches!(
+            a,
+            "--home" | "--model" | "--gate" | "--resume" | "--provider"
+        ) {
+            i += 2;
+            continue;
+        }
+        if !a.starts_with('-') {
+            words.push(a);
+        }
+        i += 1;
+    }
+    let sub = words.get(1).copied().unwrap_or("");
+    let dir = match words.get(2) {
+        Some(d) => PathBuf::from(d),
+        None => std::env::current_dir().map_err(ioe)?,
+    };
+    // The marker is keyed by the absolute path the process will report as
+    // its working directory, so resolve links the way getcwd does.
+    let dir = std::fs::canonicalize(&dir)
+        .map_err(|e| ("ORBIT-E0501", format!("{}: {e}", dir.display())))?;
+    let trust = orbit_tools::permissions::FolderTrust::new(home.to_path_buf());
+    let trusted = match sub {
+        "trust" => {
+            trust.trust(&dir).map_err(ioe)?;
+            true
+        }
+        "untrust" => {
+            trust.untrust(&dir).map_err(ioe)?;
+            false
+        }
+        "status" => trust.is_trusted(&dir),
+        _ => {
+            return Err((
+                "ORBIT-E1101",
+                "usage: orbit folder trust|untrust|status [DIR]".into(),
+            ))
+        }
+    };
+    Ok(serde_json::json!({
+        "schema": "orbit.cli/v1",
+        "command": format!("folder {sub}"),
+        "status": "ok",
+        "folder": dir.display().to_string(),
+        "trusted": trusted,
+    }))
 }
 
 fn cmd_models(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {

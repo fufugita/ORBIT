@@ -198,43 +198,83 @@ pub fn wave1_definitions() -> Vec<ToolDefinition> {
     crate::tool_definitions()
 }
 
-/// Load the merged rule set from the settings scopes (user + project
-/// when trusted + local). The old permissions.toml whole-tool rules
-/// migrate as bare-tool rules.
+/// Load the merged rule set from the settings scopes: user, then the
+/// project's `.orbit/settings.toml` and `.orbit/settings.local.toml`
+/// (both under the current directory), then the old whole-tool
+/// `permissions.toml`.
+///
+/// A folder that is not trusted cannot grant itself anything: its
+/// `deny` and `ask` rules still apply (they only make ORBIT stricter),
+/// its `allow` rules do not. Without that, cloning a repository and
+/// running `orbit` in it would be enough to have `Bash(*)` allowed.
+/// `orbit folder trust` is how a person extends trust.
 pub fn load_rules(home: &Path) -> RuleSet {
+    let project = std::env::current_dir().unwrap_or_default();
+    load_rules_in(home, &project)
+}
+
+/// [`load_rules`] for an explicit project directory.
+pub fn load_rules_in(home: &Path, project: &Path) -> RuleSet {
+    let trusted = crate::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(project);
     let mut rules = RuleSet::default();
-    // User scope: $ORBIT_HOME/settings.toml [permissions] table.
     // A file that exists but does not parse is WARNED, never silently
     // skipped (S1: silent skip deleted the user's deny rules).
-    for (path, legacy) in [
-        (home.join("settings.toml"), false),
-        (std::path::PathBuf::from(".orbit/settings.toml"), false),
-        (
-            std::path::PathBuf::from(".orbit/settings.local.toml"),
-            false,
-        ),
-        (home.join("permissions.toml"), true),
+    for (path, scope) in [
+        (home.join("settings.toml"), Scope::User),
+        (project.join(".orbit/settings.toml"), Scope::Project),
+        (project.join(".orbit/settings.local.toml"), Scope::Project),
+        (home.join("permissions.toml"), Scope::Legacy),
     ] {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
         match toml_parse(&text) {
-            Ok(v) => {
-                if legacy {
-                    merge_legacy(&mut rules, &v);
-                } else {
-                    merge_scope(&mut rules, &v);
+            Ok(v) => match scope {
+                Scope::Legacy => merge_legacy(&mut rules, &v),
+                Scope::User => {
+                    merge_scope(&mut rules, &v, true);
                 }
-            }
+                Scope::Project => {
+                    let skipped = merge_scope(&mut rules, &v, trusted);
+                    if skipped > 0 {
+                        warn_once(&path, &format!(
+                            "{skipped} allow rule(s) NOT applied: this folder is not trusted (orbit folder trust)"
+                        ));
+                    }
+                }
+            },
             Err(e) => {
-                eprintln!(
-                    "warning: {}: {e} (permission rules in it are NOT applied)",
-                    path.display()
+                warn_once(
+                    &path,
+                    &format!("{e} (permission rules in it are NOT applied)"),
                 );
             }
         }
     }
     rules
+}
+
+/// Where a settings file sits, which decides what it may grant.
+enum Scope {
+    /// `$ORBIT_HOME/settings.toml`: the person's own.
+    User,
+    /// The project's files: only as trusted as the folder.
+    Project,
+    /// The old whole-tool `permissions.toml`.
+    Legacy,
+}
+
+/// Print a warning about a settings file once per process: the rules are
+/// loaded on every tool call, and a warning per call would bury the
+/// screen.
+fn warn_once(path: &Path, what: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let key = format!("{}:{what}", path.display());
+    let seen = SEEN.get_or_init(Default::default);
+    if seen.lock().map(|mut s| s.insert(key)).unwrap_or(true) {
+        eprintln!("warning: {}: {what}", path.display());
+    }
 }
 
 /// Parse a settings file with the real TOML parser (S1): the old
@@ -298,7 +338,10 @@ fn flatten_toml(table: &toml::Table, prefix: &str) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
-fn merge_scope(rules: &mut RuleSet, v: &serde_json::Value) {
+/// Merge one scope's `[permissions]` table. `allow_ok` is whether this
+/// scope may add allow rules; returns how many it skipped.
+fn merge_scope(rules: &mut RuleSet, v: &serde_json::Value, allow_ok: bool) -> usize {
+    let mut skipped = 0;
     for (effect, table) in [
         (crate::permissions::RuleEffectSerde::Allow, "allow"),
         (crate::permissions::RuleEffectSerde::Ask, "ask"),
@@ -309,12 +352,17 @@ fn merge_scope(rules: &mut RuleSet, v: &serde_json::Value) {
             for item in arr {
                 if let Some(s) = item.as_str() {
                     if let Some(r) = crate::permissions::parse_rule(s, effect) {
-                        rules.rules.push(r);
+                        if effect == crate::permissions::RuleEffectSerde::Allow && !allow_ok {
+                            skipped += 1;
+                        } else {
+                            rules.rules.push(r);
+                        }
                     }
                 }
             }
         }
     }
+    skipped
 }
 
 fn merge_legacy(rules: &mut RuleSet, v: &serde_json::Value) {
@@ -347,5 +395,77 @@ mod s1_tests {
             v.get("permissions.deny").is_some(),
             "dotted key present: {v}"
         );
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use crate::permissions::{FolderTrust, RuleEffect};
+
+    fn dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("orbit-trust-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let project = base.join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".orbit")).unwrap();
+        (home, project)
+    }
+
+    const FILE: &str = "[permissions]\nallow = [\"Bash(*)\"]\nask = [\"Bash(git push *)\"]\ndeny = [\"Bash(rm *)\"]\n";
+
+    /// A cloned repository's own settings may make ORBIT stricter, and
+    /// may not make it looser.
+    #[test]
+    fn an_untrusted_folder_adds_no_allow_rules() {
+        let (home, project) = dirs("untrusted");
+        for f in ["settings.toml", "settings.local.toml"] {
+            std::fs::write(project.join(".orbit").join(f), FILE).unwrap();
+        }
+        let rules = load_rules_in(&home, &project);
+        assert_eq!(rules.evaluate("Bash", "anything"), None, "no allow got in");
+        assert_eq!(rules.evaluate("Bash", "rm -rf x"), Some(RuleEffect::Deny));
+        assert_eq!(
+            rules.evaluate("Bash", "git push origin"),
+            Some(RuleEffect::Ask)
+        );
+        let _ = std::fs::remove_dir_all(home.parent().unwrap());
+    }
+
+    #[test]
+    fn a_trusted_folder_applies_its_allow_rules() {
+        let (home, project) = dirs("trusted");
+        std::fs::write(project.join(".orbit/settings.local.toml"), FILE).unwrap();
+        FolderTrust::new(home.clone()).trust(&project).unwrap();
+        let rules = load_rules_in(&home, &project);
+        assert_eq!(
+            rules.evaluate("Bash", "cargo build"),
+            Some(RuleEffect::Allow)
+        );
+        // Deny still beats allow.
+        assert_eq!(rules.evaluate("Bash", "rm -rf x"), Some(RuleEffect::Deny));
+        // Trust is per folder.
+        let other = project.parent().unwrap().join("other");
+        std::fs::create_dir_all(other.join(".orbit")).unwrap();
+        std::fs::write(other.join(".orbit/settings.toml"), FILE).unwrap();
+        assert_eq!(
+            load_rules_in(&home, &other).evaluate("Bash", "cargo build"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(home.parent().unwrap());
+    }
+
+    /// The person's own settings are theirs: no trust question.
+    #[test]
+    fn the_user_scope_needs_no_trust() {
+        let (home, project) = dirs("user");
+        std::fs::write(home.join("settings.toml"), FILE).unwrap();
+        let rules = load_rules_in(&home, &project);
+        assert_eq!(
+            rules.evaluate("Bash", "cargo build"),
+            Some(RuleEffect::Allow)
+        );
+        let _ = std::fs::remove_dir_all(home.parent().unwrap());
     }
 }
