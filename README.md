@@ -235,12 +235,22 @@ content can never become user authority.
 
 ## Quickstart
 
+Install (a release binary when one exists, a cargo build otherwise):
+
 ```sh
-# Build (requires Rust 1.94 — see rust-toolchain.toml)
+curl -fsSL https://raw.githubusercontent.com/fufugita/ORBIT/main/install.sh | sh
+```
+
+Or build from a checkout (requires Rust 1.94 — see rust-toolchain.toml):
+
+```sh
 cargo build --release
 
 # Initialize the trust root, PIB, and Ledger
 ./target/release/orbit init
+
+# Add a provider (interactive: presets, discovery, roles)
+./target/release/orbit provider add
 
 # Start the interactive harness (TUI when a TTY is detected)
 ./target/release/orbit
@@ -251,13 +261,70 @@ cargo build --release
 # Send a single prompt through the pipeline
 ./target/release/orbit ask "reply with exactly: pong" --model <model>
 
-# List configured models
+# List configured models and roles
 ./target/release/orbit models
 ```
 
 The harness reads provider configuration from `$ORBIT_HOME/providers.toml`
 (default `~/.orbit/`). A missing config falls back to the
 `ORBIT_GATE_URL` / `ORBIT_MODEL` / `ORBIT_GATE_TOKEN` environment contract.
+
+## Providers
+
+`orbit provider add` walks a preset through setup — the well-known
+providers' endpoints, credential conventions and public model facts are
+built in, and the models are discovered live from the endpoint:
+
+```console
+$ orbit provider add
+Providers:
+  1. anthropic    Anthropic — Claude models over the native Messages API
+  2. openai       OpenAI — GPT models over the chat completions API
+  3. openrouter   OpenRouter — one key, many providers' models
+  4. qwen         Qwen (DashScope international endpoint)
+  5. zai          Z.ai — GLM models (OpenAI-compatible surface)
+  ...
+Discovered models:
+  1. claude-opus-5-5 — Opus 5.5 — the main brain
+  2. claude-sonnet-5-5 — Sonnet 5.5 — fast main agent / coding subagent
+  3. claude-haiku-4-5 — Haiku 4.5 — explore, extraction, summaries
+```
+
+Credentials are stored as **env-var names, never values**: the preset
+suggests the convention (`ANTHROPIC_API_KEY`, `DASHSCOPE_API_KEY`, …),
+you `export` the key yourself, and ORBIT reads it at request time.
+Scripted form for dotfiles:
+
+```sh
+orbit provider add anthropic --model claude-opus-5-5,claude-haiku-4-5
+orbit provider add qwen --url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --model qwen3.8-max --credential-env DASHSCOPE_API_KEY
+orbit provider add ollama --model qwen3.5:9b          # local, no key
+orbit provider list && orbit provider remove qwen
+```
+
+Gate URLs keep their path: DashScope's `/compatible-mode/v1` and Z.ai's
+`/api/paas/v4` reach the adapters verbatim.
+
+### Model roles
+
+`providers.toml` carries a `[roles]` table — ORBIT's task-based router.
+The main conversation keeps one model (switching mid-thread drops cached
+context and replayed thinking); delegated work picks its own:
+
+```toml
+[roles]
+main       = "claude-opus-5-5"             # the conversation's model
+subagent   = "claude-sonnet-5-5"           # Task-tool children
+explore    = "anthropic/claude-haiku-4-5"  # read-only Explore/Plan
+compaction = "claude-haiku-4-5"            # auto-compact summaries
+```
+
+A bare id resolves across providers; `provider/model` disambiguates when
+the same id is declared twice. A subagent's own `model:` frontmatter
+overrides its role. `orbit provider role <name> [model]` sets and
+queries roles; interactive `provider add` offers to fill unset ones,
+preferring cheap models for explore and compaction.
 
 ## CLI reference
 
@@ -275,6 +342,7 @@ orbit export --to      encrypt an age bundle
 orbit restore          restore into a fresh namespace
 orbit mod install|list|allow-issuer   signed mods
 orbit folder trust|untrust|status     let a folder's own settings loosen permissions
+orbit provider add|list|remove|presets|role   manage providers and roles
 orbit version          build + evidence facts (computed, no fixed claims)
 orbit web              start the browser harness
 ```
