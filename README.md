@@ -143,7 +143,7 @@ could signal every process of the user on procps-ng 4.0.4.
 | v0.1 specification (DR-01..DR-14) | Frozen 12 Aug 2026 |
 | v0.1 release candidate | `v0.1.0-rc.1` is tagged; `spec/spec-manifest.yaml` still records `implementation_complete: NO` and `audited_release_ready: NO` |
 | Roadmap gates 1–6 | Scripted tests pass; no real-model run yet |
-| Terminal UI | The default front-end; the earlier three-pane HUD stays behind `--old-tui` |
+| Terminal UI | The default front-end; `--no-tui` keeps the plain REPL |
 
 ## What is ORBIT
 
@@ -185,9 +185,8 @@ content can never become user authority.
 - **Terminal UI** — a ratatui + crossterm front-end of panels (Changes,
   Conversation, Terminal, Plan, Activity, Context, Review, Agent) in four
   layout presets. It is the default when stdin and stdout are a TTY;
-  `--old-tui` keeps the earlier three-pane HUD and `--no-tui` drops to the
-  plain REPL. The saved layout and the colour and motion settings live in
-  `$ORBIT_HOME/tui.toml`.
+  `--no-tui` drops to the plain REPL. The saved layout and the colour and
+  motion settings live in `$ORBIT_HOME/tui.toml`.
 - **Tool calling with approval** — reads run freely, edits and commands ask.
   The card shows an Edit's diff, a command's directory, the permission mode,
   the sandbox state and the rule a grant would add. `y` allows once. `s`
@@ -281,7 +280,7 @@ orbit web              start the browser harness
 ```
 
 Common flags: `--model <M>`, `--gate <URL>`, `--provider <name>`,
-`--home <DIR>`, `--continue`, `--resume <ID>`, `--no-tui`, `--old-tui`,
+`--home <DIR>`, `--continue`, `--resume <ID>`, `--no-tui`,
 `--auto-tools`, `--permission-mode <default|acceptEdits|plan|dontAsk|bypass>`.
 For `-p`: `--output-format <text|json|stream-json>`, `--allowedTools`,
 `--disallowedTools`, `--max-turns`, `--max-cost`, `--bare`,

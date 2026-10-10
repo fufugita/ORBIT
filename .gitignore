@@ -52,4 +52,6 @@ approval-probe.txt
 scripts/__pycache__/
 crates/hud-tui/receipts/
 crates/hud-tui/review-receipts/
+docs/tui/receipts/
+docs/tui/review-receipts/
 .playwright-mcp/
