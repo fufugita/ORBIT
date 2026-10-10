@@ -426,7 +426,7 @@ Today one codebase carries five front-ends, two SDKs and nine libraries that onl
 | Web front-end (`crates/web`) | Its own loop at `web/turn.rs:313` | Keep, as a protocol client from phase 2: it is one of gate 2's three front-ends. No new browser features before gate 6. |
 | SDKs (TypeScript, Python) | IR types only | Freeze until phase 6, when `query()` arrives. |
 | The nine libraries only tests call: `orbit-core`, `orbit-context`, `orbit-memory`, `orbit-session`, `orbit-sandbox`, `orbit-plugin`, `orbit-ledger-events`, `orbit-api`, `orbit-ir` | Tested, never called | Change each only in the phase that wires it: the sandbox in 3; context, memory and session in 4; the plugin runtime in 5; each of `orbit-core`'s primitives, with its ledger events, in the phase that first uses it (TTE and SDE in 5, RTA, EPB and the authority extractor in 6). `orbit-api` and `orbit-ir` wait for the SDK decision below. |
-| Releases | `v0.1.0-rc.1` is tagged | No new tag until gate 3. The next release is the first one that can change code. |
+| Releases | `v0.1.0-rc.1` is tagged | Gates 3 through 6 are green, so the next release is due: `v0.2.0` is the first one that can change code. |
 
 **The SDK decision.** DR-11 names `orbit-ir` (deterministic CBOR) as the one contract between the Rust core and the SDKs, while §Headless generates the SDKs' events from the engine protocol's JSON. Settle it at the start of phase 6, before writing `query()`, and record the answer as a decision record.
 

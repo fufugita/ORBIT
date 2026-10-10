@@ -95,7 +95,10 @@ impl McpSession {
             serde_json::json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
-                "clientInfo": { "name": "orbit", "version": "0.1.0" },
+                "clientInfo": {
+                    "name": "orbit",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
             }),
         )?;
         session.notify("notifications/initialized", serde_json::json!({}))?;

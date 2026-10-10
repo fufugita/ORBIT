@@ -371,7 +371,7 @@ fn cmd_init(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static
 
     // Initialize Ledger with SessionStart.
     let ledger_dir = home.join("ledger");
-    let mut w = LedgerWriter::open(&ledger_dir, "writer-init".into(), "0.1.0")
+    let mut w = LedgerWriter::open(&ledger_dir, "writer-init".into(), env!("CARGO_PKG_VERSION"))
         .map_err(|e| ("ORBIT-E0719", e.to_string()))?;
     w.append(LedgerEvent::SessionStart(SessionStart {
         session_id: "session-example".into(),
