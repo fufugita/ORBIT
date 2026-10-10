@@ -1657,6 +1657,13 @@ pub fn run_tui_turn(
         // window minus the output reserve (phase 4).
         window_tokens: crate::context_window_for(&config.home, &config.model),
         request_stem: "orbit-tui".into(),
+        // The compaction role: a cheap model may summarize while the
+        // conversation keeps its own. None = same model summarizes.
+        compaction_config: Some(crate::role_turn_config(
+            &config.home,
+            &turn_config,
+            "compaction",
+        )),
         ..Default::default()
     };
 

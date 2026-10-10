@@ -648,7 +648,7 @@ pub fn execute_call(
             )?;
             return Ok((output, None));
         }
-        let turn_config = session_subagent_config(tool_cx, home);
+        let turn_config = subagent_config_for(tool_cx, home, agent);
         let observer = tool_cx.ext::<SubagentObserver>();
         let output = match crate::tools::execute_task(
             home,
@@ -1441,6 +1441,76 @@ fn session_subagent_config(cx: &orbit_tools::ToolContext, home: &Path) -> orbit_
         }
         None => subagent_turn_config(home),
     }
+}
+
+/// The configuration THIS subagent runs on. Task-based routing
+/// (roadmap §Providers): the agent's own `model:` frontmatter wins,
+/// then the explore role for the read-only Explore/Plan agents, then
+/// the subagent role, then the session's own model. Caches and thinking
+/// belong to one model, so the MAIN conversation never switches — only
+/// the delegated task does.
+fn subagent_config_for(
+    cx: &orbit_tools::ToolContext,
+    home: &Path,
+    agent: &str,
+) -> orbit_engine::TurnConfig {
+    let base = session_subagent_config(cx, home);
+
+    // Look the agent up for its own model override. Unknown names keep
+    // the role path (execute_task will report the unknown agent).
+    let agents = {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let trusted =
+            orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd);
+        orbit_engine::skills::load_agents(home, trusted)
+    };
+    let agent_model = agents
+        .iter()
+        .find(|a| a.name == agent)
+        .map(|a| a.model.trim())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+
+    if let Some(spec) = agent_model {
+        // An agent-declared model resolves like a role spec: bare id
+        // across providers, provider/model explicit.
+        let cfg = crate::config::ProvidersConfig::load(home).ok();
+        let provider = cfg.as_ref().and_then(|c| c.provider_for_role_spec(&spec));
+        if let Some(provider) = provider {
+            let model = spec.rsplit('/').next().unwrap_or(&spec).to_string();
+            let mut out = base.clone();
+            out.provider_id = provider.name.clone();
+            out.gate = provider.url.clone();
+            out.model = model.clone();
+            out.kind = orbit_engine::dispatch::ProviderKind::from_config(&provider.kind);
+            out.credential_env = provider.env.clone().filter(|s| !s.trim().is_empty());
+            out.pricing = provider
+                .models
+                .iter()
+                .find(|m| m.id == model)
+                .map(|m| std::convert::From::from(m.pricing));
+            out.max_output_tokens = cfg
+                .as_ref()
+                .and_then(|c| c.max_output_tokens_for(&model))
+                .unwrap_or(32_000) as u64;
+            out.sampling = None; // E8: subagents inherit no sampling
+            return out;
+        }
+        // A declared model that matches no provider: keep the base and
+        // let the request fail loudly rather than silently rerouting.
+        return base;
+    }
+
+    // Read-only explorers prefer the cheap role; everything else the
+    // subagent role. Unset/unresolvable roles fall back to the session.
+    let role = if agent == "Explore" || agent == "Plan" {
+        "explore"
+    } else {
+        "subagent"
+    };
+    let mut out = crate::role_turn_config(home, &base, role);
+    out.sampling = None; // E8: subagents inherit no sampling
+    out
 }
 
 /// Derive a TurnConfig for a subagent from the environment alone

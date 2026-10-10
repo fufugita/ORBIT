@@ -1342,6 +1342,11 @@ fn cmd_headless(args: &[String]) -> i32 {
         window_tokens: orbit_cli::context_window_for(&home, &model),
         request_stem: "orbit-p".into(),
         session_id: session_id.clone(),
+        compaction_config: Some(orbit_cli::role_turn_config(
+            &home,
+            &turn_config,
+            "compaction",
+        )),
         ..Default::default()
     };
     // The authority extractor (phase 6): "run the tests but never
@@ -1780,6 +1785,11 @@ fn cmd_chat(args: &[String]) -> i32 {
     let mut model = value_after(args, "--model")
         .or_else(|| std::env::var("ORBIT_MODEL").ok())
         .or_else(|| std::env::var("ORBIT_ACTIVE_MODEL").ok())
+        .or_else(|| {
+            // roles.main: the configured default for the conversation.
+            let spec = cfg.roles.main.clone();
+            (!spec.is_empty()).then(|| spec.rsplit('/').next().unwrap_or(&spec).to_string())
+        })
         .unwrap_or_else(|| {
             cfg.provider
                 .iter()
@@ -2098,6 +2108,11 @@ fn cmd_chat(args: &[String]) -> i32 {
             window_tokens: orbit_cli::context_window_for(&home, &model),
             request_stem: "orbit-repl".into(),
             session_id: session.clone(),
+            compaction_config: Some(orbit_cli::role_turn_config(
+                &home,
+                &turn_config,
+                "compaction",
+            )),
             ..Default::default()
         };
         let report = orbit_engine::run_turn(
@@ -2501,6 +2516,41 @@ fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
             }))
         }
         "add" => cmd_provider_add(home, args),
+        "role" => {
+            let pos = positionals(args);
+            let (role, spec) = match (pos.get(2), pos.get(3)) {
+                (Some(r), Some(s)) => (r.to_string(), s.to_string()),
+                (Some(r), None) => {
+                    // Show the role's current value.
+                    let cfg =
+                        config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+                    let current = cfg.roles.get(r).unwrap_or("");
+                    return Ok(serde_json::json!({
+                        "schema": "orbit.cli/v1",
+                        "command": "provider role",
+                        "status": "ok",
+                        "role": r,
+                        "model": current,
+                    }));
+                }
+                _ => {
+                    return Err((
+                        "ORBIT-E1101",
+                        "usage: orbit provider role <main|subagent|explore|compaction> [model|provider/model]".into(),
+                    ));
+                }
+            };
+            let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+            cfg.set_role(&role, &spec).map_err(|e| ("ORBIT-E1106", e))?;
+            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "provider role",
+                "status": "ok",
+                "role": role,
+                "model": spec,
+            }))
+        }
         other => Err((
             "ORBIT-E1101",
             format!("unknown provider subcommand '{other}'; add|list|remove|presets"),
@@ -2704,6 +2754,48 @@ fn run_provider_add_interactive(
     )?;
     use std::io::Write;
     let _ = std::io::stdout().flush();
+
+    // Roles offer: fill unset roles from what was just added. The
+    // presets' own model facts suggest the natural mapping (a big model
+    // for main, cheap ones for explore/compaction); anything already
+    // set stays untouched.
+    let mut roles_set: Vec<(String, String)> = Vec::new();
+    if prompt_yes_no("Fill unset task roles from these models?", true)? {
+        let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+        // First chosen model = main; preset facts suggest the cheap ones.
+        let cheap_hint = |id: &str| {
+            orbit_cli::presets::preset_model(preset, id)
+                .map(|f| f.pricing.0)
+                .unwrap_or(u64::MAX)
+        };
+        let (cheapest, rest): (Vec<&String>, Vec<&String>) =
+            model_ids.iter().partition(|id| cheap_hint(id) <= 1_000_000);
+        let suggest = |role: &str| -> Option<String> {
+            match role {
+                "main" => rest.first().or(cheapest.first()).map(|s| s.to_string()),
+                // Cheap tiers serve explore/compaction when present.
+                _ => cheapest.first().or(rest.first()).map(|s| s.to_string()),
+            }
+        };
+        for role in ["main", "subagent", "explore", "compaction"] {
+            if cfg.roles.get(role).is_some() {
+                continue;
+            }
+            if let Some(m) = suggest(role) {
+                if cfg.set_role(role, &format!("{name}/{m}")).is_ok() {
+                    roles_set.push((role.to_string(), format!("{name}/{m}")));
+                }
+            }
+        }
+        if !roles_set.is_empty() {
+            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            println!("roles:");
+            for (r, m) in &roles_set {
+                println!("  {r:<11} {m}");
+            }
+        }
+    }
+
     Ok(serde_json::json!({
         "schema": "orbit.cli/v1",
         "command": "provider add",
@@ -2712,6 +2804,7 @@ fn run_provider_add_interactive(
         "kind": kind,
         "url": gate,
         "models": model_ids,
+        "roles_set": roles_set,
     }))
 }
 
@@ -2769,6 +2862,12 @@ fn run_provider_add_scripted(
 fn cmd_models(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
     let entries: Vec<(String, String)> = cfg.all_models();
+    let roles: std::collections::BTreeMap<String, String> = cfg
+        .roles
+        .entries()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     Ok(serde_json::json!({
         "schema": "orbit.cli/v1",
         "command": "models",
@@ -2776,6 +2875,7 @@ fn cmd_models(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
         "providers": cfg.provider,
         "models": entries,
         "count": entries.len(),
+        "roles": roles,
         "json": args.iter().any(|a| a == "--json"),
     }))
 }
@@ -2820,6 +2920,13 @@ fn handle_chat_command(
                     } else {
                         for (prov, m) in &entries {
                             println!("{prov} \t{m}");
+                        }
+                    }
+                    let roles = cfg.roles.entries();
+                    if !roles.is_empty() {
+                        println!("roles:");
+                        for (role, spec) in roles {
+                            println!("  {role:<11} {spec}");
                         }
                     }
                 }

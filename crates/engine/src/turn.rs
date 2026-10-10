@@ -52,6 +52,12 @@ pub struct TurnOptions {
     /// compacting (the recursion loops when the window is small — the
     /// summary request alone can cross the threshold).
     pub compacting: bool,
+    /// An alternate TurnConfig for the compaction dispatch only (the
+    /// `compaction` role in providers.toml: a cheap model summarizing
+    /// while the conversation keeps its own). None = the conversation's
+    /// own config also summarizes. The front-end sets this; the engine
+    /// never invents one.
+    pub compaction_config: Option<TurnConfig>,
 }
 
 /// What the next request is made of, in estimated tokens (~4 bytes each):
@@ -130,6 +136,7 @@ impl Default for TurnOptions {
             window_tokens: None,
             output_reserve_tokens: 8_192,
             compacting: false,
+            compaction_config: None,
         }
     }
 }
@@ -711,6 +718,14 @@ fn compact_transcript(
     };
     opts.max_rounds = 1;
     opts.max_attempts = 2;
+    // The compaction role: a cheap model may summarize while the
+    // conversation keeps its own (task-based routing). The role's
+    // config carries its own gate/kind/credential; the summary turn
+    // runs on it when the front-end resolved one.
+    let summary_config = options
+        .compaction_config
+        .clone()
+        .unwrap_or_else(|| config.clone());
     let mut scratch: Vec<ChatMessage> = Vec::new();
     let mut noop = NoopExecutor;
     // Private sink (B6): the summary turn is housekeeping, not a turn
@@ -719,7 +734,7 @@ fn compact_transcript(
     let mut private_sink = |_ev: FrontendEvent| {};
     let report = run_turn(
         home,
-        config,
+        &summary_config,
         &opts,
         &prompt,
         &mut scratch,
