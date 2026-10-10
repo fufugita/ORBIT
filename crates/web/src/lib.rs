@@ -207,6 +207,9 @@ pub(crate) struct WebApprovalChannel {
     /// Broadcast side so `ask` can surface the request to the browser before
     /// parking (mirrors TuiApprovalChannel posting Msg::ApprovalRequested).
     pub state: BridgeState,
+    /// The note typed with a denial ("use `make test` instead"),
+    /// captured from the deny action and handed to the engine once.
+    note: Option<String>,
 }
 
 impl orbit_cli::tool_runtime::ApprovalChannel for WebApprovalChannel {
@@ -238,8 +241,18 @@ impl orbit_cli::tool_runtime::ApprovalChannel for WebApprovalChannel {
                         return match a.get("verdict").and_then(|v| v.as_str()) {
                             Some("allow") => ApprovalVerdict::AllowOnce,
                             Some("session") => ApprovalVerdict::AllowSession,
+                            // `s`: the rule the card offered, this session.
+                            Some("rule") => ApprovalVerdict::AllowRuleSession,
+                            // `a`: the same rule, remembered in this
+                            // folder's local settings.
+                            Some("always") => ApprovalVerdict::AllowRuleAlways,
                             _ => ApprovalVerdict::Deny,
                         };
+                    }
+                    Some("deny") => {
+                        // `n`: a denial may carry a note for the model.
+                        self.note = a.get("note").and_then(|v| v.as_str()).map(str::to_string);
+                        return ApprovalVerdict::Deny;
                     }
                     Some("cancel") | Some("quit") => return ApprovalVerdict::Deny,
                     _ => continue,
@@ -247,6 +260,10 @@ impl orbit_cli::tool_runtime::ApprovalChannel for WebApprovalChannel {
                 Err(_) => return ApprovalVerdict::Deny,
             }
         }
+    }
+
+    fn take_note(&mut self) -> Option<String> {
+        self.note.take()
     }
 }
 

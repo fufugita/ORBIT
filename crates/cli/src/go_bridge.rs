@@ -83,6 +83,9 @@ fn next_action(reader: &mut BufReader<UnixStream>) -> Incoming {
 /// Send-but-not-Sync and the ApprovalChannel trait requires Send.
 struct GoApprovalChannel {
     rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<serde_json::Value>>>,
+    /// The note typed with a denial, captured from the deny action and
+    /// handed to the engine once.
+    note: Option<String>,
 }
 
 impl crate::tool_runtime::ApprovalChannel for GoApprovalChannel {
@@ -107,8 +110,21 @@ impl crate::tool_runtime::ApprovalChannel for GoApprovalChannel {
                     return match action.get("verdict").and_then(|v| v.as_str()) {
                         Some("allow") => crate::tool_runtime::ApprovalVerdict::AllowOnce,
                         Some("session") => crate::tool_runtime::ApprovalVerdict::AllowSession,
+                        // `s`: the rule the card offered, this session.
+                        Some("rule") => crate::tool_runtime::ApprovalVerdict::AllowRuleSession,
+                        // `a`: the same rule, remembered in this folder's
+                        // local settings.
+                        Some("always") => crate::tool_runtime::ApprovalVerdict::AllowRuleAlways,
                         _ => crate::tool_runtime::ApprovalVerdict::Deny,
                     };
+                }
+                Some("deny") => {
+                    // `n`: a denial may carry a note for the model.
+                    self.note = action
+                        .get("note")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    return crate::tool_runtime::ApprovalVerdict::Deny;
                 }
                 Some("cancel") | Some("quit") => {
                     return crate::tool_runtime::ApprovalVerdict::Deny;
@@ -116,6 +132,10 @@ impl crate::tool_runtime::ApprovalChannel for GoApprovalChannel {
                 _ => continue,
             }
         }
+    }
+
+    fn take_note(&mut self) -> Option<String> {
+        self.note.take()
     }
 }
 
@@ -587,6 +607,7 @@ impl orbit_engine::ToolExecutor for GoToolExecutor {
                 let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
                 let mut approval_channel = GoApprovalChannel {
                     rx: self.action_rx.clone(),
+                    note: None,
                 };
                 let result = crate::tool_runtime::execute_call(
                     &self.home,

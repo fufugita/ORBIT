@@ -454,6 +454,7 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
                 let mut approval_channel = WebApprovalChannel {
                     action_rx: self.action_rx.clone(),
                     state: self.state.clone(),
+                    note: None,
                 };
                 let (result, file_change) = orbit_cli::tool_runtime::execute_call(
                     &self.home,
