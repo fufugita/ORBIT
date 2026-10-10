@@ -86,6 +86,26 @@ pub fn load_session(home: &Path, session_id: &str) -> Result<SessionFile, String
     serde_json::from_str(&raw).map_err(|e| format!("parse {path:?}: {e}"))
 }
 
+/// Fork a session: copy its history into a NEW session id and save it
+/// (roadmap §Sessions: `--fork-session` / `/branch`). The original is
+/// untouched; the fork carries its own identity and a fresh updated_at.
+pub fn fork_session(home: &Path, session_id: &str) -> Result<SessionFile, String> {
+    let mut src = load_session(home, session_id)?;
+    let new_id = orbit_gateway::new_session_id();
+    src.session_id = new_id.clone();
+    src.updated_at = crate::timestamp_now();
+    // The fork's JSONL transcript (if one exists) is copied too, so
+    // `--resume <fork>` and the TUI's event-sourced view agree with the
+    // JSON file.
+    let jsonl_src = home.join("projects").join(format!("{session_id}.jsonl"));
+    if jsonl_src.exists() {
+        let jsonl_dst = home.join("projects").join(format!("{new_id}.jsonl"));
+        std::fs::copy(&jsonl_src, &jsonl_dst).map_err(|e| format!("copy transcript: {e}"))?;
+    }
+    save_session(home, &src)?;
+    Ok(src)
+}
+
 /// List persisted sessions, most-recently-updated first.
 pub fn list_sessions(home: &Path) -> Result<Vec<SessionFile>, String> {
     let dir = sessions_dir(home);
@@ -193,5 +213,47 @@ mod tests {
         assert_eq!(restored.len(), 3);
         assert_eq!(restored[2].role, ChatRole::Tool);
         assert_eq!(restored[2].tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn fork_copies_history_under_a_new_id_and_leaves_the_original() {
+        let home = std::env::temp_dir().join(format!("orbit-fork-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        let src = sample("session-src");
+        save_session(&home, &src).unwrap();
+
+        let fork = fork_session(&home, "session-src").unwrap();
+        assert_ne!(fork.session_id, "session-src");
+        assert_eq!(fork.transcript.len(), src.transcript.len());
+        assert_eq!(fork.model, src.model);
+
+        // The original is untouched and both load independently.
+        let back = load_session(&home, "session-src").unwrap();
+        assert_eq!(back.transcript.len(), src.transcript.len());
+        let fork_loaded = load_session(&home, &fork.session_id).unwrap();
+        assert_eq!(fork_loaded.transcript.len(), src.transcript.len());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fork_copies_the_jsonl_transcript_when_one_exists() {
+        let home = std::env::temp_dir().join(format!("orbit-fork2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(home.join("projects"));
+        // No JSON session file: fork reports the failure honestly.
+        assert!(fork_session(&home, "session-jsonl").is_err());
+        // With one, the JSONL sidecar is copied alongside.
+        let _ = std::fs::create_dir_all(home.join("sessions"));
+        std::fs::write(
+            home.join("projects/session-jsonl.jsonl"),
+            "{\"kind\":\"user_prompt\",\"text\":\"hi\"}\n",
+        )
+        .unwrap();
+        save_session(&home, &sample("session-jsonl")).unwrap();
+        let fork = fork_session(&home, "session-jsonl").unwrap();
+        let copied = home
+            .join("projects")
+            .join(format!("{}.jsonl", fork.session_id));
+        assert!(copied.exists(), "the fork's JSONL transcript is copied");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

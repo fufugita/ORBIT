@@ -51,6 +51,7 @@ fn main() {
             }
             if a == "--continue"
                 || a == "--bare"
+                || a == "--fork-session"
                 || a == "--go-tui"
                 || a == "--no-tui"
                 || a == "--tui"
@@ -158,6 +159,10 @@ fn print_human_help() {
         ("--gate <URL>", "gateway base URL"),
         ("--home <DIR>", "ORBIT home (default ~/.orbit)"),
         ("--continue", "reopen the latest session in this directory"),
+        (
+            "--fork-session",
+            "copy the resumed (or latest) session into a new id and continue there",
+        ),
         ("--resume <ID>", "resume a specific session"),
         ("--no-tui", "plain REPL instead of the TUI"),
         (
@@ -1845,6 +1850,44 @@ fn cmd_chat(args: &[String]) -> i32 {
                     None
                 }
             })
+    };
+
+    // --fork-session (roadmap §Sessions): copy the resumed (or latest)
+    // session's history into a NEW session id and continue there. The
+    // original is untouched — "replay it differently" without losing
+    // the thread you were on.
+    let resumed_file = if args.iter().any(|a| a == "--fork-session") {
+        let source = resumed_file.or_else(|| {
+            // No --resume: fork the latest session in this directory.
+            sessions::list_sessions(&home)
+                .ok()
+                .and_then(|mut list| {
+                    list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                    list.into_iter().next()
+                })
+                .or_else(|| {
+                    eprintln!("no saved sessions to fork; starting fresh");
+                    None
+                })
+        });
+        match source {
+            Some(src) => match sessions::fork_session(&home, &src.session_id) {
+                Ok(fork) => {
+                    eprintln!("forked {} into {}", src.session_id, fork.session_id);
+                    Some(fork)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: cannot fork {}: {e}; continuing the original",
+                        src.session_id
+                    );
+                    Some(src)
+                }
+            },
+            None => None,
+        }
+    } else {
+        resumed_file
     };
 
     // TUI front-end (DR-20): if TTY + --tui (default), forward to the ratatui

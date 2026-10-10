@@ -348,7 +348,7 @@ orbit web              start the browser harness
 ```
 
 Common flags: `--model <M>`, `--gate <URL>`, `--provider <name>`,
-`--home <DIR>`, `--continue`, `--resume <ID>`, `--no-tui`,
+`--home <DIR>`, `--continue`, `--resume <ID>`, `--fork-session`, `--no-tui`,
 `--auto-tools`, `--permission-mode <default|acceptEdits|plan|dontAsk|bypass>`.
 For `-p`: `--output-format <text|json|stream-json>`, `--allowedTools`,
 `--disallowedTools`, `--max-turns`, `--max-cost`, `--bare`,
