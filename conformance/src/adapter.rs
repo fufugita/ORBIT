@@ -237,6 +237,7 @@ mod tests {
             endpoint_host: String::from("api.test-provider.example"),
             endpoint_port: 443,
             endpoint_scheme: orbit_adapter::types::EndpointScheme::Https,
+            endpoint_path: String::new(),
         }
     }
 

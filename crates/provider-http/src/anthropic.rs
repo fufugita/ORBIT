@@ -220,9 +220,16 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
             // HTTP endpoint — the route kind check above excludes it.
             _ => "http",
         };
+        // Base path from the gate URL when configured (an Anthropic-compatible
+        // gateway behind a path); empty keeps the API's own `/v1`.
+        let base_path = if request.route.endpoint_path.is_empty() {
+            "/v1"
+        } else {
+            request.route.endpoint_path.as_str()
+        };
         let url = format!(
-            "{}://{}:{}/v1/messages",
-            scheme, request.route.endpoint_host, request.route.endpoint_port
+            "{}://{}:{}{}/messages",
+            scheme, request.route.endpoint_host, request.route.endpoint_port, base_path
         );
 
         // Messages: the transcript when present, else the single prompt.
