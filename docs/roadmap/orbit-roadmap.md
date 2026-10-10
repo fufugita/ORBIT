@@ -472,6 +472,6 @@ The first review found the phases built but not wired into the live path; `fddad
 
 On 10 Oct the same branch grew the provider work: the gate URL's path reaches the adapters (`bfa3f5e` — DashScope, Z.ai and Gemini endpoints were unreachable before), discovery speaks each provider's dialect (`95da7a7`), provider presets and `orbit provider` (`1996740`), model roles as the task router (`5ae6a34`), `install.sh` (`b1a5571`), and the web and Go front-ends learned `s`, `a` and the denial note (`5cb97fd`).
 
-**Open.** A real-model run of each gate (the Anthropic-wire adapter path ran against a live gateway on 10 Oct; the per-gate TUI runs remain). Narrow-screen polish. "Not now" above is unchanged.
+**Open.** Narrow-screen polish. "Not now" above is unchanged. The real-model gate runs are done (10 Oct): a live litellm gateway (`glm-5.3`) configured as an `anthropic`-kind provider drove every gate — plain `-p` turn, a Read-tool turn, a Bash-tool turn through the sandbox, and an interactive TUI turn over a PTY — with the ledger verified after (28 records, chain intact).
 
 `R` is removed (10 Oct): no release ever shipped it, so there was no muscle memory to migrate — the card offers `y` alone when no rule can be offered, the whole-tool `AllowSession` verdict stays as the web/Go `session` wire word.
