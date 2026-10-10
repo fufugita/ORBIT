@@ -295,6 +295,56 @@ impl ModelListResponse {
     }
 }
 
+/// Parsed Ollama `/api/tags` response: `{models:[{name:"..."}]}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct OllamaTagsResponse {
+    pub models: Vec<OllamaTagsItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct OllamaTagsItem {
+    pub name: String,
+}
+
+impl OllamaTagsResponse {
+    /// Parse a raw `/api/tags` body; missing/empty models is an error so
+    /// callers can fall back to manual model entry.
+    pub fn parse(raw: &str) -> Result<Vec<String>, String> {
+        let parsed: OllamaTagsResponse =
+            serde_json::from_str(raw).map_err(|e| format!("parse tags response: {e}"))?;
+        let ids: Vec<String> = parsed.models.into_iter().map(|m| m.name).collect();
+        if ids.is_empty() {
+            return Err("tags response contained no models".into());
+        }
+        Ok(ids)
+    }
+}
+
+/// The per-model limits an Anthropic `/v1/models/{id}` detail body
+/// carries, mapped to the config's own fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AnthropicModelLimits {
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u32>,
+}
+
+/// Parse an Anthropic `/v1/models/{id}` body for its limits. Unknown
+/// shapes return the empty struct — a detail fetch is best-effort and
+/// never blocks model selection.
+pub fn parse_anthropic_model_detail(raw: &str) -> AnthropicModelLimits {
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return AnthropicModelLimits::default(),
+    };
+    AnthropicModelLimits {
+        context_window: parsed.pointer("/max_input_tokens").and_then(|v| v.as_u64()),
+        max_output_tokens: parsed
+            .pointer("/max_tokens")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +546,29 @@ output_per_million_microcents = 600000
         let ids = ModelListResponse::parse(raw).unwrap();
         assert_eq!(ids, vec!["glm-5.2".to_string(), "kimi-k2.7".to_string()]);
         assert!(ModelListResponse::parse(r#"{"data":[]}"#).is_err());
+    }
+
+    #[test]
+    fn parses_ollama_tags_response() {
+        let raw = r#"{"models":[{"name":"qwen3.5:9b"},{"name":"llama4:8b"}]}"#;
+        let ids = OllamaTagsResponse::parse(raw).unwrap();
+        assert_eq!(ids, vec!["qwen3.5:9b".to_string(), "llama4:8b".to_string()]);
+        assert!(OllamaTagsResponse::parse(r#"{"models":[]}"#).is_err());
+        assert!(OllamaTagsResponse::parse("not json").is_err());
+    }
+
+    #[test]
+    fn parses_anthropic_model_detail_limits() {
+        let raw = r#"{"id":"claude-opus-5-5","max_input_tokens":200000,"max_tokens":64000}"#;
+        let limits = parse_anthropic_model_detail(raw);
+        assert_eq!(limits.context_window, Some(200_000));
+        assert_eq!(limits.max_output_tokens, Some(64_000));
+        // Unknown/absent shapes stay empty, never fail.
+        let none = parse_anthropic_model_detail(r#"{"id":"x"}"#);
+        assert_eq!(none, AnthropicModelLimits::default());
+        assert_eq!(
+            parse_anthropic_model_detail("garbage"),
+            AnthropicModelLimits::default()
+        );
     }
 }

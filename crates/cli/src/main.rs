@@ -484,11 +484,33 @@ fn validate_provider_url(gate: &str) -> Result<(), (&'static str, String)> {
     }
 }
 
-/// GET `<base>/v1/models`, using a bearer token read from the declared env var
-/// (borrowed for the request only; never printed or persisted). Runs on a
-/// short-lived tokio runtime so the interactive flow stays synchronous.
-fn discover_models(gate: &str, credential_env: Option<&str>) -> Result<Vec<String>, String> {
-    let url = format!("{}/v1/models", gate.trim_end_matches('/'));
+/// GET the provider's model list, speaking the right dialect per kind:
+/// OpenAI-compatible `{path}/models` (bearer), Anthropic `/v1/models`
+/// (x-api-key + anthropic-version), Ollama `/api/tags` (no credential).
+/// The token is read from the declared env var, borrowed for the request
+/// only; never printed or persisted. Runs on a short-lived tokio runtime
+/// so the interactive flow stays synchronous.
+fn discover_models(
+    gate: &str,
+    credential_env: Option<&str>,
+    kind: &str,
+) -> Result<Vec<String>, String> {
+    // The gate URL's path is the base path (empty = /v1 default); the
+    // discovery URL composes the same way the adapters do.
+    let base = gate.trim_end_matches('/');
+    let url = match kind {
+        "ollama" => format!("{base}/api/tags"),
+        "anthropic" => {
+            let path = url_path_of(gate);
+            let path = if path.is_empty() { "/v1" } else { &path };
+            format!("{base}{path}/models")
+        }
+        _ => {
+            let path = url_path_of(gate);
+            let path = if path.is_empty() { "/v1" } else { &path };
+            format!("{base}{path}/models")
+        }
+    };
     // reqwest uses rustls in this workspace; install the ring process-default
     // provider before constructing a standalone discovery client.
     let _ = orbit_provider_http::tls::client_config(&orbit_adapter::types::TlsPinPolicy {
@@ -506,7 +528,13 @@ fn discover_models(gate: &str, credential_env: Option<&str>) -> Result<Vec<Strin
             let mut req = client.get(&url);
             if let Some(var) = credential_env.filter(|s| !s.trim().is_empty()) {
                 if let Ok(token) = std::env::var(var) {
-                    req = req.bearer_auth(token);
+                    if kind == "anthropic" {
+                        req = req
+                            .header("x-api-key", &token)
+                            .header("anthropic-version", "2023-06-01");
+                    } else {
+                        req = req.bearer_auth(token);
+                    }
                 }
             }
             let resp = req
@@ -517,8 +545,77 @@ fn discover_models(gate: &str, credential_env: Option<&str>) -> Result<Vec<Strin
                 return Err(format!("model discovery returned {}", resp.status()));
             }
             let raw = resp.text().await.map_err(|e| format!("read models: {e}"))?;
-            orbit_cli::config::ModelListResponse::parse(&raw)
+            if kind == "ollama" {
+                orbit_cli::config::OllamaTagsResponse::parse(&raw)
+            } else {
+                orbit_cli::config::ModelListResponse::parse(&raw)
+            }
         })
+}
+
+/// The path component of a gate URL, normalized the way dispatch does:
+/// one leading slash, no trailing slash, empty for `/` or absent.
+fn url_path_of(gate: &str) -> String {
+    match url::Url::parse(gate) {
+        Ok(u) => {
+            let trimmed = u.path().trim_matches('/');
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("/{trimmed}")
+            }
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Fetch an Anthropic model's detail (`/v1/models/{id}`) for its limits.
+/// Best-effort: any failure returns the empty limits and the caller
+/// keeps its static fallbacks.
+fn anthropic_model_limits(
+    gate: &str,
+    credential_env: Option<&str>,
+    model: &str,
+) -> orbit_cli::config::AnthropicModelLimits {
+    let base = gate.trim_end_matches('/');
+    let path = {
+        let p = url_path_of(gate);
+        if p.is_empty() {
+            "/v1".to_string()
+        } else {
+            p
+        }
+    };
+    let url = format!("{base}{path}/models/{model}");
+    let _ = orbit_provider_http::tls::client_config(&orbit_adapter::types::TlsPinPolicy {
+        webpki: true,
+        spki_sha256: None,
+    });
+    tokio::runtime::Runtime::new()
+        .ok()
+        .and_then(|rt| {
+            rt.block_on(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .ok()?;
+                let mut req = client.get(&url);
+                if let Some(var) = credential_env.filter(|s| !s.trim().is_empty()) {
+                    if let Ok(token) = std::env::var(var) {
+                        req = req
+                            .header("x-api-key", &token)
+                            .header("anthropic-version", "2023-06-01");
+                    }
+                }
+                let resp = req.send().await.ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let raw = resp.text().await.ok()?;
+                Some(orbit_cli::config::parse_anthropic_model_detail(&raw))
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// Guided provider setup for `orbit init` in a real terminal.
@@ -542,19 +639,20 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
             Some(credential_env)
         };
 
-        let discovered = match discover_models(&gate, credential_env.as_deref()) {
-            Ok(ids) => {
-                println!("Discovered models:");
-                for (i, id) in ids.iter().enumerate() {
-                    println!("  {}. {id}", i + 1);
+        let discovered =
+            match discover_models(&gate, credential_env.as_deref(), "openai-compatible") {
+                Ok(ids) => {
+                    println!("Discovered models:");
+                    for (i, id) in ids.iter().enumerate() {
+                        println!("  {}. {id}", i + 1);
+                    }
+                    ids
                 }
-                ids
-            }
-            Err(e) => {
-                eprintln!("Could not discover models: {e}");
-                Vec::new()
-            }
-        };
+                Err(e) => {
+                    eprintln!("Could not discover models: {e}");
+                    Vec::new()
+                }
+            };
         let model_ids = if discovered.is_empty() {
             prompt_line("Enter model ids (comma-separated)", None)?
                 .split(',')
