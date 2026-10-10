@@ -251,6 +251,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "models" | "list-models" => cmd_models(&home, args),
         "mod" => cmd_mod(&home, args),
         "folder" => cmd_folder(&home, args),
+        "provider" => cmd_provider(&home, args),
         "version" => Ok(serde_json::to_value(orbit_cli::version_evidence(
             env!("CARGO_PKG_VERSION"),
             &build_commit(),
@@ -279,6 +280,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "mod list                        installed mods",
                 "mod allow-issuer <hex-key>       trust a mod issuer",
                 "folder trust|untrust|status [DIR]  trust a folder's own settings",
+                "provider add|list|remove|presets    manage model providers",
                 "web           start the browser harness (orbit-web bridge)"
             ]
         })),
@@ -420,29 +422,57 @@ fn add_configured_provider(
     model_ids: Vec<String>,
     pricing: Option<Vec<orbit_cli::config::Pricing>>,
 ) -> Result<(), (&'static str, String)> {
+    add_configured_provider_kind(
+        home,
+        name,
+        gate,
+        "openai-compatible",
+        credential_env,
+        model_ids,
+        pricing,
+        None,
+    )
+}
+
+/// Add a provider with an explicit adapter kind and optional pre-built
+/// model entries (preset facts + live-discovered limits). The legacy
+/// wrapper above keeps the scripted `orbit init --provider` path.
+#[allow(clippy::too_many_arguments)]
+fn add_configured_provider_kind(
+    home: &Path,
+    name: &str,
+    gate: &str,
+    kind: &str,
+    credential_env: Option<String>,
+    model_ids: Vec<String>,
+    pricing: Option<Vec<orbit_cli::config::Pricing>>,
+    model_entries: Option<Vec<orbit_cli::config::ModelEntry>>,
+) -> Result<(), (&'static str, String)> {
     validate_provider_url(gate)?;
     if model_ids.is_empty() {
         return Err(("ORBIT-E1101", "at least one model is required".into()));
     }
     let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-    let models = model_ids
-        .into_iter()
-        .enumerate()
-        .map(|(i, id)| orbit_cli::config::ModelEntry {
-            sampling: None,
-            id,
-            label: None,
-            pricing: pricing
-                .as_ref()
-                .and_then(|p| p.get(i).copied())
-                .unwrap_or_default(),
-            max_output_tokens: None,
-            context_window: None,
-        })
-        .collect();
+    let models = model_entries.unwrap_or_else(|| {
+        model_ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| orbit_cli::config::ModelEntry {
+                sampling: None,
+                id,
+                label: None,
+                pricing: pricing
+                    .as_ref()
+                    .and_then(|p| p.get(i).copied())
+                    .unwrap_or_default(),
+                max_output_tokens: None,
+                context_window: None,
+            })
+            .collect()
+    });
     cfg.add_provider(orbit_cli::config::ProviderConfig {
         name: name.into(),
-        kind: "openai-compatible".into(),
+        kind: kind.into(),
         url: gate.trim_end_matches('/').into(),
         env: credential_env.filter(|s| !s.trim().is_empty()),
         models,
@@ -2241,7 +2271,8 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
 /// through orbit-plugin's signed-manifest flow (issuer key, content
 /// digest, operator approval, ledger record).
 fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
-    let sub = args.get(1).map(String::as_str).unwrap_or("");
+    let pos = positionals(args);
+    let sub = pos.get(1).copied().unwrap_or("");
     // Issuer allowlist: $ORBIT_HOME/mods/issuers.txt, one hex key per
     // line. The operator trusts an issuer explicitly; installs from
     // anyone else are refused.
@@ -2259,7 +2290,7 @@ fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     };
     match sub {
         "allow-issuer" => {
-            let Some(key) = args.get(2) else {
+            let Some(key) = pos.get(2) else {
                 return Err((
                     "ORBIT-E1101",
                     "usage: orbit mod allow-issuer <hex-ed25519-key>".into(),
@@ -2295,7 +2326,7 @@ fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         }
         "install" => {
             let pkg = value_after(args, "--package")
-                .or_else(|| args.get(2).cloned())
+                .or_else(|| pos.get(2).map(|s| s.to_string()))
                 .ok_or_else(|| {
                     (
                         "ORBIT-E1101",
@@ -2408,6 +2439,330 @@ fn cmd_folder(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
         "status": "ok",
         "folder": dir.display().to_string(),
         "trusted": trusted,
+    }))
+}
+
+/// `orbit provider add|list|remove|presets` — provider management.
+/// `add` walks a preset (or custom) through discovery into providers.toml;
+/// it stores env-var NAMES and public model facts, never credential values.
+fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    let pos = positionals(args);
+    let sub = pos.get(1).copied().unwrap_or("list");
+    match sub {
+        "presets" => {
+            let list: Vec<serde_json::Value> = orbit_cli::presets::presets()
+                .into_iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "kind": p.kind,
+                        "url": p.url,
+                        "env": p.env,
+                        "blurb": p.blurb,
+                        "known_models": p.models.len(),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "provider presets",
+                "status": "ok",
+                "presets": list,
+            }))
+        }
+        "list" => {
+            let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "provider list",
+                "status": "ok",
+                "providers": cfg.provider,
+            }))
+        }
+        "remove" => {
+            let name = pos
+                .get(2)
+                .ok_or(("ORBIT-E1101", "usage: orbit provider remove <name>".into()))?;
+            let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+            let before = cfg.provider.len();
+            cfg.provider.retain(|p| p.name != *name);
+            if cfg.provider.len() == before {
+                return Err((
+                    "ORBIT-E1106",
+                    format!("provider '{name}' is not configured"),
+                ));
+            }
+            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "provider remove",
+                "status": "ok",
+                "removed": name,
+            }))
+        }
+        "add" => cmd_provider_add(home, args),
+        other => Err((
+            "ORBIT-E1101",
+            format!("unknown provider subcommand '{other}'; add|list|remove|presets"),
+        )),
+    }
+}
+
+/// `orbit provider add [preset]` — the interactive (or scripted) setup
+/// flow. Interactive: preset picker → credential env name → discovery →
+/// model selection → confirm. Scripted: `orbit provider add <preset>
+/// --model M[,M..] [--credential-env VAR] [--url URL]`.
+fn cmd_provider_add(
+    home: &Path,
+    args: &[String],
+) -> Result<serde_json::Value, (&'static str, String)> {
+    // Scripted form: explicit --model skips every prompt.
+    let scripted_models = value_after(args, "--model");
+    let preset_id = positionals(args)
+        .get(2)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if scripted_models.is_some() {
+                "custom".into()
+            } else {
+                String::new()
+            }
+        });
+    if preset_id.is_empty() {
+        // Interactive: pick a preset from the list.
+        let all = orbit_cli::presets::presets();
+        println!("Providers:");
+        for (i, p) in all.iter().enumerate() {
+            println!("  {}. {:<12} {}", i + 1, p.id, p.blurb);
+        }
+        let sel = prompt_line("Provider (name or number)", None)?;
+        let preset = if let Ok(n) = sel.trim().parse::<usize>() {
+            all.get(n.saturating_sub(1)).cloned()
+        } else {
+            orbit_cli::presets::preset_by_id(sel.trim())
+        };
+        let Some(preset) = preset else {
+            return Err(("ORBIT-E1101", format!("unknown provider '{sel}'")));
+        };
+        run_provider_add_interactive(home, &preset)
+    } else {
+        let Some(preset) = orbit_cli::presets::preset_by_id(&preset_id) else {
+            return Err((
+                "ORBIT-E1101",
+                format!(
+                    "unknown preset '{preset_id}'; run: orbit provider presets\n  (custom gateways: leave the preset name out and pass --url)"
+                ),
+            ));
+        };
+        if let Some(models) = scripted_models {
+            run_provider_add_scripted(home, &preset, &models, args)
+        } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            run_provider_add_interactive(home, &preset)
+        } else {
+            Err((
+                "ORBIT-E1101",
+                "non-interactive add needs --model M[,M..] (and --url for custom)".into(),
+            ))
+        }
+    }
+}
+
+fn run_provider_add_interactive(
+    home: &Path,
+    preset: &orbit_cli::presets::ProviderPreset,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    // Name: the preset id by default.
+    let name = prompt_line("Name for providers.toml", Some(preset.id))?;
+
+    // Base URL: preset default, alternates offered.
+    let gate = if preset.alt_urls.is_empty() {
+        prompt_line("Base URL", Some(preset.url))?
+    } else {
+        println!("Endpoints:");
+        println!("  1. {} (default)", preset.url);
+        for (i, (label, url)) in preset.alt_urls.iter().enumerate() {
+            println!("  {}. {url} ({label})", i + 2);
+        }
+        let sel = prompt_line("Endpoint (number)", Some("1"))?;
+        let n = sel.trim().parse::<usize>().unwrap_or(1);
+        if n == 1 {
+            preset.url.to_string()
+        } else {
+            preset
+                .alt_urls
+                .get(n - 2)
+                .map(|(_, u)| u.to_string())
+                .unwrap_or_else(|| preset.url.to_string())
+        }
+    };
+    validate_provider_url(&gate)?;
+
+    // Credential: env-var NAME only. Tell the user what to export.
+    // Ollama (empty preset env) defaults to none — it needs no key.
+    let credential_env = if preset.env.is_empty() {
+        let v = prompt_line("Credential env-var name (blank = none)", None)?;
+        if v.trim().is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    } else {
+        let v = prompt_line("Credential env-var name", Some(preset.env))?;
+        if v.trim().is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    if let Some(var) = credential_env.as_deref().filter(|v| !v.trim().is_empty()) {
+        if std::env::var(var).is_err() {
+            println!("note: export {var}=<your key> before orbit needs it");
+        }
+    }
+
+    // Discovery against the real endpoint.
+    let kind = preset.kind;
+    println!("Discovering models at {gate} ({kind})…");
+    let discovered = match discover_models(&gate, credential_env.as_deref(), kind) {
+        Ok(ids) => {
+            println!("Discovered models:");
+            for (i, id) in ids.iter().enumerate() {
+                let fact = orbit_cli::presets::preset_model(preset, id)
+                    .map(|f| format!(" — {}", f.label))
+                    .unwrap_or_default();
+                println!("  {}. {id}{fact}", i + 1);
+            }
+            ids
+        }
+        Err(e) => {
+            eprintln!("Could not discover models: {e}");
+            Vec::new()
+        }
+    };
+
+    // Selection: known preset facts join the discovered list when the
+    // endpoint did not already list them.
+    let mut offered: Vec<String> = discovered.clone();
+    for m in preset.models {
+        if !offered.iter().any(|id| id == m.id) {
+            offered.push(m.id.to_string());
+        }
+    }
+    if offered.is_empty() {
+        return Err((
+            "ORBIT-E1101",
+            "no models discovered and this preset lists none; enter them with --model".into(),
+        ));
+    }
+    let sel = prompt_line(
+        "Select models (all or comma-separated numbers)",
+        Some("all"),
+    )?;
+    let chosen: Vec<String> = if sel.trim().eq_ignore_ascii_case("all") {
+        offered
+    } else {
+        sel.split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .filter_map(|n| offered.get(n.saturating_sub(1)).cloned())
+            .collect()
+    };
+    if chosen.is_empty() {
+        return Err(("ORBIT-E1101", "no models selected".into()));
+    }
+
+    // Model entries: preset facts + (Anthropic) live per-model limits.
+    let mut entries: Vec<orbit_cli::config::ModelEntry> = chosen
+        .iter()
+        .map(|id| orbit_cli::presets::preset_model_entry(preset, id))
+        .collect();
+    if kind == "anthropic" {
+        if let Some(idx) = entries
+            .iter()
+            .position(|e| e.context_window.is_none() || e.max_output_tokens.is_none())
+        {
+            let id = entries[idx].id.clone();
+            let limits = anthropic_model_limits(&gate, credential_env.as_deref(), &id);
+            if let Some(w) = limits.context_window {
+                entries[idx].context_window = Some(w);
+            }
+            if let Some(o) = limits.max_output_tokens {
+                entries[idx].max_output_tokens = Some(o);
+            }
+        }
+    }
+
+    let model_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    add_configured_provider_kind(
+        home,
+        &name,
+        &gate,
+        kind,
+        credential_env,
+        model_ids.clone(),
+        None,
+        Some(entries),
+    )?;
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    Ok(serde_json::json!({
+        "schema": "orbit.cli/v1",
+        "command": "provider add",
+        "status": "ok",
+        "provider": name,
+        "kind": kind,
+        "url": gate,
+        "models": model_ids,
+    }))
+}
+
+fn run_provider_add_scripted(
+    home: &Path,
+    preset: &orbit_cli::presets::ProviderPreset,
+    models: &str,
+    args: &[String],
+) -> Result<serde_json::Value, (&'static str, String)> {
+    let gate = value_after(args, "--url").unwrap_or_else(|| preset.url.to_string());
+    if preset.id == "custom" && gate.is_empty() {
+        return Err((
+            "ORBIT-E1101",
+            "a custom provider needs --url (and --credential-env, --kind when not openai)".into(),
+        ));
+    }
+    validate_provider_url(&gate)?;
+    let credential_env = value_after(args, "--credential-env");
+    let kind = value_after(args, "--kind").unwrap_or_else(|| preset.kind.to_string());
+    let model_ids: Vec<String> = models
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if model_ids.is_empty() {
+        return Err(("ORBIT-E1101", "at least one model is required".into()));
+    }
+    let entries: Vec<orbit_cli::config::ModelEntry> = model_ids
+        .iter()
+        .map(|id| orbit_cli::presets::preset_model_entry(preset, id))
+        .collect();
+    let name = value_after(args, "--name").unwrap_or_else(|| preset.id.to_string());
+    add_configured_provider_kind(
+        home,
+        &name,
+        &gate,
+        &kind,
+        credential_env,
+        model_ids.clone(),
+        None,
+        Some(entries),
+    )?;
+    Ok(serde_json::json!({
+        "schema": "orbit.cli/v1",
+        "command": "provider add",
+        "status": "ok",
+        "provider": name,
+        "kind": kind,
+        "url": gate,
+        "models": model_ids,
     }))
 }
 
@@ -2573,6 +2928,41 @@ fn migrate_placeholder_pib(home: &Path) {
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+/// The positional words of an argument list: flag/value pairs and bare
+/// flags removed, verbs and their operands kept, in order. `--home X
+/// provider add ollama` yields `[provider, add, ollama]`, so a
+/// subcommand is `positionals(args).get(1)` no matter which flags led.
+fn positionals(args: &[String]) -> Vec<&str> {
+    let value_flags = [
+        "--home",
+        "--model",
+        "--gate",
+        "--resume",
+        "--credential-env",
+        "--url",
+        "--name",
+        "--kind",
+        "--manifest",
+        "--package",
+    ];
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if value_flags.contains(&a) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        out.push(a);
+        i += 1;
+    }
+    out
 }
 
 fn collect_ledger_bytes(dir: &Path) -> Result<Vec<u8>, (&'static str, String)> {

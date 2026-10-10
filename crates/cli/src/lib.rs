@@ -320,6 +320,7 @@ pub mod config;
 pub mod go_bridge;
 pub mod mods;
 pub mod permissions;
+pub mod presets;
 pub mod sessions;
 pub mod tool_runtime;
 pub mod tools;
