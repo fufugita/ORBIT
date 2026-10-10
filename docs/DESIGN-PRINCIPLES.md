@@ -54,8 +54,6 @@
 
 ---
 
-Provenance: two independent model submissions (terminal-native spec + desktop
-visual system), compared 2026-09-26. Cross-references: `docs/tui/DESIGN.md`
-(terminal front-end, normative), the desktop visual system (staged for the
-future Tauri front-end). DR-20 architecture locks remain authoritative for
-process model, approval pipeline, and display-safety seams.
+Provenance: two independent model submissions (a terminal-native spec and a
+desktop visual system), compared 2026-09-26. DR-20 architecture locks remain
+authoritative for process model, approval pipeline, and display-safety seams.

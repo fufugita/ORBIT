@@ -5,7 +5,7 @@
 //! thin view. Transport: WebSocket (browser → Rust actions) + SSE
 //! (Rust → browser events), same JSON shapes as the Go TUI bridge.
 //!
-//! Architecture (mirrors go_bridge.rs, transport swapped):
+//! Architecture (mirrors the old Go bridge, transport swapped):
 //! - axum serves the embedded SPA + `/events` (SSE) + `/actions` (WS).
 //! - The WS pump forwards browser actions to a std mpsc channel AND fires
 //!   `cancel` immediately on the shared cancel slot (a turn in flight owns
@@ -181,7 +181,8 @@ async fn ws_actions(
 
 /// Read WS frames → the shared action channel. `cancel` fires the in-flight
 /// turn's token immediately (the turn thread is blocked inside `run_turn`
-/// and cannot see the action itself — same reader-thread trick as go_bridge).
+/// and cannot see the action itself — same reader-thread trick as the old
+/// Go bridge).
 async fn ws_pump(mut socket: WebSocket, state: BridgeState) {
     while let Some(Ok(msg)) = socket.next().await {
         let Message::Text(text) = msg else { continue };

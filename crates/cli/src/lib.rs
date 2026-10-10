@@ -317,7 +317,6 @@ pub fn timestamp_now() -> String {
 // run_turn + tool runtime + sessions verbatim (docs/browser-harness.md).
 
 pub mod config;
-pub mod go_bridge;
 pub mod mods;
 pub mod permissions;
 pub mod presets;

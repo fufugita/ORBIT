@@ -34,7 +34,3 @@ commands accept `FrontendAction` and publish `FrontendEvent`. The actual
 harness/worker bridge and full workspace, approvals, inspector, and replay
 surfaces are subsequent implementation stages; until then, the UI is a shell,
 not a connected agent.
-
-## Design reference
-
-`../../docs/desktop/DESIGN.md` is normative; its rendered frames are canonical.

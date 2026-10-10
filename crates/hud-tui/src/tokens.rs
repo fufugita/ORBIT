@@ -1,7 +1,7 @@
-//! The `tui.toml` schema (docs/tui/DESIGN.md §13.4): the colour overrides,
-//! the earlier layout table and the capability switches (`[color]`: mode,
-//! glyphs, reduced motion, brand tier). The screen reads `capabilities`;
-//! a file that does not parse falls back to the defaults as a whole.
+//! The `tui.toml` schema: the colour overrides, the earlier layout table
+//! and the capability switches (`[color]`: mode, glyphs, reduced motion,
+//! brand tier). The screen reads `capabilities`; a file that does not
+//! parse falls back to the defaults as a whole.
 
 use serde::{Deserialize, Serialize};
 

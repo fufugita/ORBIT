@@ -787,7 +787,7 @@ pub fn is_known_tool(name: &str) -> bool {
 }
 
 /// Structured risk classification for a tool (backend-authoritative — the
-/// UI never classifies actions itself; docs/tui/DESIGN.md §6.15 facts rule).
+/// UI never classifies actions itself; the facts rule).
 /// All current built-ins are pure-data calculators: low risk. Shell/fs/net
 /// tools, when they exist, will classify higher by construction.
 /// The full classification vocabulary exists so future tools (shell, fs,

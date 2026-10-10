@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use orbit_cli::{config, go_bridge, sessions, tool_runtime, tools, tui_worker};
+use orbit_cli::{config, sessions, tool_runtime, tools, tui_worker};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -52,7 +52,6 @@ fn main() {
             if a == "--continue"
                 || a == "--bare"
                 || a == "--fork-session"
-                || a == "--go-tui"
                 || a == "--no-tui"
                 || a == "--tui"
             {
@@ -1892,14 +1891,12 @@ fn cmd_chat(args: &[String]) -> i32 {
 
     // TUI front-end (DR-20): if TTY + --tui (default), forward to the ratatui
     // TUI. --no-tui, non-TTY stdin/stdout, or the `tui` feature off → fall
-    // through to the existing REPL unchanged. `--go-tui` opts into the Go
-    // Bubble Tea front-end (spawns orbit-go-tui as a child).
+    // through to the existing REPL unchanged.
     #[cfg(feature = "tui")]
     {
         let want_tui = !args.iter().any(|a| a == "--no-tui")
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
             && std::io::IsTerminal::is_terminal(&std::io::stdout());
-        let want_go_tui = args.iter().any(|a| a == "--go-tui");
         if want_tui {
             let session_id = resumed_file
                 .as_ref()
@@ -1933,9 +1930,6 @@ fn cmd_chat(args: &[String]) -> i32 {
                     .map(|s| s.cost_microcents)
                     .unwrap_or(0),
             };
-            if want_go_tui {
-                return go_bridge::run_go_tui(tui_config);
-            }
             // Welcome readiness reads the REAL active model/provider —
             // set them for the in-process TUI before it computes the row.
             std::env::set_var("ORBIT_ACTIVE_MODEL", &tui_config.model);
