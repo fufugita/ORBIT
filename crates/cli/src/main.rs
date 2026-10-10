@@ -51,7 +51,6 @@ fn main() {
             }
             if a == "--continue"
                 || a == "--bare"
-                || a == "--old-tui"
                 || a == "--go-tui"
                 || a == "--no-tui"
                 || a == "--tui"
@@ -1608,6 +1607,12 @@ fn enter_worktree(name: &str) -> Result<PathBuf, String> {
     Ok(wt_path)
 }
 fn cmd_chat(args: &[String]) -> i32 {
+    // The v1 three-pane HUD was removed; say so rather than pretending the
+    // flag is unknown (or, worse, quietly starting the default screen).
+    if args.iter().any(|a| a == "--old-tui") {
+        eprintln!("orbit: the v1 HUD was removed; use the default screen or --no-tui");
+        return 2;
+    }
     // --worktree <name> (phase 4): create .orbit/worktrees/<name> on a
     // new branch and enter it, so parallel sessions never touch each
     // other's files. Idempotent: an existing worktree is entered.
@@ -1714,11 +1719,6 @@ fn cmd_chat(args: &[String]) -> i32 {
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
             && std::io::IsTerminal::is_terminal(&std::io::stdout());
         let want_go_tui = args.iter().any(|a| a == "--go-tui");
-        // The motion-first redesign (the ORBIT TUI prototype) is the
-        // default screen; --old-tui keeps the v1 HUD.
-        // The prototype is the target front-end (docs/tui/PROMPT.md).
-        // --old-tui keeps the v1 HUD available while parity work runs.
-        let want_old_tui = args.iter().any(|a| a == "--old-tui");
         if want_tui {
             let session_id = resumed_file
                 .as_ref()
@@ -1759,9 +1759,6 @@ fn cmd_chat(args: &[String]) -> i32 {
             // set them for the in-process TUI before it computes the row.
             std::env::set_var("ORBIT_ACTIVE_MODEL", &tui_config.model);
             std::env::set_var("ORBIT_ACTIVE_PROVIDER", &tui_config.provider_id);
-            if want_old_tui {
-                return orbit_hud_tui::run(args, tui_worker::make_spawner(tui_config));
-            }
             return orbit_hud_tui::proto::runtime::run_proto(
                 args,
                 tui_worker::make_spawner(tui_config),

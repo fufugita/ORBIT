@@ -2674,7 +2674,6 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "toml 0.8.23",
- "unicode-segmentation",
  "unicode-width",
 ]
 

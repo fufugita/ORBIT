@@ -313,7 +313,7 @@ pub fn emit_text(stripper: &mut CotStripper, sender: &BusSender, bytes: &[u8]) {
         Err(_) => {
             // D7: name the gate; never render the rejected bytes.
             sender.send(Msg::Redacted {
-                kind: crate::state::RedactionKind::InvalidUtf8,
+                kind: crate::model::RedactionKind::InvalidUtf8,
             });
             return;
         }
@@ -324,7 +324,7 @@ pub fn emit_text(stripper: &mut CotStripper, sender: &BusSender, bytes: &[u8]) {
     if !match_before {
         // D7: rejected by the display-safe gate — emit the chip, not the text.
         sender.send(Msg::Redacted {
-            kind: crate::state::RedactionKind::Secret,
+            kind: crate::model::RedactionKind::Secret,
         });
         return;
     }
@@ -481,7 +481,7 @@ pub fn emit_tool_finished(
     sender: &BusSender,
     call_id: &str,
     name: &str,
-    outcome: crate::state::ToolOutcome,
+    outcome: crate::model::ToolOutcome,
     fact: &str,
 ) {
     sender.send(Msg::ToolCallFinished {
@@ -553,7 +553,7 @@ pub fn emit_ledger_appended(sender: &BusSender, record_count: u64) {
 }
 
 /// Emit a workspace update (the right rail's live state).
-pub fn emit_workspace(sender: &BusSender, w: crate::state::Workspace) {
+pub fn emit_workspace(sender: &BusSender, w: crate::model::Workspace) {
     sender.send(Msg::WorkspaceUpdate(w));
 }
 
@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
             Msg::Redacted { kind } => {
-                assert_eq!(*kind, crate::state::RedactionKind::Secret)
+                assert_eq!(*kind, crate::model::RedactionKind::Secret)
             }
             other => panic!("expected Redacted, got {other:?}"),
         }
@@ -877,7 +877,7 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
             Msg::Redacted { kind } => {
-                assert_eq!(*kind, crate::state::RedactionKind::InvalidUtf8)
+                assert_eq!(*kind, crate::model::RedactionKind::InvalidUtf8)
             }
             other => panic!("expected Redacted, got {other:?}"),
         }

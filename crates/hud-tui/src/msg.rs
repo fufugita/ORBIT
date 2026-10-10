@@ -6,8 +6,7 @@
 //! `App::reduce`. Control messages come from crossterm input; data-bearing
 //! messages come from the worker thread (stream events, usage, tool calls).
 
-use crate::input::KeyAction;
-use crate::state::ApprovalDecision;
+use crate::model::ApprovalDecision;
 
 /// The rule an approval card offers to remember (`s` for the session, `a`
 /// for good), as the backend derived it from the call: shown as written,
@@ -30,8 +29,6 @@ pub enum Msg {
     Resize(u16, u16),
     /// 16 ms UI tick — advances animation, checks coalescer.
     Tick,
-    /// A parsed key action from crossterm.
-    KeyAction(KeyAction),
 
     // ── Data (from the worker thread / backend bridge) ──────────────────────
     /// A chunk of streamed text from the model. Already passed through
@@ -111,7 +108,7 @@ pub enum Msg {
     ToolCallFinished {
         call_id: String,
         name: String,
-        outcome: crate::state::ToolOutcome,
+        outcome: crate::model::ToolOutcome,
         /// A short true fact about the result ("212 lines", "exit 1"),
         /// or empty when the result carries none.
         fact: String,
@@ -137,7 +134,7 @@ pub enum Msg {
         working_dir: String,
     },
     /// Connection state changed (set by the harness on provider errors).
-    ConnectionChanged(crate::state::ConnectionState),
+    ConnectionChanged(crate::model::ConnectionState),
     /// The current turn's running cost (microcents) — after each provider
     /// round (§13.3 D5). The displayed total is committed + this; the
     /// commit happens on ResponseFinished, which carries the final turn
@@ -148,7 +145,7 @@ pub enum Msg {
     CostUpdated(u64),
     /// The bridge rejected a text chunk (D7) — never renders the text.
     /// `kind` names the gate that rejected it for the chip label.
-    Redacted { kind: crate::state::RedactionKind },
+    Redacted { kind: crate::model::RedactionKind },
     /// Initialize status-bar identity before the first render.
     Identity {
         model: String,
@@ -205,23 +202,23 @@ pub enum Msg {
     /// Execute the selected palette command.
     PaletteExecute,
     /// Input mode changed (insert ↔ normal).
-    InputModeChanged(crate::state::InputMode),
+    InputModeChanged(crate::model::InputMode),
     /// Scroll the focused pane by delta lines (positive = down).
     PaneScroll {
-        pane: crate::state::Focus,
+        pane: crate::model::Focus,
         delta: i32,
     },
     /// Toggle zoom on a pane (herdr-style fullscreen).
-    ZoomToggle(crate::state::Focus),
+    ZoomToggle(crate::model::Focus),
     /// Anchor a per-pane selection at (row, col).
     SelectionAnchor {
-        pane: crate::state::Focus,
+        pane: crate::model::Focus,
         row: u16,
         col: u16,
     },
     /// Extend the active selection (clamped to its pane).
     SelectionExtend {
-        pane: crate::state::Focus,
+        pane: crate::model::Focus,
         row: u16,
         col: u16,
     },
@@ -231,13 +228,13 @@ pub enum Msg {
     SelectionClear,
     /// The workspace pane's live state (plan/findings/verification) —
     /// emitted by the worker as the turn progresses.
-    WorkspaceUpdate(crate::state::Workspace),
+    WorkspaceUpdate(crate::model::Workspace),
     /// §8.3: skip the startup reveal to the final frame.
     SplashSkip,
     /// §6.12: show a toast (3 s or until the next keypress).
     ToastShow {
         text: String,
-        kind: crate::state::ToastKind,
+        kind: crate::model::ToastKind,
     },
     /// §6.12: dismiss the toast (any keypress).
     ToastDismiss,
@@ -302,7 +299,7 @@ pub enum Msg {
     /// The worker restored a session on boot or via `/resume <id>` — replaces
     /// the transcript and counters in one reduce.
     TranscriptLoaded {
-        lines: Vec<crate::state::TranscriptLine>,
+        lines: Vec<crate::model::TranscriptLine>,
         input_tokens: u64,
         output_tokens: u64,
         cost_microcents: u64,

@@ -9,8 +9,8 @@
 
 use orbit_adapter::types::{ChatMessage, ChatRole};
 use orbit_hud_tui::bus::BusSender;
+use orbit_hud_tui::model::TranscriptLine;
 use orbit_hud_tui::msg::Msg;
-use orbit_hud_tui::state::TranscriptLine;
 use orbit_hud_tui::worker::{CommandSink, WorkerCommand, WorkerCtx};
 use orbit_hud_tui::{ApprovalRegistry, ApprovalResponse};
 use std::path::PathBuf;
@@ -1023,7 +1023,7 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                                 // The outcome is unknown from the saved
                                 // transcript; settled-neutral is honest.
                                 summary: String::new(),
-                                outcome: Some(orbit_hud_tui::state::ToolOutcome::Ok),
+                                outcome: Some(orbit_hud_tui::model::ToolOutcome::Ok),
                                 meta: String::new(),
                                 // Restored calls have no live duration.
                                 started_at: None,
@@ -1076,8 +1076,8 @@ impl TuiApprovalChannel {
 /// everything else with `ok:true` is a success, and any other `ok:false`
 /// means the tool genuinely ran and failed. A refusal must never render as
 /// a red `✕ failed` card (§11.5 rule 4, `denied_is_not_failed`).
-fn classify_tool_result(result: &str) -> orbit_hud_tui::state::ToolOutcome {
-    use orbit_hud_tui::state::ToolOutcome;
+fn classify_tool_result(result: &str) -> orbit_hud_tui::model::ToolOutcome {
+    use orbit_hud_tui::model::ToolOutcome;
     if orbit_tools::result_is_denial(result) {
         // C4: the typed flag — every policy refusal carries it, so the
         // substring lists are gone (they missed new denial sites).
@@ -1425,7 +1425,7 @@ pub fn run_tui_turn(
 
     // The workspace rail tracks the turn's phases (§6.10):
     // 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
-    let mut ws = orbit_hud_tui::state::Workspace {
+    let mut ws = orbit_hud_tui::model::Workspace {
         phase_index: 0,
         ..Default::default()
     };
@@ -1566,9 +1566,9 @@ pub fn run_tui_turn(
                 // is the fallback for calls no executor of ours ran
                 // (a subagent's): the engine's verdict settles them.
                 let outcome = if ok {
-                    orbit_hud_tui::state::ToolOutcome::Ok
+                    orbit_hud_tui::model::ToolOutcome::Ok
                 } else {
-                    orbit_hud_tui::state::ToolOutcome::Failed
+                    orbit_hud_tui::model::ToolOutcome::Failed
                 };
                 orbit_hud_tui::emit_tool_finished(sender, &call_id, "", outcome, &result_fact);
                 // The result record is on the chain by now.
@@ -1729,7 +1729,7 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
                 &sender,
                 &call.id,
                 &call.name,
-                orbit_hud_tui::state::ToolOutcome::Cancelled,
+                orbit_hud_tui::model::ToolOutcome::Cancelled,
                 "",
             );
         };
@@ -1750,7 +1750,7 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
                             &self.sender,
                             &call.id,
                             &call.name,
-                            orbit_hud_tui::state::ToolOutcome::Denied,
+                            orbit_hud_tui::model::ToolOutcome::Denied,
                             "",
                         );
                         orbit_engine::ToolRoundResult {

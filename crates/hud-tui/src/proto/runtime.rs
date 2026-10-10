@@ -180,7 +180,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     let approvals = ApprovalRegistry::new();
     let mut scenario = Scenario::new();
     scenario.brand_tier = brand_tier;
-    scenario.welcome_chips = crate::state::compute_readiness(&home)
+    scenario.welcome_chips = crate::model::compute_readiness(&home)
         .into_iter()
         .map(|r| (r.ok, r.label))
         .collect();
@@ -1437,15 +1437,15 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                         }
                     };
                     match outcome {
-                        crate::state::ToolOutcome::Ok => {
+                        crate::model::ToolOutcome::Ok => {
                             l.tool_state = super::scenario::ToolState::Done;
                             l.meta = lead("done");
                         }
-                        crate::state::ToolOutcome::Denied => {
+                        crate::model::ToolOutcome::Denied => {
                             l.tool_state = super::scenario::ToolState::Denied;
                             l.meta = String::new();
                         }
-                        crate::state::ToolOutcome::Failed => {
+                        crate::model::ToolOutcome::Failed => {
                             l.tool_state = super::scenario::ToolState::Failed;
                             // The card already says "failed": the meta
                             // carries the fact and the time, not the word.
@@ -1455,11 +1455,11 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                                 format!("{fact} · {ds}")
                             };
                         }
-                        crate::state::ToolOutcome::Blocked => {
+                        crate::model::ToolOutcome::Blocked => {
                             l.tool_state = super::scenario::ToolState::Blocked;
                             l.meta = "blocked · unknown tool".into();
                         }
-                        crate::state::ToolOutcome::Cancelled => {
+                        crate::model::ToolOutcome::Cancelled => {
                             l.tool_state = super::scenario::ToolState::Cancelled;
                             l.meta = ds.clone();
                         }
@@ -1639,8 +1639,8 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                     .map(|t| super::panels::TaskRow {
                         title: t.title.clone(),
                         status: match t.state {
-                            crate::state::TaskState::Done => "done",
-                            crate::state::TaskState::Active => "active",
+                            crate::model::TaskState::Done => "done",
+                            crate::model::TaskState::Active => "active",
                             _ => "pending",
                         }
                         .to_string(),
@@ -2322,8 +2322,8 @@ fn overlay_code(o: Option<Overlay>) -> u8 {
 #[cfg(test)]
 mod tool_card_tests {
     use super::*;
+    use crate::model::ToolOutcome;
     use crate::msg::Msg;
-    use crate::state::ToolOutcome;
 
     fn started(id: &str, name: &str, summary: &str) -> Msg {
         Msg::ToolCallStarted {
@@ -2612,7 +2612,7 @@ mod plan_tests {
         let mut s = Scenario::new();
         apply_msg(tasks(&[("Fix add", "pending")]), &mut s, 10);
         apply_msg(
-            Msg::WorkspaceUpdate(crate::state::Workspace {
+            Msg::WorkspaceUpdate(crate::model::Workspace {
                 phase_index: 2,
                 ..Default::default()
             }),
@@ -2665,7 +2665,7 @@ mod approval_card_tests {
             Msg::ToolCallFinished {
                 call_id: "c1".into(),
                 name: "Edit".into(),
-                outcome: crate::state::ToolOutcome::Denied,
+                outcome: crate::model::ToolOutcome::Denied,
                 fact: String::new(),
             },
             &mut s,
