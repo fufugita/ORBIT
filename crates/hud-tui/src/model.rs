@@ -2,37 +2,6 @@
 //! ended, the workspace snapshot, a transcript line, the readiness rows.
 //! They carry no UI behaviour of their own.
 
-/// Which pane has keyboard focus.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Focus {
-    Left,
-    /// Default — the operator can type immediately on boot, no Tab needed.
-    #[default]
-    Center,
-    Right,
-    Status,
-}
-
-impl Focus {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Left => Self::Center,
-            Self::Center => Self::Right,
-            Self::Right => Self::Status,
-            Self::Status => Self::Left,
-        }
-    }
-
-    pub fn prev(self) -> Self {
-        match self {
-            Self::Left => Self::Status,
-            Self::Center => Self::Left,
-            Self::Right => Self::Center,
-            Self::Status => Self::Right,
-        }
-    }
-}
-
 /// A workspace task (§6.10 task rows).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
@@ -74,13 +43,6 @@ pub struct Finding {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToastKind {
-    Success,
-    Neutral,
-    Error,
-}
-
 /// One verification row: check name + result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verification {
@@ -97,25 +59,6 @@ pub enum VerificationResult {
     Passed,
     Failed,
     Pending,
-}
-
-/// Modal input (the multiplexer pattern): INSERT types into the composer
-/// (the boot default — type to talk); NORMAL runs single-key commands
-/// (q, g/z leaders, ?). Esc from an empty composer toggles to NORMAL;
-/// `i` or Enter returns to INSERT. The status line shows the mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InputMode {
-    /// Type into the composer (the boot default).
-    #[default]
-    Insert,
-    /// Single-key commands (q, g/z leaders, ?).
-    Normal,
-    /// Prefix mode (herdr/tmux-style): the next key is a command. Entered
-    /// with Ctrl+B; Esc cancels. The status line shows PREFIX.
-    Prefix,
-    /// Copy mode: j/k move a cursor through the transcript, v selects,
-    /// y yanks. Per-pane (herdr-style).
-    Copy,
 }
 
 /// One computed welcome-screen readiness check. Honesty rule: every
@@ -253,25 +196,4 @@ impl RedactionKind {
             RedactionKind::StreamInterrupted => "stream interrupted",
         }
     }
-}
-
-/// Connection state for the status bar.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ConnectionState {
-    #[default]
-    Online,
-    Reconnecting,
-    Offline,
-}
-
-/// The operator's answer to an approval card (§12): drives the Activity
-/// `grant` row text (§9.16) and the tool-line marker (◆ once / ◈ session).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalDecision {
-    /// `y` — allow this one call.
-    Once,
-    /// `R` — allow this tool for the session.
-    Session,
-    /// `n` / Esc — deny.
-    Denied,
 }
