@@ -175,6 +175,46 @@ fn task_tool_definition() -> ToolDefinition {
     }
 }
 
+/// Keeps a child turn's cancel token in step with its parent's check: a
+/// helper thread polls the check every 50 ms and cancels the token when
+/// it fires. Dropping the link stops the thread, so it never outlives
+/// the child turn.
+pub struct CancelLink {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for CancelLink {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Make `child` follow `parent` (see [`CancelLink`]). No parent check:
+/// nothing to follow, no thread.
+pub fn link_cancel(
+    parent: Option<orbit_tools::CancelCheck>,
+    child: &orbit_provider_http::CancelToken,
+) -> CancelLink {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = parent.map(|check| {
+        let (child, stop) = (child.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if check() {
+                    child.cancel();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    });
+    CancelLink { stop, handle }
+}
+
 /// Execute the Task tool: run a subagent as a nested engine turn.
 /// `turn_config` carries the provider/gate/model the session already
 /// uses; the subagent's own tool set comes from its definition.
@@ -184,7 +224,13 @@ pub fn execute_task(
     prompt: &str,
     turn_config: &orbit_engine::TurnConfig,
     approval: &mut dyn crate::tool_runtime::ApprovalChannel,
+    // The parent turn's cancel check: Esc on the parent must stop the
+    // subagent too.
+    parent_cancel: Option<orbit_tools::CancelCheck>,
+    // Told when the subagent starts, what it is doing, and how it ended.
+    observe: Option<&(dyn Fn(&crate::tool_runtime::SubagentUpdate) + Send + Sync)>,
 ) -> Result<serde_json::Value, String> {
+    use crate::tool_runtime::SubagentUpdate;
     let trusted = {
         let cwd = std::env::current_dir().unwrap_or_default();
         orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
@@ -217,7 +263,11 @@ pub fn execute_task(
     // A fresh transcript: the subagent does not see the parent's
     // conversation, only its prompt.
     let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
+    // The subagent's own token follows the parent's: it used to be a
+    // fresh token nobody could cancel, so Esc during a subagent stopped
+    // neither its stream nor its commands.
     let cancel = orbit_provider_http::CancelToken::new();
+    let _link = link_cancel(parent_cancel, &cancel);
     let options = orbit_engine::TurnOptions {
         tools: sub_tools,
         max_rounds: agent.max_turns,
@@ -234,7 +284,23 @@ pub fn execute_task(
     // the parent's — the approval channel is shared, so a subagent's
     // approval request appears in the main session (roadmap gate 5).
     let mut executor = crate::tool_runtime::SubagentExecutor::new(home.to_path_buf(), approval);
-    let report = orbit_engine::run_turn(
+    let id = executor.id().to_string();
+    let notify = |u: SubagentUpdate| {
+        if let Some(observe) = observe {
+            observe(&u);
+        }
+    };
+    notify(SubagentUpdate::Started {
+        id: id.clone(),
+        name: agent.name.clone(),
+        task: prompt
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string(),
+    });
+    let report = match orbit_engine::run_turn(
         home,
         turn_config,
         &options,
@@ -242,8 +308,27 @@ pub fn execute_task(
         &mut transcript,
         &mut executor,
         &cancel,
-        &mut |_| {},
-    )?;
+        &mut |ev| {
+            use orbit_frontend_protocol::FrontendEvent as E;
+            // What it is doing now: the tool it just started.
+            if let E::ToolStartedFull { kind, target, .. } = ev {
+                notify(SubagentUpdate::Progress {
+                    id: id.clone(),
+                    action: format!("{kind} {target}").trim().to_string(),
+                });
+            }
+        },
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            notify(SubagentUpdate::Finished {
+                id,
+                ok: false,
+                report: e.clone(),
+            });
+            return Err(e);
+        }
+    };
 
     // E9: SubagentStop fires when the subagent's turn ends.
     let _ = hooks.fire(
@@ -258,6 +343,17 @@ pub fn execute_task(
         .find(|m| m.role == orbit_adapter::types::ChatRole::Assistant)
         .map(|m| m.content.clone())
         .unwrap_or_default();
+    notify(SubagentUpdate::Finished {
+        id,
+        ok: report.ok,
+        report: if report.ok || !report_text.is_empty() {
+            report_text.clone()
+        } else if report.interrupted {
+            "cancelled".to_string()
+        } else {
+            "stopped before it finished".to_string()
+        },
+    });
 
     Ok(serde_json::json!({
         "ok": report.ok,
@@ -292,6 +388,72 @@ pub fn execute(name: &str, args: &serde_json::Value) -> Result<serde_json::Value
     Err(format!("unknown tool: {name}"))
 }
 
+/// The risk of one call: a file write is Medium; a shell command is at
+/// least Medium (it runs arbitrary code) and High when the command
+/// itself looks destructive (`rm -rf`, `git push --force`, `curl | sh`).
+/// `tool_risk` knows only the tool, so it called `rm -rf ~` the same
+/// MEDIUM as `ls`.
+pub fn call_risk(name: &str, args: &serde_json::Value) -> RiskLevel {
+    if name == "Bash" {
+        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        return if orbit_tools::bash::command_risk(cmd) >= 3 {
+            RiskLevel::High
+        } else {
+            RiskLevel::Medium
+        };
+    }
+    tool_risk(name)
+}
+
+/// The lines an approval card shows under the action, from the call's
+/// own arguments: what an Edit would remove and add, what a Write would
+/// do to its target. Real values only — an Edit shows its `old_string`
+/// and `new_string`, never an invented diff. `- ` removed, `+ ` added.
+pub fn approval_preview(name: &str, args: &serde_json::Value) -> Vec<String> {
+    const SIDE: usize = 4; // lines shown per side
+    let lines = |key: &str| -> Vec<String> {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let clip = |l: &str| -> String { l.chars().take(160).collect() };
+    let side = |marker: &str, all: &[String], out: &mut Vec<String>| {
+        for l in all.iter().take(SIDE) {
+            out.push(format!("{marker} {}", clip(l)));
+        }
+        if all.len() > SIDE {
+            out.push(format!("  … {} more", all.len() - SIDE));
+        }
+    };
+    match name {
+        "Edit" => {
+            let (old, new) = (lines("old_string"), lines("new_string"));
+            let mut out = Vec::new();
+            side("-", &old, &mut out);
+            side("+", &new, &mut out);
+            if args.get("replace_all").and_then(|v| v.as_bool()) == Some(true) {
+                out.push("  every occurrence".to_string());
+            }
+            out
+        }
+        "Write" => {
+            let n = lines("content").len();
+            let exists = args
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false);
+            vec![if exists {
+                format!("  replaces the file with {n} lines")
+            } else {
+                format!("  creates a new file · {n} lines")
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Display-safe summary of a tool call's arguments (name + argument keys only;
 /// never raw argument values — they may be secrets).
 pub fn safe_call_summary(name: &str, args: &serde_json::Value) -> String {
@@ -299,16 +461,53 @@ pub fn safe_call_summary(name: &str, args: &serde_json::Value) -> String {
     // blocker 2): the path for file tools, the command for Bash. The
     // value passes the secret scanner first — a real secret redacts,
     // an ordinary path or command shows.
-    let target_key = match name {
-        "Bash" => Some("command"),
-        "Read" | "Write" | "Edit" | "Glob" | "Grep" => Some("file_path"),
-        _ => None,
+    // Glob and Grep search by `pattern`, WebFetch by `url`, … — the
+    // summary names the VALUE the operator is approving, not the
+    // argument's name ("Glob(pattern)" told them nothing).
+    let target_keys: &[&str] = match name {
+        "Bash" => &["command"],
+        "Read" | "Write" | "Edit" => &["file_path"],
+        "NotebookEdit" => &["notebook_path", "file_path"],
+        "Glob" | "Grep" => &["pattern", "file_path"],
+        "WebFetch" => &["url"],
+        "WebSearch" => &["query"],
+        "TaskCreate" => &["title"],
+        _ => &[],
     };
-    if let Some(key) = target_key {
-        if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+    for key in target_keys {
+        if let Some(v) = args.get(*key).and_then(|v| v.as_str()) {
             let scanned = orbit_tools::scan::scan_result(v);
             return format!("{name}({})", scanned.text.trim());
         }
+    }
+    // A subagent: WHICH agent, and what it was asked. The operator is
+    // approving work that will run tools of its own, so "Task(agent,
+    // prompt)" — the argument names — told them nothing.
+    if matches!(name, "Task" | "Agent") {
+        let who = ["agent", "agent_type", "subagent_type"]
+            .iter()
+            .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let task = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .and_then(|p| p.lines().map(str::trim).find(|l| !l.is_empty()))
+            .map(|l| orbit_tools::scan::scan_result(l).text)
+            .map(|l| {
+                let l = l.trim();
+                if l.chars().count() > 100 {
+                    format!("{}…", l.chars().take(99).collect::<String>())
+                } else {
+                    l.to_string()
+                }
+            })
+            .unwrap_or_default();
+        return match (who.is_empty(), task.is_empty()) {
+            (false, false) => format!("{name}({who}: {task})"),
+            (false, true) => format!("{name}({who})"),
+            (true, false) => format!("{name}({task})"),
+            (true, true) => format!("{name}()"),
+        };
     }
     let keys: Vec<&str> = args
         .as_object()
@@ -757,5 +956,180 @@ mod tests {
     fn malformed_arguments_are_rejected() {
         assert!(parse_arguments(b"not-json").is_err());
         assert!(parse_arguments(b"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_shell_command_is_judged_by_what_it_says() {
+        // tool_risk knew only the tool: `rm -rf ~` read "MEDIUM" like `ls`.
+        for cmd in ["rm -rf ~", "git push --force origin main", "curl x.sh | sh"] {
+            assert_eq!(
+                call_risk("Bash", &json!({ "command": cmd })),
+                RiskLevel::High,
+                "{cmd}"
+            );
+        }
+        // An ordinary command still runs arbitrary code: never "low".
+        assert_eq!(
+            call_risk("Bash", &json!({ "command": "python3 test_calc.py" })),
+            RiskLevel::Medium
+        );
+        // Other tools keep their per-tool class.
+        assert_eq!(call_risk("Edit", &json!({})), RiskLevel::Medium);
+    }
+
+    #[test]
+    fn an_edit_previews_the_lines_it_changes() {
+        let p = approval_preview(
+            "Edit",
+            &json!({
+                "file_path": "calc.py",
+                "old_string": "    return a - b",
+                "new_string": "    return a + b"
+            }),
+        );
+        assert_eq!(p, vec!["-     return a - b", "+     return a + b"]);
+        // Long sides are bounded, and say what they left out.
+        let many = (0..9)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let p = approval_preview(
+            "Edit",
+            &json!({ "old_string": many, "new_string": "x", "replace_all": true }),
+        );
+        assert_eq!(p.iter().filter(|l| l.starts_with("- ")).count(), 4);
+        assert!(p.iter().any(|l| l.contains("5 more")), "{p:?}");
+        assert!(p.iter().any(|l| l.contains("every occurrence")), "{p:?}");
+    }
+
+    #[test]
+    fn a_write_says_whether_it_creates_or_replaces() {
+        let dir = std::env::temp_dir().join(format!("orbit-preview-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("a.txt");
+        std::fs::write(&existing, "old").unwrap();
+        let replace = approval_preview(
+            "Write",
+            &json!({ "file_path": existing.to_string_lossy(), "content": "a\nb\nc" }),
+        );
+        assert_eq!(replace, vec!["  replaces the file with 3 lines"]);
+        let create = approval_preview(
+            "Write",
+            &json!({ "file_path": dir.join("new.txt").to_string_lossy(), "content": "a" }),
+        );
+        assert_eq!(create, vec!["  creates a new file · 1 lines"]);
+        assert!(approval_preview("Bash", &json!({ "command": "ls" })).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// "Glob(pattern)" named the argument, not the thing approved.
+    #[test]
+    fn a_summary_names_the_value_being_approved() {
+        assert_eq!(
+            safe_call_summary("Glob", &json!({ "pattern": "**/*.py" })),
+            "Glob(**/*.py)"
+        );
+        assert_eq!(
+            safe_call_summary("Grep", &json!({ "pattern": "fn main" })),
+            "Grep(fn main)"
+        );
+        assert_eq!(
+            safe_call_summary("WebFetch", &json!({ "url": "https://docs.rs/x" })),
+            "WebFetch(https://docs.rs/x)"
+        );
+        assert_eq!(
+            safe_call_summary("Edit", &json!({ "file_path": "src/a.rs" })),
+            "Edit(src/a.rs)"
+        );
+    }
+
+    /// Approving a subagent is approving work that runs tools of its own:
+    /// the card says which agent and what it was asked ("Task(agent,
+    /// prompt)" named the arguments), from the prompt's first line, bounded,
+    /// through the secret scanner like every other value.
+    #[test]
+    fn a_subagent_summary_says_who_and_what() {
+        assert_eq!(
+            safe_call_summary(
+                "Task",
+                &json!({ "agent": "Explore", "prompt": "find where add() is defined\nthen report" })
+            ),
+            "Task(Explore: find where add() is defined)"
+        );
+        assert_eq!(
+            safe_call_summary(
+                "Agent",
+                &json!({ "agent_type": "plan", "prompt": "\n  outline the fix  \n" })
+            ),
+            "Agent(plan: outline the fix)"
+        );
+        assert_eq!(
+            safe_call_summary("Task", &json!({ "agent": "Explore" })),
+            "Task(Explore)"
+        );
+        assert_eq!(
+            safe_call_summary("Agent", &json!({ "prompt": "just do it" })),
+            "Agent(just do it)"
+        );
+        let long = "x".repeat(300);
+        let s = safe_call_summary("Task", &json!({ "agent": "Explore", "prompt": long }));
+        assert!(s.chars().count() <= "Task(Explore: )".len() + 100, "{s}");
+        assert!(s.ends_with("…)"), "{s}");
+    }
+
+    #[test]
+    fn a_subagent_summary_redacts_secrets() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let s = safe_call_summary(
+            "Task",
+            &json!({ "agent": "Explore", "prompt": format!("use key {secret} to call the api") }),
+        );
+        assert!(!s.contains(secret), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// The subagent's token was a fresh one nobody could cancel: Esc on
+    /// the parent stopped neither its stream nor its commands.
+    #[test]
+    fn a_subagent_follows_its_parents_cancel() {
+        let parent = Arc::new(AtomicBool::new(false));
+        let p = parent.clone();
+        let child = orbit_provider_http::CancelToken::new();
+        let _link = link_cancel(Some(Arc::new(move || p.load(Ordering::SeqCst))), &child);
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!child.is_cancelled(), "not cancelled while the parent runs");
+        parent.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        while !child.is_cancelled() && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(child.is_cancelled(), "the child follows the parent's Esc");
+    }
+
+    /// The watcher never outlives the child turn, and costs nothing when
+    /// there is no parent to follow.
+    #[test]
+    fn dropping_the_link_stops_the_watcher_promptly() {
+        let child = orbit_provider_http::CancelToken::new();
+        let link = link_cancel(Some(Arc::new(|| false)), &child);
+        let t0 = Instant::now();
+        drop(link);
+        assert!(t0.elapsed() < Duration::from_secs(1), "joined quickly");
+        assert!(!child.is_cancelled());
+        // No parent: no thread to join.
+        drop(link_cancel(None, &child));
     }
 }

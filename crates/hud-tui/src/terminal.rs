@@ -1,6 +1,6 @@
 //! RAII terminal guard — setup/teardown with guaranteed cleanup (DR-20 §1).
 //!
-//! `TerminalGuard::enter()` enables raw mode, enters the alternate screen,
+//! `TerminalGuard::enter_with()` enables raw mode, enters the alternate screen,
 //! and installs signal handlers for SIGTERM/SIGHUP/SIGINT. The handlers only
 //! set `AtomicBool` flags (async-signal-safe); the event loop checks them
 //! each tick via `take_pending_signal()`.
@@ -40,7 +40,6 @@
 //! operator's terminal is never left in a broken state. Write failures on an
 //! already-dead PTY are swallowed (`.ok()`): there is nothing left to restore.
 
-use crate::state::App;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -90,15 +89,6 @@ impl ShutdownSignal {
             ShutdownSignal::Hangup => 128 + 1,
             ShutdownSignal::Terminate => 128 + 15,
             ShutdownSignal::Interrupt => 128 + 2,
-        }
-    }
-
-    /// Human-readable name for the shutdown trace line.
-    pub fn name(self) -> &'static str {
-        match self {
-            ShutdownSignal::Hangup => "SIGHUP (terminal closed)",
-            ShutdownSignal::Terminate => "SIGTERM",
-            ShutdownSignal::Interrupt => "SIGINT",
         }
     }
 }
@@ -234,58 +224,12 @@ pub struct TerminalGuard {
     _watchdog: TerminalWatchdog,
 }
 
-/// Ambiguous-width probe (§11.3): print ● at column 0, ask the terminal
-/// where the cursor is (ESC[6n), check whether it moved one column or two,
-/// then erase the line. 100 ms timeout; no answer → assume narrow.
-///
-/// Runs BEFORE the alternate screen (it must be visible to the terminal,
-/// not swallowed by the alt-screen switch). Returns true when ambiguous-
-/// width glyphs render wide — the caller selects the ASCII glyph set.
-pub fn probe_ambiguous_width() -> bool {
-    use std::io::Write;
-
-    // The probe needs raw mode to read the response without a newline.
-    if crossterm::terminal::enable_raw_mode().is_err() {
-        return false; // not a TTY we can probe — assume narrow
-    }
-    let wide = {
-        let mut out = std::io::stdout();
-        // Print ● (U+25CF, ambiguous width) at column 0.
-        let _ = write!(out, "\u{25cf}");
-        let _ = out.flush();
-        // crossterm's cursor::position() sends ESC[6n and reads the reply,
-        // but it blocks with NO timeout — a terminal that ignores DSR would
-        // hang the probe forever. Run it on a thread and give it the spec's
-        // 100 ms budget; no answer in time → assume narrow (§11.3).
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let pos = crossterm::cursor::position();
-            let _ = tx.send(pos);
-        });
-        let wide = rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .ok()
-            .and_then(|r| r.ok())
-            .map(|(_, col)| col > 1)
-            .unwrap_or(false);
-        // Erase the line — the probe leaves no trace.
-        let _ = write!(out, "\r\x1b[2K");
-        let _ = out.flush();
-        wide
-    };
-    let _ = crossterm::terminal::disable_raw_mode();
-    wide
-}
-
 impl TerminalGuard {
     /// Enter raw mode + alternate screen, hide cursor, install signal handlers.
-    pub fn enter() -> Result<Self, String> {
-        Self::enter_with(true)
-    }
-
-    /// `mouse_capture = false` follows §12.4 (the MD's prototype:
-    /// mouse capture stays off — the terminal's native selection owns
-    /// the mouse).
+    ///
+    /// `mouse_capture = true` (what the TUI uses) hands the mouse to the
+    /// app: clicks, the wheel, and per-panel selection. `false` leaves it
+    /// to the terminal's own selection.
     pub fn enter_with(mouse_capture: bool) -> Result<Self, String> {
         // NOTE: no locale forcing. Forcing LANG/LC_ALL to en_US.UTF-8 hides
         // non-UTF-8 terminals (H-7 hard downgrade); the glyph set is chosen
@@ -337,26 +281,6 @@ impl TerminalGuard {
             _watchdog: watchdog,
         })
     }
-
-    /// Render the app state to the terminal.
-    ///
-    /// Pure diff rendering — ratatui emits only changed cells. There is
-    /// deliberately no full-repaint path: the live→settled turn transition
-    /// is a normal diff (same cells, new gutter style), and forcing a
-    /// whole-screen re-emit there caused a visible flash on every turn.
-    /// Real Resize events still repaint fully via ratatui's own resize
-    /// handling in the event loop.
-    pub fn draw(
-        &mut self,
-        app: &App,
-        composer_text: &str,
-        design: &crate::tokens::Design,
-    ) -> Result<(), String> {
-        self.terminal
-            .draw(|frame| crate::render::render(frame, app, composer_text, design))
-            .map(|_| ())
-            .map_err(|e| format!("draw: {e}"))
-    }
 }
 
 impl Drop for TerminalGuard {
@@ -392,16 +316,6 @@ mod tests {
         assert_eq!(ShutdownSignal::Hangup.exit_code(), 129);
         assert_eq!(ShutdownSignal::Terminate.exit_code(), 143);
         assert_eq!(ShutdownSignal::Interrupt.exit_code(), 130);
-    }
-
-    #[test]
-    fn shutdown_signal_names_are_distinct_and_stable() {
-        let names = [
-            ShutdownSignal::Hangup.name(),
-            ShutdownSignal::Terminate.name(),
-            ShutdownSignal::Interrupt.name(),
-        ];
-        assert_eq!(names, ["SIGHUP (terminal closed)", "SIGTERM", "SIGINT"]);
     }
 
     /// The signal flags are process-global; tests that mutate them must not

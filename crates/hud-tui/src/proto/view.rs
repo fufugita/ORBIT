@@ -217,6 +217,7 @@ fn tool_line(l: &TranscriptLine, cl: u16, cw: u16, class: WidthClass) -> Vec<Lin
         ),
         ToolState::Denied => ("denied by you".into(), Token::Muted),
         ToolState::Blocked => ("blocked · unknown tool".into(), Token::Amber),
+        ToolState::Cancelled => ("cancelled".into(), Token::Muted),
     };
     let compact = matches!(class, WidthClass::Compact | WidthClass::Tight);
     let meta_text = if compact {

@@ -9,8 +9,8 @@
 
 use orbit_adapter::types::{ChatMessage, ChatRole};
 use orbit_hud_tui::bus::BusSender;
+use orbit_hud_tui::model::TranscriptLine;
 use orbit_hud_tui::msg::Msg;
-use orbit_hud_tui::state::TranscriptLine;
 use orbit_hud_tui::worker::{CommandSink, WorkerCommand, WorkerCtx};
 use orbit_hud_tui::{ApprovalRegistry, ApprovalResponse};
 use std::path::PathBuf;
@@ -120,6 +120,53 @@ pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
     })
 }
 
+/// The session's tool context: ONE per session (rebuilt on resume), not
+/// per turn, so what a Read recorded still lets the next prompt's Edit
+/// through (B2: the executor used to build a fresh one every turn). It
+/// is wired to the proof surface: every ledger record the session
+/// appends is announced to the Activity panel and counted by the chip.
+fn session_tool_context(config: &TuiTurnConfig, sender: &BusSender) -> orbit_tools::ToolContext {
+    let cx = orbit_tools::ToolContext::new(
+        config.home.clone(),
+        config.session_id.clone(),
+        std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+    );
+    let ledger_sender = sender.clone();
+    cx.set_ledger_sink(Some(std::sync::Arc::new(
+        move |n: &orbit_tools::LedgerNote| {
+            orbit_hud_tui::emit_activity(
+                &ledger_sender,
+                n.kind,
+                &display_summary(&n.target),
+                &n.fact,
+                Some(&n.digest),
+            );
+        },
+    )));
+    // A subagent the session starts shows in the Agent panels and on its
+    // Task card as it works.
+    let agent_sender = sender.clone();
+    cx.set_ext(crate::tool_runtime::SubagentObserver(std::sync::Arc::new(
+        move |u: &crate::tool_runtime::SubagentUpdate| {
+            use crate::tool_runtime::SubagentUpdate as U;
+            match u {
+                U::Started { id, name, task } => {
+                    orbit_hud_tui::emit_subagent_started(&agent_sender, id, name, task)
+                }
+                U::Progress { id, action } => orbit_hud_tui::emit_subagent_progress(
+                    &agent_sender,
+                    id,
+                    &display_summary(action),
+                ),
+                U::Finished { id, ok, report } => {
+                    orbit_hud_tui::emit_subagent_finished(&agent_sender, id, report, *ok)
+                }
+            }
+        },
+    )));
+    cx
+}
+
 /// The worker's event loop — waits for prompts, runs turns, reports results.
 /// Each turn gets a fresh CancelToken installed in the shared slot so the
 /// TUI's Ctrl+C can abort the in-flight stream.
@@ -130,6 +177,12 @@ fn worker_main(
 ) {
     let mut transcript: Vec<ChatMessage> = config.initial_transcript.clone();
     let mut turns: u64 = config.initial_turns;
+    let mut tool_cx = session_tool_context(&config, &ctx.sender);
+    // The ledger chip's total: the records already in the chain.
+    orbit_hud_tui::emit_ledger_appended(
+        &ctx.sender,
+        orbit_ledger::count_records(&config.home.join("ledger")),
+    );
     // D9 (§13.5 rule 5): the session file must carry CUMULATIVE totals —
     // resumed values plus everything this run adds. Tracking them per-turn
     // only (as run_tui_turn does) made every save overwrite the history.
@@ -164,7 +217,9 @@ fn worker_main(
     // memory files, mods. Sent as the System message; never
     // re-inserted per request (that broke caching and edited-history
     // replay). Rebuilt only when the enabled mods set changes.
-    let mut system_prompt = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+    let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+    tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+    let mut system_prompt = built.text;
 
     // Send identity to the TUI so the status bar shows model/provider/session.
     // D18: priced=false makes the status bar show `cost n/a` for models
@@ -180,6 +235,16 @@ fn worker_main(
         session_id: config.session_id.clone(),
         priced: boot_priced,
     });
+
+    // The sandbox is a readiness fact the welcome screen must not hide:
+    // measured once, shown as it is.
+    orbit_hud_tui::emit_readiness(
+        &ctx.sender,
+        vec![(
+            sandbox_report().confined,
+            sandbox_report().readiness.clone(),
+        )],
+    );
 
     // Boot with a resumed session, if any.
     if config.initial_transcript.is_empty() && config.initial_turns == 0 {
@@ -231,6 +296,7 @@ fn worker_main(
                     &plan_directive,
                     true,
                     &mut scope,
+                    &tool_cx,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
@@ -280,6 +346,7 @@ fn worker_main(
                     &directive,
                     false,
                     &mut scope,
+                    &tool_cx,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
@@ -436,6 +503,7 @@ fn worker_main(
                         turns = s.turns;
                         config.session_id = s.session_id.clone();
                         config.model = s.model.clone();
+                        tool_cx = session_tool_context(&config, &ctx.sender);
                         let lines = session_to_transcript_lines(&s.transcript);
                         ctx.sender.send(Msg::TranscriptLoaded {
                             lines,
@@ -658,8 +726,10 @@ fn worker_main(
                         // The frozen prompt rebuilds so the next turn
                         // carries the new mods set (append-only: the
                         // change arrives as a new prompt, never an edit).
-                        system_prompt =
+                        let built =
                             build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                        tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                        system_prompt = built.text;
                         ctx.sender.send(Msg::SystemMessage(format!(
                             "mod {name}: {}",
                             if now_on { "enabled" } else { "disabled" }
@@ -673,8 +743,9 @@ fn worker_main(
             WorkerCommand::RefreshMods => {
                 mods = crate::mods::load_all(&config.home);
                 mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
-                system_prompt =
-                    build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                system_prompt = built.text;
                 ctx.sender.send(Msg::SystemMessage(format!(
                     "mods reloaded: {} installed, {} enabled",
                     mods.len(),
@@ -869,13 +940,11 @@ fn worker_main(
                 let decision_id = format!("bang-{}", ulid::Ulid::new());
                 let mut approval_channel =
                     TuiApprovalChannel::new(ctx.sender.clone(), ctx.approvals.clone());
-                let tool_cx = orbit_tools::ToolContext::new(
-                    config.home.clone(),
-                    config.session_id.clone(),
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
-                );
-                orbit_hud_tui::emit_tool_started(&ctx.sender, "Bash", &command);
+                // The session's context: its ledger sink announces the
+                // `!` command's records like any other call's.
+                let tool_cx = tool_cx.clone();
+                orbit_hud_tui::emit_tool_started(&ctx.sender, &call.id, "Bash", &command);
+                tool_cx.set_output_sink(Some(live_output_sink(&ctx.sender, &call.id)));
                 let (result, _) = crate::tool_runtime::execute_call(
                     &config.home,
                     &config.session_id,
@@ -888,9 +957,16 @@ fn worker_main(
                     &config.scope,
                     &tool_cx,
                 )
-                .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
+                .unwrap_or_else(|e| {
+                    (
+                        serde_json::json!({ "ok": false, "error": e }).to_string(),
+                        None,
+                    )
+                });
+                tool_cx.set_output_sink(None);
                 let outcome = classify_tool_result(&result);
-                orbit_hud_tui::emit_tool_finished(&ctx.sender, "Bash", outcome);
+                let fact = result_fact("Bash", &result);
+                orbit_hud_tui::emit_tool_finished(&ctx.sender, &call.id, "Bash", outcome, &fact);
             }
             WorkerCommand::ModCommand(mod_name, cmd_name) => {
                 // A mod command runs its body as a normal prompt turn.
@@ -947,7 +1023,7 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                                 // The outcome is unknown from the saved
                                 // transcript; settled-neutral is honest.
                                 summary: String::new(),
-                                outcome: Some(orbit_hud_tui::state::ToolOutcome::Ok),
+                                outcome: Some(orbit_hud_tui::model::ToolOutcome::Ok),
                                 meta: String::new(),
                                 // Restored calls have no live duration.
                                 started_at: None,
@@ -980,11 +1056,17 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
 pub struct TuiApprovalChannel {
     sender: BusSender,
     approvals: ApprovalRegistry,
+    /// The call the last question was about, to fetch its denial note.
+    last_call: Option<String>,
 }
 
 impl TuiApprovalChannel {
     pub fn new(sender: BusSender, approvals: ApprovalRegistry) -> Self {
-        Self { sender, approvals }
+        Self {
+            sender,
+            approvals,
+            last_call: None,
+        }
     }
 }
 
@@ -994,18 +1076,237 @@ impl TuiApprovalChannel {
 /// everything else with `ok:true` is a success, and any other `ok:false`
 /// means the tool genuinely ran and failed. A refusal must never render as
 /// a red `✕ failed` card (§11.5 rule 4, `denied_is_not_failed`).
-fn classify_tool_result(result: &str) -> orbit_hud_tui::state::ToolOutcome {
-    if result.contains("\"ok\":true") {
-        orbit_hud_tui::state::ToolOutcome::Ok
-    } else if orbit_tools::result_is_denial(result) {
+fn classify_tool_result(result: &str) -> orbit_hud_tui::model::ToolOutcome {
+    use orbit_hud_tui::model::ToolOutcome;
+    if orbit_tools::result_is_denial(result) {
         // C4: the typed flag — every policy refusal carries it, so the
         // substring lists are gone (they missed new denial sites).
-        orbit_hud_tui::state::ToolOutcome::Denied
+        ToolOutcome::Denied
     } else if result.contains("unknown tool (deny-by-default)") {
-        orbit_hud_tui::state::ToolOutcome::Blocked
+        ToolOutcome::Blocked
+    } else if result_is_cancelled(result) {
+        // The operator's Esc: neither a failure nor a denial.
+        ToolOutcome::Cancelled
+    } else if !orbit_tools::result_is_error(result) {
+        // E4: the typed verdict — the payload's own top-level `ok`, not
+        // a substring (a Bash command that prints `"ok":true` and exits
+        // 1 is a failure).
+        ToolOutcome::Ok
     } else {
-        orbit_hud_tui::state::ToolOutcome::Failed
+        ToolOutcome::Failed
     }
+}
+
+/// What the shell sandbox is on this machine, measured once per process
+/// (the probe runs a real bubblewrap canary): whether commands are
+/// confined, the rows an approval card shows, and the welcome screen's
+/// readiness line.
+struct SandboxReport {
+    confined: bool,
+    /// `(label, value)` rows for the approval card — short enough to
+    /// fit a card without clipping.
+    facts: Vec<(String, String)>,
+    /// The welcome screen's READY row.
+    readiness: String,
+}
+
+fn sandbox_report() -> &'static SandboxReport {
+    static REPORT: std::sync::OnceLock<SandboxReport> = std::sync::OnceLock::new();
+    REPORT.get_or_init(|| {
+        use orbit_tools::sandbox::{SandboxStatus, ShellSandbox};
+        match ShellSandbox::probe() {
+            SandboxStatus::Confined => SandboxReport {
+                confined: true,
+                facts: vec![
+                    ("sandbox".into(), "confined · no network".into()),
+                    (
+                        "writes".into(),
+                        "this project and a session temp dir only".into(),
+                    ),
+                ],
+                readiness: "sandbox · bubblewrap".into(),
+            },
+            SandboxStatus::Unavailable(why) => SandboxReport {
+                confined: false,
+                facts: vec![(
+                    "sandbox".into(),
+                    "NONE — runs with your full permissions".into(),
+                )],
+                readiness: format!("sandbox · off ({why}) — every command asks"),
+            },
+            SandboxStatus::Unsupported => SandboxReport {
+                confined: false,
+                facts: vec![(
+                    "sandbox".into(),
+                    "NONE — no sandbox on this platform".into(),
+                )],
+                readiness: "sandbox · none on this platform — every command asks".into(),
+            },
+        }
+    })
+}
+
+/// Set the proof chip's total from the ledger itself. Several writers
+/// append (tool calls, provider requests, subagents); announcing each one
+/// keeps the chip live, and this keeps it TRUE — it cannot drift from
+/// what `orbit ledger verify` would count.
+fn resync_ledger_chip(home: &std::path::Path, sender: &BusSender) {
+    orbit_hud_tui::emit_ledger_appended(sender, orbit_ledger::count_records(&home.join("ledger")));
+}
+
+/// The host part of a gateway URL, for display (`http://127.0.0.1:4001/v1`
+/// → `127.0.0.1:4001`).
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// Did the operator's interrupt end this call? The Bash tool answers a
+/// cancelled run with the typed error `cancelled by user`.
+fn result_is_cancelled(result: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(|e| e == "cancelled by user")
+        })
+        .unwrap_or(false)
+}
+
+/// A short, true fact about a tool result for its card — what the
+/// result itself says, never a guess. Empty when it has nothing worth a
+/// column (the card then shows only the duration).
+fn result_fact(tool: &str, result: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(result) else {
+        return String::new();
+    };
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("{n} {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let truncated = v
+        .get("truncated")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    match tool {
+        "Read" => v
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|c| {
+                let n = c.lines().count();
+                if v.get("partial").and_then(|p| p.as_bool()).unwrap_or(false) {
+                    format!("{n} lines · partial")
+                } else {
+                    plural(n, "line", "lines")
+                }
+            })
+            .unwrap_or_default(),
+        "Glob" | "Grep" => v
+            .get("matches")
+            .and_then(|m| m.as_array())
+            .map(|m| {
+                let (one, many) = if tool == "Glob" {
+                    ("file", "files")
+                } else {
+                    ("match", "matches")
+                };
+                if truncated {
+                    format!("{}+ {many}", m.len())
+                } else {
+                    plural(m.len(), one, many)
+                }
+            })
+            .unwrap_or_default(),
+        "Bash" => {
+            if v.get("backgrounded")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+            {
+                "background".to_string()
+            } else {
+                match v.get("exit_code").and_then(|c| c.as_i64()) {
+                    Some(0) | None => String::new(),
+                    Some(c) => format!("exit {c}"),
+                }
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// The target as the operator should read it: a path under the working
+/// directory is shown relative to it, and one under $HOME as `~/…`, so a
+/// long absolute prefix never pushes the file name off the card.
+fn display_target(kind: &str, target: &str) -> String {
+    if !matches!(kind, "Read" | "Write" | "Edit" | "NotebookEdit") {
+        return target.to_string();
+    }
+    display_path(target)
+}
+
+/// A call summary (`Edit(/proj/src/a.rs)`) with a file tool's path shown
+/// the way the Changes panel shows it: relative to the project. Other
+/// summaries (a Bash command line) are shown as recorded.
+fn display_summary(summary: &str) -> String {
+    for name in ["Read", "Write", "Edit", "NotebookEdit"] {
+        if let Some(arg) = summary
+            .strip_prefix(name)
+            .and_then(|r| r.strip_prefix('('))
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            return format!("{name}({})", display_path(arg));
+        }
+    }
+    summary.to_string()
+}
+
+fn display_path(path: &str) -> String {
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(rest) = path.strip_prefix(cwd.to_string_lossy().as_ref()) {
+            if let Some(rest) = rest.strip_prefix('/') {
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Some(rest) = path.strip_prefix(home.to_string_lossy().as_ref()) {
+            if rest.starts_with('/') {
+                return format!("~{rest}");
+            }
+        }
+    }
+    path.to_string()
+}
+
+/// Live command output for the Terminal panel: every line up to a cap,
+/// then one honest notice. A runaway command must not flood the UI bus;
+/// its full output stays in the call's log file.
+fn live_output_sink(sender: &BusSender, call_id: &str) -> orbit_tools::OutputSink {
+    const MAX_LIVE_LINES: usize = 3000;
+    let sender = sender.clone();
+    let call_id = call_id.to_string();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::sync::Arc::new(move |line: &str| {
+        let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < MAX_LIVE_LINES {
+            orbit_hud_tui::emit_tool_output(&sender, &call_id, line);
+        } else if n == MAX_LIVE_LINES {
+            orbit_hud_tui::emit_tool_output(
+                &sender,
+                &call_id,
+                "… more output; the full log is kept with the session's outputs",
+            );
+        }
+    })
 }
 
 impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
@@ -1017,6 +1318,24 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
         // Register a oneshot channel for this call.
         let (tx, rx) = mpsc::channel();
         self.approvals.register(&req.call_id, tx);
+        // The facts the card shows, measured, never assumed: what a Bash
+        // command can touch, and (from the request) what an edit changes.
+        let mut facts = Vec::new();
+        if req.tool_name == "Bash" {
+            facts.extend(sandbox_report().facts.iter().cloned());
+        }
+        let grant = req.grant.as_ref().map(|g| orbit_hud_tui::ApprovalGrant {
+            rule: g.rule.clone(),
+            can_save: g.can_save,
+        });
+        orbit_hud_tui::emit_approval_detail(
+            &self.sender,
+            &req.call_id,
+            facts,
+            req.preview.clone(),
+            grant,
+        );
+        self.last_call = Some(req.call_id.clone());
         // Post the request to the bus — the reducer renders an approval card.
         self.sender.send(Msg::ApprovalRequested {
             call_id: req.call_id.clone(),
@@ -1027,14 +1346,25 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         });
-        // Park until the operator responds (y/n/R). Esc handled as deny.
+        // Park until the operator responds (y/s/a/R/n). Esc handled as deny.
         match rx.recv() {
             Ok(ApprovalResponse::Allow) => crate::tool_runtime::ApprovalVerdict::AllowOnce,
             Ok(ApprovalResponse::AllowSession) => {
                 crate::tool_runtime::ApprovalVerdict::AllowSession
             }
+            Ok(ApprovalResponse::AllowRule) => {
+                crate::tool_runtime::ApprovalVerdict::AllowRuleSession
+            }
+            Ok(ApprovalResponse::AllowRuleAlways) => {
+                crate::tool_runtime::ApprovalVerdict::AllowRuleAlways
+            }
             Ok(ApprovalResponse::Deny) | Err(_) => crate::tool_runtime::ApprovalVerdict::Deny,
         }
+    }
+
+    fn take_note(&mut self) -> Option<String> {
+        let call = self.last_call.take()?;
+        self.approvals.take_note(&call)
     }
 }
 
@@ -1064,7 +1394,12 @@ pub fn run_tui_turn(
     // worker loop's SetMode command updates config.scope in place —
     // no process env, no per-call reads.
     scope: &mut crate::tool_runtime::PermissionScope,
+    // The session's tool context (see `session_tool_context`).
+    tool_cx: &orbit_tools::ToolContext,
 ) -> Result<(bool, u64, u64, u64, String), String> {
+    // One checkpoint per prompt (E7): /rewind restores a turn. The context
+    // is the session's now, so the turn boundary is marked here.
+    tool_cx.reset_turn_checkpoint();
     // Resolve provider / pricing from config (same as REPL).
     let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
     let provider = cfg.provider_for_model(&config.model);
@@ -1090,7 +1425,7 @@ pub fn run_tui_turn(
 
     // The workspace rail tracks the turn's phases (§6.10):
     // 0 orient → 1 reason → 2 act → 3 verify → 4 respond.
-    let mut ws = orbit_hud_tui::state::Workspace {
+    let mut ws = orbit_hud_tui::model::Workspace {
         phase_index: 0,
         ..Default::default()
     };
@@ -1101,6 +1436,8 @@ pub fn run_tui_turn(
     // deltas is still caught (D6).
     let mut cot = orbit_hud_tui::CotStripper::new();
     let mut first_round_seen = false;
+    // The size a running compaction started from, for its "before → after".
+    let mut compact_from: u64 = 0;
     let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
         use orbit_frontend_protocol::FrontendEvent as E;
         match ev {
@@ -1114,6 +1451,38 @@ pub fn run_tui_turn(
                     first_round_seen = true;
                 }
             }
+            E::Compacting {
+                used_tokens,
+                window_tokens,
+            } => {
+                compact_from = used_tokens;
+                orbit_hud_tui::emit_compaction(sender, true, used_tokens);
+                orbit_hud_tui::emit_activity(
+                    sender,
+                    "compaction",
+                    "compacting context",
+                    &format!("{used_tokens} of {window_tokens} tokens"),
+                    None,
+                );
+            }
+            E::Compacted {
+                summary,
+                after_tokens,
+            } => {
+                orbit_hud_tui::emit_compaction(sender, false, after_tokens);
+                let _ = summary;
+                orbit_hud_tui::emit_activity(
+                    sender,
+                    "compaction",
+                    "compacted",
+                    &format!(
+                        "~{} → ~{} tokens",
+                        orbit_hud_tui::tokens_short(compact_from),
+                        orbit_hud_tui::tokens_short(after_tokens)
+                    ),
+                    None,
+                );
+            }
             E::ToolStarted { name, summary } => {
                 if !first_round_seen {
                     // Engine events can arrive before the first round
@@ -1121,7 +1490,9 @@ pub fn run_tui_turn(
                     ws.phase_index = 2; // act
                     orbit_hud_tui::emit_workspace(sender, ws.clone());
                 }
-                orbit_hud_tui::emit_tool_started(sender, &name, &summary);
+                // No card here: ToolStartedFull carries the call's id and
+                // target, and the card is keyed by that id.
+                let _ = (name, summary);
             }
             E::CostUpdated { total_microcents } => {
                 // D5: report the TURN's running cost; the committed total
@@ -1140,9 +1511,19 @@ pub fn run_tui_turn(
                     sender,
                     &format!("retry {attempt} in {retry_in_ms}ms — {reason}"),
                 );
+                orbit_hud_tui::emit_activity(
+                    sender,
+                    "retry",
+                    &format!("attempt {attempt}"),
+                    &format!("in {retry_in_ms} ms — {reason}"),
+                    None,
+                );
+                // The failed attempt still wrote its egress record.
+                resync_ledger_chip(&config.home, sender);
             }
             E::Error { message } => {
                 orbit_hud_tui::emit_error(sender, &message);
+                resync_ledger_chip(&config.home, sender);
             }
             E::Status { text } => {
                 orbit_hud_tui::emit_status(sender, &text);
@@ -1150,6 +1531,7 @@ pub fn run_tui_turn(
             E::TurnEnded { interrupted, .. } => {
                 ws.phase_index = 4; // respond
                 orbit_hud_tui::emit_workspace(sender, ws.clone());
+                resync_ledger_chip(&config.home, sender);
                 if interrupted {
                     // The visible cancel: the MD's loop contract says a
                     // cancelled turn keeps the transcript valid — say so.
@@ -1163,24 +1545,34 @@ pub fn run_tui_turn(
                 kind,
                 target,
             } => {
-                orbit_hud_tui::emit_tool_started(sender, &kind, &target);
-                let _ = call_id;
+                orbit_hud_tui::emit_tool_started(
+                    sender,
+                    &call_id,
+                    &kind,
+                    &display_target(&kind, &target),
+                );
             }
             E::ToolOutput { call_id, line } => {
-                orbit_hud_tui::emit_status(sender, &format!("┃ {line}"));
-                let _ = call_id;
+                orbit_hud_tui::emit_tool_output(sender, &call_id, &line);
             }
             E::ToolFinishedFull {
-                call_id: _,
+                call_id,
                 ok,
                 result_fact,
             } => {
+                // The executor reports each call as it finishes, with the
+                // typed outcome (denied / cancelled / failed) and a real
+                // fact; the screen keeps the state a card settled in. This
+                // is the fallback for calls no executor of ours ran
+                // (a subagent's): the engine's verdict settles them.
                 let outcome = if ok {
-                    orbit_hud_tui::state::ToolOutcome::Ok
+                    orbit_hud_tui::model::ToolOutcome::Ok
                 } else {
-                    orbit_hud_tui::state::ToolOutcome::Failed
+                    orbit_hud_tui::model::ToolOutcome::Failed
                 };
-                orbit_hud_tui::emit_tool_finished(sender, &result_fact, outcome);
+                orbit_hud_tui::emit_tool_finished(sender, &call_id, "", outcome, &result_fact);
+                // The result record is on the chain by now.
+                resync_ledger_chip(&config.home, sender);
             }
             E::FileChanged {
                 path,
@@ -1189,7 +1581,13 @@ pub fn run_tui_turn(
                 checkpoint_id: _,
                 hunks,
             } => {
-                orbit_hud_tui::emit_file_changed(sender, &path, added, removed, hunks.clone());
+                orbit_hud_tui::emit_file_changed(
+                    sender,
+                    &display_path(&path),
+                    added,
+                    removed,
+                    hunks.clone(),
+                );
             }
             E::SubagentStarted {
                 agent_id,
@@ -1203,7 +1601,7 @@ pub fn run_tui_turn(
                 orbit_hud_tui::emit_subagent_progress(sender, &agent_id, &action);
             }
             E::SubagentFinished { agent_id, report } => {
-                orbit_hud_tui::emit_subagent_finished(sender, &agent_id, &report);
+                orbit_hud_tui::emit_subagent_finished(sender, &agent_id, &report, true);
             }
             E::ModeChanged { mode } => {
                 orbit_hud_tui::emit_mode_changed(sender, &mode);
@@ -1211,13 +1609,27 @@ pub fn run_tui_turn(
             E::Usage {
                 used_tokens,
                 window_tokens,
+                breakdown,
             } => {
-                orbit_hud_tui::emit_usage(sender, used_tokens, window_tokens);
+                orbit_hud_tui::emit_usage(sender, used_tokens, window_tokens, breakdown);
             }
             E::LedgerAppended {
                 record_count,
-                head_digest: _,
+                head_digest,
+                kind,
+                summary,
             } => {
+                // The row first (it counts one on the chip), then the
+                // ledger's own total, which is the authority.
+                if !kind.is_empty() {
+                    orbit_hud_tui::emit_activity(
+                        sender,
+                        &kind,
+                        &host_of(&resolved_gate),
+                        &summary,
+                        Some(&head_digest),
+                    );
+                }
                 orbit_hud_tui::emit_ledger_appended(sender, record_count);
             }
             _ => {}
@@ -1233,21 +1645,25 @@ pub fn run_tui_turn(
         approvals: approvals.clone(),
         auto_grants: std::mem::take(auto_grants),
         scope: std::mem::take(scope),
-        tool_cx: orbit_tools::ToolContext::new(
-            config.home.clone(),
-            config.session_id.clone(),
-            std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
-        ),
+        tool_cx: tool_cx.clone(),
     };
 
     let options = orbit_engine::TurnOptions {
         tools: crate::tools::session_tool_definitions(&config.home),
         session_id: config.session_id.clone(),
         system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
+        memory_bytes: tool_cx.ext::<MemoryBytes>().map_or(0, |m| m.0),
         // The model's window: auto-compaction triggers at 90% of
         // window minus the output reserve (phase 4).
         window_tokens: crate::context_window_for(&config.home, &config.model),
         request_stem: "orbit-tui".into(),
+        // The compaction role: a cheap model may summarize while the
+        // conversation keeps its own. None = same model summarizes.
+        compaction_config: Some(crate::role_turn_config(
+            &config.home,
+            &turn_config,
+            "compaction",
+        )),
         ..Default::default()
     };
 
@@ -1302,60 +1718,74 @@ struct TuiToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for TuiToolExecutor {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        crate::tool_runtime::remember_turn_config(&self.tool_cx, config);
+    }
+
     fn execute(
         &mut self,
         calls: &[orbit_engine::PendingToolCall],
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
+        // After Esc the calls that have not started do not run: they are
+        // answered "cancelled by user" and their cards settle at once.
+        let cx = self.tool_cx.clone();
+        let sender = self.sender.clone();
+        let on_skip = move |call: &orbit_engine::PendingToolCall| {
+            orbit_hud_tui::emit_tool_finished(
+                &sender,
+                &call.id,
+                &call.name,
+                orbit_hud_tui::model::ToolOutcome::Cancelled,
+                "",
+            );
+        };
         // Plan mode: read-only tools run (the model researches while
         // planning); everything else is denied with a notice — no
         // prompt, no execution. Read-only classification is
         // backend-authoritative (tools::is_read_only).
-        if self.plan_mode {
-            let blocked: Vec<&_> = calls
-                .iter()
-                .filter(|c| !crate::tools::is_read_only(&c.name))
-                .collect();
-            if !blocked.is_empty() {
-                let mut results = Vec::with_capacity(calls.len());
-                for call in calls {
+        if self.plan_mode && calls.iter().any(|c| !crate::tools::is_read_only(&c.name)) {
+            return crate::tool_runtime::run_until_cancelled(
+                &cx,
+                calls,
+                |call| {
                     if crate::tools::is_read_only(&call.name) {
-                        results.push(self.run_one(call));
+                        self.run_one(call)
                     } else {
-                        let args = crate::tools::parse_arguments(&call.arguments)
-                            .unwrap_or(serde_json::Value::Null);
-                        let summary = crate::tools::safe_call_summary(&call.name, &args);
-                        orbit_hud_tui::emit_tool_started(&self.sender, &call.name, &summary);
+                        // The engine announced the call; settle its card.
                         orbit_hud_tui::emit_tool_finished(
                             &self.sender,
+                            &call.id,
                             &call.name,
-                            orbit_hud_tui::state::ToolOutcome::Denied,
+                            orbit_hud_tui::model::ToolOutcome::Denied,
+                            "",
                         );
-                        results.push(orbit_engine::ToolRoundResult {
+                        orbit_engine::ToolRoundResult {
                             call_id: call.id.clone(),
                             content: r#"{"ok":false,"error":"plan mode: read-only — this tool is blocked until the plan is approved"}"#.into(),
-                        });
+                        }
                     }
-                }
-                return results;
-            }
+                },
+                on_skip,
+            );
         }
+        crate::tool_runtime::run_until_cancelled(&cx, calls, |c| self.run_one(c), on_skip)
+    }
 
-        let mut results = Vec::with_capacity(calls.len());
-        for c in calls {
-            results.push(self.run_one(c));
-        }
-        results
+    fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+        crate::tool_runtime::begin_cancel_scope(&self.tool_cx, token);
+    }
+
+    fn end_cancel_scope(&mut self) {
+        self.tool_cx.pop_cancel_check();
     }
 }
 
 impl TuiToolExecutor {
     fn run_one(&mut self, call: &orbit_engine::PendingToolCall) -> orbit_engine::ToolRoundResult {
-        // Display-safe summary first.
-        let args =
-            crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
-        let summary = crate::tools::safe_call_summary(&call.name, &args);
-        orbit_hud_tui::emit_tool_started(&self.sender, &call.name, &summary);
+        // No start event here: the engine announced this call, with its
+        // target, before the round ran, and the card is keyed by the
+        // call's id. This function owns the live output and the finish.
 
         // Per-call ULID decision ids (defect fix: the old
         // `tool-round-{round}-{index}` ids repeated every turn, so
@@ -1363,6 +1793,10 @@ impl TuiToolExecutor {
         let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
         let mut approval_channel =
             TuiApprovalChannel::new(self.sender.clone(), self.approvals.clone());
+        // A running command's output lines go to the Terminal panel as
+        // they arrive.
+        self.tool_cx
+            .set_output_sink(Some(live_output_sink(&self.sender, &call.id)));
         let (result, file_change) = crate::tool_runtime::execute_call(
             &self.home,
             &self.session_id,
@@ -1375,17 +1809,35 @@ impl TuiToolExecutor {
             &self.scope,
             &self.tool_cx,
         )
-        .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
+        .unwrap_or_else(|e| {
+            (
+                serde_json::json!({ "ok": false, "error": e }).to_string(),
+                None,
+            )
+        });
+        self.tool_cx.set_output_sink(None);
+        // The model's task list changed: the Plan panel lists it.
+        if matches!(call.name.as_str(), "TaskCreate" | "TaskUpdate")
+            && !orbit_tools::result_is_error(&result)
+        {
+            orbit_hud_tui::emit_tasks(&self.sender, orbit_tools::tasks::snapshot(&self.tool_cx));
+        }
         // Classify the result into a ToolOutcome: a refusal must render
         // as `⊘ denied by you`, not a red `✕ failed` (§11.5 rule 4).
         let outcome = classify_tool_result(&result);
-        orbit_hud_tui::emit_tool_finished(&self.sender, &call.name, outcome);
+        // A true fact for the card: the change's size for a write, else
+        // what the result itself says.
+        let fact = file_change
+            .as_ref()
+            .map(|fc| format!("+{} −{}", fc.added, fc.removed))
+            .unwrap_or_else(|| result_fact(&call.name, &result));
+        orbit_hud_tui::emit_tool_finished(&self.sender, &call.id, &call.name, outcome, &fact);
         // M11: a checkpointed write carries a real diff to the Changes
         // panel — true counts plus bounded hunks, never invented.
         if let Some(fc) = file_change {
             orbit_hud_tui::emit_file_changed(
                 &self.sender,
-                &fc.path,
+                &display_path(&fc.path),
                 fc.added,
                 fc.removed,
                 fc.hunks,
@@ -1406,7 +1858,7 @@ fn build_session_prompt(
     model: &str,
     mods: &[crate::mods::Mod],
     mods_enabled: &[String],
-) -> String {
+) -> orbit_engine::context::SystemPrompt {
     let defs = crate::tools::session_tool_definitions(home);
     let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     let mods_directive = crate::mods::system_directive(mods, mods_enabled);
@@ -1417,8 +1869,12 @@ fn build_session_prompt(
         &tool_names,
         &mods_directive,
     )
-    .text
 }
+
+/// How many bytes of the session's frozen system prompt are project
+/// instructions: kept on the tool context so each turn can tell the engine
+/// (and so the Context panel can name them).
+struct MemoryBytes(usize);
 
 /// The short id the status line shows: the first eight characters of
 /// the id proper, without the `session-` tag every stored id carries.
@@ -1438,5 +1894,148 @@ mod short_session_id_tests {
     fn drops_the_session_tag() {
         assert_eq!(short_session_id("session-01J8ZK4QX2M7C9RT"), "01J8ZK4Q");
         assert_eq!(short_session_id("deadbeefcafe"), "deadbeef");
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn config(home: &std::path::Path) -> TuiTurnConfig {
+        TuiTurnConfig {
+            home: home.to_path_buf(),
+            session_id: "session-test".into(),
+            gate: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            provider_id: "p".into(),
+            auto_tools: true,
+            scope: Default::default(),
+            initial_transcript: Vec::new(),
+            initial_turns: 0,
+            initial_input_tokens: 0,
+            initial_output_tokens: 0,
+            initial_cost_microcents: 0,
+        }
+    }
+
+    #[test]
+    fn a_file_tools_path_is_shown_relative_and_a_command_is_left_alone() {
+        let cwd = std::env::current_dir().unwrap();
+        let inside = format!("Edit({}/src/a.rs)", cwd.display());
+        assert_eq!(display_summary(&inside), "Edit(src/a.rs)");
+        // Outside the project: shown as it is (never guessed shorter).
+        assert_eq!(display_summary("Read(/etc/hosts)"), "Read(/etc/hosts)");
+        // A command line is the recorded fact; its paths are not rewritten.
+        let cmd = format!("Bash(cat {}/a.txt)", cwd.display());
+        assert_eq!(display_summary(&cmd), cmd);
+        assert_eq!(display_summary("Glob(**/*.py)"), "Glob(**/*.py)");
+    }
+
+    #[test]
+    fn host_of_strips_the_scheme_and_path() {
+        assert_eq!(host_of("http://127.0.0.1:4001/v1"), "127.0.0.1:4001");
+        assert_eq!(host_of("https://api.example.com"), "api.example.com");
+        assert_eq!(host_of("localhost:8080/x"), "localhost:8080");
+    }
+
+    /// The session's context announces every ledger record it appends to
+    /// the UI bus, with the record's hash: what the Activity panel shows.
+    #[test]
+    fn the_session_context_feeds_the_activity_panel() {
+        let home = std::env::temp_dir().join(format!("orbit-sess-ctx-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let cx = session_tool_context(&config(&home), &sender);
+        let call = orbit_engine::PendingToolCall {
+            index: 0,
+            id: "c1".into(),
+            name: "calculator".into(),
+            arguments: br#"{"expression":"1+1"}"#.to_vec(),
+        };
+        struct Never;
+        impl crate::tool_runtime::ApprovalChannel for Never {
+            fn ask(
+                &mut self,
+                _: &crate::tool_runtime::ApprovalRequest,
+                _: bool,
+            ) -> crate::tool_runtime::ApprovalVerdict {
+                panic!("auto-tools: never asked")
+            }
+        }
+        crate::tool_runtime::execute_call(
+            &home,
+            "session-test",
+            "d1",
+            &call,
+            true,
+            false,
+            &mut Never,
+            &mut crate::tool_runtime::AutoGrants::new(),
+            &crate::tool_runtime::PermissionScope::default(),
+            &cx,
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        while let Some(m) = bus.try_recv() {
+            if let orbit_hud_tui::msg::Msg::Activity { kind, digest, .. } = m {
+                got.push((kind, digest));
+            }
+        }
+        let kinds: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, ["intent", "verdict", "result"]);
+        assert!(got
+            .iter()
+            .all(|(_, d)| d.as_ref().is_some_and(|d| d.len() == 64)));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// What a Read recorded in one prompt still lets the next prompt's
+    /// Edit through: the context belongs to the session, and each prompt
+    /// gets its own checkpoint.
+    #[test]
+    fn read_before_edit_survives_into_the_next_prompt() {
+        let home = std::env::temp_dir().join(format!("orbit-sess-rbe-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (_bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let cx = session_tool_context(&config(&home), &sender);
+        let file = home.join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        // Prompt 1: the model reads the file in full.
+        let read = orbit_tools::registry()
+            .into_iter()
+            .find(|t| t.name() == "Read")
+            .unwrap()
+            .run(
+                &serde_json::json!({ "file_path": file.to_string_lossy() }),
+                &cx,
+            );
+        assert!(!read.is_error, "{}", read.payload);
+        let first_checkpoint = cx.turn_checkpoint_id();
+        // Prompt 2 (a new turn on the SAME session context): the edit is
+        // allowed, and it gets a fresh checkpoint.
+        cx.reset_turn_checkpoint();
+        let edit = orbit_tools::registry()
+            .into_iter()
+            .find(|t| t.name() == "Edit")
+            .unwrap()
+            .run(
+                &serde_json::json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "hello",
+                    "new_string": "world"
+                }),
+                &cx,
+            );
+        assert!(
+            !edit.is_error,
+            "an Edit after a Read in an earlier prompt: {}",
+            edit.payload
+        );
+        assert_ne!(
+            cx.turn_checkpoint_id(),
+            first_checkpoint,
+            "one checkpoint per prompt"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -21,6 +21,30 @@ use serde::{Deserialize, Serialize};
 
 // ── Events: harness → frontend ──────────────────────────────────────────────
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// What the context window is made of, in ESTIMATED tokens (about four
+/// characters each): a provider reports one total, never the parts. The
+/// parts are the engine's own measurement of what it sends.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextBreakdown {
+    /// Base instructions, the skills index and the environment.
+    pub system: u64,
+    /// The tool definitions sent with every request.
+    pub tools: u64,
+    /// Project instructions (ORBIT.md, AGENTS.md, CLAUDE.md…).
+    pub memory: u64,
+    /// The conversation so far.
+    pub messages: u64,
+    /// The conversation size at which auto-compaction starts (90% of the
+    /// window less the output reserve); 0 when there is no window.
+    pub compact_at: u64,
+    /// Tokens kept free for the answer.
+    pub reserve: u64,
+}
+
 /// One unified-diff hunk: `@@ -a,b +c,d @@` plus the marked lines.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiffHunk {
@@ -110,7 +134,14 @@ pub enum FrontendEvent {
         window_tokens: u64,
     },
     /// Compaction finished; history replaced by the summary.
-    Compacted { summary: String },
+    /// `after_tokens` is the conversation's estimated size once the summary
+    /// stands in for the older turns (additive; 0 when a producer does not
+    /// say).
+    Compacted {
+        summary: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        after_tokens: u64,
+    },
 
     // ── TUI motion events (the ORBIT TUI prototype's motion table).
     // Each animation is tied to an engine event, never a guess.
@@ -169,15 +200,26 @@ pub enum FrontendEvent {
     SubagentFinished { agent_id: String, report: String },
     /// The permission mode changed (the mode pill wipe).
     ModeChanged { mode: String },
-    /// Context usage (the context meter): tokens in use, the window.
+    /// Context usage (the context meter): tokens in use, the window, and
+    /// (additive; absent from older producers) what the use is made of.
     Usage {
         used_tokens: u64,
         window_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        breakdown: Option<ContextBreakdown>,
     },
     /// A record was appended to the ledger (the proof chip's dot).
+    /// `record_count` is the whole ledger's total and `head_digest` the
+    /// chain head right after the append. `kind` and `summary` (additive:
+    /// absent from older producers) say what the record is, so the
+    /// Activity panel can list it: `egress` / `<model> · <tokens>`.
     LedgerAppended {
         record_count: u64,
         head_digest: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        kind: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
     },
 }
 
@@ -336,5 +378,64 @@ mod tests {
         let back: FrontendEvent =
             serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         assert_eq!(back, FrontendEvent::WorkspaceUpdate(ws));
+    }
+}
+
+#[cfg(test)]
+mod context_event_tests {
+    use super::*;
+
+    /// The new fields are additive: an event from an older producer still
+    /// parses, and one without them serialises exactly as it used to.
+    #[test]
+    fn usage_and_compacted_are_back_compatible() {
+        let old: FrontendEvent =
+            serde_json::from_str(r#"{"type":"usage","used_tokens":10,"window_tokens":100}"#)
+                .unwrap();
+        assert_eq!(
+            old,
+            FrontendEvent::Usage {
+                used_tokens: 10,
+                window_tokens: 100,
+                breakdown: None
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"type":"usage","used_tokens":10,"window_tokens":100}"#
+        );
+        let old: FrontendEvent =
+            serde_json::from_str(r#"{"type":"compacted","summary":"s"}"#).unwrap();
+        assert_eq!(
+            old,
+            FrontendEvent::Compacted {
+                summary: "s".into(),
+                after_tokens: 0
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"type":"compacted","summary":"s"}"#
+        );
+    }
+
+    #[test]
+    fn a_breakdown_round_trips() {
+        let b = ContextBreakdown {
+            system: 1,
+            tools: 2,
+            memory: 3,
+            messages: 4,
+            compact_at: 5,
+            reserve: 6,
+        };
+        let e = FrontendEvent::Usage {
+            used_tokens: 7,
+            window_tokens: 8,
+            breakdown: Some(b),
+        };
+        let back: FrontendEvent =
+            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
     }
 }

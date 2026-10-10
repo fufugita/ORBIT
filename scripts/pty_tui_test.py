@@ -3,7 +3,7 @@
 
 Spawns the real `orbit` binary in a PTY and drives it with keystrokes,
 verifying: boot-to-typing focus, streaming (mock provider), slash commands
-(/help /model /clear /usage), tool approval (y/n), Ctrl+C cancel, Ctrl+D quit,
+(/help /model /clear /usage), tool approval (y/s/a/n), Ctrl+C cancel, Ctrl+D quit,
 SIGHUP, resize — and a clean exit with the terminal state restored.
 
 Usage:
@@ -44,7 +44,7 @@ def check(name: str, cond: bool, detail: str = ""):
 
 
 class PtySession:
-    def __init__(self, cmd, env=None, timeout=30, rows=30, cols=100):
+    def __init__(self, cmd, env=None, timeout=30, rows=30, cols=100, cwd=None):
         self.timeout = timeout
         self.master, self.slave = pty.openpty()
         # Set the PTY window size BEFORE spawning so the TUI gets a real
@@ -67,6 +67,7 @@ class PtySession:
             stdout=self.slave,
             stderr=self.slave,
             env=full_env,
+            cwd=cwd,
             close_fds=True,
             start_new_session=True,
         )
@@ -192,6 +193,26 @@ class PtySession:
             self.write(ch.encode())
             time.sleep(0.005)
 
+    def find_text(self, needle):
+        """(col, row) of `needle` on the emulated screen, or None. Built from
+        the cell grid, so a wide glyph earlier on a row cannot shift it."""
+        if self.screen is None:
+            return None
+        for y in range(self.screen.lines):
+            row = self.screen.buffer[y]
+            text = "".join((row[x].data or " ") for x in range(self.screen.columns))
+            i = text.find(needle)
+            if i >= 0:
+                return (i, y)
+        return None
+
+    def click(self, col, row):
+        """A left click at 0-based (col, row): an SGR mouse press and release
+        (what the terminal sends once the app enables mouse reporting)."""
+        self.write(f"\x1b[<0;{col + 1};{row + 1}M".encode())
+        time.sleep(0.03)
+        self.write(f"\x1b[<0;{col + 1};{row + 1}m".encode())
+
     def resize(self, rows, cols):
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         os.kill(self.proc.pid, signal.SIGWINCH)
@@ -288,17 +309,28 @@ def main():
     ap.add_argument("--gate", default="http://127.0.0.1:8088")
     ap.add_argument("--token", default="test-token")
     args = ap.parse_args()
+    # Absolute: some sessions run in another working directory.
+    args.binary = os.path.abspath(args.binary)
+    args.mock = os.path.abspath(args.mock)
 
     # This suite runs real tool calls (Bash under bwrap, Esc → kill of a
-    # process group) and deliberately kills terminals. On 2026-10-08 a run
-    # was followed within a second by SIGTERM to the user manager and a
-    # full desktop logout (journal: "Received SIGTERM from PID … (kill)").
-    # Root cause not yet proven — do not run it on a machine you are
-    # logged into unless you have read docs and accept that risk.
+    # process group) and deliberately kills terminals. On 2026-10-07/08 a
+    # run was followed within a second by SIGTERM to the user manager and
+    # a full desktop logout (journal: "Received SIGTERM from PID … (kill)").
+    # Root cause (found 2026-10-09, fixed in crates/tools/src/bash.rs):
+    # orbit stopped a tool's process group with `/usr/bin/kill -TERM
+    # -<pgid>`, and procps-ng 4.0.4 reads ONE digit of a negative operand
+    # — `-1670` became `kill(-1, SIGTERM)`, every process the user owns.
+    # Orbit now signals with kill(2) itself. The gate stays as defence in
+    # depth: this suite really does kill process groups, so run it inside
+    # a PID namespace on a machine you are logged into:
+    #   unshare --user --map-current-user --pid --fork --mount-proc \
+    #     --kill-child env ORBIT_PTY_ALLOW_KILL_TESTS=1 python3 ...
     if os.environ.get("ORBIT_PTY_ALLOW_KILL_TESTS") != "1":
         print("refusing to run: this suite exercises process-group kills and\n"
-              "closes terminals; a run on 2026-10-08 preceded a desktop logout.\n"
-              "Set ORBIT_PTY_ALLOW_KILL_TESTS=1 to run it anyway.")
+              "closes terminals. The cause of the 2026-10 desktop logouts is\n"
+              "fixed, but run it in a PID namespace (see the comment above)\n"
+              "and set ORBIT_PTY_ALLOW_KILL_TESTS=1.")
         sys.exit(2)
 
     # Fresh ORBIT home.
@@ -543,6 +575,651 @@ def main():
     s.key("enter")
     ok, buf = s.wait_for("slow", timeout=30)
     check("next prompt works after esc", ok, buf[-200:])
+
+    # ── 5c. Esc skips the calls that have not started ─────────────────────
+    # A round with TWO Bash calls (scripts/scripted_mock.py). Esc during the
+    # first must stop the second from ever starting: only the call in flight
+    # used to be killed, and the next one ran to completion.
+    import json as _json
+    import shutil as _shutil
+    import socket as _socket
+    import tempfile as _tempfile
+    work2 = _tempfile.mkdtemp(prefix="orbit-pty-2call-")
+    marker2 = os.path.join(work2, "second-ran")
+    script2 = {"main": [
+        {"tools": [
+            {"name": "Bash", "args": {"command": "sleep 30"}},
+            {"name": "Bash", "args": {"command": f"touch {marker2}"}},
+        ]},
+        {"text": "back to normal"},
+    ]}
+    with open(os.path.join(work2, "script.json"), "w") as fh:
+        _json.dump(script2, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port2 = _ss.getsockname()[1]
+    _ss.close()
+    mock2 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port2), "--script", os.path.join(work2, "script.json"),
+         "--log", os.path.join(work2, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home2 = os.path.join(work2, "home")
+    subprocess.run([args.binary, "init", "--home", home2, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home2))
+    with open(os.path.join(home2, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port2}"\n'
+                 '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+    s2 = PtySession([args.binary, "--home", home2, "--model", "scripted"],
+                    env={"ORBIT_HOME": home2}, timeout=20, rows=30, cols=110, cwd=work2)
+    s2.wait_for("ORBIT", timeout=15)
+    s2.type("go")
+    s2.key("enter")
+    ok, _ = s2.wait_for("Allow Bash", timeout=20)  # the FIRST call asks
+    time.sleep(1.6)  # §9.14 arming window
+    s2.key("y")
+    time.sleep(1.5)  # `sleep 30` is running
+    s2.key("esc")
+    ok_cancel, _ = s2.wait_for("cancelled", timeout=15)
+    time.sleep(1.0)
+    check("esc cancels a two-call round", ok_cancel)
+    check("the call that had not started never ran", not os.path.exists(marker2))
+    check("the skipped call raised no approval card",
+          "Allow Bash" not in s2.screen_text(), s2.screen_text()[-300:])
+    s2.type("again")
+    s2.key("enter")
+    ok_next, buf = s2.wait_for("back to normal", timeout=25)
+    check("next prompt works after a two-call esc", ok_next, buf[-200:])
+    s2.terminate()
+    try:
+        os.killpg(mock2.pid, signal.SIGTERM)
+    except Exception:
+        mock2.terminate()
+    _shutil.rmtree(work2, ignore_errors=True)
+
+    # ── 5d. Review: pick a file, read its real diff, open the full diff ───
+    # A round that edits one file and CREATES another (scripts/scripted_mock.py).
+    # The Changes/Review panels used to miss a created file entirely, Review's
+    # diff pane was a fixed sentence, and the footers advertised j/k, n/p and
+    # "revert" with nothing behind them.
+    work3 = _tempfile.mkdtemp(prefix="orbit-pty-review-")
+    with open(os.path.join(work3, "calc.py"), "w") as fh:
+        fh.write("def add(a, b):\n    return a - b\n")
+    script3 = {"main": [
+        {"tools": [{"name": "Read", "args": {"file_path": os.path.join(work3, "calc.py")}}]},
+        {"tools": [{"name": "Edit", "args": {
+            "file_path": os.path.join(work3, "calc.py"),
+            "old_string": "return a - b", "new_string": "return a + b"}}]},
+        {"tools": [{"name": "Write", "args": {
+            "file_path": os.path.join(work3, "notes.txt"),
+            "content": "remember: add() was subtracting\n"}}]},
+        {"text": "Done: fixed add() and left a note."},
+    ]}
+    with open(os.path.join(work3, "script.json"), "w") as fh:
+        _json.dump(script3, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port3 = _ss.getsockname()[1]
+    _ss.close()
+    mock3 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port3), "--script", os.path.join(work3, "script.json"),
+         "--log", os.path.join(work3, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home3 = os.path.join(work3, "home")
+    subprocess.run([args.binary, "init", "--home", home3, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home3))
+    with open(os.path.join(home3, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port3}"\n'
+                 '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+    s3 = PtySession([args.binary, "--home", home3, "--model", "scripted"],
+                    env={"ORBIT_HOME": home3}, timeout=20, rows=48, cols=164, cwd=work3)
+    # The TUI paints continuously; a harness that sleeps without reading
+    # the PTY lets the output back up until the app's writes block. Every
+    # wait in this scenario therefore DRAINS the terminal.
+    def pump(sess, secs):
+        end_at = time.time() + secs
+        while time.time() < end_at:
+            sess.read(min(0.3, max(0.05, end_at - time.time())))
+
+    s3.wait_for("ORBIT", timeout=15)
+    pump(s3, 2.6)  # past the startup window, so the first keys are not lost
+    s3.type("fix add")
+    s3.key("enter")
+    done3 = False
+    for _ in range(60):  # three approval cards, then the closing text
+        pump(s3, 0.5)
+        txt = s3.screen_text()
+        if "left a note" in txt:
+            done3 = True
+            break
+        if "Allow " in txt:
+            pump(s3, 1.6)  # §9.14 arming window
+            s3.key("y")
+            pump(s3, 0.6)
+    check("a round that edits one file and creates another completes", done3,
+          s3.screen_text()[-300:])
+    # Esc arranges; `]` x3 reaches the review layout; Esc again leaves
+    # arranging with focus still on the Review panel.
+    s3.key("esc")
+    pump(s3, 0.5)
+    for _ in range(3):
+        s3.type("]")
+        pump(s3, 0.6)
+    s3.key("esc")
+    pump(s3, 0.6)
+    t = s3.screen_text()
+    check("review lists both files, the created one too",
+          "calc.py" in t and "notes.txt" in t and "2 files" in t, t[-600:])
+    check("review draws the selected file's real hunk, not a placeholder",
+          "@@ -1,2 +1,2 @@" in t and "return a + b" in t and "The diff appears here" not in t,
+          t[:1500])
+    check("the footer names no key that does nothing",
+          "revert" not in t and "j/k" in t and "n/p" in t, t[-400:])
+    s3.type("j")
+    pump(s3, 0.6)
+    t = s3.screen_text()
+    check("j moves to the created file and shows it as an addition",
+          "@@ -0,0 +1,1 @@" in t and "remember: add() was subtracting" in t, t[:1500])
+    s3.key("enter")
+    pump(s3, 1.0)
+    t = s3.screen_text()
+    check("enter opens the SELECTED file's full diff",
+          "esc close" in t and t.count("remember: add() was subtracting") >= 2, t[:2000])
+    s3.key("esc")
+    pump(s3, 0.5)
+    s3.type("k")
+    pump(s3, 0.5)
+    t = s3.screen_text()
+    check("k moves back to the first file", "hunk 1/1" in t and "return a + b" in t, t[:1500])
+    s3.terminate()
+    try:
+        os.killpg(mock3.pid, signal.SIGTERM)
+    except Exception:
+        mock3.terminate()
+    _shutil.rmtree(work3, ignore_errors=True)
+
+    # ── 5e. The whole flow with the mouse ─────────────────────────────────
+    # Approve by clicking the card's buttons, switch layout from the top
+    # bar, select a file and open its diff by clicking, close the overlay
+    # by clicking outside it, and complete a `/` command by clicking its
+    # row. A clicked hint is the key it names, so every guard of the key
+    # applies — and what is drawn behind a modal cannot be clicked.
+    work4 = _tempfile.mkdtemp(prefix="orbit-pty-mouse-")
+    with open(os.path.join(work4, "calc.py"), "w") as fh:
+        fh.write("def add(a, b):\n    return a - b\n")
+    script4 = {"main": [
+        {"tools": [{"name": "Read", "args": {"file_path": os.path.join(work4, "calc.py")}}]},
+        {"tools": [{"name": "Edit", "args": {
+            "file_path": os.path.join(work4, "calc.py"),
+            "old_string": "return a - b", "new_string": "return a + b"}}]},
+        {"tools": [{"name": "Write", "args": {
+            "file_path": os.path.join(work4, "notes.txt"),
+            "content": "remember: add() was subtracting\n"}}]},
+        {"text": "Done: fixed add() and left a note."},
+    ]}
+    with open(os.path.join(work4, "script.json"), "w") as fh:
+        _json.dump(script4, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port4 = _ss.getsockname()[1]
+    _ss.close()
+    mock4 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port4), "--script", os.path.join(work4, "script.json"),
+         "--log", os.path.join(work4, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home4 = os.path.join(work4, "home")
+    subprocess.run([args.binary, "init", "--home", home4, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home4))
+    with open(os.path.join(home4, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port4}"\n'
+                 '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+    s4 = PtySession([args.binary, "--home", home4, "--model", "scripted"],
+                    env={"ORBIT_HOME": home4}, timeout=20, rows=48, cols=164, cwd=work4)
+    s4.wait_for("ORBIT", timeout=15)
+    pump(s4, 2.6)
+    s4.type("fix add")
+    s4.key("enter")
+    clicked = []
+    done4 = False
+    for _ in range(80):
+        pump(s4, 0.5)
+        txt = s4.screen_text()
+        if "left a note" in txt:
+            done4 = True
+            break
+        # The buttons are drawn only once the card has settled and the typing
+        # pause is over; the Edit approval uses the session button.
+        target = None
+        if "allow all Edit" in txt:
+            target = "allow all Edit"
+        elif "allow once" in txt:
+            target = "allow once"
+        if target:
+            pump(s4, 1.2)
+            pos = s4.find_text(target)
+            if pos:
+                s4.click(*pos)
+                clicked.append(target)
+                pump(s4, 0.8)
+    check("a round's approvals answered by clicking the card's buttons",
+          done4 and len(clicked) >= 2 and "allow once" in clicked,
+          f"{clicked}\n{s4.screen_text()[-400:]}")
+    # The top bar's `review` tab applies that layout.
+    pos = s4.find_text("review")
+    check("the review tab is in the top bar", pos is not None and pos[1] == 0, str(pos))
+    if pos:
+        s4.click(*pos)
+        pump(s4, 1.0)
+    t = s4.screen_text()
+    check("clicking the review tab switches to that layout",
+          "FILES" in t and "calc.py" in t and "notes.txt" in t, t[:1200])
+    # Click the second file's row: the pane follows (a created file: -0,0).
+    pos = None
+    for y in range(s4.screen.lines):
+        row = "".join((s4.screen.buffer[y][x].data or " ") for x in range(s4.screen.columns))
+        if "notes.txt" in row and "+1" in row:
+            pos = (row.find("notes.txt"), y)
+            break
+    check("the second file is listed", pos is not None, t[:800])
+    if pos:
+        s4.click(*pos)
+        pump(s4, 0.8)
+    t = s4.screen_text()
+    check("clicking a file row selects it and shows its diff",
+          "@@ -0,0 +1,1 @@" in t and "remember: add() was subtracting" in t, t[:1500])
+    if pos:
+        s4.click(*pos)
+        pump(s4, 1.0)
+    t = s4.screen_text()
+    check("clicking the selected file opens its full diff", "esc close" in t, t[:1500])
+    # Outside the overlay: closes it and does nothing behind it.
+    s4.click(2, 3)
+    pump(s4, 0.8)
+    t = s4.screen_text()
+    check("clicking outside the overlay closes it", "esc close" not in t, t[:800])
+    # A `/` row completes into the composer. The review layout has none:
+    # click back to the columns layout, then click into the composer.
+    pos = s4.find_text("columns")
+    check("the columns tab is in the top bar", pos is not None and pos[1] == 0, str(pos))
+    if pos:
+        s4.click(*pos)
+        pump(s4, 1.0)
+    pos = s4.find_text("Ask ORBIT")
+    check("the composer is back", pos is not None, s4.screen_text()[-600:])
+    if pos:
+        s4.click(*pos)  # clicking a panel focuses it
+        pump(s4, 0.5)
+    s4.type("/he")
+    pump(s4, 0.6)
+    pos = s4.find_text("/help")
+    check("the / list shows /help for `/he`", pos is not None, s4.screen_text()[-900:])
+    if pos:
+        s4.click(*pos)
+        pump(s4, 0.6)
+    t = s4.screen_text()
+    check("clicking a / row completes it into the composer (it does not run it)",
+          "/help " in t and "COMMANDS" not in t, t[-700:])
+    s4.terminate()
+    try:
+        os.killpg(mock4.pid, signal.SIGTERM)
+    except Exception:
+        mock4.terminate()
+    _shutil.rmtree(work4, ignore_errors=True)
+
+    # ── 5f. A subagent runs on the session's provider, and shows ───────────
+    # The Task tool took its gateway and model from ORBIT_GATE_URL/ORBIT_MODEL
+    # and otherwise from 127.0.0.1:4001 / glm-5.2. Only `-p` exports those, so
+    # in the TUI a subagent never reached the session's provider: it failed,
+    # and no event ever told the Agent panel it existed.
+    work5 = _tempfile.mkdtemp(prefix="orbit-pty-agent-")
+    with open(os.path.join(work5, "calc.py"), "w") as fh:
+        fh.write("def add(a, b):\n    return a - b\n")
+    script5 = {
+        "main": [
+            {"tools": [{"name": "Task", "args": {
+                "agent": "Explore",
+                "prompt": "SUBAGENT: find where add() is defined"}}]},
+            {"text": "The explorer is done."},
+        ],
+        "SUBAGENT:": [
+            {"tools": [{"name": "Read", "args": {"file_path": os.path.join(work5, "calc.py")}}]},
+            {"text": "add() is defined in calc.py and it subtracts."},
+        ],
+    }
+    with open(os.path.join(work5, "script.json"), "w") as fh:
+        _json.dump(script5, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port5 = _ss.getsockname()[1]
+    _ss.close()
+    mock5 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port5), "--script", os.path.join(work5, "script.json"),
+         "--log", os.path.join(work5, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home5 = os.path.join(work5, "home")
+    subprocess.run([args.binary, "init", "--home", home5, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home5))
+    with open(os.path.join(home5, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port5}"\n'
+                 '[[provider.models]]\nid = "scripted-sa"\ncontext_window = 200000\n')
+    # Neither variable is set: the session's own configuration must be used.
+    env5 = {k: v for k, v in os.environ.items() if k not in ("ORBIT_GATE_URL", "ORBIT_MODEL", "ORBIT_PROVIDER")}
+    env5["ORBIT_HOME"] = home5
+    s5 = PtySession([args.binary, "--home", home5, "--model", "scripted-sa"],
+                    env=env5, timeout=20, rows=48, cols=164, cwd=work5)
+    s5.wait_for("ORBIT", timeout=15)
+    pump(s5, 2.6)
+    s5.type("explore")
+    s5.key("enter")
+    done5 = False
+    for _ in range(80):
+        pump(s5, 0.5)
+        txt = s5.screen_text()
+        if "explorer is done" in txt:
+            done5 = True
+            break
+        if "allow once" in txt or "Allow " in txt:
+            pump(s5, 1.4)
+            s5.key("y")
+            pump(s5, 0.6)
+    check("a round that starts a subagent completes in the TUI", done5, s5.screen_text()[-400:])
+    reqs5 = []
+    try:
+        with open(os.path.join(work5, "req.jsonl")) as fh:
+            reqs5 = [_json.loads(l) for l in fh if l.strip()]
+    except OSError:
+        pass
+    def _first_user(r):
+        for m in r.get("body", {}).get("messages", []):
+            if m.get("role") == "user":
+                c = m.get("content")
+                return c if isinstance(c, str) else ""
+        return ""
+    sub5 = [r for r in reqs5 if _first_user(r).startswith("SUBAGENT:")]
+    check("the subagent's requests reached the session's gateway",
+          len(sub5) == 2, f"{len(reqs5)} requests, {len(sub5)} from the subagent")
+    check("…on the session's model",
+          bool(sub5) and all(r["body"].get("model") == "scripted-sa" for r in sub5),
+          str([r["body"].get("model") for r in sub5]))
+    # The Agent panel knows it: click the agents layout tab.
+    pos = s5.find_text("agents")
+    if pos and pos[1] == 0:
+        s5.click(*pos)
+        pump(s5, 1.0)
+    t = s5.screen_text()
+    check("the Agent panel shows the subagent, finished",
+          "Explore" in t and "done" in t and "subtracts" in t, t[:1400])
+    s5.terminate()
+    try:
+        os.killpg(mock5.pid, signal.SIGTERM)
+    except Exception:
+        mock5.terminate()
+    _shutil.rmtree(work5, ignore_errors=True)
+
+    # ── 5h. The Terminal keeps a tape per command ──────────────────────────
+    # One tape used to hold only the newest command and was wiped by the
+    # next one, so a failing command's output vanished as soon as anything
+    # else ran. Two commands, the second failing: both stay readable.
+    work6 = _tempfile.mkdtemp(prefix="orbit-pty-tapes-")
+    script6 = {"main": [
+        {"tools": [{"name": "Bash", "args": {
+            "command": "python3 -c \"print('first command ran')\"", "description": "one"}}]},
+        {"tools": [{"name": "Bash", "args": {
+            "command": "python3 -c \"import sys; print('boom: it failed'); sys.exit(3)\"",
+            "description": "two"}}]},
+        {"text": "All commands finished."},
+    ]}
+    with open(os.path.join(work6, "script.json"), "w") as fh:
+        _json.dump(script6, fh)
+    _ss = _socket.socket()
+    _ss.bind(("127.0.0.1", 0))
+    port6 = _ss.getsockname()[1]
+    _ss.close()
+    mock6 = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+         "--port", str(port6), "--script", os.path.join(work6, "script.json"),
+         "--log", os.path.join(work6, "req.jsonl")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(0.8)
+    home6 = os.path.join(work6, "home")
+    subprocess.run([args.binary, "init", "--home", home6, "--no-provider"],
+                   capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home6))
+    with open(os.path.join(home6, "providers.toml"), "w") as fh:
+        fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port6}"\n'
+                 '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+    s6 = PtySession([args.binary, "--home", home6, "--model", "scripted"],
+                    env={"ORBIT_HOME": home6}, timeout=20, rows=48, cols=164, cwd=work6)
+    s6.wait_for("ORBIT", timeout=15)
+    pump(s6, 2.6)
+    s6.type("run both")
+    s6.key("enter")
+    done6 = False
+    for _ in range(80):
+        pump(s6, 0.5)
+        txt = s6.screen_text()
+        if "All commands finished" in txt:
+            done6 = True
+            break
+        if "allow once" in txt or "Allow " in txt:
+            pump(s6, 1.4)
+            s6.key("y")
+            pump(s6, 0.6)
+    check("a round with two commands completes", done6, s6.screen_text()[-400:])
+    t = s6.screen_text()
+    check("the Terminal shows the newest command's output and its exit code",
+          "boom: it failed" in t and "exit 3" in t, t[:1200])
+    check("…and a numbered tab for each command", "✓1" in t and "✕2" in t, t[:600])
+    pos = s6.find_text("✓1")
+    if pos:
+        s6.click(*pos)
+        pump(s6, 0.8)
+    t = s6.screen_text()
+    check("clicking the first tab shows the first command's output, kept",
+          "first command ran" in t and "boom: it failed" not in t, t[:1200])
+    s6.type("]")
+    pump(s6, 0.6)
+    t = s6.screen_text()
+    check("] moves to the next command", "boom: it failed" in t and "exit 3" in t, t[:1200])
+    # Swap the first panel to Context (esc, 1, p, 6): what fills the window.
+    s6.key("esc")
+    pump(s6, 0.5)
+    s6.type("1")
+    pump(s6, 0.4)
+    s6.type("p")
+    pump(s6, 0.5)
+    s6.type("6")
+    pump(s6, 0.6)
+    s6.key("esc")
+    pump(s6, 0.8)
+    t = s6.screen_text()
+    check("the Context panel names what fills the window",
+          all(w in t for w in ("system", "tools", "memory", "messages", "free")), t[:1400])
+    check("…and where compaction starts", "compacts at" in t and "of 200k tokens" in t, t[:1400])
+    s6.terminate()
+    try:
+        os.killpg(mock6.pid, signal.SIGTERM)
+    except Exception:
+        mock6.terminate()
+    _shutil.rmtree(work6, ignore_errors=True)
+
+    # ── 5i. Grants: s remembers a kind of call, a keeps it, n says why ─────
+    # `s` allows the calls that match the rule the card offered
+    # (Bash(git init *)) for the rest of the session: a second matching call
+    # runs without a card, one that does not match still asks. `a` also writes
+    # the rule to the folder's local settings (only once the folder is
+    # trusted), and a NEW process reads it back. `n` opens a field and what is
+    # typed comes back to the model as the denial's reason. Before this the
+    # only way not to be asked again was `R`: every Bash command until quit.
+    def on_screen(sess, needle, secs):
+        """Wait until `needle` is on the emulated screen NOW (wait_for also
+        matches anything ever written, which cannot tell one card from the
+        next)."""
+        end_at = time.time() + secs
+        while time.time() < end_at:
+            sess.read(0.3)
+            if needle in sess.screen_text():
+                return True
+        return False
+
+    def grant_session(work, script, tag, trust=False):
+        """A TUI on a scripted provider, working in `work`. Returns
+        (session, mock, request_log)."""
+        script_path = os.path.join(work, f"script-{tag}.json")
+        with open(script_path, "w") as fh:
+            _json.dump(script, fh)
+        _ss = _socket.socket()
+        _ss.bind(("127.0.0.1", 0))
+        port = _ss.getsockname()[1]
+        _ss.close()
+        log = os.path.join(work, f"req-{tag}.jsonl")
+        mock = subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripted_mock.py"),
+             "--port", str(port), "--script", script_path, "--log", log],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        time.sleep(0.8)
+        home = os.path.join(work, "home")
+        if not os.path.isdir(home):
+            subprocess.run([args.binary, "init", "--home", home, "--no-provider"],
+                           capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home))
+        if trust:
+            subprocess.run([args.binary, "--home", home, "folder", "trust", work],
+                           capture_output=True, timeout=30, env=dict(os.environ, ORBIT_HOME=home))
+        with open(os.path.join(home, "providers.toml"), "w") as fh:
+            fh.write(f'[[provider]]\nname = "scripted"\nurl = "http://127.0.0.1:{port}"\n'
+                     '[[provider.models]]\nid = "scripted"\ncontext_window = 200000\n')
+        sess = PtySession([args.binary, "--home", home, "--model", "scripted"],
+                          env={"ORBIT_HOME": home}, timeout=20, rows=48, cols=164, cwd=work)
+        sess.wait_for("ORBIT", timeout=15)
+        pump(sess, 2.6)
+        return sess, mock, log
+
+    def end_grant_session(sess, mock):
+        sess.terminate()
+        try:
+            os.killpg(mock.pid, signal.SIGTERM)
+        except Exception:
+            mock.terminate()
+
+    def git_dir(work, name):
+        return os.path.isdir(os.path.join(work, name, ".git"))
+
+    # An untrusted folder: `s` is offered and `a` is not.
+    work7 = _tempfile.mkdtemp(prefix="orbit-pty-grant-")
+    script7 = {"main": [
+        {"tools": [{"name": "Bash", "args": {"command": "git init pty-a"}}]},
+        {"tools": [{"name": "Bash", "args": {"command": "git init pty-b"}}]},
+        {"tools": [{"name": "Bash", "args": {"command": "touch pty-c"}}]},
+        {"text": "Grant round finished."},
+    ]}
+    s7, mock7, log7 = grant_session(work7, script7, "s")
+    s7.type("go")
+    s7.key("enter")
+    card = on_screen(s7, "Allow Bash", 20)
+    t = s7.screen_text()
+    check("the card names the rule that s would remember",
+          card and "s grants" in t and "Bash(git init *)" in t, t[-600:])
+    check("…and does not offer to save it in a folder that is not trusted",
+          "a grants" not in t and "R grants" not in t, t[-600:])
+    # `?` opens the key help over the card (the status line says so), and it
+    # documents the new keys; closing it leaves the card to answer.
+    s7.type("?")
+    helped = on_screen(s7, "this kind of call, session", 5)
+    t = s7.screen_text()
+    check("? opens the key help over the card, and it lists s, a and n in full",
+          helped and "same, saved in this folder" in t and "deny, with a word on why" in t, t)
+    s7.key("esc")
+    pump(s7, 0.8)
+    check("closing the help leaves the card waiting for an answer",
+          "Allow Bash" in s7.screen_text() and not os.path.isdir(os.path.join(work7, "pty-a")),
+          s7.screen_text()[-600:])
+    pump(s7, 1.6)  # §9.14: the card ignores keys for a second after the last one
+    s7.key("s")
+    # The second `git init` matches the rule, so it raises no card; the next
+    # card is the `touch`, which does not.
+    asked_touch = on_screen(s7, "touch pty-c", 25)
+    t = s7.screen_text()
+    check("the call the person allowed ran", git_dir(work7, "pty-a"))
+    check("a second call matching the rule ran without asking",
+          asked_touch and git_dir(work7, "pty-b"), t[-600:])
+    check("a call that does not match still asks", asked_touch and "Allow Bash" in t, t[-600:])
+    pump(s7, 1.6)
+    s7.key("n")
+    field = on_screen(s7, "because", 5)
+    check("n opens a field for a word on why", field, s7.screen_text()[-600:])
+    s7.type("use make instead")
+    s7.key("enter")
+    finished = on_screen(s7, "Grant round finished", 30)
+    check("a denial with a note lets the round finish", finished, s7.screen_text()[-600:])
+    check("the denied call never ran", not os.path.exists(os.path.join(work7, "pty-c")))
+    try:
+        sent = open(log7).read()
+    except OSError:
+        sent = ""
+    check("the note reached the model as the reason",
+          "denied by the operator: use make instead" in sent, sent[-600:])
+    end_grant_session(s7, mock7)
+    _shutil.rmtree(work7, ignore_errors=True)
+
+    # A trusted folder: `a` saves the rule, and a new process reads it back.
+    work8 = _tempfile.mkdtemp(prefix="orbit-pty-always-")
+    script8a = {"main": [
+        {"tools": [{"name": "Bash", "args": {"command": "git init pty-a"}}]},
+        {"text": "Saved round finished."},
+    ]}
+    s8, mock8, _ = grant_session(work8, script8a, "a1", trust=True)
+    s8.type("go")
+    s8.key("enter")
+    card = on_screen(s8, "Allow Bash", 20)
+    t = s8.screen_text()
+    check("in a trusted folder the card also offers to save the rule",
+          card and "a grants" in t and "settings.local.toml" in t, t[-600:])
+    pump(s8, 1.6)
+    s8.key("a")
+    done = on_screen(s8, "Saved round finished", 30)
+    check("a lets the call run", done and git_dir(work8, "pty-a"), s8.screen_text()[-600:])
+    local = os.path.join(work8, ".orbit", "settings.local.toml")
+    try:
+        saved = open(local).read()
+    except OSError:
+        saved = ""
+    check("a wrote the rule to the folder's local settings",
+          "Bash(git init *)" in saved, saved)
+    try:
+        ignored = open(os.path.join(work8, ".orbit", ".gitignore")).read()
+    except OSError:
+        ignored = ""
+    check("…and keeps that file out of version control",
+          "settings.local.toml" in ignored, ignored)
+    end_grant_session(s8, mock8)
+
+    script8b = {"main": [
+        {"tools": [{"name": "Bash", "args": {"command": "git init pty-b"}}]},
+        {"text": "Second session finished."},
+    ]}
+    s9, mock9, _ = grant_session(work8, script8b, "a2")
+    s9.type("go")
+    s9.key("enter")
+    asked = False
+    done = False
+    end_at = time.time() + 30
+    while time.time() < end_at:
+        pump(s9, 0.3)
+        txt = s9.screen_text()
+        asked = asked or "Allow Bash" in txt
+        if "Second session finished" in txt:
+            done = True
+            break
+    check("a new session, same folder, runs the saved rule's call without asking",
+          done and not asked and git_dir(work8, "pty-b"), s9.screen_text()[-600:])
+    end_grant_session(s9, mock9)
+    _shutil.rmtree(work8, ignore_errors=True)
 
     # ── 6. /sessions + /resume round-trip ──────────────────────────────────
     # A completed turn (the tool turn above) saved a session file.

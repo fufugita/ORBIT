@@ -2484,7 +2484,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orbit-adapter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2505,7 +2505,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "ed25519-dalek",
@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-conformance"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "orbit-adapter",
  "orbit-ir",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-context"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-egress"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -2591,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "orbit-adapter",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-export"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "chrono",
@@ -2626,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-frontend-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "orbit-adapter",
@@ -2653,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-hud"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2662,7 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-hud-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "crossterm",
@@ -2674,13 +2674,12 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "toml 0.8.23",
- "unicode-segmentation",
  "unicode-width",
 ]
 
 [[package]]
 name = "orbit-ir"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2689,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-ledger"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "hex",
@@ -2704,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-ledger-events"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2713,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "orbit-adapter",
@@ -2725,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -2736,7 +2735,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-migrator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2745,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-mock-provider"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -2761,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-pib"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -2777,7 +2776,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-plugin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -2794,7 +2793,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-provider-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2817,7 +2816,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-reactor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2827,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-release"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -2838,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -2848,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2857,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -2893,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "ignore",
@@ -2901,6 +2900,7 @@ dependencies = [
  "orbit-frontend-protocol",
  "regex",
  "reqwest",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "serde",
@@ -2908,13 +2908,14 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "toml 0.8.23",
+ "toml_edit",
  "ulid",
  "url",
 ]
 
 [[package]]
 name = "orbit-trust"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -2931,7 +2932,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "futures",

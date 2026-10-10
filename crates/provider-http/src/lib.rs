@@ -75,6 +75,9 @@ pub fn shared_tls_client(
 /// local mocks). Same pooling rationale as `shared_tls_client`.
 pub fn shared_plain_client() -> Result<reqwest::Client, TransportError> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    // Building any client needs the process-wide crypto provider; this one
+    // used to rely on some other adapter having installed it first.
+    tls::ensure_crypto_provider();
     Ok(CLIENT
         .get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())
         .clone())

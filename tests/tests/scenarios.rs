@@ -516,6 +516,86 @@ fn scenario_a1_anthropic_wire() {
         !ended.is_empty() && ended[0]["input_tokens"].as_u64().unwrap_or(0) >= 100,
         "input_tokens parsed from message_start.usage (B7)"
     );
+    // 4. A provider that reports usage gets its counts on the egress row
+    //    the Activity panel shows.
+    let egress: Vec<&str> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("ledger_appended")
+                && e.get("kind").and_then(|k| k.as_str()) == Some("egress")
+        })
+        .filter_map(|e| e.get("summary").and_then(|s| s.as_str()))
+        .collect();
+    assert!(
+        egress.first().is_some_and(|s| s.contains("100 in")),
+        "the egress row carries the reported usage: {egress:?}"
+    );
+}
+
+// ── G1: a provider that reports no usage ───────────────────────────
+// Fails before the fix: the Activity row for the request read
+// "mock-model · 0 in / 0 out", as if the call had cost nothing.
+#[test]
+fn scenario_g1_egress_row_without_usage() {
+    let script: serde_json::Value = serde_json::json!({"main": [{"text": "ok"}]});
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let (events, code) = run_p(&mock, &home, &fix.path, "hello", &[]);
+    assert_eq!(code, 0, "the turn completes: {events:?}");
+
+    let egress: Vec<&str> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("ledger_appended")
+                && e.get("kind").and_then(|k| k.as_str()) == Some("egress")
+        })
+        .filter_map(|e| e.get("summary").and_then(|s| s.as_str()))
+        .collect();
+    assert_eq!(
+        egress,
+        ["mock-model"],
+        "no reported usage means the row names the model and claims no counts"
+    );
+}
+
+// ── F2: folder trust round trip ────────────────────────────────────
+// A folder is untrusted until a person says otherwise, and the verb
+// works with the home flag in either place.
+#[test]
+fn scenario_f2_folder_trust_round_trip() {
+    let base = TempDir::new().expect("tempdir");
+    let home = base.path().join("home");
+    let project = base.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let run = |args: &[&str]| -> serde_json::Value {
+        let out = Command::new(orbit_binary())
+            .args(args)
+            .output()
+            .expect("run orbit");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("json")
+    };
+    let (h, p) = (home.to_str().unwrap(), project.to_str().unwrap());
+    assert_eq!(run(&["--home", h, "folder", "status", p])["trusted"], false);
+    assert_eq!(run(&["folder", "trust", p, "--home", h])["trusted"], true);
+    assert_eq!(run(&["--home", h, "folder", "status", p])["trusted"], true);
+    assert_eq!(
+        run(&["folder", "untrust", p, "--home", h])["trusted"],
+        false
+    );
+    assert_eq!(run(&["--home", h, "folder", "status", p])["trusted"], false);
+    let bad = Command::new(orbit_binary())
+        .args(["folder", "bogus"])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success(), "an unknown sub-command is an error");
 }
 
 // ── P1: the permission matrix ──────────────────────────────────────
@@ -1736,5 +1816,73 @@ fn scenario_c4_denial_is_typed_not_silent() {
             .unwrap_or("")
             .contains("requires --auto-tools or an allow rule"),
         "C4: the denial reason reached the provider:\n{content}"
+    );
+}
+
+// ── SA1: a subagent runs on the SESSION's provider ─────────────────
+// The Task tool derived its provider from ORBIT_GATE_URL / ORBIT_MODEL
+// and otherwise from a hard-coded 127.0.0.1:4001 and `glm-5.2`, so a
+// subagent never reached the gateway or model the session was using:
+// it failed (or, worse, went to whatever listened on 4001).
+#[test]
+fn scenario_sa1_subagent_runs_on_the_sessions_provider() {
+    let script: serde_json::Value = serde_json::json!({
+        "main": [
+            {"tools": [{"name": "Task", "args": {
+                "agent": "Explore",
+                "prompt": "SUBAGENT: find where add() is defined\nthen report"}}]},
+            {"text": "the explorer is done"}],
+        "SUBAGENT:": [
+            {"tools": [{"name": "Read", "args": {"file_path": "calc.py"}}]},
+            {"text": "add() is defined in calc.py and it subtracts."}]
+    });
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let (events, _code) = run_p(&mock, &home, &fix.path, "go", &["--auto-tools"]);
+
+    // The subagent's requests reached THIS mock, on the session's model.
+    let reqs = mock.requests();
+    let sub: Vec<&serde_json::Value> = reqs
+        .iter()
+        .filter(|r| {
+            r["body"]["messages"]
+                .as_array()
+                .and_then(|m| m.iter().find(|m| m["role"] == "user"))
+                .and_then(|m| m["content"].as_str())
+                .is_some_and(|c| c.starts_with("SUBAGENT:"))
+        })
+        .collect();
+    assert_eq!(
+        sub.len(),
+        2,
+        "the subagent made a Read round and a final round on the session's gateway: {reqs:#?}"
+    );
+    for r in &sub {
+        assert_eq!(
+            r["body"]["model"], "mock-model",
+            "the subagent runs on the session's model, not a default"
+        );
+    }
+    // Its report came back to the parent as the Task result.
+    let last = reqs.last().expect("the parent's final request");
+    let tool_msg = last["body"]["messages"]
+        .as_array()
+        .and_then(|m| m.iter().rev().find(|m| m["role"] == "tool"))
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("");
+    assert!(
+        tool_msg.contains("it subtracts"),
+        "the Task result carries the subagent's report: {tool_msg}"
+    );
+    // The card says WHICH agent, and what it was asked.
+    let started = events
+        .iter()
+        .find(|e| e["type"] == "tool_started_full" && e["kind"] == "Task")
+        .expect("a tool_started_full for the Task call");
+    assert_eq!(
+        started["target"], "Explore · SUBAGENT: find where add() is defined",
+        "{started}"
     );
 }

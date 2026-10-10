@@ -36,6 +36,10 @@ pub struct TurnOutcome {
     /// plus cache tokens, provider-normalised. NOT a sum over rounds —
     /// the context meter shows instantaneous occupancy, not traffic.
     pub context_tokens: u64,
+    /// The hash of the `EgressIntent` ledger record written before this
+    /// round left the machine — what the Activity panel shows beside the
+    /// request. `None` when the round recorded nothing.
+    pub egress_digest: Option<String>,
 }
 
 /// The provider kind selects the adapter: `openai-compatible` (default),
@@ -119,6 +123,16 @@ pub fn run_dispatch(
     let port = url
         .port()
         .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+    // The gate URL's path is the endpoint's base path, carried verbatim
+    // (DashScope `/compatible-mode/v1`, Z.ai `/api/paas/v4`, Gemini
+    // `/v1beta/openai`). Empty keeps the historical default: the adapters
+    // treat an empty path as `/v1` — except Ollama, which serves at the
+    // bare host. Normalized: always a single leading `/`, never a
+    // trailing `/` (so `{path}/chat/completions` composes).
+    let endpoint_path = match config.kind {
+        ProviderKind::Ollama => String::new(),
+        _ => normalize_endpoint_path(url.path()),
+    };
 
     // Build the route binding (generic runtime config — no internal models).
     // The adapter identity + kind follow the configured provider kind.
@@ -210,6 +224,7 @@ pub fn run_dispatch(
         endpoint_host: host,
         endpoint_port: port,
         endpoint_scheme: scheme,
+        endpoint_path: endpoint_path.clone(),
     };
 
     // Register the model + async adapter in a fresh registry.
@@ -226,7 +241,11 @@ pub fn run_dispatch(
         },
         host: route.endpoint_host.clone(),
         port,
-        path_prefix: "/v1".into(),
+        path_prefix: if endpoint_path.is_empty() {
+            "/v1".into()
+        } else {
+            endpoint_path.clone()
+        },
         provider_id: config.provider_id.clone(),
         region_id: "local".into(),
     };
@@ -341,7 +360,8 @@ pub fn run_dispatch(
         })
         .map_err(|e| (e.code, e.message))?;
 
-    let (outcome, _reservation) = result;
+    let (outcome, reservation) = result;
+    let egress_digest = Some(reservation.intent_digest).filter(|d| !d.is_empty());
     match outcome {
         orbit_gateway::DispatchOutcome::Completed(r) => {
             let output: String = r
@@ -438,6 +458,7 @@ pub fn run_dispatch(
                 context_tokens: usage.input_tokens
                     + usage.cache_read_tokens
                     + usage.cache_write_tokens,
+                egress_digest,
             })
         }
         // E1: a refusal without a usable message and without a
@@ -467,5 +488,39 @@ fn ollama_capabilities() -> orbit_adapter::types::ProviderCapabilities {
         supports_json_schema_output: false,
         max_input_tokens: 262_144,
         max_output_tokens: 32_000,
+    }
+}
+
+/// The gate URL's path as an endpoint base path: exactly one leading `/`,
+/// no trailing `/`. `/` and `` both normalize to `` (the adapters'
+/// default — `/v1` for OpenAI-compatible and Anthropic, bare for Ollama).
+fn normalize_endpoint_path(raw: &str) -> String {
+    let trimmed = raw.trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::normalize_endpoint_path;
+
+    #[test]
+    fn empty_and_root_stay_empty() {
+        assert_eq!(normalize_endpoint_path(""), "");
+        assert_eq!(normalize_endpoint_path("/"), "");
+    }
+
+    #[test]
+    fn verbatim_paths_keep_one_slash_each_side() {
+        assert_eq!(normalize_endpoint_path("/v1"), "/v1");
+        assert_eq!(
+            normalize_endpoint_path("/compatible-mode/v1/"),
+            "/compatible-mode/v1"
+        );
+        assert_eq!(normalize_endpoint_path("/api/paas/v4"), "/api/paas/v4");
+        assert_eq!(normalize_endpoint_path("/v1beta/openai"), "/v1beta/openai");
     }
 }

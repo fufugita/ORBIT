@@ -158,6 +158,62 @@ fn gate2_scripted_session_through_engine() {
         orbit_frontend_protocol::FrontendEvent::ResponseFinished { .. }
     )));
 
+    // The proof surface: each round announces the egress record it wrote
+    // BEFORE the request left, and the digest is a real link of the
+    // verified chain (not a number the UI made up), in order.
+    let egress: Vec<(u64, String)> = collected
+        .iter()
+        .filter_map(|e| match e {
+            orbit_frontend_protocol::FrontendEvent::LedgerAppended {
+                record_count,
+                head_digest,
+                kind,
+                ..
+            } if kind == "egress" => Some((*record_count, head_digest.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(egress.len(), 2, "one egress record per round: {egress:?}");
+    let (records, _head) = orbit_ledger::verify_ledger(&dir.join("ledger")).expect("ledger");
+    for (count, digest) in &egress {
+        let pos = records
+            .iter()
+            .position(|r| r.self_hash == *digest)
+            .unwrap_or_else(|| panic!("{digest} is not in the ledger"));
+        assert!(
+            matches!(
+                records[pos].record.event,
+                orbit_ledger::LedgerEvent::EgressIntent(_)
+            ),
+            "the announced record is the EgressIntent"
+        );
+        assert_eq!(
+            *count,
+            (pos + 1) as u64,
+            "the total is the ledger's own count at that point"
+        );
+    }
+    assert!(egress[0].0 < egress[1].0, "the chain only grows");
+
+    // This provider reports usage, and the row says what each round used.
+    let summaries: Vec<&str> =
+        collected
+            .iter()
+            .filter_map(|e| match e {
+                orbit_frontend_protocol::FrontendEvent::LedgerAppended {
+                    kind, summary, ..
+                } if kind == "egress" => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(summaries.len(), 2);
+    for row in &summaries {
+        assert!(
+            row.starts_with("test-model \u{b7} ") && row.contains(" in / "),
+            "the egress row names the model and the usage: {row:?}"
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

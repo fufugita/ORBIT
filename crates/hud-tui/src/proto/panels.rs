@@ -186,7 +186,10 @@ fn terminal(s: &Scenario) -> Vec<Line<'static>> {
             .fg(comps::colour(Token::Amber))
             .add_modifier(Modifier::BOLD),
     ))];
-    let tail: Vec<String> = s.tool_output.iter().rev().take(3).cloned().collect();
+    let tail: Vec<String> = s
+        .selected_tape()
+        .map(|i| s.tapes[i].lines.iter().rev().take(3).cloned().collect())
+        .unwrap_or_default();
     for line in tail.iter().rev() {
         out.push(Line::from(Span::styled(
             line.clone(),

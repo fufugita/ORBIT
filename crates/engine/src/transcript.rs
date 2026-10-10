@@ -130,6 +130,29 @@ impl Transcript {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Fork: copy this session's history into a new session id and open
+    /// the new transcript. The original is untouched (append-only). The
+    /// fork starts with a Note naming its origin, so the copy is honest
+    /// about where its history came from.
+    pub fn fork(&self, new_session_id: &str) -> std::io::Result<Transcript> {
+        let fresh = Transcript::open(self.path.parent().unwrap_or(Path::new(".")), new_session_id)?;
+        for ev in self.events() {
+            fresh.append(&ev)?;
+        }
+        fresh.append(&TranscriptEvent::Note {
+            text: format!("forked from {}", self.session_id()),
+        })?;
+        Ok(fresh)
+    }
+
+    /// This transcript's session id (the file stem).
+    pub fn session_id(&self) -> String {
+        self.path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
 }
 
 /// The checkpoint store: file bytes snapshotted by content hash before
@@ -303,6 +326,35 @@ mod tests {
         let restored = cps.restore("cp1").unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fork_copies_history_and_names_its_origin() {
+        let dir = std::env::temp_dir().join(format!("orbit-t5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = Transcript::open(&dir, "session-a").unwrap();
+        t.append(&TranscriptEvent::UserPrompt { text: "one".into() })
+            .unwrap();
+        t.append(&TranscriptEvent::Assistant {
+            text: "two".into(),
+            tool_calls: vec![],
+        })
+        .unwrap();
+
+        let fork = t.fork("session-b").unwrap();
+        assert_eq!(fork.session_id(), "session-b");
+        let events = fork.events();
+        // The copied history plus the origin note.
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[2], TranscriptEvent::Note { .. }));
+        let msgs = fork.to_messages();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "one");
+
+        // The original is untouched: still two events, no note.
+        assert_eq!(t.events().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

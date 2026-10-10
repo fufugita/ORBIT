@@ -426,7 +426,7 @@ Today one codebase carries five front-ends, two SDKs and nine libraries that onl
 | Web front-end (`crates/web`) | Its own loop at `web/turn.rs:313` | Keep, as a protocol client from phase 2: it is one of gate 2's three front-ends. No new browser features before gate 6. |
 | SDKs (TypeScript, Python) | IR types only | Freeze until phase 6, when `query()` arrives. |
 | The nine libraries only tests call: `orbit-core`, `orbit-context`, `orbit-memory`, `orbit-session`, `orbit-sandbox`, `orbit-plugin`, `orbit-ledger-events`, `orbit-api`, `orbit-ir` | Tested, never called | Change each only in the phase that wires it: the sandbox in 3; context, memory and session in 4; the plugin runtime in 5; each of `orbit-core`'s primitives, with its ledger events, in the phase that first uses it (TTE and SDE in 5, RTA, EPB and the authority extractor in 6). `orbit-api` and `orbit-ir` wait for the SDK decision below. |
-| Releases | `v0.1.0-rc.1` is tagged | No new tag until gate 3. The next release is the first one that can change code. |
+| Releases | `v0.1.0-rc.1` is tagged | Gates 3 through 6 are green, so the next release is due: `v0.2.0` is the first one that can change code. |
 
 **The SDK decision.** DR-11 names `orbit-ir` (deterministic CBOR) as the one contract between the Rust core and the SDKs, while §Headless generates the SDKs' events from the engine protocol's JSON. Settle it at the start of phase 6, before writing `query()`, and record the answer as a decision record.
 
@@ -450,3 +450,28 @@ Today one codebase carries five front-ends, two SDKs and nine libraries that onl
 **Set the record straight.** ORBIT's three status records disagree. The README says all three v0.1 release gates are met; `spec/spec-manifest.yaml` says implementation has not started; and the workspace `Cargo.toml` still forbids product semantics before the spec freeze, which passed on 12 August 2026. In phase 1, make all three match this roadmap, with the README naming the last gate ORBIT has passed. Record the engine and its protocol, the tool contract, the permission model and the sandbox as new decision records rather than edits to the frozen DR-01 to DR-14.
 
 **Not now.** These wait until after gate 6: a model-based `auto` mode, Bedrock and Vertex, IDE integrations, a plugin marketplace, and the desktop and Go front-end ports.
+
+## Where this stands (9 Oct 2026)
+
+Written against the `night-2026-10-09` branch; the plan above is unchanged. Hashes are from `git log`.
+
+**Fix first: nine of nine done.** All nine landed in `bb4db4e` (2 Oct) and still hold in the code. The approval card has since gone from honest to useful: it carries the Edit diff, the sandbox state and what `R` grants (`9c9cd2d`), and `!cmd` runs through the Bash tool path (`12399c8`). `ci.yml` exists and the Tauri crate is outside the default build; that CI is green on a fresh runner is still confirmed only by a push.
+
+**Gates 1 to 6: the scripted tests pass** (`tests/tests/gates.rs`, `tests/tests/scenarios.rs`). The rule under "How a gate runs" also asks for one run against a real model through the Anthropic adapter. That run has not been made, so by this document's own rule no gate is passed yet.
+
+| Phase | Landed |
+| --- | --- |
+| 1. Fix first | `bb4db4e` |
+| 2. One engine | `a18dff4`, `fb3312e`; gate test `97cc638` |
+| 3. Tools and safety | `047575a` |
+| 4. Context and sessions | `0112fec` |
+| 5. Extensions | `5b18e7e` |
+| 6. Automation and proof | `4bbdf20` |
+
+The first review found the phases built but not wired into the live path; `fddad2d` and `853384a` (3 Oct) wired them. After that came the repair guide's B, S, E, C and Q series (`c8b46e7` to `9292c7f`), the terminal watchdog (`604564c`), the shell tool's pipe drain and `kill(2)` fix (`0d43971`, `3b57e2c`), and the panels that read engine events: Terminal (`45cf3e0`, `fa63fe6`), Plan (`60acf86`), Activity (`727e029`), Agents (`afcdad3`) and Context (`9743955`). The approval card then got pattern grants: a Bash rule matches the whole command and never through an operator (`a78cc1b`), a folder's own settings grant nothing until it is trusted (`a232b81`), `s` and `a` remember a rule and `n` takes a note (`ca6b7c3`), and the card shows the keys (`f0b6be9`). The earlier three-pane HUD and `--old-tui` were then deleted on their own branch, `night-2026-10-09-delete-v1-hud` (`f814bfb`, `9d284ba`); the default screen never expanded `@path`, which only the old composer did, so that went with it.
+
+On 10 Oct the same branch grew the provider work: the gate URL's path reaches the adapters (`bfa3f5e` — DashScope, Z.ai and Gemini endpoints were unreachable before), discovery speaks each provider's dialect (`95da7a7`), provider presets and `orbit provider` (`1996740`), model roles as the task router (`5ae6a34`), `install.sh` (`b1a5571`), and the web and Go front-ends learned `s`, `a` and the denial note (`5cb97fd`).
+
+**Open.** Narrow-screen polish. "Not now" above is unchanged. The real-model gate runs are done (10 Oct): a live litellm gateway (`glm-5.3`) configured as an `anthropic`-kind provider drove every gate — plain `-p` turn, a Read-tool turn, a Bash-tool turn through the sandbox, and an interactive TUI turn over a PTY — with the ledger verified after (28 records, chain intact).
+
+`R` is removed (10 Oct): no release ever shipped it, so there was no muscle memory to migrate — the card offers `y` alone when no rule can be offered, the whole-tool `AllowSession` verdict stays as the web/Go `session` wire word.

@@ -66,15 +66,10 @@ impl OpenAiCompatibleHttpV1 {
         // Validate the route offline (DR-09 §3 — no I/O).
         self.validate_route(&request.route)?;
 
-        // Scheme from the route binding: HttpLoopback → http, else https
-        // with SPKI pinning. A homelab mock on a LAN IP uses HttpLoopback.
-        let host = &request.route.endpoint_host;
-        let scheme = match request.route.endpoint_scheme {
-            orbit_adapter::types::EndpointScheme::HttpLoopback => "http",
-            _ => "https",
-        };
-        let base = format!("{scheme}://{host}:{}{}", request.route.endpoint_port, "/v1");
-        let url = format!("{base}/chat/completions");
+        // URL from the route: scheme (HttpLoopback → http, else https with
+        // SPKI pinning) + host/port + the gate URL's base path (empty =
+        // the historical `/v1`).
+        let url = chat_completions_url(&request.route);
 
         // Build the wire body — sampling as provider floats ONLY here.
         // Multi-turn transcript wins when present; otherwise the single
@@ -429,6 +424,80 @@ pub fn openai_capabilities() -> ProviderCapabilities {
     }
 }
 
-/// Suppress unused-import lint for types used only in the stream closure.
-#[allow(unused_imports)]
-use std::convert::Infallible as _Unused;
+/// The chat-completions URL for a route: `{scheme}://{host}:{port}{path}/chat/completions`.
+/// An empty `endpoint_path` keeps the historical `/v1` default.
+pub fn chat_completions_url(route: &ProviderRouteBinding) -> String {
+    let scheme = match route.endpoint_scheme {
+        orbit_adapter::types::EndpointScheme::HttpLoopback => "http",
+        _ => "https",
+    };
+    let path = if route.endpoint_path.is_empty() {
+        "/v1"
+    } else {
+        route.endpoint_path.as_str()
+    };
+    format!(
+        "{scheme}://{}:{}{path}/chat/completions",
+        route.endpoint_host, route.endpoint_port
+    )
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::chat_completions_url;
+    use super::openai_identity;
+    use orbit_adapter::types::{EndpointScheme, ProviderRouteBinding};
+
+    fn route(host: &str, port: u16, path: &str) -> ProviderRouteBinding {
+        ProviderRouteBinding {
+            provider_id: orbit_adapter::types::ProviderId("p".into()),
+            deployment_id: orbit_adapter::types::DeploymentId("p".into()),
+            region_id: orbit_adapter::types::RegionId("r".into()),
+            adapter_kind: orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1,
+            adapter_implementation_digest: openai_identity().implementation_digest,
+            adapter_profile_digest: openai_identity().profile_digest,
+            endpoint_digest: orbit_adapter::types::Sha256Digest("e".repeat(64)),
+            expected_model: "m".into(),
+            pricing_digest: orbit_adapter::types::Sha256Digest("0".repeat(64)),
+            endpoint_host: host.into(),
+            endpoint_port: port,
+            endpoint_scheme: EndpointScheme::Https,
+            endpoint_path: path.into(),
+        }
+    }
+
+    #[test]
+    fn empty_path_keeps_the_v1_default() {
+        assert_eq!(
+            chat_completions_url(&route("api.openai.com", 443, "")),
+            "https://api.openai.com:443/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn gate_paths_are_carried_verbatim() {
+        // DashScope international
+        assert_eq!(
+            chat_completions_url(&route(
+                "dashscope-intl.aliyuncs.com",
+                443,
+                "/compatible-mode/v1"
+            )),
+            "https://dashscope-intl.aliyuncs.com:443/compatible-mode/v1/chat/completions"
+        );
+        // Z.ai (GLM)
+        assert_eq!(
+            chat_completions_url(&route("api.z.ai", 443, "/api/paas/v4")),
+            "https://api.z.ai:443/api/paas/v4/chat/completions"
+        );
+        // Gemini's OpenAI-compat surface
+        assert_eq!(
+            chat_completions_url(&route(
+                "generativelanguage.googleapis.com",
+                443,
+                "/v1beta/openai"
+            )),
+            "https://generativelanguage.googleapis.com:443/v1beta/openai/chat/completions"
+        );
+    }
+}

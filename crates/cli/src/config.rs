@@ -129,6 +129,63 @@ fn default_kind() -> String {
 pub struct ProvidersConfig {
     #[serde(default)]
     pub provider: Vec<ProviderConfig>,
+    /// Task roles (the built-in router). Absent = every role falls back
+    /// to the session's own model. See [`RolesConfig`].
+    #[serde(default)]
+    pub roles: RolesConfig,
+}
+
+/// Task roles: which model serves each kind of work. This is ORBIT's
+/// routing surface — deliberately task-based, not per-prompt. Caches
+/// and thinking blocks belong to one model, so switching the main
+/// conversation mid-thread costs an uncached turn and drops replayed
+/// thinking; routing the *task* (a subagent, a summary) keeps the main
+/// conversation on one model (roadmap §Providers).
+///
+/// Each value is a model id (resolved across every provider) or a
+/// `provider/model` pair when the same id is declared twice.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolesConfig {
+    /// The main conversation's model. Used when no `--model`/`ORBIT_MODEL`
+    /// was given.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub main: String,
+    /// Task-tool subagents (the general-purpose path).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subagent: String,
+    /// Read-only Explore/Plan subagents and other cheap research.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub explore: String,
+    /// Auto-compaction summaries.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub compaction: String,
+}
+
+impl RolesConfig {
+    /// Every declared role as (role name, model spec).
+    pub fn entries(&self) -> Vec<(&'static str, &str)> {
+        vec![
+            ("main", self.main.as_str()),
+            ("subagent", self.subagent.as_str()),
+            ("explore", self.explore.as_str()),
+            ("compaction", self.compaction.as_str()),
+        ]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+    }
+
+    /// The declared spec for one role, if set.
+    pub fn get(&self, role: &str) -> Option<&str> {
+        let v = match role {
+            "main" => &self.main,
+            "subagent" => &self.subagent,
+            "explore" => &self.explore,
+            "compaction" => &self.compaction,
+            _ => return None,
+        };
+        (!v.is_empty()).then_some(v.as_str())
+    }
 }
 
 /// The ONE ORBIT-home resolver (C8): `--home` flag > `ORBIT_HOME` env >
@@ -181,6 +238,12 @@ impl ProvidersConfig {
         Ok(cfg)
     }
 
+    /// Parse a config from raw TOML (tests and tooling; `load` reads the
+    /// home's file).
+    pub fn load_from_str(raw: &str) -> Result<Self, String> {
+        toml::from_str(raw).map_err(|e| format!("parse providers: {e}"))
+    }
+
     /// Aggregate every declared model across all providers as (provider, model).
     pub fn all_models(&self) -> Vec<(String, String)> {
         self.provider
@@ -194,6 +257,20 @@ impl ProvidersConfig {
         self.provider
             .iter()
             .find(|p| p.models.iter().any(|m| m.id == model))
+    }
+
+    /// Resolve one role's spec to its owning provider. A bare model id
+    /// searches every provider; `provider/model` names its provider
+    /// directly (for the same id declared twice). None = the role is not
+    /// configured, or names nothing that exists.
+    pub fn provider_for_role_spec(&self, spec: &str) -> Option<&ProviderConfig> {
+        if let Some((prov, model)) = spec.split_once('/') {
+            return self
+                .provider
+                .iter()
+                .find(|p| p.name == prov && p.models.iter().any(|m| m.id == model));
+        }
+        self.provider_for_model(spec)
     }
 
     /// The declared max output tokens for a model id, if any.
@@ -234,6 +311,27 @@ impl ProvidersConfig {
             return Err(format!("provider '{}' already configured", p.name));
         }
         self.provider.push(p);
+        Ok(())
+    }
+
+    /// Set one role's model spec. An empty value clears the role.
+    /// A spec that names no configured model is refused — a role that
+    /// silently falls through to another model is a surprise, not a
+    /// convenience.
+    pub fn set_role(&mut self, role: &str, spec: &str) -> Result<(), String> {
+        if !spec.is_empty() && self.provider_for_role_spec(spec).is_none() {
+            return Err(format!(
+                "role '{role}' names model '{spec}' which no provider declares"
+            ));
+        }
+        let slot = match role {
+            "main" => &mut self.roles.main,
+            "subagent" => &mut self.roles.subagent,
+            "explore" => &mut self.roles.explore,
+            "compaction" => &mut self.roles.compaction,
+            other => return Err(format!("unknown role '{other}'")),
+        };
+        *slot = spec.to_string();
         Ok(())
     }
 
@@ -292,6 +390,56 @@ impl ModelListResponse {
             return Err("models response contained no data".into());
         }
         Ok(ids)
+    }
+}
+
+/// Parsed Ollama `/api/tags` response: `{models:[{name:"..."}]}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct OllamaTagsResponse {
+    pub models: Vec<OllamaTagsItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct OllamaTagsItem {
+    pub name: String,
+}
+
+impl OllamaTagsResponse {
+    /// Parse a raw `/api/tags` body; missing/empty models is an error so
+    /// callers can fall back to manual model entry.
+    pub fn parse(raw: &str) -> Result<Vec<String>, String> {
+        let parsed: OllamaTagsResponse =
+            serde_json::from_str(raw).map_err(|e| format!("parse tags response: {e}"))?;
+        let ids: Vec<String> = parsed.models.into_iter().map(|m| m.name).collect();
+        if ids.is_empty() {
+            return Err("tags response contained no models".into());
+        }
+        Ok(ids)
+    }
+}
+
+/// The per-model limits an Anthropic `/v1/models/{id}` detail body
+/// carries, mapped to the config's own fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AnthropicModelLimits {
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u32>,
+}
+
+/// Parse an Anthropic `/v1/models/{id}` body for its limits. Unknown
+/// shapes return the empty struct — a detail fetch is best-effort and
+/// never blocks model selection.
+pub fn parse_anthropic_model_detail(raw: &str) -> AnthropicModelLimits {
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return AnthropicModelLimits::default(),
+    };
+    AnthropicModelLimits {
+        context_window: parsed.pointer("/max_input_tokens").and_then(|v| v.as_u64()),
+        max_output_tokens: parsed
+            .pointer("/max_tokens")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok()),
     }
 }
 
@@ -496,5 +644,105 @@ output_per_million_microcents = 600000
         let ids = ModelListResponse::parse(raw).unwrap();
         assert_eq!(ids, vec!["glm-5.2".to_string(), "kimi-k2.7".to_string()]);
         assert!(ModelListResponse::parse(r#"{"data":[]}"#).is_err());
+    }
+
+    #[test]
+    fn parses_ollama_tags_response() {
+        let raw = r#"{"models":[{"name":"qwen3.5:9b"},{"name":"llama4:8b"}]}"#;
+        let ids = OllamaTagsResponse::parse(raw).unwrap();
+        assert_eq!(ids, vec!["qwen3.5:9b".to_string(), "llama4:8b".to_string()]);
+        assert!(OllamaTagsResponse::parse(r#"{"models":[]}"#).is_err());
+        assert!(OllamaTagsResponse::parse("not json").is_err());
+    }
+
+    #[test]
+    fn parses_anthropic_model_detail_limits() {
+        let raw = r#"{"id":"claude-opus-5-5","max_input_tokens":200000,"max_tokens":64000}"#;
+        let limits = parse_anthropic_model_detail(raw);
+        assert_eq!(limits.context_window, Some(200_000));
+        assert_eq!(limits.max_output_tokens, Some(64_000));
+        // Unknown/absent shapes stay empty, never fail.
+        let none = parse_anthropic_model_detail(r#"{"id":"x"}"#);
+        assert_eq!(none, AnthropicModelLimits::default());
+        assert_eq!(
+            parse_anthropic_model_detail("garbage"),
+            AnthropicModelLimits::default()
+        );
+    }
+
+    fn roles_cfg() -> ProvidersConfig {
+        let raw = r#"
+[[provider]]
+name = "anthropic"
+url = "https://api.anthropic.com"
+kind = "anthropic"
+[[provider.models]]
+id = "claude-opus-5-5"
+[[provider.models]]
+id = "claude-haiku-4-5"
+[[provider]]
+name = "local"
+url = "http://127.0.0.1:11434"
+kind = "ollama"
+[[provider.models]]
+id = "claude-haiku-4-5"
+
+[roles]
+main = "claude-opus-5-5"
+explore = "local/claude-haiku-4-5"
+"#;
+        ProvidersConfig::load_from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn roles_parse_and_resolve() {
+        let cfg = roles_cfg();
+        assert_eq!(cfg.roles.main, "claude-opus-5-5");
+        assert_eq!(cfg.roles.explore, "local/claude-haiku-4-5");
+        // Bare id finds its (first) owner.
+        let owner = cfg.provider_for_role_spec("claude-opus-5-5").unwrap();
+        assert_eq!(owner.name, "anthropic");
+        // provider/model disambiguates a duplicated id.
+        let local = cfg
+            .provider_for_role_spec("local/claude-haiku-4-5")
+            .unwrap();
+        assert_eq!(local.kind, "ollama");
+        assert!(cfg.provider_for_role_spec("no-such-model").is_none());
+    }
+
+    #[test]
+    fn set_role_rejects_unknown_models_and_roles() {
+        let mut cfg = roles_cfg();
+        assert!(cfg.set_role("main", "ghost-model").is_err());
+        assert!(cfg.set_role("warmonger", "claude-opus-5-5").is_err());
+        // Clearing is allowed.
+        assert!(cfg.set_role("explore", "").is_ok());
+        assert!(cfg.roles.explore.is_empty());
+    }
+
+    #[test]
+    fn roles_survive_the_save_roundtrip() {
+        let home = std::env::temp_dir().join(format!("orbit-roles-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        let mut cfg = roles_cfg();
+        cfg.set_role("subagent", "claude-opus-5-5").unwrap();
+        cfg.save_atomic(&home).unwrap();
+        let back = ProvidersConfig::load(&home).unwrap();
+        assert_eq!(back.roles.subagent, "claude-opus-5-5");
+        assert_eq!(back.roles.explore, "local/claude-haiku-4-5");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn providers_without_roles_section_load_clean() {
+        let raw = r#"
+[[provider]]
+name = "solo"
+url = "http://127.0.0.1:4001"
+[[provider.models]]
+id = "m1"
+"#;
+        let cfg = ProvidersConfig::load_from_str(raw).unwrap();
+        assert!(cfg.roles.entries().is_empty());
     }
 }

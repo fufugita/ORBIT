@@ -37,8 +37,22 @@ pub struct Scenario {
     pub tasks: Vec<crate::proto::panels::TaskRow>,
     /// The Changes panel's rows (FileChanged).
     pub file_changes: Vec<crate::proto::panels::FileChangeRow>,
-    /// The Terminal panel's output tail (ToolOutput lines).
-    pub tool_output: Vec<String>,
+    /// The Terminal panel's tapes, oldest first: one per Bash call, holding
+    /// the output the card does not (the card, found by `call_id`, holds
+    /// the command and how it ended).
+    pub tapes: Vec<Tape>,
+    /// The tape the Terminal shows; `None` follows the newest, so a new
+    /// command takes the panel unless the person is reading an older one.
+    pub tape_sel: Option<usize>,
+    /// The Activity panel's rows, oldest first (capped).
+    pub activity: Vec<ActivityRow>,
+    /// What the context is made of (the engine's estimate), when it said.
+    pub ctx_breakdown: Option<orbit_frontend_protocol::ContextBreakdown>,
+    /// Compactions this session, oldest first (capped): when, and the
+    /// conversation's estimated size before and after.
+    pub compactions: Vec<CompactionRow>,
+    /// The size a running compaction started from.
+    pub compacting_from: Option<u64>,
     /// Context meter (Usage): tokens in use, the window, when shown.
     pub used_tokens: u64,
     pub window_tokens: u64,
@@ -66,6 +80,16 @@ pub struct Scenario {
     /// The pending approval's backend-classified risk (0..=3) and the
     /// directory the call runs in (§9.14 facts — real values only).
     pub approval_risk: u8,
+    /// Real facts for the pending approval's card (the sandbox state of
+    /// a command): `(label, value)`.
+    pub approval_facts: Vec<(String, String)>,
+    /// The lines an edit or write would change, for the card.
+    pub approval_preview: Vec<String>,
+    /// The rule `s` and `a` would remember, with the call it was derived
+    /// for. Read it through [`Scenario::offered_grant`].
+    pub approval_grant: Option<(String, crate::msg::ApprovalGrant)>,
+    /// The note being typed with a denial (`n` opened the field), if any.
+    pub approval_note: Option<String>,
     /// Ledger records appended this session (the top bar's `●` chip).
     pub ledger_count: Option<u64>,
     /// The screen animates until this tick (ms): bumped by every
@@ -86,6 +110,11 @@ pub struct Scenario {
     /// parallel to `tasks` / `file_changes`.
     pub task_changed_ms: Vec<u64>,
     pub file_changed_ms: Vec<u64>,
+    /// The Changes / Review panels' selected file (`j`/`k`) and the
+    /// Review panel's current hunk of it (`n`/`p`). Not clamped on
+    /// write: read through `selected_file` / `selected_hunk`.
+    pub file_sel: usize,
+    pub hunk_sel: usize,
     /// Rate-limit backoff: retry at this tick, and for how long it
     /// started (M27).
     pub backoff_until_ms: Option<u64>,
@@ -123,6 +152,49 @@ pub struct Scenario {
     pub phase: usize,
 }
 
+/// One row of the Activity panel: something that happened, in order. The
+/// ledger-backed rows (`digest` set) are the proof surface: each carries
+/// the hash of the record it announces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityRow {
+    /// Local wall-clock `HH:MM:SS` when it landed.
+    pub time: String,
+    /// `intent` / `verdict` / `result` (ledger records) or `request` /
+    /// `compaction` / `retry` (runtime events).
+    pub kind: String,
+    /// What it is about (`Edit(calc.py)`, `api.example.com`).
+    pub target: String,
+    /// The recorded fact (`allowed — operator approved`, `ok`).
+    pub fact: String,
+    /// The ledger record's own hash, when the row is a record.
+    pub digest: Option<String>,
+}
+
+/// One finished compaction, for the Context panel's history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionRow {
+    /// Local wall-clock `HH:MM:SS` when it finished.
+    pub time: String,
+    /// The conversation's estimated tokens before and after.
+    pub before: u64,
+    pub after: u64,
+}
+
+/// How many lines one tape keeps, and how many tapes the panel keeps.
+pub const TAPE_MAX_LINES: usize = 400;
+pub const TAPE_MAX: usize = 20;
+
+/// One command's output in the Terminal panel. Only the lines live here;
+/// the command, its state and its duration are the transcript card's
+/// (matched by `call_id`), so the two cannot disagree.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Tape {
+    pub call_id: String,
+    pub lines: Vec<String>,
+    /// Lines cut from the front to keep the bound (the panel says so).
+    pub dropped: usize,
+}
+
 /// The M5 turn report: ✓ done · 41s · 3 tools · +$0.0031.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnReport {
@@ -141,6 +213,9 @@ pub struct TranscriptLine {
     /// `{glyph} {name}  {arg}` with right-aligned meta.
     pub tool_name: String,
     pub tool_state: ToolState,
+    /// Tool lines: the engine's id for the call. Start and finish find
+    /// their card by it, so two calls of one tool never share a line.
+    pub call_id: String,
     /// User/model turns: the submit/settle time (`HH:MM`), shown
     /// right-aligned on the first row (§9.4/§9.5).
     pub time: Option<String>,
@@ -166,6 +241,7 @@ impl Default for TranscriptLine {
             text: String::new(),
             tool_name: String::new(),
             tool_state: ToolState::Queued,
+            call_id: String::new(),
             time: None,
             meta: String::new(),
             arrivals: Vec::new(),
@@ -187,6 +263,8 @@ pub enum ToolState {
     Failed,
     Denied,
     Blocked,
+    /// Stopped by Esc, or cut off when the turn ended.
+    Cancelled,
 }
 
 impl ToolState {
@@ -201,6 +279,7 @@ impl ToolState {
             ToolState::Failed => ("✕", Token::Red),
             ToolState::Denied => ("⊘", Token::Muted),
             ToolState::Blocked => ("⊖", Token::Amber),
+            ToolState::Cancelled => ("⊘", Token::Muted),
         }
     }
 }
@@ -222,8 +301,15 @@ pub enum LineKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agent {
     pub name: String,
+    /// What it was asked to do (its prompt's first line).
+    pub task: String,
+    /// What it is doing now (its latest tool call); empty until it starts one.
     pub action: String,
+    /// Its final words once it has finished, or why it stopped.
+    pub report: String,
     pub done: bool,
+    /// Whether it completed: false when it failed or was stopped.
+    pub ok: bool,
     /// When it started / finished (M15, M16).
     pub started_ms: u64,
     pub done_ms: Option<u64>,
@@ -248,6 +334,15 @@ impl Scenario {
         Self::default()
     }
 
+    /// The rule `s` and `a` would remember for the call the card is asking
+    /// about. A rule derived for another call (its detail arrived late or
+    /// out of order) is not offered: the card must never name one rule
+    /// while a key grants another (design law 6).
+    pub fn offered_grant(&self) -> Option<&crate::msg::ApprovalGrant> {
+        let (call, grant) = self.approval_grant.as_ref()?;
+        (self.approval_call_id.as_deref() == Some(call.as_str())).then_some(grant)
+    }
+
     /// The star state for the current scenario (§10.1's table, first
     /// match wins).
     /// A monotonic change counter (§10.5): any state mutation bumps
@@ -259,7 +354,12 @@ impl Scenario {
             + self.running.len() as u64
             + self.approval_queue.len() as u64
             + self.approval_summary.is_some() as u64
-            + self.tool_output.len() as u64
+            + self
+                .tapes
+                .iter()
+                .map(|t| t.lines.len() + t.dropped)
+                .sum::<usize>() as u64
+            + self.tapes.len() as u64
             + (self.turn_live as u64)
             + (self.last_failed as u64)
     }
@@ -271,6 +371,118 @@ impl Scenario {
         let p = (now_ms.saturating_sub(self.ctx_ms) as f32 / 300.0).clamp(0.0, 1.0);
         let e = 1.0 - (1.0 - p).powi(3);
         self.ctx_from + (self.ctx_to - self.ctx_from) * e
+    }
+
+    /// The tape the Terminal shows: the newest unless one was picked.
+    pub fn selected_tape(&self) -> Option<usize> {
+        match self.tapes.len() {
+            0 => None,
+            n => Some(self.tape_sel.map_or(n - 1, |i| i.min(n - 1))),
+        }
+    }
+
+    /// Pick the previous (`-1`) or next (`+1`) tape. Landing on the newest
+    /// goes back to following it.
+    pub fn move_tape_selection(&mut self, delta: isize) {
+        let Some(cur) = self.selected_tape() else {
+            return;
+        };
+        let last = self.tapes.len() - 1;
+        let next = (cur as isize + delta).clamp(0, last as isize) as usize;
+        self.tape_sel = if next == last { None } else { Some(next) };
+    }
+
+    /// Show tape `i` (a click on its tab).
+    pub fn pick_tape(&mut self, i: usize) {
+        let last = self.tapes.len().saturating_sub(1);
+        self.tape_sel = if i >= last { None } else { Some(i) };
+    }
+
+    /// A Bash call starts: it gets its own tape. The panel follows it
+    /// unless the person is reading an older one.
+    pub fn start_tape(&mut self, call_id: &str) {
+        if !call_id.is_empty() && self.tapes.iter().any(|t| t.call_id == call_id) {
+            return;
+        }
+        let following = self.tape_sel.is_none();
+        self.tapes.push(Tape {
+            call_id: call_id.to_string(),
+            ..Default::default()
+        });
+        if self.tapes.len() > TAPE_MAX {
+            self.tapes.remove(0);
+            // Indexes shifted down by one.
+            self.tape_sel = self.tape_sel.and_then(|i| i.checked_sub(1));
+        }
+        if following {
+            self.tape_sel = None;
+        }
+    }
+
+    /// One line of a command's output, to ITS tape (a late line of an
+    /// older command still lands on that command's tape, not the newest).
+    pub fn push_tape_line(&mut self, call_id: &str, line: String) {
+        let tape = if call_id.is_empty() {
+            self.tapes.last_mut()
+        } else {
+            self.tapes.iter_mut().find(|t| t.call_id == call_id)
+        };
+        let Some(tape) = tape else {
+            return;
+        };
+        tape.lines.push(line);
+        if tape.lines.len() > TAPE_MAX_LINES {
+            let cut = tape.lines.len() - TAPE_MAX_LINES;
+            tape.lines.drain(..cut);
+            tape.dropped += cut;
+        }
+    }
+
+    /// The selected changed file's index, clamped to the list (files
+    /// only ever grow, but a cleared session empties it).
+    pub fn selected_file(&self) -> Option<usize> {
+        match self.file_changes.len() {
+            0 => None,
+            n => Some(self.file_sel.min(n - 1)),
+        }
+    }
+
+    /// The Review panel's current hunk of the selected file, clamped.
+    pub fn selected_hunk(&self) -> usize {
+        let n = self
+            .selected_file()
+            .and_then(|i| self.file_changes[i].hunks.as_ref())
+            .map_or(0, Vec::len);
+        self.hunk_sel.min(n.saturating_sub(1))
+    }
+
+    /// Move the file selection (`j` = +1, `k` = -1); stops at the ends.
+    /// A different file starts at its first hunk.
+    pub fn move_file_selection(&mut self, delta: isize) {
+        let Some(cur) = self.selected_file() else {
+            return;
+        };
+        let last = self.file_changes.len() - 1;
+        let next = (cur as isize + delta).clamp(0, last as isize) as usize;
+        if next != cur {
+            self.file_sel = next;
+            self.hunk_sel = 0;
+        } else {
+            self.file_sel = cur;
+        }
+    }
+
+    /// Move the hunk selection within the selected file; stops at the ends.
+    pub fn move_hunk_selection(&mut self, delta: isize) {
+        let cur = self.selected_hunk();
+        let n = self
+            .selected_file()
+            .and_then(|i| self.file_changes[i].hunks.as_ref())
+            .map_or(0, Vec::len);
+        if n == 0 {
+            return;
+        }
+        self.hunk_sel = (cur as isize + delta).clamp(0, n as isize - 1) as usize;
     }
 
     pub fn is_turning(&self) -> bool {
@@ -396,13 +608,26 @@ impl Scenario {
                 // engine time if the runtime passes it, else the
                 // caller updates the field directly.
             }
-            "tool_started_full" => self.visible_output = false,
+            "tool_started_full" => {
+                // The first output of ANY kind ends M9: an agentic turn
+                // usually opens with a tool call, not text, and the
+                // welcome orbit must not animate behind it.
+                self.first_prompt_waiting = false;
+                self.visible_output = false;
+            }
             "tool_finished_full" => self.visible_output = false,
-            "approval_requested" => self.approval_pending = Some("tool".into()),
+            "approval_requested" => {
+                self.first_prompt_waiting = false;
+                self.approval_pending = Some("tool".into());
+            }
             "approval_requested_full" => {}
             "approval_resolved" => {
                 self.approval_pending = None;
                 self.approval_call_id = None;
+                self.approval_facts.clear();
+                self.approval_preview.clear();
+                self.approval_grant = None;
+                self.approval_note = None;
             }
             "compacting" => self.compacting = true,
             "compacted" => self.compacting = false,
@@ -459,6 +684,22 @@ mod tests {
         assert_eq!(s.star_state(), StarState::StillMagenta); // done/ready
     }
 
+    /// M9 (the welcome orbit while the first prompt waits) ends at the
+    /// first visible output — a tool card or an approval, not only text.
+    /// A turn that opens with a tool call used to keep the hero and its
+    /// 60 fps animation up for the whole tool phase.
+    #[test]
+    fn the_first_tool_ends_the_welcome_wait() {
+        for ev in ["text_delta", "tool_started_full", "approval_requested"] {
+            let mut s = Scenario::new();
+            s.first_prompt_waiting = true;
+            s.apply("round_started", 0);
+            assert!(s.first_prompt_waiting, "still waiting before any output");
+            s.apply(ev, 10);
+            assert!(!s.first_prompt_waiting, "{ev} ends the welcome wait");
+        }
+    }
+
     #[test]
     fn reduced_motion_shows_the_still_star() {
         // every turning state under reduced motion → still ✦ cyan
@@ -484,5 +725,68 @@ mod tests {
         assert_eq!(s.star_state(), StarState::StillRed);
         s.apply("round_started", 200);
         assert!(matches!(s.star_state(), StarState::Turning { .. }));
+    }
+
+    fn file(path: &str, hunks: Option<usize>) -> crate::proto::panels::FileChangeRow {
+        crate::proto::panels::FileChangeRow {
+            path: path.into(),
+            added: 1,
+            removed: 1,
+            hunks: hunks.map(|n| {
+                (0..n)
+                    .map(|i| orbit_frontend_protocol::DiffHunk {
+                        old_start: i as u32 * 10 + 1,
+                        old_lines: 1,
+                        new_start: i as u32 * 10 + 1,
+                        new_lines: 1,
+                        lines: vec![('-', "a".into()), ('+', "b".into())],
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// `j`/`k` stop at the ends instead of wrapping or running off, and a
+    /// different file starts at its first hunk.
+    #[test]
+    fn file_selection_stops_at_the_ends_and_resets_the_hunk() {
+        let mut s = Scenario::new();
+        s.move_file_selection(1); // nothing to select: harmless
+        assert_eq!(s.selected_file(), None);
+        s.file_changes = vec![file("a", Some(3)), file("b", Some(2)), file("c", None)];
+        assert_eq!(s.selected_file(), Some(0));
+        s.move_file_selection(-1);
+        assert_eq!(s.selected_file(), Some(0), "k stops at the first");
+        s.move_hunk_selection(1);
+        s.move_hunk_selection(1);
+        assert_eq!(s.selected_hunk(), 2);
+        s.move_hunk_selection(1);
+        assert_eq!(s.selected_hunk(), 2, "n stops at the last hunk");
+        s.move_file_selection(1);
+        assert_eq!(s.selected_file(), Some(1));
+        assert_eq!(
+            s.selected_hunk(),
+            0,
+            "another file starts at its first hunk"
+        );
+        s.move_file_selection(5);
+        assert_eq!(s.selected_file(), Some(2), "j stops at the last");
+        s.move_hunk_selection(1); // a file without hunks: nothing to walk
+        assert_eq!(s.selected_hunk(), 0);
+    }
+
+    /// A later edit replaces a file's hunks; a selection that pointed past
+    /// the new, shorter list must not index out of range.
+    #[test]
+    fn a_hunk_selection_survives_its_file_losing_hunks() {
+        let mut s = Scenario::new();
+        s.file_changes = vec![file("a", Some(3))];
+        s.hunk_sel = 2;
+        s.file_changes[0].hunks = Some(vec![]);
+        assert_eq!(s.selected_hunk(), 0);
+        s.file_changes[0].hunks = None;
+        assert_eq!(s.selected_hunk(), 0);
+        s.file_sel = 9;
+        assert_eq!(s.selected_file(), Some(0), "an out-of-range file clamps");
     }
 }

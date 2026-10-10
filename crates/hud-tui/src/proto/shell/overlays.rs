@@ -133,29 +133,26 @@ fn diff(
     now_ms: u64,
     reduced: bool,
 ) {
-    let rows_avail = h.saturating_sub(8) as usize;
-    // Count the overlay's rows: hunk headers + lines.
+    // The box is 8 rows of chrome (border, blank, header, rule, blank,
+    // … content …, blank, footer, border) around its content, and keeps
+    // a row of screen on each side.
+    let rows_avail = h.saturating_sub(10) as usize;
+    // The overlay's rows: hunk headers + lines.
     let body: Vec<(char, String)> = match hunks {
-        Some(hs) => {
-            let mut v = Vec::new();
-            for hk in hs {
-                v.push((
-                    '@',
-                    format!(
-                        "@@ -{},{} +{},{} @@",
-                        hk.old_start, hk.old_lines, hk.new_start, hk.new_lines
-                    ),
-                ));
-                for (m, l) in &hk.lines {
-                    v.push((*m, l.clone()));
-                }
-            }
-            v
-        }
+        Some(hs) => super::diffrows::rows(hs).0,
         None => Vec::new(),
     };
-    let shown = body.len().min(rows_avail);
-    let box_h = (shown as i32 + 6).min(h.saturating_sub(2));
+    // A diff taller than the screen gives its last row to "N more"
+    // rather than cutting a line off silently.
+    let cut = body.len() > rows_avail && rows_avail > 0;
+    let shown = if cut { rows_avail - 1 } else { body.len() };
+    // A note (no diff to show) takes two rows.
+    let content = if matches!(hunks, Some(hs) if !hs.is_empty()) {
+        shown + cut as usize
+    } else {
+        2
+    };
+    let box_h = (content as i32 + 8).min(h.saturating_sub(2));
     let box_w = (w.saturating_sub(8)).clamp(30, 100);
     let x = (w - box_w) / 2;
     let y = (h - box_h) / 2;
@@ -217,21 +214,15 @@ fn diff(
                     );
                 }
                 Some(_) => {
-                    for (i, (m, l)) in body.iter().take(shown).enumerate() {
-                        let yy = y + 5 + i as i32;
-                        let (glyph, fg) = match m {
-                            '@' => ("  ", VIOLET),
-                            '+' => ("+ ", GREEN),
-                            '-' => ("- ", RED),
-                            '…' => ("  ", FAINT),
-                            _ => ("  ", INK2),
-                        };
-                        if *m == '@' {
-                            cv.bold(x + 2, yy, &clip_text(l, box_w - 4), VIOLET, Some(RAISE));
-                        } else {
-                            let t = format!("{glyph}{}", clip_text(l, box_w - 6));
-                            cv.text(x + 2, yy, &t, fg, Some(RAISE));
-                        }
+                    super::diffrows::draw(cv, x + 2, y + 5, box_w - 4, &body[..shown], RAISE);
+                    if cut {
+                        cv.text(
+                            x + 2,
+                            y + 5 + shown as i32,
+                            &clip_text(&format!("… {} more lines", body.len() - shown), box_w - 4),
+                            FAINT,
+                            Some(RAISE),
+                        );
                     }
                 }
             }
@@ -280,6 +271,7 @@ fn palette(
             height: reveal.max(0) as u16,
         },
         |cv| {
+            cv.hit(x, y, w, h, super::hits::Click::Inert);
             cv.fill(x + 2, y + 1, w - 4, 1, INSET);
             cv.bold(x + 3, y + 1, "›", MAGENTA, Some(INSET));
             let e = cv.text(x + 5, y + 1, query, INK, Some(INSET));
@@ -296,6 +288,7 @@ fn palette(
             }
             for (i, (cmd, desc)) in items.iter().take(9).enumerate() {
                 let ry = y + 3 + i as i32;
+                cv.hit(x + 1, ry, w - 2, 1, super::hits::Click::Palette(i));
                 let on = i == sel;
                 let q: Vec<char> = query
                     .trim_start_matches('/')
@@ -365,8 +358,13 @@ fn help(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduced: boo
             "APPROVALS",
             vec![
                 ("y", "allow once"),
-                ("R", "allow this tool for the session"),
-                ("n  esc", "deny"),
+                // The columns clip a description at 29 cells, and the
+                // scope is the part of these lines that must not be cut.
+                ("s", "this kind of call, session"),
+                ("a", "same, saved in this folder"),
+                ("R", "the whole tool, session"),
+                ("n", "deny, with a word on why"),
+                ("esc", "deny"),
             ],
         ),
         (
@@ -463,11 +461,17 @@ fn quit(cv: &mut Cv, sw: i32, sh: i32, turn_live: bool) {
             Some(RAISE),
         );
     }
+    cv.hit(x, y, w, h, super::hits::Click::Inert);
     let ky = y + h - 2;
     let mut kx = x + 3;
     for (k, l, hot) in [("y", "quit", true), ("n", "stay", false)] {
+        let from = kx;
         kx = super::frame::keycap(cv, kx, ky, k, hot);
-        kx = cv.text(kx + 1, ky, l, INK2, Some(RAISE)) + 3;
+        kx = cv.text(kx + 1, ky, l, INK2, Some(RAISE));
+        if let Some((code, mods)) = super::hits::parse_key(k) {
+            cv.hit(from, ky, kx - from, 1, super::hits::Click::Key(code, mods));
+        }
+        kx += 3;
     }
 }
 
@@ -490,8 +494,22 @@ pub fn picker(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduce
             height: reveal.max(0) as u16,
         },
         |cv| {
+            cv.hit(x, y, bw, bh, super::hits::Click::Inert);
             for (i, v) in views.iter().enumerate() {
                 let yy = y + 2 + i as i32;
+                // A row picks its view, like the digit that names it.
+                if let Some(d) = char::from_digit(i as u32 + 1, 10) {
+                    cv.hit(
+                        x + 2,
+                        yy,
+                        bw - 4,
+                        1,
+                        super::hits::Click::Key(
+                            crossterm::event::KeyCode::Char(d),
+                            crossterm::event::KeyModifiers::NONE,
+                        ),
+                    );
+                }
                 let col = ident(*v);
                 cv.put(
                     x + 3,

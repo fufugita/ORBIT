@@ -320,6 +320,7 @@ pub mod config;
 pub mod go_bridge;
 pub mod mods;
 pub mod permissions;
+pub mod presets;
 pub mod sessions;
 pub mod tool_runtime;
 pub mod tools;
@@ -375,6 +376,44 @@ pub fn context_window_for(home: &Path, model: &str) -> Option<u64> {
     crate::config::ProvidersConfig::load(home)
         .ok()
         .and_then(|c| c.context_window_for(model))
+}
+
+/// Resolve one task role to a full TurnConfig. The role's model may live
+/// on a different provider than the session's (a cheap explore model on
+/// Ollama while the main conversation runs Anthropic), so the gate,
+/// kind, credential and pricing all come from the role's own provider.
+/// An unset or unresolvable role returns the base config unchanged —
+/// the caller's session model keeps serving that task.
+pub fn role_turn_config(
+    home: &Path,
+    base: &orbit_engine::TurnConfig,
+    role: &str,
+) -> orbit_engine::TurnConfig {
+    let cfg = match crate::config::ProvidersConfig::load(home) {
+        Ok(c) => c,
+        Err(_) => return base.clone(),
+    };
+    let Some(spec) = cfg.roles.get(role) else {
+        return base.clone();
+    };
+    let Some(provider) = cfg.provider_for_role_spec(spec) else {
+        return base.clone();
+    };
+    let model = spec.rsplit('/').next().unwrap_or(spec);
+    let mut out = base.clone();
+    out.provider_id = provider.name.clone();
+    out.gate = provider.url.clone();
+    out.model = model.to_string();
+    out.kind = orbit_engine::dispatch::ProviderKind::from_config(&provider.kind);
+    out.credential_env = provider.env.clone().filter(|s| !s.trim().is_empty());
+    out.pricing = provider
+        .models
+        .iter()
+        .find(|m| m.id == model)
+        .map(|m| std::convert::From::from(m.pricing));
+    out.max_output_tokens = cfg.max_output_tokens_for(model).unwrap_or(32_000) as u64;
+    out.sampling = cfg.sampling_for(model).map(|s| (s.temperature, s.top_p));
+    out
 }
 
 /// Run one prompt through the configured gateway via the four-gate async

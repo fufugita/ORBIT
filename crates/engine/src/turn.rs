@@ -36,6 +36,10 @@ pub struct TurnOptions {
     /// re-inserted per request (that broke caching and edited-history
     /// replay). Plan mode appends its read-only posture here.
     pub system_directive: Option<String>,
+    /// How many bytes of `system_directive` are project instructions (the
+    /// memory files), so the context meter can name them apart from the
+    /// rest. 0 = not separated.
+    pub memory_bytes: usize,
     /// Request-id stem for ledger records (e.g. "orbit-tui", "orbit-p").
     pub request_stem: String,
     /// The model's context window (phase 4: compaction threshold =
@@ -48,6 +52,39 @@ pub struct TurnOptions {
     /// compacting (the recursion loops when the window is small — the
     /// summary request alone can cross the threshold).
     pub compacting: bool,
+    /// An alternate TurnConfig for the compaction dispatch only (the
+    /// `compaction` role in providers.toml: a cheap model summarizing
+    /// while the conversation keeps its own). None = the conversation's
+    /// own config also summarizes. The front-end sets this; the engine
+    /// never invents one.
+    pub compaction_config: Option<TurnConfig>,
+}
+
+/// What the next request is made of, in estimated tokens (~4 bytes each):
+/// the front-end's meter shows it beside the provider's single total. None
+/// without a window — there is nothing to compare against.
+pub fn context_breakdown(
+    options: &TurnOptions,
+    transcript: &[ChatMessage],
+) -> Option<orbit_frontend_protocol::ContextBreakdown> {
+    let window = options.window_tokens?;
+    let directive_bytes = options.system_directive.as_deref().map_or(0, str::len);
+    let memory_bytes = options.memory_bytes.min(directive_bytes);
+    // What a definition costs on the wire: its name, description and schema.
+    let tool_bytes: usize = options
+        .tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+        .sum();
+    let usable = window.saturating_sub(options.output_reserve_tokens);
+    Some(orbit_frontend_protocol::ContextBreakdown {
+        system: ((directive_bytes - memory_bytes) / 4) as u64,
+        tools: (tool_bytes / 4) as u64,
+        memory: (memory_bytes / 4) as u64,
+        messages: estimate_transcript_tokens(transcript),
+        compact_at: usable / 10 * 9,
+        reserve: options.output_reserve_tokens,
+    })
 }
 
 /// Rough token estimate for a transcript: ~4 chars per token across
@@ -93,13 +130,49 @@ impl Default for TurnOptions {
             // Phase 3 moves the tool runtime into the engine.
             tools: Vec::new(),
             system_directive: None,
+            memory_bytes: 0,
             session_id: format!("s-{}", ulid::Ulid::new()),
             request_stem: "orbit-engine".into(),
             window_tokens: None,
             output_reserve_tokens: 8_192,
             compacting: false,
+            compaction_config: None,
         }
     }
+}
+
+/// The one-line target a front-end shows for a call: the command, the
+/// path, the pattern — or, for a subagent, who and what. It reaches the
+/// screen and the stream (`stream-json` lands in CI logs), so it passes the
+/// secret scanner first, like every other summary of a call.
+fn call_target(name: &str, arguments: &[u8]) -> String {
+    let Ok(args) = serde_json::from_slice::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    let get = |key: &str| args.get(key).and_then(|v| v.as_str());
+    let raw = if matches!(name, "Task" | "Agent") {
+        let who = get("agent")
+            .or_else(|| get("agent_type"))
+            .or_else(|| get("subagent_type"))
+            .unwrap_or("");
+        let task = get("prompt")
+            .and_then(|p| p.lines().map(str::trim).find(|l| !l.is_empty()))
+            .unwrap_or("");
+        match (who.is_empty(), task.is_empty()) {
+            (false, false) => format!("{who} · {task}"),
+            (false, true) => who.to_string(),
+            (true, _) => task.to_string(),
+        }
+    } else {
+        get("command")
+            .or_else(|| get("file_path"))
+            .or_else(|| get("path"))
+            .or_else(|| get("pattern"))
+            .or_else(|| get("prompt"))
+            .map(String::from)
+            .unwrap_or_default()
+    };
+    orbit_tools::scan::scan_result(&raw).text
 }
 
 /// Run one prompt through the engine loop, updating `transcript` in
@@ -125,6 +198,7 @@ pub fn run_turn(
         &serde_json::json!({ "prompt": prompt }),
     );
 
+    executor.begin_turn(config);
     transcript.push(user_message(prompt));
 
     let mut report = TurnReport::default();
@@ -195,10 +269,12 @@ pub fn run_turn(
                     crate::hooks::HookEvent::PostCompact,
                     &serde_json::json!({ "summary_bytes": summary.len() }),
                 );
+                let after = estimate_transcript_tokens(transcript);
                 events(FrontendEvent::Compacted {
                     summary: summary.clone(),
+                    after_tokens: after,
                 });
-                compacted_at = Some(estimate_transcript_tokens(transcript));
+                compacted_at = Some(after);
             }
         }
 
@@ -236,6 +312,7 @@ pub fn run_turn(
             events(FrontendEvent::Usage {
                 used_tokens: o.context_tokens.max(estimate_transcript_tokens(transcript)),
                 window_tokens: w,
+                breakdown: context_breakdown(options, transcript),
             });
         }
 
@@ -304,37 +381,22 @@ pub fn run_turn(
 
         // The TUI's tool-line motion (M07/M08/M09/M10): the full
         // start (kind + target) before execution, the finish with a
-        // result fact after. Targets are display-safe (the CLI
-        // executor's summaries pass the secret scanner before this).
+        // result fact after.
         for tc in &o.tool_calls {
-            let target = String::from_utf8_lossy(&tc.arguments)
-                .parse::<serde_json::Value>()
-                .ok()
-                .and_then(|a| {
-                    a.get("command")
-                        .or_else(|| a.get("file_path"))
-                        .or_else(|| a.get("path"))
-                        .or_else(|| a.get("pattern"))
-                        .or_else(|| a.get("prompt"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                })
-                .unwrap_or_default();
             events(FrontendEvent::ToolStartedFull {
                 call_id: tc.id.clone(),
                 kind: tc.name.clone(),
-                target,
+                target: call_target(&tc.name, &tc.arguments),
             });
         }
         // Esc (MD §The agent loop): install the turn's cancel-checker
         // so long-running tool children (Bash) die with the stream.
         // Cleared after the round so a later turn starts clean.
-        let cancel_for_tools = cancel.clone();
-        orbit_tools::interrupt::set_cancel_check(Some(std::sync::Arc::new(move || {
-            cancel_for_tools.is_cancelled()
-        })));
+        // The turn's token is current for the round's tools, then the
+        // previous one (a parent turn's) is again.
+        executor.begin_cancel_scope(cancel);
         let results = executor.execute(&o.tool_calls, round);
-        orbit_tools::interrupt::set_cancel_check(None);
+        executor.end_cancel_scope();
         for r in &results {
             // A result fact for the settle animation: first small
             // truth in the payload (lines, tests, exit code).
@@ -465,7 +527,29 @@ fn dispatch_with_retry(
             &options.session_id,
         );
         match result {
-            Ok(o) => return Ok(o),
+            Ok(o) => {
+                // The egress record was durable BEFORE the request left
+                // (GW-04); tell the front-end its hash, now that the round
+                // has finished, so the proof surface lists it.
+                if let Some(digest) = &o.egress_digest {
+                    events(FrontendEvent::LedgerAppended {
+                        record_count: orbit_ledger::count_records(&home.join("ledger")),
+                        head_digest: digest.clone(),
+                        kind: "egress".into(),
+                        // A provider that reported no usage is not a request
+                        // that cost nothing: say the model, not "0 in / 0 out".
+                        summary: if o.input_tokens == 0 && o.output_tokens == 0 {
+                            config.model.clone()
+                        } else {
+                            format!(
+                                "{} · {} in / {} out",
+                                config.model, o.input_tokens, o.output_tokens
+                            )
+                        },
+                    });
+                }
+                return Ok(o);
+            }
             Err((code, msg)) if is_retryable(code) && attempt < options.max_attempts => {
                 // Exponential backoff with jitter: 1s, 2s, 4s, … capped
                 // at 32s; ~8 attempts span about two minutes.
@@ -634,6 +718,14 @@ fn compact_transcript(
     };
     opts.max_rounds = 1;
     opts.max_attempts = 2;
+    // The compaction role: a cheap model may summarize while the
+    // conversation keeps its own (task-based routing). The role's
+    // config carries its own gate/kind/credential; the summary turn
+    // runs on it when the front-end resolved one.
+    let summary_config = options
+        .compaction_config
+        .clone()
+        .unwrap_or_else(|| config.clone());
     let mut scratch: Vec<ChatMessage> = Vec::new();
     let mut noop = NoopExecutor;
     // Private sink (B6): the summary turn is housekeeping, not a turn
@@ -642,7 +734,7 @@ fn compact_transcript(
     let mut private_sink = |_ev: FrontendEvent| {};
     let report = run_turn(
         home,
-        config,
+        &summary_config,
         &opts,
         &prompt,
         &mut scratch,
@@ -675,5 +767,121 @@ mod tests {
         assert!(is_retryable("ORBIT-E0407"));
         assert!(!is_retryable("ORBIT-E0402")); // auth: never retry
         assert!(!is_retryable("ORBIT-E0401")); // bad url: never retry
+    }
+
+    fn target(name: &str, args: serde_json::Value) -> String {
+        call_target(name, args.to_string().as_bytes())
+    }
+
+    fn tool(name: &str, desc: &str) -> orbit_adapter::types::ToolDefinition {
+        orbit_adapter::types::ToolDefinition {
+            name: name.into(),
+            description: desc.into(),
+            parameters: serde_json::json!({"type": "object"}),
+            schema_digest: orbit_adapter::types::Sha256Digest("0".repeat(64)),
+        }
+    }
+
+    /// The parts of the context, in estimated tokens (~4 bytes each), and
+    /// the line where compaction starts. The system text is split from the
+    /// memory the front-end measured; the conversation is the transcript's.
+    #[test]
+    fn the_context_breakdown_names_its_parts() {
+        let options = TurnOptions {
+            system_directive: Some("s".repeat(4_000)),
+            memory_bytes: 1_200,
+            tools: vec![tool("Read", &"d".repeat(360))],
+            window_tokens: Some(100_000),
+            output_reserve_tokens: 10_000,
+            ..Default::default()
+        };
+        let transcript = vec![user_message("m".repeat(800))];
+        let b = context_breakdown(&options, &transcript).expect("a window is set");
+        assert_eq!(b.system, 700, "(4000 - 1200 memory) / 4");
+        assert_eq!(b.memory, 300, "1200 / 4");
+        let wire = ("Read".len() + 360 + r#"{"type":"object"}"#.len()) / 4;
+        assert_eq!(b.tools, wire as u64);
+        assert_eq!(b.messages, 225, "800 bytes + an eighth, over four");
+        assert_eq!(b.compact_at, 81_000, "90% of (100k - 10k)");
+        assert_eq!(b.reserve, 10_000);
+    }
+
+    #[test]
+    fn without_a_window_there_is_nothing_to_compare() {
+        assert!(context_breakdown(&TurnOptions::default(), &[]).is_none());
+    }
+
+    /// A memory size larger than the directive (a stale value) cannot
+    /// make the system share underflow.
+    #[test]
+    fn a_stale_memory_size_cannot_underflow() {
+        let options = TurnOptions {
+            system_directive: Some("x".repeat(100)),
+            memory_bytes: 5_000,
+            window_tokens: Some(1_000),
+            ..Default::default()
+        };
+        let b = context_breakdown(&options, &[]).unwrap();
+        assert_eq!((b.system, b.memory), (0, 25));
+    }
+
+    #[test]
+    fn a_call_names_its_command_path_or_pattern() {
+        assert_eq!(
+            target("Bash", serde_json::json!({"command": "ls -la"})),
+            "ls -la"
+        );
+        assert_eq!(
+            target("Read", serde_json::json!({"file_path": "/a/b.rs"})),
+            "/a/b.rs"
+        );
+        assert_eq!(
+            target("Glob", serde_json::json!({"pattern": "**/*.py"})),
+            "**/*.py"
+        );
+        assert_eq!(
+            target("calculator", serde_json::json!({"expression": "1+1"})),
+            ""
+        );
+        assert_eq!(call_target("Bash", b"not json"), "");
+    }
+
+    /// A target reaches the screen and the `stream-json` events (CI logs):
+    /// a token in a command must not travel with it.
+    #[test]
+    fn a_target_never_carries_a_secret() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let t = target(
+            "Bash",
+            serde_json::json!({"command": format!("curl -H 'x-api-key: {secret}' https://api")}),
+        );
+        assert!(!t.contains(secret), "{t}");
+        assert!(
+            t.starts_with("curl"),
+            "the rest of the command still shows: {t}"
+        );
+    }
+
+    /// A subagent call says which agent and what it was asked.
+    #[test]
+    fn a_subagent_call_names_the_agent_and_the_task() {
+        assert_eq!(
+            target(
+                "Task",
+                serde_json::json!({"agent": "Explore", "prompt": "find add()\nthen report"})
+            ),
+            "Explore · find add()"
+        );
+        assert_eq!(
+            target(
+                "Agent",
+                serde_json::json!({"agent_type": "plan", "prompt": "outline"})
+            ),
+            "plan · outline"
+        );
+        assert_eq!(
+            target("Task", serde_json::json!({"prompt": "just do it"})),
+            "just do it"
+        );
     }
 }

@@ -130,6 +130,14 @@ pub struct ProviderRouteBinding {
     /// homelab mock (HTTP on a LAN IP) is addressable without host sniffing.
     #[serde(default)]
     pub endpoint_scheme: EndpointScheme,
+    /// Base path of the endpoint, from the configured gate URL. Empty means
+    /// the historical default: `/v1` for the OpenAI-compatible and Anthropic
+    /// adapters, the bare host for Ollama. A non-empty gate path (DashScope's
+    /// `/compatible-mode/v1`, Z.ai's `/api/paas/v4`, Gemini's
+    /// `/v1beta/openai`) is carried verbatim — the adapters append their
+    /// method segment to it.
+    #[serde(default)]
+    pub endpoint_path: String,
 }
 
 fn default_https_port() -> u16 {

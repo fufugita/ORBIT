@@ -313,7 +313,7 @@ pub fn emit_text(stripper: &mut CotStripper, sender: &BusSender, bytes: &[u8]) {
         Err(_) => {
             // D7: name the gate; never render the rejected bytes.
             sender.send(Msg::Redacted {
-                kind: crate::state::RedactionKind::InvalidUtf8,
+                kind: crate::model::RedactionKind::InvalidUtf8,
             });
             return;
         }
@@ -324,7 +324,7 @@ pub fn emit_text(stripper: &mut CotStripper, sender: &BusSender, bytes: &[u8]) {
     if !match_before {
         // D7: rejected by the display-safe gate — emit the chip, not the text.
         sender.send(Msg::Redacted {
-            kind: crate::state::RedactionKind::Secret,
+            kind: crate::model::RedactionKind::Secret,
         });
         return;
     }
@@ -347,21 +347,148 @@ pub fn emit_mode_changed(sender: &BusSender, mode: &str) {
 }
 
 /// Emit a tool-call-started event with a display-safe summary.
-pub fn emit_tool_started(sender: &BusSender, name: &str, summary: &str) {
+pub fn emit_tool_started(sender: &BusSender, call_id: &str, name: &str, summary: &str) {
     let safe_summary = safe_text(summary);
     sender.send(Msg::ToolCallStarted {
+        call_id: call_id.to_string(),
         name: name.to_string(),
         summary: safe_summary,
     });
 }
 
+/// Emit the start or end of a context compaction (`tokens`: the
+/// conversation's estimated size before it starts, after it ends).
+pub fn emit_compaction(sender: &BusSender, running: bool, tokens: u64) {
+    sender.send(Msg::Compaction { running, tokens });
+}
+
+/// Emit one Activity row (display-safe): a ledger record (with its
+/// digest) or a notable runtime event.
+pub fn emit_activity(
+    sender: &BusSender,
+    kind: &str,
+    target: &str,
+    fact: &str,
+    digest: Option<&str>,
+) {
+    sender.send(Msg::Activity {
+        kind: kind.to_string(),
+        target: terminal_safe(target),
+        fact: terminal_safe(fact),
+        digest: digest.map(str::to_string),
+    });
+}
+
+/// Emit extra readiness rows for the welcome screen (display-safe).
+pub fn emit_readiness(sender: &BusSender, rows: Vec<(bool, String)>) {
+    sender.send(Msg::Readiness(
+        rows.into_iter()
+            .map(|(ok, label)| (ok, safe_text(&label)))
+            .collect(),
+    ));
+}
+
+/// Emit the facts and preview of the approval about to be requested
+/// (display-safe: secret values redacted, control sequences removed).
+pub fn emit_approval_detail(
+    sender: &BusSender,
+    call_id: &str,
+    facts: Vec<(String, String)>,
+    preview: Vec<String>,
+    grant: Option<crate::msg::ApprovalGrant>,
+) {
+    // The rule is shown as written, or not at all: if display-safety would
+    // change a character of it, the card would name a different rule than
+    // the one `s` grants.
+    let grant = grant.filter(|g| safe_text(&g.rule) == g.rule && terminal_safe(&g.rule) == g.rule);
+    sender.send(Msg::ApprovalDetail {
+        grant,
+        call_id: call_id.to_string(),
+        facts: facts
+            .into_iter()
+            .map(|(k, v)| (safe_text(&k), safe_text(&v)))
+            .collect(),
+        preview: preview.iter().map(|l| terminal_safe(l)).collect(),
+    });
+}
+
+/// Emit the session's task list for the Plan panel (titles display-safe).
+pub fn emit_tasks(sender: &BusSender, tasks: Vec<(String, String)>) {
+    let tasks = tasks
+        .into_iter()
+        .map(|(title, status)| (safe_text(&title), status))
+        .collect();
+    sender.send(Msg::TasksUpdate(tasks));
+}
+
+/// Emit one line of a running command's live output (display-safe).
+pub fn emit_tool_output(sender: &BusSender, call_id: &str, line: &str) {
+    sender.send(Msg::ToolOutput {
+        call_id: call_id.to_string(),
+        line: terminal_safe(line),
+    });
+}
+
+/// Display-safe form of one line of command output, for the Terminal
+/// panel. Secret VALUES are redacted (the line stays); ANSI escape
+/// sequences are removed whole — dropping only the ESC byte would leave
+/// `[1;31m` on screen; tabs become spaces; other control characters go.
+/// Unlike [`safe_text`] it does not reject chat-shaped markers such as
+/// `prompt:` — a build log may legitimately say anything.
+pub fn terminal_safe(line: &str) -> String {
+    let redacted = orbit_hud::redact_secret_values(line);
+    let mut out = String::with_capacity(redacted.len());
+    let mut chars = redacted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameter and intermediate bytes, then one final
+                // byte in 0x40..=0x7E.
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or the string terminator (ESC \).
+                Some(']') => {
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other escape is a two-byte sequence.
+                _ => {}
+            },
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Emit a tool-call-finished event. The outcome distinguishes an operator
 /// denial and a pre-run block from a genuine tool failure (§11.5 rule 4:
 /// a `Denied` outcome keeps `⊘`, never a red `✕`).
-pub fn emit_tool_finished(sender: &BusSender, name: &str, outcome: crate::state::ToolOutcome) {
+pub fn emit_tool_finished(
+    sender: &BusSender,
+    call_id: &str,
+    name: &str,
+    outcome: crate::model::ToolOutcome,
+    fact: &str,
+) {
     sender.send(Msg::ToolCallFinished {
+        call_id: call_id.to_string(),
         name: name.to_string(),
         outcome,
+        fact: safe_text(fact),
     });
 }
 
@@ -398,18 +525,25 @@ pub fn emit_subagent_progress(sender: &BusSender, id: &str, action: &str) {
     });
 }
 
-pub fn emit_subagent_finished(sender: &BusSender, id: &str, report: &str) {
+pub fn emit_subagent_finished(sender: &BusSender, id: &str, report: &str, ok: bool) {
     sender.send(Msg::SubagentFinished {
         id: id.to_string(),
         report: safe_text(report),
+        ok,
     });
 }
 
 /// Emit context usage (tokens in use, the model's window).
-pub fn emit_usage(sender: &BusSender, used_tokens: u64, window_tokens: u64) {
+pub fn emit_usage(
+    sender: &BusSender,
+    used_tokens: u64,
+    window_tokens: u64,
+    breakdown: Option<orbit_frontend_protocol::ContextBreakdown>,
+) {
     sender.send(Msg::Usage {
         used_tokens,
         window_tokens,
+        breakdown,
     });
 }
 
@@ -419,7 +553,7 @@ pub fn emit_ledger_appended(sender: &BusSender, record_count: u64) {
 }
 
 /// Emit a workspace update (the right rail's live state).
-pub fn emit_workspace(sender: &BusSender, w: crate::state::Workspace) {
+pub fn emit_workspace(sender: &BusSender, w: crate::model::Workspace) {
     sender.send(Msg::WorkspaceUpdate(w));
 }
 
@@ -589,7 +723,7 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
             Msg::Redacted { kind } => {
-                assert_eq!(*kind, crate::state::RedactionKind::Secret)
+                assert_eq!(*kind, crate::model::RedactionKind::Secret)
             }
             other => panic!("expected Redacted, got {other:?}"),
         }
@@ -608,13 +742,41 @@ mod tests {
     }
 
     #[test]
+    fn terminal_safe_strips_whole_escape_sequences_and_keeps_chat_words() {
+        // The colour codes go entirely (not just the ESC byte).
+        assert_eq!(terminal_safe("\u{1b}[1;31merror\u{1b}[0m: no"), "error: no");
+        // An OSC title is dropped whole, BEL- or ST-terminated.
+        assert_eq!(terminal_safe("\u{1b}]0;title\u{7}ok"), "ok");
+        assert_eq!(terminal_safe("\u{1b}]0;title\u{1b}\\ok"), "ok");
+        // Tabs line up as spaces; carriage returns vanish.
+        assert_eq!(terminal_safe("a\tb\r"), "a    b");
+        // A build log may say "prompt:" and print URLs.
+        assert_eq!(
+            terminal_safe("prompt: fetching https://example.com/x"),
+            "prompt: fetching https://example.com/x"
+        );
+    }
+
+    #[test]
+    fn terminal_safe_redacts_secret_values_but_keeps_the_line() {
+        let out = terminal_safe("token=ghp_0123456789abcdef0123456789abcdef0123 done");
+        assert!(!out.contains("ghp_0123"), "{out}");
+        assert!(out.contains("done"), "{out}");
+    }
+
+    #[test]
     fn emit_tool_started_gates_summary() {
         let (bus, sender) = Bus::new();
-        emit_tool_started(&sender, "calculator", "calculator(expression)");
+        emit_tool_started(&sender, "call-1", "calculator", "calculator(expression)");
         let msgs = drain(&bus);
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
-            Msg::ToolCallStarted { name, summary } => {
+            Msg::ToolCallStarted {
+                call_id,
+                name,
+                summary,
+            } => {
+                assert_eq!(call_id, "call-1");
                 assert_eq!(name, "calculator");
                 assert_eq!(summary, "calculator(expression)");
             }
@@ -715,7 +877,7 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
             Msg::Redacted { kind } => {
-                assert_eq!(*kind, crate::state::RedactionKind::InvalidUtf8)
+                assert_eq!(*kind, crate::model::RedactionKind::InvalidUtf8)
             }
             other => panic!("expected Redacted, got {other:?}"),
         }

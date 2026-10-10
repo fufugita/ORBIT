@@ -9,8 +9,11 @@
 pub mod bars;
 pub mod canvas;
 pub mod convo;
+pub mod diffrows;
 pub mod frame;
+pub mod hits;
 pub mod mark;
+pub mod md;
 pub mod motion;
 pub mod overlays;
 pub mod pal;
@@ -254,6 +257,8 @@ pub struct DrawIn<'a> {
     pub fx: &'a Fx,
     pub scenario: &'a Scenario,
     pub composer: &'a str,
+    /// The highlighted row of the `/` command list.
+    pub completion_sel: usize,
     pub now_ms: u64,
     pub reduced: bool,
     /// Colour effects off (the spec): under 16 colours or no colour,
@@ -298,6 +303,12 @@ fn layout(area: Rect, tree: &Node, sidebar: bool) -> (Vec<(Rect, View)>, u16) {
 
 /// Draw the whole screen into `f`.
 pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
+    let _ = draw_with_hits(f, inp);
+}
+
+/// Draw the whole screen into `f` and return what the frame made
+/// clickable, in drawing order (later = on top).
+pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
     let area = f.area();
     let (w, h) = (area.width as i32, area.height as i32);
     let s = inp.scenario;
@@ -307,7 +318,7 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
     let narrow = area.width < 120;
     // A zoomed panel fills the screen the way a narrow one does.
     let one_at_a_time = narrow || sh.zoom;
-    {
+    let hits = {
         let mut cv = Cv::new(f.buffer_mut());
         cv.fill(0, 0, w, h, pal::APP);
 
@@ -449,6 +460,7 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
         }
 
         // Panels.
+        let panel_hits = cv.hit_mark();
         let heavy_ms = inp.fx.focus_ms;
         for (i, r, view) in &areas {
             // M20: the heavy border grows from the panel number both
@@ -491,6 +503,7 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
                             reduced: red,
                             mono: inp.mono,
                             composer: inp.composer,
+                            completion_sel: inp.completion_sel,
                             focused: *i == focus,
                             focus_fx: focus_in,
                             scroll_offset: inp
@@ -521,6 +534,13 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
                     );
                 }
             });
+        }
+
+        // While arranging, the panels are dimmed and numbered: a click
+        // focuses one (the runtime does that), it does not press the keys
+        // of a footer hint under the veil.
+        if sh.arranging {
+            cv.truncate_hits(panel_hits);
         }
 
         // The closing panel's ghost: a fading flat card behind the
@@ -596,6 +616,13 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
         );
 
         // Overlays on top: the picker, the palette/help/quit card, the toast.
+        // A modal swallows the clicks aimed at what is behind it: this
+        // region sits under the overlay's own, so only the overlay's
+        // controls (drawn after) answer, and a click anywhere else closes
+        // it.
+        if sh.picker.is_some() || inp.overlay.is_some() {
+            cv.hit(0, 0, w, h, hits::Click::Dismiss);
+        }
         if sh.picker.is_some() {
             overlays::picker(&mut cv, w, h, inp.fx.picker_ms, inp.now_ms, red);
         }
@@ -607,8 +634,10 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
                 &mut cv, w, h, t.text, t.ok, t.shown_ms, 3000, inp.now_ms, red,
             );
         }
-    }
+        cv.take_hits()
+    };
     tier::apply(f.buffer_mut(), inp.tier);
+    hits
 }
 
 fn view_colour(v: View) -> canvas::Rgb {
@@ -637,6 +666,7 @@ mod tests {
                     fx: &Fx::default(),
                     scenario: s,
                     composer: "",
+                    completion_sel: 0,
                     now_ms: 5_000,
                     reduced: true,
                     tier: Tier::TrueColor,
@@ -728,7 +758,26 @@ mod tests {
             meta: "done · 4.8s".into(),
             ..Default::default()
         });
-        s.tool_output = vec!["running 6 tests".into()];
+        s.tapes = vec![crate::proto::scenario::Tape {
+            lines: vec!["running 6 tests".into()],
+            ..Default::default()
+        }];
+        s.activity = vec![
+            crate::proto::scenario::ActivityRow {
+                time: "14:02:11".into(),
+                kind: "verdict".into(),
+                target: "Bash(cargo test -p orbit-export)".into(),
+                fact: "allowed — operator approved".into(),
+                digest: Some("a1b2c3d4e5f6".into()),
+            },
+            crate::proto::scenario::ActivityRow {
+                time: "14:02:16".into(),
+                kind: "result".into(),
+                target: "Bash(cargo test -p orbit-export)".into(),
+                fact: "ok".into(),
+                digest: Some("0f9e8d7c6b5a".into()),
+            },
+        ];
         s
     }
 
@@ -764,8 +813,625 @@ mod tests {
     #[test]
     fn review_preset_lists_files_beside_plan_and_activity() {
         let out = render(&app_with(Preset::Review), &busy(), 164, 48);
-        for want in ["Review", "FILES", "Plan", "1/2 done", "Activity", "BASH"] {
+        for want in [
+            "Review",
+            "FILES",
+            "Plan",
+            "1/2 done",
+            "Activity",
+            "2 events",
+            "allowed",
+            "Bash(cargo test",
+            "#a1b2c3",
+            "#0f9e8d",
+        ] {
             assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+    }
+
+    /// The screen with the diff overlay open on `file`.
+    fn render_diff_overlay(file: &crate::proto::panels::FileChangeRow, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        let s = busy();
+        let app = App::new(std::path::PathBuf::new(), true);
+        term.draw(|f| {
+            draw(
+                f,
+                &DrawIn {
+                    app: &app,
+                    fx: &Fx::default(),
+                    scenario: &s,
+                    composer: "",
+                    completion_sel: 0,
+                    now_ms: 5_000,
+                    reduced: true,
+                    tier: Tier::TrueColor,
+                    mono: false,
+                    scroll_offset: 0,
+                    scrolls: &[],
+                    selection: None,
+                    brand: crate::proto::welcome::BrandTier::Static,
+                    toast: None,
+                    overlay: Some(overlays::Overlay::Diff {
+                        path: &file.path,
+                        added: file.added,
+                        removed: file.removed,
+                        hunks: &file.hunks,
+                        opened_ms: 0,
+                    }),
+                },
+            )
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn row_of(out: &str, needle: &str) -> usize {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no row with {needle:?}\n{out}"))
+    }
+
+    /// The overlay's hint used to share a row with the last diff line
+    /// (box height and footer row agreed on the same row).
+    #[test]
+    fn the_diff_overlay_footer_sits_below_the_last_line() {
+        let f = &two_files().file_changes[0];
+        let out = render_diff_overlay(f, 110, 40);
+        let last = row_of(&out, "+ new_tail()");
+        let hint = row_of(&out, "esc close");
+        let border = row_of(&out, "┗");
+        assert!(
+            last < hint && hint < border,
+            "{last} {hint} {border}\n{out}"
+        );
+    }
+
+    /// With no diff to show the box holds both note lines — they used to
+    /// be drawn over its bottom border.
+    #[test]
+    fn the_diff_overlay_note_stays_inside_the_box() {
+        let f = &two_files().file_changes[1]; // hunks: None
+        let out = render_diff_overlay(f, 110, 40);
+        let note = row_of(&out, "◌ no diff captured");
+        let why = row_of(&out, "without a \"before\"");
+        let hint = row_of(&out, "esc close");
+        let border = row_of(&out, "┗");
+        assert!(note < why && why < hint && hint < border, "{out}");
+    }
+
+    /// A short terminal cannot hold the whole diff: the last row says how
+    /// much is cut instead of dropping lines silently.
+    #[test]
+    fn the_diff_overlay_in_a_short_terminal_says_what_is_cut() {
+        let many: Vec<(char, String)> = (0..40).map(|i| ('+', format!("line {i}"))).collect();
+        let f = crate::proto::panels::FileChangeRow {
+            path: "big.rs".into(),
+            added: 40,
+            removed: 0,
+            hunks: Some(vec![orbit_frontend_protocol::DiffHunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 40,
+                lines: many,
+            }]),
+        };
+        let out = render_diff_overlay(&f, 110, 20);
+        assert!(out.contains("more lines"), "{out}");
+        assert!(!out.contains("line 39"), "{out}");
+        assert!(
+            row_of(&out, "more lines") < row_of(&out, "esc close"),
+            "{out}"
+        );
+    }
+
+    fn hunk(start: u32, lines: &[(char, &str)]) -> orbit_frontend_protocol::DiffHunk {
+        orbit_frontend_protocol::DiffHunk {
+            old_start: start,
+            old_lines: 1,
+            new_start: start,
+            new_lines: 1,
+            lines: lines.iter().map(|(m, t)| (*m, t.to_string())).collect(),
+        }
+    }
+
+    fn two_files() -> Scenario {
+        use crate::proto::panels::FileChangeRow;
+        let mut s = busy();
+        s.file_changes = vec![
+            FileChangeRow {
+                path: "src/a.rs".into(),
+                added: 2,
+                removed: 2,
+                hunks: Some(vec![
+                    hunk(
+                        3,
+                        &[
+                            (' ', "fn keep() {}"),
+                            ('-', "let x = 1;"),
+                            ('+', "let x = 2;"),
+                        ],
+                    ),
+                    hunk(40, &[('-', "old_tail()"), ('+', "new_tail()")]),
+                ]),
+            },
+            FileChangeRow {
+                path: "src/b.rs".into(),
+                added: 1,
+                removed: 0,
+                hunks: None,
+            },
+        ];
+        s
+    }
+
+    /// The Review panel used to print a fixed sentence under the file name
+    /// whether or not the engine had sent hunks. It draws the selected
+    /// file's real hunks, from the current one, and says which of how many.
+    #[test]
+    fn review_draws_the_selected_files_real_hunks() {
+        let mut s = two_files();
+        let out = render(&app_with(Preset::Review), &s, 164, 48);
+        assert!(!out.contains("The diff appears here"), "{out}");
+        for want in [
+            "src/a.rs",
+            "hunk 1/2",
+            "@@ -3,1 +3,1 @@",
+            "fn keep() {}",
+            "- let x = 1;",
+            "+ let x = 2;",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        // `n`: the second hunk leads, the first is scrolled off.
+        s.move_hunk_selection(1);
+        let out = render(&app_with(Preset::Review), &s, 164, 48);
+        assert!(
+            out.contains("hunk 2/2") && out.contains("@@ -40,1 +40,1 @@"),
+            "{out}"
+        );
+        assert!(out.contains("+ new_tail()"), "{out}");
+        assert!(!out.contains("let x = 2;"), "{out}");
+    }
+
+    /// `j` moves the selection to the next file and the pane follows. A
+    /// file with no captured "before" says so plainly.
+    #[test]
+    fn review_follows_the_file_selection_and_is_honest_without_hunks() {
+        let mut s = two_files();
+        s.move_file_selection(1);
+        let out = render(&app_with(Preset::Review), &s, 164, 48);
+        assert!(out.contains("◌ no diff captured"), "{out}");
+        assert!(!out.contains("let x = 2;"), "{out}");
+        // The selection bar is on b.rs, not a.rs.
+        // (The path also heads the right pane; the list row carries counts.)
+        let row = |name: &str, counts: &str| {
+            out.lines()
+                .find(|l| l.contains(name) && l.contains(counts))
+                .unwrap_or_else(|| panic!("no list row for {name}\n{out}"))
+                .to_string()
+        };
+        assert!(
+            row("src/b.rs", "+1").contains('▌'),
+            "{}",
+            row("src/b.rs", "+1")
+        );
+        assert!(
+            !row("src/a.rs", "+2").contains('▌'),
+            "{}",
+            row("src/a.rs", "+2")
+        );
+    }
+
+    /// A hunk longer than the pane gives its last row to "N more" instead
+    /// of cutting a line off silently.
+    #[test]
+    fn review_says_how_much_more_there_is() {
+        use crate::proto::panels::FileChangeRow;
+        let mut s = busy();
+        let many: Vec<(char, String)> = (0..80).map(|i| ('+', format!("line {i}"))).collect();
+        s.file_changes = vec![FileChangeRow {
+            path: "big.rs".into(),
+            added: 80,
+            removed: 0,
+            hunks: Some(vec![orbit_frontend_protocol::DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 80,
+                lines: many,
+            }]),
+        }];
+        let out = render(&app_with(Preset::Review), &s, 164, 30);
+        assert!(out.contains("more · ⏎ full diff"), "{out}");
+        assert!(out.contains("line 0") && !out.contains("line 79"), "{out}");
+    }
+
+    /// The footers only advertise keys that do something.
+    #[test]
+    fn panel_footers_name_only_keys_that_work() {
+        let s = two_files();
+        let out = render(&app_with(Preset::Review), &s, 164, 48);
+        assert!(!out.contains("revert"), "no revert exists yet\n{out}");
+        assert!(
+            !out.contains("step"),
+            "the plan has no step selection\n{out}"
+        );
+    }
+
+    fn agent(
+        name: &str,
+        task: &str,
+        action: &str,
+        done: Option<(bool, &str)>,
+    ) -> crate::proto::scenario::Agent {
+        crate::proto::scenario::Agent {
+            name: name.into(),
+            task: task.into(),
+            action: action.into(),
+            report: done.map(|(_, r)| r.to_string()).unwrap_or_default(),
+            done: done.is_some(),
+            ok: done.map(|(ok, _)| ok).unwrap_or(true),
+            started_ms: 1_500,
+            done_ms: done.map(|_| 3_500),
+        }
+    }
+
+    /// A running subagent shows who, for how long, what it was asked, and
+    /// what it is doing right now.
+    #[test]
+    fn the_agent_panel_shows_a_running_subagent() {
+        let mut s = busy();
+        s.agents.insert(
+            "a1".into(),
+            agent(
+                "Explore",
+                "find where add() is defined",
+                "Read calc.py",
+                None,
+            ),
+        );
+        let out = render(&app_with(Preset::Agents), &s, 164, 48);
+        for want in [
+            "Agent · explore",
+            "Explore",
+            "3.5s",
+            "find where add() is defined",
+            "▸ Read calc.py",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        // The panel named `review` shows nobody else's agent.
+        assert!(out.contains("No agent yet"), "{out}");
+    }
+
+    /// A finished subagent shows its report, wrapped; a failed one says
+    /// failed, in words and a glyph.
+    #[test]
+    fn the_agent_panel_shows_how_it_ended() {
+        let mut s = busy();
+        s.agents.insert(
+            "a1".into(),
+            agent(
+                "Explore",
+                "find add()",
+                "Read calc.py",
+                Some((
+                    true,
+                    "add() is defined in calc.py and it subtracts instead of adding.",
+                )),
+            ),
+        );
+        let out = render(&app_with(Preset::Agents), &s, 164, 48);
+        for want in ["✓", "done · 2.0s", "subtracts instead", "find add()"] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert!(
+            !out.contains("▸ Read calc.py"),
+            "a finished agent shows its report, not its last action"
+        );
+
+        let mut f = busy();
+        f.agents.insert(
+            "a1".into(),
+            agent(
+                "Explore",
+                "find add()",
+                "",
+                Some((false, "ORBIT-E0403 credential_rejected")),
+            ),
+        );
+        let out = render(&app_with(Preset::Agents), &f, 164, 48);
+        for want in ["✕", "failed · 2.0s", "credential_rejected"] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+    }
+
+    /// The panel is named in lower case ("explore"), the agent in its own
+    /// ("Explore"): they still match.
+    #[test]
+    fn an_agent_panel_matches_its_agent_whatever_the_case() {
+        let mut s = busy();
+        s.agents
+            .insert("a1".into(), agent("explore", "t", "", None));
+        let out = render(&app_with(Preset::Agents), &s, 164, 48);
+        assert!(out.contains("starting…"), "{out}");
+    }
+
+    /// Two finished commands, each with its own card and tape.
+    fn two_commands() -> Scenario {
+        use crate::proto::scenario::{LineKind, Tape, ToolState, TranscriptLine};
+        let mut s = Scenario::new();
+        let card = |id: &str, cmd: &str, state, meta: &str| TranscriptLine {
+            kind: LineKind::Tool,
+            text: cmd.into(),
+            tool_name: "Bash".into(),
+            call_id: id.into(),
+            tool_state: state,
+            meta: meta.into(),
+            ..Default::default()
+        };
+        s.transcript.push(card(
+            "t1",
+            "cargo test -p orbit",
+            ToolState::Failed,
+            "exit 101 · 2.3s",
+        ));
+        s.transcript
+            .push(card("t2", "ls -la", ToolState::Done, "done · 0.1s"));
+        s.tapes = vec![
+            Tape {
+                call_id: "t1".into(),
+                lines: vec!["error[E0599]: no method named `frob`".into()],
+                dropped: 0,
+            },
+            Tape {
+                call_id: "t2".into(),
+                lines: vec!["total 0".into(), "drwxr-xr-x 2 me me 40 .".into()],
+                dropped: 0,
+            },
+        ];
+        s
+    }
+
+    /// The Terminal keeps a tab per command and shows the newest one's
+    /// output: it used to show one tape, wiped by every new command.
+    #[test]
+    fn the_terminal_has_a_tab_per_command() {
+        let s = two_commands();
+        let out = render(&App::new(std::path::PathBuf::new(), true), &s, 164, 48);
+        // Numbered tabs: the first (failed) command, then the lit second one
+        // spelling out its command; the full line sits under the strip.
+        for want in ["✕1", "✓2 ls -la", "$ ls -la", "total 0", "done · 0.1s"] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert!(
+            !out.contains("E0599"),
+            "the other command's output waits on its tab\n{out}"
+        );
+        assert!(
+            out.contains("[ ] command"),
+            "the footer says how to switch\n{out}"
+        );
+    }
+
+    /// Picking the first tab shows that command's output and how it ended
+    /// (`exit N · duration`) on the last row, without scrolling.
+    #[test]
+    fn a_picked_tape_shows_its_output_and_how_it_ended() {
+        let mut s = two_commands();
+        s.pick_tape(0);
+        let out = render(&App::new(std::path::PathBuf::new(), true), &s, 164, 48);
+        for want in [
+            "$ cargo test -p orbit",
+            "error[E0599]",
+            "✕",
+            "exit 101 · 2.3s",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert!(!out.contains("total 0"), "{out}");
+    }
+
+    #[test]
+    fn a_tape_says_what_the_bound_cut() {
+        let mut s = two_commands();
+        s.tapes[1].dropped = 600;
+        let out = render(&App::new(std::path::PathBuf::new(), true), &s, 164, 48);
+        assert!(out.contains("… 600 earlier lines not kept"), "{out}");
+    }
+
+    /// While a command runs there is no outcome yet, so the last row is
+    /// not claimed.
+    #[test]
+    fn a_running_command_has_no_outcome_row() {
+        let mut s = two_commands();
+        s.transcript[1].tool_state = crate::proto::scenario::ToolState::Running;
+        s.transcript[1].meta.clear();
+        let out = render(&App::new(std::path::PathBuf::new(), true), &s, 164, 48);
+        assert!(out.contains("$ ls -la") && out.contains("total 0"), "{out}");
+        assert!(!out.contains("done · 0.1s"), "{out}");
+    }
+
+    /// A screen with just the Context panel.
+    fn context_app() -> App {
+        let mut a = App::new(std::path::PathBuf::new(), true);
+        a.tree = crate::proto::layout::Node::Panel {
+            view: View::Context,
+            agent: String::new(),
+        };
+        a
+    }
+
+    fn measured() -> Scenario {
+        let mut s = busy();
+        s.window_tokens = 200_000;
+        s.used_tokens = 80_000;
+        s.input_tokens = 120_000;
+        s.output_tokens = 3_400;
+        s.ctx_breakdown = Some(orbit_frontend_protocol::ContextBreakdown {
+            system: 3_200,
+            tools: 6_100,
+            memory: 12_400,
+            messages: 54_000,
+            compact_at: 144_000,
+            reserve: 16_000,
+        });
+        s
+    }
+
+    /// What fills the window: each part named with its estimated size, the
+    /// free remainder, and where compaction starts. It used to show only a
+    /// bar and "N of M tokens".
+    #[test]
+    fn the_context_panel_names_what_fills_the_window() {
+        let out = render(&context_app(), &measured(), 100, 40);
+        for want in [
+            "system",
+            "~3.2k",
+            "tools",
+            "~6.1k",
+            "memory",
+            "~12.4k",
+            "messages",
+            "~54k",
+            "free",
+            "~124k",
+            "80k of 200k tokens",
+            "▲ compacts at ~144k",
+            "90% of the window, less 16k kept for the answer",
+            "provider: 120000 in · 3400 out",
+            "the parts are estimates",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert!(
+            out.contains('█') && out.contains('░') && out.contains('▲'),
+            "{out}"
+        );
+    }
+
+    /// The parts add up to what the bar shows: never wider than the window.
+    #[test]
+    fn the_context_bar_is_never_wider_than_the_window() {
+        let mut s = measured();
+        // Estimates that overshoot the window (a transcript the estimate
+        // overcounts): the bar still fits and free is zero, not negative.
+        s.ctx_breakdown.as_mut().unwrap().messages = 500_000;
+        let out = render(&context_app(), &s, 100, 40);
+        assert!(out.contains("free") && out.contains("~0"), "{out}");
+        let bar = out
+            .lines()
+            .find(|l| l.contains('█'))
+            .expect("a bar row")
+            .to_string();
+        assert!(bar.chars().filter(|c| *c == '░').count() == 0, "{bar}");
+    }
+
+    #[test]
+    fn compactions_are_listed_with_their_sizes() {
+        let mut s = measured();
+        s.compactions.push(crate::proto::scenario::CompactionRow {
+            time: "14:02:11".into(),
+            before: 180_000,
+            after: 12_000,
+        });
+        let out = render(&context_app(), &s, 100, 44);
+        for want in ["COMPACTED", "14:02:11", "~180k → ~12k"] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+    }
+
+    /// A side column cannot hold the explanation on one line: the number
+    /// stays whole and leads, the explanation wraps.
+    #[test]
+    fn a_narrow_context_panel_keeps_the_number_whole() {
+        let out = render(&context_app(), &measured(), 50, 40);
+        assert!(out.contains("▲ compacts at ~144k"), "{out}");
+        for word in ["conversation", "alone", "kept", "answer"] {
+            assert!(out.contains(word), "the explanation lost {word:?}\n{out}");
+        }
+    }
+
+    /// Without a breakdown (a producer that does not measure it) the
+    /// panel says only what it knows: the provider's total.
+    #[test]
+    fn without_a_breakdown_the_panel_shows_only_the_total() {
+        let mut s = measured();
+        s.ctx_breakdown = None;
+        let out = render(&context_app(), &s, 100, 40);
+        assert!(out.contains("80k of 200k tokens"), "{out}");
+        assert!(!out.contains("compacts at"), "{out}");
+        assert!(!out.contains("memory"), "{out}");
+    }
+
+    #[test]
+    fn tokens_read_as_people_write_them() {
+        use panes::tokens_short;
+        for (n, want) in [
+            (0, "0"),
+            (842, "842"),
+            (3_200, "3.2k"),
+            (9_999, "10.0k"),
+            (12_400, "12.4k"),
+            (54_000, "54k"),
+            (124_000, "124k"),
+            (1_250_000, "1.2M"),
+        ] {
+            assert_eq!(tokens_short(n), want, "{n}");
+        }
+    }
+
+    /// In a side column a record takes two lines: the OUTCOME and the proof
+    /// hash on the first (nothing a long command can clip), the target
+    /// under it.
+    #[test]
+    fn activity_in_a_side_column_leads_with_the_outcome() {
+        let out = render(&app_with(Preset::Review), &busy(), 164, 48);
+        let lines: Vec<&str> = out.lines().collect();
+        let i = lines
+            .iter()
+            .position(|l| l.contains("allowed"))
+            .unwrap_or_else(|| panic!("no verdict row\n{out}"));
+        assert!(lines[i].contains("14:02:11"), "time\n{}", lines[i]);
+        assert!(
+            lines[i].contains("#a1b2c3"),
+            "hash on the same line\n{}",
+            lines[i]
+        );
+        assert!(
+            lines[i + 1].contains("Bash(cargo test"),
+            "target on the next line\n{}",
+            lines[i + 1]
+        );
+    }
+
+    /// Given room (a zoomed panel, a big terminal) every record is ONE
+    /// line: time, kind, outcome, target, reason and hash together.
+    #[test]
+    fn activity_given_room_is_one_line_per_record() {
+        let out = render(&app_with(Preset::Review), &busy(), 300, 48);
+        let row = out
+            .lines()
+            .find(|l| l.contains("allowed"))
+            .unwrap_or_else(|| panic!("no verdict row\n{out}"));
+        for want in [
+            "14:02:11",
+            "allowed",
+            "Bash(cargo test -p orbit-export)",
+            "operator approved",
+            "#a1b2c3",
+        ] {
+            assert!(row.contains(want), "missing {want:?}\n{row}");
         }
     }
 
@@ -818,6 +1484,7 @@ mod tests {
                     fx,
                     scenario: s,
                     composer: "",
+                    completion_sel: 0,
                     now_ms,
                     reduced: false,
                     tier,
@@ -1073,7 +1740,10 @@ mod tests {
                 ..Default::default()
             });
         }
-        s.tool_output = (0..60).map(|i| format!("out line {i}")).collect();
+        s.tapes = vec![crate::proto::scenario::Tape {
+            lines: (0..60).map(|i| format!("out line {i}")).collect(),
+            ..Default::default()
+        }];
         s.transcript.push(TranscriptLine {
             kind: LineKind::Tool,
             text: "cargo test".into(),
@@ -1091,6 +1761,7 @@ mod tests {
                         fx: &Fx::default(),
                         scenario: &s,
                         composer: "",
+                        completion_sel: 0,
                         now_ms: 5_000,
                         reduced: true,
                         tier: Tier::TrueColor,

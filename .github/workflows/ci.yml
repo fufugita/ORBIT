@@ -9,10 +9,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # No debuginfo on CI: artifacts shrink several-fold, linking gets
-  # faster, and the whole job fits comfortably inside the runner's
-  # time envelope (a cold full-workspace debug build was being
-  # reclaimed mid-run). Panic backtraces are not needed on CI.
+  # No debuginfo on CI: artifacts shrink several-fold and linking gets
+  # faster. Panic backtraces are not needed on CI.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   # Integration-test binaries relink the whole workspace each; the
@@ -42,20 +40,18 @@ jobs:
         run: cargo build -p orbit-cli -p orbit-mock-provider
       - name: disk before test
         run: df -h /
+      - name: allow user namespaces
+        # bwrap needs unprivileged user namespaces, which Ubuntu 24.04
+        # runners restrict through AppArmor. Lift that for this job so the
+        # sandbox tests run against a real sandbox instead of skipping. If
+        # the key does not exist they still skip, with a printed reason.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: test
-        env:
-          # Diagnostic: the sandboxed Bash tests spawn bwrap in
-          # unprivileged user namespaces; the hosted runner's process
-          # monitor has been reclaiming jobs at exactly that point on
-          # this freshly-created repository. Skip the bwrap legs on CI
-          # (they assert locally and in the sandboxed test matrix);
-          # everything else runs unchanged.
-          ORBIT_TEST_SANDBOX_OFF: "1"
-        run: cargo test --workspace --exclude orbit-tools
-      - name: tools suite alone
-        env:
-          ORBIT_TEST_SANDBOX_OFF: "1"
-        run: cargo test -p orbit-tools
+        # The whole workspace in one run. (The interrupt and sandbox tests
+        # used to be fenced off because the job kept dying when they ran;
+        # that was the test process signalling its whole user session via
+        # `kill -TERM -<pgid>`, not the runner — fixed in the code.)
+        run: cargo test --workspace
       - name: disk after test
         if: always()
         run: df -h /

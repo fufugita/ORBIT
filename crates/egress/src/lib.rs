@@ -323,4 +323,23 @@ mod tests {
         assert!(!path_prefix_matches("/v1", "/v12"));
         assert!(path_prefix_matches("", "/anything"));
     }
+
+    #[test]
+    fn a_configured_gate_path_is_allowed_at_its_own_prefix() {
+        // A gate URL with a path (DashScope, Z.ai) puts that path in the
+        // allowlist; the request carries the same path, so it matches —
+        // and a different path on the same host still does not.
+        assert!(path_prefix_matches(
+            "/compatible-mode/v1",
+            "/compatible-mode/v1"
+        ));
+        assert!(path_prefix_matches(
+            "/api/paas/v4",
+            "/api/paas/v4/chat/completions"
+        ));
+        assert!(!path_prefix_matches(
+            "/compatible-mode/v1",
+            "/api/paas/v4/chat/completions"
+        ));
+    }
 }

@@ -106,6 +106,9 @@ impl EnvSnapshot {
 /// The frozen system prompt, built once per session.
 pub struct SystemPrompt {
     pub text: String,
+    /// How many bytes of `text` are the project instructions (the memory
+    /// files): the context meter names them separately.
+    pub memory_bytes: usize,
 }
 
 /// Build the system prompt. `home` is ORBIT_HOME; `working_dir` is the
@@ -159,6 +162,7 @@ pub fn build_system_prompt(
     s.push('\n');
 
     // 4. Memory files, lowest scope first.
+    let memory_from = s.len();
     s.push_str("## Project instructions\n\n");
     for rel in MEMORY_FILES {
         let path: PathBuf = if rel.starts_with('/') {
@@ -177,6 +181,7 @@ pub fn build_system_prompt(
         }
     }
     let _ = home; // managed scope /etc/orbit/ORBIT.md is in MEMORY_FILES
+    let memory_bytes = s.len() - memory_from;
 
     // 5. Enabled mods' instructions (frozen here, not re-inserted).
     if !mods_directive.is_empty() {
@@ -185,7 +190,10 @@ pub fn build_system_prompt(
         s.push_str("\n\n");
     }
 
-    SystemPrompt { text: s }
+    SystemPrompt {
+        text: s,
+        memory_bytes,
+    }
 }
 
 /// Cap auto-memory at 200 lines / 25 KB (the spec's bound).
@@ -283,6 +291,38 @@ fn run_git_lines(dir: &Path, args: &[&str], cap: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The prompt says which part of it is project instructions, exactly
+    /// (the memory files contain `##` headings of their own, so it cannot
+    /// be found from the text afterwards).
+    #[test]
+    fn the_prompt_measures_its_memory_section() {
+        let dir = std::env::temp_dir().join(format!("orbit-ctx-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("CLAUDE.md"),
+            "# Rules\n\n## Style\nKeep it small.\n\n## Testing\nRun the tests.\n",
+        )
+        .unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let none = super::build_system_prompt(&home, &dir, "m", &[], "");
+        let start = none.text.find("## Project instructions").unwrap();
+        // With no mods the memory runs to the end.
+        assert_eq!(none.text.len() - start, none.memory_bytes);
+        assert!(
+            none.text[start..].contains("## Testing"),
+            "headings inside stay inside"
+        );
+        // With mods after it, the memory stops where they start.
+        let with = super::build_system_prompt(&home, &dir, "m", &[], "be terse");
+        let start = with.text.find("## Project instructions").unwrap();
+        let mods = with.text.find("## Enabled mods").unwrap();
+        assert_eq!(start + with.memory_bytes, mods);
+        assert!(with.memory_bytes > "Keep it small.".len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

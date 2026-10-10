@@ -1,6 +1,7 @@
 # ORBIT orbit-hud-tui — TUI front-end (ratatui + crossterm)
-# PURPOSE: Terminal user interface for ORBIT — three-pane layout, event-sourced,
-#          display-safe, brand-aware. Contract: DR-20.
+# PURPOSE: The terminal screen, the message bus and approval registry the
+#          CLI's worker drives it through, and the bridge that keeps what
+#          reaches the screen display-safe. Contract: DR-20.
 # Depends on orbit-hud (display gate, OutputMode, BrandTier, HudEvent).
 
 [package]
@@ -20,7 +21,6 @@ crossterm.workspace = true
 toml.workspace = true
 serde.workspace = true
 signal-hook.workspace = true
-unicode-segmentation.workspace = true
 unicode-width.workspace = true
 # The terminal watchdog polls the input fd for POLLHUP/POLLERR without
 # unsafe (the crate forbids it) — rustix::event::poll is safe Rust.

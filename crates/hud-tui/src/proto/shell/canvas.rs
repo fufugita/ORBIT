@@ -89,16 +89,46 @@ pub fn clip_text(s: &str, n: i32) -> String {
     out
 }
 
-/// The canvas: a buffer plus a clip rectangle.
+/// Clip a path to `n` cells from the LEFT, with a leading `…`: the end
+/// of a path (the file name) is the part that identifies it, so it is
+/// what must survive.
+pub fn clip_path(s: &str, n: i32) -> String {
+    if n <= 0 {
+        return String::new();
+    }
+    if text_width(s) <= n {
+        return s.to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for ch in s.chars().rev() {
+        let w = ch.width().unwrap_or(0) as i32;
+        if used + w > n - 1 {
+            break;
+        }
+        tail.push(ch);
+        used += w;
+    }
+    tail.reverse();
+    format!("…{}", tail.into_iter().collect::<String>())
+}
+
+/// The canvas: a buffer plus a clip rectangle, and the clickable regions
+/// drawn so far (shared by every clipped view of the same canvas).
 pub struct Cv<'a> {
     pub buf: &'a mut Buffer,
     pub clip: Rect,
+    hits: std::rc::Rc<std::cell::RefCell<Vec<super::hits::Hit>>>,
 }
 
 impl<'a> Cv<'a> {
     pub fn new(buf: &'a mut Buffer) -> Self {
         let clip = buf.area;
-        Cv { buf, clip }
+        Cv {
+            buf,
+            clip,
+            hits: Default::default(),
+        }
     }
 
     /// Run `f` with the clip narrowed to `r` (intersected).
@@ -107,8 +137,49 @@ impl<'a> Cv<'a> {
         let mut inner = Cv {
             buf: &mut *self.buf,
             clip: inter,
+            hits: std::rc::Rc::clone(&self.hits),
         };
         f(&mut inner)
+    }
+
+    /// Mark the cells `(x, y, w, h)` clickable: a click there does `click`.
+    /// Only the part inside the clip counts — a control scrolled or clipped
+    /// out of sight must not be clickable where it cannot be seen.
+    pub fn hit(&mut self, x: i32, y: i32, w: i32, h: i32, click: super::hits::Click) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (x0, y0) = (x.max(0), y.max(0));
+        let (x1, y1) = ((x + w).max(0), (y + h).max(0));
+        let want = Rect {
+            x: x0.min(u16::MAX as i32) as u16,
+            y: y0.min(u16::MAX as i32) as u16,
+            width: (x1 - x0).clamp(0, u16::MAX as i32) as u16,
+            height: (y1 - y0).clamp(0, u16::MAX as i32) as u16,
+        };
+        let rect = self.clip.intersection(want);
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        self.hits
+            .borrow_mut()
+            .push(super::hits::Hit { rect, click });
+    }
+
+    /// How many regions exist now, to drop the ones drawn after this
+    /// point with `truncate_hits`.
+    pub fn hit_mark(&self) -> usize {
+        self.hits.borrow().len()
+    }
+
+    /// Forget the regions drawn since `mark`.
+    pub fn truncate_hits(&mut self, mark: usize) {
+        self.hits.borrow_mut().truncate(mark);
+    }
+
+    /// The regions drawn so far, in drawing order (later = on top).
+    pub fn take_hits(&mut self) -> Vec<super::hits::Hit> {
+        std::mem::take(&mut *self.hits.borrow_mut())
     }
 
     fn inside(&self, x: i32, y: i32) -> bool {
@@ -282,6 +353,21 @@ mod tests {
     fn clip_adds_ellipsis() {
         assert_eq!(clip_text("abcdefgh", 5), "abcd…");
         assert_eq!(clip_text("abc", 5), "abc");
+    }
+
+    #[test]
+    fn clip_path_keeps_the_file_name() {
+        assert_eq!(clip_path("src/calc.py", 20), "src/calc.py");
+        let long = "/tmp/orbit-shot-ohez8kxv/fixture/deep/dir/calc.py";
+        let clipped = clip_path(long, 16);
+        assert_eq!(text_width(&clipped), 16);
+        assert!(
+            clipped.starts_with('…') && clipped.ends_with("calc.py"),
+            "{clipped}"
+        );
+        // clip_text keeps the START, which is the part that loses the name.
+        assert!(!clip_text(long, 16).ends_with("calc.py"));
+        assert_eq!(clip_path("abc", 0), "");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! The top bar (row 0) and the status line (last row).
 
-use super::canvas::{mix, segs_width, tint, Cv, Rgb, Seg};
+use super::canvas::{mix, segs_width, text_width, tint, Cv, Rgb, Seg};
 use super::frame::{keyhints, pill, pill_width};
 use super::motion::{ease_in_out, flash, prog, secs, shimmer, star_at};
 use super::pal::*;
@@ -112,8 +112,28 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     }
     let mut x = 12;
     if let Some(panels) = &tb.switcher {
+        // One panel at a time: the tabs sit left, the facts right. When the
+        // names of every tab would run into the cost chip, the tabs that
+        // are not open shrink to their number.
+        let tab_w = |num: &usize, title: &str, attn: bool, open: bool, short: bool| {
+            let attn_w = if attn { 2 } else { 0 };
+            if open {
+                text_width(&format!(" {num} {title} ")) + attn_w
+            } else if short {
+                text_width(&format!(" {num} ")) + attn_w
+            } else {
+                text_width(&format!(" {num} ")) + text_width(&format!("{title} ")) + attn_w
+            }
+        };
+        let full: i32 = panels
+            .iter()
+            .map(|(n, t, a)| tab_w(n, t, *a, *n - 1 == tb.focus_idx, false) + 1)
+            .sum();
+        const COST_CHIP: i32 = 10;
+        let short = x + full > w - 2 - COST_CHIP;
         for (num, title, attn) in panels {
             let on = *num - 1 == tb.focus_idx;
+            let from = x;
             if on {
                 x = cv.put(
                     x,
@@ -135,16 +155,20 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                     Some(bg_at(x)),
                     Modifier::BOLD,
                 );
-                x = cv.text(x, 0, &format!("{title} "), MUTED, Some(bg_at(x)));
+                if !short {
+                    x = cv.text(x, 0, &format!("{title} "), MUTED, Some(bg_at(x)));
+                }
                 if *attn {
                     x = cv.put(x, 0, "◆ ", MAGENTA, Some(bg_at(x)), Modifier::BOLD);
                 }
             }
+            cv.hit(from, 0, x - from, 1, super::hits::Click::Panel(*num - 1));
             x += 1;
         }
     } else {
         for (i, name) in PRESET_TABS.iter().enumerate() {
             let label = format!(" {name} ");
+            let from = x;
             if tb.preset == Some(i) {
                 let pb = tint(MAGENTA, TOPBAR, 1.0);
                 x = cv.put(x, 0, &label, ON_ACCENT, Some(pb), Modifier::BOLD);
@@ -154,6 +178,7 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             } else {
                 x = cv.text(x, 0, &label, MUTED, Some(bg_at(x)));
             }
+            cv.hit(from, 0, x - from, 1, super::hits::Click::Preset(i));
             x += 1;
         }
         if tb.preset.is_none() {
@@ -237,7 +262,12 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                     mix(
                         GREEN,
                         WHITE,
-                        flash(secs(tb.now_ms), s.ledger_ms.map(secs), 0.35, tb.reduced || tb.mono),
+                        flash(
+                            secs(tb.now_ms),
+                            s.ledger_ms.map(secs),
+                            0.35,
+                            tb.reduced || tb.mono,
+                        ),
                     ),
                 ),
                 Seg::new(group_thousands(n), INK2),
@@ -258,7 +288,9 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     }
     let cw =
         |c: &(Vec<Seg>, Option<Rgb>, u8)| segs_width(&c.0) + if c.1.is_some() { 2 } else { 0 } + 1;
-    while chips.len() > 1 && chips.iter().map(cw).sum::<i32>() - 1 > w - 2 - x {
+    // A chip that cannot fit is dropped, the last one too: drawn anyway it
+    // would run over the tabs.
+    while !chips.is_empty() && chips.iter().map(cw).sum::<i32>() - 1 > w - 2 - x {
         let lo = chips
             .iter()
             .enumerate()
@@ -469,23 +501,34 @@ pub fn status_line(
     x = cv.spans(x, y, &parts, Some(bg));
     cv.text(x, y, " ", INK, Some(bg));
 
+    // Esc stops a running turn wherever focus is; only when none runs does
+    // it start arranging.
+    let esc = if s.is_turning() {
+        ("esc", "stop")
+    } else {
+        ("esc", "arrange")
+    };
     let hints: Vec<(&str, &str)> = if s.approval_pending.is_some() {
-        vec![("y", "allow"), ("n", "deny"), ("?", "keys")]
+        // `s` is offered only for a call with a rule to remember: the hint
+        // says so rather than promising a key that would do nothing.
+        if s.offered_grant().is_some() {
+            vec![
+                ("y", "allow"),
+                ("s", "session"),
+                ("n", "deny"),
+                ("?", "keys"),
+            ]
+        } else {
+            vec![("y", "allow"), ("n", "deny"), ("?", "keys")]
+        }
     } else if focus_is_diff {
-        vec![
-            ("j/k", "file"),
-            ("z", "zoom"),
-            ("esc", "arrange"),
-            ("i", "back to ORBIT"),
-        ]
+        vec![("j/k", "file"), ("z", "zoom"), esc, ("i", "back to ORBIT")]
     } else if !focus_is_conversation {
-        vec![("z", "zoom"), ("esc", "arrange"), ("i", "back to ORBIT")]
+        vec![("z", "zoom"), esc, ("i", "back to ORBIT")]
     } else if s.turn_live {
-        vec![
-            ("esc", "arrange panels"),
-            ("⌃c", "interrupt"),
-            ("?", "keys"),
-        ]
+        // While a turn runs Esc stops it (it cannot arrange), and ⌃c opens
+        // the quit card — it does not interrupt anything.
+        vec![("esc", "stop"), ("⌃c", "quit"), ("?", "keys")]
     } else {
         vec![("esc", "arrange panels"), (":", "commands"), ("?", "keys")]
     };

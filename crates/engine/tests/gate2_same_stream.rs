@@ -120,10 +120,19 @@ fn run_session(
     // request stem feeds ledger ids, and the directive differs) — the
     // events compared are the ones a front-end renders: rounds, deltas,
     // tools, cost, response, turn end.
+    // A ledger record's hash covers its ULIDs and timestamps, so it is
+    // unique to every run by construction; the SHAPE of the stream (an
+    // egress record announced per round, in order) is what must match.
+    // That each digest is a real link of the chain is asserted in
+    // `gate2_scripted_session`.
     let stream: Vec<String> = rx
         .try_iter()
         .map(|ev| {
-            serde_json::to_string(&ev)
+            let mut value = serde_json::to_value(&ev).unwrap_or_default();
+            if let Some(d) = value.get_mut("head_digest") {
+                *d = serde_json::Value::String("<digest>".into());
+            }
+            serde_json::to_string(&value)
                 .unwrap_or_default()
                 // request stems appear nowhere in FrontendEvent, but be
                 // explicit about the comparison being label-independent.

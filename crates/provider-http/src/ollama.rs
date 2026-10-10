@@ -69,9 +69,16 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
         cancel: &CancelToken,
     ) -> Result<AsyncProviderEventStream, AdapterError> {
         self.validate_route(&request.route)?;
+        // Ollama serves at the bare host by default; a configured gate
+        // path (a nonstandard reverse-proxy layout) is honored verbatim.
+        let base_path = if request.route.endpoint_path.is_empty() {
+            ""
+        } else {
+            request.route.endpoint_path.as_str()
+        };
         let url = format!(
-            "http://{}:{}/api/chat",
-            request.route.endpoint_host, request.route.endpoint_port
+            "http://{}:{}{}/api/chat",
+            request.route.endpoint_host, request.route.endpoint_port, base_path
         );
         // Full conversation when present; else the single prompt. Ollama's
         // chat API takes tool calls/results natively on messages.

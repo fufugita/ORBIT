@@ -83,6 +83,9 @@ fn next_action(reader: &mut BufReader<UnixStream>) -> Incoming {
 /// Send-but-not-Sync and the ApprovalChannel trait requires Send.
 struct GoApprovalChannel {
     rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<serde_json::Value>>>,
+    /// The note typed with a denial, captured from the deny action and
+    /// handed to the engine once.
+    note: Option<String>,
 }
 
 impl crate::tool_runtime::ApprovalChannel for GoApprovalChannel {
@@ -107,8 +110,21 @@ impl crate::tool_runtime::ApprovalChannel for GoApprovalChannel {
                     return match action.get("verdict").and_then(|v| v.as_str()) {
                         Some("allow") => crate::tool_runtime::ApprovalVerdict::AllowOnce,
                         Some("session") => crate::tool_runtime::ApprovalVerdict::AllowSession,
+                        // `s`: the rule the card offered, this session.
+                        Some("rule") => crate::tool_runtime::ApprovalVerdict::AllowRuleSession,
+                        // `a`: the same rule, remembered in this folder's
+                        // local settings.
+                        Some("always") => crate::tool_runtime::ApprovalVerdict::AllowRuleAlways,
                         _ => crate::tool_runtime::ApprovalVerdict::Deny,
                     };
+                }
+                Some("deny") => {
+                    // `n`: a denial may carry a note for the model.
+                    self.note = action
+                        .get("note")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    return crate::tool_runtime::ApprovalVerdict::Deny;
                 }
                 Some("cancel") | Some("quit") => {
                     return crate::tool_runtime::ApprovalVerdict::Deny;
@@ -116,6 +132,10 @@ impl crate::tool_runtime::ApprovalChannel for GoApprovalChannel {
                 _ => continue,
             }
         }
+    }
+
+    fn take_note(&mut self) -> Option<String> {
+        self.note.take()
     }
 }
 
@@ -554,60 +574,97 @@ struct GoToolExecutor {
 }
 
 impl orbit_engine::ToolExecutor for GoToolExecutor {
+    fn begin_turn(&mut self, config: &orbit_engine::TurnConfig) {
+        crate::tool_runtime::remember_turn_config(&self.tool_cx, config);
+    }
+
     fn execute(
         &mut self,
         calls: &[orbit_engine::PendingToolCall],
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            let args =
-                crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
-            let summary = crate::tools::safe_call_summary(&call.name, &args);
-            emit(
-                &self.stream,
-                &serde_json::json!({
-                    "type": "tool_call_started",
-                    "call_id": call.id,
-                    "name": call.name,
-                    "summary": summary,
-                }),
-            );
+        let cx = self.tool_cx.clone();
+        let stream = self.stream.clone();
+        crate::tool_runtime::run_until_cancelled(
+            &cx,
+            calls,
+            |call| {
+                let args = crate::tools::parse_arguments(&call.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                let summary = crate::tools::safe_call_summary(&call.name, &args);
+                emit(
+                    &self.stream,
+                    &serde_json::json!({
+                        "type": "tool_call_started",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "summary": summary,
+                    }),
+                );
 
-            // Per-call ULID decision ids (defect fix: the old
-            // `tool-round-{round}-{index}` ids repeated every turn).
-            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
-            let mut approval_channel = GoApprovalChannel {
-                rx: self.action_rx.clone(),
-            };
-            let result = crate::tool_runtime::execute_call(
-                &self.home,
-                &self.session_id,
-                &decision_id,
-                call,
-                self.auto_tools,
-                true,
-                &mut approval_channel,
-                &mut self.auto_grants,
-                &self.scope,
-                &self.tool_cx,
-            )
-            .unwrap_or_else(|e| (serde_json::json!({ "ok": false, "error": e }).to_string(), None));
-            let ok = result.0.contains("\"ok\":true");
-            emit(
-                &self.stream,
-                &serde_json::json!({
-                    "type": "tool_call_finished",
-                    "call_id": call.id,
-                    "name": call.name,
-                    "ok": ok,
-                }),
-            );
-            results.push(orbit_engine::ToolRoundResult {
-                call_id: call.id.clone(),
-                content: result.0,
-            });
-        }
-        results
+                // Per-call ULID decision ids (defect fix: the old
+                // `tool-round-{round}-{index}` ids repeated every turn).
+                let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+                let mut approval_channel = GoApprovalChannel {
+                    rx: self.action_rx.clone(),
+                    note: None,
+                };
+                let result = crate::tool_runtime::execute_call(
+                    &self.home,
+                    &self.session_id,
+                    &decision_id,
+                    call,
+                    self.auto_tools,
+                    true,
+                    &mut approval_channel,
+                    &mut self.auto_grants,
+                    &self.scope,
+                    &self.tool_cx,
+                )
+                .unwrap_or_else(|e| {
+                    (
+                        serde_json::json!({ "ok": false, "error": e }).to_string(),
+                        None,
+                    )
+                });
+                // E4: the typed verdict (a substring match called a
+                // failing command that printed `"ok":true` a success).
+                let ok = !orbit_tools::result_is_error(&result.0);
+                emit(
+                    &self.stream,
+                    &serde_json::json!({
+                        "type": "tool_call_finished",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "ok": ok,
+                    }),
+                );
+                orbit_engine::ToolRoundResult {
+                    call_id: call.id.clone(),
+                    content: result.0,
+                }
+            },
+            |call| {
+                // A call skipped after Esc still gets its finish, so the
+                // Go front-end settles the card it opened.
+                emit(
+                    &stream,
+                    &serde_json::json!({
+                        "type": "tool_call_finished",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "ok": false,
+                    }),
+                );
+            },
+        )
+    }
+
+    fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
+        crate::tool_runtime::begin_cancel_scope(&self.tool_cx, token);
+    }
+
+    fn end_cancel_scope(&mut self) {
+        self.tool_cx.pop_cancel_check();
     }
 }

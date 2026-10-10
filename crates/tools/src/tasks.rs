@@ -57,6 +57,16 @@ fn now() -> String {
         .unwrap_or_default()
 }
 
+/// The session's tasks as `(title, status)` in creation order — what a
+/// front-end's plan panel lists. `status` is pending | in_progress | done.
+pub fn snapshot(cx: &ToolContext) -> Vec<(String, String)> {
+    load(cx)
+        .tasks
+        .into_iter()
+        .map(|t| (t.title, t.status))
+        .collect()
+}
+
 pub struct TaskCreateTool;
 
 impl Tool for TaskCreateTool {
