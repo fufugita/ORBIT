@@ -911,20 +911,19 @@ fn draw_approval(
             yy += 1;
         }
     } else {
-        cv.text(x + 3, yy, "R grants", MUTED, Some(RAISE));
-        // The scope is the point of the row, so a narrow card shortens the
-        // wording and keeps the word that bounds it rather than clipping it.
-        let grant = [
-            format!("every {} call, until you quit", ap.tool),
-            format!("every {} call, this session", ap.tool),
-            format!("all {}, this session", ap.tool),
-            format!("all {}, session", ap.tool),
-            "all, session".to_string(),
+        // No rule is on offer for this call, so no grant can be remembered
+        // from the card. Scope honesty without a whole-tool escape hatch:
+        // the row says exactly that instead of advertising one.
+        cv.text(x + 3, yy, "no rule", MUTED, Some(RAISE));
+        let shown = [
+            format!("this {} call is not covered by a remembered rule", ap.tool),
+            "this call has no rule to remember".to_string(),
+            "no rule to remember".to_string(),
         ]
         .into_iter()
-        .find(|g| text_width(g) <= room)
-        .unwrap_or_else(|| clip_text("all, session", room));
-        cv.text(x + 14, yy, &grant, INK2, Some(RAISE));
+        .find(|v| text_width(v) <= room)
+        .unwrap_or_else(|| clip_text("no rule to remember", room));
+        cv.text(x + 14, yy, &shown, INK2, Some(RAISE));
         yy += 1;
     }
     yy += 1;
@@ -998,10 +997,10 @@ fn draw_approval(
     // exactly there.
     //
     // With a rule on offer the grants are `y` once, `s` this session and
-    // `a` always (when it can be saved): `R`, the whole tool, still works
-    // and is in the help, but the card does not recommend it. Without a
-    // rule `R` is the one grant and says it is the whole tool (design law
-    // 6: scope honesty). When the card is too narrow for every group at
+    // `a` always (when it can be saved). Without a rule `y` is the only
+    // grant — the whole-tool session grant is gone, so the card never
+    // offers a broader key than the rule it can remember (design law 6:
+    // scope honesty). When the card is too narrow for every group at
     // full length the words shrink (`once`, `session`, `deny`), and below
     // that only the keys stay; groups never overlap.
     let cap = |label: &str| {
@@ -1012,10 +1011,9 @@ fn draw_approval(
         }
     };
     let avail = w - 6; // from x + 3 to x + w - 3
-    let tool = &ap.tool;
     let has_a = ap.grant.as_ref().is_some_and(|g| g.can_save);
-    // `(y, s, a, R, n)` labels, longest wording first.
-    let wordings: Vec<[String; 5]> = if ap.grant.is_some() {
+    // `(y, s, a, n)` labels, longest wording first.
+    let wordings: Vec<[String; 4]> = if ap.grant.is_some() {
         [
             ("allow once", "this session", "always", "esc deny"),
             ("allow once", "session", "always", "esc deny"),
@@ -1023,55 +1021,31 @@ fn draw_approval(
             ("", "", "", ""),
         ]
         .into_iter()
-        .map(|(y, s, a, n)| [y.into(), s.into(), a.into(), String::new(), n.into()])
+        .map(|(y, s, a, n)| [y.into(), s.into(), a.into(), n.into()])
         .collect()
     } else {
-        let long = [
-            format!("allow all {tool} this session"),
-            format!("allow all {tool} for session"),
-            format!("allow all {tool}"),
-            "allow session".to_string(),
-            "session".to_string(),
-        ];
-        let mut v: Vec<[String; 5]> = long
-            .iter()
-            .map(|r| {
-                [
-                    "allow once".into(),
-                    String::new(),
-                    String::new(),
-                    r.clone(),
-                    "esc deny".into(),
-                ]
-            })
-            .collect();
-        for r in ["allow session", "session", "all"] {
-            v.push([
-                "once".into(),
-                String::new(),
-                String::new(),
-                r.into(),
-                "deny".into(),
-            ]);
-        }
-        v.push(Default::default());
-        v
+        [
+            ("allow once", "", "", "esc deny"),
+            ("once", "", "", "deny"),
+            ("", "", "", ""),
+        ]
+        .into_iter()
+        .map(|(y, s, a, n)| [y.into(), s.into(), a.into(), n.into()])
+        .collect()
     };
-    let left = |wd: &[String; 5]| -> Vec<(&'static str, String)> {
+    let left = |wd: &[String; 4]| -> Vec<(&'static str, String)> {
         let mut g = vec![("y", wd[0].clone())];
         if ap.grant.is_some() {
             g.push(("s", wd[1].clone()));
             if has_a {
                 g.push(("a", wd[2].clone()));
             }
-        } else {
-            g.push(("R", wd[3].clone()));
         }
         g
     };
-    let fits = |wd: &[String; 5]| {
+    let fits = |wd: &[String; 4]| {
         let groups = left(wd);
-        groups.iter().map(|(_, l)| cap(l)).sum::<i32>() + 3 * groups.len() as i32 + cap(&wd[4])
+        groups.iter().map(|(_, l)| cap(l)).sum::<i32>() + 3 * groups.len() as i32 + cap(&wd[3])
             <= avail
     };
     let chosen = wordings
@@ -1079,7 +1053,7 @@ fn draw_approval(
         .find(|wd| fits(wd))
         .cloned()
         .unwrap_or_default();
-    let n_label = chosen[4].as_str();
+    let n_label = chosen[3].as_str();
     let deny_w = cap(n_label);
     let deny_x = x + w - 3 - deny_w;
     // Each is clickable as the key it shows: the click goes through the

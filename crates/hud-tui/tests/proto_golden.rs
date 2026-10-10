@@ -199,14 +199,16 @@ fn approval_card_needs_you_with_risk_facts_and_keys() {
         "{out}"
     );
     assert!(out.contains("/home/hanu/src/orbit"), "{out}");
-    // `R` says its true scope: every call of the tool, this session.
+    // No whole-tool grant on the card: `y` is the only allow, and the
+    // card says there is no rule to remember for this call.
+    assert!(out.contains("allow once"), "{out}");
     assert!(
-        out.contains("allow once") && out.contains("allow all shell"),
-        "{out}"
+        out.contains("no rule") && out.contains("no rule to remember"),
+        "the card says no rule is on offer: {out}"
     );
     assert!(
-        out.contains("R grants") && out.contains("every shell call, until you quit"),
-        "the card states what R grants: {out}"
+        !out.contains("R grants") && !out.contains("allow all"),
+        "the whole-tool grant is gone from the card: {out}"
     );
     assert!(out.contains("esc deny"), "{out}");
     // The card replaces the composer.
@@ -371,8 +373,11 @@ fn an_armed_approval_border_replaces_the_keys_instead_of_overdrawing_them() {
         .lines()
         .find(|l| l.contains("allow once"))
         .unwrap_or_else(|| panic!("the keys must show:\n{live}"));
-    assert!(keys.contains("allow all Edit"), "{keys}");
     assert!(keys.contains("deny"), "{keys}");
+    assert!(
+        !keys.contains(" R ") && !keys.contains("allow all"),
+        "the whole-tool grant is gone: {keys}"
+    );
 }
 
 #[test]
@@ -460,8 +465,8 @@ fn the_approval_card_shows_the_edit_the_sandbox_and_the_true_grant_scope() {
         "{edit}"
     );
     assert!(
-        edit.contains("allow all Edit"),
-        "the grant says its scope: {edit}"
+        edit.contains("no rule"),
+        "the card says no rule is on offer: {edit}"
     );
 
     // A command: the sandbox fact, in words; unconfined must stand out.
@@ -475,7 +480,10 @@ fn the_approval_card_shows_the_edit_the_sandbox_and_the_true_grant_scope() {
         bash.contains("sandbox") && bash.contains("confined · no network"),
         "{bash}"
     );
-    assert!(bash.contains("allow all Bash"), "{bash}");
+    assert!(
+        !bash.contains("allow all Bash") && !bash.contains(" R "),
+        "no whole-tool grant on the card: {bash}"
+    );
     s.approval_facts = vec![(
         "sandbox".into(),
         "NONE — runs with your full permissions".into(),
@@ -797,15 +805,6 @@ fn the_approval_card_keeps_its_parts_apart_at_every_width() {
     s.approval_risk = 2;
     s.approval_shown_ms = 1_000;
     s.approval_facts = vec![("sandbox".into(), "confined · no network".into())];
-    let r_labels = [
-        "allow all Bash this session",
-        "allow all Bash for session",
-        "allow all Bash",
-        "allow session",
-        "session",
-        "all",
-        "",
-    ];
     let mut seen_full = false;
     for width in [40u16, 44, 48, 52, 60, 70, 80, 100, 119, 120, 140, 164] {
         let out = render(&tui, &s, width, 36);
@@ -822,53 +821,35 @@ fn the_approval_card_keeps_its_parts_apart_at_every_width() {
             head.contains("MEDIUM") || head.contains("\u{25b0}\u{25b0}\u{25b1}"),
             "{width}: the risk survives:\n{head}"
         );
-        // What `R` grants keeps the word that bounds it, however narrow.
+        // The no-rule row keeps its meaning, however narrow.
         let grants = rows
             .iter()
-            .find(|r| r.contains("R grants"))
-            .unwrap_or_else(|| panic!("{width}: no `R grants` row:\n{out}"));
+            .find(|r| r.contains("no rule"))
+            .unwrap_or_else(|| panic!("{width}: no `no rule` row:\n{out}"));
         assert!(
-            grants.contains("session") || grants.contains("quit"),
-            "{width}: the scope is clipped away:\n{grants}"
+            grants.contains("no rule") || grants.contains("remember"),
+            "{width}: the wording is clipped away:\n{grants}"
         );
         let keys = rows
             .iter()
             .find(|r| r.contains('\u{2517}') && r.contains(" y "))
             .unwrap_or_else(|| panic!("{width}: no key row:\n{out}"));
-        let between = |a: &str, b: &str| -> String {
-            let from = keys.find(a).unwrap() + a.len();
-            let to = from
-                + keys[from..]
-                    .find(b)
-                    .unwrap_or_else(|| panic!("{width}: {b:?} after {a:?}:\n{keys}"));
-            keys[from..to]
-                .trim_matches(|c: char| c == '\u{2501}' || c == ' ')
-                .to_string()
-        };
-        let y_label = between(" y ", " R ");
-        let r_label = between(" R ", " n ");
-        let n_at = keys.find(" n ").unwrap() + 3;
-        // The card ends at its corner; other panels may follow on the row.
-        let n_label = keys[n_at..]
-            .split('\u{251b}')
-            .next()
-            .unwrap()
+        let y_at = keys.find(" y ").unwrap() + 3;
+        // The y label runs from its keycap to the next keycap (`n`) or
+        // the card corner, whichever comes first.
+        let rest = &keys[y_at..];
+        let end = rest.find(" n ").unwrap_or(rest.len());
+        let y_label = rest[..end]
             .trim_matches(|c: char| c == '\u{2501}' || c == ' ')
             .to_string();
         assert!(
             ["allow once", "once", ""].contains(&y_label.as_str()),
             "{width}: {y_label:?}\n{keys}"
         );
-        assert!(
-            r_labels.contains(&r_label.as_str()),
-            "{width}: {r_label:?}\n{keys}"
-        );
-        assert!(
-            ["esc deny", "deny", ""].contains(&n_label.as_str()),
-            "{width}: {n_label:?}\n{keys}"
-        );
+        // The whole-tool grant is gone: no R key anywhere on the row.
+        assert!(!keys.contains(" R "), "{width}: R is gone:\n{keys}");
         if width >= 120 {
-            seen_full |= r_label.starts_with("allow all Bash") && n_label == "esc deny";
+            seen_full |= y_label == "allow once";
         }
     }
     assert!(
@@ -930,8 +911,7 @@ fn rule_scenario(can_save: bool) -> Scenario {
 #[test]
 fn a_rule_derived_for_another_call_is_not_named_on_the_card() {
     // The card is about c1; the only rule on hand was derived for c2. It is
-    // not shown, `s` is not offered, and the card falls back to saying what
-    // `R` would grant.
+    // not shown, `s` is not offered, and the card says no rule is on offer.
     let mut tui = Tui::new();
     tui.tick_ms = 9_000;
     let mut s = rule_scenario(true);
@@ -941,7 +921,7 @@ fn a_rule_derived_for_another_call_is_not_named_on_the_card() {
         !out.contains("s grants") && !out.contains("a grants") && !out.contains("cargo test *"),
         "{out}"
     );
-    assert!(out.contains("R grants"), "{out}");
+    assert!(out.contains("no rule"), "{out}");
 }
 
 #[test]
@@ -969,8 +949,8 @@ fn the_approval_card_names_the_rule_that_s_and_a_would_remember() {
     for label in ["allow once", "this session", "always", "esc deny"] {
         assert!(single.contains(label), "key label {label:?}:\n{single}");
     }
-    // `R` still works but is not recommended: it is off the card, and the
-    // row that described it is replaced by the two that name the rule.
+    // The whole-tool grant is gone: no R anywhere, and the row that
+    // described it is replaced by the two that name the rule.
     assert!(
         !out.contains("R grants") && !out.contains("allow all Bash"),
         "{out}"
@@ -984,12 +964,12 @@ fn the_approval_card_names_the_rule_that_s_and_a_would_remember() {
     );
     assert!(!out.contains("always"), "{out}");
 
-    // No rule on offer: the card is what it was: `R` and its scope.
+    // No rule on offer: the card says so, and offers no broader key.
     let mut s = rule_scenario(true);
     s.approval_grant = None;
     let out = render(&tui, &s, 164, 48);
     assert!(
-        out.contains("R grants") && !out.contains("s grants"),
+        out.contains("no rule") && !out.contains("s grants") && !out.contains("R grants"),
         "{out}"
     );
 }

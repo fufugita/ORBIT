@@ -159,22 +159,18 @@ impl ApprovalChannel for StdApprovalChannel {
             None => String::new(),
         };
         print!(
-            "approval needed: {} ({} risk). y allow once, {rules}R allow all {} this session, n deny: ",
+            "approval needed: {} ({} risk). y allow once, {rules}n deny: ",
             req.summary,
             req.risk.as_str(),
-            req.tool_name
         );
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {
             return ApprovalVerdict::Deny;
         }
-        // `R` is capital in the card; the line reader folds case, and a
-        // lower-case `r` has always meant the same thing here.
         let answer = line.trim().to_ascii_lowercase();
         match answer.as_str() {
             "y" | "yes" => ApprovalVerdict::AllowOnce,
-            "r" => ApprovalVerdict::AllowSession,
             "s" if req.grant.is_some() => ApprovalVerdict::AllowRuleSession,
             "a" if req.grant.is_some() => ApprovalVerdict::AllowRuleAlways,
             _ => {
@@ -191,8 +187,10 @@ impl ApprovalChannel for StdApprovalChannel {
     }
 }
 
-/// A session-scoped set of tools that have been R-granted (always-allow).
-/// Stored in the harness; checked before calling `approval.ask`.
+/// A session-scoped set of tools that have been whole-tool granted (the
+/// web/Go "session" verdict; the interactive card no longer offers one —
+/// `s`/`a` remember a rule instead). Stored in the harness; checked
+/// before calling `approval.ask`.
 #[derive(Debug, Clone, Default)]
 pub struct AutoGrants {
     tools: std::collections::HashSet<String>,
@@ -2036,7 +2034,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let write = make_call("Write", br#"{"file_path":"e.txt","content":"x"}"#);
 
-        // Grant R on Write.
+        // Grant the whole tool for the session (the web "session" verdict).
         let mut ch = FixedChannel(ApprovalVerdict::AllowSession);
         let mut grants = AutoGrants::new();
         let _ = execute_call(
@@ -2055,7 +2053,7 @@ mod tests {
         assert!(grants.is_granted("Write"));
         assert!(
             !grants.is_granted("Edit"),
-            "R on Write should not grant Edit"
+            "a Write grant should not cover Edit"
         );
 
         // Edit should still ask the channel.

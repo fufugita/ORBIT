@@ -196,9 +196,9 @@ content can never become user authority.
   (`Bash(cargo test *)`), except for verbs that run code or publish
   (`cargo run`, `git push`), and the exact command for anything else or for
   a line with an operator in it. `n` denies and takes a word on why, which
-  goes back to the model; `Esc` denies without one. `R` still allows the
-  whole tool for the session; it is in the help, and on the card only when
-  no narrower rule can be offered. Every decision is a Ledger record, and a
+  goes back to the model; `Esc` denies without one. When no rule can be
+  offered for a call, `y` is the only allow — there is no whole-tool
+  session grant on the card. Every decision is a Ledger record, and a
   grant never outranks a deny rule or bypasses the known-tool check.
 - **Sandboxed shell** — on Linux, Bash runs under bubblewrap with no network
   and writes limited to the project and a session temp directory. Where the

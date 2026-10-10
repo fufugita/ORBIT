@@ -2234,7 +2234,6 @@ fn approval_key(
             KeyCode::Char('a') if offer.as_ref().is_some_and(|g| g.can_save) => {
                 Some(Answer::Response(crate::ApprovalResponse::AllowRuleAlways))
             }
-            KeyCode::Char('R') => Some(Answer::Response(crate::ApprovalResponse::AllowSession)),
             // `n` denies, and asks for a word on why (optional).
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 scenario.approval_note = Some(String::new());
@@ -2964,10 +2963,6 @@ mod click_tests {
             KeyCode::Char('y')
         );
         assert_eq!(
-            key_of(click(&mut tui, at(&rows, "allow all Edit"), false, w, h)),
-            KeyCode::Char('R')
-        );
-        assert_eq!(
             key_of(click(&mut tui, at(&rows, "esc deny"), false, w, h)),
             KeyCode::Char('n')
         );
@@ -3079,7 +3074,9 @@ mod click_tests {
             ('y', true, true, Some(R::Allow)),
             ('s', true, true, Some(R::AllowRule)),
             ('a', true, true, Some(R::AllowRuleAlways)),
-            ('R', true, true, Some(R::AllowSession)),
+            // `R`, the whole-tool grant, is gone from the card: the key
+            // now answers nothing.
+            ('R', true, true, None),
             ('a', false, true, None),
             ('s', false, false, None),
             ('a', true, false, None),
@@ -3205,7 +3202,7 @@ mod click_tests {
     /// field by accident either.
     #[test]
     fn the_new_keys_obey_the_arming_delay() {
-        for key in ['y', 's', 'a', 'R', 'n'] {
+        for key in ['y', 's', 'a', 'n'] {
             let (mut s, reg, rx) = parked(true, true);
             approval_key(
                 crossterm::event::KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
