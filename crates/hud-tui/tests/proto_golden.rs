@@ -1,6 +1,5 @@
-//! Proto golden frames (§16.2): render the §9.22 welcome, the §9.13
-//! composer and the §9.14 approval card at their golden sizes and
-//! compare symbols with `docs/tui/golden/*.txt` (trimmed rows).
+//! Proto golden frames: render the welcome, the composer and the approval
+//! card at their golden sizes and compare the drawn symbols row by row.
 //!
 //! The transcript-heavy goldens (wide_idle, wide_streaming,
 //! wide_approval) carry §13.1 fixture data the runtime does not emit

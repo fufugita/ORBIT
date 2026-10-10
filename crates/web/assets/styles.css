@@ -1,5 +1,5 @@
-/* ORBIT browser harness — same palette as the TUI's tui.toml default
- * (docs/tui/DESIGN.md §3): deep-space ground, cyan accent, warm text. */
+/* ORBIT browser harness — same palette as the TUI's tui.toml default:
+ * deep-space ground, cyan accent, warm text. */
 
 :root {
   --bg: #0b0e14;

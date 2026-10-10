@@ -426,7 +426,6 @@ Unlicense, and CC0-1.0; anything else fails the check.
 ├── crates/            Rust workspace (28 crates, plus the desktop shell)
 ├── tests/             gate and scenario tests that drive the real binary
 ├── sdk/               TypeScript + Python SDKs, WIT shims
-├── frontends/         the earlier Go terminal UI (frozen)
 ├── conformance/       cross-language IR conformance corpus
 ├── migrator/          legacy-workflow → ORBIT migration
 ├── spec/              error registry + traceability
@@ -434,7 +433,7 @@ Unlicense, and CC0-1.0; anything else fails the check.
 ├── deploy/            mock provider deployment
 ├── scripts/           build, e2e, fuzz, packaging, PTY and jail scripts
 ├── fuzz/              coverage-guided fuzzing
-├── docs/              roadmap, TUI design, prototype and screenshots
+├── docs/              roadmap, TUI prototype and screenshots
 ├── .github/           CI and the headless-run workflow
 ├── Cargo.toml         workspace manifest
 ├── deny.toml          cargo-deny policy

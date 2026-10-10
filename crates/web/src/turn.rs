@@ -1,8 +1,8 @@
 //! The turn thread — drives `run_turn` + tool loop for the browser front-end.
 //!
-//! Same shape as the Go bridge's main loop (go_bridge.rs): wait for actions,
-//! run a turn per `prompt`, park on the action channel for approvals, save
-//! the session after every turn. Events broadcast to all SSE peers.
+//! Same shape as the old Go bridge's main loop: wait for actions, run a turn
+//! per `prompt`, park on the action channel for approvals, save the session
+//! after every turn. Events broadcast to all SSE peers.
 
 use crate::{make_channels, router, BridgeState, WebApprovalChannel};
 use orbit_adapter::types::{ChatMessage, ChatRole};
@@ -105,7 +105,7 @@ fn protocol_kind(ev: &orbit_frontend_protocol::FrontendEvent) -> &'static str {
     }
 }
 
-/// The turn loop — same structure as go_bridge's main loop.
+/// The turn loop — same structure as the old Go bridge's main loop.
 fn turn_loop(
     state: BridgeState,
     mut config: TuiTurnConfig,
