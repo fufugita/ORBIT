@@ -30,6 +30,7 @@ pub mod context;
 pub mod diff;
 pub mod dispatch;
 pub mod hooks;
+pub mod routing;
 pub mod skills;
 pub mod transcript;
 pub mod turn;
@@ -99,6 +100,7 @@ pub fn user_message(text: impl Into<String>) -> ChatMessage {
         tool_call_id: None,
         tool_result: None,
         blocks: None,
+        origin_model: None,
     }
 }
 
@@ -111,5 +113,6 @@ pub fn assistant_message(text: impl Into<String>) -> ChatMessage {
         tool_call_id: None,
         tool_result: None,
         blocks: None,
+        origin_model: None,
     }
 }

@@ -338,11 +338,17 @@ pub fn run_turn(
                     limit: config.max_output_tokens,
                 });
             }
-            transcript.push(assistant_message_with_thinking(
+            let mut m = assistant_message_with_thinking(
                 o.output.clone(),
                 o.thinking.clone(),
                 o.thinking_signature.clone(),
-            ));
+            );
+            // Routing: opaque blocks are model-bound — record who made
+            // them so a later switched-model dispatch can strip them.
+            if m.blocks.is_some() {
+                m.origin_model = Some(config.model.clone());
+            }
+            transcript.push(m);
             report.final_text = o.output.clone();
             report.ok = true;
             events(FrontendEvent::ResponseFinished {
@@ -372,12 +378,17 @@ pub fn run_turn(
                 arguments: String::from_utf8_lossy(&tc.arguments).into_owned(),
             })
             .collect();
-        transcript.push(assistant_with_calls_and_thinking(
+        let mut m = assistant_with_calls_and_thinking(
             o.output.clone(),
             assistant_calls,
             o.thinking.clone(),
             o.thinking_signature.clone(),
-        ));
+        );
+        // Routing: same origin tag on the tool-call message's thinking.
+        if m.blocks.is_some() {
+            m.origin_model = Some(config.model.clone());
+        }
+        transcript.push(m);
 
         // The TUI's tool-line motion (M07/M08/M09/M10): the full
         // start (kind + target) before execution, the finish with a
@@ -443,6 +454,7 @@ pub fn run_turn(
                 tool_call_id: Some(r.call_id.clone()),
                 tool_result: Some(r.content),
                 blocks: None,
+                origin_model: None,
             });
         }
 
@@ -501,6 +513,7 @@ fn dispatch_with_retry(
                         tool_call_id: None,
                         tool_result: None,
                         blocks: None,
+                        origin_model: None,
                     },
                 );
             }
@@ -640,6 +653,7 @@ pub(crate) fn assistant_with_calls_and_thinking(
         tool_call_id: None,
         tool_result: None,
         blocks: None,
+        origin_model: None,
     };
     if let Some(t) = thinking.filter(|t| !t.is_empty()) {
         m.blocks = Some(vec![orbit_adapter::types::ContentBlock::Opaque {

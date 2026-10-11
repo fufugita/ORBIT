@@ -269,6 +269,14 @@ pub struct ChatMessage {
     /// and recorded; the model may receive the sanitized result only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<String>,
+    /// Which model produced this assistant message (routing, 2026-10-10).
+    /// Opaque blocks (thinking, redacted thinking) are model-bound: a
+    /// provider rejects another model's signatures. Difficulty routing
+    /// uses this to strip foreign thinking before a switched-model
+    /// dispatch instead of failing the request. `None` on pre-routing
+    /// messages — treated as unknown origin by the stripper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_model: Option<String>,
 }
 
 /// A tool call inside an assistant message (OpenAI-compatible wire shape).

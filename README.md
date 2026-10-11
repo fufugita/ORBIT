@@ -206,6 +206,33 @@ overrides its role. `orbit provider role <name> [model]` sets and
 queries roles; interactive `provider add` offers to fill unset ones,
 preferring cheap models for explore and compaction.
 
+### Difficulty routing
+
+Roles route *tasks*; routing also reads the *prompt*. A small keyword
+classifier — deterministic, no second model call — sends hard-sounding
+prompts ("refactor", "root cause", "trace", "security review", …) to a
+strong model and easy-sounding ones ("summarize", "what is", "typo",
+…) to a cheap one. Unset or unmatched prompts keep the session's own
+model. Hard always wins when both fire:
+
+```sh
+orbit route hard claude-opus-5-5     # arm the tiers (models must be configured)
+orbit route easy claude-haiku-4-5
+orbit route test "refactor the parser"   # preview: phase, model, the keyword that fired
+orbit route status                       # the whole table
+orbit route keywords add hard wasm      # extend the vocabulary
+orbit route off                           # disarm
+```
+
+Every routed turn writes a decision record under the session's
+`routing/` directory and the status line says what happened
+(`routed hard → <model> (refactor)`). An explicit `--model` or `/model`
+choice always wins over the table — routing never overrides you.
+Switching models drops foreign thinking blocks from the wire copy
+(providers reject another model's signatures); the session file keeps
+them. `orbit provider add` offers to arm routing when a second model
+exists.
+
 ## Features
 
 - **Tool calling with approval** — reads run freely, edits and commands ask.
@@ -260,6 +287,7 @@ orbit restore          restore into a fresh namespace
 orbit mod install|list|allow-issuer   signed mods
 orbit folder trust|untrust|status     let a folder's own settings loosen permissions
 orbit provider add|list|remove|presets|role   manage providers and roles
+orbit route status|hard|easy|off|keywords|test   difficulty routing: arm tiers, preview a prompt
 orbit version          build + evidence facts (computed, no fixed claims)
 orbit web              start the browser harness
 ```

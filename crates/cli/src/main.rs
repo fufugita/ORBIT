@@ -256,6 +256,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "mod" => cmd_mod(&home, args),
         "folder" => cmd_folder(&home, args),
         "provider" => cmd_provider(&home, args),
+        "route" => cmd_route(&home, args),
         "version" => Ok(serde_json::to_value(orbit_cli::version_evidence(
             env!("CARGO_PKG_VERSION"),
             &build_commit(),
@@ -2074,6 +2075,20 @@ fn cmd_chat(args: &[String]) -> i32 {
             credential_env,
             pricing,
         );
+        // Difficulty routing (2026-10-10): classify the prompt; hard /
+        // easy signals with armed targets switch the model for this
+        // turn. `routed_turn_config` itself defers to an explicit
+        // --model / ORBIT_MODEL choice (manual wins over the table).
+        let (turn_config, routing_decision) =
+            orbit_cli::routed_turn_config(&home, &turn_config, &trimmed, &session);
+        if turn_config.model != model {
+            println!(
+                "routed {} → {} ({})",
+                routing_decision.phase.as_str(),
+                turn_config.model,
+                routing_decision.matched.join(", ")
+            );
+        }
         let mut executor = ReplToolExecutor {
             home: home.clone(),
             session_id: session.clone(),
@@ -2497,6 +2512,169 @@ fn cmd_folder(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
 /// `orbit provider add|list|remove|presets` — provider management.
 /// `add` walks a preset (or custom) through discovery into providers.toml;
 /// it stores env-var NAMES and public model facts, never credential values.
+/// `orbit route` — inspect and set difficulty routing. Setup is one
+/// command per tier: `orbit route hard <model>` and `orbit route easy
+/// <model>`; `off` disarms a tier. `test "<prompt>"` classifies
+/// without sending anything, so the table can be tuned before it
+/// spends money.
+fn cmd_route(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    use orbit_engine::routing as r;
+    let pos = positionals(args);
+    let sub = pos.get(1).copied().unwrap_or("status");
+    let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+    match sub {
+        "status" => {
+            let table = cfg.routing_table();
+            fn spec(s: &str) -> String {
+                if s.is_empty() {
+                    "(off — this phase keeps the session model)".to_string()
+                } else {
+                    s.to_string()
+                }
+            }
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "route status",
+                "status": "ok",
+                "enabled": table.enabled(),
+                "hard": spec(&table.hard),
+                "easy": spec(&table.easy),
+                "hard_keywords": table.hard_keywords,
+                "easy_keywords": table.easy_keywords,
+                "hint": if table.enabled() {
+                    "routing is on: hard/easy signals switch the turn's model (orbit route test \"<prompt>\" to preview)"
+                } else {
+                    "routing is off: set targets with `orbit route hard <model>` and `orbit route easy <model>`"
+                },
+            }))
+        }
+        "hard" | "easy" => {
+            let spec = pos.get(2).copied().unwrap_or("");
+            if spec == "off" || spec.is_empty() {
+                cfg.set_routing_target(sub, "")
+                    .map_err(|e| ("ORBIT-E1101", e))?;
+            } else {
+                cfg.set_routing_target(sub, spec)
+                    .map_err(|e| ("ORBIT-E1101", e))?;
+            }
+            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            let table = cfg.routing_table();
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": format!("route {sub}"),
+                "status": "ok",
+                "hard": table.hard,
+                "easy": table.easy,
+                "enabled": table.enabled(),
+            }))
+        }
+        "off" => {
+            cfg.set_routing_target("hard", "")
+                .map_err(|e| ("ORBIT-E1101", e))?;
+            cfg.set_routing_target("easy", "")
+                .map_err(|e| ("ORBIT-E1101", e))?;
+            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "route off",
+                "status": "ok",
+                "enabled": false,
+            }))
+        }
+        "keywords" => {
+            // route keywords add hard|easy <word...>
+            // route keywords remove hard|easy <word>
+            // route keywords clear
+            let action = pos.get(2).copied().unwrap_or("");
+            let list_name = pos.get(3).copied().unwrap_or("");
+            let word = pos.get(4..).map(|w| w.join(" ")).unwrap_or_default();
+            let (list, name) = match list_name {
+                "hard" => (&mut cfg.routing.keywords.hard, "hard"),
+                "easy" => (&mut cfg.routing.keywords.easy, "easy"),
+                other => {
+                    return Err((
+                        "ORBIT-E1101",
+                        format!(
+                        "usage: orbit route keywords add|remove hard|easy <word>  (got '{other}')"
+                    ),
+                    ))
+                }
+            };
+            match action {
+                "add" => {
+                    let w = word.trim().to_lowercase();
+                    if w.is_empty() {
+                        return Err((
+                            "ORBIT-E1101",
+                            "usage: orbit route keywords add hard|easy <word>".into(),
+                        ));
+                    }
+                    if !list.iter().any(|x| x == &w) {
+                        list.push(w);
+                    }
+                }
+                "remove" => {
+                    let w = word.trim().to_lowercase();
+                    list.retain(|x| x != &w);
+                }
+                "clear" => {
+                    cfg.routing.keywords.clear = true;
+                    cfg.routing.keywords.hard.clear();
+                    cfg.routing.keywords.easy.clear();
+                }
+                other => {
+                    return Err((
+                        "ORBIT-E1101",
+                        format!("usage: orbit route keywords add|remove|clear … (got '{other}')"),
+                    ))
+                }
+            }
+            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            let _ = name;
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "route keywords",
+                "status": "ok",
+                "hard_keywords": cfg.routing_table().hard_keywords,
+                "easy_keywords": cfg.routing_table().easy_keywords,
+            }))
+        }
+        "test" => {
+            // The prompt is everything after `test`, verbatim.
+            let prompt = args
+                .iter()
+                .skip_while(|a| *a != "test")
+                .nth(1)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if prompt.is_empty() {
+                return Err(("ORBIT-E1101", "usage: orbit route test \"<prompt>\"".into()));
+            }
+            let table = cfg.routing_table();
+            let d = r::classify(&table, prompt);
+            let target = match d.phase {
+                r::RoutingPhase::Hard => &table.hard,
+                r::RoutingPhase::Easy => &table.easy,
+                r::RoutingPhase::Main => &cfg.roles.main,
+            };
+            Ok(serde_json::json!({
+                "schema": "orbit.cli/v1",
+                "command": "route test",
+                "status": "ok",
+                "prompt_chars": prompt.len(),
+                "phase": d.phase.as_str(),
+                "matched": d.matched,
+                "model": if target.is_empty() { "(session model)" } else { target },
+                "routing_enabled": table.enabled(),
+            }))
+        }
+        other => Err((
+            "ORBIT-E1101",
+            format!("unknown route subcommand '{other}' (status, hard, easy, off, keywords, test)"),
+        )),
+    }
+}
+
 fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     let pos = positionals(args);
     let sub = pos.get(1).copied().unwrap_or("list");
@@ -2833,6 +3011,68 @@ fn run_provider_add_interactive(
         }
     }
 
+    // Routing offer (2026-10-10): difficulty routing needs two tiers
+    // and a second distinct model. Offer it once the config can arm
+    // both — the roles suggestion above already picked the big and
+    // cheap candidates.
+    let mut routing_set: Vec<(String, String)> = Vec::new();
+    let total_models: usize = {
+        let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+        cfg.all_models().len()
+    };
+    if total_models >= 2
+        && prompt_yes_no(
+            "Turn on difficulty routing? (hard prompts → the strong model, easy → the cheap one)",
+            false,
+        )?
+    {
+        let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+        // Suggest from the just-added provider: the priciest
+        // choice = hard, the cheapest = easy. Roles already set
+        // main, so routing switches only what it recognizes.
+        let cheap_hint = |id: &str| {
+            orbit_cli::presets::preset_model(preset, id)
+                .map(|f| f.pricing.0)
+                .unwrap_or(u64::MAX)
+        };
+        let mut ranked = model_ids.clone();
+        ranked.sort_by_key(|id| cheap_hint(id));
+        let (cheap, big) = if ranked.len() >= 2 {
+            let big = ranked.last().unwrap().clone();
+            let cheap = ranked.first().unwrap().clone();
+            (cheap, big)
+        } else {
+            // One model on this provider: pick a second from the
+            // rest of the config (any distinct id).
+            let other = cfg
+                .all_models()
+                .iter()
+                .map(|(p, m)| format!("{p}/{m}"))
+                .find(|s| !model_ids.iter().any(|id| s.ends_with(id)))
+                .unwrap_or_default();
+            (model_ids[0].clone(), other)
+        };
+        let targets = [("hard", big), ("easy", cheap)];
+        for (phase, spec) in targets {
+            let spec = if cfg.provider_for_role_spec(&spec).is_some() {
+                spec
+            } else {
+                format!("{name}/{spec}")
+            };
+            if cfg.set_routing_target(phase, &spec).is_ok() {
+                routing_set.push((phase.to_string(), spec));
+            }
+        }
+        if !routing_set.is_empty() {
+            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            println!("routing:");
+            for (phase, spec) in &routing_set {
+                println!("  {phase:<5} {spec}");
+            }
+            println!("  preview with: orbit route test \"<prompt>\"");
+        }
+    }
+
     Ok(serde_json::json!({
         "schema": "orbit.cli/v1",
         "command": "provider add",
@@ -2842,6 +3082,7 @@ fn run_provider_add_interactive(
         "url": gate,
         "models": model_ids,
         "roles_set": roles_set,
+        "routing_set": routing_set,
     }))
 }
 

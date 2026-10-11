@@ -412,9 +412,12 @@ fn typing_a_slash_opens_the_command_list_above_the_composer() {
         "{all}"
     );
     assert!(all.contains("⇥ complete"), "the keys that act on it: {all}");
-    // Six rows show at once; the rest are one ↓ away, never out of reach.
-    assert!(all.contains("↓ more") && !all.contains("/usage"), "{all}");
-    let scrolled = shot("/", 6);
+    // Six rows show at once; the rest are one ↓ away, never out of
+    // reach. With more commands than rows, the last command appears
+    // (without "↓ more") once the selection reaches the end.
+    assert!(all.contains("↓ more"), "{all}");
+    let n = orbit_hud_tui::proto::chrome::COMMANDS.len();
+    let scrolled = shot("/", n.saturating_sub(1));
     assert!(
         scrolled.contains("/usage") && !scrolled.contains("↓ more"),
         "{scrolled}"

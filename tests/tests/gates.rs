@@ -1010,3 +1010,131 @@ fn gate3_danger_triple_denial_egress_highrisk() {
         .status();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── Difficulty routing (2026-10-10) ─────────────────────────────────────
+//
+// Two models on one mock provider: the classifier picks per prompt, an
+// explicit --model defers to the operator, and `orbit route test`
+// previews without dispatching.
+
+/// `orbit route ...` through the binary; returns (stdout JSON, exit).
+fn run_route(home: &std::path::Path, args: &[&str]) -> (serde_json::Value, i32) {
+    let bin = orbit_bin();
+    let out = Command::new(&bin)
+        .arg("route")
+        .args(args)
+        .env("ORBIT_HOME", home)
+        .output()
+        .expect("spawn orbit route");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let v = serde_json::from_str(&stdout).unwrap_or(
+        serde_json::json!({"stdout": stdout, "stderr": String::from_utf8_lossy(&out.stderr)}),
+    );
+    (v, code)
+}
+
+#[test]
+fn route_command_sets_targets_and_previews() {
+    let home = fresh_home("route-cmd");
+    let bin = orbit_bin();
+    init_home(bin.to_str().unwrap(), &home);
+    // Two models on the mock-less config (no provider needed for the
+    // classifier; targets must name a declared model, so declare one
+    // provider with two).
+    std::fs::write(
+        home.join("providers.toml"),
+        "[[provider]]\nname = \"p\"\nurl = \"http://127.0.0.1:9\"\n\
+         [[provider.models]]\nid = \"big-model\"\n\
+         [[provider.models]]\nid = \"small-model\"\n",
+    )
+    .unwrap();
+
+    // status before: off.
+    let (v, code) = run_route(&home, &["status"]);
+    assert_eq!(code, 0, "route status must succeed");
+    assert_eq!(v["enabled"], false, "routing off before targets: {v}");
+
+    // Setting a target that no provider declares is refused.
+    let (_, code) = run_route(&home, &["hard", "no-such-model"]);
+    assert_ne!(code, 0, "unknown model must be refused");
+
+    // Arm both tiers.
+    let (v, code) = run_route(&home, &["hard", "big-model"]);
+    assert_eq!(code, 0);
+    assert_eq!(v["hard"], "big-model");
+    let (v, code) = run_route(&home, &["easy", "small-model"]);
+    assert_eq!(code, 0);
+    assert_eq!(v["enabled"], true, "one target left set: {v}");
+
+    // The dry run: hard prompt → hard target, with the keyword shown.
+    let (v, code) = run_route(&home, &["test", "please refactor the parser"]);
+    assert_eq!(code, 0, "route test must succeed: {v}");
+    assert_eq!(v["phase"], "hard", "refactor is a hard signal: {v}");
+    assert_eq!(v["model"], "big-model");
+    let matched = v["matched"].as_array().expect("matched array");
+    assert!(
+        matched.iter().any(|m| m == "refactor"),
+        "the matched list names the keyword: {v}"
+    );
+
+    // An easy prompt with no hard word goes to the cheap tier.
+    let (v, _) = run_route(&home, &["test", "briefly summarize this file"]);
+    assert_eq!(v["phase"], "easy", "{v}");
+    assert_eq!(v["model"], "small-model");
+
+    // No signal keeps the session model.
+    let (v, _) = run_route(&home, &["test", "add a button"]);
+    assert_eq!(v["phase"], "main", "{v}");
+
+    // Custom keywords extend the defaults and survive the roundtrip.
+    let (v, code) = run_route(&home, &["keywords", "add", "hard", "orbitstuff"]);
+    assert_eq!(code, 0, "keyword add: {v}");
+    let (v, _) = run_route(&home, &["test", "orbitstuff the config"]);
+    assert_eq!(v["phase"], "hard", "custom keyword routes: {v}");
+
+    // Disarm: off clears both tiers.
+    let (v, code) = run_route(&home, &["off"]);
+    assert_eq!(code, 0);
+    assert_eq!(v["enabled"], false);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn routed_turn_switches_model_and_defers_to_explicit() {
+    let (port, _mock_guard) = spawn_mock_guarded();
+    let home = fresh_home("route-turn");
+    let bin = orbit_bin();
+    init_home(bin.to_str().unwrap(), &home);
+    std::fs::write(
+        home.join("providers.toml"),
+        format!(
+            "[[provider]]\nname = \"mock\"\nurl = \"http://127.0.0.1:{port}\"\n\n\
+             [[provider.models]]\nid = \"gate-test-model\"\n\
+             [[provider.models]]\nid = \"router-hard-model\"\n"
+        ),
+    )
+    .unwrap();
+
+    // Arm routing: hard → router-hard-model.
+    let (_, code) = run_route(&home, &["hard", "router-hard-model"]);
+    assert_eq!(code, 0);
+
+    // With an explicit --model, the operator's choice stands: the
+    // turn runs on gate-test-model even for a hard prompt.
+    let (events, code) = run_orbit_p(
+        port,
+        &home,
+        "please refactor the parser",
+        &["--output-format", "stream-json"],
+    );
+    assert_eq!(code, 0, "explicit-model turn must succeed");
+    let all = serde_json::to_string(&events).unwrap_or_default();
+    assert!(
+        !all.contains("router-hard-model"),
+        "an explicit --model defers to routing: {all:.400}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}

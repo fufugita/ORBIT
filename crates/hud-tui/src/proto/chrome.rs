@@ -79,16 +79,33 @@ pub fn hint_row(
 }
 
 /// The completion list's commands (§9.13), alphabetical.
-pub const COMMANDS: [(&str, &str); 7] = [
+pub const COMMANDS: [(&str, &str); 12] = [
     (
         "/clear",
         "forget earlier turns (the model stops seeing them)",
     ),
+    (
+        "/compact",
+        "summarize the conversation into one summary message",
+    ),
     ("/help", "keys and commands"),
+    (
+        "/mode",
+        "set the permission mode (default, acceptEdits, plan, dontAsk, bypass)",
+    ),
     ("/model", "switch the model for this session"),
     ("/models", "list models from configured providers"),
+    (
+        "/permissions",
+        "allow/deny rules in force, and their source",
+    ),
     ("/resume", "continue a saved session by id"),
+    (
+        "/rewind",
+        "list checkpoints, or restore files to one: /rewind <id>",
+    ),
     ("/sessions", "browse and resume earlier sessions"),
+    ("/undo", "drop the last exchange from the context"),
     ("/usage", "turns, tokens and cost for this session"),
 ];
 

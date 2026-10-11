@@ -133,6 +133,39 @@ pub struct ProvidersConfig {
     /// to the session's own model. See [`RolesConfig`].
     #[serde(default)]
     pub roles: RolesConfig,
+    /// Difficulty routing (2026-10-10): hard/easy keyword signals pick
+    /// the model per prompt. Absent or without models = routing off.
+    #[serde(default)]
+    pub routing: RoutingConfig,
+}
+
+/// Difficulty routing: `[routing]` in providers.toml. `hard` and `easy`
+/// name model specs (bare id across providers, `provider/model` to
+/// disambiguate) — the same resolution as roles. Keywords extend the
+/// built-in defaults; `[routing.keywords] clear = true` replaces them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// Model for hard turns ("" = that phase keeps the session model).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hard: String,
+    /// Model for easy turns.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub easy: String,
+    #[serde(default)]
+    pub keywords: RoutingKeywords,
+}
+
+/// Keyword lists. Entries are matched case-insensitively on word
+/// boundaries; a multi-word entry matches its words adjacently.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoutingKeywords {
+    /// Drop the built-in defaults before applying these.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hard: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub easy: Vec<String>,
 }
 
 /// Task roles: which model serves each kind of work. This is ORBIT's
@@ -318,6 +351,48 @@ impl ProvidersConfig {
     /// A spec that names no configured model is refused — a role that
     /// silently falls through to another model is a surprise, not a
     /// convenience.
+    /// Set one routing target (`hard` / `easy`); empty clears it. The
+    /// spec must name a configured model — the same refusal as roles.
+    pub fn set_routing_target(&mut self, phase: &str, spec: &str) -> Result<(), String> {
+        if !spec.is_empty() && self.provider_for_role_spec(spec).is_none() {
+            return Err(format!(
+                "routing '{phase}' names model '{spec}' which no provider declares"
+            ));
+        }
+        let slot = match phase {
+            "hard" => &mut self.routing.hard,
+            "easy" => &mut self.routing.easy,
+            other => return Err(format!("unknown routing phase '{other}' (hard, easy)")),
+        };
+        *slot = spec.to_string();
+        Ok(())
+    }
+
+    /// Resolve the configured routing into the engine's table: targets
+    /// plus merged keyword lists (defaults + user extensions, unless
+    /// `clear = true`). Returns a table even when disabled, so
+    /// `orbit route test` can classify against the keywords alone.
+    pub fn routing_table(&self) -> orbit_engine::routing::RoutingTable {
+        use orbit_engine::routing as r;
+        let kw = &self.routing.keywords;
+        let merge = |defaults: Vec<String>, extra: &[String]| -> Vec<String> {
+            let mut list = if kw.clear { Vec::new() } else { defaults };
+            for k in extra {
+                let k = k.trim().to_lowercase();
+                if !k.is_empty() && !list.iter().any(|x| x == &k) {
+                    list.push(k);
+                }
+            }
+            list
+        };
+        r::RoutingTable {
+            hard: self.routing.hard.clone(),
+            easy: self.routing.easy.clone(),
+            hard_keywords: merge(r::default_hard_keywords(), &kw.hard),
+            easy_keywords: merge(r::default_easy_keywords(), &kw.easy),
+        }
+    }
+
     pub fn set_role(&mut self, role: &str, spec: &str) -> Result<(), String> {
         if !spec.is_empty() && self.provider_for_role_spec(spec).is_none() {
             return Err(format!(

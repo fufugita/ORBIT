@@ -242,6 +242,7 @@ fn msg(role: orbit_adapter::types::ChatRole, text: String) -> ChatMessage {
         tool_call_id: None,
         tool_result: None,
         blocks: None,
+        origin_model: None,
     }
 }
 

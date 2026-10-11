@@ -240,6 +240,7 @@ async fn openai_adapter_sends_multi_turn_transcript() {
             tool_call_id: None,
             tool_result: None,
             blocks: None,
+            origin_model: None,
         },
         orbit_adapter::types::ChatMessage {
             role: orbit_adapter::types::ChatRole::User,
@@ -248,6 +249,7 @@ async fn openai_adapter_sends_multi_turn_transcript() {
             tool_call_id: None,
             tool_result: None,
             blocks: None,
+            origin_model: None,
         },
         orbit_adapter::types::ChatMessage {
             role: orbit_adapter::types::ChatRole::Assistant,
@@ -256,6 +258,7 @@ async fn openai_adapter_sends_multi_turn_transcript() {
             tool_call_id: None,
             tool_result: None,
             blocks: None,
+            origin_model: None,
         },
         orbit_adapter::types::ChatMessage {
             role: orbit_adapter::types::ChatRole::User,
@@ -264,6 +267,7 @@ async fn openai_adapter_sends_multi_turn_transcript() {
             tool_call_id: None,
             tool_result: None,
             blocks: None,
+            origin_model: None,
         },
     ]);
     let cancel = CancelToken::new();

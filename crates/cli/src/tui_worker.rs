@@ -640,6 +640,7 @@ fn worker_main(
                             tool_call_id: None,
                             tool_result: None,
                             blocks: None,
+                            origin_model: None,
                         });
                         // Usage counts for the compaction request itself.
                         cum_input = cum_input.saturating_add(o.input_tokens);
@@ -1414,7 +1415,7 @@ pub fn run_tui_turn(
         .to_string();
     let credential_env = provider.and_then(|p| p.env.as_deref());
 
-    let turn_config = crate::engine_turn_config(
+    let base_turn_config = crate::engine_turn_config(
         &config.home,
         &provider_id,
         &resolved_gate,
@@ -1422,6 +1423,23 @@ pub fn run_tui_turn(
         credential_env,
         pricing,
     );
+    // Difficulty routing (2026-10-10): classify the prompt; a hard or
+    // easy signal with an armed target switches the turn's model. An
+    // explicit /model or --model keeps its choice (manual wins). The
+    // status line says what happened and why.
+    let (turn_config, routing_decision) =
+        crate::routed_turn_config(&config.home, &base_turn_config, prompt, &config.session_id);
+    if turn_config.model != base_turn_config.model {
+        orbit_hud_tui::emit_status(
+            sender,
+            &format!(
+                "routed {} → {} ({})",
+                routing_decision.phase.as_str(),
+                turn_config.model,
+                routing_decision.matched.join(", ")
+            ),
+        );
+    }
 
     // The workspace rail tracks the turn's phases (§6.10):
     // 0 orient → 1 reason → 2 act → 3 verify → 4 respond.

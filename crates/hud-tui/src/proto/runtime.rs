@@ -1266,6 +1266,52 @@ fn run_command(
             let _ = command_sink.send(WorkerCommand::Compact);
             None
         }
+        "/mode" => {
+            const MODES: [&str; 5] = ["default", "acceptEdits", "plan", "dontAsk", "bypass"];
+            if arg.is_empty() {
+                let cur = scenario.permission_mode.as_deref().unwrap_or("default");
+                notice(
+                    scenario,
+                    format!("mode: {cur} · /mode <{}>", MODES.join("|")),
+                );
+            } else if MODES.contains(&arg) {
+                let _ = command_sink.send(WorkerCommand::SetMode(arg.to_string()));
+            } else {
+                notice(
+                    scenario,
+                    format!("unknown mode {arg} · /mode <{}>", MODES.join("|")),
+                );
+            }
+            None
+        }
+        "/permissions" => {
+            let _ = command_sink.send(WorkerCommand::Permissions(arg.to_string()));
+            None
+        }
+        "/rewind" => {
+            if scenario.turn_live {
+                *toast = Some(Toast {
+                    text: "wait for this turn to finish first".into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            } else {
+                let _ = command_sink.send(WorkerCommand::Rewind(arg.to_string()));
+            }
+            None
+        }
+        "/undo" => {
+            if scenario.turn_live {
+                *toast = Some(Toast {
+                    text: "wait for this turn to finish first".into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            } else {
+                let _ = command_sink.send(WorkerCommand::Undo);
+            }
+            None
+        }
         _ => {
             notice(scenario, format!("unknown command: {cmd} · try /help"));
             None

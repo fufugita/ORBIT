@@ -383,6 +383,105 @@ pub fn context_window_for(home: &Path, model: &str) -> Option<u64> {
 /// kind, credential and pricing all come from the role's own provider.
 /// An unset or unresolvable role returns the base config unchanged —
 /// the caller's session model keeps serving that task.
+/// Resolve a routed turn's TurnConfig, the routing sibling of
+/// [`role_turn_config`]. Returns `(config, decision)`: when routing is
+/// armed and the decision's phase has a target, the config points at
+/// that model (gate/kind/credential/pricing from its own provider);
+/// otherwise the base config comes back untouched. Callers record the
+/// decision when the model actually changed.
+pub fn routed_turn_config(
+    home: &Path,
+    base: &orbit_engine::TurnConfig,
+    prompt: &str,
+    session_id: &str,
+) -> (
+    orbit_engine::TurnConfig,
+    orbit_engine::routing::RoutingDecision,
+) {
+    use orbit_engine::routing as r;
+    let cfg = match crate::config::ProvidersConfig::load(home) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                base.clone(),
+                r::RoutingDecision {
+                    phase: r::RoutingPhase::Main,
+                    matched: Vec::new(),
+                },
+            )
+        }
+    };
+    let table = cfg.routing_table();
+    let decision = r::classify(&table, prompt);
+    let target = match decision.phase {
+        r::RoutingPhase::Hard => table.hard.clone(),
+        r::RoutingPhase::Easy => table.easy.clone(),
+        r::RoutingPhase::Main => String::new(),
+    };
+    if target.is_empty() {
+        return (base.clone(), decision);
+    }
+    // Explicit model choice wins over routing: the caller passes a
+    // base whose model came from --model / ORBIT_MODEL / /model, and
+    // those mean "use exactly this". Detect via roles.main: when the
+    // base model equals the configured main (or the fallback first
+    // model), no explicit choice is in force.
+    let explicit = explicit_model_in_force(&cfg, &base.model);
+    if explicit {
+        return (base.clone(), decision);
+    }
+    let Some(provider) = cfg.provider_for_role_spec(&target) else {
+        return (base.clone(), decision);
+    };
+    let model = target.rsplit('/').next().unwrap_or(&target).to_string();
+    let mut out = base.clone();
+    out.provider_id = provider.name.clone();
+    out.gate = provider.url.clone();
+    out.model = model.clone();
+    out.kind = orbit_engine::dispatch::ProviderKind::from_config(&provider.kind);
+    out.credential_env = provider.env.clone().filter(|s| !s.trim().is_empty());
+    out.pricing = provider
+        .models
+        .iter()
+        .find(|m| m.id == model)
+        .map(|m| std::convert::From::from(m.pricing));
+    out.max_output_tokens = cfg.max_output_tokens_for(&model).unwrap_or(32_000) as u64;
+    out.sampling = cfg.sampling_for(&model).map(|s| (s.temperature, s.top_p));
+    // Routing is observability, not authority: record the decision
+    // next to the session (same pattern as egress grants).
+    r::record_decision(
+        home,
+        session_id,
+        &base.model,
+        &out.model,
+        decision.phase,
+        &decision.matched,
+    );
+    (out, decision)
+}
+
+/// Whether an explicit model choice (a flag, env or /model) is in
+/// force, routing must not override. The base model differing from
+/// both roles.main and the first configured model is the fingerprint
+/// of an explicit choice.
+fn explicit_model_in_force(cfg: &crate::config::ProvidersConfig, base_model: &str) -> bool {
+    if std::env::var("ORBIT_MODEL").is_ok() || std::env::var("ORBIT_ACTIVE_MODEL").is_ok() {
+        return true;
+    }
+    let main = cfg.roles.main.rsplit('/').next().unwrap_or(&cfg.roles.main);
+    if !main.is_empty() && base_model == main {
+        return false; // the configured default — routing may act
+    }
+    // No roles.main: the fallback picks the first configured model.
+    let first = cfg
+        .provider
+        .iter()
+        .flat_map(|p| p.models.iter().map(|m| m.id.as_str()))
+        .next()
+        .unwrap_or("");
+    base_model != first
+}
+
 pub fn role_turn_config(
     home: &Path,
     base: &orbit_engine::TurnConfig,
