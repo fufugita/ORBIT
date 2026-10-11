@@ -394,10 +394,17 @@ pub fn execute_call(
     });
     let rule_verdict = rules.verdict(&call.name);
     // The call's permission key, for rules granted this session.
-    let call_key = orbit_tools::registry()
-        .into_iter()
-        .find(|t| t.name() == call.name)
-        .map(|t| t.permission_key(&args_preview));
+    // Task/Agent are intercepted below (not registry tools), but their
+    // pattern rules and session grants key on Agent(<agent-type>) —
+    // the same key the deleted registry AgentTool computed.
+    let call_key = if call.name == "Task" || call.name == "Agent" {
+        Some(orbit_tools::agent_permission_key(&args_preview))
+    } else {
+        orbit_tools::registry()
+            .into_iter()
+            .find(|t| t.name() == call.name)
+            .map(|t| t.permission_key(&args_preview))
+    };
     let rule_granted = call_key
         .as_ref()
         .is_some_and(|k| grants.rule_granted(&k.tool, &k.pattern));
@@ -838,7 +845,7 @@ fn save_rule(project: &Path, rule: &str) -> Result<(), String> {
 
 /// Layer-2 outcome for the pre-check (B4): what would the mode/pattern
 /// rules say about this call?
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum PatternOutcome {
     Allow,
     Ask,
@@ -887,6 +894,19 @@ fn pattern_layer_verdict(
                 return PatternOutcome::Ask;
             }
             return PatternOutcome::Allow;
+        }
+        // Task/Agent: intercepted in execute_call, not registry tools,
+        // but their pattern rules (Agent(Explore), Task(general)) must
+        // still evaluate. The key is the one the deleted registry
+        // AgentTool computed; the tool is not read-only (the subagent's
+        // own calls decide their permissions).
+        if tool_name == "Task" || tool_name == "Agent" {
+            let key = orbit_tools::agent_permission_key(args);
+            return match evaluate(scope.mode, &rules, &key.tool, &key.pattern, false, false) {
+                Verdict::Allow => PatternOutcome::Allow,
+                Verdict::Ask => PatternOutcome::Ask,
+                Verdict::Deny(reason) => PatternOutcome::Deny(reason),
+            };
         }
         return PatternOutcome::Ask;
     };
@@ -2679,5 +2699,76 @@ mod grant_tests {
             &PermissionScope::default(),
         );
         assert!(out.contains("operator denied"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod agent_key_tests {
+    use super::*;
+
+    /// The registry AgentTool is deleted (Task/Agent are intercepted in
+    /// execute_call before the registry), but Agent(<agent-type>)
+    /// pattern rules and session grants must keep working. This is the
+    /// regression test for the deletion: an allow rule for
+    /// Agent(Explore) must allow an Explore subagent call without
+    /// asking, and a deny rule must refuse it.
+    #[test]
+    fn agent_pattern_rules_survive_the_registry_deletion() {
+        let home = std::env::temp_dir().join(format!("orbit-agent-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.toml"),
+            "[permissions]\nallow = [\"Agent(Explore)\"]\ndeny = [\"Agent(Dangerous)\"]\n",
+        )
+        .unwrap();
+
+        let scope = PermissionScope {
+            mode: orbit_tools::permissions::PermissionMode::Default,
+            allowlist: None,
+            disallowlist: vec![],
+        };
+        let explore = serde_json::json!({"agent": "Explore", "prompt": "find it"});
+        let dangerous = serde_json::json!({"agent": "Dangerous", "prompt": "do it"});
+
+        // The allow rule lets Explore through without asking.
+        assert_eq!(
+            pattern_layer_verdict(&home, &scope, "Task", &explore),
+            PatternOutcome::Allow,
+            "Agent(Explore) allow rule must apply to a Task call"
+        );
+        assert_eq!(
+            pattern_layer_verdict(&home, &scope, "Agent", &explore),
+            PatternOutcome::Allow,
+            "and to the Agent alias"
+        );
+        // The deny rule refuses Dangerous.
+        assert!(
+            matches!(
+                pattern_layer_verdict(&home, &scope, "Task", &dangerous),
+                PatternOutcome::Deny(_)
+            ),
+            "Agent(Dangerous) deny rule must refuse the call"
+        );
+        // No rule: asks (the subagent's own calls still decide their
+        // permissions, but spawning one is a decision).
+        let unknown = serde_json::json!({"agent": "general", "prompt": "x"});
+        assert_eq!(
+            pattern_layer_verdict(&home, &scope, "Task", &unknown),
+            PatternOutcome::Ask
+        );
+
+        // The key itself: same shape the deleted AgentTool computed.
+        let key = orbit_tools::agent_permission_key(&explore);
+        assert_eq!(key.tool, "Agent");
+        assert_eq!(key.pattern, "Explore");
+        // The old tool read agent_type; the alias shape still works.
+        let alias = serde_json::json!({"agent_type": "plan", "prompt": "x"});
+        assert_eq!(orbit_tools::agent_permission_key(&alias).pattern, "plan");
+        // No agent named: general.
+        let bare = serde_json::json!({"prompt": "x"});
+        assert_eq!(orbit_tools::agent_permission_key(&bare).pattern, "general");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

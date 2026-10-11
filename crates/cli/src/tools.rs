@@ -933,8 +933,13 @@ mod tests {
         // Wave 1 (Read/Write/Edit/Glob/Grep/Bash/TaskStop/
         // AskUserQuestion/ExitPlanMode) + the three locked pure
         // built-ins + Wave 2 (TaskCreate/TaskUpdate/TaskList/WebFetch/
-        // WebSearch/Agent/NotebookEdit) + Task/Skill.
-        assert_eq!(defs.len(), 19);
+        // WebSearch/NotebookEdit). Task/Skill are session additions
+        // (session_tool_definitions), not in the bare list; the
+        // registry AgentTool was an unreachable fallback — deleted,
+        // Task is the advertised subagent tool.
+        assert_eq!(defs.len(), 18);
+        // The dead Agent fallback is gone; Task carries subagents.
+        assert!(defs.iter().all(|d| d.name != "Agent"));
         assert!(defs.iter().all(|d| d.schema_digest.as_str().len() == 64));
         // Every Wave 1 name is present exactly once.
         for name in [

@@ -64,12 +64,12 @@ from prior verified reading).
    listed, all five dispatch, `/rewind` and `/undo` refuse during a
    live turn.
 2. **Subagents looked dead but weren't.** The registry's `AgentTool`
-   ("subagents are unavailable" without a runner) is an unreachable
+   ("subagents are unavailable" without a runner) was an unreachable
    fallback: `tool_runtime::execute_call` intercepts `Task`/`Agent`
    first and runs a real engine subagent with role routing, shared
-   approvals, cancel linkage and observer events. The dead fallback is
-   mildly misleading to a reader; harmless to a user. Left as-is with
-   this note.
+   approvals, cancel linkage and observer events. — **Deleted (11
+   Oct)**: `agent.rs` is gone, `agent_permission_key` preserves the
+   `Agent(<agent-type>)` rule semantics, regression test added.
 3. **Roles existed but nothing read the prompt.** `[roles]` routes
    tasks (subagent, explore, compaction) — never difficulty. —
    **Fixed tonight**: see `docs/roadmap/orbit-roadmap.md` (11 Oct).

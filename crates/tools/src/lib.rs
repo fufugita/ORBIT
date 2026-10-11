@@ -20,7 +20,6 @@ use orbit_adapter::types::ToolDefinition;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-pub mod agent;
 pub mod askuser;
 pub mod bash;
 pub mod executor;
@@ -406,7 +405,6 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(webfetch::WebFetchTool),
         Box::new(askuser::AskUserQuestionTool),
         Box::new(askuser::ExitPlanModeTool),
-        Box::new(agent::AgentTool),
         Box::new(websearch::WebSearchTool),
         Box::new(notebook::NotebookEditTool),
     ]
@@ -505,11 +503,6 @@ pub fn tool_description(name: &str) -> &'static str {
             "Searches the web and returns results with titles, URLs and snippets \
             (requires a configured search API backend)."
         }
-        "Agent" => {
-            "Runs a subagent with its own context window and tool access; returns its \
-            final report. Use for parallel or context-heavy exploration. The subagent shares \
-            the session's permission scope."
-        }
         "NotebookEdit" => {
             "Edits a Jupyter notebook (.ipynb) cell: replace, insert or delete by \
             cell id. The notebook must have been read this session first."
@@ -539,10 +532,32 @@ pub fn is_wave1(name: &str) -> bool {
             | "TaskList"
             | "WebFetch"
             // Wave 2 completion: same registry membership rule.
+            // ("Agent" is gone: Task/Agent are intercepted in the CLI's
+            // tool_runtime before the registry, so the registry tool was
+            // an unreachable fallback that duplicated the advertised
+            // list. Rule evaluation for Agent(...) keys uses
+            // `agent_permission_key` below.)
             | "WebSearch"
-            | "Agent"
             | "NotebookEdit"
     )
+}
+
+/// The permission key for a Task/Agent subagent call. The registry's
+/// AgentTool used to compute this; the tool itself is deleted (the CLI
+/// intercepts Task/Agent before the registry), but pattern rules and
+/// session grants key on `Agent(<agent-type>)`, so the computation
+/// lives here where both the intercept and rule evaluation can use it.
+pub fn agent_permission_key(input: &serde_json::Value) -> PermissionKey {
+    let t = input
+        .get("agent")
+        .or_else(|| input.get("agent_type"))
+        .or_else(|| input.get("subagent_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("general");
+    PermissionKey {
+        tool: "Agent".into(),
+        pattern: t.to_string(),
+    }
 }
 
 /// Read-only classification (backend-authoritative, roadmap rule).
