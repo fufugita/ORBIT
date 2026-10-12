@@ -326,6 +326,13 @@ fn worker_main(
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = Some(token.clone());
                 }
+                // @file mentions expand through the Read tool before the
+                // turn runs: deny-read, the scanner and the
+                // read-before-edit record all apply to a mention, the
+                // same as to a Read call. The transcript logs the
+                // ORIGINAL prompt (what the operator typed); the
+                // expansion is what the model sees.
+                let expanded = expand_file_mentions(&prompt, &session_tool_cx);
                 if let Some(log) = &transcript_log {
                     let _ = log.append(&orbit_engine::transcript::TranscriptEvent::UserPrompt {
                         text: prompt.clone(),
@@ -337,7 +344,7 @@ fn worker_main(
                 let (_ok, input, output, cost, _final) = match run_tui_turn(
                     &config,
                     &mut transcript,
-                    &prompt,
+                    &expanded,
                     &ctx.sender,
                     &ctx.approvals,
                     &token,
@@ -2135,5 +2142,161 @@ mod session_tests {
             "one checkpoint per prompt"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// Expand `@path` mentions in a prompt into inline file contents —
+/// through the Read tool, so the mention inherits the tool's whole
+/// contract: the deny-read list (credentials never reach the provider
+/// through a mention either), the secret scanner, and the
+/// read-before-edit record (an Edit after a mention is grounded).
+///
+/// Each mention becomes:
+///
+/// ```text
+/// @path
+/// ```<lang>
+/// …file contents, capped at 10k chars…
+/// ```
+/// ```
+///
+/// A path that does not read (missing, denied, a directory) leaves the
+/// mention untouched — the model (and the operator) see the literal
+/// `@path`, never a silent drop.
+fn expand_file_mentions(text: &str, tool_cx: &orbit_tools::ToolContext) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        let (before, after) = rest.split_at(at);
+        out.push_str(before);
+        let candidate: String = after[1..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '@')
+            .collect();
+        if candidate.is_empty() {
+            out.push('@');
+            rest = &after[1..];
+            continue;
+        }
+        out.push_str(&expand_one_mention(&candidate, tool_cx));
+        let consumed = 1 + candidate.chars().count();
+        let skip: usize = after
+            .char_indices()
+            .nth(consumed)
+            .map(|(i, _)| i)
+            .unwrap_or(after.len());
+        rest = &after[skip..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One mention's expansion: the Read tool's own output, fenced. The
+/// tool's payload is JSON (`{"ok":true,"content":"…"}` or a typed
+/// denial/error); a denial or an error leaves the mention as-is.
+fn expand_one_mention(candidate: &str, tool_cx: &orbit_tools::ToolContext) -> String {
+    use orbit_tools::Tool as _;
+    let input = serde_json::json!({ "file_path": candidate });
+    let result = orbit_tools::ReadTool.run(&input, tool_cx);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.payload) else {
+        return format!("@{candidate}");
+    };
+    if !v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+        return format!("@{candidate}");
+    }
+    let Some(content) = v.get("content").and_then(|c| c.as_str()) else {
+        return format!("@{candidate}");
+    };
+    const MAX: usize = 10_000;
+    let mut body = content.to_string();
+    if body.chars().count() > MAX {
+        let cut: String = body.chars().take(MAX).collect();
+        let total = body.chars().count();
+        body = format!("{cut}\u{2026} (+{total} chars truncated)");
+    }
+    let lang = std::path::Path::new(candidate)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    format!("@{candidate}\n```{lang}\n{}\n```", body.trim_end())
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+
+    fn cx_in(dir: &std::path::Path) -> orbit_tools::ToolContext {
+        orbit_tools::ToolContext::new(dir.to_path_buf(), "mention-test".into(), dir.to_path_buf())
+    }
+
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("orbit-mention-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A mention expands to the file's contents, fenced, with the
+    /// mention itself kept as the header.
+    #[test]
+    fn a_mention_expands_to_the_files_contents() {
+        let d = temp_home("expand");
+        std::fs::write(d.join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        let cx = cx_in(&d);
+        let out = expand_file_mentions("look at @calc.py please", &cx);
+        assert!(out.contains("@calc.py"), "the mention itself stays: {out}");
+        assert!(
+            out.contains("```py") && out.contains("return a + b"),
+            "the contents are fenced with the language: {out}"
+        );
+        assert!(out.starts_with("look at "), "text before is untouched");
+        assert!(out.ends_with(" please"), "text after is untouched");
+    }
+
+    /// A missing file leaves the mention as-is: the model (and the
+    /// operator) see the literal @path, never a silent drop.
+    #[test]
+    fn a_missing_file_leaves_the_mention_untouched() {
+        let d = temp_home("missing");
+        let cx = cx_in(&d);
+        let out = expand_file_mentions("see @nope.txt", &cx);
+        assert_eq!(out, "see @nope.txt");
+    }
+
+    /// The deny-read list holds for mentions: a credential path never
+    /// reaches the provider through an @mention — the same refusal the
+    /// Read tool gives, surfaced as the untouched mention.
+    #[test]
+    fn a_deny_read_path_does_not_expand() {
+        let d = temp_home("denyread");
+        let cx = cx_in(&d);
+        let out = expand_file_mentions("read @~/.ssh/id_rsa now", &cx);
+        assert_eq!(
+            out, "read @~/.ssh/id_rsa now",
+            "the deny-read path must not expand — the Read tool refused it"
+        );
+    }
+
+    /// A bare @ and an @ at the end of the text are not mentions.
+    #[test]
+    fn a_bare_at_is_not_a_mention() {
+        let d = temp_home("bare");
+        let cx = cx_in(&d);
+        assert_eq!(expand_file_mentions("email me@", &cx), "email me@");
+        assert_eq!(expand_file_mentions("a @ b", &cx), "a @ b");
+    }
+
+    /// The read-before-edit record: a mention grounds a later Edit the
+    /// same way a Read call does — the context is shared.
+    #[test]
+    fn a_mention_records_the_read_before_edit_hash() {
+        let d = temp_home("rbe");
+        std::fs::write(d.join("a.txt"), "hello\n").unwrap();
+        let cx = cx_in(&d);
+        let _ = expand_file_mentions("check @a.txt", &cx);
+        assert!(
+            cx.was_read(&d.join("a.txt")),
+            "the mention recorded the read, so a later Edit is grounded"
+        );
     }
 }

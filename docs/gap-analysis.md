@@ -33,7 +33,7 @@ third is deliberate scope.
 | Difficulty routing (easy→cheap, hard→smart) | effort levels, manual | manual picker | — | — | — | static `[roles]` per task type | **Built tonight** |
 | Parallel read-only tool calls | 8 concurrent | yes | yes | yes | yes | waves of 8 (Read/Glob/Grep/TaskList), writes sequential | **Built 11 Oct** |
 | Subagents | Agent tool + custom agents | — | — | build/plan | — | Task/Agent, roles, shared approvals, Subagent* panels | Parity |
-| @-file mentions | yes + completion | yes | @-mentions | yes | yes | none (v1 composer had it) | Gap |
+| @-file mentions | yes + completion | yes | @-mentions | yes | yes | expands through the Read tool (deny-read + scanner apply); completion popup still open | Mostly built 11 Oct |
 | Composer input history | ↑/↓ | ↑/↓ | n/a | ↑/↓ | ↑/↓ | ↑/↓ persisted per session | **Built 11 Oct** |
 | Slash commands | full list, searchable | full list | — | full list | — | 12 exist, 7 listed | **Fixed tonight** |
 | Image/PDF read → vision | yes | yes | yes | yes | yes | `ContentBlock::Image` exists; Read never emits one | Wiring gap |
