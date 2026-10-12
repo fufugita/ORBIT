@@ -67,14 +67,32 @@ pub fn sessions_dir(home: &Path) -> PathBuf {
 }
 
 /// Save a session (rewrite the JSON file; append-safe by write-temp+rename).
+///
+/// Security posture (DR-06 §1.2, same as the ledger writer): sessions dir
+/// 0700, session files 0600. A session JSON carries the full transcript —
+/// prompts, tool results, pasted text — and must not leak to local users
+/// through the default umask. The modes are re-forced on every save so a
+/// tree left loose by an older build is corrected on first touch.
 pub fn save_session(home: &Path, s: &SessionFile) -> Result<(), String> {
     let dir = sessions_dir(home);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {dir:?}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod 0700 {dir:?}: {e}"))?;
+    }
     let json = serde_json::to_string_pretty(s).map_err(|e| format!("serialize: {e}"))?;
     let path = dir.join(format!("{}.json", s.session_id));
     let tmp = dir.join(format!(".{}.tmp", s.session_id));
     std::fs::write(&tmp, json).map_err(|e| format!("write {tmp:?}: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("rename -> {path:?}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 {path:?}: {e}"))?;
+    }
     Ok(())
 }
 
@@ -235,6 +253,42 @@ mod tests {
         assert_eq!(back.transcript.len(), src.transcript.len());
         let fork_loaded = load_session(&home, &fork.session_id).unwrap();
         assert_eq!(fork_loaded.transcript.len(), src.transcript.len());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Security (DR-06 §1.2): a session JSON carries the full transcript,
+    /// so the sessions dir is 0700 and the file 0600. A loose tree left by
+    /// an older build is tightened on the next save.
+    #[cfg(unix)]
+    #[test]
+    fn session_files_and_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = test_home("perms");
+        let dir = sessions_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A pre-existing loose file that save must tighten.
+        let loose = dir.join("session-old.json");
+        std::fs::write(&loose, "{}").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_session(&home, &sample("session-perms")).unwrap();
+
+        let d = std::fs::metadata(&dir).unwrap();
+        assert_eq!(
+            d.permissions().mode() & 0o777,
+            0o700,
+            "sessions dir must be 0700"
+        );
+        let f = std::fs::metadata(dir.join("session-perms.json")).unwrap();
+        assert_eq!(
+            f.permissions().mode() & 0o777,
+            0o600,
+            "session file must be 0600"
+        );
+
+        // The stale loose file is not saved-over, but the dir is now 0700,
+        // so it is unreachable to other users regardless of its own mode.
         let _ = std::fs::remove_dir_all(&home);
     }
 

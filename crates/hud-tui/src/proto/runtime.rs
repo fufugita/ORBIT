@@ -2415,10 +2415,30 @@ fn save_history(path: &Option<std::path::PathBuf>, history: &[String]) {
         .map(|l| l.replace('\n', " ").trim().to_string())
         .collect::<Vec<_>>()
         .join("\n");
+    // Security posture (matches the ledger writer, DR-06 §1.2): dir 0700,
+    // file 0600. The history can carry pasted credentials and engagement
+    // text, so it must not leak to local users via the default umask
+    // (0o022 would leave it group/world readable). Permission failures are
+    // swallowed like the write itself — history persistence is best-effort,
+    // never a reason to wedge a turn.
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let _ = std::fs::write(p, raw);
+    // set_permissions AFTER the write: `.mode()` at open only applies to
+    // newly created files, but save_history may append to a file created by
+    // an older build (or a permissive umask) — force 0600 every save so an
+    // existing file is corrected, not just a fresh one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 #[cfg(test)]
@@ -3964,6 +3984,55 @@ mod history_persistence_tests {
         assert_eq!(raw.lines().count(), 1);
     }
 
+    /// Security (DR-06 §1.2): the history can carry pasted credentials, so
+    /// the file is 0600 and its directory 0700 — a world-readable history
+    /// would leak the operator's last prompts to any local user.
+    #[cfg(unix)]
+    #[test]
+    fn history_file_and_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile_dir();
+        let path = Some(dir.join("sessions").join("s3.history"));
+        save_history(&path, &["secret=AKIAEXAMPLE".to_string()]);
+        let f = std::fs::metadata(path.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            f.permissions().mode() & 0o777,
+            0o600,
+            "history file must be 0600"
+        );
+        let d = std::fs::metadata(path.as_ref().unwrap().parent().unwrap()).unwrap();
+        assert_eq!(
+            d.permissions().mode() & 0o777,
+            0o700,
+            "sessions dir must be 0700"
+        );
+    }
+
+    /// A history file left world-readable by an older build is corrected on
+    /// the next save — the mode is forced every write, not only at creation.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_loose_file_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile_dir();
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = Some(sessions.join("s4.history"));
+        std::fs::write(path.as_ref().unwrap(), "old prompt").unwrap();
+        std::fs::set_permissions(
+            path.as_ref().unwrap(),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        save_history(&path, &["new prompt".to_string()]);
+        let f = std::fs::metadata(path.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            f.permissions().mode() & 0o777,
+            0o600,
+            "loose file must be tightened"
+        );
+    }
+
     /// The bound holds on write: an over-long history keeps the
     /// newest HISTORY_MAX entries.
     #[test]
@@ -3980,7 +4049,14 @@ mod history_persistence_tests {
     }
 
     fn tempfile_dir() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("orbit-history-{}", std::process::id()));
+        // Unique per CALL, not per process: tests in this binary run on
+        // parallel threads, and a shared path whose setup does
+        // remove_dir_all first means one test deletes another's files
+        // mid-flight (observed as read/metadata failures only when enough
+        // history tests ran concurrently).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("orbit-history-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
