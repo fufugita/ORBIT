@@ -26,6 +26,10 @@ use crate::WorkerCommand;
 /// still polls so redraws after events are instant.
 const UI_TICK: Duration = Duration::from_millis(16);
 
+/// The composer history's bound (§11.3): newest first, the last 200
+/// prompts. The persisted file holds the same bound.
+const HISTORY_MAX: usize = 200;
+
 /// The overlays (§9.19–9.21): one at a time, instant open/close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -224,9 +228,30 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     // Queued prompts (§11.4): sent while a turn runs, shown as a
     // queued row until their TurnStarted.
     let mut queued: Vec<String> = Vec::new();
-    // Composer history (§11.3), newest first.
-    let mut history: Vec<String> = Vec::new();
+    // Composer history (§11.3), newest first. Persisted per session
+    // (`sessions/<id>.history`, one prompt per line): the CLI names
+    // the session (ORBIT_SESSION_ID — the same id the worker saves
+    // under), so a resumed session's ↑/↓ memory loads before the
+    // first key.
+    let history_path = std::env::var("ORBIT_SESSION_ID")
+        .ok()
+        .map(|sid| home.join("sessions").join(format!("{sid}.history")));
+    let mut history: Vec<String> = history_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|raw| {
+            raw.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .take(HISTORY_MAX)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut history_idx: Option<usize> = None;
+    // The history length as of the last key: a change means a send
+    // happened, and the file is written then, not at exit.
+    let mut history_len_at_key = history.len();
     // Copy mode is `z y` (§11.2); armed by z.
     let mut pending_leader: Option<char> = None;
     let mut want_copy_mode = false;
@@ -315,6 +340,14 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                     let snap_after =
                         super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
                     tui.fx.observe(&snap_before, &snap_after, now_ms);
+                    // The composer history persists as it grows: a
+                    // send (or a `!` command) is the moment to write
+                    // it, not the exit — a signal or a crash must not
+                    // lose the session's ↑/↓ memory.
+                    if history.len() != history_len_at_key {
+                        history_len_at_key = history.len();
+                        save_history(&history_path, &history);
+                    }
                     if quit {
                         break;
                     }
@@ -499,6 +532,10 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     }
 
     let _ = guard;
+    // The composer history outlives the run: one last save (the sends
+    // saved as they happened; this catches nothing on a clean exit,
+    // and everything on a signal).
+    save_history(&history_path, &history);
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::cursor::SetCursorStyle::DefaultUserShape
@@ -2364,6 +2401,26 @@ fn overlay_code(o: Option<Overlay>) -> u8 {
     }
 }
 
+/// Persist the composer history (§11.3): newest first, bounded at
+/// [`HISTORY_MAX`], one JSON array per session. Best-effort by design
+/// — losing the history is a comfort, not a correctness, failure.
+fn save_history(path: &Option<std::path::PathBuf>, history: &[String]) {
+    let Some(p) = path else { return };
+    if history.is_empty() {
+        return;
+    }
+    let raw: String = history
+        .iter()
+        .take(HISTORY_MAX)
+        .map(|l| l.replace('\n', " ").trim().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, raw);
+}
+
 #[cfg(test)]
 mod tool_card_tests {
     use super::*;
@@ -3860,5 +3917,72 @@ mod activity_panel_tests {
             .position(|t| t.contains("result"))
             .expect("the ledger row renders");
         assert!(read_idx < result_idx, "cards above, records below");
+    }
+}
+
+#[cfg(test)]
+mod history_persistence_tests {
+    use super::*;
+
+    /// The history file is one prompt per line, newest first, bounded:
+    /// what save_history writes, the boot loader reads back.
+    #[test]
+    fn history_round_trips_through_the_file() {
+        let dir = tempfile_dir();
+        let path = Some(dir.join("sessions").join("s1.history"));
+        let history = vec![
+            "third prompt".to_string(),
+            "second prompt".to_string(),
+            "first prompt".to_string(),
+        ];
+        save_history(&path, &history);
+        let raw = std::fs::read_to_string(path.as_ref().unwrap()).unwrap();
+        assert_eq!(raw, "third prompt\nsecond prompt\nfirst prompt");
+        // And the boot loader's shape reads it back, newest first.
+        let loaded: Vec<String> = std::fs::read_to_string(path.as_ref().unwrap())
+            .map(|raw| {
+                raw.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(HISTORY_MAX)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(loaded, history);
+    }
+
+    /// A prompt with newlines is one history line: the file is one
+    /// entry per line, so a newline inside a prompt becomes a space.
+    #[test]
+    fn a_multiline_prompt_is_one_history_line() {
+        let dir = tempfile_dir();
+        let path = Some(dir.join("sessions").join("s2.history"));
+        save_history(&path, &["line one\nline two".to_string()]);
+        let raw = std::fs::read_to_string(path.as_ref().unwrap()).unwrap();
+        assert_eq!(raw, "line one line two");
+        assert_eq!(raw.lines().count(), 1);
+    }
+
+    /// The bound holds on write: an over-long history keeps the
+    /// newest HISTORY_MAX entries.
+    #[test]
+    fn the_history_file_keeps_the_newest_entries() {
+        let dir = tempfile_dir();
+        let path = Some(dir.join("sessions").join("s3.history"));
+        let history: Vec<String> = (0..HISTORY_MAX + 50)
+            .map(|i| format!("prompt {i}"))
+            .collect();
+        save_history(&path, &history);
+        let raw = std::fs::read_to_string(path.as_ref().unwrap()).unwrap();
+        assert_eq!(raw.lines().count(), HISTORY_MAX);
+        assert!(raw.starts_with("prompt 0"), "newest first");
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("orbit-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 }

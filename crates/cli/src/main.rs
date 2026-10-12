@@ -1969,6 +1969,10 @@ fn cmd_chat(args: &[String]) -> i32 {
             // set them for the in-process TUI before it computes the row.
             std::env::set_var("ORBIT_ACTIVE_MODEL", &tui_config.model);
             std::env::set_var("ORBIT_ACTIVE_PROVIDER", &tui_config.provider_id);
+            // The composer history persists per session: the TUI loads
+            // and saves `<id>.history` under the session id it shares
+            // with the worker's saves.
+            std::env::set_var("ORBIT_SESSION_ID", &tui_config.session_id);
             return orbit_hud_tui::proto::runtime::run_proto(
                 args,
                 tui_worker::make_spawner(tui_config),

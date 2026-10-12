@@ -34,7 +34,7 @@ third is deliberate scope.
 | Parallel read-only tool calls | 8 concurrent | yes | yes | yes | yes | waves of 8 (Read/Glob/Grep/TaskList), writes sequential | **Built 11 Oct** |
 | Subagents | Agent tool + custom agents | — | — | build/plan | — | Task/Agent, roles, shared approvals, Subagent* panels | Parity |
 | @-file mentions | yes + completion | yes | @-mentions | yes | yes | none (v1 composer had it) | Gap |
-| Composer input history | ↑/↓ | ↑/↓ | n/a | ↑/↓ | ↑/↓ | none | Gap (cheap) |
+| Composer input history | ↑/↓ | ↑/↓ | n/a | ↑/↓ | ↑/↓ | ↑/↓ persisted per session | **Built 11 Oct** |
 | Slash commands | full list, searchable | full list | — | full list | — | 12 exist, 7 listed | **Fixed tonight** |
 | Image/PDF read → vision | yes | yes | yes | yes | yes | `ContentBlock::Image` exists; Read never emits one | Wiring gap |
 | LSP diagnostics in context | partial (IDE surface) | — | yes | **yes** | — | none | Later |
