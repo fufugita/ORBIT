@@ -36,7 +36,7 @@ third is deliberate scope.
 | @-file mentions | yes + completion | yes | @-mentions | yes | yes | expands through the Read tool (deny-read + scanner apply); completion popup still open | Mostly built 11 Oct |
 | Composer input history | ↑/↓ | ↑/↓ | n/a | ↑/↓ | ↑/↓ | ↑/↓ persisted per session | **Built 11 Oct** |
 | Slash commands | full list, searchable | full list | — | full list | — | 12 exist, 7 listed | **Fixed tonight** |
-| Image/PDF read → vision | yes | yes | yes | yes | yes | `ContentBlock::Image` exists; Read never emits one | Wiring gap |
+| Image/PDF read → vision | yes | yes | yes | yes | yes | Read of an image returns base64 data; the block rides the tool_result where the provider speaks blocks | **Built 11 Oct** |
 | LSP diagnostics in context | partial (IDE surface) | — | yes | **yes** | — | none | Later |
 | Browser-use tool | — | — | **headless browser** | — | — | WebFetch only | Later |
 | Session share URL | — | — | — | yes | — | encrypted export + verify (provable, offline) | Different axis — ours is stronger for audit, theirs for collaboration |

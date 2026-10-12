@@ -124,12 +124,34 @@ fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<serde_js
                 // E4: the typed verdict, shared with the engine and
                 // the ledger — never a substring of the content.
                 let is_error = orbit_tools::result_is_error(&content);
+                // An image Read attached its block: tool_result.content
+                // becomes a block array — the text line plus the image,
+                // the wire shape Anthropic vision accepts.
+                let wire_content: serde_json::Value = if let Some(blocks) =
+                    m.blocks.as_ref().filter(|b| !b.is_empty())
+                {
+                    let mut parts = vec![serde_json::json!({
+                        "type": "text",
+                        "text": content,
+                    })];
+                    for b in blocks {
+                        if let ContentBlock::Image { data, media_type } = b {
+                            parts.push(serde_json::json!({
+                                    "type": "image",
+                                    "source": { "type": "base64", "media_type": media_type, "data": data },
+                                }));
+                        }
+                    }
+                    parts.into()
+                } else {
+                    serde_json::Value::String(content)
+                };
                 wire.push(serde_json::json!({
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": id,
-                        "content": content,
+                        "content": wire_content,
                         "is_error": is_error,
                     }],
                 }));
@@ -456,4 +478,61 @@ fn anthropic_stream(
         let reason = finish_reason.unwrap_or_else(|| "end_turn".into());
         yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some(reason), final_usage: Some(usage) } });
     })
+}
+
+#[cfg(test)]
+mod tool_result_image_tests {
+    use super::*;
+    use orbit_adapter::types::{ChatMessage, ChatRole, ContentBlock};
+
+    fn tool_msg(content: &str, blocks: Option<Vec<ContentBlock>>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some("call-1".into()),
+            tool_result: Some(content.into()),
+            blocks,
+            origin_model: None,
+        }
+    }
+
+    /// An image Read rides the tool_result as a block array: the text
+    /// line plus the image, the shape Anthropic vision accepts.
+    #[test]
+    fn a_tool_result_with_an_image_block_carries_the_array() {
+        let msg = tool_msg(
+            r#"{"ok":true,"content":"[image: shot.png, 40 bytes, image/png]"}"#,
+            Some(vec![ContentBlock::Image {
+                data: "aGVsbG8=".into(),
+                media_type: "image/png".into(),
+            }]),
+        );
+        let (_, wire) = anthropic_messages(&[msg]);
+        let tr = &wire[0]["content"][0];
+        assert_eq!(tr["type"], "tool_result");
+        assert_eq!(tr["tool_use_id"], "call-1");
+        let parts = tr["content"].as_array().expect("a block array");
+        assert_eq!(parts.len(), 2, "text line + image");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[1]["source"]["type"], "base64");
+        assert_eq!(parts[1]["source"]["media_type"], "image/png");
+        assert_eq!(parts[1]["source"]["data"], "aGVsbG8=");
+    }
+
+    /// Without a block the tool_result content stays the plain string —
+    /// the common case is unchanged on the wire.
+    #[test]
+    fn a_plain_tool_result_stays_a_string() {
+        let msg = tool_msg(r#"{"ok":true,"content":"1 file"}"#, None);
+        let (_, wire) = anthropic_messages(&[msg]);
+        let tr = &wire[0]["content"][0];
+        assert_eq!(tr["type"], "tool_result");
+        assert!(
+            tr["content"].is_string(),
+            "no block, no array: {}",
+            tr["content"]
+        );
+    }
 }

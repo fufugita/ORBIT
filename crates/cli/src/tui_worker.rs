@@ -2151,14 +2151,8 @@ mod session_tests {
 /// through a mention either), the secret scanner, and the
 /// read-before-edit record (an Edit after a mention is grounded).
 ///
-/// Each mention becomes:
-///
-/// ```text
-/// @path
-/// ```<lang>
-/// …file contents, capped at 10k chars…
-/// ```
-/// ```
+/// Each mention becomes `@path`, then a fenced code block tagged with
+/// the file's language, holding the contents capped at 10k chars.
 ///
 /// A path that does not read (missing, denied, a directory) leaves the
 /// mention untouched — the model (and the operator) see the literal

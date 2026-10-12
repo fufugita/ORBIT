@@ -447,13 +447,20 @@ pub fn run_turn(
             }
         }
         for r in results {
+            // An image Read carries its data in the result JSON; the
+            // block rides on the Tool message for providers that speak
+            // blocks (Anthropic's tool_result accepts image content).
+            // A provider that does not — the OpenAI-compatible tool
+            // role is a string — ignores the block and keeps the
+            // honest `content` line, the same contract as thinking.
+            let blocks = image_block_of(&r.content);
             transcript.push(ChatMessage {
                 role: ChatRole::Tool,
                 content: r.content.clone(),
                 tool_calls: None,
                 tool_call_id: Some(r.call_id.clone()),
                 tool_result: Some(r.content),
-                blocks: None,
+                blocks,
                 origin_model: None,
             });
         }
@@ -470,6 +477,23 @@ pub fn run_turn(
             return Ok(report);
         }
     }
+}
+
+/// The image block of a tool result, when the result carries one: the
+/// Read tool puts `image_base64` + `image_media_type` in its payload
+/// for an image file. `None` for every other result (the common case).
+fn image_block_of(content: &str) -> Option<Vec<orbit_adapter::types::ContentBlock>> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let data = v.get("image_base64")?.as_str()?.to_string();
+    let media_type = v
+        .get("image_media_type")
+        .and_then(|m| m.as_str())
+        .unwrap_or("image/png")
+        .to_string();
+    Some(vec![orbit_adapter::types::ContentBlock::Image {
+        data,
+        media_type,
+    }])
 }
 
 fn emit_turn_ended(events: EventSink<'_>, report: &TurnReport, rounds: u32) {
@@ -897,5 +921,55 @@ mod tests {
             target("Task", serde_json::json!({"prompt": "just do it"})),
             "just do it"
         );
+    }
+}
+
+#[cfg(test)]
+mod image_block_tests {
+    use super::*;
+
+    /// A Read result carrying image data yields one Image block; the
+    /// text-only result yields none.
+    #[test]
+    fn image_data_becomes_one_image_block() {
+        let content = serde_json::json!({
+            "ok": true,
+            "content": "[image: shot.png, 40 bytes, image/png]",
+            "image_base64": "aGVsbG8=",
+            "image_media_type": "image/png",
+        })
+        .to_string();
+        let blocks = image_block_of(&content).expect("an image block");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            orbit_adapter::types::ContentBlock::Image { data, media_type } => {
+                assert_eq!(data, "aGVsbG8=");
+                assert_eq!(media_type, "image/png");
+            }
+            other => panic!("not an image block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_text_result_has_no_image_block() {
+        let content =
+            serde_json::json!({ "ok": true, "content": "def add():\n  return 1" }).to_string();
+        assert!(image_block_of(&content).is_none());
+        // Not JSON at all: no panic, no block.
+        assert!(image_block_of("not json").is_none());
+    }
+
+    /// A media type the payload omitted falls back to png — the block
+    /// is still valid, never a blank media type.
+    #[test]
+    fn a_missing_media_type_defaults_to_png() {
+        let content = serde_json::json!({ "ok": true, "image_base64": "aGVsbG8=" }).to_string();
+        let blocks = image_block_of(&content).expect("an image block");
+        match &blocks[0] {
+            orbit_adapter::types::ContentBlock::Image { media_type, .. } => {
+                assert_eq!(media_type, "image/png");
+            }
+            other => panic!("not an image block: {other:?}"),
+        }
     }
 }

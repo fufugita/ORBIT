@@ -11,6 +11,14 @@ use std::path::Path;
 const MAX_READ_LINES: usize = 2000;
 const MAX_READ_BYTES: u64 = 256 * 1024;
 
+/// An image a Read returns as data instead of text: the extension the
+/// Anthropic and OpenAI vision APIs both accept.
+const IMAGE_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+/// The inline cap for an image the Read tool returns: 5 MB of bytes
+/// before base64 (the providers' own request limits sit above this;
+/// the cap keeps one image from eating the context budget).
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
 // ============================== Read ==============================
 
 pub struct ReadTool;
@@ -61,6 +69,18 @@ impl Tool for ReadTool {
             return ToolResult::err(&format!(
                 "{file_path} is a directory; use Glob to list files"
             ));
+        }
+        // An image Read returns data, not lossy text: the payload
+        // carries `image_base64` + `image_media_type`, and the engine
+        // attaches the block to the wire where the provider speaks
+        // blocks (Anthropic tool_result). The text path is untouched.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if IMAGE_EXTS.contains(&ext.as_str()) {
+            return read_image(&path, file_path, &metadata, &ext);
         }
         if metadata.len() > MAX_READ_BYTES {
             return ToolResult::err(&format!(
@@ -124,6 +144,39 @@ impl Tool for ReadTool {
         }
         ToolResult::ok(payload)
     }
+}
+
+/// An image Read: the bytes as base64 data, not lossy text. The
+/// payload carries `image_base64` + `image_media_type` (the engine
+/// attaches the `ContentBlock::Image` where the provider speaks
+/// blocks); `content` says what it was, so a non-vision provider or a
+/// plain transcript still reads honestly. The deny-read check already
+/// ran (the caller's path); the size cap is the image's own.
+fn read_image(path: &Path, file_path: &str, metadata: &std::fs::Metadata, ext: &str) -> ToolResult {
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return ToolResult::err(&format!(
+            "{file_path} is {} bytes; Read caps images at {} bytes",
+            metadata.len(),
+            MAX_IMAGE_BYTES
+        ));
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return ToolResult::err(&format!("cannot read {file_path}: {e}")),
+    };
+    let media_type = match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+    ToolResult::ok(json!({
+        "ok": true,
+        "content": format!("[image: {file_path}, {} bytes, {media_type}]", bytes.len()),
+        "image_base64": data,
+        "image_media_type": media_type,
+    }))
 }
 
 // ============================== Write ==============================
@@ -827,5 +880,117 @@ pub mod simple_regex {
             }
         }
         hit != neg
+    }
+}
+
+#[cfg(test)]
+mod image_read_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cx_in(dir: &std::path::Path) -> ToolContext {
+        ToolContext::new(dir.to_path_buf(), "image-test".into(), dir.to_path_buf())
+    }
+
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("orbit-imgread-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A minimal valid PNG (1×1 transparent): the 8-byte signature
+    /// plus an IHDR/IDAT/IEND the media type check never parses — the
+    /// Read tool keys on the extension, not the bytes.
+    fn tiny_png() -> Vec<u8> {
+        let mut b = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        b.extend_from_slice(b"fake-but-bounded-png-bytes-for-the-test");
+        b
+    }
+
+    /// An image Read returns base64 data, not lossy text: the payload
+    /// carries `image_base64` + `image_media_type`, and `content` says
+    /// what it was so a plain transcript reads honestly.
+    #[test]
+    fn an_image_read_returns_base64_data() {
+        let d = temp_home("b64");
+        std::fs::write(d.join("shot.png"), tiny_png()).unwrap();
+        let cx = cx_in(&d);
+        let r = ReadTool
+            .run(&json!({ "file_path": "shot.png" }), &cx)
+            .payload;
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert!(v["ok"].as_bool().unwrap());
+        assert_eq!(v["image_media_type"], "image/png");
+        let data = v["image_base64"].as_str().unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).unwrap();
+        assert_eq!(decoded, tiny_png());
+        assert!(
+            v["content"].as_str().unwrap().contains("[image: shot.png"),
+            "the honest content line: {}",
+            v["content"]
+        );
+    }
+
+    /// The extension decides: jpg/jpeg/webp map to their media types;
+    /// a text file with image-ish bytes stays the text path.
+    #[test]
+    fn media_types_follow_the_extension() {
+        let d = temp_home("ext");
+        std::fs::write(d.join("a.jpg"), tiny_png()).unwrap();
+        std::fs::write(d.join("b.webp"), tiny_png()).unwrap();
+        std::fs::write(d.join("c.txt"), "just text").unwrap();
+        let cx = cx_in(&d);
+        for (name, mt) in [("a.jpg", "image/jpeg"), ("b.webp", "image/webp")] {
+            let r = ReadTool.run(&json!({ "file_path": name }), &cx).payload;
+            let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["image_media_type"], mt, "{name}");
+        }
+        let r = ReadTool.run(&json!({ "file_path": "c.txt" }), &cx).payload;
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert!(
+            v.get("image_base64").is_none(),
+            "a text file never carries image data"
+        );
+        assert!(v["content"].as_str().unwrap().contains("just text"));
+    }
+
+    /// The deny-read list holds for images exactly as for text.
+    #[test]
+    fn a_deny_read_image_is_refused() {
+        let d = temp_home("deny");
+        let ssh = d.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("key.png"), tiny_png()).unwrap();
+        let cx = cx_in(&d);
+        let r = ReadTool
+            .run(&json!({ "file_path": "~/.ssh/key.png" }), &cx)
+            .payload;
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert!(!v["ok"].as_bool().unwrap(), "the deny-read path refused");
+        assert!(v["denied"].as_bool().unwrap(), "a typed refusal");
+    }
+
+    /// The image cap: a file above 5 MB is refused with the cap named,
+    /// never read into memory.
+    #[test]
+    fn an_oversized_image_is_refused_without_reading() {
+        let d = temp_home("cap");
+        // A sparse file: 6 MB of zeros without writing 6 MB.
+        let f = std::fs::File::create(d.join("big.png")).unwrap();
+        f.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        drop(f);
+        let cx = cx_in(&d);
+        let r = ReadTool
+            .run(&json!({ "file_path": "big.png" }), &cx)
+            .payload;
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert!(!v["ok"].as_bool().unwrap());
+        assert!(
+            v["error"].as_str().unwrap().contains("caps images"),
+            "the refusal names the cap: {}",
+            v["error"]
+        );
     }
 }
