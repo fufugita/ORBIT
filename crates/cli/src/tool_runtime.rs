@@ -341,8 +341,11 @@ pub fn execute_call(
         return Ok((tool_error("tool arguments exceed 64 KiB"), None));
     }
     let arguments_sha256 = hex::encode(Sha256::digest(&call.arguments));
-    let mut writer = LedgerWriter::open(&home.join("ledger"), "orbit-tool".into(), "0.1.0")
-        .map_err(|e| format!("open ledger: {e}"))?;
+    // The retry here (not just in record_result) is what makes a
+    // parallel wave safe: several calls open the writer for their
+    // intent at once, and the loser must wait out the winner, not
+    // fail the call.
+    let mut writer = reopen_writer(home)?;
     let intent_digest = writer
         .append(LedgerEvent::ToolIntent(ToolIntent {
             session_id: session_id.into(),
@@ -938,9 +941,37 @@ fn safe_call_summary(call: &crate::PendingToolCall) -> String {
 /// Open the ledger writer for one append (the single-writer lock is
 /// held only for the append, then released — nested sessions open
 /// their own between the parent's records).
+///
+/// Parallel read-only calls (and a subagent racing its parent's
+/// records) can hold the flock when another append tries to open:
+/// that is contention, not a wedged ledger, so retry briefly with
+/// backoff. E0719 is still returned once the retries are spent — the
+/// caller records it as the honest failure, never invents a result.
 fn reopen_writer(home: &Path) -> Result<LedgerWriter, String> {
-    LedgerWriter::open(&home.join("ledger"), "orbit-tool".into(), "0.1.0")
-        .map_err(|e| format!("open ledger: {e}"))
+    const ATTEMPTS: u32 = 8;
+    const FIRST_WAIT_MS: u64 = 2;
+    let mut wait_ms = FIRST_WAIT_MS;
+    let mut last_err = String::new();
+    for attempt in 0..ATTEMPTS {
+        match LedgerWriter::open(&home.join("ledger"), "orbit-tool".into(), "0.1.0") {
+            Ok(w) => {
+                if attempt > 0 {
+                    // Contention happened and cleared — the common
+                    // parallel case. Nothing to log beyond the chain
+                    // itself staying valid.
+                }
+                return Ok(w);
+            }
+            Err(e @ orbit_ledger::LedgerError::LedgerUnavailableAtBoot(_)) => {
+                // E0719 (writer.lock held): retry with backoff.
+                last_err = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                wait_ms *= 2;
+            }
+            Err(e) => return Err(format!("open ledger: {e}")),
+        }
+    }
+    Err(format!("open ledger: {last_err}"))
 }
 
 fn record_result(
@@ -1040,6 +1071,144 @@ pub fn run_until_cancelled(
         }
     }
     results
+}
+
+/// The provably parallel-safe set: read-only tools that can never ask
+/// for approval. `orbit_tools::is_read_only` also names
+/// AskUserQuestion and WebSearch, but those can prompt (an approval
+/// channel is not `Sync`, and a prompt from a worker thread would race
+/// the front-end's single ask surface) — they stay sequential. Every
+/// tool here is allowed outright by the pattern layer in default mode,
+/// touches no thread-local state, and its result is pure data.
+pub fn is_parallel_safe(name: &str) -> bool {
+    matches!(name, "Read" | "Glob" | "Grep" | "TaskList")
+}
+
+/// The bound on concurrent read-only calls. Eight matches the field
+/// (Claude Code runs 8 concurrent); a round of Reads is bounded by the
+/// model's own tool-call fan-out, so this is a ceiling, not a queue.
+const PARALLEL_LIMIT: usize = 8;
+
+/// Run a round's calls: a run of two or more parallel-safe read-only
+/// calls runs concurrently (bounded by [`PARALLEL_LIMIT`]); everything
+/// else runs sequentially in the model's order. Results come back in
+/// the model's order either way, so the transcript the engine builds is
+/// identical whether or not a round was parallelized.
+///
+/// The cancel contract is [`run_until_cancelled`]'s: once the turn is
+/// cancelled, calls that have not started are answered "cancelled by
+/// user" without running, and `on_skip` settles their cards.
+///
+/// `run` executes one call on the calling thread (the front-end's own
+/// executor). `run_ro` is the same execution re-expressed for a worker
+/// thread: it takes the call by value and is `Sync`. A front-end whose
+/// executor cannot be shared across threads calls
+/// [`run_until_cancelled`] directly and stays sequential.
+pub fn run_round_parallel(
+    cx: &orbit_tools::ToolContext,
+    calls: &[crate::PendingToolCall],
+    mut run: impl FnMut(&crate::PendingToolCall) -> orbit_engine::ToolRoundResult,
+    run_ro: impl Fn(crate::PendingToolCall) -> orbit_engine::ToolRoundResult + Sync,
+    mut on_skip: impl FnMut(&crate::PendingToolCall),
+) -> Vec<orbit_engine::ToolRoundResult> {
+    // Fast path: fewer than two parallel-safe calls is the sequential
+    // loop, byte-for-byte — the common round is unchanged.
+    let parallel_count = calls.iter().filter(|c| is_parallel_safe(&c.name)).count();
+    if parallel_count < 2 {
+        return run_until_cancelled(cx, calls, run, on_skip);
+    }
+
+    let mut results: Vec<Option<orbit_engine::ToolRoundResult>> =
+        (0..calls.len()).map(|_| None).collect();
+
+    // Walk the calls in the model's order. A maximal run of
+    // parallel-safe calls is one wave; anything else runs sequentially
+    // (writes keep their order and their approval surface).
+    let mut i = 0;
+    while i < calls.len() {
+        // Cancelled before this call starts: the rest never run.
+        if cx.is_cancelled() {
+            for call in &calls[i..] {
+                on_skip(call);
+            }
+            for (j, call) in calls[i..].iter().enumerate() {
+                results[i + j] = Some(cancelled_result(call));
+            }
+            break;
+        }
+
+        if !is_parallel_safe(&calls[i].name) {
+            results[i] = Some(run(&calls[i]));
+            i += 1;
+            continue;
+        }
+
+        // The maximal run of parallel-safe calls starting at i.
+        let start = i;
+        while i < calls.len() && is_parallel_safe(&calls[i].name) {
+            i += 1;
+        }
+
+        if i - start == 1 {
+            results[start] = Some(run(&calls[start]));
+            continue;
+        }
+
+        // Two or more: batches of PARALLEL_LIMIT, in order. One scope
+        // per batch; every result lands back at its position in the
+        // round, so the model's order is restored.
+        for batch_start in (start..i).step_by(PARALLEL_LIMIT) {
+            let batch_end = (batch_start + PARALLEL_LIMIT).min(i);
+            let batch = &calls[batch_start..batch_end];
+
+            if cx.is_cancelled() {
+                for (j, call) in batch.iter().enumerate() {
+                    on_skip(call);
+                    results[batch_start + j] = Some(cancelled_result(call));
+                }
+                continue;
+            }
+
+            let run_ro = &run_ro;
+            std::thread::scope(|s| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .enumerate()
+                    .map(|(j, call)| {
+                        let idx = batch_start + j;
+                        let call = call.clone();
+                        s.spawn(move || (idx, run_ro(call)))
+                    })
+                    .collect();
+                for h in handles {
+                    // A panicked worker leaves its slot empty; the
+                    // pass below fills it in the call's own place.
+                    if let Ok((idx, r)) = h.join() {
+                        results[idx] = Some(r);
+                    }
+                }
+            });
+
+            // A worker that panicked left its slot empty: answer the
+            // call in its own place, never silently drop it.
+            for (j, call) in batch.iter().enumerate() {
+                if results[batch_start + j].is_none() {
+                    results[batch_start + j] = Some(orbit_engine::ToolRoundResult {
+                        call_id: call.id.clone(),
+                        content: tool_error("tool panicked"),
+                    });
+                }
+            }
+        }
+    }
+
+    // Every call has a result: the transcript the engine builds stays
+    // valid whatever happened above.
+    results
+        .into_iter()
+        .zip(calls.iter())
+        .map(|(r, call)| r.unwrap_or_else(|| cancelled_result(call)))
+        .collect()
 }
 
 /// A permission refusal (C4): the typed `denied` flag marks "policy or
@@ -1578,6 +1747,90 @@ mod tests {
             "test-session".into(),
             work_dir.to_path_buf(),
         )
+    }
+
+    /// The ledger's single-writer flock (E0719) is contention, not a
+    /// wedge: two Read results appending at once must both land, the
+    /// second waiting out the first. This is the load-bearing fix that
+    /// makes parallel read-only calls safe — without it the loser's
+    /// result record is dropped and the chain is short a record.
+    #[test]
+    fn concurrent_result_appends_do_not_drop_records() {
+        let home = test_home("ledger-contention");
+        let cx = test_cx(&home.join("work"));
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        let calls: Vec<crate::PendingToolCall> = (0..4)
+            .map(|i| crate::PendingToolCall {
+                index: i,
+                id: format!("call-{i}"),
+                name: "Read".into(),
+                arguments: br#"{}"#.to_vec(),
+            })
+            .collect();
+        // Run four execute_calls concurrently: each opens the writer
+        // for intent, drops it, reopens for the result. The retry in
+        // reopen_writer is what lets them all succeed.
+        let home_c = home.clone();
+        let calls_c = calls.clone();
+        std::thread::scope(|s| {
+            for call in &calls_c {
+                let home = home_c.clone();
+                let cx = cx.clone();
+                s.spawn(move || {
+                    let mut ch = StdApprovalChannel::new(false);
+                    let mut grants = AutoGrants::new();
+                    let _ = execute_call(
+                        &home,
+                        "sess",
+                        &format!("d-{}", call.id),
+                        call,
+                        false,
+                        true,
+                        &mut ch,
+                        &mut grants,
+                        &PermissionScope::default(),
+                        &cx,
+                    );
+                });
+            }
+        });
+        // Every call wrote an intent, a verdict and a result — and a
+        // lone-writer race dropped none of them. Decode the kinds so
+        // the assertion says what actually happened, not a magic total.
+        let ledger_dir = home.join("ledger");
+        let (recs, _) = orbit_ledger::reader::verify_ledger(&ledger_dir).expect("ledger verifies");
+        use orbit_ledger::event::LedgerEvent::*;
+        let mut kinds: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for r in &recs {
+            let k = match &r.record.event {
+                ToolIntent(_) => "intent",
+                ToolVerdict(_) => "verdict",
+                ToolResult(_) => "result",
+                _ => "other",
+            };
+            *kinds.entry(k).or_default() += 1;
+        }
+        let call_id_count = |prefix: &str| {
+            recs.iter()
+                .filter(|r| match &r.record.event {
+                    ToolIntent(e) => e.call_id.starts_with(prefix),
+                    ToolVerdict(e) => e.call_id.starts_with(prefix),
+                    ToolResult(e) => e.call_id.starts_with(prefix),
+                    _ => false,
+                })
+                .count()
+        };
+        for i in 0..4 {
+            let prefix = format!("call-{i}");
+            assert_eq!(
+                call_id_count(&prefix),
+                3,
+                "{prefix}: intent + verdict + result, all present"
+            );
+        }
+        assert_eq!(kinds.get("intent"), Some(&4), "one intent per call");
+        assert_eq!(kinds.get("verdict"), Some(&4), "one verdict per call");
+        assert_eq!(kinds.get("result"), Some(&4), "one result per call");
     }
 
     fn session_config(model: &str) -> orbit_engine::TurnConfig {
@@ -2240,6 +2493,308 @@ mod cancel_tests {
         );
         cx.pop_cancel_check();
         assert!(!cx.is_cancelled(), "the scope is closed");
+    }
+
+    fn ro_call(i: u32, name: &str) -> crate::PendingToolCall {
+        crate::PendingToolCall {
+            index: i,
+            id: format!("c{i}"),
+            name: name.into(),
+            arguments: br#"{}"#.to_vec(),
+        }
+    }
+
+    /// A round of parallel-safe read-only calls runs concurrently: the
+    /// second call starts before the first finishes (the runner blocks
+    /// until it sees both in flight). This is the throughput claim —
+    /// a round of Reads is one wave, not a queue.
+    #[test]
+    fn parallel_safe_calls_run_concurrently() {
+        let cx = cx();
+        let calls = [ro_call(0, "Read"), ro_call(1, "Read"), ro_call(2, "Grep")];
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = run_round_parallel(
+            &cx,
+            &calls,
+            |c| orbit_engine::ToolRoundResult {
+                call_id: c.id.clone(),
+                content: "{}".into(),
+            },
+            {
+                let barrier = barrier.clone();
+                let entered = entered.clone();
+                move |c| {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    // All three must be in flight together; if the
+                    // round were sequential this deadlocks the test
+                    // (the barrier times out via panic on the third
+                    // wait — the count assertion is the real check).
+                    let _ = barrier.wait();
+                    orbit_engine::ToolRoundResult {
+                        call_id: c.id.clone(),
+                        content: "{}".into(),
+                    }
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            3,
+            "all three read-only calls entered the runner"
+        );
+        // The model's order is preserved in the results.
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.call_id.clone())
+                .collect::<Vec<_>>(),
+            ["c0", "c1", "c2"]
+        );
+    }
+
+    /// Results come back in the model's order even when the calls
+    /// finish out of order: the slow first Read lands first in the
+    /// results, the fast ones after it.
+    #[test]
+    fn parallel_results_return_in_the_models_order() {
+        let cx = cx();
+        let calls = [ro_call(0, "Read"), ro_call(1, "Read"), ro_call(2, "Read")];
+        let results = run_round_parallel(
+            &cx,
+            &calls,
+            |c| orbit_engine::ToolRoundResult {
+                call_id: c.id.clone(),
+                content: "{}".into(),
+            },
+            |c| {
+                // c0 is the slow one; c1 and c2 return at once.
+                if c.id == "c0" {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
+                orbit_engine::ToolRoundResult {
+                    call_id: c.id.clone(),
+                    content: format!(r#"{{"id":"{}"}}"#, c.id),
+                }
+            },
+            |_| {},
+        );
+        let ids: Vec<&str> = results.iter().map(|r| r.call_id.as_str()).collect();
+        assert_eq!(ids, ["c0", "c1", "c2"]);
+        // And each result is its own call's, not its neighbour's.
+        assert!(results[0].content.contains("c0"));
+        assert!(results[2].content.contains("c2"));
+    }
+
+    /// A mixed round keeps the writes sequential and in order: the
+    /// Bash call runs on the calling thread (the front-end's own
+    /// executor). The Reads around it are lone calls (not adjacent),
+    /// so they run sequentially too — a wave is a *run* of
+    /// parallel-safe calls, because the model's order between a Read
+    /// and a following Bash is semantic (the Bash may write what the
+    /// next Read reads).
+    #[test]
+    fn mixed_round_runs_writes_sequentially_in_order() {
+        let cx = cx();
+        let calls = [ro_call(0, "Read"), ro_call(1, "Bash"), ro_call(2, "Read")];
+        let order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seq_order = order.clone();
+        let results = run_round_parallel(
+            &cx,
+            &calls,
+            move |c| {
+                seq_order.lock().unwrap().push(format!("seq:{}", c.id));
+                orbit_engine::ToolRoundResult {
+                    call_id: c.id.clone(),
+                    content: "{}".into(),
+                }
+            },
+            |c| orbit_engine::ToolRoundResult {
+                call_id: c.id.clone(),
+                content: "{}".into(),
+            },
+            |_| {},
+        );
+        let o = order.lock().unwrap().clone();
+        assert_eq!(
+            o,
+            ["seq:c0", "seq:c1", "seq:c2"],
+            "no adjacent run: the whole round is sequential, in order"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c0", "c1", "c2"]
+        );
+    }
+
+    /// The wave shape the model actually emits: a run of Reads, then
+    /// a write, then another run of Reads. Each run is one wave; the
+    /// write between them is sequential.
+    #[test]
+    fn adjacent_runs_are_waves_and_the_write_between_is_sequential() {
+        let cx = cx();
+        let calls = [
+            ro_call(0, "Read"),
+            ro_call(1, "Read"),
+            ro_call(2, "Bash"),
+            ro_call(3, "Read"),
+            ro_call(4, "Read"),
+        ];
+        let order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seq_order = order.clone();
+        let wave = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wave_count = wave.clone();
+        let results = run_round_parallel(
+            &cx,
+            &calls,
+            move |c| {
+                seq_order.lock().unwrap().push(format!("seq:{}", c.id));
+                orbit_engine::ToolRoundResult {
+                    call_id: c.id.clone(),
+                    content: "{}".into(),
+                }
+            },
+            move |c| {
+                wave_count.fetch_add(1, Ordering::SeqCst);
+                orbit_engine::ToolRoundResult {
+                    call_id: c.id.clone(),
+                    content: "{}".into(),
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(
+            order.lock().unwrap().clone(),
+            ["seq:c2"],
+            "only the Bash ran on the sequential executor"
+        );
+        assert_eq!(
+            wave.load(Ordering::SeqCst),
+            4,
+            "both runs of Reads ran as waves (4 worker executions)"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c0", "c1", "c2", "c3", "c4"]
+        );
+    }
+
+    /// Esc during a wave: the wave's calls are in flight and finish
+    /// (Read/Grep are quick), but the calls after the wave never
+    /// start — they are answered "cancelled by user".
+    #[test]
+    fn esc_after_a_wave_skips_the_rest() {
+        let cx = cx();
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = flag.clone();
+        let f2 = flag.clone();
+        cx.push_cancel_check(Arc::new(move || f.load(Ordering::SeqCst)));
+        let calls = [
+            ro_call(0, "Read"),
+            ro_call(1, "Read"),
+            ro_call(2, "Bash"),
+            ro_call(3, "Read"),
+        ];
+        let mut skipped = Vec::new();
+        let results = run_round_parallel(
+            &cx,
+            &calls,
+            |c| orbit_engine::ToolRoundResult {
+                call_id: c.id.clone(),
+                content: "{}".into(),
+            },
+            {
+                let f = f2;
+                move |c| {
+                    // Esc lands while the wave is in flight.
+                    f.store(true, Ordering::SeqCst);
+                    orbit_engine::ToolRoundResult {
+                        call_id: c.id.clone(),
+                        content: "{}".into(),
+                    }
+                }
+            },
+            |c| skipped.push(c.id.clone()),
+        );
+        // The wave (c0, c1) ran; the Bash and the Read after it never
+        // started.
+        assert_eq!(skipped, ["c2", "c3"]);
+        assert_eq!(results.len(), 4, "every call gets a result");
+        assert!(results[2].content.contains("cancelled by user"));
+        assert!(results[3].content.contains("cancelled by user"));
+    }
+
+    /// A single parallel-safe call in a round is not a wave: it runs
+    /// on the sequential executor (no thread for one call).
+    #[test]
+    fn a_lone_read_is_not_a_wave() {
+        let cx = cx();
+        let calls = [ro_call(0, "Read"), ro_call(1, "Bash")];
+        let ran_seq = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seq = ran_seq.clone();
+        let results = run_round_parallel(
+            &cx,
+            &calls,
+            move |c| {
+                seq.lock().unwrap().push(c.id.clone());
+                orbit_engine::ToolRoundResult {
+                    call_id: c.id.clone(),
+                    content: "{}".into(),
+                }
+            },
+            |c| orbit_engine::ToolRoundResult {
+                call_id: c.id.clone(),
+                content: "{}".into(),
+            },
+            |_| {},
+        );
+        assert_eq!(
+            ran_seq.lock().unwrap().clone(),
+            ["c0", "c1"],
+            "both calls ran sequentially, in the model's order"
+        );
+        assert_eq!(results.len(), 2);
+    }
+
+    /// A panicked worker never drops its call: the slot is answered
+    /// with a typed error in the call's own place.
+    #[test]
+    fn a_panicking_worker_still_answers_its_call() {
+        let cx = cx();
+        let calls = [ro_call(0, "Read"), ro_call(1, "Read")];
+        let results = run_round_parallel(
+            &cx,
+            &calls,
+            |c| orbit_engine::ToolRoundResult {
+                call_id: c.id.clone(),
+                content: "{}".into(),
+            },
+            |c| {
+                if c.id == "c1" {
+                    panic!("worker boom");
+                }
+                orbit_engine::ToolRoundResult {
+                    call_id: c.id.clone(),
+                    content: "{}".into(),
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].call_id, "c0");
+        assert_eq!(results[1].call_id, "c1");
+        assert!(
+            results[1].content.contains("tool panicked"),
+            "the panicked call is answered, not dropped: {}",
+            results[1].content
+        );
     }
 }
 

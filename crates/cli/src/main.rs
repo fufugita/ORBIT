@@ -1607,7 +1607,40 @@ impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
         let cx = self.tool_cx.clone();
-        tool_runtime::run_until_cancelled(
+        // Parallel read-only calls run concurrently (headless is the CI
+        // path — a round of Reads is the common shape). The runner owns
+        // its state; non-interactive dontAsk semantics as below.
+        let home = self.home.clone();
+        let session_id = self.session_id.clone();
+        let auto_tools = self.auto_tools;
+        let scope = self.scope.clone();
+        let tool_cx = self.tool_cx.clone();
+        let run_ro = move |call: orbit_engine::PendingToolCall| {
+            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+            let (result, _) = tool_runtime::execute_call(
+                &home,
+                &session_id,
+                &decision_id,
+                &call,
+                auto_tools,
+                false, // non-interactive: dontAsk semantics
+                &mut tool_runtime::StdApprovalChannel::new(false),
+                &mut tool_runtime::AutoGrants::new(),
+                &scope,
+                &tool_cx,
+            )
+            .unwrap_or_else(|e| {
+                (
+                    serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    None,
+                )
+            });
+            orbit_engine::ToolRoundResult {
+                call_id: call.id.clone(),
+                content: result,
+            }
+        };
+        tool_runtime::run_round_parallel(
             &cx,
             calls,
             |call| {
@@ -1635,6 +1668,7 @@ impl orbit_engine::ToolExecutor for HeadlessToolExecutor {
                     content: result,
                 }
             },
+            run_ro,
             |_| {},
         )
     }
@@ -2276,7 +2310,43 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
         let cx = self.tool_cx.clone();
-        tool_runtime::run_until_cancelled(
+        // A run of parallel-safe read-only calls runs concurrently; the
+        // REPL's sequential closure (with its SESSION_SNAPSHOT refresh)
+        // stays the executor for everything else. The runner owns its
+        // state: the parallel set never prompts in default modes, so a
+        // non-interactive StdApprovalChannel (never asks, dontAsk
+        // semantics) is honest for it.
+        let home = self.home.clone();
+        let session_id = self.session_id.clone();
+        let auto_tools = self.auto_tools;
+        let scope = self.scope.clone();
+        let tool_cx = self.tool_cx.clone();
+        let run_ro = move |call: orbit_engine::PendingToolCall| {
+            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+            let (result, _) = tool_runtime::execute_call(
+                &home,
+                &session_id,
+                &decision_id,
+                &call,
+                auto_tools,
+                false,
+                &mut tool_runtime::StdApprovalChannel::new(false),
+                &mut tool_runtime::AutoGrants::new(),
+                &scope,
+                &tool_cx,
+            )
+            .unwrap_or_else(|e| {
+                (
+                    serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    None,
+                )
+            });
+            orbit_engine::ToolRoundResult {
+                call_id: call.id.clone(),
+                content: result,
+            }
+        };
+        tool_runtime::run_round_parallel(
             &cx,
             calls,
             |call| {
@@ -2318,6 +2388,7 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
                     content: result,
                 }
             },
+            run_ro,
             |_| {},
         )
     }

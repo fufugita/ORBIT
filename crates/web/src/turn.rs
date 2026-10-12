@@ -442,7 +442,50 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
         _round: u32,
     ) -> Vec<orbit_engine::ToolRoundResult> {
         let cx = self.tool_cx.clone();
-        orbit_cli::tool_runtime::run_until_cancelled(
+        // Parallel-safe read-only calls run concurrently (MD gate 2:
+        // the engine's tool_started_full / tool_finished_full events
+        // are the stream, keyed by call id — order-independent). The
+        // runner owns its state; the parallel set never prompts in
+        // default modes, and an Ask-rule oddity degrades to a card per
+        // call rather than corruption.
+        let home = self.home.clone();
+        let session_id = self.session_id.clone();
+        let auto_tools = self.auto_tools;
+        let state = self.state.clone();
+        let action_rx = self.action_rx.clone();
+        let scope = self.scope.clone();
+        let tool_cx = self.tool_cx.clone();
+        let run_ro = move |call: orbit_engine::PendingToolCall| {
+            let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+            let mut approval_channel = WebApprovalChannel {
+                action_rx: action_rx.clone(),
+                state: state.clone(),
+                note: None,
+            };
+            let (result, _) = orbit_cli::tool_runtime::execute_call(
+                &home,
+                &session_id,
+                &decision_id,
+                &call,
+                auto_tools,
+                true,
+                &mut approval_channel,
+                &mut orbit_cli::tool_runtime::AutoGrants::new(),
+                &scope,
+                &tool_cx,
+            )
+            .unwrap_or_else(|e| {
+                (
+                    serde_json::json!({ "ok": false, "error": e }).to_string(),
+                    None,
+                )
+            });
+            orbit_engine::ToolRoundResult {
+                call_id: call.id.clone(),
+                content: result,
+            }
+        };
+        orbit_cli::tool_runtime::run_round_parallel(
             &cx,
             calls,
             |call| {
@@ -494,6 +537,7 @@ impl orbit_engine::ToolExecutor for WebToolExecutor {
                     content: result,
                 }
             },
+            run_ro,
             |_| {},
         )
     }

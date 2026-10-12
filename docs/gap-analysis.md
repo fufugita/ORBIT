@@ -31,7 +31,7 @@ third is deliberate scope.
 | Capability | Claude Code | Codex CLI | Cline | opencode | pi | ORBIT (before tonight) | Verdict |
 |---|---|---|---|---|---|---|---|
 | Difficulty routing (easy→cheap, hard→smart) | effort levels, manual | manual picker | — | — | — | static `[roles]` per task type | **Built tonight** |
-| Parallel read-only tool calls | 8 concurrent | yes | yes | yes | yes | sequential | **Gap — next** |
+| Parallel read-only tool calls | 8 concurrent | yes | yes | yes | yes | waves of 8 (Read/Glob/Grep/TaskList), writes sequential | **Built 11 Oct** |
 | Subagents | Agent tool + custom agents | — | — | build/plan | — | Task/Agent, roles, shared approvals, Subagent* panels | Parity |
 | @-file mentions | yes + completion | yes | @-mentions | yes | yes | none (v1 composer had it) | Gap |
 | Composer input history | ↑/↓ | ↑/↓ | n/a | ↑/↓ | ↑/↓ | none | Gap (cheap) |
@@ -80,7 +80,7 @@ from prior verified reading).
 |---|---|---|
 | 1 | Difficulty routing | the litellm phase router's idea, but in-harness: deterministic, inspectable (`route test`), recorded per decision — provable, which a gateway plugin cannot be. User-requested. |
 | 2 | Slash discoverability | 30-minute honesty fix; the UI promised commands it hid. |
-| 3 | Parallel read-only calls | biggest remaining throughput gap; touches the executor path, so it follows 1–2. |
+| 3 | Parallel read-only calls | **Built 11 Oct** — waves of 8, contiguous runs, ledger flock retry; see the roadmap. |
 | 4 | Activity panel from ledger records | ORBIT's differentiator deserves a real proof surface (NEXT-STEPS P2 agrees). |
 | 5 | @-mentions + input history | day-one ergonomics; both small, both expected. |
 | 6 | Image reads → Image blocks | the adapter type exists; Read needs to produce it. |

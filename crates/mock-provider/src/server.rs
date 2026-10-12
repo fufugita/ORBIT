@@ -12,7 +12,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -119,6 +119,10 @@ async fn openai(
         // Gate 3's danger triple: read a deny-read path, fetch an
         // unlisted host, run rm -rf — one round, three mechanisms.
         Some("danger-triple")
+    } else if model.contains("fanout") && !last_is_tool_result() {
+        // The parallel-reads gate: four Read calls in one round. The
+        // harness must run them concurrently and answer all four.
+        Some("read-fanout")
     } else {
         None
     };
@@ -161,6 +165,12 @@ async fn openai(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             openai_danger_triple(),
+        )
+            .into_response(),
+        "read-fanout" => (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            openai_read_fanout(),
         )
             .into_response(),
         "slow-bash-tool-calls" => (
@@ -248,6 +258,12 @@ async fn anthropic(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             anthropic_danger_triple(),
+        )
+            .into_response(),
+        "read-fanout" => (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            anthropic_read_fanout(),
         )
             .into_response(),
         "slow-bash-tool-calls" => (
@@ -406,6 +422,67 @@ fn openai_danger_triple() -> String {
     ]
     .join("\n\n")
 }
+/// Four Read calls in one round (the parallel-reads gate), OpenAI
+/// streaming shape. Each call names one of a-fan/b-fan/c-fan/d-fan.
+/// Built with `json!` so the nested string-escaping cannot drift.
+fn openai_read_fanout() -> String {
+    let mut lines = Vec::new();
+    for (i, name) in ["a-fan", "b-fan", "c-fan", "d-fan"].iter().enumerate() {
+        let id = format!("call-f{i}");
+        // Fragment 1: the call opens, the arguments string begins.
+        lines.push(
+            json!({
+                "id": "r1",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": i,
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": "{\"file_path\":"}
+                    }]},
+                    "finish_reason": null
+                }]
+            })
+            .to_string(),
+        );
+        // Fragment 2: the file path closes the arguments string.
+        lines.push(
+            json!({
+                "id": "r1",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": i,
+                        "function": {"arguments": format!("\"{name}.txt\"}}")}
+                    }]},
+                    "finish_reason": null
+                }]
+            })
+            .to_string(),
+        );
+    }
+    lines.push(
+        json!({
+            "id": "r1",
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 4}
+        })
+        .to_string(),
+    );
+    lines.push("data: [DONE]".into());
+    lines.push(String::new());
+    lines
+        .into_iter()
+        .map(|l| {
+            if l.starts_with("data: ") || l.is_empty() {
+                l
+            } else {
+                format!("data: {l}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn anthropic_danger_triple() -> String {
     [
         r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#,
@@ -422,6 +499,28 @@ fn anthropic_danger_triple() -> String {
         r#"data: {"type":"message_stop"}"#,
         "",
     ].join("\n\n")
+}
+
+/// Four Read calls in one round (the parallel-reads gate): each block
+/// names one of a-fan/a-fan/b-fan/c-fan, d-fan. Files the gate test
+/// creates before the run.
+fn anthropic_read_fanout() -> String {
+    let mut lines = vec![r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#.to_string()];
+    for (i, name) in ["a-fan", "b-fan", "c-fan", "d-fan"].iter().enumerate() {
+        lines.push(format!(
+            r#"data: {{"type":"content_block_start","index":{i},"content_block":{{"type":"tool_use","id":"toolu-f{i}","name":"Read","input":{{}}}}}}"#
+        ));
+        lines.push(format!(
+            r#"data: {{"type":"content_block_delta","index":{i},"delta":{{"type":"input_json_delta","partial_json":"{{\"file_path\":\"{name}.txt\"}}"}}"}}"#
+        ));
+        lines.push(format!(
+            r#"data: {{"type":"content_block_stop","index":{i}}}"#
+        ));
+    }
+    lines.push(r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4,"input_tokens":5}}"#.to_string());
+    lines.push(r#"data: {"type":"message_stop"}"#.to_string());
+    lines.push(String::new());
+    lines.join("\n\n")
 }
 
 fn anthropic_bash_tool_calls() -> String {

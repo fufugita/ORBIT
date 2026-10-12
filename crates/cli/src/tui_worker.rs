@@ -1787,7 +1787,12 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
                 on_skip,
             );
         }
-        crate::tool_runtime::run_until_cancelled(&cx, calls, |c| self.run_one(c), on_skip)
+        // The default path: a run of two or more parallel-safe read-only
+        // calls runs concurrently (bounded); everything else sequential
+        // in the model's order. `run_ro` captures only owned, `Sync`
+        // state — no borrow of self, no thread-local.
+        let run_ro = self.read_only_runner();
+        crate::tool_runtime::run_round_parallel(&cx, calls, |c| self.run_one(c), run_ro, on_skip)
     }
 
     fn begin_cancel_scope(&mut self, token: &orbit_provider_http::CancelToken) {
@@ -1799,7 +1804,82 @@ impl orbit_engine::ToolExecutor for TuiToolExecutor {
     }
 }
 
+/// One parallel-safe call on a worker thread. Shared state arrives in
+/// `st` (all Arc-interior or plain data): the tool context (its
+/// read-before-edit map is shared), the bus sender (thread-safe), the
+/// approval registry (thread-safe). Two honest limits, by design:
+/// - Grants: a scratch `AutoGrants` per worker. The parallel set
+///   (Read/Glob/Grep/TaskList) never prompts in default/acceptEdits/
+///   plan modes, so there is nothing to remember; if the operator
+///   pinned an Ask rule on one, the card still appears and the verdict
+///   still governs the call — only an `s`/`a` press from that odd ask
+///   is not kept for later calls.
+/// - Live output: no output sink. These tools return whole results;
+///   the sink is Bash's streaming surface and would interleave.
+struct TuiReadOnlyState {
+    home: std::path::PathBuf,
+    session_id: String,
+    auto_tools: bool,
+    scope: crate::tool_runtime::PermissionScope,
+    tool_cx: orbit_tools::ToolContext,
+    sender: orbit_hud_tui::bus::BusSender,
+    approvals: orbit_hud_tui::ApprovalRegistry,
+}
+
+fn run_read_only_call(
+    st: &TuiReadOnlyState,
+    call: orbit_engine::PendingToolCall,
+) -> orbit_engine::ToolRoundResult {
+    let decision_id = format!("tool-{}-{}", ulid::Ulid::new(), call.index);
+    let mut approval_channel = TuiApprovalChannel::new(st.sender.clone(), st.approvals.clone());
+    let mut scratch_grants = crate::tool_runtime::AutoGrants::new();
+    let (result, _) = crate::tool_runtime::execute_call(
+        &st.home,
+        &st.session_id,
+        &decision_id,
+        &call,
+        st.auto_tools,
+        true,
+        &mut approval_channel,
+        &mut scratch_grants,
+        &st.scope,
+        &st.tool_cx,
+    )
+    .unwrap_or_else(|e| {
+        (
+            serde_json::json!({ "ok": false, "error": e }).to_string(),
+            None,
+        )
+    });
+    let outcome = classify_tool_result(&result);
+    let fact = result_fact(&call.name, &result);
+    orbit_hud_tui::emit_tool_finished(&st.sender, &call.id, &call.name, outcome, &fact);
+    orbit_engine::ToolRoundResult {
+        call_id: call.id.clone(),
+        content: result,
+    }
+}
+
 impl TuiToolExecutor {
+    /// The worker-thread runner for parallel-safe read-only calls: a
+    /// closure over owned, `Sync` state only (paths, the session
+    /// context, the bus sender, the approval registry). Nothing here
+    /// borrows `self`, so the round can hand it to `thread::scope`.
+    fn read_only_runner(
+        &self,
+    ) -> impl Fn(orbit_engine::PendingToolCall) -> orbit_engine::ToolRoundResult + Sync {
+        let st = TuiReadOnlyState {
+            home: self.home.clone(),
+            session_id: self.session_id.clone(),
+            auto_tools: self.auto_tools,
+            scope: self.scope.clone(),
+            tool_cx: self.tool_cx.clone(),
+            sender: self.sender.clone(),
+            approvals: self.approvals.clone(),
+        };
+        move |call| run_read_only_call(&st, call)
+    }
+
     fn run_one(&mut self, call: &orbit_engine::PendingToolCall) -> orbit_engine::ToolRoundResult {
         // No start event here: the engine announced this call, with its
         // target, before the round ran, and the card is keyed by the

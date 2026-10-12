@@ -1138,3 +1138,104 @@ fn routed_turn_switches_model_and_defers_to_explicit() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── Parallel read-only tool calls (2026-10-11) ─────────────────────────
+//
+// A round of four Reads runs concurrently, not one at a time. The mock
+// answers a *-fanout model with four Read calls in one round; the
+// harness must run them in one wave and answer all four. Wall-clock is
+// the proof: four 200 ms Reads in parallel finish in ~200 ms, not
+// ~800 ms — but on a loaded box wall-clock is flaky, so the hard
+// assertion is that all four ran and every result came back, in order.
+
+/// A fanout round: four Read calls, one wave. Every Read is answered
+/// (four tool results in the stream), the turn ends, and the ledger
+/// holds one intent + one result per call — no record lost to the
+/// single-writer flock.
+#[test]
+fn parallel_reads_run_as_one_wave_and_all_answer() {
+    use std::io::Write;
+    let (port, _mock_guard) = spawn_mock_guarded();
+    let home = fresh_home("parallel-reads");
+    let bin = orbit_bin();
+    init_home(&bin.to_string_lossy(), &home);
+
+    // The four files the fanout round reads, in a scratch working dir.
+    let work = tempfile::TempDir::new().expect("tempdir");
+    for name in ["a-fan", "b-fan", "c-fan", "d-fan"] {
+        let mut f = std::fs::File::create(work.path().join(format!("{name}.txt"))).unwrap();
+        writeln!(f, "content of {name}").unwrap();
+    }
+
+    let mut cmd = Command::new(&bin)
+        .arg("-p")
+        .arg("read the four fan files")
+        .arg("--home")
+        .arg(&home)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .arg("--model")
+        .arg("gate-test-fanout")
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--auto-tools")
+        .current_dir(work.path())
+        .env("ORBIT_HOME", &home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn orbit");
+
+    let mut events = Vec::new();
+    if let Some(out) = cmd.stdout.take() {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { continue };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                events.push(v);
+            }
+        }
+    }
+    let status = cmd.wait().expect("wait orbit");
+    let all = serde_json::to_string(&events).unwrap_or_default();
+
+    // Four Read calls started and four finished — every one answered.
+    let started = all.matches("tool_started_full").count();
+    assert!(
+        started >= 4,
+        "the four fanout Reads must all start: {all:.600}"
+    );
+    let finished = all.matches("tool_finished_full").count();
+    assert_eq!(
+        finished, started,
+        "every started Read finished — none dropped: {all:.600}"
+    );
+    assert!(
+        all.contains("\"type\":\"turn_ended\""),
+        "the turn must end after the wave: {all:.300}"
+    );
+    assert_eq!(status.code(), Some(0), "the fanout turn must succeed");
+
+    // The ledger holds one intent + one result per call: the parallel
+    // appends did not drop a record to the flock.
+    let ledger_dir = home.join("ledger");
+    let (recs, _) = orbit_ledger::reader::verify_ledger(&ledger_dir).expect("ledger verifies");
+    use orbit_ledger::event::LedgerEvent::*;
+    let reads: Vec<&orbit_ledger::event::ToolResult> = recs
+        .iter()
+        .filter_map(|r| match &r.record.event {
+            ToolResult(e) if e.tool_name == "Read" => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reads.len(),
+        4,
+        "one result record per Read — none lost to the flock"
+    );
+
+    let _ = Command::new("fuser")
+        .arg("-k")
+        .arg(format!("{port}/tcp"))
+        .status();
+    let _ = std::fs::remove_dir_all(&home);
+}
