@@ -3739,3 +3739,126 @@ mod context_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod activity_panel_tests {
+    use super::*;
+    use crate::msg::Msg;
+
+    /// The Activity panel is the ledger's face: a row the session
+    /// appended renders with its kind, target, fact and short hash —
+    /// not just the running tool cards.
+    #[test]
+    fn ledger_rows_render_in_the_activity_panel() {
+        let mut s = Scenario::new();
+        apply_msg(
+            Msg::Activity {
+                kind: "intent".into(),
+                target: "Read(a-fan.txt)".into(),
+                fact: "requested".into(),
+                digest: Some("a1b2c3d4e5f6a7b8c9d0".repeat(4)),
+            },
+            &mut s,
+            1,
+        );
+        apply_msg(
+            Msg::Activity {
+                kind: "verdict".into(),
+                target: "Read(a-fan.txt)".into(),
+                fact: "allowed — read-only".into(),
+                digest: Some("f1e2d3c4b5a697886970".repeat(4)),
+            },
+            &mut s,
+            2,
+        );
+        let lines = crate::proto::panels::activity(&s, 5_000, true);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = text.join("\n");
+        assert!(joined.contains("Activity"), "the panel header: {joined}");
+        assert!(
+            joined.contains("intent") && joined.contains("Read(a-fan.txt)"),
+            "the intent row with its target: {joined}"
+        );
+        assert!(
+            joined.contains("allowed — read-only"),
+            "the verdict's fact: {joined}"
+        );
+        assert!(
+            joined.contains("a1b2c3d4"),
+            "the record's short hash: {joined}"
+        );
+    }
+
+    /// A denial is the one row that carries the amber: the operator
+    /// must be able to spot refusals in the tail at a glance.
+    #[test]
+    fn a_denied_verdict_row_carries_the_amber() {
+        let mut s = Scenario::new();
+        apply_msg(
+            Msg::Activity {
+                kind: "verdict".into(),
+                target: "Bash(rm -rf ~)".into(),
+                fact: "denied by rule".into(),
+                digest: Some("0".repeat(64)),
+            },
+            &mut s,
+            1,
+        );
+        let lines = crate::proto::panels::activity(&s, 5_000, true);
+        // Find the verdict row and check its kind span is amber.
+        let row = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("verdict")))
+            .expect("the verdict row renders");
+        let amber = row.spans.iter().any(|s| {
+            s.style.fg == Some(comps::colour(crate::proto::core::Token::Amber))
+                || s.style.fg == Some(ratatui::style::Color::Rgb(0xF5, 0x9E, 0x0B))
+        });
+        assert!(amber, "the denied verdict is amber, not plain cyan");
+    }
+
+    /// Idle with no records says idle; a running card still renders
+    /// above the ledger rows.
+    #[test]
+    fn running_cards_render_above_the_ledger_rows() {
+        let mut s = Scenario::new();
+        s.running.insert("call-1".into(), "Read".into());
+        apply_msg(
+            Msg::Activity {
+                kind: "result".into(),
+                target: "Read(a.txt)".into(),
+                fact: "ok".into(),
+                digest: None,
+            },
+            &mut s,
+            1,
+        );
+        let lines = crate::proto::panels::activity(&s, 5_000, true);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let read_idx = text
+            .iter()
+            .position(|t| t.contains("call-1"))
+            .expect("the running card renders");
+        let result_idx = text
+            .iter()
+            .position(|t| t.contains("result"))
+            .expect("the ledger row renders");
+        assert!(read_idx < result_idx, "cards above, records below");
+    }
+}

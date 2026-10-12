@@ -236,14 +236,19 @@ fn plan(s: &Scenario) -> Vec<Line<'static>> {
 }
 
 /// Activity: the running tools with their comets (M08).
-fn activity(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
+/// Activity: what is running now (the tool cards), then what the
+/// ledger recorded — every row the session appended, newest last, a
+/// ledger row carrying its record's short hash (M19: the proof
+/// surface). The panel is the ledger's face: a row per record, not a
+/// per-call card alone.
+pub(super) fn activity(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         "Activity",
         Style::default()
             .fg(comps::colour(Token::Cyan))
             .add_modifier(Modifier::BOLD),
     ))];
-    if s.running.is_empty() {
+    if s.running.is_empty() && s.activity.is_empty() {
         out.push(Line::from(Span::styled(
             format!("{} idle", glyphs::QUEUED),
             Style::default().fg(comps::colour(Token::Muted)),
@@ -251,6 +256,43 @@ fn activity(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
     }
     for (id, kind) in &s.running {
         out.push(comps::tool_line(kind, id, tick, tick, reduced));
+    }
+    // The ledger rows: bounded by the model (500), the panel keeps the
+    // tail that fits. A record's row ends with its short hash — the
+    // audit tie to the chain.
+    for row in &s.activity {
+        let kind_style = match row.kind.as_str() {
+            // A verdict that allowed: the ink says what happened; a
+            // denial carries the amber (below).
+            "verdict" if row.fact.starts_with("denied") => Style::default()
+                .fg(comps::colour(Token::Amber))
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default().fg(comps::colour(Token::Cyan)),
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("{} ", row.time),
+                Style::default().fg(comps::colour(Token::Muted)),
+            ),
+            Span::styled(format!("{} ", row.kind), kind_style),
+            Span::styled(
+                row.target.clone(),
+                Style::default().fg(comps::colour(Token::Ink)),
+            ),
+        ];
+        if !row.fact.is_empty() {
+            spans.push(Span::styled(
+                format!(" — {}", row.fact),
+                Style::default().fg(comps::colour(Token::Muted)),
+            ));
+        }
+        if let Some(d) = &row.digest {
+            spans.push(Span::styled(
+                format!(" {}", &d[..8]),
+                Style::default().fg(comps::colour(Token::Rule)),
+            ));
+        }
+        out.push(Line::from(spans));
     }
     let _ = reduced;
     out
