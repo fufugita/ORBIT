@@ -6,11 +6,11 @@
 
 use age::secrecy::ExposeSecret;
 use orbit_adapter::types::EffortSetting;
-use orbit_export::{generate_local_key, restore, ExportBuilder};
+use orbit_export::{ExportBuilder, generate_local_key, restore};
 use orbit_ledger::event::{
     LedgerEvent, Phase, PhaseTransition, SessionEnd, SessionStart, TerminalOutcome,
 };
-use orbit_ledger::{verify_ledger, LedgerWriter};
+use orbit_ledger::{LedgerWriter, verify_ledger};
 use orbit_reactor::{CancelOrigin, CancelTarget, CancellationToken, Reactor};
 use std::path::{Path, PathBuf};
 
@@ -224,10 +224,10 @@ fn print_human_help() {
 /// The commit this binary was built from, as honestly as it can be known.
 /// Only a compile-time stamp can describe the source of these executable bytes.
 fn build_commit() -> String {
-    if let Some(c) = option_env!("ORBIT_BUILD_COMMIT") {
-        if !c.is_empty() {
-            return c.to_string();
-        }
+    if let Some(c) = option_env!("ORBIT_BUILD_COMMIT")
+        && !c.is_empty()
+    {
+        return c.to_string();
     }
     "unknown".into()
 }
@@ -689,14 +689,14 @@ fn discover_models(
             if kind == "anthropic" {
                 request = request.header("anthropic-version", "2023-06-01");
             }
-            if kind != "ollama" {
-                if let Some(token) = credential_env.and_then(|var| std::env::var(var).ok()) {
-                    request = if kind == "anthropic" {
-                        request.header("x-api-key", token)
-                    } else {
-                        request.bearer_auth(token)
-                    };
-                }
+            if kind != "ollama"
+                && let Some(token) = credential_env.and_then(|var| std::env::var(var).ok())
+            {
+                request = if kind == "anthropic" {
+                    request.header("x-api-key", token)
+                } else {
+                    request.bearer_auth(token)
+                };
             }
             let response = request
                 .send()
@@ -1064,12 +1064,12 @@ fn cmd_replay(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
         let events = t.events();
         let mut seen_cp = false;
         for (i, ev) in events.iter().enumerate() {
-            if let orbit_engine::transcript::TranscriptEvent::Checkpoint { id } = ev {
-                if id == cp {
-                    seen_cp = true;
-                    truncated_to = Some(i + 1);
-                    break;
-                }
+            if let orbit_engine::transcript::TranscriptEvent::Checkpoint { id } = ev
+                && id == cp
+            {
+                seen_cp = true;
+                truncated_to = Some(i + 1);
+                break;
             }
         }
         if !seen_cp {
@@ -1278,23 +1278,23 @@ fn validate_value(
             problems.push(format!("{path}: expected {ty}"));
         }
     }
-    if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
-        if let serde_json::Value::Object(map) = v {
-            for r in req {
-                if let Some(name) = r.as_str() {
-                    if !map.contains_key(name) {
-                        problems.push(format!("{path}: missing required field {name:?}"));
-                    }
-                }
+    if let Some(req) = schema.get("required").and_then(|r| r.as_array())
+        && let serde_json::Value::Object(map) = v
+    {
+        for r in req {
+            if let Some(name) = r.as_str()
+                && !map.contains_key(name)
+            {
+                problems.push(format!("{path}: missing required field {name:?}"));
             }
         }
     }
     if let (Some(props), serde_json::Value::Object(map)) = (schema.get("properties"), v) {
         for (name, sub) in props.as_object().unwrap_or(&serde_json::Map::new()) {
-            if let Some(val) = map.get(name) {
-                if let Err(p) = validate_value(val, sub, &format!("{path}.{name}")) {
-                    problems.extend(p);
-                }
+            if let Some(val) = map.get(name)
+                && let Err(p) = validate_value(val, sub, &format!("{path}.{name}"))
+            {
+                problems.extend(p);
             }
         }
     }
@@ -1305,10 +1305,10 @@ fn validate_value(
             }
         }
     }
-    if let Some(en) = schema.get("enum").and_then(|e| e.as_array()) {
-        if !en.contains(v) {
-            problems.push(format!("{path}: not in enum"));
-        }
+    if let Some(en) = schema.get("enum").and_then(|e| e.as_array())
+        && !en.contains(v)
+    {
+        problems.push(format!("{path}: not in enum"));
     }
     if problems.is_empty() {
         Ok(())
@@ -1369,7 +1369,7 @@ fn copy_owned_fork_transcript(home: &Path, source: &str, target: &str) -> Result
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("fork transcript: {error}")),
         Ok(metadata) if !metadata.is_file() => {
-            return Err("fork transcript must be a regular file".into())
+            return Err("fork transcript must be a regular file".into());
         }
         _ => {}
     }
@@ -1517,13 +1517,15 @@ mod owned_startup_tests {
         saved(&home, "source", "2026-10-14T12:00:00Z");
         let before = std::fs::read(home.join("sessions/source.json")).unwrap();
         let guard = SessionLease::acquire(&home, "fresh", "other").unwrap();
-        assert!(owned_startup_session(
-            &home,
-            &args(&["--resume", "source", "--fork-session"]),
-            "chat",
-            "fresh"
-        )
-        .is_err());
+        assert!(
+            owned_startup_session(
+                &home,
+                &args(&["--resume", "source", "--fork-session"]),
+                "chat",
+                "fresh"
+            )
+            .is_err()
+        );
         assert_eq!(
             std::fs::read(home.join("sessions/source.json")).unwrap(),
             before
@@ -1616,7 +1618,7 @@ fn cmd_headless(args: &[String]) -> i32 {
     // --bare: skip discovering hooks, skills, mods, MCP servers and
     // memory files (phase 6 — fast start; recommended for scripts).
     if args.iter().any(|a| a == "--bare") {
-        std::env::set_var("ORBIT_BARE", "1");
+        tools::enable_bare_mode();
     }
     // --json-schema <file>: structured output. Anthropic gets
     // output_config.format natively later; here the honest path for
@@ -1634,11 +1636,13 @@ fn cmd_headless(args: &[String]) -> i32 {
     // --permission-mode / --allowedTools / --disallowedTools: the
     // command-line permission scope (review blocker 4), carried in the
     // session's PermissionScope (S5) — never process env vars.
-    if let Some(mode) = value_after(args, "--permission-mode") {
-        if orbit_tools::permissions::PermissionMode::from_config(&mode).is_none() {
-            eprintln!("ORBIT-E1101: unknown --permission-mode {mode} (default, acceptEdits, plan, dontAsk, bypass)");
-            return 1;
-        }
+    if let Some(mode) = value_after(args, "--permission-mode")
+        && orbit_tools::permissions::PermissionMode::from_config(&mode).is_none()
+    {
+        eprintln!(
+            "ORBIT-E1101: unknown --permission-mode {mode} (default, acceptEdits, plan, dontAsk, bypass)"
+        );
+        return 1;
     }
     let scope = tool_runtime::PermissionScope::from_flags(
         value_after(args, "--permission-mode").as_deref(),
@@ -1654,17 +1658,17 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
     };
     let explicit_provider = value_after(args, "--provider");
-    if let Some(spec) = &requested_model {
-        if let Err(error) = orbit_cli::checked_model_turn(
+    if let Some(spec) = &requested_model
+        && let Err(error) = orbit_cli::checked_model_turn(
             &home,
             spec,
             explicit_provider.as_deref(),
             requested_gate.as_deref(),
             false,
-        ) {
-            eprintln!("ORBIT-E0401: {error}");
-            return 1;
-        }
+        )
+    {
+        eprintln!("ORBIT-E0401: {error}");
+        return 1;
     }
     let (live_lease, resumed_file) =
         match owned_startup_session(&home, args, "headless", &format!("p-{}", ulid::Ulid::new())) {
@@ -1709,7 +1713,6 @@ fn cmd_headless(args: &[String]) -> i32 {
     let model = turn_config.model.clone();
     let provider_id = turn_config.provider_id.clone();
     let resolved_gate = turn_config.gate.clone();
-    let credential_env = turn_config.credential_env.clone();
 
     let selection_origin = orbit_cli::startup_selection_origin(
         value_after(args, "--model").is_some(),
@@ -1717,16 +1720,6 @@ fn cmd_headless(args: &[String]) -> i32 {
         resumed_file.as_ref(),
         !cfg.roles.main.is_empty(),
     );
-    // The full resolved config for subagents (phase 5): the Task tool
-    // derives its TurnConfig from these env vars, so a subagent matches
-    // the parent's provider/gate/model/credential exactly.
-    std::env::set_var("ORBIT_GATE_URL", &resolved_gate);
-    std::env::set_var("ORBIT_MODEL", &model);
-    std::env::set_var("ORBIT_PROVIDER", &provider_id);
-    if let Some(env_name) = credential_env {
-        std::env::set_var("ORBIT_CREDENTIAL_ENV", env_name);
-    }
-
     // Session persistence in headless mode (phase 4): --continue /
     // --resume load the prior transcript; after the turn the session
     // is saved so the next --continue finds it. Without this, a
@@ -1821,13 +1814,13 @@ fn cmd_headless(args: &[String]) -> i32 {
     use std::io::Write;
     let stream_json = format == "stream-json";
     let json_out = format == "json";
-    if let Some(decision) = &routing_decision {
-        if stream_json {
-            println!(
-                "{}",
-                serde_json::json!({"type":"status","text":format!("route {}/{} → {}/{}",decision.phase.as_str(),decision.difficulty.as_str(),decision.provider_id,decision.raw_model)})
-            );
-        }
+    if let Some(decision) = &routing_decision
+        && stream_json
+    {
+        println!(
+            "{}",
+            serde_json::json!({"type":"status","text":format!("route {}/{} → {}/{}",decision.phase.as_str(),decision.difficulty.as_str(),decision.provider_id,decision.raw_model)})
+        );
     }
     let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
         if stream_json {
@@ -1927,72 +1920,72 @@ fn cmd_headless(args: &[String]) -> i32 {
     // against the schema; on failure, retry ONCE with the validation
     // error appended to the transcript (validate-and-retry — the
     // honest path for providers without native structured output).
-    if let Some(schema) = &json_schema {
-        if let Ok(r) = &report {
-            if let Err(problems) = validate_json_against_schema(&r.final_text, schema) {
-                if stream_json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&orbit_frontend_protocol::FrontendEvent::Status {
-                            text: format!("schema validation failed, retrying: {problems}")
-                        })
-                        .unwrap_or_default()
-                    );
-                }
-                transcript.push(orbit_engine::user_message(format!(
+    if let Some(schema) = &json_schema
+        && let Ok(r) = &report
+        && let Err(problems) = validate_json_against_schema(&r.final_text, schema)
+    {
+        if stream_json {
+            println!(
+                "{}",
+                serde_json::to_string(&orbit_frontend_protocol::FrontendEvent::Status {
+                    text: format!("schema validation failed, retrying: {problems}")
+                })
+                .unwrap_or_default()
+            );
+        }
+        transcript.push(orbit_engine::user_message(format!(
                     "Your previous reply did not match the required JSON schema: {problems}. Reply again with ONLY valid JSON matching the schema."
                 )));
-                report = orbit_engine::run_turn(
-                    &home,
-                    &turn_config,
-                    &options,
-                    "Reply with only valid JSON matching the schema.",
-                    &mut transcript,
-                    &mut executor,
-                    &orbit_provider_http::CancelToken::new(),
-                    &mut events,
-                );
-            }
-        }
+        report = orbit_engine::run_turn(
+            &home,
+            &turn_config,
+            &options,
+            "Reply with only valid JSON matching the schema.",
+            &mut transcript,
+            &mut executor,
+            &orbit_provider_http::CancelToken::new(),
+            &mut events,
+        );
     }
 
     // RTA (E10): attest from the structured exit status of the last
     // test-like command, in every front-end. A claim after a failing
     // command is an unverified claim and is shown as one.
     let mut rta_verdict: Option<serde_json::Value> = None;
-    if let Ok(_r) = &report {
-        if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript) {
-            if scan.claimed_pass {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let verdict = if scan.exit_code == 0 {
-                    // The recorded exit was 0 — re-run to attest (the
-                    // re-run is ORBIT's own eyes on the claim).
-                    match orbit_engine::automation::attest_test_pass(&scan.command, &cwd) {
-                        Ok(p) => serde_json::json!({
-                            "attested": true,
-                            "command": p.command,
-                            "at": p.attested_at_epoch
-                        }),
-                        Err(e) => serde_json::json!({
-                            "attested": false,
-                            "command": scan.command,
-                            "reason": e
-                        }),
-                    }
-                } else {
-                    // The recorded exit status was already a failure:
-                    // no re-run needed — the claim contradicts the
-                    // recorded facts.
-                    serde_json::json!({
-                        "attested": false,
-                        "command": scan.command,
-                        "recorded_exit_code": scan.exit_code,
-                        "reason": "the last test-like command exited non-zero; the claim is unverified"
-                    })
-                };
-                if stream_json {
-                    let attested = verdict["attested"].as_bool().unwrap_or(false);
-                    println!(
+    if let Ok(_r) = &report
+        && let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
+        && scan.claimed_pass
+    {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let verdict = if scan.exit_code == 0 {
+            // The recorded exit was 0 — re-run to attest (the
+            // re-run is ORBIT's own eyes on the claim).
+            match orbit_engine::automation::attest_test_pass(&scan.command, &cwd) {
+                Ok(p) => serde_json::json!({
+                    "attested": true,
+                    "command": p.command,
+                    "at": p.attested_at_epoch
+                }),
+                Err(e) => serde_json::json!({
+                    "attested": false,
+                    "command": scan.command,
+                    "reason": e
+                }),
+            }
+        } else {
+            // The recorded exit status was already a failure:
+            // no re-run needed — the claim contradicts the
+            // recorded facts.
+            serde_json::json!({
+                "attested": false,
+                "command": scan.command,
+                "recorded_exit_code": scan.exit_code,
+                "reason": "the last test-like command exited non-zero; the claim is unverified"
+            })
+        };
+        if stream_json {
+            let attested = verdict["attested"].as_bool().unwrap_or(false);
+            println!(
                         "{}",
                         serde_json::to_string(&orbit_frontend_protocol::FrontendEvent::Status {
                             text: format!(
@@ -2009,10 +2002,8 @@ fn cmd_headless(args: &[String]) -> i32 {
                         })
                         .unwrap_or_default()
                     );
-                }
-                rta_verdict = Some(verdict);
-            }
         }
+        rta_verdict = Some(verdict);
     }
 
     // Persist the session whatever the outcome (a failed turn still
@@ -2055,10 +2046,10 @@ fn cmd_headless(args: &[String]) -> i32 {
             }
             // The cost guard fires after the turn (the engine checks
             // between rounds; here it gates the exit class).
-            if let Some(reason) = cost_guard.check(r.cost_microcents) {
-                if stream_json || json_out {
-                    eprintln!("{reason}");
-                }
+            if let Some(reason) = cost_guard.check(r.cost_microcents)
+                && (stream_json || json_out)
+            {
+                eprintln!("{reason}");
             }
             // Exit codes: 0 done, 1 failed, 2 permission denial,
             // 3 max-turns, 130 interrupted. A permission denial is
@@ -2347,10 +2338,10 @@ fn validate_chat_arguments(args: &[String]) -> Result<(), String> {
     if seen.contains("--tui") && seen.contains("--no-tui") {
         return Err("choose --tui or --no-tui".into());
     }
-    if let Some(mode) = value_after(args, "--permission-mode") {
-        if orbit_tools::permissions::PermissionMode::from_config(&mode).is_none() {
-            return Err("unknown permission mode".into());
-        }
+    if let Some(mode) = value_after(args, "--permission-mode")
+        && orbit_tools::permissions::PermissionMode::from_config(&mode).is_none()
+    {
+        return Err("unknown permission mode".into());
     }
     Ok(())
 }
@@ -2416,17 +2407,17 @@ fn cmd_chat(args: &[String]) -> i32 {
             })
         })
         .unwrap_or_default();
-    if let Some(spec) = &requested_model {
-        if let Err(error) = orbit_cli::checked_model_turn(
+    if let Some(spec) = &requested_model
+        && let Err(error) = orbit_cli::checked_model_turn(
             &home,
             spec,
             value_after(args, "--provider").as_deref(),
             requested_gate.as_deref(),
             false,
-        ) {
-            eprintln!("ORBIT-E0401: {error}");
-            return 2;
-        }
+        )
+    {
+        eprintln!("ORBIT-E0401: {error}");
+        return 2;
     }
 
     // Session identity + persistence. `--resume <id>` loads a prior session's
@@ -2542,23 +2533,22 @@ fn cmd_chat(args: &[String]) -> i32 {
                     .map(|s| s.cost_microcents)
                     .unwrap_or(0),
             };
-            // Welcome readiness reads the REAL active model/provider —
-            // set them for the in-process TUI before it computes the row.
-            std::env::set_var("ORBIT_ACTIVE_MODEL", &tui_config.model);
-            std::env::set_var("ORBIT_ACTIVE_PROVIDER", &tui_config.provider_id);
-            // The composer history persists per session: the TUI loads
-            // and saves `<id>.history` under the session id it shares
-            // with the worker's saves.
-            std::env::set_var("ORBIT_SESSION_ID", &tui_config.session_id);
+            let identity = orbit_hud_tui::model::StartupIdentity {
+                model: tui_config.model.clone(),
+                provider_id: tui_config.provider_id.clone(),
+                session_id: tui_config.session_id.clone(),
+            };
             let host = orbit_cli::customization_host::host(
                 &home,
                 &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 tui_config.scope.clone(),
                 args.iter().any(|arg| arg == "--safe-customization"),
             );
-            return orbit_hud_tui::run_proto_with_customization(
+            return orbit_hud_tui::run_proto_with_startup(
                 args,
                 tui_worker::make_spawner_owned(tui_config, live_lease),
+                home.clone(),
+                identity,
                 host,
             );
         }
@@ -2569,7 +2559,9 @@ fn cmd_chat(args: &[String]) -> i32 {
     // must not print to the alt screen.
     tool_runtime::enable_plain_output();
     if orbit_cli::mods::validation_status(&home).is_err() {
-        eprintln!("Instruction bundles or enabled metadata are malformed or unsafe. Run orbit doctor; invalid entries remain disabled and stored files are unchanged.");
+        eprintln!(
+            "Instruction bundles or enabled metadata are malformed or unsafe. Run orbit doctor; invalid entries remain disabled and stored files are unchanged."
+        );
     }
 
     if let Some(s) = &resumed_file {
@@ -2831,30 +2823,29 @@ fn cmd_chat(args: &[String]) -> i32 {
             if !handled {
                 eprintln!("unknown command: {trimmed}; try /help");
             } else if prior_selection != (model.clone(), selected_effort.clone(), selection_origin)
-            {
-                if let Ok(resolved) = chat_effort_config(
+                && let Ok(resolved) = chat_effort_config(
                     &home,
                     &model,
                     &gate,
                     Some(&active_provider),
                     selected_effort.as_ref(),
-                ) {
-                    let sf = sessions::SessionFile::from_chat(
-                        &session,
-                        &model,
-                        &resolved.gate,
-                        &resolved.provider_id,
-                        &transcript,
-                        turns,
-                        total_input,
-                        total_output,
-                        total_cost,
-                    )
-                    .with_effort(selected_effort.clone())
-                    .with_selection_origin(selection_origin);
-                    if let Err(e) = live_lease.save(&sf) {
-                        eprintln!("warning: session not saved: {e}");
-                    }
+                )
+            {
+                let sf = sessions::SessionFile::from_chat(
+                    &session,
+                    &model,
+                    &resolved.gate,
+                    &resolved.provider_id,
+                    &transcript,
+                    turns,
+                    total_input,
+                    total_output,
+                    total_cost,
+                )
+                .with_effort(selected_effort.clone())
+                .with_selection_origin(selection_origin);
+                if let Err(e) = live_lease.save(&sf) {
+                    eprintln!("warning: session not saved: {e}");
                 }
             }
             continue;
@@ -3072,13 +3063,14 @@ fn cmd_chat(args: &[String]) -> i32 {
                 }
                 // E10: the attestation scan runs in EVERY front-end —
                 // an unverified claim is shown, not just in headless.
-                if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript) {
-                    if scan.claimed_pass && scan.exit_code != 0 {
-                        eprintln!(
-                            "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
-                            scan.command, scan.exit_code
-                        );
-                    }
+                if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
+                    && scan.claimed_pass
+                    && scan.exit_code != 0
+                {
+                    eprintln!(
+                        "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
+                        scan.command, scan.exit_code
+                    );
                 }
             }
             Err(_) => {
@@ -3402,7 +3394,7 @@ fn cmd_folder(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
             return Err((
                 "ORBIT-E1101",
                 "usage: orbit folder trust|untrust|status [DIR]".into(),
-            ))
+            ));
         }
     };
     Ok(serde_json::json!({
@@ -3824,24 +3816,16 @@ fn run_provider_add_interactive(
     // Ollama (empty preset env) defaults to none — it needs no key.
     let credential_env = if preset.env.is_empty() {
         let v = prompt_line("Credential env-var name (blank = none)", None)?;
-        if v.trim().is_empty() {
-            None
-        } else {
-            Some(v)
-        }
+        if v.trim().is_empty() { None } else { Some(v) }
     } else {
         let v = prompt_line("Credential env-var name", Some(preset.env))?;
-        if v.trim().is_empty() {
-            None
-        } else {
-            Some(v)
-        }
+        if v.trim().is_empty() { None } else { Some(v) }
     };
     validate_discovery_input(&name, &gate, credential_env.as_deref(), preset.kind)?;
-    if let Some(var) = credential_env.as_deref().filter(|v| !v.trim().is_empty()) {
-        if std::env::var(var).is_err() {
-            println!("note: export {var}=<your key> before orbit needs it");
-        }
+    if let Some(var) = credential_env.as_deref().filter(|v| !v.trim().is_empty())
+        && std::env::var(var).is_err()
+    {
+        println!("note: export {var}=<your key> before orbit needs it");
     }
 
     // Discovery against the real endpoint.
@@ -3900,19 +3884,18 @@ fn run_provider_add_interactive(
         models: entries.clone(),
     })
     .map_err(|e| ("ORBIT-E1101", e.to_string()))?;
-    if kind == "anthropic" {
-        if let Some(idx) = entries
+    if kind == "anthropic"
+        && let Some(idx) = entries
             .iter()
             .position(|e| e.context_window.is_none() || e.max_output_tokens.is_none())
-        {
-            let id = entries[idx].id.clone();
-            let limits = anthropic_model_limits(&gate, credential_env.as_deref(), &id);
-            if let Some(w) = limits.context_window {
-                entries[idx].context_window = Some(w);
-            }
-            if let Some(o) = limits.max_output_tokens {
-                entries[idx].max_output_tokens = Some(o);
-            }
+    {
+        let id = entries[idx].id.clone();
+        let limits = anthropic_model_limits(&gate, credential_env.as_deref(), &id);
+        if let Some(w) = limits.context_window {
+            entries[idx].context_window = Some(w);
+        }
+        if let Some(o) = limits.max_output_tokens {
+            entries[idx].max_output_tokens = Some(o);
         }
     }
 
@@ -4138,7 +4121,9 @@ fn handle_chat_command(
 ) -> bool {
     match cmd {
         "/help" => {
-            println!("commands: exit, /help, /model <M>, /effort [VALUE|default], /permissions [<tool>|allow|ask|deny|reset <tool>], /clear, /usage, /models, /sessions, /resume <ID>");
+            println!(
+                "commands: exit, /help, /model <M>, /effort [VALUE|default], /permissions [<tool>|allow|ask|deny|reset <tool>], /clear, /usage, /models, /sessions, /resume <ID>"
+            );
             true
         }
         "/clear" => {
@@ -4659,10 +4644,10 @@ fn cmd_serve(args: &[String]) -> i32 {
         let requested = startup_effort_argument(args, std::env::var("ORBIT_EFFORT").ok())?;
         let effort = sessions::startup_effort(requested, saved.as_ref(), &entry.id, &provider.name);
         apply_selected_effort(&home, &mut checked, effort.as_ref())?;
-        if let Some(mode) = value_after(args, "--permission-mode") {
-            if orbit_tools::permissions::PermissionMode::from_config(&mode).is_none() {
-                return Err(format!("unknown permission mode {mode}"));
-            }
+        if let Some(mode) = value_after(args, "--permission-mode")
+            && orbit_tools::permissions::PermissionMode::from_config(&mode).is_none()
+        {
+            return Err(format!("unknown permission mode {mode}"));
         }
         let turn = tui_worker::TuiTurnConfig {
             home: home.clone(),
@@ -4720,7 +4705,7 @@ fn cmd_serve(args: &[String]) -> i32 {
             .map_err(|error| error.to_string())?;
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
         if args.iter().any(|argument| argument == "--bare") {
-            std::env::set_var("ORBIT_BARE", "1");
+            tools::enable_bare_mode();
         }
         eprintln!("Starting session {} at {}", lease.session_id(), socket);
         foreground_owner(
@@ -4738,11 +4723,7 @@ fn cmd_serve(args: &[String]) -> i32 {
         }
     };
     let signal = OWNER_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
-    if signal == 0 {
-        code
-    } else {
-        128 + signal
-    }
+    if signal == 0 { code } else { 128 + signal }
 }
 
 #[cfg(unix)]
@@ -4831,7 +4812,7 @@ fn cmd_attach(args: &[String]) -> i32 {
                 orbit_cli::attach::stop(path).map_err(|error| error.to_string())?,
             ),
             _ => {
-                return orbit_cli::attach::run_interactive(path).map_err(|error| error.to_string())
+                return orbit_cli::attach::run_interactive(path).map_err(|error| error.to_string());
             }
         }
         .map_err(|error| error.to_string())?;
@@ -5235,13 +5216,15 @@ mod provider_wizard_tests {
                 validate_discovery_input(name, "https://example.invalid", Some(env), kind).is_err()
             );
         }
-        assert!(validate_discovery_input(
-            "p",
-            "https://example.invalid/v1?api-version=2026-01-01",
-            Some("KEY"),
-            "openai-compatible"
-        )
-        .is_ok());
+        assert!(
+            validate_discovery_input(
+                "p",
+                "https://example.invalid/v1?api-version=2026-01-01",
+                Some("KEY"),
+                "openai-compatible"
+            )
+            .is_ok()
+        );
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -5382,15 +5365,17 @@ mod provider_wizard_tests {
         let missing = f.0.join("absent");
         assert!(add(&missing, "q").unwrap_err().1.contains("setup"));
         assert!(!missing.exists());
-        assert!(add_configured_provider(
-            &missing,
-            "q",
-            "https://user:PRIVATE@example.invalid",
-            None,
-            vec!["m".into()],
-            None
-        )
-        .is_err());
+        assert!(
+            add_configured_provider(
+                &missing,
+                "q",
+                "https://user:PRIVATE@example.invalid",
+                None,
+                vec!["m".into()],
+                None
+            )
+            .is_err()
+        );
         assert!(!missing.exists());
     }
     #[test]
@@ -5537,9 +5522,11 @@ mod provider_wizard_tests {
                 "unexpected fixture endpoint"
             );
             if kind == "anthropic" {
-                assert!(request
-                    .to_ascii_lowercase()
-                    .contains("anthropic-version: 2023-06-01"));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("anthropic-version: 2023-06-01")
+                );
             }
         }
     }
@@ -5551,26 +5538,32 @@ mod provider_wizard_tests {
         let limits = anthropic_model_limits(&format!("{endpoint}/v1"), None, "vendor/raw");
         assert_eq!(limits.context_window, Some(190000));
         assert_eq!(limits.max_output_tokens, Some(24000));
-        assert!(thread
-            .join()
-            .unwrap()
-            .starts_with("GET /v1/models/vendor%2Fraw HTTP/1.1\r\n"));
+        assert!(
+            thread
+                .join()
+                .unwrap()
+                .starts_with("GET /v1/models/vendor%2Fraw HTTP/1.1\r\n")
+        );
     }
     #[test]
     fn actual_discovery_caps_declared_and_chunked_response_bodies() {
         let (endpoint, thread) = server(
             b"HTTP/1.1 200 OK\r\nContent-Length: 131073\r\nConnection: close\r\n\r\n".to_vec(),
         );
-        assert!(discover_models(&endpoint, None, "openai-compatible")
-            .unwrap_err()
-            .contains("128 KiB"));
+        assert!(
+            discover_models(&endpoint, None, "openai-compatible")
+                .unwrap_err()
+                .contains("128 KiB")
+        );
         assert!(thread.join().unwrap().starts_with("GET /v1/models "));
         let body = "x".repeat(PROVIDER_RESPONSE_LIMIT + 1);
         let bytes = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).into_bytes();
         let (endpoint, thread) = server(bytes);
-        assert!(discover_models(&endpoint, None, "openai-compatible")
-            .unwrap_err()
-            .contains("128 KiB"));
+        assert!(
+            discover_models(&endpoint, None, "openai-compatible")
+                .unwrap_err()
+                .contains("128 KiB")
+        );
         thread.join().unwrap();
     }
     #[test]

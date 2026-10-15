@@ -12,7 +12,7 @@ use crate::dispatch::{DispatchEngine, DispatchOutcome, DispatchState};
 use crate::registry::ProviderRegistry;
 use crate::{new_decision_id, new_session_id};
 use orbit_adapter::adapters::{
-    canonical_success_result, identity, text_capabilities, DeterministicTestV1,
+    DeterministicTestV1, canonical_success_result, identity, text_capabilities,
 };
 use orbit_adapter::conformance::canonical_request;
 use orbit_adapter::credential::SecretBytes;

@@ -7,7 +7,7 @@
 //! registry and sending the response.
 
 use std::collections::HashMap;
-use std::sync::{mpsc, Mutex};
+use std::sync::{Mutex, mpsc};
 
 /// The operator's response to an approval request. Defined in hud-tui so the
 /// TUI doesn't depend on cli's `ApprovalVerdict`; the CLI maps at the boundary.

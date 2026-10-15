@@ -10,7 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::{load_fixture, ConfError, Fixture};
+use crate::{ConfError, Fixture, load_fixture};
 use orbit_migrator::{ClaudeConstruct, ConstructKind, Migrator};
 
 /// Parse the spawn block from a fixture source/expected YAML into a list of

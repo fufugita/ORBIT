@@ -4,8 +4,8 @@
 //! carries the trust allowlist so the Trust gate has a single source.
 
 use crate::ModelRef;
-use orbit_adapter::types::{AdapterKind, ProviderRouteBinding};
 use orbit_adapter::ProviderAdapter;
+use orbit_adapter::types::{AdapterKind, ProviderRouteBinding};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

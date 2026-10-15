@@ -7,8 +7,8 @@
 //! (§16.2 allows symbols-only comparison per row) once the fixture
 //! state exists. Today we assert the states that DO render.
 
-use orbit_hud_tui::proto::runtime::draw;
 use orbit_hud_tui::proto::runtime::Tui;
+use orbit_hud_tui::proto::runtime::draw;
 use orbit_hud_tui::proto::scenario::{LineKind, Scenario, ToolState, TranscriptLine};
 use ratatui::backend::TestBackend;
 

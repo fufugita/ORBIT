@@ -1,13 +1,13 @@
 use crate::adapters::{
-    canonical_success_result, identity, text_capabilities, DeterministicTestV1, MockHttpV1,
-    MockScript,
+    DeterministicTestV1, MockHttpV1, MockScript, canonical_success_result, identity,
+    text_capabilities,
 };
 use crate::conformance::{assert_invoke_success, assert_route_validation, canonical_request};
 use crate::credential::SecretBytes;
 use crate::error::{AdapterError, AdapterRetryClass};
 use crate::provider_adapter::ProviderAdapter;
 use crate::redaction::{
-    classify_sensitive_name, redact_pair, scrub_secret_bytes, RedactionCategory,
+    RedactionCategory, classify_sensitive_name, redact_pair, scrub_secret_bytes,
 };
 use crate::stream::{canonical_output_sha256, output_evidence, validate_stream};
 use crate::types::*;

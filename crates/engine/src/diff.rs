@@ -207,11 +207,7 @@ pub fn hunks(old: &str, new: &str) -> Option<Vec<DiffHunk>> {
         });
     }
     let _ = (total_old, total_new);
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[cfg(test)]

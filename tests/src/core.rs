@@ -405,13 +405,14 @@ fn issuer_allowlist_enforced_at_capability_card_resolution() {
     };
     let mut reg = orbit_plugin::PluginRegistry::new(64);
     reg.attach_ledger();
-    assert!(reg
-        .install(
+    assert!(
+        reg.install(
             &manifest,
             &orbit_plugin::WasiHostAllowlist::canonical(),
             b"bytes"
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 #[test]
@@ -427,13 +428,14 @@ fn plugin_self_issued_card_rejected_at_registry() {
     };
     let mut reg = orbit_plugin::PluginRegistry::new(64);
     reg.attach_ledger();
-    assert!(reg
-        .install(
+    assert!(
+        reg.install(
             &manifest,
             &orbit_plugin::WasiHostAllowlist::canonical(),
             b"bytes"
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 #[test]
@@ -843,14 +845,16 @@ fn landlock_unavailable_produces_e0803_no_process_spawn() {
         if let Ok(k) = kf {
             // If the probe passed, Landlock is available; else refuse.
             if !k.landlock_abi_v4 {
-                assert!(orbit_sandbox::validate_applicable(
-                    &orbit_sandbox::resolve_profile(
-                        &orbit_sandbox::SandboxProfileId::PluginDefault
+                assert!(
+                    orbit_sandbox::validate_applicable(
+                        &orbit_sandbox::resolve_profile(
+                            &orbit_sandbox::SandboxProfileId::PluginDefault
+                        )
+                        .unwrap(),
+                        &k
                     )
-                    .unwrap(),
-                    &k
-                )
-                .is_err());
+                    .is_err()
+                );
             }
         }
     }
@@ -870,13 +874,14 @@ fn plugin_install_requires_ledger_event() {
         declared_imports: vec![],
     };
     let mut reg = orbit_plugin::PluginRegistry::new(64); // no ledger attached
-    assert!(reg
-        .install(
+    assert!(
+        reg.install(
             &manifest,
             &orbit_plugin::WasiHostAllowlist::canonical(),
             b"b"
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 #[test]

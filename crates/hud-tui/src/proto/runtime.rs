@@ -18,10 +18,10 @@ use super::scenario::{LineKind, Scenario, ToolState, TranscriptLine, TurnReport}
 use super::screen::Focus;
 use crate::worker::WorkerCtx;
 
-use crate::bus::{Bus, BusSender};
-use crate::worker::CommandSink;
 use crate::ApprovalRegistry;
 use crate::WorkerCommand;
+use crate::bus::{Bus, BusSender};
+use crate::worker::CommandSink;
 
 /// The UI tick: 16 ms. §10.5 — an idle ORBIT draws nothing; the loop
 /// still polls so redraws after events are instant.
@@ -151,7 +151,13 @@ impl Tui {
 
 /// `orbit chat` → the prototype screen (the MD's target front-end).
 pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) -> i32 {
-    run_proto_inner(args, worker_spawner, None)
+    run_proto_inner(
+        args,
+        worker_spawner,
+        startup_home_from_env(),
+        crate::model::StartupIdentity::from_env(),
+        None,
+    )
 }
 
 /// The caller owns storage/policy. This frontend only consumes the checked host interface.
@@ -160,8 +166,25 @@ pub fn run_proto_with_customization(
     worker_spawner: crate::worker::WorkerSpawner,
     host: std::sync::Arc<dyn orbit_frontend_protocol::customization::ProfileHost>,
 ) -> i32 {
+    run_proto_with_startup(
+        args,
+        worker_spawner,
+        startup_home_from_env(),
+        crate::model::StartupIdentity::from_env(),
+        host,
+    )
+}
+
+/// Start with the same resolved home and identity used by the caller's worker.
+pub fn run_proto_with_startup(
+    args: &[String],
+    worker_spawner: crate::worker::WorkerSpawner,
+    home: std::path::PathBuf,
+    identity: crate::model::StartupIdentity,
+    host: std::sync::Arc<dyn orbit_frontend_protocol::customization::ProfileHost>,
+) -> i32 {
     match crate::customization::CustomizationSession::open(host) {
-        Ok(session) => run_proto_inner(args, worker_spawner, Some(session)),
+        Ok(session) => run_proto_inner(args, worker_spawner, home, identity, Some(session)),
         Err(error) => {
             eprintln!("orbit-tui: {error}");
             1
@@ -169,15 +192,19 @@ pub fn run_proto_with_customization(
     }
 }
 
+fn startup_home_from_env() -> std::path::PathBuf {
+    std::env::var("ORBIT_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(".orbit"))
+}
+
 fn run_proto_inner(
     args: &[String],
     worker_spawner: crate::worker::WorkerSpawner,
+    home: std::path::PathBuf,
+    identity: crate::model::StartupIdentity,
     customization: Option<crate::customization::CustomizationSession>,
 ) -> i32 {
-    let home = std::env::var("ORBIT_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(".orbit"));
-
     // tui.toml (Appendix C): colour mode, glyphs, motion, brand,
     // notify, colours, layout.
     let safe_session = args.iter().any(|arg| arg == "--safe-customization")
@@ -230,13 +257,13 @@ fn run_proto_inner(
     let approvals = ApprovalRegistry::new();
     let mut scenario = Scenario::new();
     scenario.brand_tier = brand_tier;
-    scenario.welcome_chips = crate::model::compute_readiness(&home)
+    scenario.welcome_chips = crate::model::compute_readiness_with_identity(&home, &identity)
         .into_iter()
         .map(|r| (r.ok, r.label))
         .collect();
     // The model name arrives via Msg::Identity; the waiting line
     // needs it before then too.
-    scenario.model = std::env::var("ORBIT_ACTIVE_MODEL").unwrap_or_default();
+    scenario.model = identity.model.clone();
 
     let mut tui = Tui {
         profile,
@@ -288,13 +315,9 @@ fn run_proto_inner(
     // queued row until their TurnStarted.
     let mut queued: Vec<String> = Vec::new();
     // Composer history (§11.3), newest first. Persisted per session
-    // (`sessions/<id>.history`): the CLI names
-    // the session (ORBIT_SESSION_ID — the same id the worker saves
-    // under), so a resumed session's ↑/↓ memory loads before the
-    // first key.
-    let history_path = std::env::var("ORBIT_SESSION_ID")
-        .ok()
-        .map(|sid| home.join("sessions").join(format!("{sid}.history")));
+    // (`sessions/<id>.history`): the caller supplies the same session id
+    // the worker saves under, so a resumed session's memory loads before input.
+    let history_path = composer_history_path(&home, &identity);
     let mut history: Vec<String> = history_path
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -614,19 +637,19 @@ fn run_proto_inner(
                 tui.hits = frame_hits;
             }
             // Toast expiry (§9.13): 3 s.
-            if let Some(t) = &toast {
-                if now_ms.saturating_sub(t.shown_ms) >= 3000 {
-                    toast = None;
-                }
+            if let Some(t) = &toast
+                && now_ms.saturating_sub(t.shown_ms) >= 3000
+            {
+                toast = None;
             }
         }
     }
 
     drop(guard);
-    if let Some(sig) = crate::terminal::take_pending_signal() {
-        if matches!(exit_code, 0 | 1) {
-            exit_code = sig.exit_code();
-        }
+    if let Some(sig) = crate::terminal::take_pending_signal()
+        && matches!(exit_code, 0 | 1)
+    {
+        exit_code = sig.exit_code();
     }
     // The composer history outlives the run: one last save (the sends
     // saved as they happened; this catches nothing on a clean exit,
@@ -840,10 +863,10 @@ fn handle_key(
             KeyCode::Char(ch) => Some(super::app::Key::Char(ch)),
             _ => None,
         };
-        if let Some(key) = key {
-            if tui.app.key(key) {
-                save_layout(tui, toast, now_ms);
-            }
+        if let Some(key) = key
+            && tui.app.key(key)
+        {
+            save_layout(tui, toast, now_ms);
         }
         tui.sync_focus();
         return false;
@@ -1067,13 +1090,12 @@ fn handle_key(
                 composer.push_str(&history[0]);
             }
             KeyCode::Up => {
-                if let Some(i) = *history_idx {
-                    if i + 1 < history.len() {
+                if let Some(i) = *history_idx
+                    && i + 1 < history.len() {
                         *history_idx = Some(i + 1);
                         composer.clear();
                         composer.push_str(&history[i + 1]);
                     }
-                }
             }
             KeyCode::Down => {
                 if let Some(i) = *history_idx {
@@ -1091,13 +1113,12 @@ fn handle_key(
                 composer.pop();
                 *completion_sel = 0;
             }
-            KeyCode::Esc => {
+            KeyCode::Esc
                 // §11.3: Esc closes the completion list; otherwise
                 // nothing (the draft is kept).
-                if composer == "/" {
+                if composer == "/" => {
                     composer.clear();
                 }
-            }
 
             _ => {}
         }
@@ -2475,11 +2496,11 @@ fn handle_mouse(
             // presses, or the row it picks, must reach THAT panel, not
             // whichever one happened to have focus.
             let focus_under = |tui: &mut Tui| {
-                if let Some((i, _, _)) = under {
-                    if *i != tui.app.focus {
-                        tui.app.focus = *i;
-                        tui.sync_focus();
-                    }
+                if let Some((i, _, _)) = under
+                    && *i != tui.app.focus
+                {
+                    tui.app.focus = *i;
+                    tui.sync_focus();
                 }
             };
             match click {
@@ -2788,6 +2809,16 @@ fn overlay_code(o: Option<Overlay>) -> u8 {
 }
 
 const HISTORY_FILE_SCHEMA: &str = "orbit.composer-history/v1";
+
+fn composer_history_path(
+    home: &std::path::Path,
+    identity: &crate::model::StartupIdentity,
+) -> Option<std::path::PathBuf> {
+    (!identity.session_id.is_empty()).then(|| {
+        home.join("sessions")
+            .join(format!("{}.history", identity.session_id))
+    })
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4743,6 +4774,43 @@ mod composer_key_tests {
 mod history_persistence_tests {
     use super::*;
 
+    #[test]
+    fn typed_startup_keeps_readiness_and_history_on_the_resolved_session() {
+        let root = tempfile_dir();
+        let home = root.join("selected home");
+        std::fs::create_dir_all(home.join("trust")).unwrap();
+        std::fs::create_dir_all(home.join("ledger/segments")).unwrap();
+        std::fs::write(home.join("trust/manifest.json"), "{}").unwrap();
+        std::fs::write(home.join("ledger/segments/0000000000000000.log"), []).unwrap();
+        let identity = crate::model::StartupIdentity {
+            model: "family/selected-model".into(),
+            provider_id: "selected-provider".into(),
+            session_id: "resumed-session".into(),
+        };
+        let rows = crate::model::compute_readiness_with_identity(&home, &identity);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.ok));
+        assert_eq!(rows[1].label, "ledger · 1 segment");
+        assert_eq!(rows[2].label, "selected-provider · family/selected-model");
+
+        let history = vec!["first line\nsecond line".into()];
+        let path = composer_history_path(&home, &identity);
+        assert_eq!(path, Some(home.join("sessions/resumed-session.history")));
+        save_history(&path, &history);
+        let other = crate::model::StartupIdentity {
+            session_id: "another-session".into(),
+            ..identity.clone()
+        };
+        assert!(!composer_history_path(&home, &other).unwrap().exists());
+        assert_eq!(
+            read_history(&std::fs::read_to_string(path.unwrap()).unwrap()),
+            history
+        );
+        assert!(composer_history_path(&home, &Default::default()).is_none());
+        assert!(!crate::model::compute_readiness_with_identity(&home, &Default::default())[2].ok);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// The history file has exact prompt entries, newest first, bounded:
     /// what save_history writes, the boot loader reads back.
     #[test]
@@ -4917,11 +4985,7 @@ fn pane_context(
                 id: id.clone(),
                 name: a.name.clone(),
                 state: if a.done {
-                    if a.ok {
-                        "done"
-                    } else {
-                        "failed"
-                    }
+                    if a.ok { "done" } else { "failed" }
                 } else {
                     "running"
                 }
@@ -4979,11 +5043,9 @@ fn reduce_frontend_message(
 ) -> Option<String> {
     let restored = matches!(&msg, crate::msg::Msg::TranscriptLoaded { .. });
     let result = apply_msg(msg, s, now);
-    if restored {
-        if let Some(session) = tui.customization.as_mut() {
-            session.invalidate_session(pane_context(s, session.context.controller));
-            s.custom_panes = session.outputs.clone();
-        }
+    if restored && let Some(session) = tui.customization.as_mut() {
+        session.invalidate_session(pane_context(s, session.context.controller));
+        s.custom_panes = session.outputs.clone();
     }
     result
 }
@@ -5110,18 +5172,18 @@ pub fn handle_custom_key(
     if tui.app.focused_view() == super::layout::View::Custom {
         match k.code {
             KeyCode::Char('r') => {
-                if let Some(id) = tui.app.tree.custom_id_at(tui.app.focus) {
-                    if let Some(session) = tui.customization.as_mut() {
-                        session.context = pane_context(s, cancel.is_some());
-                        let result = session.refresh(&id);
-                        s.custom_panes = session.outputs.clone();
-                        if let Err(error) = result {
-                            *toast = Some(Toast {
-                                text: error.to_string(),
-                                ok: false,
-                                shown_ms: now,
-                            });
-                        }
+                if let Some(id) = tui.app.tree.custom_id_at(tui.app.focus)
+                    && let Some(session) = tui.customization.as_mut()
+                {
+                    session.context = pane_context(s, cancel.is_some());
+                    let result = session.refresh(&id);
+                    s.custom_panes = session.outputs.clone();
+                    if let Err(error) = result {
+                        *toast = Some(Toast {
+                            text: error.to_string(),
+                            ok: false,
+                            shown_ms: now,
+                        });
                     }
                 }
                 return true;
@@ -5328,7 +5390,7 @@ mod routing_projection_tests {
 mod customization_review_tests {
     use super::*;
     use orbit_frontend_protocol::customization::*;
-    use ratatui::{backend::TestBackend, style::Color, Terminal};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
     use std::{
         collections::BTreeMap,
         sync::{Arc, Mutex},
@@ -5527,10 +5589,12 @@ mod customization_review_tests {
         tui.tick_ms = 5000;
         assert!(!tui.reduced && !tui.app.reduced);
         assert_eq!(tui.brand_tier, super::super::welcome::BrandTier::Anim);
-        assert!(buffer(&tui)
-            .content
-            .iter()
-            .any(|c| matches!(c.fg, Color::Rgb(..))));
+        assert!(
+            buffer(&tui)
+                .content
+                .iter()
+                .any(|c| matches!(c.fg, Color::Rgb(..)))
+        );
         assert!(select_profile(&legacy, None).reduced_motion);
     }
     #[test]
@@ -5547,10 +5611,12 @@ mod customization_review_tests {
             },
         );
         let first = buffer(&tui);
-        assert!(first
-            .content
-            .iter()
-            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        assert!(
+            first
+                .content
+                .iter()
+                .all(|c| c.fg == Color::Reset && c.bg == Color::Reset)
+        );
         assert_eq!(tui.brand_tier, super::super::welcome::BrandTier::Static);
         let source = host(Profile::default());
         tui.customization = Some(crate::customization::CustomizationSession::open(source).unwrap());
@@ -5559,10 +5625,12 @@ mod customization_review_tests {
         assert!(!tui.reduced && !tui.app.reduced);
         assert_eq!(scenario.brand_tier, super::super::welcome::BrandTier::Anim);
         assert_eq!(tui.tier, super::super::core::Tier::TrueColor);
-        assert!(buffer(&tui)
-            .content
-            .iter()
-            .any(|c| matches!(c.fg, Color::Rgb(..))));
+        assert!(
+            buffer(&tui)
+                .content
+                .iter()
+                .any(|c| matches!(c.fg, Color::Rgb(..)))
+        );
     }
     #[test]
     fn canonical_truecolor_cannot_upgrade_no_color_or_sixteen_color_hardware() {
@@ -5582,15 +5650,19 @@ mod customization_review_tests {
             );
             assert_eq!(tui.tier, expected);
             let actual = buffer(&tui);
-            assert!(!actual
-                .content
-                .iter()
-                .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..))));
-            if no_color {
-                assert!(actual
+            assert!(
+                !actual
                     .content
                     .iter()
-                    .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+                    .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..)))
+            );
+            if no_color {
+                assert!(
+                    actual
+                        .content
+                        .iter()
+                        .all(|c| c.fg == Color::Reset && c.bg == Color::Reset)
+                );
             }
         }
     }

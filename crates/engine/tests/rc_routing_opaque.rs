@@ -5,14 +5,14 @@ use orbit_adapter::types::{ChatMessage, ChatRole, ContentBlock, ToolDefinition};
 use orbit_engine::{PendingToolCall, ToolExecutor, ToolRoundResult, TurnConfig, TurnOptions};
 use orbit_frontend_protocol::FrontendEvent;
 use orbit_provider_http::CancelToken;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Digest;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -418,10 +418,12 @@ fn opaque_identity_unproven_legacy_blocks_are_conservatively_stripped() {
     let legacy: ChatMessage = serde_json::from_value(json!({"role":"assistant","content":"visible legacy",
         "origin_model":"model-a","blocks":[{"type":"opaque","json":"{\"type\":\"thinking\",\"thinking\":\"legacy private\",\"signature\":\"legacy-signature\"}"}]})).unwrap();
     assert!(legacy.origin_provider.is_none());
-    assert!(serde_json::to_value(&legacy)
-        .unwrap()
-        .get("origin_provider")
-        .is_none());
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("origin_provider")
+            .is_none()
+    );
     let mut missing_model = legacy.clone();
     missing_model.origin_provider = Some("provider_a".into());
     missing_model.origin_model = None;
@@ -611,12 +613,16 @@ fn direct_dispatch_also_filters_foreign_blocks_without_mutating_the_caller() {
     assert_eq!(outcome.output, "visible fixture answer");
     assert_eq!(provider.calls().len(), 1);
     assert!(wire_thinking(&provider.calls()[0]).is_empty());
-    assert!(provider.calls()[0]
-        .to_string()
-        .contains("visible direct history"));
-    assert!(!provider.calls()[0]
-        .to_string()
-        .contains("foreign-redacted-data"));
+    assert!(
+        provider.calls()[0]
+            .to_string()
+            .contains("visible direct history")
+    );
+    assert!(
+        !provider.calls()[0]
+            .to_string()
+            .contains("foreign-redacted-data")
+    );
     assert_eq!(original[1].blocks.as_ref().unwrap().len(), 2);
     let mut wire = original.clone();
     assert_eq!(

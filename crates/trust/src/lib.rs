@@ -18,4 +18,4 @@ pub mod root;
 
 pub use error::TrustError;
 pub use manifest::{RootPublicKey, RouteSpec, TrustLevel, TrustRootManifest};
-pub use root::{added_roots_path, TrustRootStore};
+pub use root::{TrustRootStore, added_roots_path};

@@ -5,7 +5,7 @@
 //! three seconds. Nothing here is a canned frame: each cell is a
 //! function of the clock.
 
-use super::canvas::{mix, tint, Cv, Rgb};
+use super::canvas::{Cv, Rgb, mix, tint};
 use super::motion::star_at;
 use super::pal::MAGENTA_HI;
 use ratatui::style::Modifier;
@@ -142,11 +142,11 @@ pub fn draw_mark(cv: &mut Cv, x: i32, y: i32, o: &MarkOpts) {
             );
         }
     }
-    if let Some(k) = o.star_k {
-        if !HIDDEN.contains(&k) {
-            let (sc, sr) = STATIONS[k % 12];
-            cv.bold(x + sc, y + sr, "✦", o.star_col, Some(o.bg));
-        }
+    if let Some(k) = o.star_k
+        && !HIDDEN.contains(&k)
+    {
+        let (sc, sr) = STATIONS[k % 12];
+        cv.bold(x + sc, y + sr, "✦", o.star_col, Some(o.bg));
     }
 }
 
@@ -163,11 +163,7 @@ pub struct Hero<'a> {
 
 /// Rows the hero takes (without the sections below it).
 pub fn hero_height(waiting: bool) -> i32 {
-    if waiting {
-        7
-    } else {
-        9
-    }
+    if waiting { 7 } else { 9 }
 }
 
 /// Draw the welcome hero in the panel interior `(x, y, w, h)`; returns

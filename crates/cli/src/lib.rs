@@ -297,7 +297,9 @@ pub fn version_evidence(version: &str, commit_sha: &str) -> CliOutput {
             "version": version,
             "commit_sha": commit_sha,
             "build": {
-                "toolchain": concat!(env!("CARGO_PKG_RUST_VERSION"), " (pinned)"),
+                "toolchain": env!("ORBIT_BUILD_RUSTC"),
+                "minimum_rust_version": env!("CARGO_PKG_RUST_VERSION"),
+                "edition": "2024",
                 "target": std::env::consts::ARCH,
                 "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             },
@@ -818,7 +820,10 @@ pub fn effort_status(_home: &Path, config: &orbit_engine::TurnConfig) -> String 
         Some(values) if values.is_empty() => "unsupported (default only)".into(),
         Some(values) => values.iter().map(label).collect::<Vec<_>>().join(", "),
     };
-    format!("Configured effort for {}/{}: {request}\nSupported: {choices}.\nReset: /effort default restores the model default.", config.provider_id, config.model)
+    format!(
+        "Configured effort for {}/{}: {request}\nSupported: {choices}.\nReset: /effort default restores the model default.",
+        config.provider_id, config.model
+    )
 }
 
 /// The model's context window from providers.toml, for the engine's
@@ -1223,7 +1228,9 @@ mod effort_resolution_tests {
 
     #[test]
     fn exact_owner_metadata_and_reset_validate_before_mutation() {
-        let home = Home::new("[[provider]]\nname='one'\nurl='https://one.example'\n[[provider.models]]\nid='shared'\nsupported_efforts=['low','high']\ndefault_effort='low'\n[[provider.models]]\nid='unknown'\n[[provider.models]]\nid='unsupported'\nsupported_efforts=[]\n[[provider]]\nname='two'\nkind='ollama'\nurl='https://two.example'\n[[provider.models]]\nid='shared'\nsupported_efforts=[false,'false']\ndefault_effort=false\n");
+        let home = Home::new(
+            "[[provider]]\nname='one'\nurl='https://one.example'\n[[provider.models]]\nid='shared'\nsupported_efforts=['low','high']\ndefault_effort='low'\n[[provider.models]]\nid='unknown'\n[[provider.models]]\nid='unsupported'\nsupported_efforts=[]\n[[provider]]\nname='two'\nkind='ollama'\nurl='https://two.example'\n[[provider.models]]\nid='shared'\nsupported_efforts=[false,'false']\ndefault_effort=false\n",
+        );
         let mut config =
             try_engine_turn_config(&home.0, "two", "https://two.example", "shared", None, None)
                 .unwrap();
@@ -1234,8 +1241,10 @@ mod effort_resolution_tests {
         assert!(boolean_status.contains("Supported: false, \"false\".\n"));
         apply_effort_setting(&home.0, &mut config, &EffortSetting::Value(level("false"))).unwrap();
         assert_eq!(config.effort, Some(level("false")));
-        assert!(effort_status(&home.0, &config)
-            .starts_with("Configured effort for two/shared: \"false\"\n"));
+        assert!(
+            effort_status(&home.0, &config)
+                .starts_with("Configured effort for two/shared: \"false\"\n")
+        );
         apply_effort_setting(&home.0, &mut config, &EffortSetting::Default).unwrap();
         assert_eq!(config.effort, Some(EffortValue::Bool(false)));
         let before = format!("{config:?}");
@@ -1248,12 +1257,10 @@ mod effort_resolution_tests {
             let mut config =
                 try_engine_turn_config(&home.0, "one", "https://one.example", model, None, None)
                     .unwrap();
-            assert!(apply_effort_setting(
-                &home.0,
-                &mut config,
-                &EffortSetting::Value(level("high"))
-            )
-            .is_err());
+            assert!(
+                apply_effort_setting(&home.0, &mut config, &EffortSetting::Value(level("high")))
+                    .is_err()
+            );
             apply_effort_setting(&home.0, &mut config, &EffortSetting::Default).unwrap();
             assert!(config.effort.is_none());
             let status = effort_status(&home.0, &config);
@@ -1267,7 +1274,9 @@ mod effort_resolution_tests {
 
     #[test]
     fn different_role_and_route_models_use_their_own_default() {
-        let home = Home::new("[[provider]]\nname='p'\nurl='https://example.test'\n[[provider.models]]\nid='main'\nsupported_efforts=['low','high']\ndefault_effort='low'\n[[provider.models]]\nid='vendor/summary'\nsupported_efforts=['medium']\ndefault_effort='medium'\n[roles]\nmain='p/main'\ncompaction='p/vendor/summary'\nexplore='p/main'\n[routing]\nhard='vendor/summary'\n[routing.keywords]\nclear=true\nhard=['difficult']\n");
+        let home = Home::new(
+            "[[provider]]\nname='p'\nurl='https://example.test'\n[[provider.models]]\nid='main'\nsupported_efforts=['low','high']\ndefault_effort='low'\n[[provider.models]]\nid='vendor/summary'\nsupported_efforts=['medium']\ndefault_effort='medium'\n[roles]\nmain='p/main'\ncompaction='p/vendor/summary'\nexplore='p/main'\n[routing]\nhard='vendor/summary'\n[routing.keywords]\nclear=true\nhard=['difficult']\n",
+        );
         let mut base =
             try_engine_turn_config(&home.0, "p", "https://example.test", "main", None, None)
                 .unwrap();

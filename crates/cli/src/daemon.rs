@@ -6,11 +6,11 @@ use crate::tui_worker::TuiTurnConfig;
 use orbit_adapter::types::{ChatMessage, ChatRole, EffortSetting};
 use orbit_provider_http::CancelToken;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -177,10 +177,10 @@ struct SubscriptionRegistration {
 }
 impl Drop for SubscriptionRegistration {
     fn drop(&mut self) {
-        if let Some(hub) = self.hub.upgrade() {
-            if let Ok(mut hub) = hub.lock() {
-                hub.subscribers.retain(|(id, _)| *id != self.id);
-            }
+        if let Some(hub) = self.hub.upgrade()
+            && let Ok(mut hub) = hub.lock()
+        {
+            hub.subscribers.retain(|(id, _)| *id != self.id);
         }
     }
 }
@@ -749,10 +749,10 @@ fn await_ack(
 }
 impl Drop for ControllerLease {
     fn drop(&mut self) {
-        if let Ok(mut hub) = self.handle.lock() {
-            if hub.controller.as_deref() == Some(&self.token) {
-                hub.controller = None;
-            }
+        if let Ok(mut hub) = self.handle.lock()
+            && hub.controller.as_deref() == Some(&self.token)
+        {
+            hub.controller = None;
         }
     }
 }
@@ -880,15 +880,15 @@ impl OwnerRuntime {
             .spawn(move || {
                 let completion = worker_handle.clone();
                 let result = owner_loop(config, lease, request_store, worker_handle, receiver);
-                if let Err(error) = &result {
-                    if let Ok(mut hub) = completion.lock() {
-                        hub.stopping = true;
-                        hub.snapshot.state = TurnState::Interrupted;
-                        if let Some(cancel) = &hub.cancel {
-                            cancel.cancel();
-                        }
-                        hub.emit("error", json!({"message":error.to_string()}));
+                if let Err(error) = &result
+                    && let Ok(mut hub) = completion.lock()
+                {
+                    hub.stopping = true;
+                    hub.snapshot.state = TurnState::Interrupted;
+                    if let Some(cancel) = &hub.cancel {
+                        cancel.cancel();
                     }
+                    hub.emit("error", json!({"message":error.to_string()}));
                 }
                 result
             })
@@ -1068,7 +1068,7 @@ mod request_storage {
                         session_id: id.into(),
                         current_request: None,
                         requests: BTreeMap::new(),
-                    })
+                    });
                 }
                 Err(failure) => return Err(error(failure)),
             };
@@ -1349,7 +1349,7 @@ fn configure_owned(
         _ => {
             return Err(OwnerError::Invalid(
                 "unsupported configuration action".into(),
-            ))
+            ));
         }
     }
     let turn = configured_turn(&candidate.turn)?;
@@ -1752,10 +1752,11 @@ fn owner_loop(
                     .saturating_add(report.cost_microcents);
             }
             hub.snapshot.messages = visible_messages(&transcript, &hub.masks);
-            if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript) {
-                if scan.claimed_pass && scan.exit_code != 0 {
-                    hub.emit("status",json!({"text":format!("UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",scan.command,scan.exit_code)}));
-                }
+            if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
+                && scan.claimed_pass
+                && scan.exit_code != 0
+            {
+                hub.emit("status",json!({"text":format!("UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",scan.command,scan.exit_code)}));
             }
             hub.snapshot.partial_response.clear();
             hub.snapshot.pending_approvals.clear();
@@ -1934,10 +1935,10 @@ fn execute_owned(
         cx,
     )
     .unwrap_or_else(|error| (json!({"ok":false,"error":error}).to_string(), None));
-    if let Some(change) = change {
-        if let Ok(mut hub) = handle.lock() {
-            hub.emit("file_changed",json!({"path":change.path,"added":change.added,"removed":change.removed,"checkpoint_id":change.checkpoint_id,"hunks":change.hunks}));
-        }
+    if let Some(change) = change
+        && let Ok(mut hub) = handle.lock()
+    {
+        hub.emit("file_changed",json!({"path":change.path,"added":change.added,"removed":change.removed,"checkpoint_id":change.checkpoint_id,"hunks":change.hunks}));
     }
     orbit_engine::ToolRoundResult {
         call_id: call.id.clone(),
@@ -1993,10 +1994,10 @@ mod transport {
     }
     fn private_path(path: &Path) -> Result<(), OwnerError> {
         for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
-            if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
-                if metadata.file_type().is_symlink() {
-                    return Err(OwnerError::Protocol("symlink in endpoint path".into()));
-                }
+            if let Ok(metadata) = std::fs::symlink_metadata(ancestor)
+                && metadata.file_type().is_symlink()
+            {
+                return Err(OwnerError::Protocol("symlink in endpoint path".into()));
             }
         }
         Ok(())
@@ -2399,7 +2400,7 @@ mod transport {
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    continue
+                    continue;
                 }
                 Err(failure) => return Err(error(failure)),
             };

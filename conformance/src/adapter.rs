@@ -214,8 +214,8 @@ fn validate_result_events(events: &[ProviderStreamEvent]) -> String {
 mod tests {
     use super::*;
     use orbit_adapter::adapters::{
-        canonical_success_result, identity, text_capabilities, DeterministicTestV1, MockHttpV1,
-        MockScript,
+        DeterministicTestV1, MockHttpV1, MockScript, canonical_success_result, identity,
+        text_capabilities,
     };
     use orbit_adapter::conformance::canonical_request;
     use orbit_adapter::types::{
@@ -361,7 +361,7 @@ mod tests {
             },
         ];
         let _ = events; // the harness validates the RETURNED events; for a
-                        // negative case we assert via orbit_adapter::stream.
+        // negative case we assert via orbit_adapter::stream.
         let r = route(AdapterKind::MockHttpV1);
         let request = canonical_request(&r, b"conformance input");
         // The negative stream validation is proven by the adapter crate's own

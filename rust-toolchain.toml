@@ -1,5 +1,5 @@
-# v0.2 pinned toolchain (wasmtime 47 requires rust 1.94).
-# The v0.1 release tag remains pinned at 1.88 (rust-version in its Cargo.toml).
+# The current stable compiler is pinned for repeatable development and release builds.
+# Historical release tags retain their original compiler requirements.
 [toolchain]
-channel = "1.94.0"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]

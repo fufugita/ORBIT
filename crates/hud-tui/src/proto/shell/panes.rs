@@ -2,10 +2,10 @@
 //! Context, Review and Agent. Each draws only what the engine has
 //! actually sent; an empty panel shows the prototype's empty state.
 
-use super::canvas::{clip_path, clip_text, mix, text_width, tint, wrap_ranges, Cv, Rgb, Seg};
+use super::canvas::{Cv, Rgb, Seg, clip_path, clip_text, mix, text_width, tint, wrap_ranges};
 use super::convo::kind_of;
 use super::diffrows;
-use super::frame::{badge_themed, empty_state, panel_frame, BadgeState, FrameSpec};
+use super::frame::{BadgeState, FrameSpec, badge_themed, empty_state, panel_frame};
 use super::motion::{ease_out, flash, prog, pulse, secs};
 use super::pal::Palette;
 use crate::proto::layout::View;

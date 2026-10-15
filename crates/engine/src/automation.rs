@@ -40,34 +40,32 @@ pub fn extract_spoken_rules(speech: &str) -> Vec<SpokenRule> {
         // never git push" / "don't push".
         if l.contains("never") || l.contains("don't") || l.contains("do not") {
             // Deny shapes: never <verb-phrase>.
-            if let Some(phrase) = deny_phrase(&l) {
-                if let Some(rule) = phrase_to_rule(&phrase, SpokenEffect::Deny) {
-                    out.push(SpokenRule {
-                        rule,
-                        effect: SpokenEffect::Deny,
-                        source_phrase: line.trim().to_string(),
-                    });
-                }
+            if let Some(phrase) = deny_phrase(&l)
+                && let Some(rule) = phrase_to_rule(&phrase, SpokenEffect::Deny)
+            {
+                out.push(SpokenRule {
+                    rule,
+                    effect: SpokenEffect::Deny,
+                    source_phrase: line.trim().to_string(),
+                });
             }
         }
         // Allow shapes: "run the tests", "you may run cargo test",
         // "feel free to run X". An allow for the same TARGET a deny on
         // this line already covers is dropped (deny wins); different
         // targets on one line both extract ("tests but never push").
-        if let Some(phrase) = allow_phrase(&l) {
-            if let Some(rule) = phrase_to_rule(&phrase, SpokenEffect::Allow) {
-                let denied_same_target = out.iter().any(|r| {
-                    r.effect == SpokenEffect::Deny
-                        && r.source_phrase == line.trim()
-                        && r.rule == rule
+        if let Some(phrase) = allow_phrase(&l)
+            && let Some(rule) = phrase_to_rule(&phrase, SpokenEffect::Allow)
+        {
+            let denied_same_target = out.iter().any(|r| {
+                r.effect == SpokenEffect::Deny && r.source_phrase == line.trim() && r.rule == rule
+            });
+            if !denied_same_target {
+                out.push(SpokenRule {
+                    rule,
+                    effect: SpokenEffect::Allow,
+                    source_phrase: line.trim().to_string(),
                 });
-                if !denied_same_target {
-                    out.push(SpokenRule {
-                        rule,
-                        effect: SpokenEffect::Allow,
-                        source_phrase: line.trim().to_string(),
-                    });
-                }
             }
         }
     }
@@ -181,37 +179,34 @@ pub fn scan_attestation(
         if m.role == ChatRole::Assistant && final_text.is_empty() && !m.content.is_empty() {
             final_text = m.content.to_lowercase();
         }
-        if command.is_none() {
-            if let Some(calls) = m.tool_calls.as_ref() {
-                for c in calls.iter().rev() {
-                    let Ok(a) = serde_json::from_str::<serde_json::Value>(&c.arguments) else {
-                        continue;
-                    };
-                    let Some(cmd) = a.get("command").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let is_test = cmd.contains("cargo test")
-                        || cmd.contains("npm test")
-                        || cmd.contains("pytest")
-                        || cmd.contains("go test")
-                        || cmd.contains("python3 test");
-                    if is_test {
-                        command = Some(cmd.to_string());
-                        // The paired result: the Tool message with this
-                        // call id carries the recorded exit_code.
-                        let id = c.id.clone();
-                        if let Some(tm) = transcript.iter().rev().find(|t| {
-                            t.role == ChatRole::Tool
-                                && t.tool_call_id.as_deref() == Some(id.as_str())
-                        }) {
-                            if let Some(r) = tm.tool_result.as_deref() {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(r) {
-                                    exit_code = v.get("exit_code").and_then(|x| x.as_i64());
-                                }
-                            }
-                        }
-                        break;
+        if command.is_none()
+            && let Some(calls) = m.tool_calls.as_ref()
+        {
+            for c in calls.iter().rev() {
+                let Ok(a) = serde_json::from_str::<serde_json::Value>(&c.arguments) else {
+                    continue;
+                };
+                let Some(cmd) = a.get("command").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let is_test = cmd.contains("cargo test")
+                    || cmd.contains("npm test")
+                    || cmd.contains("pytest")
+                    || cmd.contains("go test")
+                    || cmd.contains("python3 test");
+                if is_test {
+                    command = Some(cmd.to_string());
+                    // The paired result: the Tool message with this
+                    // call id carries the recorded exit_code.
+                    let id = c.id.clone();
+                    if let Some(tm) = transcript.iter().rev().find(|t| {
+                        t.role == ChatRole::Tool && t.tool_call_id.as_deref() == Some(id.as_str())
+                    }) && let Some(r) = tm.tool_result.as_deref()
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(r)
+                    {
+                        exit_code = v.get("exit_code").and_then(|x| x.as_i64());
                     }
+                    break;
                 }
             }
         }
@@ -358,14 +353,12 @@ pub fn ledger_head(home: &Path) -> Option<String> {
     let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
         let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if newest.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
-                        newest = Some((p, modified));
-                    }
-                }
-            }
+        if p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            && let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+            && newest.as_ref().map(|(_, t)| modified > *t).unwrap_or(true)
+        {
+            newest = Some((p, modified));
         }
     }
     let (path, _) = newest?;

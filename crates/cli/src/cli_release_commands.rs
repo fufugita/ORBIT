@@ -2,7 +2,7 @@
 use crate::{
     config, customization, doctor as diagnostics, pentest as engagement, setup as identity,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -93,7 +93,9 @@ pub fn parse_setup(args: &[String]) -> Result<SetupArguments, (&'static str, Str
         || (parsed.guided && (has_provider || parsed.interactive_provider))
         || (parsed.interactive_provider && has_provider)
     {
-        return Err(invalid("choose one of manual provider flags, --guided, --interactive-provider or --no-provider"));
+        return Err(invalid(
+            "choose one of manual provider flags, --guided, --interactive-provider or --no-provider",
+        ));
     }
     if parsed.dry_run && (parsed.guided || parsed.interactive_provider) {
         return Err(invalid(
@@ -376,9 +378,11 @@ pub fn pentest(home: &Path, args: &[String]) -> CommandResult {
                     options.name = Some((*value).clone());
                 }
             }
-            _ => return Err(invalid(
-                "usage: pentest init DIR [--profile standard] [--name NAME] [--dry-run] [--json]",
-            )),
+            _ => {
+                return Err(invalid(
+                    "usage: pentest init DIR [--profile standard] [--name NAME] [--dry-run] [--json]",
+                ));
+            }
         }
         index += 1;
     }

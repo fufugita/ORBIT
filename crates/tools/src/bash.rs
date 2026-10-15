@@ -6,7 +6,7 @@
 //! process group. The read-only allowlist runs without asking in
 //! default mode.
 
-use crate::{finish, Tool, ToolContext, ToolResult};
+use crate::{Tool, ToolContext, ToolResult, finish};
 use serde_json::json;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
@@ -548,13 +548,12 @@ fn pump<R: std::io::Read + Send + 'static>(
                         }
                         b.extend_from_slice(&bytes[..bytes.len().min(room)]);
                     }
-                    if let Some(f) = &file {
-                        if let Ok(mut g) = f.lock() {
-                            if g.1 < FILE_CAP {
-                                let _ = g.0.write_all(bytes);
-                                g.1 += n as u64;
-                            }
-                        }
+                    if let Some(f) = &file
+                        && let Ok(mut g) = f.lock()
+                        && g.1 < FILE_CAP
+                    {
+                        let _ = g.0.write_all(bytes);
+                        g.1 += n as u64;
                     }
                     if sink.is_some() {
                         for &b in bytes {
@@ -623,15 +622,15 @@ impl Tool for TaskStopTool {
         };
         // Kill the whole process group (negative PID) so shell children
         // die with the leader; then drop the record.
-        if let Ok(mut bg) = BACKGROUND.lock() {
-            if let Some(pos) = bg.iter().position(|b| b.id == task_id) {
-                let cmd = bg.remove(pos);
-                let killed = kill_process_group(cmd.pid);
-                return ToolResult::ok(json!({
-                    "ok": killed,
-                    "stopped": task_id,
-                }));
-            }
+        if let Ok(mut bg) = BACKGROUND.lock()
+            && let Some(pos) = bg.iter().position(|b| b.id == task_id)
+        {
+            let cmd = bg.remove(pos);
+            let killed = kill_process_group(cmd.pid);
+            return ToolResult::ok(json!({
+                "ok": killed,
+                "stopped": task_id,
+            }));
         }
         ToolResult::err("no such background task")
     }
@@ -1197,8 +1196,8 @@ mod output_tests {
 #[cfg(test)]
 mod cancel_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn cx() -> (ToolContext, PathBuf) {
         let dir = std::env::temp_dir().join(format!("orbit-cancel-{}", ulid::Ulid::new()));

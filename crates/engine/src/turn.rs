@@ -6,7 +6,7 @@
 //! the turn, the operator cancels, or the round guard fires.
 
 use crate::{
-    assistant_message, dispatch::TurnConfig, user_message, EventSink, ToolExecutor, TurnReport,
+    EventSink, ToolExecutor, TurnReport, assistant_message, dispatch::TurnConfig, user_message,
 };
 use orbit_adapter::types::{ChatMessage, ChatRole};
 use orbit_frontend_protocol::FrontendEvent;
@@ -558,22 +558,22 @@ fn dispatch_with_retry(
         // transcript (never persisted to the session file — it's rebuilt
         // from the enabled set every turn).
         let mut wire_transcript = transcript.to_vec();
-        if let Some(directive) = &options.system_directive {
-            if !directive.is_empty() {
-                wire_transcript.insert(
-                    0,
-                    ChatMessage {
-                        role: ChatRole::System,
-                        content: directive.clone(),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        tool_result: None,
-                        blocks: None,
-                        origin_model: None,
-                        origin_provider: None,
-                    },
-                );
-            }
+        if let Some(directive) = &options.system_directive
+            && !directive.is_empty()
+        {
+            wire_transcript.insert(
+                0,
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: directive.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    tool_result: None,
+                    blocks: None,
+                    origin_model: None,
+                    origin_provider: None,
+                },
+            );
         }
         // Live stream: forward TextDelta bytes to the front-end as
         // protocol events. The observer borrows `events` for the

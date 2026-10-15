@@ -1,0 +1,28 @@
+{
+  "name": "@fufugita/orbit",
+  "version": "0.2.0",
+  "description": "ORBIT terminal and browser agent harness",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "orbit": "bin/orbit.mjs",
+    "orbit-web": "bin/orbit-web.mjs"
+  },
+  "files": ["LICENSE", "bin/", "lib/launcher.mjs", "lib/platform.mjs"],
+  "engines": {"node": "^22.15.0 || >=23.11.0"},
+  "os": ["linux"],
+  "cpu": ["x64", "arm64"],
+  "libc": ["glibc"],
+  "optionalDependencies": {
+    "@fufugita/orbit-linux-x64-gnu": "0.2.0",
+    "@fufugita/orbit-linux-arm64-gnu": "0.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fufugita/ORBIT.git",
+    "directory": "packaging/npm"
+  },
+  "homepage": "https://github.com/fufugita/ORBIT",
+  "bugs": "https://github.com/fufugita/ORBIT/issues",
+  "publishConfig": {"access": "public"}
+}

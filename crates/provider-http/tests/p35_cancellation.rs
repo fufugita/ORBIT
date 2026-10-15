@@ -7,8 +7,8 @@ use orbit_adapter::types::{
     TlsPinPolicy,
 };
 use orbit_provider_http::{AsyncProviderAdapter, CancelToken};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -283,10 +283,12 @@ async fn cancellation_case(kind: Adapter, stage: Stage) {
             .unwrap();
         assert!(!text, "response started before body processing");
         if matches!(stage, Stage::Idle) {
-            assert!(tokio::time::timeout(CANCEL_BUDGET, observed.recv())
-                .await
-                .unwrap()
-                .unwrap());
+            assert!(
+                tokio::time::timeout(CANCEL_BUDGET, observed.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
         }
     } else if matches!(stage, Stage::ErrorBody) {
         // Headers and an incomplete body reached the client, which cannot

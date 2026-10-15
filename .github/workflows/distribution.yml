@@ -1,0 +1,166 @@
+name: distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified npm packages
+        type: boolean
+        default: false
+      channel:
+        description: npm distribution tag
+        type: choice
+        options: [next, latest]
+        default: next
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - crates/**
+      - packaging/npm/**
+      - scripts/package_install_bundle.py
+      - .github/workflows/distribution.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "1"
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: 1.99.0
+
+jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            npm_arch: x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            npm_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    steps:
+      - name: Build prerequisites
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config python3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: distribution-${{ matrix.target }}
+      - name: Build both executables
+        run: cargo build --locked --release --target '${{ matrix.target }}' -p orbit-cli --bin orbit -p orbit-web --bin orbit-web
+      - name: Check native executables
+        run: |
+          target/${{ matrix.target }}/release/orbit --version
+          target/${{ matrix.target }}/release/orbit --help >/dev/null
+      - name: Package actual release bytes
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; p=json.load(sys.stdin)["packages"]; v={x["version"] for x in p if x["name"] in ("orbit-cli","orbit-web")}; assert len(v)==1; print(v.pop())')"
+          python3 scripts/package_install_bundle.py --orbit target/${{ matrix.target }}/release/orbit --orbit-web target/${{ matrix.target }}/release/orbit-web --version "$version" --target '${{ matrix.target }}' --output dist/native
+      - name: Install and run the actual native npm packages
+        shell: bash
+        run: |
+          archives=(dist/native/*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          node packaging/npm/stage.mjs --archive "${archives[0]}" --output dist/native-npm
+          mkdir dist/trial-packs
+          npm pack ./dist/native-npm/orbit-linux-${{ matrix.npm_arch }}-gnu --pack-destination dist/trial-packs
+          npm pack ./dist/native-npm/orbit --pack-destination dist/trial-packs
+          prefix="$(mktemp -d)/prefix"
+          npm install --global --prefix "$prefix" --ignore-scripts --offline --no-audit --no-fund dist/trial-packs/*.tgz
+          "$prefix/bin/orbit" --version
+          "$prefix/bin/orbit" --home "$prefix/home" setup --no-provider --json
+          set +e
+          "$prefix/bin/orbit" --home "$prefix/home" doctor --json >doctor-output.json
+          status=$?
+          set -e
+          test "$status" -eq 1
+          python3 -c 'import json; d=json.load(open("doctor-output.json")); assert d["command"] == "doctor"; r=d["report"]; assert r["ready"] is False; checks={c["id"]:c for c in r["checks"]}; assert checks["identity"]["status"] == "ready"; assert checks["providers"]["status"] == "missing"'
+          set +e
+          "$prefix/bin/orbit-web" --home "$prefix/uninitialized" --no-browser >web-output 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 2
+          grep -q 'not initialized' web-output
+          npm uninstall --global --prefix "$prefix" --ignore-scripts --offline --no-audit --no-fund @fufugita/orbit @fufugita/orbit-linux-${{ matrix.npm_arch }}-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/native/*
+          if-no-files-found: error
+
+  packages:
+    needs: [quality, native]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist/native
+          merge-multiple: true
+      - name: Stage and pack all supported platforms
+        run: |
+          mapfile -t archives < <(find dist/native -maxdepth 1 -name '*.tar.gz' -type f | sort)
+          test "${#archives[@]}" -eq 2
+          node packaging/npm/stage.mjs --archive "${archives[0]}" --archive "${archives[1]}" --output dist/npm
+          mkdir dist/npm-packs
+          for package in orbit-linux-x64-gnu orbit-linux-arm64-gnu orbit; do
+            npm pack "./dist/npm/$package" --pack-destination dist/npm-packs
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm-packs/*.tgz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: packages
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-packages
+          path: packages
+      - name: Publish native packages before the launcher
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CHANNEL: ${{ inputs.channel }}
+        run: |
+          case "$NPM_CHANNEL" in next|latest) ;; *) exit 1 ;; esac
+          for platform in x64 arm64; do
+            files=(packages/fufugita-orbit-linux-"$platform"-gnu-*.tgz)
+            test "${#files[@]}" -eq 1
+            test -f "${files[0]}"
+            npm publish "${files[0]}" --access public --provenance --tag "$NPM_CHANNEL"
+          done
+          files=(packages/fufugita-orbit-[0-9]*.tgz)
+          test "${#files[@]}" -eq 1
+          test -f "${files[0]}"
+          npm publish "${files[0]}" --access public --provenance --tag "$NPM_CHANNEL"

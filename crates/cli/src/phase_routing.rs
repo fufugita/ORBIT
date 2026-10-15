@@ -99,16 +99,15 @@ fn checked_provider(provider: &ProviderConfig) -> Result<(), String> {
     }
     checked_kind(provider)?;
     crate::config::validate_provider_endpoint(&provider.url)?;
-    if let Some(env) = &provider.env {
-        if env.is_empty()
+    if let Some(env) = &provider.env
+        && (env.is_empty()
             || env.len() > 128
             || !env
                 .bytes()
                 .enumerate()
-                .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || i > 0 && b.is_ascii_digit())
-        {
-            return Err("credential reference must be an environment variable name".into());
-        }
+                .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || i > 0 && b.is_ascii_digit()))
+    {
+        return Err("credential reference must be an environment variable name".into());
     }
     if provider.models.len() > 1024 {
         return Err("provider model count exceeds 1024".into());
@@ -122,16 +121,15 @@ fn checked_provider(provider: &ProviderConfig) -> Result<(), String> {
         if model.max_output_tokens == Some(0) || model.context_window == Some(0) {
             return Err("declared model limits must be positive".into());
         }
-        if let Some(sampling) = &model.sampling {
-            if sampling
+        if let Some(sampling) = &model.sampling
+            && (sampling
                 .temperature
                 .is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v))
                 || sampling
                     .top_p
-                    .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
-            {
-                return Err("sampling values are outside their supported range".into());
-            }
+                    .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v)))
+        {
+            return Err("sampling values are outside their supported range".into());
         }
     }
     Ok(())

@@ -1,11 +1,11 @@
 //! Offline, validated, idempotent initialization using ORBIT's existing identity formats.
 use crate::config::{ProviderConfig, ProvidersConfig};
-use crate::customization::{io_error, publish, read_regular, Directory, Error, Lock};
+use crate::customization::{Directory, Error, Lock, io_error, publish, read_regular};
 use ed25519_dalek::{Signer, SigningKey};
 use orbit_ledger::event::SessionStart;
 use orbit_ledger::{LedgerEvent, LedgerWriter};
 use orbit_pib::{PibIdentity, PibRegistry};
-use orbit_trust::manifest::{TrustRootManifestBody, MANIFEST_SCHEMA};
+use orbit_trust::manifest::{MANIFEST_SCHEMA, TrustRootManifestBody};
 use orbit_trust::{RootPublicKey, TrustRootManifest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -274,7 +274,10 @@ fn identity_state(home: &Path) -> Result<bool, Error> {
         return Ok(false);
     }
     if count != 4 {
-        return Err(Error::Invalid(format!("partial identity; missing {}; use setup repair --dry-run; identity is never regenerated",repair_dry_run(home)?.missing.join(", "))));
+        return Err(Error::Invalid(format!(
+            "partial identity; missing {}; use setup repair --dry-run; identity is never regenerated",
+            repair_dry_run(home)?.missing.join(", ")
+        )));
     }
     verify_identity(home)?;
     Ok(true)

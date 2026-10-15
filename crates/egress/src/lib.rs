@@ -302,9 +302,11 @@ mod tests {
                 spki_sha256: "expected".into(),
             }],
         );
-        assert!(broker
-            .check_spki_pin("openai", "us-east-1", "expected")
-            .is_ok());
+        assert!(
+            broker
+                .check_spki_pin("openai", "us-east-1", "expected")
+                .is_ok()
+        );
         assert_eq!(
             broker
                 .check_spki_pin("openai", "us-east-1", "wrong")

@@ -19,7 +19,7 @@
 #![allow(dead_code)] // helpers used only inside #[test] fns
 
 use orbit_ledger::event::{Phase, PhaseTransition};
-use orbit_ledger::{verify_ledger, LedgerError, LedgerWriter};
+use orbit_ledger::{LedgerError, LedgerWriter, verify_ledger};
 use orbit_reactor::{
     CancelOrigin, CancelTarget, CancellationToken, Phase as RPhase, Reactor, ReactorState,
     TerminalState,

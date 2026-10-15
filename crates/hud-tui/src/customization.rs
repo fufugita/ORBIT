@@ -2,14 +2,14 @@
 use crate::proto::{
     layout::{Node, View},
     shell::{
-        canvas::{clip_text, wrap_ranges, Cv},
-        frame::{panel_frame, FocusFx, FrameSpec},
+        canvas::{Cv, clip_text, wrap_ranges},
+        frame::{FocusFx, FrameSpec, panel_frame},
         hits::Click,
     },
 };
 use orbit_frontend_protocol::customization::{
-    CustomizationError, PaneAction, PaneContext, PaneOutput, PaneState, Profile, ProfileHost,
-    ResolvedProfile, Surface, MAX_PANE_LINES, MAX_PANE_OUTPUT_BYTES,
+    CustomizationError, MAX_PANE_LINES, MAX_PANE_OUTPUT_BYTES, PaneAction, PaneContext, PaneOutput,
+    PaneState, Profile, ProfileHost, ResolvedProfile, Surface,
 };
 use ratatui::layout::Rect;
 use std::{collections::BTreeMap, sync::Arc};

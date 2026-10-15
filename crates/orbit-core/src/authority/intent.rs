@@ -219,15 +219,14 @@ pub fn extract_directives(span: &UserTypedSpan) -> Result<Vec<AuthorityDirective
     }
     // E1904: conflicting Grant + Deny on the same dimension.
     for d in &directives {
-        if let AuthorityDirective::Grant { dimension, .. } = d {
-            if directives
+        if let AuthorityDirective::Grant { dimension, .. } = d
+            && directives
                 .iter()
                 .any(|x| matches!(x, AuthorityDirective::Deny { dimension: dd } if dd == dimension))
-            {
-                return Err(AuthorityError::ConflictingDirectives(format!(
-                    "grant and deny on same dimension {dimension:?} (E1904)"
-                )));
-            }
+        {
+            return Err(AuthorityError::ConflictingDirectives(format!(
+                "grant and deny on same dimension {dimension:?} (E1904)"
+            )));
         }
     }
     Ok(directives)

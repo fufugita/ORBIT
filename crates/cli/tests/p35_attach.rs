@@ -168,32 +168,42 @@ fn unix_attach_plain_view_one_prompt_saved_reply_and_bounded_logs() {
     let cursor = client.recovery.cursor.clone();
     let mut output = vec![];
     attach::render_recovery(&client.recovery, &mut output).unwrap();
-    assert!(String::from_utf8(output.clone())
-        .unwrap()
-        .contains("Session owned"));
+    assert!(
+        String::from_utf8(output.clone())
+            .unwrap()
+            .contains("Session owned")
+    );
     client.prompt("attached prompt".into()).unwrap();
     wait_done(&serving.handle());
     assert_eq!(fixture.calls(), 1);
     let recovery = client.logs(Some(&cursor)).unwrap();
-    assert!(recovery
-        .events
-        .iter()
-        .any(|event| event.kind == "request_finished"));
+    assert!(
+        recovery
+            .events
+            .iter()
+            .any(|event| event.kind == "request_finished")
+    );
     attach::render_recovery(&recovery, &mut output).unwrap();
-    assert!(String::from_utf8(output)
-        .unwrap()
-        .contains("owned fixture reply"));
-    assert!(client
-        .snapshot()
-        .unwrap()
-        .messages
-        .iter()
-        .any(|message| message["text"] == "owned fixture reply"));
-    assert!(sessions::load_session(&fixture.root, "owned")
-        .unwrap()
-        .transcript
-        .iter()
-        .any(|message| message.content == "owned fixture reply"));
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("owned fixture reply")
+    );
+    assert!(
+        client
+            .snapshot()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message["text"] == "owned fixture reply")
+    );
+    assert!(
+        sessions::load_session(&fixture.root, "owned")
+            .unwrap()
+            .transcript
+            .iter()
+            .any(|message| message.content == "owned fixture reply")
+    );
 }
 
 #[test]
@@ -322,12 +332,14 @@ fn unix_attach_plain_invalid_effort_preserves_owner_and_saved_settings() {
     let fixture = Fixture::new();
     let serving = fixture.serve();
     let before = fs::read(fixture.root.join("sessions/owned.json")).unwrap();
-    assert!(attach::run_with_io(
-        &fixture.socket(),
-        &mut Cursor::new(b"/effort high\n"),
-        &mut vec![]
-    )
-    .is_err());
+    assert!(
+        attach::run_with_io(
+            &fixture.socket(),
+            &mut Cursor::new(b"/effort high\n"),
+            &mut vec![]
+        )
+        .is_err()
+    );
     let snapshot = serving.handle().snapshot().unwrap();
     assert!(snapshot.effort.is_none());
     assert_eq!(snapshot.model, "model-a");
@@ -369,11 +381,13 @@ fn unix_attach_plain_lists_render_actual_model_and_saved_session_data() {
             .unwrap(),
     )
     .unwrap();
-    assert!(sessions["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|session| session["session_id"] == "owned" && session["model"] == "model-a"));
+    assert!(
+        sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["session_id"] == "owned" && session["model"] == "model-a")
+    );
     assert_eq!(fixture.calls(), 0);
 }
 
@@ -478,12 +492,14 @@ fn unix_attach_partial_stream_cancel_preserves_text_and_reports_interruption() {
         daemon::RequestState::Interrupted
     );
     let recovery = client.refresh().unwrap();
-    assert!(recovery
-        .events
-        .iter()
-        .any(|event| event.kind == "turn_ended"
-            && event.payload["ok"] == false
-            && event.payload["interrupted"] == true));
+    assert!(
+        recovery
+            .events
+            .iter()
+            .any(|event| event.kind == "turn_ended"
+                && event.payload["ok"] == false
+                && event.payload["interrupted"] == true)
+    );
     let saved = sessions::load_session(&fixture.root, "owned").unwrap();
     let partial = saved
         .transcript
@@ -651,16 +667,20 @@ fn unix_attach_truncated_then_delayed_ack_poisons_stream_and_reconnects_without_
         request_id: "uncertain-ack".into(),
         text: "one accepted prompt".into(),
     };
-    assert!(client
-        .send(action())
-        .unwrap_err()
-        .to_string()
-        .contains("outcome is unknown"));
-    assert!(client
-        .send(OwnerAction::Cancel)
-        .unwrap_err()
-        .to_string()
-        .contains("reconnect explicitly"));
+    assert!(
+        client
+            .send(action())
+            .unwrap_err()
+            .to_string()
+            .contains("outcome is unknown")
+    );
+    assert!(
+        client
+            .send(OwnerAction::Cancel)
+            .unwrap_err()
+            .to_string()
+            .contains("reconnect explicitly")
+    );
     assert!(client.snapshot().is_err());
     fixture.wait_calls(1);
     let until = Instant::now() + Duration::from_secs(3);

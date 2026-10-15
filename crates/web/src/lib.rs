@@ -4,33 +4,33 @@
 #![deny(unsafe_code)]
 
 use axum::{
+    Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::get,
-    Router,
 };
 use futures::StreamExt;
 use orbit_cli::daemon::{ControllerLease, EventCursor, OwnerAction, OwnerHandle, OwnerSnapshot};
 use rust_embed::RustEmbed;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 use tokio::sync::broadcast;
 
 pub mod customization;
 mod turn;
-pub use turn::{run_bridge, run_bridge_owned, run_bridge_owned_with_customization, BridgeConfig};
+pub use turn::{BridgeConfig, run_bridge, run_bridge_owned, run_bridge_owned_with_customization};
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
@@ -137,10 +137,10 @@ impl BridgeState {
         if self.owner.is_some() {
             return;
         }
-        if kind == "identity" {
-            if let Ok(mut identity) = self.fixture_identity.lock() {
-                *identity = Some(payload.clone());
-            }
+        if kind == "identity"
+            && let Ok(mut identity) = self.fixture_identity.lock()
+        {
+            *identity = Some(payload.clone());
         }
         let _ = self.fixture_events.send(BridgeEvent {
             kind: kind.into(),
@@ -251,10 +251,10 @@ impl BridgeController {
         // obey the same strict frame contract as variants carrying fields.
         let canonical = serde_json::to_value(&action)
             .map_err(|error| format!("invalid browser action: {error}"))?;
-        if let (Some(input), Some(expected)) = (value.as_object(), canonical.as_object()) {
-            if input.keys().any(|key| !expected.contains_key(key)) {
-                return Err("invalid browser action: unexpected field".into());
-            }
+        if let (Some(input), Some(expected)) = (value.as_object(), canonical.as_object())
+            && input.keys().any(|key| !expected.contains_key(key))
+        {
+            return Err("invalid browser action: unexpected field".into());
         }
         let ack = self.lease.send(action).map_err(|error| error.to_string())?;
         let snapshot = self.owner.snapshot().map_err(|error| error.to_string())?;
@@ -432,7 +432,7 @@ async fn sse_events(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "event subscriber limit reached",
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         let frames = recovery_frames(subscription.recovery.clone());

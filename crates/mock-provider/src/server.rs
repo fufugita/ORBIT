@@ -5,14 +5,14 @@
 //! the homelab or in-process for the conformance tests.
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
-    Json, Router,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -583,8 +583,8 @@ fn ollama_success() -> String {
 }
 
 /// Spawn on `127.0.0.1:0` and return the assigned address + shutdown handle.
-pub async fn spawn(
-) -> Result<(SocketAddr, ServerState, tokio::task::JoinHandle<()>), std::io::Error> {
+pub async fn spawn()
+-> Result<(SocketAddr, ServerState, tokio::task::JoinHandle<()>), std::io::Error> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let state = ServerState::default();

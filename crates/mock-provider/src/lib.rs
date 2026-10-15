@@ -8,7 +8,7 @@
 
 pub mod server;
 
-pub use server::{router, spawn, ServerConfig, ServerState};
+pub use server::{ServerConfig, ServerState, router, spawn};
 
 /// Scriptable behavior for a mock endpoint.
 #[derive(Debug, Clone, Default)]

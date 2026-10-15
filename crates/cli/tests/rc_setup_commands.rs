@@ -98,11 +98,13 @@ fn command_duplicate_option_fails_before_home_creation() {
 #[test]
 fn command_partial_provider_arguments_fail_before_home_creation() {
     let f = Fixture::new();
-    assert!(commands::init(
-        &f.home,
-        &args(&["--provider", "fixture", "--gate", "http://127.0.0.1:9"])
-    )
-    .is_err());
+    assert!(
+        commands::init(
+            &f.home,
+            &args(&["--provider", "fixture", "--gate", "http://127.0.0.1:9"])
+        )
+        .is_err()
+    );
     assert!(!f.home.exists());
 }
 #[test]
@@ -262,17 +264,21 @@ fn command_pentest_status_counts_real_files_without_initializing_home() {
 #[test]
 fn command_pentest_invalid_complete_request_cannot_create_destination() {
     let f = Fixture::new();
-    assert!(commands::pentest(
-        &f.home,
-        &args(&["init", f.work.to_str().unwrap(), "--profile", "unknown"])
-    )
-    .is_err());
+    assert!(
+        commands::pentest(
+            &f.home,
+            &args(&["init", f.work.to_str().unwrap(), "--profile", "unknown"])
+        )
+        .is_err()
+    );
     assert!(!f.work.exists());
-    assert!(commands::pentest(
-        &f.home,
-        &args(&["init", f.work.to_str().unwrap(), "--unknown"])
-    )
-    .is_err());
+    assert!(
+        commands::pentest(
+            &f.home,
+            &args(&["init", f.work.to_str().unwrap(), "--unknown"])
+        )
+        .is_err()
+    );
     assert!(!f.work.exists());
 }
 
@@ -337,9 +343,11 @@ fn command_mod_malformed_enabled_metadata_never_enables_defaults_or_changes_byte
     let loaded = mods::load_all(&f.home);
     assert!(mods::initial_enabled(&f.home, &loaded).is_empty());
     assert!(mods::read_enabled_checked(&f.home).is_err());
-    assert!(mods::read_enabled_checked(&f.home)
-        .unwrap_err()
-        .contains("metadata is malformed"));
+    assert!(
+        mods::read_enabled_checked(&f.home)
+            .unwrap_err()
+            .contains("metadata is malformed")
+    );
     assert!(mods::validation_status(&f.home).is_err());
     assert!(mods::toggle(&f.home, &loaded, "fixture").is_err());
     assert!(mods::write_enabled(&f.home, &mods::EnabledSet::default()).is_err());
@@ -374,10 +382,12 @@ fn command_mod_legacy_public_enabled_file_is_replaced_privately_and_atomically()
             .enabled,
         vec!["fixture"]
     );
-    assert!(!std::fs::read_dir(f.home.join("mods"))
-        .unwrap()
-        .flatten()
-        .any(|e| e.file_name().to_string_lossy().starts_with(".enabled-")));
+    assert!(
+        !std::fs::read_dir(f.home.join("mods"))
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".enabled-"))
+    );
 }
 #[test]
 fn command_mod_toggle_respects_real_default_state() {
@@ -402,13 +412,15 @@ fn command_mod_lock_contention_preserves_enabled_bytes() {
         .open(f.home.join("mods/.enabled.lock"))
         .unwrap();
     lock.try_lock().unwrap();
-    assert!(mods::write_enabled(
-        &f.home,
-        &mods::EnabledSet {
-            enabled: vec!["fixture".into()]
-        }
-    )
-    .is_err());
+    assert!(
+        mods::write_enabled(
+            &f.home,
+            &mods::EnabledSet {
+                enabled: vec!["fixture".into()]
+            }
+        )
+        .is_err()
+    );
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
 #[test]
@@ -419,13 +431,15 @@ fn command_mod_enabled_symlink_is_refused_without_touching_target() {
     let outside = f.root.join("outside");
     std::fs::write(&outside, b"{\"enabled\":[]}").unwrap();
     symlink(&outside, f.home.join("mods/enabled.json")).unwrap();
-    assert!(mods::write_enabled(
-        &f.home,
-        &mods::EnabledSet {
-            enabled: vec!["fixture".into()]
-        }
-    )
-    .is_err());
+    assert!(
+        mods::write_enabled(
+            &f.home,
+            &mods::EnabledSet {
+                enabled: vec!["fixture".into()]
+            }
+        )
+        .is_err()
+    );
     assert_eq!(std::fs::read(outside).unwrap(), b"{\"enabled\":[]}");
 }
 #[test]
@@ -458,13 +472,15 @@ fn command_mod_invalid_command_utf8_is_reported_and_never_loaded() {
 fn command_mod_duplicate_enabled_names_are_rejected_before_publishing() {
     let f = Fixture::new();
     make_bundle(&f, "fixture", false);
-    assert!(mods::write_enabled(
-        &f.home,
-        &mods::EnabledSet {
-            enabled: vec!["fixture".into(), "fixture".into()]
-        }
-    )
-    .is_err());
+    assert!(
+        mods::write_enabled(
+            &f.home,
+            &mods::EnabledSet {
+                enabled: vec!["fixture".into(), "fixture".into()]
+            }
+        )
+        .is_err()
+    );
     assert!(!f.home.join("mods/enabled.json").exists());
 }
 #[test]
@@ -483,9 +499,11 @@ fn command_engagement_real_project_loaders_require_explicit_folder_trust() {
     let trust = orbit_tools::permissions::FolderTrust::new(f.home.clone());
     assert!(!trust.is_trusted(&f.work));
     assert!(orbit_engine::skills::load_skills(&f.home, false).is_empty());
-    assert!(!orbit_engine::skills::load_agents(&f.home, false)
-        .iter()
-        .any(|a| a.name == "triage"));
+    assert!(
+        !orbit_engine::skills::load_agents(&f.home, false)
+            .iter()
+            .any(|a| a.name == "triage")
+    );
     trust.trust(&f.work).unwrap();
     let trusted = trust.is_trusted(&f.work);
     assert!(trusted);

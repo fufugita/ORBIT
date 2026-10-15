@@ -20,12 +20,12 @@ pub fn validate_record(record: &LedgerRecord, prev: &str) -> Result<String, Ledg
     let self_hash = record
         .compute_self_hash()
         .map_err(|e| LedgerError::VerifyFailed(e.to_string()))?;
-    if let Some(stored) = &record.ledger_hash_self {
-        if stored != &self_hash {
-            return Err(LedgerError::VerifyFailed(format!(
-                "self hash mismatch: stored {stored}, computed {self_hash}"
-            )));
-        }
+    if let Some(stored) = &record.ledger_hash_self
+        && stored != &self_hash
+    {
+        return Err(LedgerError::VerifyFailed(format!(
+            "self hash mismatch: stored {stored}, computed {self_hash}"
+        )));
     }
     Ok(self_hash)
 }
@@ -38,10 +38,10 @@ pub fn verify_ledger(dir: &Path) -> Result<(Vec<ReadRecord>, String), LedgerErro
     if let Ok(rd) = std::fs::read_dir(&segments_dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(hexpart) = name.strip_suffix(".log") {
-                if let Ok(n) = u64::from_str_radix(hexpart, 16) {
-                    ordinals.push(n);
-                }
+            if let Some(hexpart) = name.strip_suffix(".log")
+                && let Ok(n) = u64::from_str_radix(hexpart, 16)
+            {
+                ordinals.push(n);
             }
         }
     }
@@ -127,10 +127,10 @@ pub fn recover_head(segments_dir: &Path) -> Result<String, LedgerError> {
     if let Ok(rd) = std::fs::read_dir(segments_dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(hexpart) = name.strip_suffix(".log") {
-                if let Ok(n) = u64::from_str_radix(hexpart, 16) {
-                    ordinals.push(n);
-                }
+            if let Some(hexpart) = name.strip_suffix(".log")
+                && let Ok(n) = u64::from_str_radix(hexpart, 16)
+            {
+                ordinals.push(n);
             }
         }
     }

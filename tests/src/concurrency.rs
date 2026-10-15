@@ -6,7 +6,7 @@
 
 use orbit_ledger::event::Phase as LedgerPhase;
 use orbit_ledger::event::{LedgerEvent, PhaseTransition};
-use orbit_ledger::{verify_ledger, LedgerWriter};
+use orbit_ledger::{LedgerWriter, verify_ledger};
 use orbit_reactor::{CancelOrigin, CancelTarget, CancellationToken, Reactor};
 use std::path::PathBuf;
 

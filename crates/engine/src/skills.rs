@@ -63,10 +63,10 @@ pub fn load_skills(home: &Path, project_trusted: bool) -> Vec<Skill> {
         };
         for entry in entries.flatten() {
             let skill_md = entry.path().join("SKILL.md");
-            if let Ok(text) = std::fs::read_to_string(&skill_md) {
-                if let Some(skill) = parse_skill_md(&text) {
-                    out.push(skill);
-                }
+            if let Ok(text) = std::fs::read_to_string(&skill_md)
+                && let Some(skill) = parse_skill_md(&text)
+            {
+                out.push(skill);
             }
         }
     }
@@ -209,12 +209,11 @@ pub fn load_agents(home: &Path, project_trusted: bool) -> Vec<AgentDef> {
             continue;
         };
         for entry in entries.flatten() {
-            if entry.path().extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                    if let Some(def) = parse_agent_md(&text) {
-                        out.push(def);
-                    }
-                }
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("md")
+                && let Ok(text) = std::fs::read_to_string(entry.path())
+                && let Some(def) = parse_agent_md(&text)
+            {
+                out.push(def);
             }
         }
     }

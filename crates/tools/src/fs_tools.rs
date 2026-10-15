@@ -4,7 +4,7 @@
 //! (hash match) so the model cannot blind-edit. All results pass the
 //! secret scanner at the boundary.
 
-use crate::{glob_match, is_deny_read, resolve_path, Tool, ToolContext, ToolResult};
+use crate::{Tool, ToolContext, ToolResult, glob_match, is_deny_read, resolve_path};
 use serde_json::json;
 use std::path::Path;
 
@@ -614,10 +614,10 @@ impl Tool for GrepTool {
                 if matches.len() >= head_limit || file_count >= FILE_LIMIT {
                     return false;
                 }
-                if let Some(g) = glob_filter {
-                    if !glob_path_match(g, &p.to_string_lossy()) {
-                        return true;
-                    }
+                if let Some(g) = glob_filter
+                    && !glob_path_match(g, &p.to_string_lossy())
+                {
+                    return true;
                 }
                 file_count += 1;
                 if !is_deny_read(p) {
@@ -829,10 +829,10 @@ pub mod simple_regex {
                     return true;
                 }
                 let mut it = rest.chars();
-                if let Some(ch) = it.next() {
-                    if piece_matches_one(inner, ch) {
-                        return rec(&seq[1..], &rest[ch.len_utf8()..]);
-                    }
+                if let Some(ch) = it.next()
+                    && piece_matches_one(inner, ch)
+                {
+                    return rec(&seq[1..], &rest[ch.len_utf8()..]);
                 }
                 false
             }
@@ -870,10 +870,11 @@ pub mod simple_regex {
                 }
             } else if cs.peek() == Some(&'-') {
                 cs.next();
-                if let Some(hi) = cs.next() {
-                    if c <= ch && ch <= hi {
-                        hit = true;
-                    }
+                if let Some(hi) = cs.next()
+                    && c <= ch
+                    && ch <= hi
+                {
+                    hit = true;
                 }
             } else if c == ch {
                 hit = true;

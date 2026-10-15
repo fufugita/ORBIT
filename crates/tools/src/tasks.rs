@@ -167,10 +167,10 @@ impl Tool for TaskUpdateTool {
             .get("status")
             .and_then(|v| v.as_str())
             .map(String::from);
-        if let Some(s) = &status {
-            if !matches!(s.as_str(), "pending" | "in_progress" | "done") {
-                return ToolResult::err("status must be pending, in_progress or done");
-            }
+        if let Some(s) = &status
+            && !matches!(s.as_str(), "pending" | "in_progress" | "done")
+        {
+            return ToolResult::err("status must be pending, in_progress or done");
         }
         let title = args.get("title").and_then(|v| v.as_str()).map(String::from);
         let detail = args
@@ -284,11 +284,12 @@ mod tests {
         let c2 = ToolContext::new(home.clone(), "test-session".into(), home.clone());
         let r = TaskListTool.run(&serde_json::json!({}), &c2);
         let p: serde_json::Value = serde_json::from_str(&r.payload).unwrap();
-        assert!(p
-            .get("rendered")
-            .and_then(|v| v.as_str())
-            .unwrap()
-            .contains("ship it"));
+        assert!(
+            p.get("rendered")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .contains("ship it")
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }

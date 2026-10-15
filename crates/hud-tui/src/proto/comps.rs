@@ -5,8 +5,8 @@
 //! the panels compose these. Under reduced motion every animation
 //! collapses to its end state (the caller passes the end tick).
 
-use super::anim::{pulse, Anim, Curve};
-use super::core::{glyphs, Token};
+use super::anim::{Anim, Curve, pulse};
+use super::core::{Token, glyphs};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -49,10 +49,10 @@ pub fn fresh_ink_style_themed(
     }
     let a = Anim::new(arrived_ms, 450, Curve::EaseOut);
     let p = a.progress(now_ms); // 0 → 1
-                                // lerp white(0xEE) → ink(0xEE)… actually bright → ink: near-white
-                                // (0xFF-ish) to ink (0xEE,0xEA,0xF5) is subtle; the design means
-                                // bright white → normal ink, i.e. bold-white → ink. Use the ink
-                                // channel lerp from white.
+    // lerp white(0xEE) → ink(0xEE)… actually bright → ink: near-white
+    // (0xFF-ish) to ink (0xEE,0xEA,0xF5) is subtle; the design means
+    // bright white → normal ink, i.e. bold-white → ink. Use the ink
+    // channel lerp from white.
     let (ir, ig, ib) = colors.token(Token::Ink);
     let (r, g, b) = (lerp(0xFF, ir, p), lerp(0xFF, ig, p), lerp(0xFF, ib, p));
     Style::default().fg(Color::Rgb(r, g, b))

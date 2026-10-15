@@ -123,14 +123,16 @@ fn effort_reaches_every_dispatch_and_reset_omits_it() {
         "fixture",
     )
     .unwrap();
-    assert!(state
-        .last_body
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .get("reasoning_effort")
-        .is_none());
+    assert!(
+        state
+            .last_body
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get("reasoning_effort")
+            .is_none()
+    );
     assert_eq!(state.requests.load(std::sync::atomic::Ordering::SeqCst), 3);
     stop.send(()).unwrap();
     worker.join().unwrap();

@@ -9,11 +9,11 @@
 //! - GW-23: TLS with SPKI pin (via `tls::client_config`).
 //! - Sampling serialized as provider floats ONLY at the wire boundary.
 
+use crate::AsyncProviderAdapter;
 use crate::cancel::CancelToken;
 use crate::error::TransportError;
 use crate::sse::SseParser;
 use crate::stream::AsyncProviderEventStream;
-use crate::AsyncProviderAdapter;
 use futures::StreamExt;
 use orbit_adapter::credential::SecretBytes;
 use orbit_adapter::error::AdapterError;
@@ -212,9 +212,9 @@ impl OpenAiCompatibleHttpV1 {
 /// Consume the OpenAI SSE byte stream and emit `ProviderStreamEvent`s.
 fn openai_stream(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
-        + Unpin
-        + Send
-        + 'static,
+    + Unpin
+    + Send
+    + 'static,
     first_byte_timeout_ms: u64,
     idle_timeout_ms: u64,
     cancel: CancelToken,
@@ -312,8 +312,8 @@ fn openai_stream(
                             });
                             seq += 1;
                         }
-                        if let Some(args) = call.pointer("/function/arguments").and_then(|v| v.as_str()) {
-                            if !args.is_empty() {
+                        if let Some(args) = call.pointer("/function/arguments").and_then(|v| v.as_str())
+                            && !args.is_empty() {
                                 yield Ok(ProviderStreamEvent {
                                     sequence: seq,
                                     event: ProviderEventKind::ToolCallArgumentsDelta {
@@ -323,7 +323,6 @@ fn openai_stream(
                                 });
                                 seq += 1;
                             }
-                        }
                     }
                 }
                 if let Some(reason) = json.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) {

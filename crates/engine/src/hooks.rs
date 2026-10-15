@@ -112,10 +112,8 @@ impl Hooks {
             hooks.extend(parse_hooks_toml(&text));
         }
         // Project scope (trusted only).
-        if project_trusted {
-            if let Ok(text) = std::fs::read_to_string(".orbit/settings.toml") {
-                hooks.extend(parse_hooks_toml(&text));
-            }
+        if project_trusted && let Ok(text) = std::fs::read_to_string(".orbit/settings.toml") {
+            hooks.extend(parse_hooks_toml(&text));
         }
         Hooks {
             hooks,
@@ -165,7 +163,7 @@ fn run_hook(cfg: &HookConfig, payload: &serde_json::Value) -> HookOutcome {
                 exit_code: -1,
                 stderr: format!("hook spawn failed: {e}"),
                 decision: None,
-            }
+            };
         }
     };
     if let Some(mut stdin) = child.stdin.take() {
@@ -229,10 +227,12 @@ fn parse_hooks_toml(text: &str) -> Vec<HookConfig> {
         }
         if line.starts_with('[') {
             // leaving the hooks table
-            if let Some(c) = current.take() {
-                if in_hooks && !c.event.is_empty() && !c.command.is_empty() {
-                    out.push(c);
-                }
+            if let Some(c) = current.take()
+                && in_hooks
+                && !c.event.is_empty()
+                && !c.command.is_empty()
+            {
+                out.push(c);
             }
             in_hooks = false;
             continue;
@@ -253,10 +253,11 @@ fn parse_hooks_toml(text: &str) -> Vec<HookConfig> {
             }
         }
     }
-    if let Some(c) = current.take() {
-        if !c.event.is_empty() && !c.command.is_empty() {
-            out.push(c);
-        }
+    if let Some(c) = current.take()
+        && !c.event.is_empty()
+        && !c.command.is_empty()
+    {
+        out.push(c);
     }
     out
 }

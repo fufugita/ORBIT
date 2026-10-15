@@ -237,12 +237,14 @@ mod tests {
     #[test]
     fn window_is_hard_ceiling() {
         let mut t = SegmentTable::with_window(10);
-        assert!(t
-            .write_segment(seg("a", SegmentKind::HighPriority, 0), 6)
-            .is_ok());
-        assert!(t
-            .write_segment(seg("b", SegmentKind::HighPriority, 0), 6)
-            .is_err());
+        assert!(
+            t.write_segment(seg("a", SegmentKind::HighPriority, 0), 6)
+                .is_ok()
+        );
+        assert!(
+            t.write_segment(seg("b", SegmentKind::HighPriority, 0), 6)
+                .is_err()
+        );
     }
 
     #[test]

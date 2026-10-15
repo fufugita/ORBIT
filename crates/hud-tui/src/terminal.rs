@@ -45,10 +45,10 @@ use crossterm::cursor::{Hide, Show};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -220,7 +220,7 @@ impl TerminalWatchdog {
     }
 
     fn run(input: &std::io::Stdin) {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
         loop {
             let mut fds = [PollFd::new(input, PollFlags::empty())];
             let timeout = Timespec {

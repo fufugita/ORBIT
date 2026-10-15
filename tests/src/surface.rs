@@ -1,8 +1,8 @@
 //! DR-03 §5b — HUD + CLI + DIST surface tests (exact seeded names).
 #![allow(unused_imports)] // used only in #[test] fns
 
-use orbit_cli::{check_telemetry, parse_args, resolve_config, CliOutput, ConfigLayer, ExecMode};
-use orbit_hud::{display_safe, BrandTier, Env, Hud, HudEvent, OutputMode};
+use orbit_cli::{CliOutput, ConfigLayer, ExecMode, check_telemetry, parse_args, resolve_config};
+use orbit_hud::{BrandTier, Env, Hud, HudEvent, OutputMode, display_safe};
 
 // ── ORBIT-F-HUD-004: env negotiation ──────────────────────────────
 
@@ -466,18 +466,22 @@ fn dist_static_musl_binary() {
 #[test]
 fn dist_wasi_runtime_vendored() {
     // WASI runtime is vendored (DR-13 §2); the plugin host is the only entry.
-    assert!(orbit_plugin::WasiHostAllowlist::canonical()
-        .validate(&["wasi:http/proxy".into()])
-        .is_ok());
+    assert!(
+        orbit_plugin::WasiHostAllowlist::canonical()
+            .validate(&["wasi:http/proxy".into()])
+            .is_ok()
+    );
 }
 
 #[test]
 fn dist_clean_machine_install_verify() {
     // Proven separately by scripts/e2e-clean-machine.sh (row 9); this records
     // the evidence file exists.
-    assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../evidence/v0.1/demo-transcript.md")
-        .exists());
+    assert!(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../evidence/v0.1/demo-transcript.md")
+            .exists()
+    );
 }
 
 #[test]

@@ -1,10 +1,10 @@
 #![cfg(unix)]
 
 use orbit_cli::tool_runtime::{
-    execute_call, permission_command, ApprovalChannel, ApprovalRequest, ApprovalVerdict,
-    AutoGrants, PermissionScope,
+    ApprovalChannel, ApprovalRequest, ApprovalVerdict, AutoGrants, PermissionScope, execute_call,
+    permission_command,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 const TOOLS: [&str; 4] = [
@@ -160,10 +160,12 @@ fn navigation_policy_allowed_navigation_and_snapshot_are_real_scanned_calls() {
     let snapshot = f.call("browser_snapshot", json!({}), &mut answer, false);
     assert_eq!(snapshot["ok"], true, "{snapshot}");
     assert!(snapshot["result"].as_str().unwrap().contains("Count: 0"));
-    assert!(snapshot["result"]
-        .as_str()
-        .unwrap()
-        .contains("Untrusted page text"));
+    assert!(
+        snapshot["result"]
+            .as_str()
+            .unwrap()
+            .contains("Untrusted page text")
+    );
     assert!(!snapshot.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
     assert!(snapshot["redactions"].as_u64().unwrap() >= 2);
     let requests = f.requests();
@@ -310,10 +312,12 @@ fn browser_close_releases_page_and_later_snapshot_reports_real_error() {
     let snapshot = f.call("browser_snapshot", json!({}), &mut answer, false);
     assert_eq!(snapshot["ok"], false, "{snapshot}");
     assert_eq!(snapshot["result_error"], true);
-    assert!(snapshot["result"]
-        .as_str()
-        .unwrap()
-        .contains("no open page"));
+    assert!(
+        snapshot["result"]
+            .as_str()
+            .unwrap()
+            .contains("no open page")
+    );
     let state: Value =
         serde_json::from_slice(&std::fs::read(f.home.join("state.json")).unwrap()).unwrap();
     assert_eq!(state["closed"], true);

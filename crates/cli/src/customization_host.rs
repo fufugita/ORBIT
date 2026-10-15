@@ -2,8 +2,8 @@
 use crate::customization::{Error, LocalProfileHost};
 use crate::tool_runtime::PermissionScope;
 use orbit_frontend_protocol::customization::{
-    PaneContext, PaneOutput, Profile, ProfileCommand, ProfileCommandResult, ProfileHost,
-    ResolvedProfile, MAX_PROFILE_BYTES,
+    MAX_PROFILE_BYTES, PaneContext, PaneOutput, Profile, ProfileCommand, ProfileCommandResult,
+    ProfileHost, ResolvedProfile,
 };
 use std::path::Path;
 use std::sync::Arc;

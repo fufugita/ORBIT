@@ -207,9 +207,9 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
 
 fn ollama_stream(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
-        + Unpin
-        + Send
-        + 'static,
+    + Unpin
+    + Send
+    + 'static,
     first_byte_timeout_ms: u64,
     idle_timeout_ms: u64,
     cancel: CancelToken,
@@ -246,9 +246,8 @@ fn ollama_stream(
             while let Some(pos)=buffer.iter().position(|b|*b==b'\n') {
                 let line:Vec<u8>=buffer.drain(..=pos).collect();
                 let v:serde_json::Value=match serde_json::from_slice(&line){Ok(v)=>v,Err(_)=>continue};
-                if let Some(text)=v.pointer("/message/content").and_then(|x|x.as_str()){
-                    if !text.is_empty(){yield Ok(ProviderStreamEvent{sequence:seq,event:ProviderEventKind::TextDelta{bytes:text.as_bytes().to_vec()}});seq+=1;}
-                }
+                if let Some(text)=v.pointer("/message/content").and_then(|x|x.as_str())
+                    && !text.is_empty(){yield Ok(ProviderStreamEvent{sequence:seq,event:ProviderEventKind::TextDelta{bytes:text.as_bytes().to_vec()}});seq+=1;}
                 if v.get("done").and_then(|x|x.as_bool())==Some(true){
                     usage.input_tokens=v.get("prompt_eval_count").and_then(|x|x.as_u64()).unwrap_or(0);
                     usage.output_tokens=v.get("eval_count").and_then(|x|x.as_u64()).unwrap_or(0);

@@ -35,7 +35,7 @@ For a source build, provide the checkout and its version explicitly:
 bash install.sh --method source --source . --version 0.2.0 --dir "$HOME/.local/bin"
 ```
 
-Source mode requires the pinned Rust 1.94 toolchain and `Cargo.lock`. It builds
+Source mode requires the pinned Rust 1.99 toolchain and `Cargo.lock`. It builds
 both executables with locked dependencies. Add the chosen destination to `PATH`,
 then check `orbit --version` and `orbit --help` from outside the checkout.
 
@@ -106,3 +106,60 @@ checks make readiness fail; optional unavailable integrations remain visible.
 
 See [customization](customization.md), [pentest workspaces](pentest.md), and the
 [first real-provider trial](provider-acceptance.md) for the next steps.
+
+## Package distribution
+
+Homebrew uses the existing repository as an explicit tap. This is a Linux-only
+source formula; `--HEAD` selects main until a stable source release is declared.
+It installs Rust as a build dependency and installs both `orbit` and `orbit-web`.
+
+```sh
+brew tap fufugita/orbit https://github.com/fufugita/ORBIT.git
+brew install --HEAD fufugita/orbit/orbit
+brew upgrade --fetch-HEAD fufugita/orbit/orbit
+brew uninstall fufugita/orbit/orbit
+```
+
+For npm, the launcher package is `@fufugita/orbit`. Exact-version optional
+packages supply both native executables on Linux x64 or arm64 with glibc 2.35+.
+Node.js must provide `process.execve` (22.15+ or 23.11+). Other platforms,
+including musl Linux, receive an explicit unsupported-platform message. Enable
+optional dependencies; `--omit=optional` omits the native executable package.
+No lifecycle script downloads code or modifies your configuration.
+
+After publication, install the candidate with:
+
+```sh
+npm install --global --include=optional @fufugita/orbit@next
+npm uninstall --global @fufugita/orbit
+```
+
+Registry installation requires an actually published version. A local archive
+can be tested without publishing or changing the system prefix:
+
+```sh
+node packaging/npm/stage.mjs --archive path/to/orbit-0.2.0-x86_64-unknown-linux-gnu.tar.gz --output dist/npm
+mkdir -p dist/npm-packs
+npm pack ./dist/npm/orbit-linux-x64-gnu --pack-destination dist/npm-packs
+npm pack ./dist/npm/orbit --pack-destination dist/npm-packs
+npm install --global --prefix /tmp/orbit-npm-trial --ignore-scripts --offline --no-audit --no-fund dist/npm-packs/*.tgz
+/tmp/orbit-npm-trial/bin/orbit --version
+```
+
+Supply each archive's adjacent `.sha256` file. Staging checks the archive,
+manifest, both executable hashes and ELF architecture before writing packages.
+The archive is unsigned; these checks establish integrity, not publisher identity.
+Local staging permits one architecture; public publication must include both.
+
+The `distribution` GitHub workflow builds both native architectures inside
+Ubuntu 22.04 containers, stages npm packages, and uploads the archives and npm
+packs. Pushes build artifacts only. To publish, configure access to the npm
+scope with trusted publishing or the `npm` environment's `NPM_TOKEN` secret,
+then dispatch the workflow on main with `publish` enabled. Native packages are
+published before the launcher. The default tag is `next`; choose `latest` only
+after provider acceptance. For the first publication, npm may require an account
+bootstrap before trusted publishing can be configured.
+
+Normal uninstall removes package-manager files and preserves ORBIT's home,
+identity, sessions and configuration. Run `orbit setup` and `orbit doctor` after
+installation; provider credentials remain environment-variable names in settings.

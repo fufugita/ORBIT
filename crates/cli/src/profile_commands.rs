@@ -1,8 +1,8 @@
 //! Shared checked customization operations used by command-line and frontend hosts.
 use crate::customization::{self, Directory, Error, LocalProfileHost};
 use orbit_frontend_protocol::customization::{
-    canonical_token, CustomizationCapabilities, Layout, LayoutNode, Profile, ProfileCommand,
-    ProfileCommandResult, ProfileHost, MAX_PROFILE_BYTES,
+    CustomizationCapabilities, Layout, LayoutNode, MAX_PROFILE_BYTES, Profile, ProfileCommand,
+    ProfileCommandResult, ProfileHost, canonical_token,
 };
 use serde::de::DeserializeOwned;
 use std::path::{Component, Path, PathBuf};
@@ -251,7 +251,7 @@ fn layout_preset(name: &str) -> Result<Layout, Error> {
         _ => {
             return Err(invalid(
                 "layout.preset expects default, columns, build, agents or review",
-            ))
+            ));
         }
     };
     let tree: LayoutNode = serde_json::from_value(
@@ -538,13 +538,15 @@ mod tests {
         let f = Fixture::new();
         text_profile(&f, r#"{"capture_path":"/opt/client/private"}"#);
         let before = std::fs::read(f.host.home.join("customization.json")).unwrap();
-        assert!(execute(
-            &f.host,
-            ProfileCommand::Export {
-                path: "quoted.json".into()
-            }
-        )
-        .is_err());
+        assert!(
+            execute(
+                &f.host,
+                ProfileCommand::Export {
+                    path: "quoted.json".into()
+                }
+            )
+            .is_err()
+        );
         assert!(!f.dir.join("quoted.json").exists());
         assert_eq!(
             std::fs::read(f.host.home.join("customization.json")).unwrap(),
@@ -558,9 +560,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(std::fs::read_to_string(f.dir.join("public.json"))
-            .unwrap()
-            .contains("HTTPS://example.invalid/public/path"));
+        assert!(
+            std::fs::read_to_string(f.dir.join("public.json"))
+                .unwrap()
+                .contains("HTTPS://example.invalid/public/path")
+        );
     }
     #[test]
     fn checked_profile_command_rejects_stale_browser_revision_before_publication() {
@@ -615,10 +619,12 @@ mod tests {
         let after = f.host.load().unwrap();
         assert_eq!(after.profile.theme, "orbit");
         assert_eq!(after.profile.browser.font_size_px, 18.0);
-        assert!(execute(&f.host, ProfileCommand::Reload)
-            .unwrap()
-            .profile
-            .is_some());
+        assert!(
+            execute(&f.host, ProfileCommand::Reload)
+                .unwrap()
+                .profile
+                .is_some()
+        );
     }
     #[test]
     fn profile_commands_invalid_changes_preserve_exact_existing_bytes() {
@@ -666,13 +672,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.host.load().unwrap().profile.theme, "paper");
-        assert!(execute(
-            &f.host,
-            ProfileCommand::Export {
-                path: "export.json".into()
-            }
-        )
-        .is_err());
+        assert!(
+            execute(
+                &f.host,
+                ProfileCommand::Export {
+                    path: "export.json".into()
+                }
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(f.dir.join("export.json")).unwrap(), bytes);
     }
     #[test]
@@ -680,13 +688,15 @@ mod tests {
         let f = Fixture::new();
         let text=br#"{"panes":[{"id":"notes","title":"Notes","surfaces":["terminal"],"source":{"kind":"text","text":"safe"},"actions":[{"kind":"refresh","unexpected":"refuse"}]}]}"#;
         private_write(&f.dir.join("bad.json"), text);
-        assert!(execute(
-            &f.host,
-            ProfileCommand::Import {
-                path: "bad.json".into()
-            }
-        )
-        .is_err());
+        assert!(
+            execute(
+                &f.host,
+                ProfileCommand::Import {
+                    path: "bad.json".into()
+                }
+            )
+            .is_err()
+        );
         assert!(!f.host.home.exists());
         assert!(set(&f.host,"panes",r#"[{"id":"notes","title":"Notes","surfaces":["terminal"],"source":{"kind":"text","text":"safe"},"actions":[{"kind":"refresh","unexpected":"refuse"}]}]"#).is_err());
         assert!(!f.host.home.exists());
@@ -698,13 +708,15 @@ mod tests {
         let f = Fixture::new();
         private_write(&f.dir.join("real.json"), b"{}");
         symlink(f.dir.join("real.json"), f.dir.join("link.json")).unwrap();
-        assert!(execute(
-            &f.host,
-            ProfileCommand::Import {
-                path: "link.json".into()
-            }
-        )
-        .is_err());
+        assert!(
+            execute(
+                &f.host,
+                ProfileCommand::Import {
+                    path: "link.json".into()
+                }
+            )
+            .is_err()
+        );
         assert!(!f.host.home.exists());
     }
     #[test]
@@ -729,13 +741,15 @@ mod tests {
         let f = Fixture::new();
         set(&f.host, "theme", "paper").unwrap();
         let path = f.host.home.join("new-export.json");
-        assert!(execute(
-            &f.host,
-            ProfileCommand::Export {
-                path: path.to_string_lossy().into_owned()
-            }
-        )
-        .is_err());
+        assert!(
+            execute(
+                &f.host,
+                ProfileCommand::Export {
+                    path: path.to_string_lossy().into_owned()
+                }
+            )
+            .is_err()
+        );
         assert!(!path.exists());
     }
     #[test]

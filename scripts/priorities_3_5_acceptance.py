@@ -31,7 +31,7 @@ MAX_JSON = 16 * 1024 * 1024
 MAX_DOCUMENT = 1024 * 1024
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,180}\Z")
-ENVIRONMENT = {"RUSTUP_TOOLCHAIN": "1.94.0", "CARGO_BUILD_JOBS": "1",
+ENVIRONMENT = {"RUSTUP_TOOLCHAIN": "1.99.0", "CARGO_BUILD_JOBS": "1",
                "RUST_TEST_THREADS": "1", "CARGO_TERM_COLOR": "never",
                "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
                "ORBIT_PTY_ALLOW_KILL_TESTS": "1", "TERM": "xterm-256color", "COLORTERM": "truecolor"}

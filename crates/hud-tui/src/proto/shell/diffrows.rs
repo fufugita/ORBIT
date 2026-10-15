@@ -3,7 +3,7 @@
 //! faint bar, context in muted ink. Built only from the bounded hunks a
 //! `FileChanged` event carried — nothing here invents a line.
 
-use super::canvas::{clip_text, tint, Cv, Rgb};
+use super::canvas::{Cv, Rgb, clip_text, tint};
 use orbit_frontend_protocol::DiffHunk;
 
 /// One displayable row: its marker (`@` hunk header, `+`, `-`, ` `

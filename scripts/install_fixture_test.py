@@ -130,9 +130,9 @@ shutil.copyfile(source,output)
     def source(self, fail=False, missing=False, wrong_version=False):
         checkout = self.root / "checkout"
         checkout.mkdir()
-        (checkout / "Cargo.toml").write_text('[workspace.package]\nversion="0.2.0"\nrust-version="1.94"\n')
+        (checkout / "Cargo.toml").write_text('[workspace.package]\nversion="0.2.0"\nrust-version="1.99"\n')
         (checkout / "Cargo.lock").write_text('version=4\n')
-        self.shim("rustc", "print('rustc 1.94.0 (fixture)')\n")
+        self.shim("rustc", "print('rustc 1.99.0 (fixture)')\n")
         self.shim("cargo", '''import json,os,sys
 from pathlib import Path
 with open(os.environ['FIXTURE_LOG'],'a') as log:log.write(json.dumps(sys.argv)+'\\n')
@@ -145,7 +145,7 @@ for name in ('orbit','orbit-web'):
 ''')
         if fail: self.env["FIXTURE_BUILD_FAIL"] = "1"
         if missing: self.env["FIXTURE_MISSING_WEB"] = "1"
-        if wrong_version: (checkout / "Cargo.toml").write_text('[workspace.package]\nversion="9.9.9"\nrust-version="1.94"\n')
+        if wrong_version: (checkout / "Cargo.toml").write_text('[workspace.package]\nversion="9.9.9"\nrust-version="1.99"\n')
         return checkout
 
     def commands(self):

@@ -10,8 +10,8 @@
 //! - `TuiApprovalChannel` (in hud-tui) posts to the bus and parks on a response.
 //! - The `R` verdict (DR-20 §2.7) grants session-scoped per-tool auto-approval.
 
-use orbit_ledger::event::{LedgerEvent, ToolIntent, ToolResult, ToolVerdict};
 use orbit_ledger::LedgerWriter;
+use orbit_ledger::event::{LedgerEvent, ToolIntent, ToolResult, ToolVerdict};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -1132,7 +1132,7 @@ fn grant_offer(
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Option<GrantOffer> {
-    use orbit_tools::permissions::{rule_matches, PermissionMode, PermissionRule, RuleEffectSerde};
+    use orbit_tools::permissions::{PermissionMode, PermissionRule, RuleEffectSerde, rule_matches};
     if !matches!(
         scope.mode,
         PermissionMode::Default | PermissionMode::AcceptEdits
@@ -1214,7 +1214,7 @@ fn pattern_layer_verdict_with_plan(
     working_dir: &Path,
     plan: Option<&McpDispatchPlan>,
 ) -> PatternOutcome {
-    use orbit_tools::permissions::{evaluate, parse_rule, RuleEffectSerde, Verdict};
+    use orbit_tools::permissions::{RuleEffectSerde, Verdict, evaluate, parse_rule};
 
     let entries = match plan
         .map(|plan| Ok(plan.rules.clone()))
@@ -1271,10 +1271,10 @@ fn pattern_layer_verdict_with_plan(
             {
                 return PatternOutcome::Deny("diagnostics or document is denied by rule".into());
             }
-            if let Some(allowlist) = &scope.allowlist {
-                if !allowlist.iter().any(|entry| entry == tool_name) {
-                    return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
-                }
+            if let Some(allowlist) = &scope.allowlist
+                && !allowlist.iter().any(|entry| entry == tool_name)
+            {
+                return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
             }
             return match evaluate(scope.mode, &rules, tool_name, pattern, true, false) {
                 Verdict::Allow => PatternOutcome::Allow,
@@ -1380,15 +1380,15 @@ fn pattern_layer_verdict_with_plan(
                     return PatternOutcome::McpError(safe, redactions);
                 }
             };
-            if let Some(allowlist) = &scope.allowlist {
-                if !allowlist.iter().any(|entry| {
+            if let Some(allowlist) = &scope.allowlist
+                && !allowlist.iter().any(|entry| {
                     parse_rule(entry, RuleEffectSerde::Allow).is_some_and(|rule| {
                         orbit_tools::permissions::rule_tool_matches(&rule, tool_name, Some(&server))
                             && orbit_tools::permissions::rule_matches(&rule, "")
                     })
-                }) {
-                    return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
-                }
+                })
+            {
+                return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
             }
             return match orbit_tools::permissions::evaluate_with_server(
                 scope.mode,
@@ -1470,7 +1470,7 @@ pub fn effective_permission_policy(
     working_dir: &Path,
     selector: &str,
 ) -> Result<PermissionPolicyReport, String> {
-    use orbit_tools::permissions::{parse_rule, rule_tool_matches, RuleEffectSerde};
+    use orbit_tools::permissions::{RuleEffectSerde, parse_rule, rule_tool_matches};
     validate_policy_selector(selector)?;
     let server_selector = selector
         .strip_prefix("mcp__")
@@ -1592,7 +1592,7 @@ pub fn effective_permission_policy(
         {
             RuleEffectSerde::Allow
         } else {
-            use orbit_tools::permissions::{evaluate, RuleSet, Verdict};
+            use orbit_tools::permissions::{RuleSet, Verdict, evaluate};
             match evaluate(
                 scope.mode,
                 &RuleSet::default(),
@@ -2206,7 +2206,7 @@ fn execute_wave1(
     args: &serde_json::Value,
     tool_cx: &orbit_tools::ToolContext,
 ) -> (String, Option<FileChange>) {
-    use orbit_tools::permissions::{evaluate, parse_rule, RuleEffectSerde};
+    use orbit_tools::permissions::{RuleEffectSerde, evaluate, parse_rule};
 
     // Merged rules: the new pattern scopes + the legacy whole-tool file.
     let mut rules = orbit_tools::executor::load_rules(home);
@@ -2286,7 +2286,7 @@ fn execute_wave1(
         // allow, and the ask-collapse (the operator approved the call
         // — but not running it bare on a sandbox-less machine).
         orbit_tools::permissions::Verdict::Allow if !sandbox_up => {
-            return (sandbox_refusal(), None)
+            return (sandbox_refusal(), None);
         }
         orbit_tools::permissions::Verdict::Allow => {}
         orbit_tools::permissions::Verdict::Deny(reason) => {
@@ -2324,26 +2324,26 @@ fn execute_wave1(
     // diff to the Changes panel (line counts from the diff, hunks from
     // the same bytes — nothing invented).
     let mut before: Option<(std::path::PathBuf, Vec<u8>, String)> = None;
-    if call.name == "Write" || call.name == "Edit" {
-        if let Some(path_str) = args.get("file_path").and_then(|v| v.as_str()) {
-            let path = orbit_tools::resolve_path(&cx, path_str);
-            if path.exists() {
-                let cps = orbit_engine::transcript::Checkpoints::new(home, &cx.session_id);
-                // E7: one checkpoint id per turn — the context mints
-                // it on first write and reuses it for the turn.
-                let turn_cp = cx.turn_checkpoint_id();
-                if let Ok(pre) = std::fs::read(&path) {
-                    let _ = cps.snapshot_file(&turn_cp, &path);
-                    before = Some((path, pre, turn_cp));
-                }
-            } else if call.name == "Write" {
-                // A file created from nothing is still a change — a diff
-                // against an empty "before". (There is nothing to
-                // snapshot: the checkpoint restores what existed.) It used
-                // to leave no event at all, so a new file never reached
-                // the Changes or Review panel.
-                before = Some((path, Vec::new(), cx.turn_checkpoint_id()));
+    if (call.name == "Write" || call.name == "Edit")
+        && let Some(path_str) = args.get("file_path").and_then(|v| v.as_str())
+    {
+        let path = orbit_tools::resolve_path(&cx, path_str);
+        if path.exists() {
+            let cps = orbit_engine::transcript::Checkpoints::new(home, &cx.session_id);
+            // E7: one checkpoint id per turn — the context mints
+            // it on first write and reuses it for the turn.
+            let turn_cp = cx.turn_checkpoint_id();
+            if let Ok(pre) = std::fs::read(&path) {
+                let _ = cps.snapshot_file(&turn_cp, &path);
+                before = Some((path, pre, turn_cp));
             }
+        } else if call.name == "Write" {
+            // A file created from nothing is still a change — a diff
+            // against an empty "before". (There is nothing to
+            // snapshot: the checkpoint restores what existed.) It used
+            // to leave no event at all, so a new file never reached
+            // the Changes or Review panel.
+            before = Some((path, Vec::new(), cx.turn_checkpoint_id()));
         }
     }
 
@@ -2601,16 +2601,16 @@ fn scan_mcp_value_with_key(
 
 fn mcp_error(error: &str) -> String {
     const SERVER_ERROR_PREFIX: &str = "mcp call failed: mcp server error: ";
-    if let Some(body) = error.strip_prefix(SERVER_ERROR_PREFIX) {
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) {
-            let mut redactions = 0;
-            scan_mcp_value(&mut value, &mut redactions);
-            return bounded_mcp_output(
-                serde_json::json!({ "ok":false, "result_error":true,
+    if let Some(body) = error.strip_prefix(SERVER_ERROR_PREFIX)
+        && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body)
+    {
+        let mut redactions = 0;
+        scan_mcp_value(&mut value, &mut redactions);
+        return bounded_mcp_output(
+            serde_json::json!({ "ok":false, "result_error":true,
                     "error":format!("{SERVER_ERROR_PREFIX}{value}"), "redactions":redactions }),
-                "error",
-            );
-        }
+            "error",
+        );
     }
     let (safe, redactions) = scan_mcp_text(error);
     bounded_mcp_output(
@@ -2678,11 +2678,11 @@ fn mcp_result_text(result: &serde_json::Value) -> String {
 #[cfg(all(test, unix))]
 mod mcp_runtime_tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
     use std::time::{Duration, Instant};
 
@@ -2833,9 +2833,10 @@ for line in sys.stdin:
         assert_eq!(out["ok"], true);
         assert!(out["result"].as_str().unwrap().contains("42"));
         assert!(!out.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
-        assert!(!out
-            .to_string()
-            .contains("AbCDef1234567890gHiJKLmN7890xyzPQ"));
+        assert!(
+            !out.to_string()
+                .contains("AbCDef1234567890gHiJKLmN7890xyzPQ")
+        );
         assert!(out["redactions"].as_u64().unwrap() >= 3);
         assert_eq!(fixture.status(), "ok");
     }
@@ -2901,9 +2902,10 @@ for line in sys.stdin:
         let out = fixture.call("server_error", &PermissionScope::default());
         assert_eq!(out["ok"], false);
         assert!(!out.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
-        assert!(!out
-            .to_string()
-            .contains("AbCDef1234567890gHiJKLmN7890xyzPQ"));
+        assert!(
+            !out.to_string()
+                .contains("AbCDef1234567890gHiJKLmN7890xyzPQ")
+        );
         assert!(out["redactions"].as_u64().unwrap() >= 4);
         let invalid_name = "ghp_abcdefghijklmnopqrstuvwxyz123456";
         std::fs::write(
@@ -4166,8 +4168,8 @@ mod tests {
 #[cfg(test)]
 mod cancel_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn call(i: u32) -> crate::PendingToolCall {
         crate::PendingToolCall {
@@ -4840,14 +4842,16 @@ mod grant_tests {
             mode: PermissionMode::AcceptEdits,
             ..Default::default()
         };
-        assert!(grant_offer(
-            &home,
-            &scope,
-            &project,
-            "Bash",
-            &serde_json::json!({ "command": "ls x" })
-        )
-        .is_some());
+        assert!(
+            grant_offer(
+                &home,
+                &scope,
+                &project,
+                "Bash",
+                &serde_json::json!({ "command": "ls x" })
+            )
+            .is_some()
+        );
     }
 
     /// `a` is offered as savable only in a folder that is trusted, since
@@ -5099,7 +5103,7 @@ mod agent_key_tests {
 mod agent_lifecycle_tests {
     use super::*;
     use orbit_engine::agent_store::{AgentStatus, AgentStore};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::atomic::Ordering;
 
     struct Mock {
@@ -5257,14 +5261,12 @@ mod agent_lifecycle_tests {
         assert_eq!(result["ok"], true, "{result}");
         assert!(!marker.exists());
         let body = mock.body();
-        assert!(!body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["function"]["name"]
+        assert!(!body["tools"].as_array().unwrap().iter().any(|tool| {
+            tool["function"]["name"]
                 .as_str()
                 .unwrap()
-                .starts_with("mcp__")));
+                .starts_with("mcp__")
+        }));
     }
 
     #[test]
@@ -5371,11 +5373,13 @@ mod agent_lifecycle_tests {
                 .count(),
             2
         );
-        assert!(AgentStore::new(&fixture.home, "untrusted-context-id")
-            .unwrap()
-            .list()
-            .unwrap()
-            .is_empty());
+        assert!(
+            AgentStore::new(&fixture.home, "untrusted-context-id")
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
         let started: Vec<_> = updates
             .lock()
             .unwrap()
@@ -5541,10 +5545,12 @@ mod agent_lifecycle_tests {
         let saved = fixture.store().load(agent_id).unwrap();
         assert_eq!(saved.status, AgentStatus::Failed);
         assert_eq!(saved.turns, 1);
-        assert!(saved
-            .transcript
-            .iter()
-            .any(|message| message.content == "persist failed turn"));
+        assert!(
+            saved
+                .transcript
+                .iter()
+                .any(|message| message.content == "persist failed turn")
+        );
         assert!(!saved.report.is_empty());
         assert_eq!(mock.requests(), 0);
         let serialized = serde_json::to_string(&saved).unwrap();
@@ -5563,10 +5569,12 @@ mod agent_lifecycle_tests {
         let wrong_profile =
             fixture.task(json!({"agent":"Plan","resume":agent_id,"prompt":"change authority"}));
         assert_eq!(wrong_profile["ok"], false, "{wrong_profile}");
-        assert!(wrong_profile["error"]
-            .as_str()
-            .unwrap()
-            .contains("type mismatch"));
+        assert!(
+            wrong_profile["error"]
+                .as_str()
+                .unwrap()
+                .contains("type mismatch")
+        );
         let wrong_owner = fixture.call(
             "other-owner",
             "Task",
@@ -5679,12 +5687,14 @@ mod agent_lifecycle_tests {
             &plan,
         );
         assert!(orbit_tools::result_is_denial(&send.to_string()));
-        assert!(fixture
-            .store()
-            .load(&agent.agent_id)
-            .unwrap()
-            .inbox
-            .is_empty());
+        assert!(
+            fixture
+                .store()
+                .load(&agent.agent_id)
+                .unwrap()
+                .inbox
+                .is_empty()
+        );
         let explicit_allow =
             PermissionScope::from_flags(Some("plan"), Some("AgentSendMessage"), None);
         let still_denied = fixture.call(

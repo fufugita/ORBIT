@@ -98,15 +98,15 @@ impl MemoryStore {
             .entries
             .iter()
             .find(|e| e.key == entry.key && e.scope == entry.scope && !e.is_correction)
+            && prior.value != entry.value
+            && !entry.is_correction
         {
-            if prior.value != entry.value && !entry.is_correction {
-                self.conflicts.push(MemoryConflictEvent {
-                    scope: entry.scope,
-                    key: entry.key.clone(),
-                    prior_digest: prior.digest.clone(),
-                    new_digest: entry.digest.clone(),
-                });
-            }
+            self.conflicts.push(MemoryConflictEvent {
+                scope: entry.scope,
+                key: entry.key.clone(),
+                prior_digest: prior.digest.clone(),
+                new_digest: entry.digest.clone(),
+            });
         }
         // Remove any prior same-scope entry; the new one (or correction) wins.
         self.entries

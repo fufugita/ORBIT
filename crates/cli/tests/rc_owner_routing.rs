@@ -9,7 +9,7 @@ use orbit_cli::phase_routing::SelectionOrigin;
 use orbit_cli::sessions::{self, SessionFile, SessionLease};
 use orbit_cli::tool_runtime::PermissionScope;
 use orbit_cli::tui_worker::TuiTurnConfig;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -345,12 +345,11 @@ impl Owned {
 impl Drop for Owned {
     fn drop(&mut self) {
         self.controller.take();
-        if let Some(runtime) = self.runtime.take() {
-            if let Err(error) = runtime.shutdown() {
-                if !std::thread::panicking() {
-                    panic!("owner cleanup failed: {error}");
-                }
-            }
+        if let Some(runtime) = self.runtime.take()
+            && let Err(error) = runtime.shutdown()
+            && !std::thread::panicking()
+        {
+            panic!("owner cleanup failed: {error}");
         }
     }
 }
@@ -368,10 +367,12 @@ fn assert_pin(origin: SelectionOrigin) {
     let route = owner.snapshot().last_route.unwrap();
     assert_eq!(route["source"], "explicit");
     assert_eq!(route["raw_model"], RAW_A);
-    assert!(route["suppressed_reason"]
-        .as_str()
-        .unwrap()
-        .contains("/route auto"));
+    assert!(
+        route["suppressed_reason"]
+            .as_str()
+            .unwrap()
+            .contains("/route auto")
+    );
     assert_eq!(owner.decisions().len(), 1);
 }
 
@@ -666,10 +667,12 @@ fn routing_and_settings_queries_do_not_call_or_change_selection() {
     f.assert_base(&owner, SelectionOrigin::Flag, low());
     assert!(owner.snapshot().last_route.is_none());
     assert!(owner.decisions().is_empty());
-    assert!(owner
-        .events()
-        .iter()
-        .any(|event| event.kind == "routing" && event.payload["selection_origin"] == "flag"));
+    assert!(
+        owner
+            .events()
+            .iter()
+            .any(|event| event.kind == "routing" && event.payload["selection_origin"] == "flag")
+    );
 }
 
 #[test]
@@ -726,11 +729,13 @@ fn routed_tool_round_keeps_inherited_read_denial() {
     assert!(f.a.calls().is_empty());
     let calls = f.b.calls();
     assert_eq!(calls.len(), 2);
-    assert!(!calls[0]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["function"]["name"] == "Read"));
+    assert!(
+        !calls[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "Read")
+    );
     let tool = calls[1]["messages"]
         .as_array()
         .unwrap()
@@ -755,12 +760,14 @@ fn invalid_hot_switch_retains_pin_and_next_turn_uses_original_provider() {
     let f = Fixture::new();
     let mut owner = f.start(Some(SelectionOrigin::Flag), low());
     let before = fs::read(f.home.join("sessions/routing-owner.json")).unwrap();
-    assert!(owner
-        .send(OwnerAction::SetModel {
-            model: "provider_b/missing".into(),
-            provider: None
-        })
-        .is_err());
+    assert!(
+        owner
+            .send(OwnerAction::SetModel {
+                model: "provider_b/missing".into(),
+                provider: None
+            })
+            .is_err()
+    );
     f.assert_no_calls();
     assert_eq!(
         fs::read(f.home.join("sessions/routing-owner.json")).unwrap(),

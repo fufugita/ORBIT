@@ -4,8 +4,8 @@
 //! `cancel()` notifies waiters; adapters race pending network waits against
 //! the signal and terminate with a partial result.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
 /// Shared cancellation signal. Clone is cheap; all clones observe the same flag.

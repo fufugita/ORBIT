@@ -1,4 +1,4 @@
-use orbit_cli::tool_runtime::{permission_command, PermissionScope};
+use orbit_cli::tool_runtime::{PermissionScope, permission_command};
 use std::path::PathBuf;
 
 struct PolicyFixture {
@@ -382,10 +382,11 @@ fn integration_lsp_cancelled_context_never_launches() {
 #[test]
 fn frontend_policy_builtin_deny_overrides_auto_tools_and_session_grants() {
     let f = PolicyFixture::new();
-    assert!(f
-        .command("deny calculator")
-        .unwrap()
-        .contains("calculator: Deny"));
+    assert!(
+        f.command("deny calculator")
+            .unwrap()
+            .contains("calculator: Deny")
+    );
     let mut answer = Refuse {
         asked: 0,
         auto_hint: false,
@@ -393,10 +394,11 @@ fn frontend_policy_builtin_deny_overrides_auto_tools_and_session_grants() {
     let output = run_calculator(&f, &PermissionScope::default(), &mut answer);
     assert_eq!(output["ok"], false, "{output}");
     assert_eq!(answer.asked, 0);
-    assert!(f
-        .command("reset calculator")
-        .unwrap()
-        .contains("calculator: Allow"));
+    assert!(
+        f.command("reset calculator")
+            .unwrap()
+            .contains("calculator: Allow")
+    );
     let output = run_calculator(&f, &PermissionScope::default(), &mut answer);
     assert_eq!(output["ok"], true, "{output}");
     assert_eq!(output["result"]["result"], 2.0);
@@ -405,10 +407,11 @@ fn frontend_policy_builtin_deny_overrides_auto_tools_and_session_grants() {
 #[test]
 fn frontend_policy_builtin_ask_requires_confirmation_despite_convenience_grants() {
     let f = PolicyFixture::new();
-    assert!(f
-        .command("ask calculator")
-        .unwrap()
-        .contains("calculator: Ask"));
+    assert!(
+        f.command("ask calculator")
+            .unwrap()
+            .contains("calculator: Ask")
+    );
     let mut answer = Refuse {
         asked: 0,
         auto_hint: false,
@@ -421,9 +424,11 @@ fn frontend_policy_builtin_ask_requires_confirmation_despite_convenience_grants(
         mode: orbit_tools::permissions::PermissionMode::DontAsk,
         ..Default::default()
     };
-    assert!(permission_command(&f.home, &scope, &f.work, "calculator")
-        .unwrap()
-        .contains("calculator: Deny"));
+    assert!(
+        permission_command(&f.home, &scope, &f.work, "calculator")
+            .unwrap()
+            .contains("calculator: Deny")
+    );
     let output = run_calculator(&f, &scope, &mut answer);
     assert_eq!(output["ok"], false, "{output}");
     assert_eq!(answer.asked, 1);
@@ -436,9 +441,11 @@ fn frontend_policy_builtin_scope_exclusion_refuses_even_with_auto_tools() {
         allowlist: Some(vec!["Read".into()]),
         ..Default::default()
     };
-    assert!(permission_command(&f.home, &scope, &f.work, "calculator")
-        .unwrap()
-        .contains("calculator: Deny"));
+    assert!(
+        permission_command(&f.home, &scope, &f.work, "calculator")
+            .unwrap()
+            .contains("calculator: Deny")
+    );
     let mut answer = Refuse {
         asked: 0,
         auto_hint: false,
@@ -567,9 +574,11 @@ fn catalog_exact_separator_profile_discovers_only_its_configured_server() {
         .filter(|definition| definition.name == wire)
         .collect();
     assert_eq!(matching.len(), 1);
-    assert!(matching[0]
-        .description
-        .contains(&format!("mcp: {separator}")));
+    assert!(
+        matching[0]
+            .description
+            .contains(&format!("mcp: {separator}"))
+    );
     assert_eq!(
         std::fs::read_to_string(log).unwrap(),
         "spawn c\ntools/list c\n"
@@ -586,7 +595,7 @@ fn frontend_policy_uncovered_query_does_not_mutate_disk() {
 
 #[test]
 fn frontend_policy_uncovered_builtin_modes_match_canonical_evaluation() {
-    use orbit_tools::permissions::{evaluate, PermissionMode, RuleSet, Verdict};
+    use orbit_tools::permissions::{PermissionMode, RuleSet, Verdict, evaluate};
     let f = PolicyFixture::new();
     for mode in [
         PermissionMode::Default,
@@ -631,10 +640,11 @@ fn frontend_policy_ask_is_saved_and_visible_after_reload() {
         text.contains("Ask") && text.contains("operator-override"),
         "{text}"
     );
-    assert!(f
-        .command("mcp__browser__local__snapshot")
-        .unwrap()
-        .contains("Ask"));
+    assert!(
+        f.command("mcp__browser__local__snapshot")
+            .unwrap()
+            .contains("Ask")
+    );
     assert!(
         std::fs::read_to_string(f.home.join("permission-overrides.toml"))
             .unwrap()
@@ -672,14 +682,16 @@ fn frontend_policy_independent_deny_remains_visible_after_allow() {
 #[test]
 fn frontend_policy_deny_and_reset_roundtrip() {
     let f = PolicyFixture::new();
-    assert!(f
-        .command("deny mcp__browser__local__*")
-        .unwrap()
-        .contains("Deny"));
-    assert!(f
-        .command("reset mcp__browser__local__*")
-        .unwrap()
-        .contains("Ask"));
+    assert!(
+        f.command("deny mcp__browser__local__*")
+            .unwrap()
+            .contains("Deny")
+    );
+    assert!(
+        f.command("reset mcp__browser__local__*")
+            .unwrap()
+            .contains("Ask")
+    );
 }
 #[test]
 fn frontend_policy_malformed_command_preserves_saved_bytes() {
@@ -718,7 +730,7 @@ fn frontend_policy_status_shows_sources_and_operator_exclusion() {
 mod package_commands {
     use super::PolicyFixture;
     use ed25519_dalek::SigningKey;
-    use orbit_ledger::{verify_ledger, LedgerEvent};
+    use orbit_ledger::{LedgerEvent, verify_ledger};
     use orbit_plugin::sign_manifest;
     use serde_json::Value;
     use std::process::{Command, Stdio};

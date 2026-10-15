@@ -147,7 +147,7 @@ impl Reactor {
             ReactorState::Terminal(_) => {
                 return Err(ReactorError::InvalidTransition(
                     "terminal state cannot transition (E0505)".into(),
-                ))
+                ));
             }
         };
         let legal = match (from, to) {
@@ -193,14 +193,14 @@ impl Reactor {
         // (represented by staying in the current phase), then we transition
         // to Checkpoint on the next phase opening. Here we model the terminal
         // cancel directly once the current phase is a non-execute phase.
-        if let ReactorState::Running(p) = &self.state {
-            if *p != Phase::Execute {
-                // Plan/Init/Verify/Checkpoint cancel → checkpoint with Cancelled.
-                self.state = ReactorState::Terminal(TerminalState::Cancelled);
-            }
-            // In Execute, cancellation requests are handled by TTE per-attempt
-            // (DR-01 §9); the reactor waits for the execute to observe it.
+        if let ReactorState::Running(p) = &self.state
+            && *p != Phase::Execute
+        {
+            // Plan/Init/Verify/Checkpoint cancel → checkpoint with Cancelled.
+            self.state = ReactorState::Terminal(TerminalState::Cancelled);
         }
+        // In Execute, cancellation requests are handled by TTE per-attempt
+        // (DR-01 §9); the reactor waits for the execute to observe it.
     }
 
     /// True if the phase router may select the orchestrator model for `phase`.

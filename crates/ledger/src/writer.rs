@@ -410,10 +410,10 @@ fn next_segment_ordinal(segments_dir: &Path) -> u64 {
         for e in rd.flatten() {
             let name = e.file_name();
             let s = name.to_string_lossy();
-            if let Some(hexpart) = s.strip_suffix(".log") {
-                if let Ok(n) = u64::from_str_radix(hexpart, 16) {
-                    max = max.max(n + 1);
-                }
+            if let Some(hexpart) = s.strip_suffix(".log")
+                && let Ok(n) = u64::from_str_radix(hexpart, 16)
+            {
+                max = max.max(n + 1);
             }
         }
     }

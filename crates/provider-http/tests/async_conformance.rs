@@ -15,10 +15,10 @@ use orbit_adapter::types::{
     AdapterKind, ProviderEventKind, ProviderRequest, ProviderRouteBinding, ProviderStreamEvent,
     Sha256Digest,
 };
-use orbit_mock_provider::{server::spawn, ServerState};
+use orbit_mock_provider::{ServerState, server::spawn};
 use orbit_provider_http::{
-    openai::{openai_capabilities, openai_identity},
     AsyncProviderAdapter, CancelToken, OpenAiCompatibleHttpV1,
+    openai::{openai_capabilities, openai_identity},
 };
 
 fn route_for(host: &str, port: u16, kind: AdapterKind) -> ProviderRouteBinding {
@@ -92,16 +92,18 @@ async fn openai_adapter_streams_success_with_valid_evidence() {
             .and_then(|v| v.as_str()),
         Some("hello")
     );
-    assert!(!captured.to_string().contains(
-        request(
-            "127.0.0.1",
-            addr.port(),
-            AdapterKind::OpenAiCompatibleHttpV1
+    assert!(
+        !captured.to_string().contains(
+            request(
+                "127.0.0.1",
+                addr.port(),
+                AdapterKind::OpenAiCompatibleHttpV1
+            )
+            .metadata
+            .input_sha256
+            .as_str()
         )
-        .metadata
-        .input_sha256
-        .as_str()
-    ));
+    );
 
     // Sequence contiguity + single terminal (GW-11).
     let evidence = orbit_adapter::stream::output_evidence(&events).unwrap();

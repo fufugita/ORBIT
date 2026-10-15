@@ -1,10 +1,10 @@
 //! Bounded browser presentation over the same checked profile host as the terminal.
 use orbit_frontend_protocol::customization::{
-    CustomizationError, PaneAction, PaneContext, PaneOutput, PaneState, ProfileCommand,
-    ProfileHost, ResolvedProfile, Surface, MAX_PANE_LINES, MAX_PANE_OUTPUT_BYTES,
+    CustomizationError, MAX_PANE_LINES, MAX_PANE_OUTPUT_BYTES, PaneAction, PaneContext, PaneOutput,
+    PaneState, ProfileCommand, ProfileHost, ResolvedProfile, Surface,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -222,7 +222,7 @@ impl BrowserSession {
                 match action {
                     PaneAction::Refresh => self.refresh(&pane_id, context)?,
                     PaneAction::OwnerCancel if !context.controller => {
-                        return Err("owner cancellation requires controller authority".into())
+                        return Err("owner cancellation requires controller authority".into());
                     }
                     action => effect = Some(action),
                 }

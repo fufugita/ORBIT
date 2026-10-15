@@ -369,11 +369,7 @@ pub fn evaluate_with_server(
             let freely = is_read_only_tool
                 || (tool == "Bash" && is_readonly_command)
                 || (mode == PermissionMode::AcceptEdits && edit_tools);
-            if freely {
-                Verdict::Allow
-            } else {
-                Verdict::Ask
-            }
+            if freely { Verdict::Allow } else { Verdict::Ask }
         }
         PermissionMode::Plan => {
             if is_read_only_tool {

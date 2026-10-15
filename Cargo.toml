@@ -4,7 +4,7 @@
 # six-phase roadmap (docs/roadmap/).
 
 [workspace]
-resolver = "2"
+resolver = "3"
 # The Tauri desktop crate needs GTK system libraries, so it breaks
 # `cargo test --workspace` on any machine (or CI runner) without them.
 # It is excluded from the default build; build it explicitly with
@@ -46,10 +46,10 @@ members = [
 
 [workspace.package]
 version = "0.2.0"
-edition = "2021"
-rust-version = "1.94"          # pinned toolchain at release; see DR-13 §4.3
+edition = "2024"
+rust-version = "1.99"          # pinned toolchain at release; see DR-13 §4.3
 license = "Apache-2.0"         # core; shims dual (MIT OR Apache-2.0) per DR-13 §4
-repository = "https://github.com/orbit-hq/orbit"
+repository = "https://github.com/fufugita/ORBIT"
 description = "ORBIT — the harness that orbits around you. User-authority orchestration with a strict proof/privacy kernel."
 
 [workspace.dependencies]

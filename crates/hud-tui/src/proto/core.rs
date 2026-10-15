@@ -92,10 +92,10 @@ impl Tier {
         if no_color {
             return Self::None;
         }
-        if let Some(ct) = colorterm {
-            if ct.contains("truecolor") || ct.contains("24bit") {
-                return Self::TrueColor;
-            }
+        if let Some(ct) = colorterm
+            && (ct.contains("truecolor") || ct.contains("24bit"))
+        {
+            return Self::TrueColor;
         }
         match term {
             Some(t) if t.contains("256color") => Self::T256,

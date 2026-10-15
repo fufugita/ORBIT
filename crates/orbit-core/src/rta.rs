@@ -105,9 +105,10 @@ mod tests {
                 .code(),
             "E1503"
         );
-        assert!(svc
-            .assess("a2".into(), "p".into(), TrustLevel::Standard, 1000, 0)
-            .is_ok());
+        assert!(
+            svc.assess("a2".into(), "p".into(), TrustLevel::Standard, 1000, 0)
+                .is_ok()
+        );
     }
 
     #[test]

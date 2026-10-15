@@ -26,7 +26,7 @@ use crate::proto::core::Tier;
 use crate::proto::layout::{Node, Preset, View};
 use crate::proto::panels::split_areas;
 use crate::proto::scenario::Scenario;
-use canvas::{clip_text, mix, Cv};
+use canvas::{Cv, clip_text, mix};
 use motion::{ease_in_out, ease_out, prog, secs};
 use ratatui::layout::Rect;
 
@@ -606,11 +606,11 @@ pub fn draw_with_profile(
 
         // The selection is bound to one panel: it is clamped to that
         // panel's content and drawn only inside it.
-        if let Some(sel) = &inp.selection {
-            if let Some((_, r, _)) = areas.iter().find(|(i, _, _)| *i == sel.panel) {
-                for (x, y, w) in sel.rows(content_rect(*r)) {
-                    cv.wash(x, y, w, 1, palette.selection);
-                }
+        if let Some(sel) = &inp.selection
+            && let Some((_, r, _)) = areas.iter().find(|(i, _, _)| *i == sel.panel)
+        {
+            for (x, y, w) in sel.rows(content_rect(*r)) {
+                cv.wash(x, y, w, 1, palette.selection);
             }
         }
 

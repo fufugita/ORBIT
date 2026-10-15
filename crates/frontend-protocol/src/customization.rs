@@ -432,7 +432,7 @@ impl Profile {
             }
             match &pane.source {
                 PaneSource::Text { text } if text.len() > 16 * 1024 => {
-                    return Err(invalid("panes.source.text exceeds 16 KiB"))
+                    return Err(invalid("panes.source.text exceeds 16 KiB"));
                 }
                 PaneSource::MarkdownFile { path }
                     if path.is_empty()
@@ -445,7 +445,7 @@ impl Profile {
                 {
                     return Err(invalid(
                         "panes.source.path must be a relative workspace path",
-                    ))
+                    ));
                 }
                 _ => {}
             }
@@ -453,10 +453,10 @@ impl Profile {
                 return Err(invalid("panes.actions exceeds 8"));
             }
             for action in &pane.actions {
-                if let PaneAction::InsertPrompt { text } = action {
-                    if text.len() > 4096 {
-                        return Err(invalid("panes.actions.insert_prompt exceeds 4096 bytes"));
-                    }
+                if let PaneAction::InsertPrompt { text } = action
+                    && text.len() > 4096
+                {
+                    return Err(invalid("panes.actions.insert_prompt exceeds 4096 bytes"));
                 }
             }
         }

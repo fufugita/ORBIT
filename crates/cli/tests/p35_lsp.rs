@@ -12,8 +12,8 @@ use orbit_tools::ToolContext;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 struct Fixture {
@@ -291,9 +291,11 @@ fn server_requested_edits_are_rejected_and_never_applied() {
         "fn main() { let x = 1; }\n"
     );
     let frames = f.frames();
-    assert!(frames
-        .iter()
-        .any(|v| v["id"] == 99 && v["error"]["code"] == -32601));
+    assert!(
+        frames
+            .iter()
+            .any(|v| v["id"] == 99 && v["error"]["code"] == -32601)
+    );
 }
 #[test]
 fn output_is_scanned_and_controls_removed() {
@@ -345,10 +347,12 @@ fn availability_and_tool_schema_do_not_launch_or_accept_launch_arguments() {
     let def = lsp::tool_definition();
     assert_eq!(def.name, "LspDiagnostics");
     assert_eq!(def.parameters["additionalProperties"], false);
-    assert!(serde_json::from_value::<LspDiagnosticsArgs>(
-        serde_json::json!({"file_path":"file.rs","command":"other"})
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<LspDiagnosticsArgs>(
+            serde_json::json!({"file_path":"file.rs","command":"other"})
+        )
+        .is_err()
+    );
     f.assert_not_launched();
 }
 
@@ -532,10 +536,11 @@ fn review_inherited_nonmatching_path_rule_keeps_permitted_diagnostics() {
             .status,
         DiagnosticStatus::Received
     );
-    assert!(f
-        .frames()
-        .iter()
-        .any(|v| v["method"] == "textDocument/didOpen"));
+    assert!(
+        f.frames()
+            .iter()
+            .any(|v| v["method"] == "textDocument/didOpen")
+    );
 }
 
 #[test]
@@ -609,18 +614,22 @@ fn review_repeated_same_family_tokens_are_all_redacted() {
         assert!(!bytes.contains(token));
     }
     assert!(r.diagnostics[0].message.contains("redacted"));
-    assert!(r.diagnostics[0]
-        .code
-        .as_ref()
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .contains("redacted"));
-    assert!(r.diagnostics[0]
-        .source
-        .as_ref()
-        .unwrap()
-        .contains("redacted"));
+    assert!(
+        r.diagnostics[0]
+            .code
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("redacted")
+    );
+    assert!(
+        r.diagnostics[0]
+            .source
+            .as_ref()
+            .unwrap()
+            .contains("redacted")
+    );
     assert!(!r.redactions.is_empty());
 }
 
@@ -628,9 +637,11 @@ fn review_repeated_same_family_tokens_are_all_redacted() {
 fn review_short_prefix_does_not_conceal_a_later_real_token() {
     let f = Fixture::new("short_prefix");
     let r = f.run().unwrap();
-    assert!(!serde_json::to_string(&r)
-        .unwrap()
-        .contains("ghp_abcdefghijklmnopQRSTUVWX0123456789"));
+    assert!(
+        !serde_json::to_string(&r)
+            .unwrap()
+            .contains("ghp_abcdefghijklmnopQRSTUVWX0123456789")
+    );
     assert!(r.diagnostics[0].message.contains("ghp_short"));
     assert!(!r.redactions.is_empty());
 }
@@ -671,9 +682,11 @@ fn assert_owned_processes_gone(f: &Fixture) {
     let helper = observed["helper"].as_u64().unwrap();
     assert_eq!(observed["helper_parent"], leader);
     assert_eq!(observed["helper_group"], leader);
-    assert!(observed["helper_state"]
-        .as_str()
-        .is_some_and(|state| state.starts_with('R') || state.starts_with('S')));
+    assert!(
+        observed["helper_state"]
+            .as_str()
+            .is_some_and(|state| state.starts_with('R') || state.starts_with('S'))
+    );
     assert!(
         !PathBuf::from(format!("/proc/{leader}")).exists(),
         "server leader was not reaped"

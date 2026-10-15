@@ -362,12 +362,12 @@ pub fn wrap_ranges(text: &str, w: i32) -> Vec<(usize, usize)> {
             i = end + 1;
             continue;
         }
-        if end < n && chars[end] != ' ' {
-            if let Some(sp) = chars[i..end].iter().rposition(|&ch| ch == ' ') {
-                if sp > 0 {
-                    end = i + sp;
-                }
-            }
+        if end < n
+            && chars[end] != ' '
+            && let Some(sp) = chars[i..end].iter().rposition(|&ch| ch == ' ')
+            && sp > 0
+        {
+            end = i + sp;
         }
         out.push((i, end));
         i = end;

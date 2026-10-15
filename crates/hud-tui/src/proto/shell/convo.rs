@@ -3,9 +3,9 @@
 //! prototype's `userRows` / `orbitRows` / `cardRows` / `approvalCard` /
 //! `composer`.
 
-use super::canvas::{clip_text, mix, segs_width, text_width, tint, wrap_ranges, Cv, Rgb, Seg};
-use super::frame::{badge_themed, fit_hints, keycap, keyhints, panel_frame, BadgeState, FrameSpec};
-use super::mark::{draw_hero, Hero};
+use super::canvas::{Cv, Rgb, Seg, clip_text, mix, segs_width, text_width, tint, wrap_ranges};
+use super::frame::{BadgeState, FrameSpec, badge_themed, fit_hints, keycap, keyhints, panel_frame};
+use super::mark::{Hero, draw_hero};
 use super::motion::{ease_out, flash, prog, pulse, secs, shimmer, star_at};
 use super::pal::Palette;
 use crate::proto::scenario::{LineKind, Scenario, ToolState, TranscriptLine};
@@ -223,12 +223,12 @@ fn wrap_line(chars: &[char], first: usize, rest: usize) -> Vec<(usize, usize)> {
     let (mut i, mut w) = (0usize, first.max(1));
     while i < n {
         let mut end = (i + w).min(n);
-        if end < n && chars[end] != ' ' {
-            if let Some(sp) = chars[i..end].iter().rposition(|&c| c == ' ') {
-                if sp > 0 {
-                    end = i + sp;
-                }
-            }
+        if end < n
+            && chars[end] != ' '
+            && let Some(sp) = chars[i..end].iter().rposition(|&c| c == ' ')
+            && sp > 0
+        {
+            end = i + sp;
         }
         out.push((i, end));
         i = end;
@@ -517,10 +517,10 @@ fn wrapped_note_text(text: &str, width: i32) -> Vec<String> {
                     word_break = Some(end);
                 }
             }
-            if end < chars.len() {
-                if let Some(boundary) = word_break {
-                    end = boundary;
-                }
+            if end < chars.len()
+                && let Some(boundary) = word_break
+            {
+                end = boundary;
             }
             rows.push(chars[start..end].iter().collect());
             start = end;
@@ -815,25 +815,25 @@ fn transcript_rows_themed(colors: Palette, compact: bool, inp: &ConvIn, w: i32) 
             inp.reduced,
             inp.mono,
         ));
-    } else if let Some(r) = &s.turn_report {
-        if !s.turn_live {
-            let noun = if r.tools == 1 { "tool" } else { "tools" };
-            let mut t = format!("✓ done · {}s · {} {noun}", r.duration_ms / 1000, r.tools);
-            if r.priced {
-                t.push_str(&format!(
-                    " · +${:.3}",
-                    r.cost_microcents as f64 / 1_000_000.0
-                ));
-            }
-            rows.push(None);
-            rows.extend(report_rows_themed(
-                colors,
-                t,
-                s.turn_ended_ms,
-                inp.now_ms,
-                inp.reduced,
+    } else if let Some(r) = &s.turn_report
+        && !s.turn_live
+    {
+        let noun = if r.tools == 1 { "tool" } else { "tools" };
+        let mut t = format!("✓ done · {}s · {} {noun}", r.duration_ms / 1000, r.tools);
+        if r.priced {
+            t.push_str(&format!(
+                " · +${:.3}",
+                r.cost_microcents as f64 / 1_000_000.0
             ));
         }
+        rows.push(None);
+        rows.extend(report_rows_themed(
+            colors,
+            t,
+            s.turn_ended_ms,
+            inp.now_ms,
+            inp.reduced,
+        ));
     }
     rows
 }

@@ -150,7 +150,7 @@ fn sde_derive_narrower_than_parent() {
 /// namespace (the E2E chain, unit-level).
 #[test]
 fn export_restore_verify_roundtrip() {
-    use orbit_export::{generate_local_key, restore, ExportBuilder};
+    use orbit_export::{ExportBuilder, generate_local_key, restore};
     let (recipient, identity) = generate_local_key();
     let mut b = ExportBuilder::new("s1".into(), "p1".into(), "0".repeat(64));
     b.add_file("ledger/a".into(), b"data");
@@ -162,7 +162,7 @@ fn export_restore_verify_roundtrip() {
 /// restore_corrupt_bundle_refused — a wrong key refuses restore (E0508).
 #[test]
 fn restore_corrupt_bundle_refused() {
-    use orbit_export::{generate_local_key, restore, ExportBuilder};
+    use orbit_export::{ExportBuilder, generate_local_key, restore};
     let (recipient, _id) = generate_local_key();
     let (_r2, id2) = generate_local_key();
     let mut b = ExportBuilder::new("s1".into(), "p1".into(), "0".repeat(64));

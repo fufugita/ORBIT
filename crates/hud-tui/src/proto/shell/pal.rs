@@ -262,15 +262,15 @@ impl Palette {
         if let Some(v) = color("blue") {
             p.blue = v;
         }
-        if let Some(v) = color("foreground") {
-            if color("ink").is_none() {
-                p.ink = v;
-            }
+        if let Some(v) = color("foreground")
+            && color("ink").is_none()
+        {
+            p.ink = v;
         }
-        if let Some(v) = color("border") {
-            if color("rule").is_none() {
-                p.rule = v;
-            }
+        if let Some(v) = color("border")
+            && color("rule").is_none()
+        {
+            p.rule = v;
         }
         if let Some(v) = color("app") {
             p.app = v;

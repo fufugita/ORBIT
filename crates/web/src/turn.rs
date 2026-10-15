@@ -1,6 +1,6 @@
 //! Server lifetime for the shared session owner. No browser-specific turn loop.
 
-use crate::{router, BridgeState};
+use crate::{BridgeState, router};
 use orbit_cli::{
     daemon::{OwnerConfig, OwnerRuntime},
     sessions::SessionLease,

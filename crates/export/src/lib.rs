@@ -282,12 +282,14 @@ mod tests {
         let manifest = restore(&sealed, &identity, "session-2", "session-1").unwrap();
         assert_eq!(manifest.source_session_id, "session-1");
         assert!(manifest.files.contains_key("ledger/0000.log"));
-        assert!(manifest
-            .files
-            .get("ephemeral/prompt.txt")
-            .unwrap()
-            .excluded_reason
-            .is_some());
+        assert!(
+            manifest
+                .files
+                .get("ephemeral/prompt.txt")
+                .unwrap()
+                .excluded_reason
+                .is_some()
+        );
     }
 
     #[test]

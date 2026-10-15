@@ -338,18 +338,16 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
         if li < skip_to {
             continue;
         }
-        if !fence {
-            if let Some(table) = table_at(&all_lines, li, max_width) {
-                ri = emit_table(
-                    &mut out,
-                    &table,
-                    &all_lines[li..li + table.lines],
-                    ri,
-                    li + table.lines < nlines,
-                );
-                skip_to = li + table.lines;
-                continue;
-            }
+        if !fence && let Some(table) = table_at(&all_lines, li, max_width) {
+            ri = emit_table(
+                &mut out,
+                &table,
+                &all_lines[li..li + table.lines],
+                ri,
+                li + table.lines < nlines,
+            );
+            skip_to = li + table.lines;
+            continue;
         }
         let line: Vec<char> = line_str.chars().collect();
         let has_newline = li + 1 < nlines;
@@ -489,31 +487,31 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
                     }
                 }
                 // [text](url)
-                if c == '[' {
-                    if let Some(close) = line[j + 1..].iter().position(|x| *x == ']') {
-                        let close = j + 1 + close;
-                        if line.get(close + 1) == Some(&'(') {
-                            if let Some(end) = line[close + 2..].iter().position(|x| *x == ')') {
-                                let end = close + 2 + end;
-                                drop_raw!(j);
-                                let link = Sty { link: true, ..sty };
-                                for (r, ch) in line.iter().enumerate().take(close).skip(j + 1) {
-                                    emit!(Some(r), *ch, link);
-                                }
-                                drop_raw!(close);
-                                drop_raw!(close + 1);
-                                let dim = Sty { dim: true, ..sty };
-                                emit!(None::<usize>, ' ', dim);
-                                emit!(None::<usize>, '(', dim);
-                                for (r, ch) in line.iter().enumerate().take(end).skip(close + 2) {
-                                    emit!(Some(r), *ch, dim);
-                                }
-                                emit!(None::<usize>, ')', dim);
-                                drop_raw!(end);
-                                j = end + 1;
-                                continue;
-                            }
+                if c == '['
+                    && let Some(close) = line[j + 1..].iter().position(|x| *x == ']')
+                {
+                    let close = j + 1 + close;
+                    if line.get(close + 1) == Some(&'(')
+                        && let Some(end) = line[close + 2..].iter().position(|x| *x == ')')
+                    {
+                        let end = close + 2 + end;
+                        drop_raw!(j);
+                        let link = Sty { link: true, ..sty };
+                        for (r, ch) in line.iter().enumerate().take(close).skip(j + 1) {
+                            emit!(Some(r), *ch, link);
                         }
+                        drop_raw!(close);
+                        drop_raw!(close + 1);
+                        let dim = Sty { dim: true, ..sty };
+                        emit!(None::<usize>, ' ', dim);
+                        emit!(None::<usize>, '(', dim);
+                        for (r, ch) in line.iter().enumerate().take(end).skip(close + 2) {
+                            emit!(Some(r), *ch, dim);
+                        }
+                        emit!(None::<usize>, ')', dim);
+                        drop_raw!(end);
+                        j = end + 1;
+                        continue;
                     }
                 }
                 emit!(Some(j), c, sty);

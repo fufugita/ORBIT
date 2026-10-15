@@ -99,7 +99,7 @@ pub fn read_selection_origin(
     let path = sessions_dir(home).join(format!("{id}.json"));
     match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(model_origin(None))
+            return Ok(model_origin(None));
         }
         Err(error) => return Err(error.kind().to_string()),
         Ok(_) => {}
@@ -393,7 +393,7 @@ mod leased_storage {
                 _ => {
                     return Err(SessionLeaseError::UnsafePath(
                         "parent traversal in home path".into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -668,13 +668,15 @@ mod lease_durability_tests {
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(lease.load().unwrap().model, "original");
-        assert!(std::fs::read_dir(home.join("sessions"))
-            .unwrap()
-            .all(|entry| !entry
+        assert!(
+            std::fs::read_dir(home.join("sessions"))
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")));
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
         drop(lease);
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -695,13 +697,15 @@ mod lease_durability_tests {
         assert!(failure.to_string().contains("was published"));
         assert_ne!(std::fs::read(&path).unwrap(), before);
         assert_eq!(lease.load().unwrap().model, "changed");
-        assert!(std::fs::read_dir(home.join("sessions"))
-            .unwrap()
-            .all(|entry| !entry
+        assert!(
+            std::fs::read_dir(home.join("sessions"))
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")));
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
         drop(lease);
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -869,10 +873,12 @@ mod tests {
         }
         let mut legacy = serde_json::to_value(sample("legacy")).unwrap();
         legacy.as_object_mut().unwrap().remove("effort");
-        assert!(serde_json::from_value::<SessionFile>(legacy)
-            .unwrap()
-            .effort
-            .is_none());
+        assert!(
+            serde_json::from_value::<SessionFile>(legacy)
+                .unwrap()
+                .effort
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 

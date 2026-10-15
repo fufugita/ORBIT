@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use orbit_ledger::{verify_ledger, LedgerEvent, LedgerWriter, PluginInstall};
+use orbit_ledger::{LedgerEvent, LedgerWriter, PluginInstall, verify_ledger};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -86,11 +86,13 @@ fn missing_segment_directory_sync_refuses_installation_ack() {
     assert_eq!(writer.head(), previous);
     std::fs::remove_file(f.ledger.join("segments")).unwrap();
     std::fs::rename(f.ledger.join("saved-segments"), f.ledger.join("segments")).unwrap();
-    assert!(writer
-        .append(LedgerEvent::PluginInstall(install()))
-        .unwrap_err()
-        .to_string()
-        .contains("reopened"));
+    assert!(
+        writer
+            .append(LedgerEvent::PluginInstall(install()))
+            .unwrap_err()
+            .to_string()
+            .contains("reopened")
+    );
 }
 
 #[test]
@@ -119,17 +121,21 @@ fn private_file(path: &Path) {
 
 fn no_installation_proof(ledger: &Path) {
     let (records, _) = verify_ledger(ledger).unwrap();
-    assert!(records
-        .iter()
-        .all(|record| !matches!(record.record.event, LedgerEvent::PluginInstall(_))));
+    assert!(
+        records
+            .iter()
+            .all(|record| !matches!(record.record.event, LedgerEvent::PluginInstall(_)))
+    );
 }
 
 fn refused_writer_stays_poisoned(writer: &mut LedgerWriter) {
-    assert!(writer
-        .append(LedgerEvent::PluginInstall(install()))
-        .unwrap_err()
-        .to_string()
-        .contains("reopened"));
+    assert!(
+        writer
+            .append(LedgerEvent::PluginInstall(install()))
+            .unwrap_err()
+            .to_string()
+            .contains("reopened")
+    );
     assert!(writer.fsync().unwrap_err().to_string().contains("reopened"));
 }
 

@@ -3,10 +3,10 @@
 
 use crate::tool_runtime::PermissionScope;
 use orbit_adapter::ToolDefinition;
-use orbit_tools::permissions::{parse_rule, FolderTrust, RuleEffect, RuleEffectSerde, RuleSet};
-use orbit_tools::{is_deny_read, resolve_path, ToolContext};
+use orbit_tools::permissions::{FolderTrust, RuleEffect, RuleEffectSerde, RuleSet, parse_rule};
+use orbit_tools::{ToolContext, is_deny_read, resolve_path};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -200,13 +200,14 @@ fn configuration(home: &Path, cx: &ToolContext) -> Result<Option<Vec<Server>>, L
     // A trusted project may specialize an already enabled user configuration.
     // It cannot activate diagnostics when the user configuration is absent/off.
     let local = work.join(".orbit/lsp.toml");
-    if trusted && local != home.join("lsp.toml") {
-        if let Some(project) = read_configuration(&local)? {
-            if !project.enabled {
-                return Ok(None);
-            }
-            config = project;
+    if trusted
+        && local != home.join("lsp.toml")
+        && let Some(project) = read_configuration(&local)?
+    {
+        if !project.enabled {
+            return Ok(None);
         }
+        config = project;
     }
     if config.servers.is_empty() {
         return Ok(None);

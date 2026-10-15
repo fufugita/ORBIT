@@ -8,8 +8,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use orbit_web::{router, BridgeState};
-use std::sync::{mpsc, Arc, Mutex};
+use orbit_web::{BridgeState, router};
+use std::sync::{Arc, Mutex, mpsc};
 use tower::ServiceExt;
 
 fn state() -> (BridgeState, Arc<Mutex<mpsc::Receiver<serde_json::Value>>>) {

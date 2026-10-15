@@ -9,7 +9,7 @@ mod setup;
 use customization::Error;
 pub use orbit_cli::{config, phase_routing, tool_runtime};
 use setup::*;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 struct Fixture {
     root: PathBuf,
@@ -56,14 +56,16 @@ fn invalid(mutator: impl FnOnce(&mut config::ProviderConfig)) {
     let f = Fixture::new();
     let mut p = provider();
     mutator(&mut p);
-    assert!(plan_setup(
-        &f.home,
-        &SetupRequest {
-            provider: Some(p),
-            ..Default::default()
-        }
-    )
-    .is_err());
+    assert!(
+        plan_setup(
+            &f.home,
+            &SetupRequest {
+                provider: Some(p),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
     assert!(!f.home.exists());
 }
 #[test]
@@ -206,10 +208,12 @@ fn partial_identity_refuses_regeneration_without_mutation() {
         std::fs::read(f.home.join("trust/operator.key")).unwrap(),
         key
     );
-    assert!(repair_dry_run(&f.home)
-        .unwrap()
-        .missing
-        .contains(&"pib.json".into()));
+    assert!(
+        repair_dry_run(&f.home)
+            .unwrap()
+            .missing
+            .contains(&"pib.json".into())
+    );
 }
 #[test]
 fn relative_url_fails_before_home() {
@@ -401,7 +405,9 @@ fn credential_query_refuses_before_home_and_preserves_existing_identity_and_conf
         assert_eq!(f.identity(), identity);
         assert_eq!(std::fs::read(f.home.join("providers.toml")).unwrap(), bytes);
     }
-    assert!(config::ProvidersConfig::load(&f.home).unwrap().provider[0]
-        .url
-        .contains("api-version=2026-01-01"));
+    assert!(
+        config::ProvidersConfig::load(&f.home).unwrap().provider[0]
+            .url
+            .contains("api-version=2026-01-01")
+    );
 }

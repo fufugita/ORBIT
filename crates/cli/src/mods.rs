@@ -117,10 +117,10 @@ fn metadata(dir: &crate::customization::Directory) -> Result<Metadata, String> {
     let table = table
         .as_table()
         .ok_or("instruction metadata must be a table")?;
-    if let Some(name) = table.get("name") {
-        if !name.as_str().is_some_and(valid_name) {
-            return Err("instruction metadata name is invalid".into());
-        }
+    if let Some(name) = table.get("name")
+        && !name.as_str().is_some_and(valid_name)
+    {
+        return Err("instruction metadata name is invalid".into());
     }
     let description = match table.get("description") {
         None => String::new(),
@@ -300,7 +300,7 @@ fn publish_enabled(
     expected: Option<Vec<u8>>,
     set: &EnabledSet,
 ) -> Result<(), String> {
-    use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
     use std::io::Write;
     let bytes = serde_json::to_vec_pretty(set).map_err(|_| "cannot encode enabled metadata")?;
     if bytes.len() > MAX_BYTES {

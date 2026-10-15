@@ -1,6 +1,6 @@
 //! The top bar (row 0) and the status line (last row).
 
-use super::canvas::{mix, segs_width, text_width, tint, Cv, Rgb, Seg};
+use super::canvas::{Cv, Rgb, Seg, mix, segs_width, text_width, tint};
 use super::frame::{keyhints, pill, pill_width};
 use super::motion::{ease_in_out, flash, prog, secs, shimmer, star_at};
 use super::pal::Palette;

@@ -9,7 +9,7 @@ platform-specific.
 From the repository root:
 
 ```sh
-RUSTUP_TOOLCHAIN=1.94.0 cargo tauri dev --manifest-path crates/desktop/src-tauri/Cargo.toml
+RUSTUP_TOOLCHAIN=1.99.0 cargo tauri dev --manifest-path crates/desktop/src-tauri/Cargo.toml
 ```
 
 If the Tauri CLI is not installed:

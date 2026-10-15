@@ -12,9 +12,9 @@
 #![allow(unused_imports)] // used only in #[test] fns
 #![allow(dead_code)] // helpers used only inside #[test] fns
 
-use orbit_export::{generate_local_key, restore, ExportBuilder};
+use orbit_export::{ExportBuilder, generate_local_key, restore};
 use orbit_ledger::event::{LedgerEvent, Phase, PhaseTransition};
-use orbit_ledger::{verify_ledger, LedgerWriter};
+use orbit_ledger::{LedgerWriter, verify_ledger};
 use std::path::{Path, PathBuf};
 
 /// Frozen soak load: 200 full cycles. Changing this changes the load budget.

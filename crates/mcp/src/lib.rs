@@ -410,12 +410,11 @@ impl McpSession {
                     true,
                 ));
             }
-            if let Some(error) = error {
-                if error.get("code").and_then(|c| c.as_i64()).is_none()
-                    || error.get("message").and_then(|m| m.as_str()).is_none()
-                {
-                    return Err(("mcp response has invalid error".into(), true));
-                }
+            if let Some(error) = error
+                && (error.get("code").and_then(|c| c.as_i64()).is_none()
+                    || error.get("message").and_then(|m| m.as_str()).is_none())
+            {
+                return Err(("mcp response has invalid error".into(), true));
             }
             if response_id.as_u64() != Some(id) {
                 continue;
@@ -1198,18 +1197,20 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(first["pid"], second["pid"]);
         let before = fixture.events().len();
-        assert!(pool
-            .call_tool("fake", &cfg, "hidden", serde_json::json!({}))
-            .unwrap_err()
-            .contains("disabled"));
-        assert!(pool
-            .request(
+        assert!(
+            pool.call_tool("fake", &cfg, "hidden", serde_json::json!({}))
+                .unwrap_err()
+                .contains("disabled")
+        );
+        assert!(
+            pool.request(
                 "fake",
                 &cfg,
                 "tools/call",
                 serde_json::json!({"name":"Echo"})
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(fixture.events().len(), before);
         assert_eq!(
             fixture
@@ -1221,9 +1222,11 @@ for line in sys.stdin:
         );
         let mut session = McpSession::spawn("direct", &cfg).unwrap();
         assert!(session.call_tool("hidden", serde_json::json!({})).is_err());
-        assert!(session
-            .request("tools/call", serde_json::json!({"name":"hidden"}))
-            .is_err());
+        assert!(
+            session
+                .request("tools/call", serde_json::json!({"name":"hidden"}))
+                .is_err()
+        );
         assert!(session.is_alive());
     }
 
@@ -1235,20 +1238,22 @@ for line in sys.stdin:
         cfg.enabled = false;
         assert!(McpSession::spawn("disabled", &cfg).is_err());
         assert!(pool.list_tools("disabled", &cfg).unwrap().is_empty());
-        assert!(pool
-            .call_tool("disabled", &cfg, "echo", serde_json::json!({}))
-            .is_err());
+        assert!(
+            pool.call_tool("disabled", &cfg, "echo", serde_json::json!({}))
+                .is_err()
+        );
         cfg.enabled = true;
         cfg.tools = Some(vec![]);
         assert!(pool.list_tools("empty", &cfg).unwrap().is_empty());
-        assert!(pool
-            .request(
+        assert!(
+            pool.request(
                 "empty",
                 &cfg,
                 "tools/call",
                 serde_json::json!({"name":"echo"})
             )
-            .is_err());
+            .is_err()
+        );
         assert!(fixture.events().is_empty());
     }
 
@@ -1272,10 +1277,12 @@ for line in sys.stdin:
         let delayed = Fixture::new("paged_delay");
         let mut session = McpSession::spawn("delayed", &delayed.cfg).unwrap();
         let start = Instant::now();
-        assert!(session
-            .list_tools_with_options(&options(120))
-            .unwrap_err()
-            .contains("timed out"));
+        assert!(
+            session
+                .list_tools_with_options(&options(120))
+                .unwrap_err()
+                .contains("timed out")
+        );
         assert!(start.elapsed() < Duration::from_millis(210));
         assert!(!session.is_alive());
     }
@@ -1341,10 +1348,12 @@ for line in sys.stdin:
             .unwrap_err();
         assert!(error.contains("no tool request was sent"));
         assert!(!error.contains("outcome is unknown"));
-        assert!(!fresh
-            .events()
-            .iter()
-            .any(|e| e["msg"]["method"] == "tools/call"));
+        assert!(
+            !fresh
+                .events()
+                .iter()
+                .any(|e| e["msg"]["method"] == "tools/call")
+        );
     }
 
     #[test]
@@ -1359,20 +1368,24 @@ for line in sys.stdin:
         assert!(error.contains("timed out"));
         assert_quick(start);
         assert!(start.elapsed() < Duration::from_millis(400));
-        assert!(!fixture
-            .events()
-            .iter()
-            .any(|e| e["msg"]["method"] == "notifications/cancelled"));
+        assert!(
+            !fixture
+                .events()
+                .iter()
+                .any(|e| e["msg"]["method"] == "notifications/cancelled")
+        );
         let cancelled = Arc::new(AtomicBool::new(true));
         let fresh = Fixture::new("normal");
-        assert!(McpSession::spawn_with_options(
-            "pre-cancelled",
-            &fresh.cfg,
-            &cancel_options(500, &cancelled)
-        )
-        .err()
-        .unwrap()
-        .contains("cancelled"));
+        assert!(
+            McpSession::spawn_with_options(
+                "pre-cancelled",
+                &fresh.cfg,
+                &cancel_options(500, &cancelled)
+            )
+            .err()
+            .unwrap()
+            .contains("cancelled")
+        );
         assert!(fresh.events().is_empty());
     }
 
@@ -1404,10 +1417,12 @@ for line in sys.stdin:
         trigger.join().unwrap();
         assert!(error.contains("cancelled"));
         assert_quick(start);
-        assert!(!fixture
-            .events()
-            .iter()
-            .any(|e| e["msg"]["method"] == "notifications/cancelled"));
+        assert!(
+            !fixture
+                .events()
+                .iter()
+                .any(|e| e["msg"]["method"] == "notifications/cancelled")
+        );
     }
 
     #[test]
@@ -1415,16 +1430,20 @@ for line in sys.stdin:
         let fixture = Fixture::new("silent_call");
         let mut session = McpSession::spawn("silent", &fixture.cfg).unwrap();
         let start = Instant::now();
-        assert!(session
-            .call_tool_with_options("echo", serde_json::json!({}), &options(60))
-            .unwrap_err()
-            .contains("timed out"));
+        assert!(
+            session
+                .call_tool_with_options("echo", serde_json::json!({}), &options(60))
+                .unwrap_err()
+                .contains("timed out")
+        );
         assert_quick(start);
         assert!(!session.is_alive());
-        assert!(session
-            .call_tool("echo", serde_json::json!({}))
-            .unwrap_err()
-            .contains("retired"));
+        assert!(
+            session
+                .call_tool("echo", serde_json::json!({}))
+                .unwrap_err()
+                .contains("retired")
+        );
         let mut session = McpSession::spawn("cancel", &fixture.cfg).unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = cancelled.clone();
@@ -1433,14 +1452,16 @@ for line in sys.stdin:
             flag.store(true, Ordering::SeqCst);
         });
         let start = Instant::now();
-        assert!(session
-            .call_tool_with_options(
-                "echo",
-                serde_json::json!({}),
-                &cancel_options(1000, &cancelled)
-            )
-            .unwrap_err()
-            .contains("cancelled"));
+        assert!(
+            session
+                .call_tool_with_options(
+                    "echo",
+                    serde_json::json!({}),
+                    &cancel_options(1000, &cancelled)
+                )
+                .unwrap_err()
+                .contains("cancelled")
+        );
         trigger.join().unwrap();
         assert_quick(start);
         assert!(!session.is_alive());
@@ -1487,20 +1508,24 @@ for line in sys.stdin:
             let fixture = Fixture::new(mode);
             let mut session = McpSession::spawn(mode, &fixture.cfg).unwrap();
             let start = Instant::now();
-            assert!(session
-                .call_tool_with_options("echo", serde_json::json!({}), &options(80))
-                .unwrap_err()
-                .contains("timed out"));
+            assert!(
+                session
+                    .call_tool_with_options("echo", serde_json::json!({}), &options(80))
+                    .unwrap_err()
+                    .contains("timed out")
+            );
             assert_quick(start);
             assert!(!session.is_alive());
         }
         let fixture = Fixture::new("silent_list");
         let mut session = McpSession::spawn("silent-list", &fixture.cfg).unwrap();
         let start = Instant::now();
-        assert!(session
-            .list_tools_with_options(&options(60))
-            .unwrap_err()
-            .contains("timed out"));
+        assert!(
+            session
+                .list_tools_with_options(&options(60))
+                .unwrap_err()
+                .contains("timed out")
+        );
         assert_quick(start);
         assert!(!session.is_alive());
     }
@@ -1529,18 +1554,22 @@ for line in sys.stdin:
         }
         let fixture = Fixture::new("normal");
         let mut session = McpSession::spawn("output", &fixture.cfg).unwrap();
-        assert!(session
-            .call_tool(
-                "echo",
-                serde_json::json!({"payload":"x".repeat(MAX_FRAME_BYTES)})
-            )
-            .unwrap_err()
-            .contains("1 MiB"));
+        assert!(
+            session
+                .call_tool(
+                    "echo",
+                    serde_json::json!({"payload":"x".repeat(MAX_FRAME_BYTES)})
+                )
+                .unwrap_err()
+                .contains("1 MiB")
+        );
         assert!(!session.is_alive());
-        assert!(!fixture
-            .events()
-            .iter()
-            .any(|e| e["msg"]["method"] == "tools/call"));
+        assert!(
+            !fixture
+                .events()
+                .iter()
+                .any(|e| e["msg"]["method"] == "tools/call")
+        );
     }
 
     #[test]
@@ -1550,18 +1579,22 @@ for line in sys.stdin:
         assert!(session.call_tool("echo", serde_json::json!({})).unwrap()["content"].is_array());
         let fixture = Fixture::new("rpc_error");
         let mut session = McpSession::spawn("errors", &fixture.cfg).unwrap();
-        assert!(session
-            .call_tool("echo", serde_json::json!({}))
-            .unwrap_err()
-            .contains("fixture failure"));
+        assert!(
+            session
+                .call_tool("echo", serde_json::json!({}))
+                .unwrap_err()
+                .contains("fixture failure")
+        );
         assert!(session.is_alive());
         assert!(session.call_tool("echo", serde_json::json!({})).is_ok());
         let fixture = Fixture::new("list_rpc_error");
         let mut session = McpSession::spawn("list-errors", &fixture.cfg).unwrap();
-        assert!(session
-            .list_tools()
-            .unwrap_err()
-            .contains("list fixture failure"));
+        assert!(
+            session
+                .list_tools()
+                .unwrap_err()
+                .contains("list fixture failure")
+        );
         assert!(session.is_alive());
         assert_eq!(session.list_tools().unwrap().len(), 2);
     }
@@ -1596,8 +1629,8 @@ for line in sys.stdin:
         assert!(result["content"].is_array());
         assert!(start.elapsed() < Duration::from_millis(250));
         let start = Instant::now();
-        assert!(pool
-            .call_tool_with_options(
+        assert!(
+            pool.call_tool_with_options(
                 "slow",
                 &silent.cfg,
                 "echo",
@@ -1605,7 +1638,8 @@ for line in sys.stdin:
                 &options(40)
             )
             .unwrap_err()
-            .contains("timed out"));
+            .contains("timed out")
+        );
         assert!(start.elapsed() < Duration::from_millis(200));
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = cancelled.clone();
@@ -1613,8 +1647,8 @@ for line in sys.stdin:
             std::thread::sleep(Duration::from_millis(20));
             flag.store(true, Ordering::SeqCst);
         });
-        assert!(pool
-            .call_tool_with_options(
+        assert!(
+            pool.call_tool_with_options(
                 "slow",
                 &silent.cfg,
                 "echo",
@@ -1622,7 +1656,8 @@ for line in sys.stdin:
                 &cancel_options(200, &cancelled)
             )
             .unwrap_err()
-            .contains("cancelled"));
+            .contains("cancelled")
+        );
         trigger.join().unwrap();
         assert!(worker.join().unwrap().is_err());
         assert_eq!(
@@ -1640,15 +1675,16 @@ for line in sys.stdin:
         let fixture = Fixture::new("silent_call");
         let pool = McpPool::new();
         for _ in 0..2 {
-            assert!(pool
-                .call_tool_with_options(
+            assert!(
+                pool.call_tool_with_options(
                     "server",
                     &fixture.cfg,
                     "echo",
                     serde_json::json!({}),
                     &options(90)
                 )
-                .is_err());
+                .is_err()
+            );
         }
         let events = fixture.events();
         let calls: Vec<_> = events
@@ -1710,8 +1746,8 @@ for line in sys.stdin:
         };
         let pool = McpPool::new();
         let start = Instant::now();
-        assert!(pool
-            .call_tool_with_options(
+        assert!(
+            pool.call_tool_with_options(
                 "overall",
                 &cfg,
                 "echo",
@@ -1719,15 +1755,18 @@ for line in sys.stdin:
                 &options(170)
             )
             .unwrap_err()
-            .contains("timed out"));
+            .contains("timed out")
+        );
         assert!(
             start.elapsed() < Duration::from_millis(260),
             "{:?}",
             start.elapsed()
         );
-        assert!(fixture
-            .events()
-            .iter()
-            .any(|e| e["msg"]["method"] == "tools/call"));
+        assert!(
+            fixture
+                .events()
+                .iter()
+                .any(|e| e["msg"]["method"] == "tools/call")
+        );
     }
 }

@@ -4,7 +4,7 @@ use crate::daemon::{
     ActionAck, ApprovalChoice, EventCursor, OwnerAction, OwnerError, OwnerSnapshot, Recovery,
     TurnState,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -69,7 +69,16 @@ impl AttachClient {
             _ => None,
         };
         let value = self.request(json!({"type":"action","action":action}));
-        match value{Ok(value)=>Ok(value),Err(error @ OwnerError::Protocol(_))=>Err(match request_id{Some(id)=>OwnerError::Runtime(format!("request {id}: outcome is unknown; inspect the session without resubmitting ({error})")),None=>error}),Err(error)=>Err(error)}
+        match value {
+            Ok(value) => Ok(value),
+            Err(error @ OwnerError::Protocol(_)) => Err(match request_id {
+                Some(id) => OwnerError::Runtime(format!(
+                    "request {id}: outcome is unknown; inspect the session without resubmitting ({error})"
+                )),
+                None => error,
+            }),
+            Err(error) => Err(error),
+        }
     }
     fn request<T: serde::de::DeserializeOwned>(&mut self, request: Value) -> Result<T, OwnerError> {
         if !self.healthy {
@@ -422,7 +431,7 @@ fn input_action(
             })?;
         }
         line if line.starts_with('/') => {
-            return Err(OwnerError::Invalid("unknown attach command".into()))
+            return Err(OwnerError::Invalid("unknown attach command".into()));
         }
         line if line.trim().is_empty() => {}
         line => {

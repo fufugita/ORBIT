@@ -298,9 +298,10 @@ fn wasi_plugin_cannot_obtain_credential_lease() {
     // S13: credentials live in the Rust core; the WASI allowlist has no
     // credential import.
     let al = orbit_plugin::WasiHostAllowlist::canonical();
-    assert!(al
-        .validate(&["orbit:reactor/credentials/*".into()])
-        .is_err());
+    assert!(
+        al.validate(&["orbit:reactor/credentials/*".into()])
+            .is_err()
+    );
 }
 
 // ── ORBIT-F-GW-004 ────────────────────────────────────────────────
@@ -444,7 +445,7 @@ fn provenance_segregation() {
 #[test]
 fn quoted_directive_treated_as_data() {
     // KERN-3: quoted text is data, not authority.
-    use orbit_core::authority::intent::{extract_directives, UserTypedSpan};
+    use orbit_core::authority::intent::{UserTypedSpan, extract_directives};
     // A directive-shaped string in non-user content is handled by the caller;
     // here the extractor only sees user-typed spans, so a neutral line yields
     // no directives (no grant).
@@ -461,7 +462,7 @@ fn quoted_directive_treated_as_data() {
 fn malformed_scope_refused_not_silently_unrestricted() {
     // P1-2: `grant models foo,bar` (non-JSON scope) must be REFUSED with
     // E1902 — never silently coerced to Null (which would grant everything).
-    use orbit_core::authority::intent::{extract_directives, UserTypedSpan};
+    use orbit_core::authority::intent::{UserTypedSpan, extract_directives};
     let span = UserTypedSpan {
         text: "grant models foo,bar".into(),
     };

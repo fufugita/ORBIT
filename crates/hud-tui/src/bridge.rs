@@ -154,7 +154,7 @@ pub fn strip_cot(text: &str) -> String {
                 // Reconstruct the tag to get its char length.
                 let tag_str: String = chars[i..].iter().take_while(|&&c| c != '>').collect();
                 let tag_char_len = tag_str.len() + 1; // include the '>'
-                                                      // Extract the tag name (without < >).
+                // Extract the tag name (without < >).
                 let tag_name: String = chars[i + 1..i + tag_char_len - 1].iter().collect();
                 let close = format!("</{tag_name}>");
                 let close_lower = close.to_lowercase();

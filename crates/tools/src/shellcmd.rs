@@ -106,10 +106,11 @@ pub fn strip_launchers(cmd: &str) -> String {
         words.drain(..skip);
     }
     // `/usr/bin/rm -rf x` is `rm -rf x`.
-    if let Some(first) = words.first().copied() {
-        if first.contains('/') && !first.ends_with('/') {
-            words[0] = first.rsplit('/').next().unwrap_or(first);
-        }
+    if let Some(first) = words.first().copied()
+        && first.contains('/')
+        && !first.ends_with('/')
+    {
+        words[0] = first.rsplit('/').next().unwrap_or(first);
     }
     words.join(" ")
 }
@@ -322,18 +323,18 @@ pub fn grant_pattern(command: &str) -> Option<(String, bool)> {
     if INTERPRETERS.contains(&base) || first.contains('/') || first.contains('=') {
         return Some((cmd, false));
     }
-    if MULTIPLEXERS.contains(&base) {
-        if let Some(verb) = words.get(1).copied() {
-            let plain_verb = !verb.starts_with('-')
-                && verb
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            let risky = RISKY_VERBS
-                .iter()
-                .any(|(tool, verbs)| *tool == base && verbs.contains(&verb));
-            if plain_verb && !risky {
-                return Some((format!("{base} {verb} *"), true));
-            }
+    if MULTIPLEXERS.contains(&base)
+        && let Some(verb) = words.get(1).copied()
+    {
+        let plain_verb = !verb.starts_with('-')
+            && verb
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        let risky = RISKY_VERBS
+            .iter()
+            .any(|(tool, verbs)| *tool == base && verbs.contains(&verb));
+        if plain_verb && !risky {
+            return Some((format!("{base} {verb} *"), true));
         }
     }
     Some((cmd, false))

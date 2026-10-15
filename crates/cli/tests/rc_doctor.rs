@@ -12,7 +12,7 @@ mod doctor;
 mod setup;
 use doctor::*;
 pub use orbit_cli::{config, lsp, phase_routing, tool_runtime};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 struct Fixture {
     root: PathBuf,
@@ -129,18 +129,73 @@ fn oversized_configuration_is_bounded() {
 }
 #[test]
 fn fabricated_credential_value_never_appears() {
+    const CHILD: &str = "ORBIT_DOCTOR_CREDENTIAL_CHILD";
+    const ENV: &str = "ORBIT_DOCTOR_CREDENTIAL_VALUE";
+    const SECRET: &str = "fabricated-private-value-9837142";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fabricated_credential_value_never_appears",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(ENV, SECRET)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated credential check timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let json = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once("ORBIT_DOCTOR_REPORT=")
+                    .map(|(_, json)| json)
+            })
+            .expect("child must return the measured report");
+        let report: DoctorReport = serde_json::from_str(json).unwrap();
+        assert!(report.ready);
+        assert!(!report.checks.is_empty());
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.id == "credential.0")
+                .unwrap()
+                .status,
+            CheckStatus::Ready
+        );
+        assert!(!stdout.contains(SECRET));
+        return;
+    }
     let f = Fixture::new();
-    let env = format!("ORBIT_DOCTOR_TEST_{}", ulid::Ulid::new());
-    let secret = "fabricated-private-value-9837142";
-    std::env::set_var(&env, secret);
+    assert_eq!(std::env::var(ENV).unwrap(), SECRET);
     let mut cfg = config::ProvidersConfig::load(&f.home).unwrap();
-    cfg.provider[0].env = Some(env.clone());
+    cfg.provider[0].env = Some(ENV.into());
     f.write("providers.toml", toml::to_string(&cfg).unwrap());
     let report = f.report();
     assert_eq!(f.status("credential.0"), CheckStatus::Ready);
     let bytes = serde_json::to_string(&report).unwrap();
-    assert!(!bytes.contains(secret));
-    std::env::remove_var(env);
+    assert!(!bytes.contains(SECRET));
+    println!("ORBIT_DOCTOR_REPORT={bytes}");
 }
 #[test]
 fn missing_credential_presence_is_missing() {
@@ -257,17 +312,21 @@ fn untrusted_project_configuration_is_not_activated_or_parsed() {
     std::fs::create_dir(&project).unwrap();
     std::fs::write(project.join("mcp.json"), b"{not valid").unwrap();
     let report = f.report();
-    assert!(report
-        .checks
-        .iter()
-        .find(|c| c.id == "project.trust")
-        .unwrap()
-        .detail
-        .contains("untrusted"));
-    assert!(!report
-        .checks
-        .iter()
-        .any(|c| c.id.starts_with("project.mcp")));
+    assert!(
+        report
+            .checks
+            .iter()
+            .find(|c| c.id == "project.trust")
+            .unwrap()
+            .detail
+            .contains("untrusted")
+    );
+    assert!(
+        !report
+            .checks
+            .iter()
+            .any(|c| c.id.starts_with("project.mcp"))
+    );
 }
 #[test]
 fn matching_bundle_hashes_and_version_are_verified_without_execution() {

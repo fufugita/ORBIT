@@ -427,9 +427,11 @@ fn gate4_continue_after_kill9() {
     // Turn 1 completes normally: the session file exists with 1 turn.
     let (events, code) = run_orbit_p(port, &home, "say hi once", &["--auto-tools"]);
     assert_eq!(code, 0);
-    assert!(events
-        .iter()
-        .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended")));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended"))
+    );
 
     // Turn 2 is killed mid-flight with SIGKILL (nothing can intercept).
     let mut child = Command::new(&bin)
@@ -477,12 +479,11 @@ fn gate4_continue_after_kill9() {
     let mut found_turns = 0u64;
     if let Ok(rd) = std::fs::read_dir(&sessions_dir) {
         for entry in rd.flatten() {
-            if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(t) = v.get("turns").and_then(|t| t.as_u64()) {
-                        found_turns = found_turns.max(t);
-                    }
-                }
+            if let Ok(text) = std::fs::read_to_string(entry.path())
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                && let Some(t) = v.get("turns").and_then(|t| t.as_u64())
+            {
+                found_turns = found_turns.max(t);
             }
         }
     }
@@ -825,13 +826,13 @@ fn gate2_one_loop_same_event_stream() {
             let Ok(line) = line else { break };
             if let Some(k) = line.strip_prefix("event: ") {
                 kind = k.trim().to_string();
-            } else if let Some(d) = line.strip_prefix("data: ") {
-                if !kind.is_empty() {
-                    sse2.lock()
-                        .unwrap()
-                        .push((kind.clone(), d.trim().to_string()));
-                    kind.clear();
-                }
+            } else if let Some(d) = line.strip_prefix("data: ")
+                && !kind.is_empty()
+            {
+                sse2.lock()
+                    .unwrap()
+                    .push((kind.clone(), d.trim().to_string()));
+                kind.clear();
             }
         }
     });
@@ -1247,11 +1248,14 @@ fn route_command_sets_targets_and_previews() {
     assert_eq!(v["phase"], "general", "{v}");
     assert_eq!(v["difficulty"], "hard", "custom keyword routes: {v}");
     assert_eq!(v["raw_model"], "big-model");
-    assert!(v["matched"]["hard_hits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|hit| hit["keyword"] == "orbitstuff" && hit["occurrences"].as_u64().unwrap_or(0) > 0));
+    assert!(
+        v["matched"]["hard_hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["keyword"] == "orbitstuff"
+                && hit["occurrences"].as_u64().unwrap_or(0) > 0)
+    );
 
     // Disarm: off clears both tiers.
     let (v, code) = run_route(&home, &["off"]);

@@ -110,18 +110,17 @@ fn user_turn(l: &TranscriptLine, cl: u16, cw: u16, class: WidthClass) -> Vec<Lin
             Span::raw(" "),
             Span::styled(row.clone(), Style::default().fg(comps::colour(Token::Ink))),
         ];
-        if i == 0 {
-            if let Some(t) = &l.time {
-                if show_time {
-                    let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
-                    let pad = band_w.saturating_sub(used + t.width() as u16 + 1);
-                    spans.push(Span::raw(" ".repeat(pad as usize)));
-                    spans.push(Span::styled(
-                        t.clone(),
-                        Style::default().fg(comps::colour(Token::Muted)),
-                    ));
-                }
-            }
+        if i == 0
+            && let Some(t) = &l.time
+            && show_time
+        {
+            let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
+            let pad = band_w.saturating_sub(used + t.width() as u16 + 1);
+            spans.push(Span::raw(" ".repeat(pad as usize)));
+            spans.push(Span::styled(
+                t.clone(),
+                Style::default().fg(comps::colour(Token::Muted)),
+            ));
         }
         // The band fills to band_w.
         let used: u16 = spans.iter().map(|s| s.width() as u16).sum();

@@ -14,8 +14,8 @@
 #![deny(unsafe_code)]
 
 use orbit_tools::fs_tools::{EditTool, ReadTool, WriteTool};
-use orbit_tools::permissions::{evaluate, parse_rule, PermissionMode, RuleEffectSerde, RuleSet};
-use orbit_tools::{bash, Tool, ToolContext};
+use orbit_tools::permissions::{PermissionMode, RuleEffectSerde, RuleSet, evaluate, parse_rule};
+use orbit_tools::{Tool, ToolContext, bash};
 
 fn cx_for(dir: &std::path::Path) -> ToolContext {
     ToolContext::new(

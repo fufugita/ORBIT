@@ -239,19 +239,19 @@ impl Node {
                 shares,
                 children,
             }) = self.at_mut(&parent_path)
+                && *d == direction
+                && children.len() < 8
             {
-                if *d == direction && children.len() < 8 {
-                    children.insert(
-                        child_i + 1,
-                        Node::Panel {
-                            view,
-                            agent: String::new(),
-                        },
-                    );
-                    shares.insert(child_i + 1, 1);
-                    normalize_shares(shares, children.len());
-                    return true;
-                }
+                children.insert(
+                    child_i + 1,
+                    Node::Panel {
+                        view,
+                        agent: String::new(),
+                    },
+                );
+                shares.insert(child_i + 1, 1);
+                normalize_shares(shares, children.len());
+                return true;
             }
         }
         // Otherwise replace the leaf with a split of two.
@@ -401,11 +401,11 @@ impl Node {
     /// A split with one child becomes that child (close/split can
     /// leave single-child splits behind).
     fn collapse(&mut self, path: &[usize]) {
-        if let Some(Node::Split { children, .. }) = self.at_mut(path) {
-            if children.len() == 1 {
-                let only = children.pop().unwrap();
-                *self.at_mut(path).unwrap() = only;
-            }
+        if let Some(Node::Split { children, .. }) = self.at_mut(path)
+            && children.len() == 1
+        {
+            let only = children.pop().unwrap();
+            *self.at_mut(path).unwrap() = only;
         }
     }
 
@@ -618,7 +618,7 @@ impl LayoutFile {
                     layout: Self::default_tree_file(),
                     revision: None,
                     legacy_bytes: None,
-                })
+                });
             }
             Err(error) => return Err(error),
         };
@@ -664,7 +664,7 @@ impl LayoutFile {
         home: &std::path::Path,
         expected: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>, String> {
-        use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+        use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
         use std::io::Write;
         if let Some(tree) = &self.tree {
             validate_legacy_tree(tree)?;
@@ -810,7 +810,7 @@ fn validate_legacy_tree(tree: &Node) -> Result<(), String> {
 }
 
 fn layout_dir(home: &std::path::Path) -> Result<std::fs::File, String> {
-    use rustix::fs::{open, Mode, OFlags};
+    use rustix::fs::{Mode, OFlags, open};
     let fd = open(
         home,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -850,7 +850,7 @@ fn layout_read(dir: &std::fs::File) -> Result<Option<Vec<u8>>, String> {
     layout_read_named(dir, "tui.toml")
 }
 fn layout_read_named(dir: &std::fs::File, name: &str) -> Result<Option<Vec<u8>>, String> {
-    use rustix::fs::{openat, Mode, OFlags};
+    use rustix::fs::{Mode, OFlags, openat};
     use std::io::Read;
     let fd = match openat(
         dir,

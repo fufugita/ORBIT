@@ -15,7 +15,7 @@ use daemon::{OwnerAction, OwnerConfig, OwnerRuntime, TurnState, UnixServer};
 use sessions::SessionLease;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -150,14 +150,18 @@ fn local_turn_one_prompt_uses_existing_engine_and_saves_reply() {
     assert_eq!(fixture.calls()[0]["model"], "model-a");
     let snapshot = handle.snapshot().unwrap();
     assert_eq!(snapshot.turns, 1);
-    assert!(serde_json::to_string(&snapshot.messages)
-        .unwrap()
-        .contains("owned fixture reply"));
+    assert!(
+        serde_json::to_string(&snapshot.messages)
+            .unwrap()
+            .contains("owned fixture reply")
+    );
     let saved = sessions::load_session(&fixture.root, "owned").unwrap();
-    assert!(saved
-        .transcript
-        .iter()
-        .any(|message| message.content == "owned fixture reply"));
+    assert!(
+        saved
+            .transcript
+            .iter()
+            .any(|message| message.content == "owned fixture reply")
+    );
     drop(controller);
     runtime.shutdown().unwrap();
 }
@@ -193,16 +197,20 @@ fn local_turn_private_socket_and_read_only_client_cannot_submit() {
         0o600
     );
     let mut stream = BufReader::new(daemon::local_connect(&fixture.socket()).unwrap());
-    assert!(rpc(
-        &mut stream,
-        serde_json::json!({"type":"hello","controlling":false})
-    )["ok"]
-        .as_bool()
-        .unwrap());
+    assert!(
+        rpc(
+            &mut stream,
+            serde_json::json!({"type":"hello","controlling":false})
+        )["ok"]
+            .as_bool()
+            .unwrap()
+    );
     assert!(!rpc(&mut stream, serde_json::json!({"type":"action","action":{"type":"prompt","request_id":"read-only","text":"refused"}}))["ok"].as_bool().unwrap());
-    assert!(rpc(&mut stream, serde_json::json!({"type":"status"}))["ok"]
-        .as_bool()
-        .unwrap());
+    assert!(
+        rpc(&mut stream, serde_json::json!({"type":"status"}))["ok"]
+            .as_bool()
+            .unwrap()
+    );
     assert_eq!(fixture.calls().len(), 0);
     drop(stream);
     stop.cancel();
@@ -313,12 +321,14 @@ fn stable_request_identity_deduplicates_completion_and_rejects_payload_conflict(
             .unwrap()
             .duplicate
     );
-    assert!(controller
-        .send(OwnerAction::Prompt {
-            request_id: "stable-key".into(),
-            text: "different intent".into()
-        })
-        .is_err());
+    assert!(
+        controller
+            .send(OwnerAction::Prompt {
+                request_id: "stable-key".into(),
+                text: "different intent".into()
+            })
+            .is_err()
+    );
     assert_eq!(fixture.calls().len(), 1);
     assert_eq!(handle.snapshot().unwrap().turns, 1);
     runtime.shutdown().unwrap();
@@ -341,9 +351,11 @@ fn restart_preserves_saved_conversation_and_durable_request_claim() {
     let runtime = fixture.start();
     let snapshot = runtime.handle().snapshot().unwrap();
     assert_eq!(snapshot.turns, 1);
-    assert!(serde_json::to_string(&snapshot.messages)
-        .unwrap()
-        .contains("saved prompt"));
+    assert!(
+        serde_json::to_string(&snapshot.messages)
+            .unwrap()
+            .contains("saved prompt")
+    );
     let mut controller = runtime.handle().claim_controller().unwrap();
     assert!(
         controller
@@ -382,13 +394,15 @@ fn approval_reconnect_keeps_exact_pending_id_and_independent_actions() {
     drop(controller);
     let mut controller = handle.claim_controller().unwrap();
     assert_eq!(wait_pending(&handle), id);
-    assert!(controller
-        .send(OwnerAction::Approval {
-            call_id: "stale".into(),
-            verdict: daemon::ApprovalChoice::AllowOnce,
-            note: None
-        })
-        .is_err());
+    assert!(
+        controller
+            .send(OwnerAction::Approval {
+                call_id: "stale".into(),
+                verdict: daemon::ApprovalChoice::AllowOnce,
+                note: None
+            })
+            .is_err()
+    );
     controller.send(OwnerAction::ListModels).unwrap();
     assert_eq!(wait_pending(&handle), id);
     assert!(!output.exists());
@@ -464,9 +478,11 @@ fn expired_replay_cursor_requires_fresh_snapshot() {
     assert!(subscription.recovery.snapshot.is_some());
     assert!(subscription.recovery.events.is_empty());
     assert!(subscription.recovery.cursor.sequence > 2);
-    assert!(serde_json::to_string(&subscription.recovery.snapshot)
-        .unwrap()
-        .contains("owned fixture reply"));
+    assert!(
+        serde_json::to_string(&subscription.recovery.snapshot)
+            .unwrap()
+            .contains("owned fixture reply")
+    );
     runtime.shutdown().unwrap();
 }
 
@@ -484,18 +500,22 @@ fn model_effort_settings_validate_save_and_restore_without_provider_calls() {
     let selected = handle.snapshot().unwrap();
     let saved_bytes = fs::read(fixture.root.join("sessions/owned.json")).unwrap();
     assert!(selected.effort_status.contains("high"));
-    assert!(controller
-        .send(OwnerAction::SetEffort {
-            choice: orbit_cli::parse_effort_setting("unsupported").unwrap()
-        })
-        .is_err());
+    assert!(
+        controller
+            .send(OwnerAction::SetEffort {
+                choice: orbit_cli::parse_effort_setting("unsupported").unwrap()
+            })
+            .is_err()
+    );
     assert_eq!(handle.snapshot().unwrap().effort, selected.effort);
-    assert!(controller
-        .send(OwnerAction::SetModel {
-            model: "missing".into(),
-            provider: None
-        })
-        .is_err());
+    assert!(
+        controller
+            .send(OwnerAction::SetModel {
+                model: "missing".into(),
+                provider: None
+            })
+            .is_err()
+    );
     assert_eq!(handle.snapshot().unwrap().model, "model-a");
     assert_eq!(
         fs::read(fixture.root.join("sessions/owned.json")).unwrap(),
@@ -733,9 +753,11 @@ fn process_crash_restart_labels_unknown_work_and_never_resubmits() {
         snapshot.requests["crash-key"].state,
         daemon::RequestState::Interrupted
     );
-    assert!(serde_json::to_string(&snapshot.messages)
-        .unwrap()
-        .contains("crash prompt"));
+    assert!(
+        serde_json::to_string(&snapshot.messages)
+            .unwrap()
+            .contains("crash prompt")
+    );
     let mut controller = handle.claim_controller().unwrap();
     let repeated = controller
         .send(OwnerAction::Prompt {
@@ -746,12 +768,14 @@ fn process_crash_restart_labels_unknown_work_and_never_resubmits() {
     assert!(repeated.duplicate);
     assert_eq!(repeated.state, "interrupted");
     assert_eq!(fixture.calls().len(), 1);
-    assert!(controller
-        .send(OwnerAction::Prompt {
-            request_id: "crash-key".into(),
-            text: "other prompt".into()
-        })
-        .is_err());
+    assert!(
+        controller
+            .send(OwnerAction::Prompt {
+                request_id: "crash-key".into(),
+                text: "other prompt".into()
+            })
+            .is_err()
+    );
     assert_eq!(fixture.calls().len(), 1);
     runtime.shutdown().unwrap();
 }
@@ -898,14 +922,16 @@ fn read_history_survives_a_later_prompt_edit() {
     wait_done(&handle);
     assert_eq!(fixture.calls().len(), 4);
     assert_eq!(fs::read_to_string(&file).unwrap(), "after\n");
-    assert!(fixture.calls()[3]["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|message| message["role"] == "tool"
-            && message["content"]
-                .as_str()
-                .is_some_and(|content| content.contains("after") || content.contains("ok"))));
+    assert!(
+        fixture.calls()[3]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("after") || content.contains("ok")))
+    );
     runtime.shutdown().unwrap();
 }
 
@@ -922,11 +948,13 @@ fn resume_acquires_candidate_before_swapping_and_preserves_saved_identity() {
     candidate.save(&saved).unwrap();
     let old_bytes = fs::read(fixture.root.join("sessions/owned.json")).unwrap();
     let mut controller = handle.claim_controller().unwrap();
-    assert!(controller
-        .send(OwnerAction::Resume {
-            session_id: "candidate".into()
-        })
-        .is_err());
+    assert!(
+        controller
+            .send(OwnerAction::Resume {
+                session_id: "candidate".into()
+            })
+            .is_err()
+    );
     assert_eq!(handle.snapshot().unwrap().session_id, "owned");
     assert_eq!(
         fs::read(fixture.root.join("sessions/owned.json")).unwrap(),
@@ -1189,9 +1217,11 @@ fn dropped_line_pem_markers_preserve_context_across_limit_and_delta_boundaries()
             let event = subscription.recv_timeout(Duration::from_secs(5)).unwrap();
             let encoded = serde_json::to_string(&event).unwrap();
             assert!(!encoded.contains(body), "{name} leaked in {}", event.kind);
-            assert!(!serde_json::to_string(&handle.snapshot().unwrap())
-                .unwrap()
-                .contains(body));
+            assert!(
+                !serde_json::to_string(&handle.snapshot().unwrap())
+                    .unwrap()
+                    .contains(body)
+            );
             if event.kind == "text_delta" {
                 live.push_str(event.payload["text"].as_str().unwrap());
             }

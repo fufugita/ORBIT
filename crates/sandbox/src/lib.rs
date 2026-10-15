@@ -15,8 +15,8 @@ pub mod linux;
 pub mod profile;
 
 pub use error::SandboxError;
-pub use linux::{probe_kernel, validate_applicable, KernelFeatures};
+pub use linux::{KernelFeatures, probe_kernel, validate_applicable};
 pub use profile::{
-    apply_override, builtin_profiles, resolve_profile, SandboxDomain, SandboxProfile,
-    SandboxProfileId,
+    SandboxDomain, SandboxProfile, SandboxProfileId, apply_override, builtin_profiles,
+    resolve_profile,
 };

@@ -165,9 +165,11 @@ fn phase_identity_qualified_raw_slashes_survive() {
 #[test]
 fn phase_identity_ambiguous_bare_id_requires_provider() {
     let f = Fixture::new();
-    assert!(resolve_model(&f.config, "base", None)
-        .unwrap_err()
-        .contains("ambiguous"));
+    assert!(
+        resolve_model(&f.config, "base", None)
+            .unwrap_err()
+            .contains("ambiguous")
+    );
     assert_eq!(
         resolve_model(&f.config, "other/base", None)
             .unwrap()
@@ -376,15 +378,17 @@ fn phase_target_absence_uses_legacy_then_base() {
 fn unknown_configured_target_errors_even_when_pinned() {
     let mut f = Fixture::new();
     f.settings.phases.get_mut(&TaskPhase::Coding).unwrap().hard = "local/nope".into();
-    assert!(preview(
-        &f.config,
-        &f.settings,
-        &f.base(),
-        SelectionOrigin::Flag,
-        "hello",
-        None
-    )
-    .is_err());
+    assert!(
+        preview(
+            &f.config,
+            &f.settings,
+            &f.base(),
+            SelectionOrigin::Flag,
+            "hello",
+            None
+        )
+        .is_err()
+    );
 }
 #[test]
 fn stale_qualified_prefix_never_becomes_foreign_raw_id() {
@@ -415,15 +419,17 @@ fn metadata_change_requires_checked_reresolution() {
     let mut f = Fixture::new();
     let old = f.base();
     f.config.provider[0].url = "http://127.0.0.1:9".into();
-    assert!(preview(
-        &f.config,
-        &f.settings,
-        &old,
-        SelectionOrigin::Default,
-        "hello",
-        None
-    )
-    .is_err());
+    assert!(
+        preview(
+            &f.config,
+            &f.settings,
+            &old,
+            SelectionOrigin::Default,
+            "hello",
+            None
+        )
+        .is_err()
+    );
 }
 #[test]
 fn changed_identity_uses_own_effort_and_preserves_base() {
@@ -482,15 +488,17 @@ fn overlong_keyword_and_prompt_are_refused() {
     });
     assert!(f.settings.keywords().is_err());
     f.settings.phase_keywords = None;
-    assert!(preview(
-        &f.config,
-        &f.settings,
-        &f.base(),
-        SelectionOrigin::Default,
-        &"x".repeat(256 * 1024 + 1),
-        None
-    )
-    .is_err());
+    assert!(
+        preview(
+            &f.config,
+            &f.settings,
+            &f.base(),
+            SelectionOrigin::Default,
+            &"x".repeat(256 * 1024 + 1),
+            None
+        )
+        .is_err()
+    );
 }
 #[test]
 fn malformed_phase_schema_is_not_ignored() {
@@ -547,19 +555,23 @@ fn set_reset_candidate_validates_without_touching_original() {
         },
     )
     .unwrap();
-    assert!(!parse_settings(&cleared)
-        .unwrap()
-        .phases
-        .contains_key(&TaskPhase::Design));
-    assert!(config_candidate(
-        &f.raw,
-        RouteMutation::Set {
-            phase: TaskPhase::Design,
-            difficulty: None,
-            model: "missing".into()
-        }
-    )
-    .is_err());
+    assert!(
+        !parse_settings(&cleared)
+            .unwrap()
+            .phases
+            .contains_key(&TaskPhase::Design)
+    );
+    assert!(
+        config_candidate(
+            &f.raw,
+            RouteMutation::Set {
+                phase: TaskPhase::Design,
+                difficulty: None,
+                model: "missing".into()
+            }
+        )
+        .is_err()
+    );
     assert_eq!(f.raw, original);
     let reset = config_candidate(&candidate, RouteMutation::Reset { phase: None }).unwrap();
     assert!(!parse_settings(&reset).unwrap().enabled());
@@ -584,19 +596,23 @@ fn invalid_urls_kinds_and_env_names_are_rejected() {
 }
 #[test]
 fn oversized_document_or_invalid_existing_shape_cannot_mutate() {
-    assert!(config_candidate(
-        &"x".repeat(MAX_CONFIG_BYTES + 1),
-        RouteMutation::Reset { phase: None }
-    )
-    .is_err());
-    assert!(config_candidate(
-        "routing=[]",
-        RouteMutation::Setup {
-            easy: "x".into(),
-            hard: "y".into()
-        }
-    )
-    .is_err());
+    assert!(
+        config_candidate(
+            &"x".repeat(MAX_CONFIG_BYTES + 1),
+            RouteMutation::Reset { phase: None }
+        )
+        .is_err()
+    );
+    assert!(
+        config_candidate(
+            "routing=[]",
+            RouteMutation::Setup {
+                easy: "x".into(),
+                hard: "y".into()
+            }
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -625,19 +641,23 @@ fn legacy_target_candidate_is_checked_and_can_be_disabled() {
         },
     )
     .unwrap();
-    assert!(ProvidersConfig::load_from_str(&cleared)
-        .unwrap()
-        .routing
-        .hard
-        .is_empty());
-    assert!(config_candidate(
-        &candidate,
-        RouteMutation::LegacyTarget {
-            difficulty: Difficulty::Easy,
-            model: "missing".into()
-        }
-    )
-    .is_err());
+    assert!(
+        ProvidersConfig::load_from_str(&cleared)
+            .unwrap()
+            .routing
+            .hard
+            .is_empty()
+    );
+    assert!(
+        config_candidate(
+            &candidate,
+            RouteMutation::LegacyTarget {
+                difficulty: Difficulty::Easy,
+                model: "missing".into()
+            }
+        )
+        .is_err()
+    );
 }
 #[test]
 fn legacy_keyword_candidates_add_remove_and_clear_without_dropping_other_values() {
@@ -651,11 +671,13 @@ fn legacy_keyword_candidates_add_remove_and_clear_without_dropping_other_values(
         },
     )
     .unwrap();
-    assert!(ProvidersConfig::load_from_str(&added)
-        .unwrap()
-        .routing_table()
-        .hard_keywords
-        .contains(&"bespoke".into()));
+    assert!(
+        ProvidersConfig::load_from_str(&added)
+            .unwrap()
+            .routing_table()
+            .hard_keywords
+            .contains(&"bespoke".into())
+    );
     let removed = config_candidate(
         &added,
         RouteMutation::EditKeywords {
@@ -665,11 +687,13 @@ fn legacy_keyword_candidates_add_remove_and_clear_without_dropping_other_values(
         },
     )
     .unwrap();
-    assert!(!ProvidersConfig::load_from_str(&removed)
-        .unwrap()
-        .routing_table()
-        .hard_keywords
-        .contains(&"bespoke".into()));
+    assert!(
+        !ProvidersConfig::load_from_str(&removed)
+            .unwrap()
+            .routing_table()
+            .hard_keywords
+            .contains(&"bespoke".into())
+    );
     let cleared = config_candidate(&added, RouteMutation::ClearKeywords).unwrap();
     let cfg = ProvidersConfig::load_from_str(&cleared).unwrap();
     assert!(cfg.routing_table().hard_keywords.is_empty());

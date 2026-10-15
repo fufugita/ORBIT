@@ -1,7 +1,7 @@
 //! Durable signed package storage and a read-time verified installed catalog.
 //! Package installation stores bytes and proof; it does not execute packages.
 
-use orbit_ledger::{validate_record, LedgerEvent, LedgerRecord, LedgerWriter, PluginInstall};
+use orbit_ledger::{LedgerEvent, LedgerRecord, LedgerWriter, PluginInstall, validate_record};
 use orbit_plugin::{PluginManifest, WasiHostAllowlist};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -469,26 +469,25 @@ fn catalog_selected(home: &Path, query: &str, exact: bool) -> Result<CatalogPage
             ledger_record_hash: String::new(),
             status: PackageStatus::Tampered,
         };
-        if let Ok(record) = record {
-            if valid_payload(&record.payload)
-                && record.v == "orbit.signed-install/v1"
-                && record.payload.install_id == id
-                && hex_string(&record.ledger_record_hash, 64)
-            {
-                let p = &record.payload;
-                entry = CatalogEntry {
-                    name: p.name.clone(),
-                    version: p.version.clone(),
-                    issuer_public_key: p.issuer_public_key.clone(),
-                    install_id: p.install_id.clone(),
-                    manifest_digest: p.manifest_digest.clone(),
-                    content_digest: p.content_digest.clone(),
-                    package_bytes: p.package_bytes,
-                    ledger_record_hash: record.ledger_record_hash.clone(),
-                    status: PackageStatus::Tampered,
-                };
-                entry.status = package_status(&store, &record, &issuers, &proofs);
-            }
+        if let Ok(record) = record
+            && valid_payload(&record.payload)
+            && record.v == "orbit.signed-install/v1"
+            && record.payload.install_id == id
+            && hex_string(&record.ledger_record_hash, 64)
+        {
+            let p = &record.payload;
+            entry = CatalogEntry {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                issuer_public_key: p.issuer_public_key.clone(),
+                install_id: p.install_id.clone(),
+                manifest_digest: p.manifest_digest.clone(),
+                content_digest: p.content_digest.clone(),
+                package_bytes: p.package_bytes,
+                ledger_record_hash: record.ledger_record_hash.clone(),
+                status: PackageStatus::Tampered,
+            };
+            entry.status = package_status(&store, &record, &issuers, &proofs);
         }
         let needle = query.to_ascii_lowercase();
         let contains = needle.is_empty()

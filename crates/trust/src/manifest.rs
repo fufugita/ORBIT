@@ -3,7 +3,7 @@
 //! v0.1 ships with a baked-in root public key plus local `trust add-root`.
 //! The manifest is signed; failure to verify against any root → exit 2, E0706.
 
-use crate::canonical::{canonical_bytes, sha256_hex, CanonicalError};
+use crate::canonical::{CanonicalError, canonical_bytes, sha256_hex};
 use crate::error::TrustError;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};

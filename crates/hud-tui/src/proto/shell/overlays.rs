@@ -3,11 +3,11 @@
 //! "show what?" picker, toasts that slide in with a draining line, and
 //! the big panel numbers shown while arranging.
 
-use super::canvas::{clip_text, mix, segs_width, text_width, tint, Cv, Rgb, Seg};
+use super::canvas::{Cv, Rgb, Seg, clip_text, mix, segs_width, text_width, tint};
 use super::frame::{hints_width, keyhints};
 use super::motion::{ease_in_out, ease_out, prog, secs};
 use super::pal::Palette;
-use crate::proto::chrome::{subsequence, COMMANDS};
+use crate::proto::chrome::{COMMANDS, subsequence};
 use crate::proto::layout::View;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;

@@ -6,7 +6,7 @@
 //! every result, and the ledger's intent/verdict/result records.
 
 use crate::permissions::{PermissionMode, RuleSet, Verdict};
-use crate::{registry, ToolContext, ToolResult};
+use crate::{ToolContext, ToolResult, registry};
 use orbit_adapter::types::ToolDefinition;
 use std::path::{Path, PathBuf};
 
@@ -203,7 +203,7 @@ fn risk_for(tool: &str, input: &serde_json::Value) -> u8 {
 #[cfg(test)]
 mod grant_precedence_tests {
     use super::*;
-    use crate::permissions::{parse_rule, RuleEffectSerde};
+    use crate::permissions::{RuleEffectSerde, parse_rule};
 
     struct Refuse(usize);
     impl ApprovalChannel for Refuse {
@@ -347,9 +347,12 @@ pub fn load_sourced_rules_in(
                 Scope::Project => {
                     let skipped = merge_scope(&mut rules, &v, trusted);
                     if skipped > 0 {
-                        warn_once(&path, &format!(
-                            "{skipped} allow rule(s) NOT applied: this folder is not trusted (orbit folder trust)"
-                        ));
+                        warn_once(
+                            &path,
+                            &format!(
+                                "{skipped} allow rule(s) NOT applied: this folder is not trusted (orbit folder trust)"
+                            ),
+                        );
                     }
                 }
             },
@@ -500,7 +503,7 @@ pub fn write_operator_override(
     effect: Option<crate::permissions::RuleEffectSerde>,
 ) -> Result<(), String> {
     use std::io::Write;
-    use toml_edit::{value, Array, DocumentMut, Item, Table};
+    use toml_edit::{Array, DocumentMut, Item, Table, value};
     let rule = crate::permissions::parse_rule(selector, crate::permissions::RuleEffectSerde::Ask)
         .ok_or_else(|| "a permission selector is required".to_string())?;
     if rule.tool != selector
@@ -641,7 +644,7 @@ pub fn write_operator_override(
 /// A `.orbit/.gitignore` naming the file is created when there is none,
 /// so a grant meant for one machine is not committed by accident.
 pub fn add_local_allow_rule(project: &Path, rule: &str) -> Result<PathBuf, String> {
-    use toml_edit::{value, Array, DocumentMut, Item, Table};
+    use toml_edit::{Array, DocumentMut, Item, Table, value};
     let dir = project.join(".orbit");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join("settings.local.toml");
@@ -774,13 +777,13 @@ fn merge_scope(rules: &mut RuleSet, v: &serde_json::Value, allow_ok: bool) -> us
         let key = format!("permissions.{table}");
         if let Some(arr) = v.get(&key).and_then(|x| x.as_array()) {
             for item in arr {
-                if let Some(s) = item.as_str() {
-                    if let Some(r) = crate::permissions::parse_rule(s, effect) {
-                        if effect == crate::permissions::RuleEffectSerde::Allow && !allow_ok {
-                            skipped += 1;
-                        } else {
-                            rules.rules.push(r);
-                        }
+                if let Some(s) = item.as_str()
+                    && let Some(r) = crate::permissions::parse_rule(s, effect)
+                {
+                    if effect == crate::permissions::RuleEffectSerde::Allow && !allow_ok {
+                        skipped += 1;
+                    } else {
+                        rules.rules.push(r);
                     }
                 }
             }
@@ -797,10 +800,10 @@ fn merge_legacy(rules: &mut RuleSet, v: &serde_json::Value) {
     ] {
         if let Some(arr) = v.get(key).and_then(|x| x.as_array()) {
             for item in arr {
-                if let Some(s) = item.as_str() {
-                    if let Some(r) = crate::permissions::parse_rule(s, effect) {
-                        rules.rules.push(r);
-                    }
+                if let Some(s) = item.as_str()
+                    && let Some(r) = crate::permissions::parse_rule(s, effect)
+                {
+                    rules.rules.push(r);
                 }
             }
         }

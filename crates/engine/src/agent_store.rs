@@ -556,16 +556,15 @@ fn validate_field(value: &str, field: &str) -> Result<(), String> {
 }
 
 fn validate_name(name: Option<&str>) -> Result<(), String> {
-    if let Some(name) = name {
-        if name.trim().is_empty()
+    if let Some(name) = name
+        && (name.trim().is_empty()
             || name.chars().count() > MAX_NAME_CHARS
-            || name.chars().any(char::is_control)
-        {
-            return Err(
-                "agent name must be nonempty, at most 64 characters, and contain no controls"
-                    .to_owned(),
-            );
-        }
+            || name.chars().any(char::is_control))
+    {
+        return Err(
+            "agent name must be nonempty, at most 64 characters, and contain no controls"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -807,12 +806,16 @@ mod tests {
         let parent = create(&first);
         let other = create(&second);
         assert!(second.load(&parent.agent_id).is_err());
-        assert!(second
-            .create("research", None, "mock/model", Some(&parent.agent_id))
-            .is_err());
-        assert!(second
-            .enqueue(&other.agent_id, "message", Some(&parent.agent_id))
-            .is_err());
+        assert!(
+            second
+                .create("research", None, "mock/model", Some(&parent.agent_id))
+                .is_err()
+        );
+        assert!(
+            second
+                .enqueue(&other.agent_id, "message", Some(&parent.agent_id))
+                .is_err()
+        );
         let child = first
             .create("research", None, "mock/model", Some(&parent.agent_id))
             .unwrap();
@@ -832,10 +835,12 @@ mod tests {
             second.directory.join(format!("{}.json", parent.agent_id)),
         )
         .unwrap();
-        assert!(second
-            .load(&parent.agent_id)
-            .unwrap_err()
-            .contains("owner mismatch"));
+        assert!(
+            second
+                .load(&parent.agent_id)
+                .unwrap_err()
+                .contains("owner mismatch")
+        );
         for id in [
             "../outside",
             "/tmp/outside",
@@ -863,10 +868,11 @@ mod tests {
             vec![old.clone()]
         );
         let peer = home.store("owner");
-        assert!(peer
-            .begin(&agent.agent_id, None)
-            .unwrap_err()
-            .contains("active run"));
+        assert!(
+            peer.begin(&agent.agent_id, None)
+                .unwrap_err()
+                .contains("active run")
+        );
         let new = peer.enqueue(&agent.agent_id, "during run", None).unwrap();
         let result = run
             .finish(
@@ -893,11 +899,13 @@ mod tests {
             )
             .unwrap();
         assert!(final_state.inbox.is_empty());
-        assert!(reopened
-            .begin(&agent.agent_id, None)
-            .unwrap()
-            .messages()
-            .is_empty());
+        assert!(
+            reopened
+                .begin(&agent.agent_id, None)
+                .unwrap()
+                .messages()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1055,13 +1063,17 @@ mod tests {
                 .enqueue(&another.agent_id, &"x".repeat(MAX_MESSAGE_BYTES), None)
                 .unwrap();
         }
-        assert!(store
-            .enqueue(&another.agent_id, "byte overflow", None)
-            .is_err());
+        assert!(
+            store
+                .enqueue(&another.agent_id, "byte overflow", None)
+                .is_err()
+        );
         assert!(store.enqueue(&another.agent_id, " ", None).is_err());
-        assert!(store
-            .enqueue(&another.agent_id, &"x".repeat(MAX_MESSAGE_BYTES + 1), None)
-            .is_err());
+        assert!(
+            store
+                .enqueue(&another.agent_id, &"x".repeat(MAX_MESSAGE_BYTES + 1), None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1071,17 +1083,23 @@ mod tests {
         assert!(AgentStore::new(&home.0, &"x".repeat(257)).is_err());
         let store = home.store("owner");
         for name in ["", "\ncontrol", &"x".repeat(65)] {
-            assert!(store
-                .create("research", Some(name), "mock/model", None)
-                .is_err());
+            assert!(
+                store
+                    .create("research", Some(name), "mock/model", None)
+                    .is_err()
+            );
         }
         assert!(store.create("", None, "mock/model", None).is_err());
-        assert!(store
-            .create("research", None, &"x".repeat(257), None)
-            .is_err());
-        assert!(store
-            .create("research", None, "mock/\nmodel", None)
-            .is_err());
+        assert!(
+            store
+                .create("research", None, &"x".repeat(257), None)
+                .is_err()
+        );
+        assert!(
+            store
+                .create("research", None, "mock/\nmodel", None)
+                .is_err()
+        );
         store
             .create("research", Some(&"é".repeat(64)), "mock/model", None)
             .unwrap();
@@ -1091,9 +1109,10 @@ mod tests {
         assert!(store.create("research", None, "mock/model", None).is_err());
         let list = store.list().unwrap();
         assert_eq!(list.len(), MAX_AGENTS);
-        assert!(list
-            .windows(2)
-            .all(|pair| pair[0].agent_id < pair[1].agent_id));
+        assert!(
+            list.windows(2)
+                .all(|pair| pair[0].agent_id < pair[1].agent_id)
+        );
         let serialized = serde_json::to_value(&list[0]).unwrap();
         assert!(serialized.get("transcript").is_none());
         assert!(serialized.get("inbox").is_none());
@@ -1135,14 +1154,15 @@ mod tests {
         let agent = create(&store);
         let message = store.enqueue(&agent.agent_id, "keep", None).unwrap();
         let run = store.begin(&agent.agent_id, None).unwrap();
-        assert!(run
-            .finish(
+        assert!(
+            run.finish(
                 vec![crate::user_message("uncommitted")],
                 "x".repeat(MAX_SNAPSHOT_BYTES + 1),
                 AgentStatus::Completed,
                 1
             )
-            .is_err());
+            .is_err()
+        );
         let loaded = store.load(&agent.agent_id).unwrap();
         assert_eq!(loaded.status, AgentStatus::Interrupted);
         assert!(loaded.transcript.is_empty());
@@ -1159,10 +1179,12 @@ mod tests {
         let nested_home = home.0.join("missing/parent/home");
         let nested_store = AgentStore::new(&nested_home, "nested-owner").unwrap();
         let nested_agent = create(&nested_store);
-        assert!(AgentStore::new(&nested_home, "nested-owner")
-            .unwrap()
-            .load(&nested_agent.agent_id)
-            .is_ok());
+        assert!(
+            AgentStore::new(&nested_home, "nested-owner")
+                .unwrap()
+                .load(&nested_agent.agent_id)
+                .is_ok()
+        );
         for path in [
             home.0.join("missing"),
             home.0.join("missing/parent"),
@@ -1206,9 +1228,11 @@ mod tests {
         assert_eq!(fs::read(&unrelated).unwrap(), b"do not touch");
         fs::remove_file(store.directory.join(".state.lock")).unwrap();
         symlink(&unrelated, store.directory.join(".state.lock")).unwrap();
-        assert!(store
-            .enqueue(&agent.agent_id, "do not write", None)
-            .is_err());
+        assert!(
+            store
+                .enqueue(&agent.agent_id, "do not write", None)
+                .is_err()
+        );
         assert_eq!(fs::read(&unrelated).unwrap(), b"do not touch");
     }
     #[test]

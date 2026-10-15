@@ -179,10 +179,12 @@ mod tests {
         let sbom_raw = std::fs::read_to_string(dir.join("sbom.spdx.json")).unwrap();
         let sbom: serde_json::Value = serde_json::from_str(&sbom_raw).unwrap();
         assert_eq!(sbom["spdxVersion"], "SPDX-2.3");
-        assert!(sbom["packages"]
-            .as_array()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false));
+        assert!(
+            sbom["packages"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        );
         // Spot-check reproducibility: the binary built twice is byte-identical.
         let repro_raw = std::fs::read_to_string(dir.join("reproducibility.json")).unwrap();
         let repro: serde_json::Value = serde_json::from_str(&repro_raw).unwrap();

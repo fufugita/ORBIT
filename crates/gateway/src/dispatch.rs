@@ -19,11 +19,11 @@
 //! safely do (GW-09): never redispatch an ambiguous/output-observed attempt.
 
 use crate::registry::ProviderRegistry;
+use orbit_adapter::ProviderAdapter;
 use orbit_adapter::credential::SecretBytes;
 use orbit_adapter::types::{
     DecisionId, ProviderRequest, ProviderResult, ProviderRouteBinding, RequestId,
 };
-use orbit_adapter::ProviderAdapter;
 use orbit_egress::{BrokerVerdict, EgressAllowlist, EgressBroker, EgressTuple, SpkiPin};
 use orbit_ledger::event::{EgressDestination, EgressIntent, LedgerEvent};
 use orbit_ledger::{LedgerError, LedgerWriter, SessionId};
@@ -172,7 +172,7 @@ impl DispatchEngine {
                     message: format!("decision_id {decision_id} already dispatched (E0701)"),
                     session_id: session_id.into(),
                     decision_id: decision_id.into(),
-                })
+                });
             }
             Err(e) => {
                 return Err(DispatchError {
@@ -181,7 +181,7 @@ impl DispatchEngine {
                     message: format!("recovery read failed: {e}"),
                     session_id: session_id.into(),
                     decision_id: decision_id.into(),
-                })
+                });
             }
         }
 
@@ -245,7 +245,7 @@ impl DispatchEngine {
                             policy_snapshot_id: "pol".into(),
                             intent_digest: String::new(),
                         },
-                    ))
+                    ));
                 }
             };
 
@@ -297,7 +297,7 @@ impl DispatchEngine {
                     message: format!("decision_id {decision_id} already dispatched (E0701)"),
                     session_id: session_id.into(),
                     decision_id: decision_id.into(),
-                })
+                });
             }
             Err(e) => {
                 return Err(DispatchError {
@@ -306,7 +306,7 @@ impl DispatchEngine {
                     message: format!("recovery read failed: {e}"),
                     session_id: session_id.into(),
                     decision_id: decision_id.into(),
-                })
+                });
             }
         }
 
@@ -373,7 +373,7 @@ impl DispatchEngine {
                             policy_snapshot_id: "pol".into(),
                             intent_digest: String::new(),
                         },
-                    ))
+                    ));
                 }
             };
 
@@ -387,7 +387,7 @@ impl DispatchEngine {
                         message: e.to_string(),
                     },
                     reservation,
-                ))
+                ));
             }
         };
         match orbit_provider_http::stream::collect_stream(stream, observer).await {

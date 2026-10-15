@@ -209,14 +209,14 @@ def source_bundle(args, stage, target):
     manifest = tomllib.loads(manifest_raw.decode())
     if manifest.get("workspace", {}).get("package", {}).get("version") != args.version:
         fail("requested version does not match the supplied checkout")
-    if manifest.get("workspace", {}).get("package", {}).get("rust-version") != "1.94":
-        fail("source checkout must require Rust 1.94")
-    if not shutil.which("cargo") or not shutil.which("rustc"): fail("source mode requires Cargo and Rust 1.94")
+    if manifest.get("workspace", {}).get("package", {}).get("rust-version") != "1.99":
+        fail("source checkout must require Rust 1.99")
+    if not shutil.which("cargo") or not shutil.which("rustc"): fail("source mode requires Cargo and Rust 1.99")
     env = os.environ.copy()
-    env["RUSTUP_TOOLCHAIN"] = "1.94.0"
+    env["RUSTUP_TOOLCHAIN"] = "1.99.0"
     env["CARGO_BUILD_JOBS"] = "1"
     result = subprocess.run(["rustc", "--version"], check=True, capture_output=True, text=True, timeout=15, env=env)
-    if not re.match(r"rustc 1\.94\.", result.stdout): fail("source mode requires Rust 1.94")
+    if not re.match(r"rustc 1\.99\.", result.stdout): fail("source mode requires Rust 1.99")
     build = stage / "build"
     run(["cargo", "build", "--locked", "--release", "--manifest-path", str(checkout / "Cargo.toml"), "--target", target, "--target-dir", str(build), "-p", "orbit-cli", "--bin", "orbit", "-p", "orbit-web", "--bin", "orbit-web"], timeout=3600, cwd=checkout, env=env)
     files, components = {}, {}

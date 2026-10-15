@@ -13,8 +13,8 @@ pub mod dispatch;
 pub mod registry;
 
 pub use dispatch::{
-    new_decision_id, new_request_id, new_session_id, tmpdir, DispatchEngine, DispatchError,
-    DispatchOutcome, DispatchState, EgressReservation,
+    DispatchEngine, DispatchError, DispatchOutcome, DispatchState, EgressReservation,
+    new_decision_id, new_request_id, new_session_id, tmpdir,
 };
 pub use registry::ProviderRegistry;
 
@@ -167,7 +167,7 @@ impl Gateway {
                 return Admission::Denied {
                     gate: Gate::Capability,
                     reason: "no capability card/route for model (E0405)".into(),
-                }
+                };
             }
         };
         // Gate 3: Egress — the route must be pinned (endpoint present).

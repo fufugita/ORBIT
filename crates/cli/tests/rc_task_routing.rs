@@ -2,7 +2,7 @@
 use orbit_cli::tool_runtime::{
     self, ApprovalChannel, ApprovalRequest, ApprovalVerdict, AutoGrants, PermissionScope,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -323,12 +323,12 @@ fn routed_parent_inherits_new_model_default_without_base_override_leak() {
             .model,
         "family/routed-notools"
     );
-    assert!(f
-        .cx
-        .ext::<tool_runtime::SessionEffortSetting>()
-        .unwrap()
-        .0
-        .is_none());
+    assert!(
+        f.cx.ext::<tool_runtime::SessionEffortSetting>()
+            .unwrap()
+            .0
+            .is_none()
+    );
 }
 #[test]
 fn invalid_phase_target_refuses_before_provider_or_agent() {

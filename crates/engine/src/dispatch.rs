@@ -116,9 +116,18 @@ impl TurnConfig {
         };
         self.kind.validate_effort_value(effort)?;
         match &self.supported_efforts {
-            None => Err(format!("effort support is unknown for model {}; declare supported_efforts before selecting {effort}", self.model)),
-            Some(choices) if choices.is_empty() => Err(format!("model {} declares effort controls unsupported", self.model)),
-            Some(choices) if !choices.contains(effort) => Err(format!("effort {effort} is not supported by model {}", self.model)),
+            None => Err(format!(
+                "effort support is unknown for model {}; declare supported_efforts before selecting {effort}",
+                self.model
+            )),
+            Some(choices) if choices.is_empty() => Err(format!(
+                "model {} declares effort controls unsupported",
+                self.model
+            )),
+            Some(choices) if !choices.contains(effort) => Err(format!(
+                "effort {effort} is not supported by model {}",
+                self.model
+            )),
             Some(_) => Ok(()),
         }
     }

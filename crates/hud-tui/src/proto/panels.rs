@@ -6,7 +6,7 @@
 //! `TestBackend` and compare cells and styles.
 
 use super::comps;
-use super::core::{glyphs, Token};
+use super::core::{Token, glyphs};
 use super::layout::View;
 #[cfg(test)]
 use super::scenario::TranscriptLine;
@@ -387,8 +387,8 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     /// Golden-shape test: render the default three-column layout at a
     /// fixed tick and assert the structural invariants (numbers in

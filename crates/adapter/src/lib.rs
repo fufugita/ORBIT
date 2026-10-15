@@ -29,6 +29,6 @@ mod tests;
 
 pub use adapters::{DeterministicTestV1, MockHttpV1, MockScript};
 pub use credential::{CredentialLease, SecretBytes};
-pub use error::{profile_mismatch, AdapterError, AdapterRetryClass};
+pub use error::{AdapterError, AdapterRetryClass, profile_mismatch};
 pub use provider_adapter::ProviderAdapter;
 pub use types::*;

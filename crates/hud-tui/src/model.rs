@@ -70,10 +70,35 @@ pub struct ReadinessRow {
     pub label: String,
 }
 
-/// Compute the welcome readiness row from the real environment: trust
-/// root present, ledger segment count, active provider · model. Each
-/// check is measured, not asserted — a missing trust root shows ✗.
+/// The checked session identity shared by the frontend and its worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupIdentity {
+    pub model: String,
+    pub provider_id: String,
+    pub session_id: String,
+}
+
+impl StartupIdentity {
+    /// Compatibility for standalone callers that supply startup values through env.
+    pub(crate) fn from_env() -> Self {
+        Self {
+            model: std::env::var("ORBIT_ACTIVE_MODEL").unwrap_or_default(),
+            provider_id: std::env::var("ORBIT_ACTIVE_PROVIDER").unwrap_or_else(|_| "local".into()),
+            session_id: std::env::var("ORBIT_SESSION_ID").unwrap_or_default(),
+        }
+    }
+}
+
+/// Compute readiness for standalone callers using read-only environment defaults.
 pub fn compute_readiness(home: &std::path::Path) -> Vec<ReadinessRow> {
+    compute_readiness_with_identity(home, &StartupIdentity::from_env())
+}
+
+/// Measure trust and ledger state alongside the caller's resolved provider/model.
+pub fn compute_readiness_with_identity(
+    home: &std::path::Path,
+    identity: &StartupIdentity,
+) -> Vec<ReadinessRow> {
     let mut rows = Vec::new();
     // Trust root: the signed trust anchor `orbit init` writes. The file
     // is trust/manifest.json (see cmd_init) — an earlier revision of
@@ -96,10 +121,16 @@ pub fn compute_readiness(home: &std::path::Path) -> Vec<ReadinessRow> {
             if segs == 1 { "" } else { "s" }
         ),
     });
-    // Provider · model: the CLI exports the ACTIVE pair before the
-    // in-process TUI starts (ORBIT_ACTIVE_MODEL / ORBIT_ACTIVE_PROVIDER).
-    let model = std::env::var("ORBIT_ACTIVE_MODEL").unwrap_or_else(|_| "unset".into());
-    let provider = std::env::var("ORBIT_ACTIVE_PROVIDER").unwrap_or_else(|_| "local".into());
+    let model = if identity.model.is_empty() {
+        "unset"
+    } else {
+        &identity.model
+    };
+    let provider = if identity.provider_id.is_empty() {
+        "local"
+    } else {
+        &identity.provider_id
+    };
     rows.push(ReadinessRow {
         ok: model != "unset",
         label: format!("{provider} · {model}"),

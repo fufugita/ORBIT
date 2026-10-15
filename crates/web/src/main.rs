@@ -6,7 +6,7 @@ use orbit_cli::{
     sessions::{SessionFile, SessionLease},
     tui_worker::TuiTurnConfig,
 };
-use orbit_web::{run_bridge_owned_with_customization, BridgeConfig};
+use orbit_web::{BridgeConfig, run_bridge_owned_with_customization};
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
     args.iter()
@@ -238,7 +238,7 @@ fn startup(args: &[String]) -> Result<(BridgeConfig, SessionLease, bool), String
         })
         .unwrap_or_default();
     if args.iter().any(|argument| argument == "--bare") {
-        std::env::set_var("ORBIT_BARE", "1");
+        orbit_cli::tools::enable_bare_mode();
     }
     let origin = orbit_cli::startup_selection_origin(
         value_after(args, "--model").is_some(),
@@ -411,9 +411,11 @@ mod browser_startup_tests {
             "--gate".into(),
             "http://127.0.0.1:45678".into(),
         ];
-        assert!(configured_gate_preflight(&args, &providers)
-            .unwrap_err()
-            .contains("requires --provider"));
+        assert!(
+            configured_gate_preflight(&args, &providers)
+                .unwrap_err()
+                .contains("requires --provider")
+        );
         assert!(!home.0.join("sessions").exists());
     }
 }

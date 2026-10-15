@@ -5,7 +5,7 @@
 //! behavior where specified, stable exit codes, and golden fixtures").
 #![allow(unused_imports)] // used only in #[test] fns
 
-use orbit_cli::{parse_args, CliOutput, ExecMode};
+use orbit_cli::{CliOutput, ExecMode, parse_args};
 
 #[allow(dead_code)] // used only in #[test] fns
 fn fixture_path(name: &str) -> String {
@@ -40,14 +40,18 @@ fn cli_version_evidence_golden() {
         profile == "debug" || profile == "release",
         "profile must be the real build profile, got {profile:?}"
     );
-    assert!(!v["data"]["build"]["target"]
-        .as_str()
-        .unwrap_or("")
-        .is_empty());
-    assert!(!v["data"]["build"]["toolchain"]
-        .as_str()
-        .unwrap_or("")
-        .is_empty());
+    assert!(
+        !v["data"]["build"]["target"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty()
+    );
+    assert!(
+        !v["data"]["build"]["toolchain"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty()
+    );
     // Evidence: hashes present (hex or empty) and bundle_ready CONSISTENT
     // with them — a bundle is ready only when all three hash to something.
     let ev = &v["data"]["evidence"];

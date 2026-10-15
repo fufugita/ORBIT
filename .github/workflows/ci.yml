@@ -6,6 +6,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -52,6 +53,11 @@ jobs:
         # that was the test process signalling its whole user session via
         # `kill -TERM -<pgid>`, not the runner — fixed in the code.)
         run: cargo test --workspace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: npm distribution contracts
+        run: scripts/in-jail.sh node scripts/npm_distribution_test.mjs
       - name: disk after test
         if: always()
         run: df -h /

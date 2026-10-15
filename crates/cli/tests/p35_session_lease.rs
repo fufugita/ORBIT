@@ -2,7 +2,7 @@
 
 use orbit_cli::sessions::{SessionFile, SessionLease, SessionLeaseError};
 use std::fs;
-use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

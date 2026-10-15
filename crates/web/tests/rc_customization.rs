@@ -12,8 +12,8 @@ use orbit_cli::{
     tui_worker::TuiTurnConfig,
 };
 use orbit_frontend_protocol::customization::*;
-use orbit_web::{router, BridgeState};
-use serde_json::{json, Value};
+use orbit_web::{BridgeState, router};
+use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
@@ -54,10 +54,10 @@ impl Fixture {
         let ready: Value = loop {
             assert!(Instant::now() < until);
             assert!(provider.try_wait().unwrap().is_none());
-            if let Ok(bytes) = fs::read(root.join("ready.json")) {
-                if let Ok(value) = serde_json::from_slice(&bytes) {
-                    break value;
-                }
+            if let Ok(bytes) = fs::read(root.join("ready.json"))
+                && let Ok(value) = serde_json::from_slice(&bytes)
+            {
+                break value;
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -188,11 +188,13 @@ async fn authenticated_profile_get_is_readonly_and_returns_actual_panes() {
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["resolved"]["profile"]["theme"], "orbit");
-    assert!(value["panes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|p| p["text"] == "FIRST LOCAL NOTES"));
+    assert!(
+        value["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["text"] == "FIRST LOCAL NOTES")
+    );
     assert_eq!(f.bytes(), before);
     assert!(f.calls().is_empty());
     controller.send(json!({"type":"effort"})).unwrap();
@@ -306,15 +308,17 @@ fn invalid_font_and_color_leave_exact_profile_bytes_unchanged() {
         ("browser.font_size_px", "25"),
         ("token_overrides.ink", "red;display:none"),
     ] {
-        assert!(controller
-            .send(f.action(
-                &state,
-                ProfileCommand::Set {
-                    key: key.into(),
-                    value: value.into()
-                }
-            ))
-            .is_err());
+        assert!(
+            controller
+                .send(f.action(
+                    &state,
+                    ProfileCommand::Set {
+                        key: key.into(),
+                        value: value.into()
+                    }
+                ))
+                .is_err()
+        );
     }
     assert_eq!(f.bytes(), before);
     assert!(f.calls().is_empty());
@@ -373,9 +377,13 @@ fn undeclared_index_and_stale_action_declaration_cannot_dispatch() {
     changed.profile.panes[0].actions.clear();
     f.host.replace(changed.profile, &changed.revision).unwrap();
     let before = f.bytes();
-    assert!(controller
-        .send(json!({"type":"pane_action","pane_id":"notes","action_index":1,"revision":revision}))
-        .is_err());
+    assert!(
+        controller
+            .send(
+                json!({"type":"pane_action","pane_id":"notes","action_index":1,"revision":revision})
+            )
+            .is_err()
+    );
     assert_eq!(f.bytes(), before);
     assert!(f.calls().is_empty());
     drop(controller);
@@ -423,11 +431,13 @@ fn missing_and_symlinked_file_sources_are_visible_without_leaking_file_contents(
     let reply = controller
         .send(json!({"type":"pane_refresh","pane_id":"notes","revision":revision}))
         .unwrap();
-    assert!(reply["panes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|p| p["id"] == "notes" && p["state"] == "missing"));
+    assert!(
+        reply["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == "notes" && p["state"] == "missing")
+    );
     fs::write(f.root.join("outside.txt"), "NEVER DISPLAY OUTSIDE").unwrap();
     std::os::unix::fs::symlink(f.root.join("outside.txt"), f.work.join("notes.md")).unwrap();
     let reply = controller

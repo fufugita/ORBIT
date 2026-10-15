@@ -1,5 +1,5 @@
 //! Bounded offline readiness. No check launches a program or contacts a provider.
-use crate::customization::{read_regular, Directory, Error};
+use crate::customization::{Directory, Error, read_regular};
 use crate::setup::{optional_file, validate_provider, verify_bounded_ledger, verify_identity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

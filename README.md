@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/rust-1.94-orange"></a>
+  <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/rust-1.99-orange"></a>
   <a href="https://github.com/fufugita/ORBIT/releases"><img alt="Release" src="https://img.shields.io/badge/release-v0.2.0-blue"></a>
   <a href="https://github.com/fufugita/ORBIT/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/fufugita/ORBIT/actions/workflows/ci.yml/badge.svg"></a>
   <a href="#license"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
@@ -127,6 +127,26 @@ too small.
 
 ## Install
 
+On Linux, Homebrew can build the current main branch with both executables:
+
+```sh
+brew tap fufugita/orbit https://github.com/fufugita/ORBIT.git
+brew install --HEAD fufugita/orbit/orbit
+```
+
+The npm distribution is `@fufugita/orbit`, with prebuilt Linux x64 and arm64
+glibc 2.35+ packages. It needs Node.js 22.15+ (or 23.11+), and no Rust compiler or
+installation script. Once the package has been published:
+
+```sh
+npm install --global @fufugita/orbit@next
+```
+
+The initial npm release requires registry authentication; the package source and
+native build workflow do not imply that a version is already published. See
+[package distribution](docs/setup.md#package-distribution) for local package
+installation and publishing prerequisites.
+
 Install the command-line and browser executables as one verified bundle. Release
 mode needs Bash, Python 3.11+, curl, and a SHA-256 utility; Rust is needed only for
 a source build. Use a version with published native Linux assets:
@@ -140,7 +160,7 @@ The installer requires the archive checksum and both executable hashes. Managed
 upgrades switch both binaries together and preserve your configuration. It refuses
 unmanaged executables in the destination; choose a fresh `--dir` in that case.
 A missing release asset fails visibly. To build explicitly from a checkout with
-the pinned Rust 1.94 toolchain and locked dependencies:
+the pinned Rust 1.99 toolchain and locked dependencies:
 
 ```sh
 git clone https://github.com/fufugita/ORBIT
@@ -595,8 +615,12 @@ shell, SDK parity — is tracked in
 
 ## Development
 
+The workspace uses Rust 1.99 with edition 2024. An edition selects language
+semantics; its year is separate from the compiler release. The exact compiler
+is pinned in `rust-toolchain.toml` for consistent builds.
+
 ```sh
-# Toolchain is pinned to Rust 1.94 via rust-toolchain.toml
+# Rust 1.99 compiler and 2024 language edition; dependencies stay locked
 cargo build
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check

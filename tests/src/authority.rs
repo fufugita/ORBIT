@@ -6,8 +6,8 @@
 
 use orbit_core::authority::error::AuthorityError;
 use orbit_core::authority::intent::{
-    extract_directives, AuthorityConfirmation, AuthorityDimension, AuthorityProvenance,
-    AuthorityScope, ConfirmationChannel, UserAuthorityIntent, UserTypedSpan,
+    AuthorityConfirmation, AuthorityDimension, AuthorityProvenance, AuthorityScope,
+    ConfirmationChannel, UserAuthorityIntent, UserTypedSpan, extract_directives,
 };
 use std::collections::BTreeSet;
 

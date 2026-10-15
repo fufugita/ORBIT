@@ -6,7 +6,7 @@ mod customization;
 use customization::*;
 pub use orbit_cli::tool_runtime;
 use orbit_frontend_protocol::customization::*;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 use tool_runtime::PermissionScope;
 struct Fixture {
@@ -311,14 +311,16 @@ fn pane_inherited_read_denial() {
     }));
     std::fs::write(f.workspace.join("notes.md"), b"secret").unwrap();
     let scope = PermissionScope::from_flags(None, None, Some("Read"));
-    assert!(read_pane_scoped(
-        &f.home,
-        &f.workspace,
-        "notes",
-        &PaneContext::default(),
-        &scope
-    )
-    .is_err());
+    assert!(
+        read_pane_scoped(
+            &f.home,
+            &f.workspace,
+            "notes",
+            &PaneContext::default(),
+            &scope
+        )
+        .is_err()
+    );
 }
 #[test]
 fn pane_saved_path_rule_denial() {
@@ -603,16 +605,18 @@ fn review_regression_dontask_inherited_bare_read_allows_and_keeps_denials() {
     }));
     std::fs::write(f.workspace.join("notes.md"), b"INHERITED BARE READ NOTE").unwrap();
     let mut scope = PermissionScope::from_flags(Some("dontAsk"), Some("Read"), None);
-    assert!(read_pane_scoped(
-        &f.home,
-        &f.workspace,
-        "notes",
-        &PaneContext::default(),
-        &scope
-    )
-    .unwrap()
-    .text
-    .contains("INHERITED BARE READ NOTE"));
+    assert!(
+        read_pane_scoped(
+            &f.home,
+            &f.workspace,
+            "notes",
+            &PaneContext::default(),
+            &scope
+        )
+        .unwrap()
+        .text
+        .contains("INHERITED BARE READ NOTE")
+    );
     scope.disallowlist.push("Read(notes.md)".into());
     assert!(matches!(
         read_pane_scoped(
@@ -634,16 +638,18 @@ fn review_regression_dontask_inherited_matching_read_selector_allows_but_ask_win
     }));
     std::fs::write(f.workspace.join("notes.md"), b"MATCHED INHERITED READ NOTE").unwrap();
     let scope = PermissionScope::from_flags(Some("dontAsk"), Some("Read(notes.md)"), None);
-    assert!(read_pane_scoped(
-        &f.home,
-        &f.workspace,
-        "notes",
-        &PaneContext::default(),
-        &scope
-    )
-    .unwrap()
-    .text
-    .contains("MATCHED INHERITED READ NOTE"));
+    assert!(
+        read_pane_scoped(
+            &f.home,
+            &f.workspace,
+            "notes",
+            &PaneContext::default(),
+            &scope
+        )
+        .unwrap()
+        .text
+        .contains("MATCHED INHERITED READ NOTE")
+    );
     std::fs::write(
         f.home.join("settings.toml"),
         "[permissions]\nask=['Read(notes.md)']\n",
@@ -703,16 +709,18 @@ fn review_regression_dontask_pane_allow_rule_permits_read_but_cannot_override_as
         "[allow]\ntools=['Read(notes.md)']\n",
     )
     .unwrap();
-    assert!(read_pane_scoped(
-        &f.home,
-        &f.workspace,
-        "notes",
-        &PaneContext::default(),
-        &scope
-    )
-    .unwrap()
-    .text
-    .contains("EXPLICITLY PERMITTED NOTE"));
+    assert!(
+        read_pane_scoped(
+            &f.home,
+            &f.workspace,
+            "notes",
+            &PaneContext::default(),
+            &scope
+        )
+        .unwrap()
+        .text
+        .contains("EXPLICITLY PERMITTED NOTE")
+    );
     std::fs::write(
         f.home.join("settings.toml"),
         "[permissions]\nallow=['Read']\nask=['Read(notes.md)']\n",
@@ -746,11 +754,12 @@ fn review_regression_live_pane_mode_overrides_only_mode_and_keeps_inherited_deni
         scope: PermissionScope::default(),
     };
     let mut context = PaneContext::default();
-    assert!(host
-        .read_pane("notes", &context)
-        .unwrap()
-        .text
-        .contains("LOCAL LIVE MODE NOTE"));
+    assert!(
+        host.read_pane("notes", &context)
+            .unwrap()
+            .text
+            .contains("LOCAL LIVE MODE NOTE")
+    );
     context.permission_mode = Some("dontAsk".into());
     assert!(host.read_pane("notes", &context).is_err());
     assert_eq!(host.scope.mode, PermissionMode::Default);
@@ -759,11 +768,12 @@ fn review_regression_live_pane_mode_overrides_only_mode_and_keeps_inherited_deni
         "[allow]\ntools=['Read(notes.md)']\n",
     )
     .unwrap();
-    assert!(host
-        .read_pane("notes", &context)
-        .unwrap()
-        .text
-        .contains("LOCAL LIVE MODE NOTE"));
+    assert!(
+        host.read_pane("notes", &context)
+            .unwrap()
+            .text
+            .contains("LOCAL LIVE MODE NOTE")
+    );
     host.scope.disallowlist.push("Read".into());
     context.permission_mode = Some("default".into());
     assert!(host.read_pane("notes", &context).is_err());
@@ -858,14 +868,16 @@ fn review_regression_absolute_read_rules_override_inherited_allow_on_every_pane_
     }
     std::fs::remove_file(f.home.join("settings.toml")).unwrap();
     let scope = PermissionScope::from_flags(Some("dontAsk"), Some("Read"), None);
-    assert!(read_pane_scoped(
-        &f.home,
-        &f.workspace,
-        "notes",
-        &PaneContext::default(),
-        &scope
-    )
-    .unwrap()
-    .text
-    .contains("PRIVATE ABSOLUTE RULE NOTE"));
+    assert!(
+        read_pane_scoped(
+            &f.home,
+            &f.workspace,
+            "notes",
+            &PaneContext::default(),
+            &scope
+        )
+        .unwrap()
+        .text
+        .contains("PRIVATE ABSOLUTE RULE NOTE")
+    );
 }

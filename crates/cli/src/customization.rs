@@ -56,7 +56,7 @@ impl Directory {
                     _ => {
                         return Err(Error::UnsafePath(
                             "path contains non-normal components".into(),
-                        ))
+                        ));
                     }
                 }
                 let m = std::fs::symlink_metadata(&checked).map_err(io_error)?;
@@ -661,7 +661,7 @@ fn authorized(
     scope: &PermissionScope,
 ) -> Result<(), Error> {
     use orbit_tools::permissions::{
-        parse_rule, rule_matches, rule_tool_matches, RuleEffect, RuleEffectSerde, RuleSet,
+        RuleEffect, RuleEffectSerde, RuleSet, parse_rule, rule_matches, rule_tool_matches,
     };
     if orbit_tools::is_deny_read(path) {
         return Err(Error::UnsafePath(

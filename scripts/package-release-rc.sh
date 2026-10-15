@@ -5,7 +5,7 @@ ORBIT_PACKAGE_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 cd "$ORBIT_PACKAGE_ROOT"
 command -v cargo >/dev/null || { printf '%s\n' 'package: Cargo is required' >&2; exit 1; }
 command -v python3 >/dev/null || { printf '%s\n' 'package: Python 3.11+ is required' >&2; exit 1; }
-export RUSTUP_TOOLCHAIN=1.94.0
+export RUSTUP_TOOLCHAIN=1.99.0
 export CARGO_BUILD_JOBS=1
 ORBIT_PACKAGE_VERSION="$(cargo metadata --no-deps --locked --format-version 1 | python3 -c 'import json,sys; p=json.load(sys.stdin)["packages"]; v={x["version"] for x in p if x["name"] in ("orbit-cli","orbit-web")}; assert len(v)==1, "component versions differ"; print(v.pop())')"
 ORBIT_PACKAGE_TARGET="$(rustc -vV | sed -n 's/^host: //p')"

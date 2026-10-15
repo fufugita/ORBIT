@@ -1,6 +1,6 @@
 use orbit_frontend_protocol::customization::*;
 use orbit_hud_tui::{
-    customization::{profile_tree, ActionEffect, CustomizationSession},
+    customization::{ActionEffect, CustomizationSession, profile_tree},
     proto::{
         app::App,
         core::Tier,
@@ -9,12 +9,12 @@ use orbit_hud_tui::{
         shell::{self, DrawIn, Fx},
     },
 };
-use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -558,12 +558,14 @@ fn layout_profile_change_makes_legacy_revision_stale() {
     let snapshot = LayoutFile::load_checked(&home.0).unwrap();
     let before = std::fs::read(home.0.join("tui.toml")).unwrap();
     write_private(home.0.join("customization.json"), "{\"name\":\"Changed\"}").unwrap();
-    assert!(LayoutFile {
-        tree: Some(Node::default_tree()),
-        from_preset: "columns".into()
-    }
-    .save_checked(&home.0, snapshot.revision.as_deref())
-    .is_err());
+    assert!(
+        LayoutFile {
+            tree: Some(Node::default_tree()),
+            from_preset: "columns".into()
+        }
+        .save_checked(&home.0, snapshot.revision.as_deref())
+        .is_err()
+    );
     assert_eq!(std::fs::read(home.0.join("tui.toml")).unwrap(), before);
 }
 
@@ -577,11 +579,13 @@ fn layout_uses_the_profile_stores_shared_exclusive_lock() {
         .open(home.0.join(".customization.lock"))
         .unwrap();
     lock.try_lock().unwrap();
-    assert!(LayoutFile {
-        tree: Some(Node::default_tree()),
-        from_preset: "columns".into()
-    }
-    .save(&home.0)
-    .is_err());
+    assert!(
+        LayoutFile {
+            tree: Some(Node::default_tree()),
+            from_preset: "columns".into()
+        }
+        .save(&home.0)
+        .is_err()
+    );
     assert!(!home.0.join("tui.toml").exists());
 }

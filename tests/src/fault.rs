@@ -19,9 +19,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use orbit_export::{generate_local_key, restore, ExportBuilder};
+use orbit_export::{ExportBuilder, generate_local_key, restore};
 use orbit_ledger::event::{LedgerEvent, Phase, PhaseTransition, SessionStart};
-use orbit_ledger::{verify_ledger, LedgerError, LedgerWriter};
+use orbit_ledger::{LedgerError, LedgerWriter, verify_ledger};
 
 #[allow(dead_code)] // used only in #[test] fns
 fn tmpdir(tag: &str) -> PathBuf {

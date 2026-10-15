@@ -367,23 +367,23 @@ pub fn denial_reason(payload: &str) -> Option<String> {
 
 /// Wrap a result payload: inline when short, spilled when long.
 pub fn finish(mut result: ToolResult, cx: &ToolContext, call_id: &str) -> ToolResult {
-    if result.payload.len() > INLINE_LIMIT {
-        if let Ok(dir) = cx.outputs_dir() {
-            let path = dir.join(format!("{call_id}.txt"));
-            if std::fs::write(&path, &result.payload).is_ok() {
-                let preview = result.payload.chars().take(2_000).collect::<String>();
-                result.payload = serde_json::json!({
-                    // E4: the spill wrapper's verdict is the typed one
-                    // (the payload's own top-level ok, parsed — never
-                    // a substring of the preview).
-                    "ok": !result_is_error(&result.payload) && !result.is_error,
-                    "note": "result too long for inline display",
-                    "spilled_to": path.to_string_lossy(),
-                    "preview": preview,
-                })
-                .to_string();
-                result.spilled_to = Some(path);
-            }
+    if result.payload.len() > INLINE_LIMIT
+        && let Ok(dir) = cx.outputs_dir()
+    {
+        let path = dir.join(format!("{call_id}.txt"));
+        if std::fs::write(&path, &result.payload).is_ok() {
+            let preview = result.payload.chars().take(2_000).collect::<String>();
+            result.payload = serde_json::json!({
+                // E4: the spill wrapper's verdict is the typed one
+                // (the payload's own top-level ok, parsed — never
+                // a substring of the preview).
+                "ok": !result_is_error(&result.payload) && !result.is_error,
+                "note": "result too long for inline display",
+                "spilled_to": path.to_string_lossy(),
+                "preview": preview,
+            })
+            .to_string();
+            result.spilled_to = Some(path);
         }
     }
     result
@@ -652,10 +652,10 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// Resolve a tool argument path against the working directory,
 /// expanding `~`.
 pub fn resolve_path(cx: &ToolContext, p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix('~') {
-        if let Ok(home) = std::env::var("HOME") {
-            return Path::new(&home).join(rest.trim_start_matches('/'));
-        }
+    if let Some(rest) = p.strip_prefix('~')
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return Path::new(&home).join(rest.trim_start_matches('/'));
     }
     let path = Path::new(p);
     if path.is_absolute() {

@@ -20,12 +20,12 @@
 
 #![allow(unused_imports)] // used only in #[test] fns
 
-use orbit_core::authority::intent::{extract_directives, AuthorityDimension, UserTypedSpan};
+use orbit_core::authority::intent::{AuthorityDimension, UserTypedSpan, extract_directives};
 use orbit_ledger::canonical;
 use orbit_ledger::event::{
     LedgerEvent, LedgerRecord, Phase, PhaseTransition, SessionEnd, SessionStart, TerminalOutcome,
 };
-use orbit_ledger::{verify_ledger, LedgerWriter};
+use orbit_ledger::{LedgerWriter, verify_ledger};
 use orbit_reactor::{Phase as ReactorPhase, Reactor};
 use std::path::PathBuf;
 

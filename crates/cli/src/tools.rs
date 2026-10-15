@@ -8,6 +8,13 @@
 use orbit_adapter::types::ToolDefinition;
 use sha2::{Digest, Sha256};
 
+static BARE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Select the process's script-friendly tool set before starting workers.
+pub fn enable_bare_mode() {
+    BARE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn config_home_from_env() -> std::path::PathBuf {
     // C8: the ONE home resolver — same precedence as the CLI entry
     // (--home > ORBIT_HOME > ~/.orbit > existing local .orbit). The old
@@ -76,9 +83,10 @@ pub fn session_tool_definitions_with_context(
 ) -> Vec<ToolDefinition> {
     // --bare skips discovering skills, mods, MCP servers and memory
     // files (phase 6: fast start for scripts).
-    if std::env::var("ORBIT_BARE")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    if BARE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("ORBIT_BARE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     {
         return tool_definitions();
     }
@@ -486,16 +494,16 @@ pub(crate) fn execute_task_in_session(
         .ok_or_else(|| format!("unknown subagent: {agent_type}"))?;
     let store = crate::tool_runtime::agent_store_for_context(home, session_id, parent_cx)?;
     let saved = resume.map(|id| store.load(id)).transpose()?;
-    if let Some(saved) = &saved {
-        if saved.agent_type != agent_type {
-            return Err(AgentTaskError::for_agent(
-                format!(
-                    "agent type mismatch: stored '{}', requested '{}'",
-                    saved.agent_type, agent_type
-                ),
-                &saved.agent_id,
-            ));
-        }
+    if let Some(saved) = &saved
+        && saved.agent_type != agent_type
+    {
+        return Err(AgentTaskError::for_agent(
+            format!(
+                "agent type mismatch: stored '{}', requested '{}'",
+                saved.agent_type, agent_type
+            ),
+            &saved.agent_id,
+        ));
     }
     let mut turn_config = crate::tool_runtime::task_config_for(
         parent_cx,
@@ -623,7 +631,8 @@ pub(crate) fn execute_task_in_session(
         max_rounds: agent.max_turns,
         system_directive: Some(format!(
             "You are {name}, a subagent. {desc}\n\nComplete the task and reply with your final report. You do not see the parent conversation.",
-            name = agent.name, desc = agent.description
+            name = agent.name,
+            desc = agent.description
         )),
         request_stem: format!("orbit-task-{id}"),
         ..Default::default()
@@ -902,11 +911,10 @@ fn calculator() -> BuiltinTool {
             if expr.len() > 512 {
                 return Err("expression too long".into());
             }
-            if !expr.chars().all(|c| {
-                c.is_ascii_digit()
-                    || c.is_ascii_whitespace()
-                    || "+-*/()^%.".contains(c)
-            }) {
+            if !expr
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_whitespace() || "+-*/()^%.".contains(c))
+            {
                 return Err("expression contains disallowed characters".into());
             }
             let result = eval_arithmetic(expr).ok_or_else(|| "invalid expression".to_string())?;
@@ -1254,6 +1262,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bare_tool_definitions_respect_startup_and_environment() {
+        const CHILD: &str = "ORBIT_BARE_TOOL_TEST_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            if mode == "flag" {
+                enable_bare_mode();
+            }
+            let home = std::env::temp_dir().join(format!("orbit-bare-{}", ulid::Ulid::new()));
+            std::fs::create_dir(&home).unwrap();
+            let definitions = session_tool_definitions(&home);
+            let has = |name: &str| definitions.iter().any(|tool| tool.name == name);
+            assert!(has("Read") && has("Bash") && has("calculator"));
+            if mode == "full" {
+                assert!(has("Skill") && has("Task") && has("ListAgents"));
+            } else {
+                assert_eq!(definitions.len(), tool_definitions().len());
+                assert!(!has("Skill") && !has("Task") && !has("ListAgents"));
+            }
+            std::fs::remove_dir_all(home).unwrap();
+            println!("ORBIT_BARE_TOOLS_CHECKED={mode}");
+            return;
+        }
+        for (mode, bare) in [("full", "0"), ("env", "1"), ("flag", "0")] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::tests::bare_tool_definitions_respect_startup_and_environment",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, mode)
+                .env("ORBIT_BARE", bare)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated bare-tool check timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("ORBIT_BARE_TOOLS_CHECKED={mode}"))
+            );
+        }
+    }
+
+    #[test]
     fn risk_classification_is_backend_authoritative() {
         // Known pure-data tools are low; anything unclassified fails toward
         // medium, never silently low.
@@ -1276,11 +1345,13 @@ mod tests {
 
     #[test]
     fn calculator_rejects_code_characters_and_div_zero() {
-        assert!(execute(
-            "calculator",
-            &serde_json::json!({"expression":"system(\"id\")"})
-        )
-        .is_err());
+        assert!(
+            execute(
+                "calculator",
+                &serde_json::json!({"expression":"system(\"id\")"})
+            )
+            .is_err()
+        );
         assert!(execute("calculator", &serde_json::json!({"expression":"1/0"})).is_err());
     }
 
@@ -1473,8 +1544,8 @@ mod approval_tests {
 #[cfg(test)]
 mod link_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     /// The subagent's token was a fresh one nobody could cancel: Esc on

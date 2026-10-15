@@ -103,11 +103,11 @@ fn run_corpus(rng: &mut Lcg, name: &str, seed: &[u8], f: &dyn Fn(&[u8])) {
 /// IR CBOR encode never panics on any mutation (floats → Err, not panic).
 fn fuzz_ir_cbor(input: &[u8]) {
     // Treat input as a JSON Value string; encode must be total.
-    if let Ok(s) = std::str::from_utf8(input) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            // Encoding either succeeds or returns a float error — never panic.
-            let _ = orbit_ir::cbor::encode(&v);
-        }
+    if let Ok(s) = std::str::from_utf8(input)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+    {
+        // Encoding either succeeds or returns a float error — never panic.
+        let _ = orbit_ir::cbor::encode(&v);
     }
 }
 

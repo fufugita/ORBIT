@@ -17,8 +17,8 @@
 #![allow(unused_imports)] // used only in #[test] fns
 
 use orbit_adapter::adapters::{
-    canonical_success_result, identity, text_capabilities, DeterministicTestV1, MockHttpV1,
-    MockScript,
+    DeterministicTestV1, MockHttpV1, MockScript, canonical_success_result, identity,
+    text_capabilities,
 };
 use orbit_adapter::conformance::canonical_request;
 use orbit_adapter::credential::SecretBytes;
@@ -27,8 +27,8 @@ use orbit_adapter::stream::{output_evidence, validate_stream};
 use orbit_adapter::types::*;
 use orbit_egress::{EgressAllowlist, EgressTuple, SpkiPin};
 use orbit_gateway::{
-    new_decision_id, new_request_id, new_session_id, DispatchEngine, DispatchOutcome,
-    ProviderRegistry,
+    DispatchEngine, DispatchOutcome, ProviderRegistry, new_decision_id, new_request_id,
+    new_session_id,
 };
 use orbit_ledger::LedgerWriter;
 
@@ -183,12 +183,14 @@ fn gateway_recovery_reads_durable_dispatch_state() {
 #[test]
 fn gateway_retry_policy_max_two_attempts_same_route() {
     let g = orbit_gateway::Gateway::new(vec![], vec![]);
-    assert!(g
-        .should_retry(0, orbit_gateway::RetryClass::RetryableTransport)
-        .is_ok());
-    assert!(g
-        .should_retry(1, orbit_gateway::RetryClass::RetryableTransport)
-        .is_ok());
+    assert!(
+        g.should_retry(0, orbit_gateway::RetryClass::RetryableTransport)
+            .is_ok()
+    );
+    assert!(
+        g.should_retry(1, orbit_gateway::RetryClass::RetryableTransport)
+            .is_ok()
+    );
     // Attempt 2 = third total → E0407.
     assert_eq!(
         g.should_retry(2, orbit_gateway::RetryClass::RetryableTransport)

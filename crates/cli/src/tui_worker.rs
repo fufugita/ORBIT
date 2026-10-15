@@ -154,12 +154,13 @@ pub fn make_spawner_owned(
                     choices: questions
                         .iter()
                         .map(|q| {
-                            vec![q
-                                .options
-                                .get(pick)
-                                .or_else(|| q.options.first())
-                                .cloned()
-                                .unwrap_or_default()]
+                            vec![
+                                q.options
+                                    .get(pick)
+                                    .or_else(|| q.options.first())
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            ]
                         })
                         .collect(),
                 }
@@ -494,16 +495,17 @@ fn worker_main_owned(
                 // E10: the attestation scan runs in EVERY front-end —
                 // an unverified claim becomes a visible status, not a
                 // silent exit 0.
-                if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript) {
-                    if scan.claimed_pass && scan.exit_code != 0 {
-                        orbit_hud_tui::emit_status(
-                            &ctx.sender,
-                            &format!(
-                                "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
-                                scan.command, scan.exit_code
-                            ),
-                        );
-                    }
+                if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
+                    && scan.claimed_pass
+                    && scan.exit_code != 0
+                {
+                    orbit_hud_tui::emit_status(
+                        &ctx.sender,
+                        &format!(
+                            "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
+                            scan.command, scan.exit_code
+                        ),
+                    );
                 }
                 // Always emit ResponseFinished — the TUI's turn_in_flight flag
                 // and queue drain both depend on it, whether the turn
@@ -1545,21 +1547,18 @@ fn display_path(path: &str) -> String {
     if !path.starts_with('/') {
         return path.to_string();
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(rest) = path.strip_prefix(cwd.to_string_lossy().as_ref()) {
-            if let Some(rest) = rest.strip_prefix('/') {
-                if !rest.is_empty() {
-                    return rest.to_string();
-                }
-            }
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(rest) = path.strip_prefix(cwd.to_string_lossy().as_ref())
+        && let Some(rest) = rest.strip_prefix('/')
+        && !rest.is_empty()
+    {
+        return rest.to_string();
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        if let Some(rest) = path.strip_prefix(home.to_string_lossy().as_ref()) {
-            if rest.starts_with('/') {
-                return format!("~{rest}");
-            }
-        }
+    if let Some(home) = std::env::var_os("HOME")
+        && let Some(rest) = path.strip_prefix(home.to_string_lossy().as_ref())
+        && rest.starts_with('/')
+    {
+        return format!("~{rest}");
     }
     path.to_string()
 }
@@ -2131,7 +2130,8 @@ impl TuiToolExecutor {
     /// borrows `self`, so the round can hand it to `thread::scope`.
     fn read_only_runner(
         &self,
-    ) -> impl Fn(orbit_engine::PendingToolCall) -> orbit_engine::ToolRoundResult + Sync {
+    ) -> impl Fn(orbit_engine::PendingToolCall) -> orbit_engine::ToolRoundResult + Sync + use<>
+    {
         let st = TuiReadOnlyState {
             home: self.home.clone(),
             session_id: self.session_id.clone(),
@@ -2783,9 +2783,11 @@ default_effort = "medium"
                 .count(),
             3
         );
-        assert!(reports
-            .iter()
-            .any(|s| s.contains("reasoning_effort requires a named level")));
+        assert!(
+            reports
+                .iter()
+                .any(|s| s.contains("reasoning_effort requires a named level"))
+        );
         assert!(reports.iter().any(|s| s.starts_with("Model unchanged:")
             && s.contains("Use /effort default before switching.")));
         let saved = crate::sessions::load_session(&home, "session-test").unwrap();
@@ -2862,9 +2864,10 @@ default_effort = "medium"
         }
         let kinds: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(kinds, ["intent", "verdict", "result"]);
-        assert!(got
-            .iter()
-            .all(|(_, d)| d.as_ref().is_some_and(|d| d.len() == 64)));
+        assert!(
+            got.iter()
+                .all(|(_, d)| d.as_ref().is_some_and(|d| d.len() == 64))
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -3412,12 +3415,16 @@ mod mention_tests {
         }
         let expanded = expand_file_mentions(&mentions.join(" "), &cx_in(&d));
         assert_eq!(expanded.images.len(), MAX_MENTION_IMAGES);
-        assert!(expanded
-            .text
-            .ends_with(" [image not attached: prompt image limit reached]"));
-        assert!(expanded
-            .text
-            .contains(&format!("@capture{MAX_MENTION_IMAGES}.png")));
+        assert!(
+            expanded
+                .text
+                .ends_with(" [image not attached: prompt image limit reached]")
+        );
+        assert!(
+            expanded
+                .text
+                .contains(&format!("@capture{MAX_MENTION_IMAGES}.png"))
+        );
     }
 
     #[test]
@@ -3443,9 +3450,11 @@ mod mention_tests {
             })
             .sum();
         assert!(encoded_bytes <= MAX_MENTION_IMAGE_DATA);
-        assert!(expanded
-            .text
-            .ends_with("@capture3.png [image not attached: prompt image limit reached]"));
+        assert!(
+            expanded
+                .text
+                .ends_with("@capture3.png [image not attached: prompt image limit reached]")
+        );
     }
 
     #[test]

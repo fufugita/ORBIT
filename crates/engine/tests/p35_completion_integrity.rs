@@ -7,8 +7,8 @@ use orbit_provider_http::CancelToken;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -242,16 +242,20 @@ fn compaction_case(reason: &str, expected_summary: bool) {
     );
     if expected_summary {
         assert!(transcript[0].content.contains("summary candidate"));
-        assert!(!transcript
-            .iter()
-            .any(|message| message.content == original[0].content));
+        assert!(
+            !transcript
+                .iter()
+                .any(|message| message.content == original[0].content)
+        );
         let requests = fixture.requests.lock().unwrap();
         let wire = requests[1]["messages"].as_array().unwrap();
         assert_eq!(wire.len(), 7, "one summary plus the newest six messages");
-        assert!(wire[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("summary candidate"));
+        assert!(
+            wire[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("summary candidate")
+        );
         for (actual, expected) in wire[1..6].iter().zip(&original[7..]) {
             assert_eq!(actual["content"], expected.content);
         }
@@ -263,11 +267,13 @@ fn compaction_case(reason: &str, expected_summary: bool) {
             "incomplete compaction cannot replace history"
         );
         let requests = fixture.requests.lock().unwrap();
-        assert!(requests[1]["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|message| message["content"] == original[0].content));
+        assert!(
+            requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["content"] == original[0].content)
+        );
     }
     assert_eq!(transcript.last().unwrap().content, "ordinary answer");
 }
@@ -334,9 +340,11 @@ fn cancellation_during_compaction_preserves_history_and_skips_main_request() {
     assert_eq!(fixture.calls(), 1);
     assert_eq!(&transcript[..original.len()], original.as_slice());
     assert_eq!(transcript.last().unwrap().content, "latest prompt");
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, FrontendEvent::Compacted { .. })));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, FrontendEvent::Compacted { .. }))
+    );
 }
 
 fn partial_case(thinking: bool) {
@@ -383,9 +391,11 @@ fn partial_case(thinking: bool) {
     assert!(
         partial.tool_calls.is_none() && partial.blocks.is_none() && partial.origin_model.is_none()
     );
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, FrontendEvent::Retrying { .. })));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, FrontendEvent::Retrying { .. }))
+    );
 }
 
 #[test]

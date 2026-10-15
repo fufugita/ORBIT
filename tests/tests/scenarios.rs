@@ -281,14 +281,14 @@ fn scenario_f1_fix_the_test() {
     assert_eq!(count(&events, "turn_ended"), 1, "one turn_ended");
     // No tool result says the call was refused.
     for e in &events {
-        if let Some(t) = e.get("type").and_then(|t| t.as_str()) {
-            if t.contains("tool") {
-                let text = e.to_string();
-                assert!(
-                    !text.contains("refused"),
-                    "tool event carries a refusal: {text}"
-                );
-            }
+        if let Some(t) = e.get("type").and_then(|t| t.as_str())
+            && t.contains("tool")
+        {
+            let text = e.to_string();
+            assert!(
+                !text.contains("refused"),
+                "tool event carries a refusal: {text}"
+            );
         }
     }
 }

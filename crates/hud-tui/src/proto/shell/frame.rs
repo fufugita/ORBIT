@@ -2,7 +2,7 @@
 //! tinted header band with its number chip, state badges, pills and key
 //! hints — ported from the prototype's `panelFrame`.
 
-use super::canvas::{clip_text, mix, segs_width, text_width, tint, Cv, Rgb, Seg};
+use super::canvas::{Cv, Rgb, Seg, clip_text, mix, segs_width, text_width, tint};
 use super::pal::Palette;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -279,10 +279,10 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
             break;
         }
     }
-    if let Some(b) = &badge {
-        if pill_width(b) > max_b {
-            badge = None;
-        }
+    if let Some(b) = &badge
+        && pill_width(b) > max_b
+    {
+        badge = None;
     }
     let bw = badge.as_ref().map(|b| pill_width(b)).unwrap_or(0);
     let room = w - 6 - (xx - x) - bw;

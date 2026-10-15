@@ -10,8 +10,8 @@ use orbit_cli::{
     tool_runtime::PermissionScope,
     tui_worker::TuiTurnConfig,
 };
-use orbit_web::{router, BridgeState};
-use serde_json::{json, Value};
+use orbit_web::{BridgeState, router};
+use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::fs::DirBuilderExt,
@@ -44,10 +44,10 @@ impl Fixture {
         let ready: Value = loop {
             assert!(Instant::now() < until);
             assert!(provider.try_wait().unwrap().is_none());
-            if let Ok(bytes) = fs::read(root.join("ready.json")) {
-                if let Ok(ready) = serde_json::from_slice::<Value>(&bytes) {
-                    break ready;
-                }
+            if let Ok(bytes) = fs::read(root.join("ready.json"))
+                && let Ok(ready) = serde_json::from_slice::<Value>(&bytes)
+            {
+                break ready;
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -156,10 +156,12 @@ fn owner_query_one_prompt_uses_shared_engine_and_saves_once() {
     assert_eq!(fixture.calls().len(), 1);
     assert_eq!(fixture.calls()[0]["model"], "vendor/model-a");
     let saved = sessions::load_session(&fixture.root, "browser-owned").unwrap();
-    assert!(saved
-        .transcript
-        .iter()
-        .any(|message| message.content == "owned fixture reply"));
+    assert!(
+        saved
+            .transcript
+            .iter()
+            .any(|message| message.content == "owned fixture reply")
+    );
     drop(client);
     runtime.shutdown().unwrap();
 }
@@ -227,9 +229,10 @@ fn owner_query_pending_approval_recovers_exact_id_and_rejects_stale() {
         id
     );
     let mut next = state.claim_controller().unwrap();
-    assert!(next
-        .send(json!({"type":"approval","call_id":"stale","verdict":"deny","note":null}))
-        .is_err());
+    assert!(
+        next.send(json!({"type":"approval","call_id":"stale","verdict":"deny","note":null}))
+            .is_err()
+    );
     assert_eq!(state.snapshot().unwrap().pending_approvals.len(), 1);
     next.send(json!({"type":"approval","call_id":id,"verdict":"deny","note":"fixture refusal"}))
         .unwrap();

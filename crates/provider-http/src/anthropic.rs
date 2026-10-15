@@ -91,10 +91,10 @@ fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<serde_js
                 // thinking, compaction) — the API requires them intact.
                 if let Some(obs) = &m.blocks {
                     for b in obs {
-                        if let ContentBlock::Opaque { json } = b {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
-                                blocks.push(v);
-                            }
+                        if let ContentBlock::Opaque { json } = b
+                            && let Ok(v) = serde_json::from_str::<serde_json::Value>(json)
+                        {
+                            blocks.push(v);
                         }
                     }
                 }
@@ -361,9 +361,9 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
 
 fn anthropic_stream(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
-        + Unpin
-        + Send
-        + 'static,
+    + Unpin
+    + Send
+    + 'static,
     first_byte_timeout_ms: u64,
     idle_timeout_ms: u64,
     cancel: CancelToken,
@@ -454,11 +454,10 @@ fn anthropic_stream(
                                 }
                             }
                             "input_json_delta" => {
-                                if let Some(part) = v.pointer("/delta/partial_json").and_then(|x|x.as_str()) {
-                                    if let Some((_, _, json)) = tool_calls.get_mut(&index) {
+                                if let Some(part) = v.pointer("/delta/partial_json").and_then(|x|x.as_str())
+                                    && let Some((_, _, json)) = tool_calls.get_mut(&index) {
                                         json.push_str(part);
                                     }
-                                }
                             }
                             _ => {}
                         }

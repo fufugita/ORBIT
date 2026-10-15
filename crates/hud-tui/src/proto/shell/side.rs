@@ -2,7 +2,7 @@
 //! what the engine has sent. A section with no data says so instead of
 //! inventing rows.
 
-use super::canvas::{clip_text, text_width, tint, Cv, Rgb, Seg};
+use super::canvas::{Cv, Rgb, Seg, clip_text, text_width, tint};
 use super::convo::kind_of;
 use super::frame::{pill, pill_width, star_frame};
 use super::motion::{flash, secs};
@@ -153,7 +153,7 @@ pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool, mono
             Some(colors.sidebar),
         );
         yy += 2;
-        for (_, a) in s.agents.iter() {
+        for a in s.agents.values() {
             // M15: arcs at 10 fps; M16: the pill flashes green for 600 ms
             // when the agent finishes.
             let arc = if reduced {

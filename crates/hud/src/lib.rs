@@ -222,7 +222,7 @@ fn redact_line(line: &str) -> String {
             return format!(
                 "{}= [redacted:secret]{}",
                 k,
-                &v[1 + v[1..].len() - val.len()..].trim_start_matches(val)
+                v[1 + v[1..].len() - val.len()..].trim_start_matches(val)
             );
         }
     }

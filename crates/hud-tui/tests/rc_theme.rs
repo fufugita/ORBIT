@@ -3,9 +3,9 @@ use orbit_hud_tui::proto::{
     app::App,
     core::Tier,
     scenario::{LineKind, Scenario, TranscriptLine},
-    shell::{self, canvas::Cv, pal::Palette, DrawIn, Fx},
+    shell::{self, DrawIn, Fx, canvas::Cv, pal::Palette},
 };
-use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, Terminal};
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect, style::Color};
 
 fn profile(theme: &str) -> Profile {
     Profile {
@@ -334,10 +334,11 @@ fn shell_256_conversion_happens_after_theme() {
         5000,
     );
     assert!(b.content.iter().any(|c| matches!(c.fg, Color::Indexed(_))));
-    assert!(!b
-        .content
-        .iter()
-        .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..))));
+    assert!(
+        !b.content
+            .iter()
+            .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..)))
+    );
 }
 #[test]
 fn shell_16_conversion_happens_after_theme() {
@@ -350,11 +351,12 @@ fn shell_16_conversion_happens_after_theme() {
         40,
         5000,
     );
-    assert!(!b
-        .content
-        .iter()
-        .any(|c| matches!(c.fg, Color::Rgb(..) | Color::Indexed(_))
-            || matches!(c.bg, Color::Rgb(..) | Color::Indexed(_))));
+    assert!(
+        !b.content
+            .iter()
+            .any(|c| matches!(c.fg, Color::Rgb(..) | Color::Indexed(_))
+                || matches!(c.bg, Color::Rgb(..) | Color::Indexed(_)))
+    );
 }
 #[test]
 fn shell_mono_keeps_labels_without_colors() {
@@ -380,20 +382,22 @@ fn shell_mono_keeps_labels_without_colors() {
             5000
         ))
     );
-    assert!(b
-        .content
-        .iter()
-        .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+    assert!(
+        b.content
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset)
+    );
 }
 #[test]
 fn shell_profile_mono_reduces_detected_truecolor() {
     let mut p = profile("paper");
     p.color_mode = ColorMode::Mono;
     let b = screen(&p);
-    assert!(b
-        .content
-        .iter()
-        .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+    assert!(
+        b.content
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset)
+    );
 }
 #[test]
 fn shell_no_color_overrules_explicit_truecolor() {
@@ -406,10 +410,11 @@ fn shell_no_color_overrules_explicit_truecolor() {
         &mut b,
         shell::effective_tier(Tier::TrueColor, ColorMode::Truecolor, true),
     );
-    assert!(b
-        .content
-        .iter()
-        .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+    assert!(
+        b.content
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset)
+    );
 }
 #[test]
 fn shell_user_cannot_upgrade_detected_16_color() {

@@ -4,12 +4,12 @@
 mod signed_packages;
 
 use ed25519_dalek::{Signer, SigningKey};
-use orbit_ledger::{verify_ledger, LedgerEvent, LedgerWriter};
-use orbit_plugin::{sign_manifest, PluginManifest};
+use orbit_ledger::{LedgerEvent, LedgerWriter, verify_ledger};
+use orbit_plugin::{PluginManifest, sign_manifest};
 use sha2::{Digest, Sha256};
 use signed_packages::{
-    catalog, install, read_install_inputs, status, trust_issuer, with_test_hook, PackageError,
-    PackageStatus, TestPoint,
+    PackageError, PackageStatus, TestPoint, catalog, install, read_install_inputs, status,
+    trust_issuer, with_test_hook,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -158,10 +158,12 @@ fn durable_install_refuses_invalid_signature_without_mutation() {
         "0"
     };
     f.manifest.signature.replace_range(0..1, replacement);
-    assert!(install(&f.home, &f.manifest, &f.bytes, true)
-        .unwrap_err()
-        .to_string()
-        .contains("signature"));
+    assert!(
+        install(&f.home, &f.manifest, &f.bytes, true)
+            .unwrap_err()
+            .to_string()
+            .contains("signature")
+    );
     f.no_install();
 }
 
@@ -170,10 +172,12 @@ fn durable_install_refuses_changed_content_without_mutation() {
     let mut f = Fixture::new(vec![]);
     f.trust();
     f.bytes.push(1);
-    assert!(install(&f.home, &f.manifest, &f.bytes, true)
-        .unwrap_err()
-        .to_string()
-        .contains("digest"));
+    assert!(
+        install(&f.home, &f.manifest, &f.bytes, true)
+            .unwrap_err()
+            .to_string()
+            .contains("digest")
+    );
     f.no_install();
 }
 
@@ -181,20 +185,24 @@ fn durable_install_refuses_changed_content_without_mutation() {
 fn durable_install_refuses_disallowed_import_without_mutation() {
     let f = Fixture::new(vec!["wasi:filesystem/types".into()]);
     f.trust();
-    assert!(install(&f.home, &f.manifest, &f.bytes, true)
-        .unwrap_err()
-        .to_string()
-        .contains("import"));
+    assert!(
+        install(&f.home, &f.manifest, &f.bytes, true)
+            .unwrap_err()
+            .to_string()
+            .contains("import")
+    );
     f.no_install();
 }
 
 #[test]
 fn durable_install_refuses_untrusted_issuer_without_mutation() {
     let f = Fixture::new(vec![]);
-    assert!(install(&f.home, &f.manifest, &f.bytes, true)
-        .unwrap_err()
-        .to_string()
-        .contains("trusted"));
+    assert!(
+        install(&f.home, &f.manifest, &f.bytes, true)
+            .unwrap_err()
+            .to_string()
+            .contains("trusted")
+    );
     f.no_install();
 }
 
@@ -596,11 +604,13 @@ fn detached_proof_segment_is_never_catalog_verified() {
     )
     .unwrap();
     assert_eq!(page.packages[0].status, PackageStatus::InvalidProof);
-    assert!(verify_ledger(&f.home.join("ledger"))
-        .unwrap()
-        .0
-        .iter()
-        .all(|r| !matches!(r.record.event, LedgerEvent::PluginInstall(_))));
+    assert!(
+        verify_ledger(&f.home.join("ledger"))
+            .unwrap()
+            .0
+            .iter()
+            .all(|r| !matches!(r.record.event, LedgerEvent::PluginInstall(_)))
+    );
 }
 
 #[test]
@@ -681,9 +691,11 @@ fn issuer_publication_fault(after: bool) {
     let actual = std::fs::read(f.home.join("saved-mods/issuers.txt")).unwrap();
     if after {
         assert!(matches!(error, PackageError::PublicationUncertain(_)));
-        assert!(String::from_utf8(actual)
-            .unwrap()
-            .contains(&"ab".repeat(32)));
+        assert!(
+            String::from_utf8(actual)
+                .unwrap()
+                .contains(&"ab".repeat(32))
+        );
     } else {
         assert!(matches!(error, PackageError::Storage(_)));
         assert_eq!(actual, previous);
@@ -1021,10 +1033,12 @@ fn symlink_store_and_conflicting_immutable_bytes_never_authorize_success() {
     std::fs::create_dir(f.home.join("outside")).unwrap();
     std::os::unix::fs::symlink(f.home.join("outside"), f.home.join("signed-packages")).unwrap();
     assert!(install(&f.home, &f.manifest, &f.bytes, true).is_err());
-    assert!(std::fs::read_dir(f.home.join("outside"))
-        .unwrap()
-        .next()
-        .is_none());
+    assert!(
+        std::fs::read_dir(f.home.join("outside"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
     std::fs::remove_file(f.home.join("signed-packages")).unwrap();
     let receipt = install(&f.home, &f.manifest, &f.bytes, true).unwrap();
     let index = saved_index(&f, &receipt.install_id);

@@ -26,11 +26,7 @@ fn lum(c: (u8, u8, u8)) -> f32 {
 fn sat(c: (u8, u8, u8)) -> f32 {
     let mx = c.0.max(c.1).max(c.2) as f32;
     let mn = c.0.min(c.1).min(c.2) as f32;
-    if mx == 0.0 {
-        0.0
-    } else {
-        (mx - mn) / mx
-    }
+    if mx == 0.0 { 0.0 } else { (mx - mn) / mx }
 }
 
 /// The nearest xterm-256 index (6×6×6 cube or the grey ramp).

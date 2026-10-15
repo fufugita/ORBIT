@@ -2,7 +2,7 @@
 //! a test can render any frame at any time. Times are seconds as `f32`.
 //! Under reduced motion every curve collapses to its end state.
 
-use super::canvas::{mix, Rgb, Seg};
+use super::canvas::{Rgb, Seg, mix};
 use super::pal::*;
 
 pub fn secs(ms: u64) -> f32 {

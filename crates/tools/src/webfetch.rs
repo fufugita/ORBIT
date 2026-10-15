@@ -100,17 +100,16 @@ impl Tool for WebFetchTool {
         let cache_key = raw.to_string();
         {
             let g = CACHE.lock().unwrap();
-            if let Some(map) = g.as_ref() {
-                if let Some(c) = map.get(&cache_key) {
-                    if c.at.elapsed() < TTL {
-                        return ToolResult::ok(serde_json::json!({
-                            "url": c.final_url,
-                            "content": c.md,
-                            "prompt": prompt,
-                            "cached": true
-                        }));
-                    }
-                }
+            if let Some(map) = g.as_ref()
+                && let Some(c) = map.get(&cache_key)
+                && c.at.elapsed() < TTL
+            {
+                return ToolResult::ok(serde_json::json!({
+                    "url": c.final_url,
+                    "content": c.md,
+                    "prompt": prompt,
+                    "cached": true
+                }));
             }
         }
 
@@ -147,25 +146,24 @@ impl Tool for WebFetchTool {
                     .map_err(|e| e.to_string())?;
                 let status = resp.status();
                 // Cross-host redirect: return it, do not follow.
-                if status.is_redirection() {
-                    if let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok())
-                    {
-                        let next = fetch_url.join(loc).map_err(|e| e.to_string())?;
-                        if next.host_str() != fetch_url.host_str() {
-                            return Ok((format!("{next}"), String::new(), true));
-                        }
-                        // same-host redirect: one follow is enough
-                        let resp2 = client
-                            .get(next.clone())
-                            .send()
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        if !resp2.status().is_success() {
-                            return Err(format!("HTTP {}", resp2.status()));
-                        }
-                        let bytes = cap(resp2.bytes().await.map_err(|e| e.to_string())?.to_vec());
-                        return Ok((next.to_string(), html_to_markdown(&bytes), false));
+                if status.is_redirection()
+                    && let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok())
+                {
+                    let next = fetch_url.join(loc).map_err(|e| e.to_string())?;
+                    if next.host_str() != fetch_url.host_str() {
+                        return Ok((format!("{next}"), String::new(), true));
                     }
+                    // same-host redirect: one follow is enough
+                    let resp2 = client
+                        .get(next.clone())
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !resp2.status().is_success() {
+                        return Err(format!("HTTP {}", resp2.status()));
+                    }
+                    let bytes = cap(resp2.bytes().await.map_err(|e| e.to_string())?.to_vec());
+                    return Ok((next.to_string(), html_to_markdown(&bytes), false));
                 }
                 if !status.is_success() {
                     return Err(format!("HTTP {status}"));

@@ -1,11 +1,11 @@
 #![cfg(unix)]
 
 use orbit_cli::tool_runtime::{
-    execute_call, ApprovalChannel, ApprovalRequest, ApprovalVerdict, AutoGrants, PermissionScope,
-    StdApprovalChannel,
+    ApprovalChannel, ApprovalRequest, ApprovalVerdict, AutoGrants, PermissionScope,
+    StdApprovalChannel, execute_call,
 };
 use orbit_tools::permissions::PermissionMode;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 struct Fixture {
@@ -456,17 +456,21 @@ fn override_replacements_reload_and_reset_to_user_ask() {
         let report =
             set_permission_override(&f.home, &scope, &f.work, &f.wire(), Some(effect)).unwrap();
         assert_eq!(report.effect, effect);
-        assert!(report
-            .matching_rules
-            .iter()
-            .any(|rule| rule.source == "user" && rule.shadowed));
+        assert!(
+            report
+                .matching_rules
+                .iter()
+                .any(|rule| rule.source == "user" && rule.shadowed)
+        );
         let raw = std::fs::read_to_string(f.home.join("permission-overrides.toml")).unwrap();
         assert_eq!(raw.matches(&f.wire()).count(), 1);
         let reloaded = effective_permission_policy(&f.home, &scope, &f.work, &f.wire()).unwrap();
-        assert!(reloaded
-            .matching_rules
-            .iter()
-            .any(|rule| rule.source == "operator-override" && rule.effect == effect));
+        assert!(
+            reloaded
+                .matching_rules
+                .iter()
+                .any(|rule| rule.source == "operator-override" && rule.effect == effect)
+        );
     }
     let report = set_permission_override(&f.home, &scope, &f.work, &f.wire(), None).unwrap();
     assert_eq!(report.effect, Effect::Ask);

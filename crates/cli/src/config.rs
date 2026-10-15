@@ -333,18 +333,18 @@ pub fn resolve_home(args: &[String]) -> std::path::PathBuf {
     {
         return std::path::PathBuf::from(h);
     }
-    if let Ok(h) = std::env::var("ORBIT_HOME") {
-        if !h.is_empty() {
-            return std::path::PathBuf::from(h);
-        }
+    if let Ok(h) = std::env::var("ORBIT_HOME")
+        && !h.is_empty()
+    {
+        return std::path::PathBuf::from(h);
     }
     let user = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .map(|h| h.join(".orbit"));
-    if let Some(u) = &user {
-        if u.exists() {
-            return u.clone();
-        }
+    if let Some(u) = &user
+        && u.exists()
+    {
+        return u.clone();
     }
     let local = std::path::PathBuf::from(".orbit");
     if local.exists() {
@@ -361,7 +361,7 @@ impl ProvidersConfig {
         let path = home.join("providers.toml");
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
+                return Ok(Self::default());
             }
             Err(error) => return Err(error.kind().to_string()),
             Ok(_) => {}
@@ -408,7 +408,7 @@ impl ProvidersConfig {
         home: &Path,
         update: impl FnOnce(&str) -> Result<String, String>,
     ) -> Result<Self, String> {
-        use crate::customization::{publish, read_regular, Directory, Lock};
+        use crate::customization::{Directory, Lock, publish, read_regular};
         let directory = Directory::open(home, true).map_err(|e| e.to_string())?;
         let _lock = Lock::acquire(&directory, ".config.lock").map_err(|e| e.to_string())?;
         let path = directory
@@ -482,10 +482,10 @@ impl ProvidersConfig {
     /// Prefer an exact declared provider/model pair, then the full bare model ID.
     /// A slash inside the actual ID is never discarded during metadata lookup.
     pub fn model_entry_for_spec(&self, spec: &str) -> Option<(&ProviderConfig, &ModelEntry)> {
-        if let Some((provider, model)) = spec.split_once('/') {
-            if let Some(pair) = self.model_entry(provider, model) {
-                return Some(pair);
-            }
+        if let Some((provider, model)) = spec.split_once('/')
+            && let Some(pair) = self.model_entry(provider, model)
+        {
+            return Some(pair);
         }
         self.provider.iter().find_map(|provider| {
             provider
