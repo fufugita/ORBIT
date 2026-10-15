@@ -2,9 +2,17 @@
 
 use orbit_cli::sessions::{SessionFile, SessionLease, SessionLeaseError};
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 struct Home(PathBuf);
@@ -29,6 +37,57 @@ impl Drop for ChildOwner {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PreExecBarrier {
+    release: Option<OwnedFd>,
+    spawning: Option<JoinHandle<io::Result<Child>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl PreExecBarrier {
+    fn release_and_reap(&mut self) -> Result<(), String> {
+        // Always unblock spawn before joining, including during unwinding.
+        if let Some(release) = self.release.take() {
+            let _ = fs::File::from(release).write_all(b"R");
+        }
+        if let Some(spawning) = self.spawning.take() {
+            let mut child = spawning
+                .join()
+                .map_err(|_| "spawn thread panicked".to_owned())?
+                .map_err(|error| format!("child did not exec: {error}"))?;
+            let _ = child.kill();
+            child.wait().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PreExecBarrier {
+    fn drop(&mut self) {
+        let _ = self.release_and_reap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cloexec_pipe() -> (OwnedFd, OwnedFd) {
+    let mut descriptors = [-1; 2];
+    // SAFETY: pipe2 initializes exactly these two slots on success. Both FDs
+    // transfer immediately into unique owners, and neither crosses exec.
+    assert_eq!(
+        unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "pipe creation failed: {}",
+        io::Error::last_os_error()
+    );
+    unsafe {
+        (
+            OwnedFd::from_raw_fd(descriptors[0]),
+            OwnedFd::from_raw_fd(descriptors[1]),
+        )
     }
 }
 
@@ -227,6 +286,88 @@ fn stale_metadata_cannot_override_a_live_os_lock() {
     drop(lease);
     let _next = SessionLease::acquire(&home.0, "session-a", "tui").unwrap();
     assert_eq!(fs::metadata(&lock).unwrap().ino(), inode);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn release_is_immediate_while_a_child_inherits_the_pre_exec_descriptor() {
+    let home = Home::new();
+    let lease = SessionLease::acquire(&home.0, "session-a", "daemon").unwrap();
+    lease.save(&sample("session-a", "parent-model")).unwrap();
+    let session_before = fs::read(session_path(&home.0, "session-a")).unwrap();
+    let lock = home.0.join("sessions/.leases/session-a.lock");
+    let inode_before = fs::metadata(&lock).unwrap().ino();
+    let (ready_read, ready_write) = cloexec_pipe();
+    let (release_read, release_write) = cloexec_pipe();
+    let spawning = std::thread::spawn(move || {
+        let ready = ready_write.as_raw_fd();
+        let release = release_read.as_raw_fd();
+        let mut command = Command::new("/bin/true");
+        // SAFETY: the closure captures only raw FD numbers. Between fork and
+        // exec it uses stack data and async-signal-safe syscalls exclusively;
+        // it does not allocate, acquire Rust locks or run Rust destructors.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::write(ready, b"F".as_ptr().cast(), 1) != 1 {
+                    libc::_exit(121);
+                }
+                let mut poll = libc::pollfd {
+                    fd: release,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // A failed parent must never leave this child stuck in spawn.
+                if libc::poll(&mut poll, 1, 10_000) != 1 || poll.revents & libc::POLLIN == 0 {
+                    libc::_exit(122);
+                }
+                let mut byte = 0_u8;
+                if libc::read(release, (&mut byte as *mut u8).cast(), 1) != 1 || byte != b'R' {
+                    libc::_exit(123);
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn();
+        drop((ready_write, release_read));
+        child
+    });
+    let mut barrier = PreExecBarrier {
+        release: Some(release_write),
+        spawning: Some(spawning),
+    };
+    let mut poll = libc::pollfd {
+        fd: ready_read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll points to one initialized descriptor held by ready_read.
+    let fork_announced = unsafe { libc::poll(&mut poll, 1, 5_000) } == 1
+        && poll.revents & libc::POLLIN != 0
+        && fs::File::from(ready_read)
+            .read_exact(&mut [0_u8; 1])
+            .is_ok();
+    let live_parent_refused = matches!(
+        SessionLease::acquire(&home.0, "session-a", "tui"),
+        Err(SessionLeaseError::Busy { .. })
+    );
+    drop(lease);
+    // Deliberately no retry or sleep: the pre-exec child still holds every
+    // inherited CLOEXEC descriptor when the former owner relinquishes its lease.
+    let reacquired = SessionLease::acquire_and_load(&home.0, "session-a", "tui");
+    let inode_after = fs::metadata(&lock).map(|metadata| metadata.ino());
+    let session_after = fs::read(session_path(&home.0, "session-a"));
+    let cleanup = barrier.release_and_reap();
+
+    // Release the barrier and reap the child before any assertion can fail.
+    assert!(cleanup.is_ok(), "pre-exec cleanup failed: {cleanup:?}");
+    assert!(fork_announced, "child never reached the pre-exec barrier");
+    assert!(live_parent_refused, "live parent lost exclusive ownership");
+    let (next, saved) = reacquired.expect("dropping the owner must release an inherited OS lock");
+    assert_eq!(next.session_id(), "session-a");
+    assert_eq!(next.kind(), "tui");
+    assert_eq!(saved.model, "parent-model");
+    assert_eq!(inode_after.unwrap(), inode_before);
+    assert_eq!(session_after.unwrap(), session_before);
 }
 
 #[test]

@@ -319,10 +319,23 @@ mod leased_storage {
         sessions: File,
         leases: File,
         lock: File,
+        owner_pid: u32,
         #[cfg(test)]
         fail_before_rename: std::cell::Cell<bool>,
         #[cfg(test)]
         fail_directory_sync: std::cell::Cell<bool>,
+    }
+
+    impl Drop for Storage {
+        fn drop(&mut self) {
+            // A concurrent fork can retain this open-file description until
+            // exec. Release ownership now instead of waiting for every copy
+            // to close. A forked copy must not unlock its live parent's lease.
+            if self.owner_pid == std::process::id() {
+                // SAFETY: the owned lock FD is still live throughout Drop.
+                let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+            }
+        }
     }
 
     fn io(error: std::io::Error) -> SessionLeaseError {
@@ -469,7 +482,7 @@ mod leased_storage {
             private_directory(&sessions)?;
             let leases = directory_at(&sessions, OsStr::new(".leases"), true)?;
             private_directory(&leases)?;
-            let mut lock = open_at(
+            let lock = open_at(
                 &leases,
                 OsStr::new(&format!("{id}.lock")),
                 libc::O_RDWR | libc::O_CREAT,
@@ -487,26 +500,26 @@ mod leased_storage {
                     Err(io(error))
                 };
             }
-            let storage = Self {
+            let mut storage = Self {
                 path,
                 home,
                 sessions,
                 leases,
-                lock: lock.try_clone().map_err(io)?,
+                lock,
+                owner_pid: std::process::id(),
                 #[cfg(test)]
                 fail_before_rename: std::cell::Cell::new(false),
                 #[cfg(test)]
                 fail_directory_sync: std::cell::Cell::new(false),
             };
             storage.verify_location(id)?;
-            let metadata =
-                serde_json::json!({"session_id":id,"kind":kind,"pid":std::process::id()});
+            let metadata = serde_json::json!({"session_id":id,"kind":kind,"pid":storage.owner_pid});
             let bytes = serde_json::to_vec(&metadata)
                 .map_err(|e| SessionLeaseError::InvalidData(e.to_string()))?;
-            lock.set_len(0).map_err(io)?;
-            lock.seek(SeekFrom::Start(0)).map_err(io)?;
-            lock.write_all(&bytes).map_err(io)?;
-            lock.sync_all().map_err(io)?;
+            storage.lock.set_len(0).map_err(io)?;
+            storage.lock.seek(SeekFrom::Start(0)).map_err(io)?;
+            storage.lock.write_all(&bytes).map_err(io)?;
+            storage.lock.sync_all().map_err(io)?;
             storage.leases.sync_all().map_err(io)?;
             Ok(storage)
         }
