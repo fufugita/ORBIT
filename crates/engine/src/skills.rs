@@ -90,6 +90,9 @@ pub fn skills_index(skills: &[Skill]) -> String {
 pub struct AgentDef {
     pub name: String,
     pub description: String,
+    /// The Markdown body, applied as instructions on each subagent turn.
+    #[serde(default)]
+    pub instructions: String,
     /// Tool names the subagent may use (empty = read-only set).
     #[serde(default)]
     pub tools: Vec<String>,
@@ -109,7 +112,7 @@ fn default_max_turns() -> u32 {
 /// Parse an agent definition .md (same frontmatter shape).
 pub fn parse_agent_md(text: &str) -> Option<AgentDef> {
     let rest = text.trim().strip_prefix("---")?;
-    let (front, _body) = rest.split_once("---")?;
+    let (front, body) = rest.split_once("---")?;
     let mut name = String::new();
     let mut description = String::new();
     let mut tools = Vec::new();
@@ -157,6 +160,7 @@ pub fn parse_agent_md(text: &str) -> Option<AgentDef> {
     Some(AgentDef {
         name,
         description,
+        instructions: body.trim().to_string(),
         tools,
         model,
         effort,
@@ -170,6 +174,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
         AgentDef {
             name: "Explore".into(),
             description: "Read-only exploration; returns a thorough report".into(),
+            instructions: String::new(),
             tools: vec!["Read".into(), "Glob".into(), "Grep".into()],
             model: String::new(),
             effort: None,
@@ -178,6 +183,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
         AgentDef {
             name: "Plan".into(),
             description: "Read-only research; returns an implementation plan".into(),
+            instructions: String::new(),
             tools: vec!["Read".into(), "Glob".into(), "Grep".into()],
             model: String::new(),
             effort: None,
@@ -186,6 +192,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
         AgentDef {
             name: "general-purpose".into(),
             description: "Full tool access for delegated tasks".into(),
+            instructions: String::new(),
             tools: vec![],
             model: String::new(),
             effort: None,
@@ -268,6 +275,63 @@ Body text.
         assert_eq!(def.tools, vec!["Read", "Grep"]);
         assert_eq!(def.model, "cheap-model");
         assert_eq!(def.max_turns, 10);
+        assert_eq!(def.instructions, "Body text.");
+    }
+
+    #[test]
+    fn agent_instructions_preserve_multiline_paragraphs_and_unicode() {
+        let body = "# Evidence review\n\nKeep the blank paragraph.\nUse λ → evidence.\n\n    preserve indented examples";
+        let definition = parse_agent_md(&format!(
+            "---\nname: evidence-reviewer\ndescription: Review evidence\ntools: [Read, Grep]\nmodel: review-model\neffort: 'false'\nmaxTurns: 7\n---\n\n{body}\n\n"
+        ))
+        .unwrap();
+        assert_eq!(definition.instructions, body);
+        assert_eq!(definition.tools, vec!["Read", "Grep"]);
+        assert_eq!(definition.model, "review-model");
+        assert_eq!(
+            definition.effort,
+            Some(orbit_adapter::types::EffortSetting::Value(
+                orbit_adapter::types::EffortValue::Level("false".into())
+            ))
+        );
+        assert_eq!(definition.max_turns, 7);
+    }
+
+    #[test]
+    fn legacy_agent_definitions_default_to_empty_instructions() {
+        let definition: AgentDef = serde_json::from_value(serde_json::json!({
+            "name": "legacy-reviewer",
+            "description": "Review saved evidence",
+            "tools": ["Read"],
+            "model": "review-model",
+            "max_turns": 7
+        }))
+        .unwrap();
+        assert!(definition.instructions.is_empty());
+        assert_eq!(definition.tools, vec!["Read"]);
+        assert_eq!(definition.model, "review-model");
+        assert_eq!(definition.effort, None);
+        assert_eq!(definition.max_turns, 7);
+        let mut saved = serde_json::to_value(&definition).unwrap();
+        saved["instructions"] = serde_json::json!("First paragraph.\n\nSecond paragraph: λ.");
+        let reloaded: AgentDef = serde_json::from_value(saved).unwrap();
+        assert_eq!(
+            reloaded.instructions,
+            "First paragraph.\n\nSecond paragraph: λ."
+        );
+    }
+
+    #[test]
+    fn empty_agent_body_and_builtin_instructions_remain_empty() {
+        for body in ["", "\n\n", " \n\t\n"] {
+            let definition = parse_agent_md(&format!("---\nname: empty\n---\n{body}")).unwrap();
+            assert!(definition.instructions.is_empty());
+        }
+        assert!(
+            builtin_agents()
+                .iter()
+                .all(|definition| definition.instructions.is_empty())
+        );
     }
 
     #[test]

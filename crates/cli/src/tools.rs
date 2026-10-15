@@ -625,15 +625,20 @@ pub(crate) fn execute_task_in_session(
         cancel.cancel();
     }
     let _link = link_cancel(parent_cancel, &cancel);
+    let mut system_directive = format!(
+        "You are {name}, a subagent. {desc}\n\nComplete the task and reply with your final report. You do not see the parent conversation.",
+        name = agent.name,
+        desc = agent.description
+    );
+    if !agent.instructions.is_empty() {
+        system_directive.push_str("\n\n");
+        system_directive.push_str(&agent.instructions);
+    }
     let options = orbit_engine::TurnOptions {
         session_id: id.clone(),
         tools: sub_tools,
         max_rounds: agent.max_turns,
-        system_directive: Some(format!(
-            "You are {name}, a subagent. {desc}\n\nComplete the task and reply with your final report. You do not see the parent conversation.",
-            name = agent.name,
-            desc = agent.description
-        )),
+        system_directive: Some(system_directive),
         request_stem: format!("orbit-task-{id}"),
         ..Default::default()
     };

@@ -220,6 +220,172 @@ fn declared_agent_profile_model_suppresses_phase_routing() {
     assert_eq!(f.b.calls(), 0);
 }
 #[test]
+fn agent_instructions_reach_fresh_and_durable_resumed_task_requests_once() {
+    use orbit_adapter::types::{ChatRole, EffortSetting, EffortValue};
+
+    const AGENT: &str = "instruction-reviewer";
+    const MARKER: &str = "agent-instruction-wire-marker-7e3b6a";
+    const BODY: &str = "# Review procedure\n\nagent-instruction-wire-marker-7e3b6a\nKeep each finding tied to its evidence.\n\nPreserve this Unicode instruction: λ → evidence.\nUse the declared Read tool; return a concise report.";
+    let f = Fixture::new();
+    let agents = f.home.join("agents");
+    std::fs::create_dir(&agents).unwrap();
+    std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        agents.join("instruction-reviewer.md"),
+        format!(
+            "---\nname: {AGENT}\ndescription: Review evidence with the declared profile\ntools: [Read]\nmodel: a/family/pinned-notools\neffort: low\nmaxTurns: 3\n---\n\n{BODY}\n"
+        ),
+    )
+    .unwrap();
+    let mut parent = orbit_cli::phase_routing::resolve_model(
+        &orbit_cli::config::ProvidersConfig::load(&f.home).unwrap(),
+        "a/family/base-notools",
+        None,
+    )
+    .unwrap()
+    .turn_config(None)
+    .unwrap();
+    let parent_effort = EffortSetting::Value(EffortValue::Level("high".into()));
+    orbit_cli::apply_effort_setting(&f.home, &mut parent, &parent_effort).unwrap();
+    tool_runtime::remember_turn_config(&f.cx, &parent);
+    tool_runtime::remember_effort_setting(&f.cx, &Some(parent_effort.clone()));
+    let parent_before = format!("{parent:?}");
+    let profile_effort = Some(EffortSetting::Value(EffortValue::Level("low".into())));
+
+    let first = f.task(json!({"agent": AGENT, "prompt": "implement the first review"}));
+    assert_eq!(first["ok"], true, "{first}");
+    let agent_id = id(&first);
+    let first_request = f.a.body();
+    let first_saved = f.store().load(&agent_id).unwrap();
+    assert_eq!(first_saved.agent_type, AGENT);
+    assert_eq!(first_saved.model, "a/family/pinned-notools");
+    assert_eq!(first_saved.effort, profile_effort);
+    assert_eq!(first_saved.turns, 1);
+
+    // Reload through a fresh store handle: the second run must use durable
+    // history rather than an in-memory continuation of the first request.
+    let reloaded = f.store().load(&agent_id).unwrap();
+    assert_eq!(reloaded.transcript, first_saved.transcript);
+    let resumed = f.task(json!({
+        "agent": AGENT,
+        "resume": reloaded.agent_id,
+        "prompt": "implement the second review"
+    }));
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    assert_eq!(id(&resumed), agent_id);
+    let resumed_request = f.a.body();
+    let resumed_saved = f.store().load(&agent_id).unwrap();
+    assert_eq!(f.a.calls(), 2);
+    assert_eq!(f.b.calls(), 0);
+    assert_eq!(resumed_saved.turns, 2);
+    assert_eq!(resumed_saved.model, first_saved.model);
+    assert_eq!(resumed_saved.effort, profile_effort);
+    assert!(
+        resumed_saved
+            .transcript
+            .starts_with(&first_saved.transcript)
+    );
+    assert_eq!(
+        resumed_saved.transcript.len(),
+        first_saved.transcript.len() + 2
+    );
+    assert!(
+        resumed_saved.transcript.iter().all(|message| {
+            message.role != ChatRole::System && !message.content.contains(MARKER)
+        })
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            f.cx.ext::<tool_runtime::SessionTurnConfig>().unwrap().0
+        ),
+        parent_before
+    );
+    assert_eq!(
+        f.cx.ext::<tool_runtime::SessionEffortSetting>().unwrap().0,
+        Some(parent_effort)
+    );
+    assert!(!parent_before.contains(MARKER));
+
+    for (label, request) in [("fresh", first_request), ("resumed", resumed_request)] {
+        assert_eq!(request["model"], "family/pinned-notools", "{label}");
+        assert_eq!(request["reasoning_effort"], "low", "{label}");
+        let tools: Vec<_> = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tools, vec!["Read"], "{label}: restricted tool exposure");
+        assert!(!tools.contains(&"Bash") && !tools.contains(&"Write"));
+        let messages = request["messages"].as_array().unwrap();
+        let system: Vec<_> = messages
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .collect();
+        assert_eq!(system.len(), 1, "{label}: one system directive");
+        let directive = system[0]["content"].as_str().unwrap();
+        assert_eq!(
+            directive.matches(MARKER).count(),
+            1,
+            "{label}: the selected agent body must reach the provider once"
+        );
+        assert!(
+            directive.ends_with(BODY),
+            "{label}: complete multiline body"
+        );
+        assert_eq!(request.to_string().matches(MARKER).count(), 1, "{label}");
+        assert!(
+            messages
+                .iter()
+                .filter(|m| m["role"] != "system")
+                .all(|m| { !m["content"].as_str().unwrap_or_default().contains(MARKER) })
+        );
+    }
+}
+#[test]
+fn agent_instructions_empty_profiles_preserve_existing_system_directive() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.home.join("agents")).unwrap();
+    std::fs::write(
+        f.home.join("agents/empty-reviewer.md"),
+        "---\nname: empty-reviewer\ndescription: Review without extra instructions\ntools: [Read]\nmodel: a/family/pinned-notools\n---\n\n \t\n",
+    )
+    .unwrap();
+    for (agent, expected) in [
+        (
+            "empty-reviewer",
+            "You are empty-reviewer, a subagent. Review without extra instructions\n\nComplete the task and reply with your final report. You do not see the parent conversation.",
+        ),
+        (
+            "Explore",
+            "You are Explore, a subagent. Read-only exploration; returns a thorough report\n\nComplete the task and reply with your final report. You do not see the parent conversation.",
+        ),
+    ] {
+        let result = f.task(json!({"agent": agent, "prompt": "observe the evidence"}));
+        assert_eq!(result["ok"], true, "{agent}: {result}");
+        let request = f.a.body();
+        let system: Vec<_> = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .collect();
+        assert_eq!(system.len(), 1, "{agent}");
+        assert_eq!(system[0]["content"], expected, "{agent}");
+        assert!(
+            f.store()
+                .load(&id(&result))
+                .unwrap()
+                .transcript
+                .iter()
+                .all(|message| message.role != orbit_adapter::types::ChatRole::System)
+        );
+    }
+    assert_eq!(f.a.calls(), 2);
+    assert_eq!(f.b.calls(), 0);
+}
+#[test]
 fn ambiguous_bare_task_identity_fails_without_provider_or_agent() {
     let f = Fixture::new();
     let result = f.task(json!({"agent":"Explore","prompt":"implement","model":"shared/notools"}));
