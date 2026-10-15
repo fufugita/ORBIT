@@ -96,6 +96,8 @@ pub struct AgentDef {
     /// Model override (empty = the session's model).
     #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub effort: Option<orbit_adapter::types::EffortSetting>,
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
 }
@@ -112,6 +114,7 @@ pub fn parse_agent_md(text: &str) -> Option<AgentDef> {
     let mut description = String::new();
     let mut tools = Vec::new();
     let mut model = String::new();
+    let mut effort = None;
     let mut max_turns = default_max_turns();
     for line in front.lines() {
         if let Some(v) = line.strip_prefix("name:") {
@@ -129,6 +132,21 @@ pub fn parse_agent_md(text: &str) -> Option<AgentDef> {
                 .collect();
         } else if let Some(v) = line.strip_prefix("model:") {
             model = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("effort:") {
+            use orbit_adapter::types::{EffortSetting, EffortValue};
+            let raw = v.trim();
+            let quoted = raw.starts_with(['\'', '"']);
+            let value = raw.trim_matches(['\'', '"']);
+            effort = Some(match value {
+                "default" => EffortSetting::Default,
+                "true" if !quoted => EffortSetting::Value(EffortValue::Bool(true)),
+                "false" if !quoted => EffortSetting::Value(EffortValue::Bool(false)),
+                value => {
+                    let value = EffortValue::Level(value.into());
+                    value.validate().ok()?;
+                    EffortSetting::Value(value)
+                }
+            });
         } else if let Some(v) = line.strip_prefix("maxTurns:") {
             max_turns = v.trim().parse().unwrap_or(default_max_turns());
         }
@@ -141,6 +159,7 @@ pub fn parse_agent_md(text: &str) -> Option<AgentDef> {
         description,
         tools,
         model,
+        effort,
         max_turns,
     })
 }
@@ -153,6 +172,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             description: "Read-only exploration; returns a thorough report".into(),
             tools: vec!["Read".into(), "Glob".into(), "Grep".into()],
             model: String::new(),
+            effort: None,
             max_turns: 25,
         },
         AgentDef {
@@ -160,6 +180,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             description: "Read-only research; returns an implementation plan".into(),
             tools: vec!["Read".into(), "Glob".into(), "Grep".into()],
             model: String::new(),
+            effort: None,
             max_turns: 25,
         },
         AgentDef {
@@ -167,6 +188,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             description: "Full tool access for delegated tasks".into(),
             tools: vec![],
             model: String::new(),
+            effort: None,
             max_turns: 50,
         },
     ]
@@ -247,6 +269,32 @@ Body text.
         assert_eq!(def.tools, vec!["Read", "Grep"]);
         assert_eq!(def.model, "cheap-model");
         assert_eq!(def.max_turns, 10);
+    }
+
+    #[test]
+    fn agent_effort_frontmatter_preserves_typed_choices_and_reset() {
+        use orbit_adapter::types::{EffortSetting, EffortValue};
+        for (raw, expected) in [
+            ("true", EffortSetting::Value(EffortValue::Bool(true))),
+            ("false", EffortSetting::Value(EffortValue::Bool(false))),
+            (
+                "'false'",
+                EffortSetting::Value(EffortValue::Level("false".into())),
+            ),
+            (
+                "high",
+                EffortSetting::Value(EffortValue::Level("high".into())),
+            ),
+            ("default", EffortSetting::Default),
+        ] {
+            let def = parse_agent_md(&format!("---\nname: custom\neffort: {raw}\n---\n")).unwrap();
+            assert_eq!(def.effort, Some(expected));
+        }
+        assert_eq!(
+            parse_agent_md("---\nname: legacy\n---\n").unwrap().effort,
+            None
+        );
+        assert!(parse_agent_md("---\nname: invalid\neffort: \"high \"\n---\n").is_none());
     }
 
     #[test]

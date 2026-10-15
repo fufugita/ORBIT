@@ -1,5 +1,43 @@
 # ORBIT: the path to a real harness
 
+## Current candidate — 15 Oct 2026
+
+The current implementation adds the following release workflows. Historical
+milestones below retain their original dates and describe the code at those
+checkpoints.
+
+- **Setup and installation:** offline manual configuration, repeatable identity
+  initialization, local readiness diagnostics, and managed Linux bundles that
+  activate the command-line and browser executables together. Failed validation
+  keeps the previous bundle available.
+- **Routing:** independent phase/difficulty classification, exact provider/model
+  resolution, offline previews, preserved explicit selections and an explicit
+  return to automatic routing. The main frontends and Task agents use the same
+  rules. Signed thinking is replayed only for its original provider/model pair.
+- **Customization:** shared terminal/browser profiles, three themes, semantic
+  colors, density, glyphs, motion, pane layouts and browser fonts. Portable named
+  panes display inert data and prepare drafts without automatically sending them.
+- **Pentest workspaces:** private local scope/evidence/findings/report scaffolds,
+  workflow skills and an inherited triage agent. Existing evidence survives
+  reinitialization; trust, permissions and profile import remain explicit.
+- **Integrations:** exact MCP tool policy, exclusive local owner/attach sessions,
+  browser owner controls, opt-in LSP diagnostics, configured browser MCP tools
+  and checked installation of signed non-executing content.
+
+See [setup](../setup.md), [customization](../customization.md) and
+[pentest workspaces](../pentest.md) for the current commands and boundaries.
+The [real-provider trial](../provider-acceptance.md) is required to assess this
+candidate with actual accounts and model capabilities. Local fixtures do not
+replace that trial or certify untested operating systems.
+
+Remaining work includes remote HTTP MCP and argument-aware grants, live agent
+steering/background scheduling, native IDE integration, a hosted marketplace
+and arbitrary JavaScript extension APIs. Terminal fonts are configured in the
+terminal application. The comparison with other harnesses covers inspected
+interfaces and selected workflows, rather than exhaustive feature parity.
+
+## Original roadmap
+
 Oct 2, 2026 · @fugi
 
 ## Verdict
@@ -62,7 +100,7 @@ Fix these nine before adding features: two show users invented facts, two leak o
 | # | Defect | Where | Fix |
 | --- | --- | --- | --- |
 | 1 | Every approval card shows the same invented facts: `runs in ~/src/orbit`, `sandbox landlock · rw /tmp only`, `egress none`, `ledger decision is recorded` | `crates/hud-tui/src/render.rs:2581` | Draw facts only from the request. Until the sandbox is wired in, the card shows no facts |
-| 2 | The welcome screen shows invented readiness: `✓ ledger · 7 records`, `✓ local · glm-5.2`, whatever the real model is | `render.rs:1223` | Compute each check (trust root, ledger count, provider) at startup, or drop the row |
+| 2 | The welcome screen shows invented readiness: `✓ ledger · 7 records`, `✓ local · <model>`, whatever the real model is | `render.rs:1223` | Compute each check (trust root, ledger count, provider) at startup, or drop the row |
 | 3 | `@path` pastes any readable file into the prompt, unscanned: `@.env` or `@~/.ssh/id_rsa` goes straight to the provider | `crates/hud-tui/src/lib.rs:1070` | Expand mentions through the Read tool, so permission rules, deny-by-default credential paths and the secret scanner (row 4) all apply |
 | 4 | The display gate rejects a whole chunk when it contains `authorization`, `api_key` or any `://`, yet passes a real key that lacks those words. In a coding agent it would blank ordinary code and every URL | `crates/hud/src/lib.rs:55` | Replace keyword rejection with value detection (private key blocks, known key formats, high-entropy tokens). Redact the value, keep the line, and run the same scanner on everything sent to a provider |
 | 5 | `!cmd` runs `sh -c` on the input thread: the TUI freezes until it exits, and the output never reaches the model | `lib.rs:1017` | Run it on the worker like any command, stream its output, and add command and output to the conversation, as Claude Code's shell mode does |
@@ -472,7 +510,7 @@ The first review found the phases built but not wired into the live path; `fddad
 
 On 10 Oct the same branch grew the provider work: the gate URL's path reaches the adapters (`bfa3f5e` — DashScope, Z.ai and Gemini endpoints were unreachable before), discovery speaks each provider's dialect (`95da7a7`), provider presets and `orbit provider` (`1996740`), model roles as the task router (`5ae6a34`), `install.sh` (`b1a5571`), and the web and Go front-ends learned `s`, `a` and the denial note (`5cb97fd`).
 
-**Open.** Narrow-screen polish. "Not now" above is unchanged. The real-model gate runs are done (10 Oct): a live litellm gateway (`glm-5.3`) configured as an `anthropic`-kind provider drove every gate — plain `-p` turn, a Read-tool turn, a Bash-tool turn through the sandbox, and an interactive TUI turn over a PTY — with the ledger verified after (28 records, chain intact).
+**Open.** Narrow-screen polish. "Not now" above is unchanged. The real-model gate runs are done (10 Oct): a configured compatible gateway using an `anthropic`-kind provider drove every gate — plain `-p` turn, a Read-tool turn, a Bash-tool turn through the sandbox, and an interactive TUI turn over a PTY — with the ledger verified after (28 records, chain intact).
 
 `R` is removed (10 Oct): no release ever shipped it, so there was no muscle memory to migrate — the card offers `y` alone when no rule can be offered, the whole-tool `AllowSession` verdict stays as the web/Go `session` wire word.
 
@@ -498,3 +536,51 @@ A competitive gap analysis against Claude Code, Codex CLI, Cline, opencode and p
 **@file mentions expand through the Read tool (11 Oct).** `@path` in a prompt expands to the file's contents, fenced, capped at 10k chars — but the read is the Read tool's own run, not a bare `fs::read`: the deny-read list holds for mentions (a credential path never reaches the provider through one), the secret scanner applies, and the read-before-edit record is written, so a later Edit is grounded by a mention the same way as by a Read call. A path that does not read (missing, denied, a directory) leaves the mention untouched — the model and the operator see the literal `@path`, never a silent drop. The transcript logs the original prompt; the expansion is what the model sees. Still open: the completion popup on `@` (the v1 composer's picker died with the v1 HUD).
 
 **Image reads produce vision blocks (11 Oct).** A Read of a png/jpg/jpeg/webp returns base64 data, not lossy text: the payload carries `image_base64` + `image_media_type` (capped at 5 MB, the deny-read list holds for images exactly as for text), and `content` stays an honest one-line description for plain transcripts. The engine attaches the `ContentBlock::Image` on the Tool message; the Anthropic adapter serializes it inside the `tool_result` as a block array (text line + image — the wire shape Anthropic vision accepts), and providers that do not speak blocks (the OpenAI-compatible tool role is a string) ignore the block and keep the honest content line, the same contract as thinking. The design follows Codex's precedent (a dedicated image path on Read, not a side-effect) with Hermes' media-type mapping. PDFs are deliberately NOT images (Hermes routes them via document, never a vision part — same choice here).
+
+## Where this stands (14 Oct 2026)
+
+The composer now completes workspace paths after `@`, handles quoted paths
+and URL/email boundaries, searches input history with Ctrl-R, and preserves
+multiline prompts in a tagged format while reading legacy history files.
+Image mentions use permitted, bounded user image blocks. Picking a file or
+history entry edits the draft. Terminal output loss triggers safe teardown
+and preserves the signal exit code.
+
+`Task`/`Agent` now returns stable agent IDs and persists conversations under
+the owning parent session. Calls can assign a display name, resume an ID,
+or explicitly choose a configured model. Resume retains the saved model
+unless overridden. The agent pane displays the actual model and updates
+the same agent record on resume.
+
+`ListAgents` pages through metadata, and `AgentSendMessage` queues input
+for the next explicit resume. Calls remain synchronous; messages arriving
+during a run wait for a later resume. Cross-process run leases prevent
+overlapping execution of one ID, and saving a result acknowledges only
+the messages captured at the start. Child runs inherit parent permissions,
+working directories and cancellation, with nesting capped at three levels.
+
+The native Unix MCP client now bounds protocol frames, paged discovery and
+model-facing results. Absolute deadlines and cancellation cover lock and
+pipe waits, while per-server locks let unrelated connections progress.
+Configuration can disable a server or expose exact tool names; selection
+is checked before discovery and again at dispatch. Calls use the actual
+working directory, retain server error flags and structured results, and
+scan content before shortening it. Failed connections are retired; a later
+explicit call can reconnect, without replaying a timed-out tool request.
+
+Provider effort controls now carry a typed boolean or named level through
+model configuration and the actual provider request. Models declare exact
+supported choices and an optional default; unknown support cannot authorize
+an explicit selection. `--effort` and `/effort` select/reset subsequent
+requests, and saved chats/agents retain explicit values and resets separately
+from resolved provider defaults. Routing, model changes and role selection
+resolve and validate the target model. Existing omission/adaptive behavior
+remains the default. OpenAI support here is Chat Completions; Responses
+transport and dynamic account capability discovery remain separate work.
+
+Still open: live agent steering and background scheduling,
+argument-aware MCP rules and narrow grants, remote HTTP transport
+and broader server attachment, LSP diagnostics,
+browser integration and distribution. Reference coverage remains bounded;
+the lifecycle comparison inspected declared schemas rather than exercising
+every workflow of the reference harness.

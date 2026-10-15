@@ -148,7 +148,7 @@ pub fn recover_head(segments_dir: &Path) -> Result<String, LedgerError> {
             Err(e) => {
                 return Err(LedgerError::LedgerUnavailableAtBoot(format!(
                     "segment {path:?} unreadable during recovery: {e}"
-                )))
+                )));
             }
         };
         let mut off = 0usize;

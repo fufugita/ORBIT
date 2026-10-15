@@ -331,8 +331,9 @@ async fn anthropic(
 async fn ollama(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
+    *state.last_body.lock().unwrap() = Some(body);
     state
         .requests
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

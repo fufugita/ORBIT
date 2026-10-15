@@ -11,3 +11,4 @@ serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
 ulid.workspace = true
+libc.workspace = true

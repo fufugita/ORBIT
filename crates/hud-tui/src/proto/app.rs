@@ -19,6 +19,8 @@ use super::scenario::Scenario;
 
 /// Everything the screen needs.
 pub struct App {
+    pub layout_error: Option<String>,
+    pub layout_revision: Option<Vec<u8>>,
     pub tree: Node,
     /// Focused panel index (reading order, 0-based).
     pub focus: usize,
@@ -71,9 +73,14 @@ pub enum Key {
 
 impl App {
     pub fn new(home: std::path::PathBuf, reduced: bool) -> Self {
-        let file = LayoutFile::load(&home);
+        let (file, layout_revision, layout_error) = match LayoutFile::load_checked(&home) {
+            Ok(snapshot) => (snapshot.layout, snapshot.revision, None),
+            Err(error) => (LayoutFile::default(), None, Some(error)),
+        };
         let tree = file.tree.unwrap_or_else(Node::default_tree);
         Self {
+            layout_error,
+            layout_revision,
             tree: tree.clone(),
             focus: Self::conversation_index(&tree).unwrap_or(0),
             arranging: false,
@@ -97,6 +104,8 @@ impl App {
     /// A copy of the layout state, for tests that compare before/after.
     pub fn clone_for_test(&self) -> App {
         App {
+            layout_error: self.layout_error.clone(),
+            layout_revision: self.layout_revision.clone(),
             tree: self.tree.clone(),
             focus: self.focus,
             arranging: self.arranging,
@@ -120,7 +129,7 @@ impl App {
             Preset::Review,
         ]
         .into_iter()
-        .find(|p| self.tree == Node::preset(*p))
+        .find(|p| self.tree == Node::preset(*p) || self.tree == Node::profile_preset(*p))
     }
 
     /// Move focus to the next/previous panel (wraps).
@@ -327,7 +336,7 @@ impl App {
     }
 
     /// Save the layout as "yours" (any change calls this).
-    pub fn save_yours(&self) {
+    pub fn save_yours(&mut self) -> Result<(), String> {
         let preset_name = match self.tree {
             Node::Split { .. } if self.tree == Node::preset(Preset::Build) => "build",
             Node::Split { .. } if self.tree == Node::preset(Preset::Agents) => "agents",
@@ -338,7 +347,17 @@ impl App {
             tree: Some(self.tree.clone()),
             from_preset: preset_name.into(),
         };
-        let _ = f.save(&self.home);
+        match f.save_checked(&self.home, self.layout_revision.as_deref()) {
+            Ok(revision) => {
+                self.layout_revision = revision;
+                self.layout_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.layout_error = Some(error.clone());
+                Err(error)
+            }
+        }
     }
 
     /// Under 120 columns one panel shows at a time: the tree is kept,
@@ -426,6 +445,11 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn app(home: &std::path::Path) -> App {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         App::new(home.to_path_buf(), false)
     }
 
@@ -476,7 +500,7 @@ mod tests {
         a.key(Key::Esc);
         a.key(Key::Char('v'));
         a.pick(View::Plan);
-        a.save_yours();
+        a.save_yours().unwrap();
         let back = LayoutFile::load(&home);
         assert_eq!(back.tree, Some(a.tree.clone()), "yours round-trips");
         let _ = std::fs::remove_dir_all(&home);
@@ -490,7 +514,7 @@ mod tests {
         let mut a = app(&home);
         a.key(Key::Char(']')); // build
         assert_eq!(a.tree, Node::preset(Preset::Build));
-        a.save_yours();
+        a.save_yours().unwrap();
         assert_eq!(LayoutFile::load(&home).from_preset, "build");
         a.key(Key::Char('[')); // back to columns
         assert_eq!(a.tree, Node::preset(Preset::Columns));

@@ -23,6 +23,7 @@ age.workspace = true
 zeroize.workspace = true
 toml.workspace = true
 libc = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 
 orbit-trust = { path = "../trust" }
 orbit-ledger = { path = "../ledger" }
@@ -44,6 +45,9 @@ orbit-hud-tui = { path = "../hud-tui", optional = true }
 tokio.workspace = true
 reqwest.workspace = true
 url = "2"
+
+[dev-dependencies]
+orbit-mock-provider = { path = "../mock-provider" }
 
 [features]
 tui = ["orbit-hud-tui"]

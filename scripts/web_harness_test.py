@@ -22,23 +22,30 @@ Checks:
 
 import json
 import os
+from pathlib import Path
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
 
 PASS = 0
 FAIL = 0
+SCENARIOS = {}
 
 def check(name, ok, detail=""):
     global PASS, FAIL
     mark = "\033[32mPASS\033[0m" if ok else "\033[31mFAIL\033[0m"
     print(f"  [{mark}] {name}" + (f" — {detail}" if detail and not ok else ""))
     PASS, FAIL = PASS + (1 if ok else 0), FAIL + (1 if not ok else 0)
+    key = name.replace(" ", "_").replace(".", "_")
+    if key in SCENARIOS:
+        raise AssertionError(f"duplicate scenario {key}")
+    SCENARIOS[key] = {"passed": bool(ok), "assertions": 1}
 
 
 def port_open(port, timeout=0.3):
@@ -51,16 +58,32 @@ def port_open(port, timeout=0.3):
 
 def start_mock(binary, port):
     if port_open(port):
-        return None
+        raise RuntimeError(f"fixture port {port} is already occupied")
     env = os.environ.copy()
     env["ORBIT_MOCK_BIND"] = f"127.0.0.1:{port}"
-    logf = open("/tmp/orbit-mock.log", "a")
-    p = subprocess.Popen([binary], stdout=logf, stderr=logf, env=env, start_new_session=True)
+    p = subprocess.Popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env=env, start_new_session=True)
     for _ in range(15):
         if port_open(port):
             return p
+        if p.poll() is not None:
+            raise RuntimeError("mock provider exited before readiness")
         time.sleep(0.2)
-    return p
+    p.kill()
+    p.wait(timeout=5)
+    raise RuntimeError("mock provider did not become ready")
+
+
+def free_port():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def stop_child(child):
+    if child is not None and child.poll() is None:
+        os.killpg(os.getpgid(child.pid), signal.SIGTERM)
+        child.wait(timeout=10)
 
 
 class WSClient:
@@ -88,6 +111,7 @@ class WSClient:
         status = buf.split(b"\r\n", 1)[0]
         if b"101" not in status:
             raise ConnectionError(f"handshake refused: {status!r}")
+        self._buffer = buf.split(b"\r\n\r\n", 1)[1]
 
     def send(self, obj):
         payload = json.dumps(obj).encode()
@@ -136,7 +160,8 @@ class WSClient:
             return payload.decode("utf-8", "replace")
 
     def _recv_exact(self, n):
-        buf = b""
+        buf = self._buffer[:n]
+        self._buffer = self._buffer[len(buf):]
         while len(buf) < n:
             chunk = self.sock.recv(n - len(buf))
             if not chunk:
@@ -150,6 +175,7 @@ class SSEClient:
 
     def __init__(self, port, path="/events"):
         self.events = []
+        self.consumed = {}
         self.lock = threading.Lock()
         self.done = threading.Event()
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -187,8 +213,10 @@ class SSEClient:
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self.lock:
-                for ev, data in self.events:
+                for index in range(self.consumed.get(kind, 0), len(self.events)):
+                    ev, data = self.events[index]
                     if ev == kind and (pred is None or pred(json.loads(data or "{}"))):
+                        self.consumed[kind] = index + 1
                         return json.loads(data or "{}")
             time.sleep(0.05)
         return None
@@ -207,40 +235,55 @@ def main():
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", default="/media/hanu/HANU/ORBIT/target/debug/orbit-web")
-    ap.add_argument("--mock", default="/media/hanu/HANU/ORBIT/target/debug/orbit-mock-provider")
-    ap.add_argument("--home", default="/tmp/orbit-web-home")
-    ap.add_argument("--port", type=int, default=4591)
+    repo = Path(__file__).resolve().parents[1]
+    ap.add_argument("--binary", default=str(repo / "target/debug/orbit-web"))
+    ap.add_argument("--cli", help="matching orbit CLI (defaults to the bridge's sibling)")
+    ap.add_argument("--mock", default=str(repo / "target/debug/orbit-mock-provider"))
+    ap.add_argument("--home")
+    ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--mock-port", type=int, default=0)
     ap.add_argument("--model", default="mock-slow")
     args = ap.parse_args()
+    args.cli = args.cli or str(Path(args.binary).resolve().with_name("orbit"))
 
-    subprocess.run(["rm", "-rf", args.home], check=False)
+    args.home = args.home or tempfile.mkdtemp(prefix="orbit-web-acceptance-")
+    os.makedirs(args.home, mode=0o700, exist_ok=True)
+    if os.listdir(args.home):
+        raise RuntimeError("fixture --home must be an empty directory")
+    args.port = args.port or free_port()
+    args.mock_port = args.mock_port or free_port()
+    if args.port == args.mock_port or port_open(args.port):
+        raise RuntimeError("fixture requires two distinct unused ports")
+    gate = f"http://127.0.0.1:{args.mock_port}"
     env = os.environ.copy()
     env["ORBIT_HOME"] = args.home
     subprocess.run(
-        ["/media/hanu/HANU/ORBIT/target/debug/orbit", "init", "--home", args.home, "--no-provider"],
-        capture_output=True, timeout=30, env=env,
+        [args.cli, "init", "--home", args.home, "--no-provider"],
+        capture_output=True, timeout=30, env=env, check=True,
     )
     with open(os.path.join(args.home, "providers.toml"), "w") as f:
         f.write(
-            f'[[provider]]\nname = "local"\nurl = "http://127.0.0.1:8088"\n'
+            f'[[provider]]\nname = "local"\nurl = "{gate}"\n'
             f'env = "ORBIT_GATE_TOKEN"\n\n[[provider.models]]\nid = "{args.model}"\n'
-            f'[[provider.models]]\nid = "mock"\n'
+            f'[[provider.models]]\nid = "mock"\n[[provider.models]]\nid = "mock-bash"\n'
         )
 
-    mock = start_mock(args.mock, 8088)
-    print(f"mock provider: {'already running' if mock is None else 'started'}")
+    mock = start_mock(args.mock, args.mock_port)
+    print("mock provider: started on ephemeral loopback")
 
     # Start the bridge.
     server_env = os.environ.copy()
-    server_env.update({"ORBIT_HOME": args.home, "ORBIT_GATE_TOKEN": "test-token"})
-    server = subprocess.Popen(
+    server_env.pop("ORBIT_WEB_TOKEN", None)
+    server_env.update({"ORBIT_HOME": args.home, "ORBIT_GATE_TOKEN": "test-token",
+                       "ORBIT_GATE_URL": gate})
+    server = None
+    try:
+        server = subprocess.Popen(
         [args.binary, "--no-browser", "--port", str(args.port), "--model", args.model,
-         "--gate", "http://127.0.0.1:8088"],
+         "--gate", gate],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=server_env,
         start_new_session=True,
-    )
-    try:
+        )
         for _ in range(30):
             if port_open(args.port):
                 break
@@ -274,31 +317,45 @@ def main():
         # ── 3. WS actions: sessions list ───────────────────────────────
         print("\n== WS sessions ==")
         ws = WSClient(args.port)
-        ws.send({"type": "list_sessions"})
+        ready = json.loads(ws.recv_text(timeout=10) or "{}")
+        assert ready.get("type") == "controller_ready", ready
+
+        def action(value):
+            ws.send(value)
+            reply = json.loads(ws.recv_text(timeout=10) or "{}")
+            assert reply.get("type") == "action_ack", reply
+            return reply
+
+        action({"type": "list_sessions"})
         ev = sse.wait_for("sessions", timeout=10)
         check("sessions event", ev is not None and "sessions" in ev, str(ev))
 
         # ── 4. Prompt → stream → finished ──────────────────────────────
         print("\n== turn: stream ==")
-        ws.send({"type": "prompt", "text": "hello from the browser test"})
+        action({"type": "prompt", "request_id": "legacy-browser-stream", "text": "hello from the browser test"})
         fin = sse.wait_for("turn_ended", timeout=30, pred=lambda d: d.get("ok", False))
         check("turn_ended event", fin is not None, "no turn_ended within 30s")
         deltas = sse.collect_deltas(0)
         check("deltas streamed", len(deltas) > 0, "no text_delta events")
         if fin:
             check("usage reported", "input_tokens" in fin and "output_tokens" in fin)
+        completed = sse.wait_for("request_finished", timeout=10,
+                                 pred=lambda value: value.get("request_id") == "legacy-browser-stream")
+        assert completed is not None, "owner must persist and finish before the next setting action"
 
         # ── 5. Tool call → approval → finished ─────────────────────────
         print("\n== turn: approval ==")
         # The "mock" model issues a tool call (same as the TUI suite).
-        ws.send({"type": "set_model", "model": "mock-bash"})
-        sse.wait_for("model_changed", timeout=10)
-        ws.send({"type": "prompt", "text": "use a tool please"})
+        selected = action({"type": "set_model", "model": "mock-bash"})
+        assert selected.get("snapshot", {}).get("model") == "mock-bash", selected
+        assert sse.wait_for("identity", timeout=10,
+                            pred=lambda value: value.get("model") == "mock-bash") is not None
+        action({"type": "prompt", "request_id": "legacy-browser-tool", "text": "use a tool please"})
         ap_ev = sse.wait_for("approval_requested", timeout=30)
         check("approval event", ap_ev is not None and "call_id" in ap_ev, str(ap_ev))
         if ap_ev:
             check("approval has summary", bool(ap_ev.get("summary")))
-            ws.send({"type": "approve", "call_id": ap_ev["call_id"], "verdict": "allow"})
+            action({"type": "approve", "call_id": ap_ev["call_id"], "verdict": "allow"})
             fin2 = sse.wait_for("turn_ended", timeout=30)
             check("turn finished after approval", fin2 is not None)
             tools = [e for e, _ in sse.events if e == "tool_started_full"]
@@ -306,7 +363,10 @@ def main():
 
         # ── 6. Session persisted ───────────────────────────────────────
         print("\n== persistence ==")
-        ws.send({"type": "list_sessions"})
+        completed = sse.wait_for("request_finished", timeout=10,
+                                 pred=lambda value: value.get("request_id") == "legacy-browser-tool")
+        assert completed is not None and completed.get("turns", 0) >= 2, completed
+        action({"type": "list_sessions"})
         ev = sse.wait_for("sessions", timeout=10,
                           pred=lambda d: any(s.get("turns", 0) >= 2 for s in d.get("sessions", [])))
         check("session saved with turns", ev is not None, str(ev))
@@ -316,15 +376,22 @@ def main():
         if ev:
             sid = next(s["session_id"] for s in ev["sessions"] if s.get("turns", 0) >= 2)
             ws.send({"type": "resume", "id": sid})
-            tr = sse.wait_for("transcript", timeout=10)
+            tr = None
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                reply = json.loads(ws.recv_text(timeout=10) or "{}")
+                if reply.get("type") == "action_ack" and reply.get("ack", {}).get("state") == "resumed":
+                    tr = reply.get("snapshot")
+                    break
             check("transcript restored", tr is not None and len(tr.get("messages", [])) >= 3,
                   str(tr)[:120])
 
     finally:
-        os.killpg(os.getpgid(server.pid), signal.SIGTERM)
-        server.wait(timeout=10)
+        stop_child(server)
+        stop_child(mock)
 
     print(f"\n{'='*40}\nweb harness: {PASS} passed, {FAIL} failed")
+    print("ORBIT_CHECK_RECEIPT " + json.dumps({"scenarios": SCENARIOS}))
     sys.exit(1 if FAIL else 0)
 
 

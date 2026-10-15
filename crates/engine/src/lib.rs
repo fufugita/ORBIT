@@ -25,6 +25,7 @@
 //! runtime into the engine (see [`ToolExecutor`]); the system prompt
 //! and context builder are phase-4 work.
 
+pub mod agent_store;
 pub mod automation;
 pub mod context;
 pub mod diff;
@@ -101,6 +102,7 @@ pub fn user_message(text: impl Into<String>) -> ChatMessage {
         tool_result: None,
         blocks: None,
         origin_model: None,
+        origin_provider: None,
     }
 }
 
@@ -114,5 +116,6 @@ pub fn assistant_message(text: impl Into<String>) -> ChatMessage {
         tool_result: None,
         blocks: None,
         origin_model: None,
+        origin_provider: None,
     }
 }

@@ -7,8 +7,60 @@
 //! references its bearer token by environment variable name (`env = "..."`),
 //! resolved at dispatch time and never printed or persisted.
 
+use orbit_adapter::types::EffortValue;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Provider credentials belong in an environment reference, never in the URL.
+/// Errors deliberately contain neither the input URL nor any query value.
+pub fn validate_provider_endpoint(raw: &str) -> Result<url::Url, String> {
+    if raw.len() > 2048 || raw.chars().any(char::is_control) {
+        return Err("provider URL must be bounded printable HTTP(S)".into());
+    }
+    let endpoint = url::Url::parse(raw).map_err(|_| "provider URL must be absolute HTTP(S)")?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(
+            "provider URL must be absolute HTTP(S) without credentials or a fragment".into(),
+        );
+    }
+    for (key, _) in endpoint.query_pairs() {
+        let normalized: String = key
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if [
+            "apikey",
+            "xapikey",
+            "key",
+            "token",
+            "accesstoken",
+            "refreshtoken",
+            "sessiontoken",
+            "idtoken",
+            "bearertoken",
+            "password",
+            "secret",
+            "clientsecret",
+            "authorization",
+            "auth",
+            "credential",
+            "credentials",
+        ]
+        .contains(&normalized.as_str())
+        {
+            return Err(
+                "provider URL contains a credential query; use a credential ENV reference".into(),
+            );
+        }
+    }
+    Ok(endpoint)
+}
 
 /// Per-million-token pricing in microdollars (DR-09 §8; C5: the unit was
 /// mislabeled "microcents" — 200000 means $0.20 per million tokens, and the
@@ -92,6 +144,44 @@ pub struct ModelEntry {
     /// outright, so sampling is opt-in per model, never ambient.
     #[serde(default)]
     pub sampling: Option<SamplingOverride>,
+    /// Operator-declared exact choices. None is unknown; an empty list declares no support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_efforts: Option<Vec<EffortValue>>,
+    /// Omitted by default, preserving the provider's existing request behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<EffortValue>,
+}
+
+impl ModelEntry {
+    pub fn validate_effort(&self, kind: orbit_engine::ProviderKind) -> Result<(), String> {
+        if let Some(choices) = &self.supported_efforts {
+            for (index, value) in choices.iter().enumerate() {
+                value.validate()?;
+                kind.validate_effort_value(value)?;
+                if choices[..index].contains(value) {
+                    return Err(format!(
+                        "model '{}' has duplicate effort '{value}'",
+                        self.id
+                    ));
+                }
+            }
+        }
+        if let Some(value) = &self.default_effort {
+            value.validate()?;
+            kind.validate_effort_value(value)?;
+            if !self
+                .supported_efforts
+                .as_ref()
+                .is_some_and(|choices| choices.contains(value))
+            {
+                return Err(format!(
+                    "model '{}' default effort '{value}' must be among declared supported_efforts",
+                    self.id
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Per-model sampling (E8): only what is explicitly set is sent.
@@ -153,6 +243,13 @@ pub struct RoutingConfig {
     pub easy: String,
     #[serde(default)]
     pub keywords: RoutingKeywords,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub phases: std::collections::BTreeMap<
+        orbit_engine::routing::TaskPhase,
+        crate::phase_routing::PhaseTargets,
+    >,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_keywords: Option<crate::phase_routing::PhaseKeywords>,
 }
 
 /// Keyword lists. Entries are matched case-insensitively on word
@@ -262,19 +359,100 @@ impl ProvidersConfig {
     /// contract). Malformed file = an error surfaced to the user.
     pub fn load(home: &Path) -> Result<Self, String> {
         let path = home.join("providers.toml");
-        if !path.exists() {
-            return Ok(Self::default());
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(error.kind().to_string()),
+            Ok(_) => {}
         }
-        let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
-        let cfg: ProvidersConfig =
-            toml::from_str(&raw).map_err(|e| format!("parse {path:?}: {e}"))?;
-        Ok(cfg)
+        let directory =
+            crate::customization::Directory::open(home, false).map_err(|e| e.to_string())?;
+        let bytes = crate::customization::read_regular(
+            &directory
+                .io()
+                .map_err(|e| e.to_string())?
+                .join("providers.toml"),
+            128 * 1024,
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+        let raw =
+            std::str::from_utf8(&bytes).map_err(|_| "providers configuration must be UTF-8")?;
+        let config = Self::load_from_str(raw)?;
+        directory.check().map_err(|e| e.to_string())?;
+        Ok(config)
     }
 
     /// Parse a config from raw TOML (tests and tooling; `load` reads the
     /// home's file).
     pub fn load_from_str(raw: &str) -> Result<Self, String> {
-        toml::from_str(raw).map_err(|e| format!("parse providers: {e}"))
+        if raw.len() > 128 * 1024 {
+            return Err("providers configuration exceeds 128 KiB".into());
+        }
+        let cfg: Self = toml::from_str(raw).map_err(|e| format!("parse providers: {e}"))?;
+        cfg.validate_efforts()?;
+        crate::phase_routing::parse_settings(raw)?;
+        Ok(cfg)
+    }
+
+    pub fn phase_settings(&self) -> crate::phase_routing::PhaseRoutingConfig {
+        crate::phase_routing::PhaseRoutingConfig {
+            phases: self.routing.phases.clone(),
+            phase_keywords: self.routing.phase_keywords.clone(),
+        }
+    }
+
+    /// Mutate the current complete document while holding the shared config lock.
+    pub fn update_atomic(
+        home: &Path,
+        update: impl FnOnce(&str) -> Result<String, String>,
+    ) -> Result<Self, String> {
+        use crate::customization::{publish, read_regular, Directory, Lock};
+        let directory = Directory::open(home, true).map_err(|e| e.to_string())?;
+        let _lock = Lock::acquire(&directory, ".config.lock").map_err(|e| e.to_string())?;
+        let path = directory
+            .io()
+            .map_err(|e| e.to_string())?
+            .join("providers.toml");
+        let bytes = match std::fs::symlink_metadata(&path) {
+            Ok(_) => read_regular(&path, 128 * 1024, false).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.kind().to_string()),
+        };
+        let raw =
+            std::str::from_utf8(&bytes).map_err(|_| "providers configuration must be UTF-8")?;
+        let candidate = update(raw)?;
+        let config = Self::load_from_str(&candidate)?;
+        crate::phase_routing::validate_settings(&config, &config.phase_settings())?;
+        if candidate.as_bytes() != bytes {
+            publish(&directory, "providers.toml", candidate.as_bytes(), false)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(config)
+    }
+
+    pub fn validate_efforts(&self) -> Result<(), String> {
+        for provider in &self.provider {
+            for model in &provider.models {
+                model
+                    .validate_effort(orbit_engine::ProviderKind::from_config(&provider.kind))
+                    .map_err(|error| format!("provider '{}': {error}", provider.name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve metadata against the actual owning provider, including duplicate model IDs.
+    pub fn model_entry(
+        &self,
+        provider_id: &str,
+        model: &str,
+    ) -> Option<(&ProviderConfig, &ModelEntry)> {
+        self.provider
+            .iter()
+            .find(|p| p.name == provider_id)
+            .and_then(|p| p.models.iter().find(|m| m.id == model).map(|m| (p, m)))
     }
 
     /// Aggregate every declared model across all providers as (provider, model).
@@ -297,13 +475,25 @@ impl ProvidersConfig {
     /// directly (for the same id declared twice). None = the role is not
     /// configured, or names nothing that exists.
     pub fn provider_for_role_spec(&self, spec: &str) -> Option<&ProviderConfig> {
-        if let Some((prov, model)) = spec.split_once('/') {
-            return self
-                .provider
-                .iter()
-                .find(|p| p.name == prov && p.models.iter().any(|m| m.id == model));
+        self.model_entry_for_spec(spec)
+            .map(|(provider, _)| provider)
+    }
+
+    /// Prefer an exact declared provider/model pair, then the full bare model ID.
+    /// A slash inside the actual ID is never discarded during metadata lookup.
+    pub fn model_entry_for_spec(&self, spec: &str) -> Option<(&ProviderConfig, &ModelEntry)> {
+        if let Some((provider, model)) = spec.split_once('/') {
+            if let Some(pair) = self.model_entry(provider, model) {
+                return Some(pair);
+            }
         }
-        self.provider_for_model(spec)
+        self.provider.iter().find_map(|provider| {
+            provider
+                .models
+                .iter()
+                .find(|entry| entry.id == spec)
+                .map(|entry| (provider, entry))
+        })
     }
 
     /// The declared max output tokens for a model id, if any.
@@ -342,6 +532,9 @@ impl ProvidersConfig {
     pub fn add_provider(&mut self, p: ProviderConfig) -> Result<(), String> {
         if self.provider.iter().any(|x| x.name == p.name) {
             return Err(format!("provider '{}' already configured", p.name));
+        }
+        for model in &p.models {
+            model.validate_effort(orbit_engine::ProviderKind::from_config(&p.kind))?;
         }
         self.provider.push(p);
         Ok(())
@@ -415,6 +608,7 @@ impl ProvidersConfig {
     /// created 0600 — the config may reference env-var names but never holds
     /// credential values; 0600 is defense-in-depth for the provider list.
     pub fn save_atomic(&self, home: &Path) -> Result<(), String> {
+        self.validate_efforts()?;
         let dir = home;
         std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
         let path = dir.join("providers.toml");
@@ -684,8 +878,10 @@ output_per_million_microcents = 600000
             url: "http://127.0.0.1:4001".into(),
             env: Some("ORBIT_GATE_TOKEN".into()),
             models: vec![ModelEntry {
+                supported_efforts: None,
+                default_effort: None,
                 sampling: None,
-                id: "glm-5.2".into(),
+                id: "fixture-model".into(),
                 label: None,
                 pricing: Pricing {
                     input_per_million_microdollars: 200_000,
@@ -715,9 +911,12 @@ output_per_million_microcents = 600000
 
     #[test]
     fn parses_models_response() {
-        let raw = r#"{"data":[{"id":"glm-5.2"},{"id":"kimi-k2.7"}]}"#;
+        let raw = r#"{"data":[{"id":"fixture-model"},{"id":"kimi-k2.7"}]}"#;
         let ids = ModelListResponse::parse(raw).unwrap();
-        assert_eq!(ids, vec!["glm-5.2".to_string(), "kimi-k2.7".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["fixture-model".to_string(), "kimi-k2.7".to_string()]
+        );
         assert!(ModelListResponse::parse(r#"{"data":[]}"#).is_err());
     }
 
@@ -819,5 +1018,93 @@ id = "m1"
 "#;
         let cfg = ProvidersConfig::load_from_str(raw).unwrap();
         assert!(cfg.roles.entries().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod effort_metadata_tests {
+    use super::*;
+    use orbit_adapter::types::EffortValue;
+
+    #[test]
+    fn legacy_capabilities_stay_unknown_and_typed_choices_roundtrip() {
+        let legacy = ProvidersConfig::load_from_str("[[provider]]\nname='p'\nurl='https://example.test'\n[[provider.models]]\nid='legacy'\n").unwrap();
+        assert_eq!(legacy.provider[0].models[0].supported_efforts, None);
+        assert_eq!(legacy.provider[0].models[0].default_effort, None);
+        let raw = "[[provider]]\nname='p'\nkind='ollama'\nurl='https://example.test'\n[[provider.models]]\nid='typed'\nsupported_efforts=[false,'false','high']\ndefault_effort=false\ncontext_window=4096\n[provider.models.sampling]\ntemperature=0.5\n[roles]\nmain='p/typed'\n";
+        let cfg = ProvidersConfig::load_from_str(raw).unwrap();
+        let values = cfg.provider[0].models[0]
+            .supported_efforts
+            .as_ref()
+            .unwrap();
+        assert_eq!(values[0], EffortValue::Bool(false));
+        assert_eq!(values[1], EffortValue::Level("false".into()));
+        let home = std::env::temp_dir().join(format!("orbit-effort-config-{}", ulid::Ulid::new()));
+        cfg.save_atomic(&home).unwrap();
+        assert_eq!(ProvidersConfig::load(&home).unwrap(), cfg);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn malformed_duplicates_and_unverified_defaults_are_rejected() {
+        let base =
+            "[[provider]]\nname='p'\nurl='https://example.test'\n[[provider.models]]\nid='m'\n";
+        for suffix in [
+            "supported_efforts=['high','high']\n",
+            "supported_efforts=[' high']\n",
+            "supported_efforts=['default']\n",
+            "supported_efforts=[true]\n",
+            "default_effort='high'\n",
+            "supported_efforts=[]\ndefault_effort='high'\n",
+            "supported_efforts=['low']\ndefault_effort='high'\n",
+        ] {
+            assert!(
+                ProvidersConfig::load_from_str(&format!("{base}{suffix}")).is_err(),
+                "{suffix}"
+            );
+        }
+        assert!(ProvidersConfig::load_from_str(&format!("{base}supported_efforts=[]\n")).is_ok());
+    }
+
+    #[test]
+    fn failed_save_keeps_the_prior_configuration_intact() {
+        let mut cfg = ProvidersConfig::load_from_str(
+            "[[provider]]\nname='p'\nurl='https://example.test'\n[[provider.models]]\nid='m'\n",
+        )
+        .unwrap();
+        let home = std::env::temp_dir().join(format!("orbit-effort-save-{}", ulid::Ulid::new()));
+        cfg.save_atomic(&home).unwrap();
+        let old = std::fs::read(home.join("providers.toml")).unwrap();
+        cfg.provider[0].models[0].default_effort = Some(EffortValue::Level("high".into()));
+        assert!(cfg.save_atomic(&home).is_err());
+        assert_eq!(std::fs::read(home.join("providers.toml")).unwrap(), old);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn model_spec_resolution_preserves_full_bare_and_qualified_slash_ids() {
+        let cfg = ProvidersConfig::load_from_str("[[provider]]\nname='p'\nurl='https://example.test'\n[[provider.models]]\nid='vendor/reasoner'\nsupported_efforts=['high']\ndefault_effort='high'\n[[provider.models]]\nid='p/incidental-prefix'\n").unwrap();
+        for spec in ["vendor/reasoner", "p/vendor/reasoner"] {
+            let (provider, entry) = cfg.model_entry_for_spec(spec).unwrap();
+            assert_eq!(provider.name, "p");
+            assert_eq!(entry.id, "vendor/reasoner");
+            assert_eq!(
+                entry.default_effort,
+                Some(EffortValue::Level("high".into()))
+            );
+        }
+        assert_eq!(
+            cfg.model_entry_for_spec("p/incidental-prefix")
+                .unwrap()
+                .1
+                .id,
+            "p/incidental-prefix"
+        );
+        assert_eq!(
+            cfg.model_entry_for_spec("p/p/incidental-prefix")
+                .unwrap()
+                .1
+                .id,
+            "p/incidental-prefix"
+        );
     }
 }

@@ -100,6 +100,18 @@ it on release through OSC 52, so your terminal has to allow that. `?` lists ever
 commands, `:` opens the command palette, and a line that starts with `!` runs
 a command of your own.
 
+Type `@` in the composer to browse files in the current workspace. `↑` and `↓`
+choose a path; `Tab` or `Enter` inserts it into the draft. Selecting a directory
+continues browsing. Ignored files and sensitive paths are hidden from suggestions.
+Use `@"docs/design note.md"` for paths with spaces. When you send the prompt,
+mentions pass through the Read tool's permission and scanning checks; image
+mentions such as `@screenshot.png` attach the image for providers that support it.
+
+`Ctrl-R` searches saved input history. Type a substring, repeat `Ctrl-R` to
+find an older match, and press `Enter` to accept it into the draft. `Esc` restores
+the draft you started with. A second `Enter` sends the accepted draft. History
+preserves multiline prompts across restarts; older history files still load.
+
 Colour is negotiated with the terminal rather than assumed: true colour, 256,
 16 and no colour (`NO_COLOR` is honoured) each have their own palette, and
 colour effects such as fades switch off at the low end while glyph motion
@@ -115,39 +127,78 @@ too small.
 
 ## Install
 
-Requires Rust 1.94 (pinned in `rust-toolchain.toml`):
+Install the command-line and browser executables as one verified bundle. Release
+mode needs Bash, Python 3.11+, curl, and a SHA-256 utility; Rust is needed only for
+a source build. Use a version with published native Linux assets:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fufugita/ORBIT/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/fufugita/ORBIT/main/install.sh -o /tmp/orbit-install.sh
+bash /tmp/orbit-install.sh --method release --version 0.2.0 --dir "$HOME/.local/bin"
 ```
 
-or from a checkout:
+The installer requires the archive checksum and both executable hashes. Managed
+upgrades switch both binaries together and preserve your configuration. It refuses
+unmanaged executables in the destination; choose a fresh `--dir` in that case.
+A missing release asset fails visibly. To build explicitly from a checkout with
+the pinned Rust 1.94 toolchain and locked dependencies:
 
 ```sh
 git clone https://github.com/fufugita/ORBIT
 cd ORBIT
-cargo build --release
+bash install.sh --method source --source . --version 0.2.0 --dir "$HOME/.local/bin"
 ```
+
+See [setup and installation](docs/setup.md) for the bundle layout and platform
+limits. Checksums establish integrity against the published checksum; current
+bundles are unsigned.
 
 ## Quickstart
 
 ```sh
-# Initialize the trust root, identity, and ledger
-orbit init
+# Offline setup; repeating this preserves your identity and ledger
+orbit setup
+orbit doctor
 
-# Add a provider (interactive: presets, discovery, roles)
-orbit provider add
+# Manual guided provider setup; credentials stay in your environment
+orbit setup --guided
 
-# Start the harness — the TUI opens when stdin/stdout are a terminal
+# Open the terminal harness
 orbit
 
-# Or run one prompt headless, with tools
+# Or send one prompt headless
 orbit -p "read README.md and summarize it" --output-format text
 ```
 
-The harness reads provider configuration from `$ORBIT_HOME/providers.toml`
-(default `~/.orbit/`). A missing config falls back to the
-`ORBIT_GATE_URL` / `ORBIT_MODEL` / `ORBIT_GATE_TOKEN` environment contract.
+Provider configuration lives in `$ORBIT_HOME/providers.toml` (default
+`~/.orbit/`). Declare exact endpoint/model pairs and credential environment-variable
+names. A legacy direct-gateway session requires an explicit `ORBIT_GATE_URL` or
+`--gate`; malformed or ambiguous declared configuration is refused.
+
+Built-in phase and difficulty routing is configured without another model call:
+
+```sh
+orbit route setup --easy first/small --hard second/strong
+orbit route test "Implement a comprehensive parser"
+```
+
+Use declared provider/model names in place of the examples. Explicit model choices
+pin a session; `/route auto` enables automatic selection for it. See
+[setup](docs/setup.md) for individual phase targets and saved-session controls.
+
+Appearance and named panes share a portable profile:
+
+```sh
+orbit customize theme midnight
+orbit customize set colors.accent '#8A91FF'
+orbit customize set layout.preset review
+orbit customize capabilities
+```
+
+See [customization](docs/customization.md) for fonts, layouts, colors, custom panes,
+reload, and import/export. For engagement templates, scope and evidence panes,
+start with [pentest workspaces](docs/pentest.md). Follow the
+[first real-provider trial](docs/provider-acceptance.md) before relying on a new
+provider configuration.
 
 ## Providers
 
@@ -205,6 +256,47 @@ the same id is declared twice. A subagent's own `model:` frontmatter
 overrides its role. `orbit provider role <name> [model]` sets and
 queries roles; interactive `provider add` offers to fill unset ones,
 preferring cheap models for explore and compaction.
+
+### Named and resumable agents
+
+`Task` (also accepted as `Agent`) returns a stable `agent_id`, status and
+report. Give a new agent a display `name`, then pass its ID as `resume`
+to continue its saved conversation with the same agent profile:
+
+```json
+{"agent":"Explore","prompt":"Map the parser","name":"parser research"}
+{"agent":"Explore","prompt":"Check its error paths","resume":"<agent_id>"}
+```
+
+Names are labels; IDs address agents. Saved agents belong to the parent
+conversation and remain available when that conversation is resumed.
+Each call runs synchronously. An optional `model` selects a configured
+model, including `provider/model`, ahead of profile frontmatter and role
+routing. Resume keeps the saved model unless the call supplies another
+one. The agent panel displays the model actually used.
+
+An optional `effort` selects one of that model's declared effort choices.
+Use a level string, or a boolean for an Ollama model that supports it.
+Resume keeps the saved selection; `"effort":"default"` or `"effort":null`
+restores the model default. An explicit model change resolves the new
+model's settings. Profile frontmatter can also set `effort`; a parent's
+choice is inherited only for the same provider and model. Effort changes
+apply to subsequent requests and newly started agents.
+
+`ListAgents` returns IDs, names, profiles, models, saved effort selections,
+status and pending
+message counts. Its optional `offset` and `limit` page through the list;
+follow `next_offset` until it is null. `AgentSendMessage` takes an
+`agent_id` and `message` and returns a queued receipt. Messages are
+delivered on the next explicit `Task` resume. Messages arriving during
+a run wait for a later resume.
+
+Child calls inherit the parent's permission rules, working directories
+and cancellation. Nesting is limited to three agent levels, with at
+most 64 saved agents per parent conversation. Long tool-response reports
+are shortened with `report_truncated`; the full report remains saved.
+After an interrupted run, the next resume asks the agent to inspect existing effects before
+continuing; external effects are not automatically replayed.
 
 ### Difficulty routing
 
@@ -292,7 +384,7 @@ orbit version          build + evidence facts (computed, no fixed claims)
 orbit web              start the browser harness
 ```
 
-Common flags: `--model <M>`, `--gate <URL>`, `--provider <name>`,
+Common flags: `--model <M>`, `--effort <VALUE|default>`, `--gate <URL>`, `--provider <name>`,
 `--home <DIR>`, `--continue`, `--resume <ID>`, `--fork-session`, `--no-tui`,
 `--auto-tools`, `--permission-mode <default|acceptEdits|plan|dontAsk|bypass>`.
 For `-p`: `--output-format <text|json|stream-json>`, `--allowedTools`,
@@ -363,6 +455,9 @@ env = "ORBIT_GATE_TOKEN"     # env-var NAME, never the value
 id = "model-a"
 context_window = 200000      # enables auto-compaction as the window fills
 max_output_tokens = 32000    # the default when omitted
+# Optional: declare only choices this provider/model accepts.
+# supported_efforts = ["low", "medium", "high"]
+# default_effort = "high"
 
 [provider.models.pricing]
 input_per_million_microdollars = 200000   # $0.20 per million input tokens
@@ -371,6 +466,85 @@ output_per_million_microdollars = 600000   # $0.60 per million output tokens
 
 The pricing unit is microdollars per million tokens. Sampling
 (`temperature`, `top_p`) is sent only when a model sets it.
+
+### Reasoning effort
+
+Declare `supported_efforts` in the model's table to enable explicit effort
+selection. Values are exact strings, or booleans for Ollama's thinking
+control. An omitted list means support is unknown; an empty list declares
+no supported choices. `default_effort`, when set, must be in that list.
+Existing configurations without these fields keep their provider defaults.
+
+Use `--effort high` at startup, or `/effort high` during chat. `/effort`
+shows the configured request value and choices; `/effort default` clears
+the session override and restores `default_effort`, or leaves the provider
+field omitted when there is no configured default. `ORBIT_EFFORT` supplies
+a startup choice when the flag is absent. An explicit startup selection
+or reset takes precedence over a saved choice.
+
+JSON quotes distinguish a named string from a boolean: `/effort "false"`
+or `--effort '"false"'` selects the string, while plain `false` selects
+the boolean. Each must be declared separately when both are supported.
+
+Selections persist with chats and named agents. Changing a model validates
+an explicit choice against the target model; an incompatible change leaves
+the current settings intact. Implicit defaults follow the newly selected
+model. Separate role models use their own configured settings.
+
+OpenAI-compatible Chat Completions uses `reasoning_effort`, Anthropic uses
+`output_config.effort` while retaining its existing adaptive thinking, and
+Ollama uses `think`. Boolean values are not converted into effort levels.
+The setting describes the request ORBIT sends; it does not measure internal
+reasoning or confirm a gateway's acceptance. Declare capabilities from the
+chosen model's documentation or metadata. ORBIT refuses unverified or
+unsupported selections before sending a request.
+
+### MCP servers
+
+On Unix, ORBIT runs configured MCP servers over stdio using protocol
+`2025-06-18`. Put user-wide servers in `$ORBIT_HOME/mcp.json`, or project
+servers in `.orbit/mcp.json`
+after trusting that folder:
+
+```json
+{
+  "servers": {
+    "docs": {
+      "command": "node",
+      "args": ["/path/to/server.js"],
+      "enabled": true,
+      "tools": ["search", "read_document"],
+      "timeout_ms": 30000,
+      "initialize_timeout_ms": 5000
+    }
+  }
+}
+```
+
+Omit `tools` to expose all server tools, or use an empty list to expose
+none. Names are exact and case-sensitive. `enabled: false` skips discovery
+and refuses calls. Agent tool restrictions also apply before discovery
+and at execution; exposing a tool never grants approval.
+
+The defaults are 30 seconds per operation and 5 seconds for initialization.
+Timeout values must be between 1 and 600,000 milliseconds. One deadline
+covers waiting for the server, initialization, writes and responses;
+progress messages do not extend it. Each server has its own connection
+lock. A failed connection is retired and a later explicit call can
+reconnect. A cancelled or timed-out call is never automatically replayed;
+when request data was sent, its external outcome may be unknown.
+
+Discovery follows bounded pages, and protocol frames and accumulated tool
+metadata are limited to 1 MiB. Model-facing results are scanned and limited
+to 64 KiB of encoded JSON, with truncation marked. Server error flags and
+structured results remain visible. MCP calls respect the caller's tool
+rules and working directory; Plan mode refuses opaque MCP calls because
+their read/write behavior is unknown.
+
+See [integrations](docs/integrations.md) for native MCP policy and catalog
+overrides, session owner/attach workflows, LSP diagnostics, and signed package
+usage. The [browser guide](docs/browser-harness.md) covers browser access,
+recovery and workspace customization.
 
 ### Permission rules
 
@@ -403,6 +577,7 @@ whenever you rearrange the panels) and colour and motion settings such as
 | `ORBIT_HOME` | Config directory (default `~/.orbit`) |
 | `ORBIT_GATE_URL` | Gateway base URL (fallback) |
 | `ORBIT_MODEL` | Default model id (fallback) |
+| `ORBIT_EFFORT` | Startup effort selection when `--effort` is absent; `default` resets it |
 | `ORBIT_GATE_TOKEN` | Bearer token (referenced by `providers.toml`) |
 | `ORBIT_ALLOW_UNSANDBOXED_BASH` | Set to `1` to let Bash run unsandboxed where no sandbox is available |
 | `ORBIT_ASCII_EMOJI` | Set to `0` to disable ASCII emoji fallback |

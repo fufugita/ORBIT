@@ -8,6 +8,82 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A provider's exact reasoning control. Boolean toggles and named levels
+/// remain distinct; neither is translated into a token budget.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EffortValue {
+    Bool(bool),
+    Level(String),
+}
+
+impl EffortValue {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::Level(level) = self {
+            if level.is_empty()
+                || level.len() > 64
+                || level.trim() != level
+                || level.chars().any(char::is_control)
+            {
+                return Err("effort levels must contain 1–64 UTF-8 bytes, without surrounding whitespace or control characters".into());
+            }
+            if level == "default" {
+                return Err(
+                    "default resets the effort selection; it is not a provider effort level".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_openai(&self) -> Result<(), String> {
+        self.validate()?;
+        match self {
+            Self::Level(_) => Ok(()),
+            Self::Bool(_) => {
+                Err("OpenAI-compatible reasoning_effort requires a named level".into())
+            }
+        }
+    }
+
+    pub fn validate_for_anthropic(&self) -> Result<(), String> {
+        self.validate()?;
+        match self {
+            Self::Level(level)
+                if matches!(level.as_str(), "low" | "medium" | "high" | "xhigh" | "max") =>
+            {
+                Ok(())
+            }
+            _ => Err(
+                "Anthropic output_config.effort requires low, medium, high, xhigh or max".into(),
+            ),
+        }
+    }
+
+    pub fn validate_for_ollama(&self) -> Result<(), String> {
+        self.validate()
+    }
+}
+
+impl std::fmt::Display for EffortValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bool(value) => write!(f, "{value}"),
+            Self::Level(level) => f.write_str(level),
+        }
+    }
+}
+
+/// Selection provenance, separate from a resolved optional wire value.
+/// An absent setting is legacy/unset; Default is an explicit reset.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "mode", content = "value", rename_all = "snake_case")]
+pub enum EffortSetting {
+    #[default]
+    Default,
+    Value(EffortValue),
+}
+
 /// Stable SHA-256 digest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Sha256Digest(pub String);
@@ -277,6 +353,11 @@ pub struct ChatMessage {
     /// messages — treated as unknown origin by the stripper.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_model: Option<String>,
+    /// The exact configured provider that produced opaque assistant blocks.
+    /// Absent on older history; raw model equality alone cannot establish that
+    /// a signed block belongs to the selected provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_provider: Option<String>,
 }
 
 /// A tool call inside an assistant message (OpenAI-compatible wire shape).
@@ -327,6 +408,8 @@ pub struct ProviderRequest {
     /// sends the full conversation (the final user turn's bytes are still
     /// `input` for hashing/zeroization; the transcript is the wire payload).
     pub messages: Option<Vec<ChatMessage>>,
+    /// Omission retains the provider's existing default request controls.
+    pub effort: Option<EffortValue>,
     pub sampling: SamplingParameters,
     pub output: OutputRequirements,
     pub tools: Vec<ToolDefinition>,

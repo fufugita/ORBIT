@@ -115,9 +115,7 @@ impl<'a> Wave1Executor<'a> {
             && crate::bash::is_readonly_command(
                 input.get("command").and_then(|v| v.as_str()).unwrap_or(""),
             );
-        let (verdict, _sandbox_up) = if self.grants.is_granted(&grant_key) {
-            (Verdict::Allow, true)
-        } else {
+        let (mut verdict, _sandbox_up) = {
             // evaluate_live: mode/rules semantics + the fallback rule
             // (no shell sandbox → every Bash command asks).
             crate::permissions::evaluate_live(
@@ -129,6 +127,15 @@ impl<'a> Wave1Executor<'a> {
                 is_ro_cmd,
             )
         };
+        // A remembered grant can cover a default ask, never a deny or a
+        // configured confirmation rule. Deliberate bypass remains in evaluate.
+        if verdict == Verdict::Ask
+            && self.grants.is_granted(&grant_key)
+            && self.rules.evaluate(&key.tool, &key.pattern)
+                != Some(crate::permissions::RuleEffect::Ask)
+        {
+            verdict = Verdict::Allow;
+        }
 
         match verdict {
             Verdict::Allow => {}
@@ -193,6 +200,54 @@ fn risk_for(tool: &str, input: &serde_json::Value) -> u8 {
     }
 }
 
+#[cfg(test)]
+mod grant_precedence_tests {
+    use super::*;
+    use crate::permissions::{parse_rule, RuleEffectSerde};
+
+    struct Refuse(usize);
+    impl ApprovalChannel for Refuse {
+        fn ask(&mut self, _: &ApprovalCard) -> ApprovalAnswer {
+            self.0 += 1;
+            ApprovalAnswer::Deny
+        }
+    }
+
+    #[test]
+    fn remembered_grants_do_not_skip_deny_or_explicit_confirmation() {
+        for effect in [RuleEffectSerde::Deny, RuleEffectSerde::Ask] {
+            let path =
+                std::env::temp_dir().join(format!("orbit-wave1-policy-{}", ulid::Ulid::new()));
+            std::fs::create_dir_all(&path).unwrap();
+            let cx = ToolContext::new(path.clone(), "owner".into(), path.clone());
+            let mut approval = Refuse(0);
+            let rule = parse_rule("Write", effect).unwrap();
+            let mut executor = Wave1Executor::new(
+                PermissionMode::Default,
+                RuleSet { rules: vec![rule] },
+                cx,
+                &mut approval,
+                None,
+            );
+            executor.grants.grant("Write(out.txt)".into());
+            let output = executor.execute_call(&CallForExecution {
+                id: "one".into(),
+                name: "Write".into(),
+                arguments: r#"{"file_path":"out.txt","content":"must not write"}"#.into(),
+            });
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&output).unwrap()["ok"],
+                false,
+                "{output}"
+            );
+            assert!(!path.join("out.txt").exists());
+            drop(executor);
+            assert_eq!(approval.0, usize::from(effect == RuleEffectSerde::Ask));
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}
+
 /// The definitions the engine advertises (Wave 1 set).
 pub fn wave1_definitions() -> Vec<ToolDefinition> {
     crate::tool_definitions()
@@ -215,19 +270,74 @@ pub fn load_rules(home: &Path) -> RuleSet {
 
 /// [`load_rules`] for an explicit project directory.
 pub fn load_rules_in(home: &Path, project: &Path) -> RuleSet {
+    match load_sourced_rules_in(home, project) {
+        Ok(entries) => RuleSet {
+            rules: entries
+                .into_iter()
+                .filter(|entry| !entry.shadowed)
+                .map(|entry| entry.rule)
+                .collect(),
+        },
+        Err(error) => {
+            warn_once(home, &error);
+            RuleSet::default()
+        }
+    }
+}
+
+/// The source label is a bounded scope name, never an unrelated file's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedPermissionRule {
+    pub rule: crate::permissions::PermissionRule,
+    pub source: &'static str,
+    pub shadowed: bool,
+}
+
+/// Strict loader used by execution and the effective policy view.
+pub fn load_sourced_rules_in(
+    home: &Path,
+    project: &Path,
+) -> Result<Vec<SourcedPermissionRule>, String> {
     let trusted = crate::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(project);
-    let mut rules = RuleSet::default();
+    let mut entries = Vec::new();
     // A file that exists but does not parse is WARNED, never silently
     // skipped (S1: silent skip deleted the user's deny rules).
-    for (path, scope) in [
-        (home.join("settings.toml"), Scope::User),
-        (project.join(".orbit/settings.toml"), Scope::Project),
-        (project.join(".orbit/settings.local.toml"), Scope::Project),
-        (home.join("permissions.toml"), Scope::Legacy),
+    for (path, scope, source) in [
+        (home.join("settings.toml"), Scope::User, "user"),
+        (
+            project.join(".orbit/settings.toml"),
+            Scope::Project,
+            "project",
+        ),
+        (
+            project.join(".orbit/settings.local.toml"),
+            Scope::Project,
+            "project-local",
+        ),
+        (home.join("permissions.toml"), Scope::Legacy, "legacy"),
+        (
+            home.join("permission-overrides.toml"),
+            Scope::User,
+            "operator-override",
+        ),
     ] {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+        if source == "operator-override"
+            && std::fs::symlink_metadata(&path)
+                .is_ok_and(|meta| !meta.file_type().is_file() || meta.len() > 64 * 1024)
+        {
+            return Err("operator override path must be a bounded regular file".into());
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{source} permission rules cannot be read: {error}")),
         };
+        validate_rule_file(&text, matches!(scope, Scope::Legacy))
+            .map_err(|error| format!("{source} permission rules: {error}"))?;
+        if source == "operator-override" {
+            validate_override_file(&text)?;
+        }
+        let mut rules = RuleSet::default();
         match toml_parse(&text) {
             Ok(v) => match scope {
                 Scope::Legacy => merge_legacy(&mut rules, &v),
@@ -243,15 +353,282 @@ pub fn load_rules_in(home: &Path, project: &Path) -> RuleSet {
                     }
                 }
             },
-            Err(e) => {
-                warn_once(
-                    &path,
-                    &format!("{e} (permission rules in it are NOT applied)"),
-                );
+            Err(error) => return Err(format!("{source} permission rules: {error}")),
+        }
+        entries.extend(rules.rules.into_iter().map(|rule| SourcedPermissionRule {
+            rule,
+            source,
+            shadowed: false,
+        }));
+    }
+    let overrides: std::collections::HashSet<_> = entries
+        .iter()
+        .filter(|entry| entry.source == "operator-override")
+        .map(|entry| entry.rule.tool.clone())
+        .collect();
+    for entry in &mut entries {
+        entry.shadowed = entry.source != "operator-override"
+            && entry.rule.effect != crate::permissions::RuleEffectSerde::Deny
+            && entry.rule.pattern.is_empty()
+            && overrides.contains(&entry.rule.tool);
+    }
+    Ok(entries)
+}
+
+fn validate_rule_file(text: &str, legacy: bool) -> Result<(), String> {
+    let doc: toml::Table = toml::from_str(text).map_err(|_| "invalid TOML".to_string())?;
+    if legacy {
+        for (key, value) in &doc {
+            if !matches!(key.as_str(), "allow" | "deny") {
+                return Err("legacy permissions support only allow and deny tables".into());
+            }
+            let table = value
+                .as_table()
+                .ok_or_else(|| "legacy permission sections must be tables".to_string())?;
+            if table.keys().any(|key| key != "tools") {
+                return Err("legacy permission tables support only tools".into());
             }
         }
     }
-    rules
+    if !legacy
+        && doc
+            .get("permissions")
+            .is_some_and(|value| !value.is_table())
+    {
+        return Err("permissions must be a table".into());
+    }
+    for effect in ["allow", "ask", "deny"] {
+        let value = if legacy {
+            doc.get(effect).and_then(|table| table.get("tools"))
+        } else {
+            doc.get("permissions").and_then(|table| table.get(effect))
+        };
+        if let Some(value) = value {
+            let array = value
+                .as_array()
+                .ok_or_else(|| format!("{effect} must be an array"))?;
+            for entry in array {
+                let raw = entry
+                    .as_str()
+                    .ok_or_else(|| format!("{effect} entries must be strings"))?;
+                let rule =
+                    crate::permissions::parse_rule(raw, crate::permissions::RuleEffectSerde::Ask)
+                        .ok_or_else(|| "empty or malformed permission rule".to_string())?;
+                if rule.tool.len() > 256 || rule.tool.chars().any(|c| c.is_control()) {
+                    return Err(
+                        "permission tool names must be bounded and contain no controls".into(),
+                    );
+                }
+                crate::permissions::validate_mcp_selector(&rule.tool)?;
+                if rule.tool.starts_with("mcp__")
+                    && (!rule.pattern.is_empty() || raw.contains(['(', ')']))
+                {
+                    return Err("MCP policies use exact tools or mcp__<server>__* without argument patterns".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The same strict legacy TOML parser used by the merged execution policy.
+pub fn load_legacy_permission_rules(home: &Path) -> Result<RuleSet, String> {
+    let text = match std::fs::read_to_string(home.join("permissions.toml")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(RuleSet::default()),
+        Err(error) => return Err(format!("read legacy permission rules: {error}")),
+    };
+    validate_rule_file(&text, true)?;
+    let parsed = toml_parse(&text)?;
+    let mut rules = RuleSet::default();
+    merge_legacy(&mut rules, &parsed);
+    Ok(rules)
+}
+
+fn validate_override_file(text: &str) -> Result<(), String> {
+    if text.len() > 64 * 1024 {
+        return Err("operator overrides exceed 64 KiB".into());
+    }
+    let doc: toml::Table =
+        toml::from_str(text).map_err(|_| "invalid operator override TOML".to_string())?;
+    if doc.keys().any(|key| key != "permissions") {
+        return Err("unknown operator override table".into());
+    }
+    if let Some(value) = doc.get("permissions") {
+        let table = value
+            .as_table()
+            .ok_or_else(|| "override permissions must be a table".to_string())?;
+        for (key, value) in table {
+            if !matches!(key.as_str(), "allow" | "ask" | "deny") {
+                return Err("unknown operator override permission key".into());
+            }
+            for item in value
+                .as_array()
+                .ok_or_else(|| "override permissions must be arrays".to_string())?
+            {
+                let selector = item
+                    .as_str()
+                    .ok_or_else(|| "override selectors must be strings".to_string())?;
+                let rule = crate::permissions::parse_rule(
+                    selector,
+                    crate::permissions::RuleEffectSerde::Ask,
+                )
+                .ok_or_else(|| "malformed operator selector".to_string())?;
+                if rule.tool != selector
+                    || !rule.pattern.is_empty()
+                    || selector.contains(['(', ')'])
+                    || selector.len() > 256
+                    || selector
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control())
+                    || (!selector.starts_with("mcp__") && selector.contains('*'))
+                {
+                    return Err("operator overrides require exact selectors".into());
+                }
+                crate::permissions::validate_mcp_selector(selector)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace only a matching operator override; reset reveals independent layers.
+/// Publication follows a private, synced temporary file and an atomic rename.
+pub fn write_operator_override(
+    home: &Path,
+    selector: &str,
+    effect: Option<crate::permissions::RuleEffectSerde>,
+) -> Result<(), String> {
+    use std::io::Write;
+    use toml_edit::{value, Array, DocumentMut, Item, Table};
+    let rule = crate::permissions::parse_rule(selector, crate::permissions::RuleEffectSerde::Ask)
+        .ok_or_else(|| "a permission selector is required".to_string())?;
+    if rule.tool != selector
+        || !rule.pattern.is_empty()
+        || selector.len() > 256
+        || selector
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        || (!selector.starts_with("mcp__") && selector.contains('*'))
+    {
+        return Err("override requires an exact tool or mcp__<server>__* selector".into());
+    }
+    crate::permissions::validate_mcp_selector(selector)?;
+    // The lock is separate from the replaceable file; OS ownership ends on
+    // close/crash and concurrent writers cannot silently drop other selectors.
+    let lock_path = home.join("permission-overrides.lock");
+    if std::fs::symlink_metadata(&lock_path).is_ok_and(|meta| !meta.file_type().is_file()) {
+        return Err("operator override lock must be a regular file".into());
+    }
+    let mut lock_options = std::fs::OpenOptions::new();
+    lock_options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_options.mode(0o600);
+    }
+    let lock = lock_options
+        .open(&lock_path)
+        .map_err(|error| format!("open operator override lock: {error}"))?;
+    lock.try_lock()
+        .map_err(|error| format!("operator override writer unavailable: {error}"))?;
+    let path = home.join("permission-overrides.toml");
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.file_type().is_file()) {
+        return Err("operator override path must be a regular file".into());
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read operator overrides: {error}")),
+    };
+    validate_rule_file(&text, false)?;
+    validate_override_file(&text)?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|_| "invalid operator override TOML".to_string())?;
+    if doc.get("permissions").is_none() {
+        doc["permissions"] = Item::Table(Table::new());
+    }
+    let perms = doc["permissions"]
+        .as_table_mut()
+        .ok_or_else(|| "permissions must be a table".to_string())?;
+    for (name, selected) in [
+        ("allow", crate::permissions::RuleEffectSerde::Allow),
+        ("ask", crate::permissions::RuleEffectSerde::Ask),
+        ("deny", crate::permissions::RuleEffectSerde::Deny),
+    ] {
+        let mut entries = Array::new();
+        if let Some(existing) = perms.get(name) {
+            let array = existing
+                .as_array()
+                .ok_or_else(|| format!("{name} must be an array"))?;
+            for entry in array
+                .iter()
+                .filter(|entry| entry.as_str() != Some(selector))
+            {
+                entries.push(entry.clone());
+            }
+        }
+        if effect == Some(selected) {
+            entries.push(selector);
+        }
+        perms[name] = value(entries);
+    }
+    validate_override_file(&doc.to_string())?;
+    let tmp = home.join(format!(".permission-overrides-{}.tmp", ulid::Ulid::new()));
+    let backup = tmp.with_extension("previous");
+    let save = (|| {
+        let directory = std::fs::File::open(home)
+            .map_err(|error| format!("open override directory: {error}"))?;
+        directory
+            .sync_all()
+            .map_err(|error| format!("sync override directory: {error}"))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|error| format!("create operator overrides: {error}"))?;
+        file.write_all(doc.to_string().as_bytes())
+            .map_err(|error| format!("save operator overrides: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync operator overrides: {error}"))?;
+        let previous = path.exists();
+        if previous {
+            std::fs::hard_link(&path, &backup)
+                .map_err(|error| format!("preserve prior overrides: {error}"))?;
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|error| format!("publish operator overrides: {error}"))?;
+        if let Err(error) = directory.sync_all() {
+            let rollback = if previous {
+                std::fs::rename(&backup, &path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            rollback.map_err(|rollback| format!("override publication uncertain: sync failed ({error}); rollback failed ({rollback})"))?;
+            let _ = directory.sync_all();
+            return Err(format!(
+                "sync override directory: {error}; prior policy restored"
+            ));
+        }
+        Ok(())
+    })();
+    if save.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    if save.is_ok() || std::fs::read_to_string(&path).is_ok_and(|current| current == text) {
+        let _ = std::fs::remove_file(&backup);
+    }
+    save
 }
 
 /// Remember `rule` as an allow rule in the project's local settings

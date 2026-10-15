@@ -1,168 +1,132 @@
-# ORBIT Browser Harness — Architecture
+# Browser harness
 
-> Status: **implemented** (crates/web + `orbit web`). The Rust core is the
-> single source of truth; the browser is a thin view.
->
-> Verified: `scripts/web_harness_test.py` — 13/13 (SPA, SSE identity, WS
-> actions, streaming, approval, persistence, resume) against the mock
-> provider, plus 6 router unit tests in crates/web/tests/.
+The browser harness uses ORBIT's session owner, provider adapters, tool permissions
+and saved conversations. Configure a provider through [setup](setup.md), then
+start the browser from the workspace you want to use:
 
-## Goal
-
-A browser front-end for ORBIT that reuses the exact same Rust core, protocol,
-and trust/ledger/tool-runtime as the TUI — so the operator can switch between
-terminal and browser without losing session state, approvals, or audit
-provenance. The browser is **not** a second harness; it is a second projection
-of the same harness.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  Browser (any modern browser, local or remote)            │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │  Single-page app (TypeScript, no framework)         │  │
-│  │  • three-pane layout (Sessions · Chat · Tasks)      │  │
-│  │  • streaming transcript (SSE)                        │  │
-│  │  • composer with slash commands                      │  │
-│  │  • approval modal (y / n / R)                        │  │
-│  │  • status bar (model · provider · session · cost)    │  │
-│  │  • theme (CSS custom properties, same palette)       │  │
-│  └───────────────────────┬────────────────────────────┘  │
-│                          │ WebSocket (actions) + SSE (events) │
-│  ┌───────────────────────┴────────────────────────────┐  │
-│  │  orbit-web (Rust, axum) — the bridge server          │  │
-│  │  • serves the SPA (static assets)                    │  │
-│  │  • WebSocket: browser → Rust actions (prompt, cancel, │  │
-│  │    approve, quit)                                    │  │
-│  │  • SSE: Rust → browser events (identity, delta,      │  │
-│  │    tool_call_started, cost, finished, error)         │  │
-│  │  • reuses run_turn + tool_runtime + sessions          │  │
-│  └───────────────────────┬────────────────────────────┘  │
-│                          │ in-process (same binary)        │
-│  ┌───────────────────────┴────────────────────────────┐  │
-│  │  Rust core (untouched):                              │  │
-│  │  gateway · ledger · trust · tool runtime · sessions  │  │
-│  │  egress · cancel · provider adapters · HUD gate      │  │
-│  └────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
+```sh
+orbit web --model PROVIDER/MODEL
 ```
 
-## Protocol (same JSON shapes as the Go TUI bridge)
+The default address is `http://127.0.0.1:4173`. ORBIT attempts to open it in your
+browser. Use `--no-browser` to open the address yourself, `--port 4180` to choose
+another port, or `--port 0 --no-browser` to let the system choose a port and print
+the actual address. The matching `orbit-web` executable must be installed beside
+`orbit`; see [setup and installation](setup.md).
 
-### Rust → Browser (SSE)
+## Work with a conversation
 
-```
-event: identity
-data: {"model":"...","provider":"...","session":"..."}
+Send a prompt with Enter; Shift+Enter inserts a newline. The transcript shows
+streamed responses, tool activity and approval requests. Cancel stops the current
+turn. An approval offers allow once, allow for this session, or deny; the owner
+applies the decision through the normal tool runtime and permission rules.
 
-event: delta
-data: {"text":"chunk"}
+The status bar identifies the provider, model and session, with usage and cost.
+Use the sessions list or `/resume SESSION_ID` to switch to a saved conversation.
+To start directly in one:
 
-event: tool_call_started
-data: {"call_id":"...","name":"...","summary":"..."}
-
-event: tool_call_finished
-data: {"call_id":"...","name":"...","ok":true}
-
-event: cost
-data: {"microcents":2500,"input_tokens":12,"output_tokens":34}
-
-event: finished
-data: {"output":"...","input_tokens":12,"output_tokens":34,"cost_microcents":2500}
-
-event: error
-data: {"message":"ORBIT-E0401: ..."}
-
-event: cancelled
-data: {}
+```sh
+orbit web --resume SESSION_ID
 ```
 
-### Browser → Rust (WebSocket)
+Saved sessions use the same home as the terminal harness. A private session lease
+is acquired before loading the saved conversation. A session already owned by
+another process is refused; ORBIT does not create a replacement session. Close
+the previous owner before moving that conversation between terminal and browser.
 
-```json
-{"type":"prompt","text":"what is 2+2"}
-{"type":"cancel"}
-{"type":"approve","call_id":"call-0","verdict":"allow"}
-{"type":"approve","call_id":"call-0","verdict":"deny"}
-{"type":"approve","call_id":"call-0","verdict":"session"}
-{"type":"quit"}
+Use `/model PROVIDER/MODEL` to pin a declared model. `/route status` shows routing
+information; `/route auto` clears the manual pin so configured routes can apply.
+Configure phase and difficulty mappings with `orbit route` outside the browser.
+The effort control and `/effort VALUE` use the selected model's declared
+capabilities; `/effort default` returns to its default. Unsupported values fail
+without changing the current setting.
+
+## Change appearance and panes
+
+Open **Appearance and panes** to select `orbit`, `midnight` or `paper`, adjust
+colors, spacing, symbols and reduced motion, choose a layout, or set a browser
+font and size. Fonts are names already available to the browser; ORBIT does not
+download them. Terminal font settings belong to the terminal application.
+
+The same profile is available through `/theme NAME`, `/customize ...` and the
+`orbit customize` commands. Settings also expose the layout tree, named panes and
+explicit profile validation, import and export. Paths refer to the machine
+running ORBIT. See [customization](customization.md) for the schema and examples.
+
+A profile retains one Conversation pane and composer. Named panes can show inert
+text, bounded workspace Markdown, or routing, usage, agent and engagement
+snapshots. Refresh reads current permitted data. Declared actions can focus the
+conversation, insert a draft, refresh, or cancel through the controlling owner.
+Inserting a draft never submits it. File reads retain inherited allow/deny rules
+and the owner's current permission mode.
+
+Changes validate the whole profile and its revision before saving. A stale or
+invalid edit produces an error and preserves the stored settings. Session changes
+mark old pane snapshots stale; replies from an earlier session cannot restore
+them. On narrow screens, the pane tabs select the active view. Repeated references
+to the same named pane keep separate tab identities.
+
+If stored customization is malformed, start a temporary recovery session:
+
+```sh
+orbit web --safe-customization
 ```
 
-This is **identical** to the Go TUI's Unix-socket protocol, just over
-WebSocket + SSE instead of a Unix socket. The Rust `run_turn` + tool loop
-is shared verbatim — only the transport changes.
+This uses read-only session defaults without rewriting the profile or legacy
+`tui.toml`. Repair the original files explicitly before returning to normal mode.
 
-## Security model
+## Connections and access
 
-- **Loopback-only by default.** The bridge server binds `127.0.0.1:PORT`.
-  Remote access requires an explicit `--bind 0.0.0.0` flag + a bearer token
-  (same `ORBIT_GATE_TOKEN` contract; never stored, never logged).
-- **Display-safety gate (H-3) applies.** All text sent to the browser passes
-  through `orbit_hud::display_safe` — secrets, URLs, and control chars are
-  redacted before they leave Rust. The browser never sees raw credentials.
-- **No prompt bytes in the Ledger.** Same as the TUI — the browser sends
-  prompts over WebSocket, Rust processes them through the four-gate pipeline,
-  and prompt bytes never enter the Ledger, exports, or logs.
-- **Approvals are server-side.** The browser sends an `approve` action, but
-  the actual grant/deny decision is recorded in the Ledger by the Rust core.
-  The browser cannot bypass the approval flow — it can only send a verdict
-  that Rust applies.
-- **CORS: none.** The SPA is served from the same origin as the WebSocket/SSE.
-  No cross-origin requests.
+Loopback access needs no browser token by default. To require one, set
+`ORBIT_WEB_TOKEN` or pass `--token`; open the page with that value in its
+`?token=...` query. The automatic browser opener includes the configured token.
+This is a **browser access token**. Provider credentials remain separate ENV
+references in `providers.toml`; `ORBIT_GATE_TOKEN` is not the browser token.
 
-## Session continuity
+An explicit non-loopback `--bind` requires a nonempty browser token. The bridge
+serves HTTP; it does not configure TLS. Protected event, action and customization
+requests check the token when configured, the Host and actual listening port,
+and a matching Origin when present. Loopback listeners reject non-loopback Host
+names. Use the listening address rather than an unrelated hostname or proxy URL.
 
-- The browser and TUI share the same `$ORBIT_HOME/sessions/` directory.
-- `--resume <session-id>` works from both front-ends — the browser loads the
-  prior transcript and continues the conversation.
-- A session started in the TUI can be resumed in the browser and vice versa.
-- The Ledger records every turn regardless of which front-end initiated it.
+One WebSocket connection holds controller authority at a time. Additional event
+streams can observe the owner, but cannot submit prompts or approve tools.
+Closing a tab releases its controller connection; it does not stop the shared
+owner or replay a prompt. Closing the server ends that owner.
 
-## Theming
+After a disconnect the page reconnects and asks the owner for recovery using an
+instance/sequence cursor. ORBIT supplies retained events or a full snapshot when
+the cursor is too old or belongs to another owner instance. Pending responses,
+approvals, request state and usage come from that recovery. A submitted prompt is
+not automatically resent; inspect the recovered state before submitting it again.
 
-- The browser uses CSS custom properties that mirror the TUI's `tui.toml`
-  palette: `--accent`, `--composer`, `--text`, `--dim`, `--error`, etc.
-- A `theme.toml` (or the existing `tui.toml` extended with a `[browser]`
-  section) maps the same colors to CSS values.
-- Dark mode is the default (matches the terminal); light mode is opt-in.
-- The orbital logo is an SVG animation (same star-on-ring motif, CSS-driven).
+## Implementation and local validation
 
-## Implementation plan (next milestone)
+`orbit-web` serves the static JavaScript application from `crates/web/assets`.
+`GET /events` projects ordered owner events over SSE; `/actions` accepts bounded,
+typed WebSocket actions. Prompts carry request IDs for owner-side duplicate
+handling. WebSocket acknowledgements report action acceptance; only the ordered
+SSE recovery/event stream updates conversation state and its cursor. The browser
+does not run a separate provider or tool loop.
 
-1. **`crates/web/`** — new crate. Axum server with:
-   - `GET /` → serve the SPA (static HTML/JS/CSS from `crates/web/assets/`)
-   - `GET /events` → SSE stream (Rust → browser)
-   - `WS /actions` → WebSocket (browser → Rust)
-   - Reuses `run_turn` + `tool_runtime` + `sessions` from the CLI crate
-2. **`crates/web/assets/`** — the SPA:
-   - `index.html` — three-pane layout, composer, status bar, approval modal
-   - `app.ts` — WebSocket + SSE client, state machine, rendering
-   - `styles.css` — theme via custom properties
-   - `logo.svg` — animated orbital logo
-3. **`orbit web`** — new CLI command. Starts the bridge server and opens the
-   browser (or prints the URL). Flags: `--port`, `--bind`, `--no-browser`.
-4. **E2E test** — `scripts/web_harness_test.py` (stdlib-only: raw-socket WS
-   client + SSE reader) exercises the live server end-to-end. The harness
-   modules (run_turn, tool runtime, sessions) were extracted from the cli
-   binary into `orbit-cli`'s lib so the web crate reuses them verbatim —
-   the same code path the TUI and Go bridge drive.
+`GET /customization` provides an authorized, display-safe profile and pane view.
+Profile edits and pane actions require current controller authority. The server
+checks revisions and displayed action declarations, and obtains pane context and
+session identity together from the owner. Profiles and file content are scanned
+before browser projection; rendering uses inert text and checked style values.
 
-## What stays untouched
+Local release checks include 26 production-script scenarios on a controlled DOM,
+the original 18 browser-control scenarios, 13 customization backend scenarios and
+19 existing owner/browser backend scenarios. These establish local fixture
+behavior, including recovery, authority, drafts and settings. The actual HTTP
+harness also passes 13 scenarios against a local fixture, covering streaming,
+approval, tool events, persistence and resumed transcripts. Native browser
+interaction and real-provider use
+remain separate acceptance steps; these checks do not establish visual parity
+with the terminal or another harness.
 
-- The entire Rust core: gateway, ledger, trust, tool runtime, sessions, egress.
-- The TUI (both ratatui and Go Bubble Tea) — they remain first-class.
-- The JSON protocol — shared across all three front-ends (TUI, Go TUI, browser).
-- The display-safety gate, approval flow, and Ledger provenance.
-
-## Why not just a web-based TUI?
-
-The terminal TUI is the primary surface (operators live in the terminal). The
-browser harness is for:
-- Rich markdown rendering (code blocks with syntax highlighting, tables, images)
-- Multi-session dashboards (side-by-side conversations)
-- Mobile access (resume a session from a phone)
-- Collaboration (share a read-only view of a session with a teammate)
-
-The browser never replaces the TUI — it complements it. The Rust core is the
-harness; the front-ends are projections.
+Current browser startup flags are `--home`, `--model`, `--provider`, `--effort`,
+`--gate`, `--resume`, `--bind`, `--port`, `--token`, `--no-browser`,
+`--permission-mode`, `--allowedTools`, `--disallowedTools`, `--auto-tools`,
+`--bare` and `--safe-customization`. A supplied `--gate` must match the selected
+configured provider URL; it cannot redirect a qualified model to another gateway.

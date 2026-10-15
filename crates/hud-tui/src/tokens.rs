@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 // ── User overrides (tui.toml, §13.4) ─────────────────────────────────────────
 
-/// Colour overrides a `tui.toml` may carry. They are parsed so a file that
-/// has them still loads; the screen does not apply them.
+/// Semantic colour overrides accepted by legacy `tui.toml`. The live frontend
+/// adapts these into the same per-frame palette as a portable profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserColors {
@@ -154,4 +154,33 @@ pub struct Theme {
     pub layout: LayoutConfig,
     #[serde(rename = "color")]
     pub capabilities: CapabilitiesConfig,
+}
+
+impl Theme {
+    /// Adapt the legacy file through the same semantic vocabulary as a portable profile.
+    pub fn profile(&self) -> orbit_frontend_protocol::customization::Profile {
+        use orbit_frontend_protocol::customization::{ColorMode, Glyphs, Profile};
+        let mut profile = Profile::default();
+        if let Ok(serde_json::Value::Object(colors)) = serde_json::to_value(&self.colors) {
+            for (key, value) in colors {
+                if let Some(value) = value.as_str() {
+                    profile.token_overrides.insert(key, value.into());
+                }
+            }
+        }
+        profile.reduced_motion = self.capabilities.reduced;
+        profile.glyphs = match self.capabilities.glyphs.as_str() {
+            "ascii" => Glyphs::Ascii,
+            "unicode" => Glyphs::Unicode,
+            _ => Glyphs::Auto,
+        };
+        profile.color_mode = match self.capabilities.mode.as_str() {
+            "truecolor" => ColorMode::Truecolor,
+            "256" => ColorMode::Ansi256,
+            "16" => ColorMode::Ansi16,
+            "mono" => ColorMode::Mono,
+            _ => ColorMode::Auto,
+        };
+        profile
+    }
 }

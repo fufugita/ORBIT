@@ -5,18 +5,13 @@
 //! → export → restore into a fresh namespace → verify again.
 
 use age::secrecy::ExposeSecret;
-use ed25519_dalek::{Signer, SigningKey};
+use orbit_adapter::types::EffortSetting;
 use orbit_export::{generate_local_key, restore, ExportBuilder};
 use orbit_ledger::event::{
     LedgerEvent, Phase, PhaseTransition, SessionEnd, SessionStart, TerminalOutcome,
 };
 use orbit_ledger::{verify_ledger, LedgerWriter};
-use orbit_pib::PibRegistry;
 use orbit_reactor::{CancelOrigin, CancelTarget, CancellationToken, Reactor};
-use orbit_trust::manifest::{signed_bytes, TrustRootManifestBody, MANIFEST_SCHEMA};
-use orbit_trust::{RootPublicKey, TrustRootManifest, TrustRootStore};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use orbit_cli::{config, sessions, tool_runtime, tools, tui_worker};
@@ -40,42 +35,31 @@ fn main() {
     // `--help`/`-h`/`--version` stay on the JSON dispatch (first-class verbs).
     // A leading flag may carry a value (`--home X init`): skip
     // flag/value pairs to find the first real word.
-    let first_is_command = {
-        let mut i = 0usize;
-        let mut found = false;
-        while i < args.len() {
-            let a = &args[i];
-            if a == "--home" || a == "--model" || a == "--gate" || a == "--resume" {
-                i += 2; // the flag and its value
-                continue;
+    let first_word = positionals(&args).first().copied();
+    let wants_chat = args.is_empty() || first_word == Some("chat") || first_word.is_none();
+    // A prompt is arbitrary text. Only a top-level -p selects headless mode;
+    // operands of local commands cannot change the execution path.
+    if headless_prompt_index(&args).is_some() {
+        let headless = match headless_arguments(&args) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                eprintln!("ORBIT-E1101: {error}");
+                std::process::exit(1);
             }
-            if a == "--continue"
-                || a == "--bare"
-                || a == "--fork-session"
-                || a == "--no-tui"
-                || a == "--tui"
-            {
-                i += 1;
-                continue;
-            }
-            found = !a.starts_with('-');
-            break;
-        }
-        found
-    };
-    let wants_chat = args.is_empty()
-        || args[0] == "chat"
-        || (!first_is_command && args[0] != "--help" && args[0] != "-h" && args[0] != "--version");
+        };
+        std::process::exit(cmd_headless(&headless));
+    }
     // C1: `--help`/`-h` print HUMAN help (exit 0); `--version` prints the
     // version line. The machine-readable forms stay on the verbs:
     // `orbit help --json` and `orbit version` (JSON).
     if args.iter().any(|a| a == "--help" || a == "-h") {
         if args.iter().any(|a| a == "--json") {
-            // fall through to the JSON verb below
+            let value = dispatch(&["help".into(), "--json".into()]).expect("static help command");
+            println!("{}", serde_json::to_string(&value).unwrap_or_default());
         } else {
             print_human_help();
-            std::process::exit(0);
         }
+        std::process::exit(0);
     }
     if args
         .first()
@@ -85,16 +69,24 @@ fn main() {
         println!("orbit {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
-    if args.first().map(|a| a == "web").unwrap_or(false) {
-        let code = cmd_web(&args[1..]);
-        std::process::exit(code);
+    if positionals(&args).first().copied() == Some("web") {
+        let mut tail = match command_tail(&args) {
+            Ok(tail) => tail,
+            Err((code, error)) => {
+                eprintln!("{code}: {error}");
+                std::process::exit(2)
+            }
+        };
+        tail.extend([
+            "--home".into(),
+            config::resolve_home(&args).to_string_lossy().into_owned(),
+        ]);
+        std::process::exit(cmd_web(&tail));
     }
-    // `orbit -p "<prompt>"` — headless one-shot with tools (roadmap
-    // phase 2). Streams the engine's events as JSON lines; never asks
-    // (dontAsk default: anything no allow rule covers is denied).
-    if args.first().map(|a| a == "-p").unwrap_or(false) {
-        let code = cmd_headless(&args[1..]);
-        std::process::exit(code);
+    match positionals(&args).first().copied() {
+        Some("serve") => std::process::exit(cmd_serve(&args)),
+        Some("attach") => std::process::exit(cmd_attach(&args)),
+        _ => {}
     }
     if wants_chat {
         let code = cmd_chat(&args);
@@ -103,10 +95,25 @@ fn main() {
 
     let result = dispatch(&args);
     match result {
-        Ok(v) => println!(
-            "{}",
-            serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
-        ),
+        Ok(v) => {
+            let command = positionals(&args).first().copied().unwrap_or("");
+            let human = ["setup", "doctor", "pentest"].contains(&command)
+                && !args.iter().any(|arg| arg == "--json");
+            if human {
+                print!("{}", orbit_cli::cli_release_commands::human_report(&v));
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
+                );
+            }
+            if v.pointer("/report/ready")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                std::process::exit(1);
+            }
+        }
         Err((code, msg)) => {
             eprintln!("{code}: {msg}");
             std::process::exit(2);
@@ -129,20 +136,50 @@ fn print_human_help() {
     println!("COMMANDS:");
     for (name, desc) in [
         ("chat", "start the interactive harness (default when bare)"),
-        ("init", "initialize trust root + PIB + ledger"),
+        (
+            "setup [--guided]",
+            "offline setup; preserves existing identity and history",
+        ),
+        ("init", "initialize once (setup compatibility alias)"),
+        (
+            "doctor [--json]",
+            "offline readiness; never starts configured servers",
+        ),
+        (
+            "pentest init/status/templates/readiness",
+            "local engagement workspaces and templates",
+        ),
+        (
+            "customize show/set/import/export/reset",
+            "appearance, layouts and named panes",
+        ),
+        ("theme NAME", "select orbit, midnight or paper"),
         ("models", "list models from all configured providers"),
+        (
+            "route status/test/setup/set/reset",
+            "configure or preview phase and difficulty routing",
+        ),
         ("ask PROMPT", "send one prompt through a configured gateway"),
         (
             "-p PROMPT",
             "headless one-shot with tools (stream-json output)",
         ),
         ("web", "start the browser harness (orbit-web bridge)"),
+        ("serve --socket <PATH>", "own one session in the foreground"),
+        (
+            "attach --socket <PATH>",
+            "connect to its prompt, status or controls",
+        ),
         ("verify-ledger", "verify the ledger hash chain"),
         ("replay --dry", "verify + emit a no-dispatch replay plan"),
         ("export --to", "encrypt an age bundle"),
         ("restore", "restore into a fresh namespace"),
         ("version", "release evidence (claims + hashes)"),
-        ("mod install/list/allow-issuer", "signed mod management"),
+        (
+            "mod install/list/search/status",
+            "durable signed package catalog",
+        ),
+        ("mod issuers/allow-issuer", "trusted package issuers"),
         (
             "folder trust/untrust/status",
             "let a folder's own settings loosen permissions",
@@ -155,6 +192,10 @@ fn print_human_help() {
     println!("CHAT FLAGS:");
     for (name, desc) in [
         ("--model <M>", "model id (providers.toml)"),
+        (
+            "--effort <VALUE>",
+            "configured request effort (or default; ORBIT_EFFORT fallback)",
+        ),
         ("--gate <URL>", "gateway base URL"),
         ("--home <DIR>", "ORBIT home (default ~/.orbit)"),
         ("--continue", "reopen the latest session in this directory"),
@@ -164,6 +205,10 @@ fn print_human_help() {
         ),
         ("--resume <ID>", "resume a specific session"),
         ("--no-tui", "plain REPL instead of the TUI"),
+        (
+            "--safe-customization",
+            "read-only session defaults; preserve malformed stored files",
+        ),
         (
             "--auto-tools",
             "TUI/chat: run tools without asking (bypass)",
@@ -177,33 +222,11 @@ fn print_human_help() {
 }
 
 /// The commit this binary was built from, as honestly as it can be known.
-/// Build scripts may pin it via ORBIT_BUILD_COMMIT (compile-time); a tree
-/// build without that falls back to asking git at runtime; a binary with
-/// no git in reach reports "unknown" rather than inventing a value (C2).
+/// Only a compile-time stamp can describe the source of these executable bytes.
 fn build_commit() -> String {
     if let Some(c) = option_env!("ORBIT_BUILD_COMMIT") {
         if !c.is_empty() {
             return c.to_string();
-        }
-    }
-    // Runtime fallback: ask the source tree (dev builds run from a repo).
-    let manifest_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|p| p.to_path_buf());
-    if let Some(root) = manifest_root {
-        if let Ok(out) = std::process::Command::new("git")
-            .arg("rev-parse")
-            .arg("--short=12")
-            .arg("HEAD")
-            .current_dir(&root)
-            .output()
-        {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return s;
-                }
-            }
         }
     }
     "unknown".into()
@@ -231,7 +254,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
     let mut i = 0usize;
     while i < args.len() {
         let a = &args[i];
-        if a == "--home" || a == "--model" || a == "--gate" || a == "--resume" {
+        if a == "--home" || a == "--model" || a == "--gate" || a == "--resume" || a == "--effort" {
             i += 2;
             continue;
         }
@@ -245,6 +268,21 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
     let _ = &verb;
     match verb.as_str() {
         "init" => cmd_init(&home, args),
+        "setup" => cmd_setup(&home, args, false),
+        "doctor" => orbit_cli::cli_release_commands::doctor(&home, &command_tail(args)?),
+        "pentest" => orbit_cli::cli_release_commands::pentest(&home, &command_tail(args)?),
+        "customize" | "theme" => {
+            let mut tail = command_tail(args)?;
+            if verb == "theme" {
+                tail.insert(0, "theme".into());
+            }
+            orbit_cli::customization_host::command(
+                &home,
+                &std::env::current_dir().map_err(ioe)?,
+                &tail,
+            )
+            .map_err(|error| ("ORBIT-E1101", error))
+        }
         "run" => cmd_run(&home, args),
         "cancel" => cmd_cancel(&home),
         "verify-ledger" => cmd_verify(&home),
@@ -270,8 +308,14 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
             "commands": [
                 "(bare)        start the interactive harness",
                 "chat          start the interactive harness (explicit alias)",
-                "init          initialize trust root + PIB + Ledger",
+                "setup [--guided] offline setup without rotating existing identity",
+                "init          setup compatibility alias",
+                "doctor [--json] offline readiness without server startup",
+                "pentest init|status|templates|readiness local engagement workflows",
+                "customize show|capabilities|set|theme|reset|validate|import|export portable customization",
+                "theme NAME    select a built-in appearance",
                 "models        list models from all configured providers",
+                "route status|test|setup|set|reset|auto  configure and preview model routing",
                 "ask PROMPT    send one prompt through a configured gateway",
                 "-p PROMPT     headless one-shot with tools (stream-json output)",
                 "run           run the example phase chain",
@@ -281,8 +325,9 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "export --to   encrypt an age bundle",
                 "restore       restore into a fresh namespace",
                 "version       release evidence (claims + hashes)",
-                "mod install <pkg> --manifest <m>  install a signed mod",
-                "mod list                        installed mods",
+                "mod install <pkg> --manifest <m> --yes  store a verified signed package",
+                "mod list|search|status           verified installed package catalog",
+                "mod issuers                     trusted package issuers",
                 "mod allow-issuer <hex-key>       trust a mod issuer",
                 "folder trust|untrust|status [DIR]  trust a folder's own settings",
                 "provider add|list|remove|presets    manage model providers",
@@ -302,120 +347,68 @@ fn orbit_home(args: &[String]) -> Option<PathBuf> {
     Some(orbit_cli::config::resolve_home(args))
 }
 
-/// `orbit init`: generate a local Ed25519 trust root, sign the manifest, verify it,
-/// initialize PIB identity + Ledger (DR-03 E2E: initialize trust).
-fn cmd_init(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
-    std::fs::create_dir_all(home).map_err(ioe)?;
-    let trust_dir = home.join("trust");
-    std::fs::create_dir_all(&trust_dir).map_err(ioe)?;
-
-    // Generate operator authority root (local; private bytes mode 0600).
-    let sk = SigningKey::generate(&mut rand::rngs::OsRng);
-    let root = RootPublicKey(hex::encode(sk.verifying_key().to_bytes()));
-    let body = TrustRootManifestBody {
-        schema: MANIFEST_SCHEMA.into(),
-        version: "0.1.0".into(),
-        issuer_allowlist: vec![],
-        routes: vec![],
-        lifecycle: vec![],
-        model_allowlist: BTreeSet::new(),
-    };
-    let sig = sk.sign(&signed_bytes(&body).map_err(|e| ("ORBIT-E0706", e.to_string()))?);
-    let manifest = TrustRootManifest {
-        body,
-        signature: hex::encode(sig.to_bytes()),
-    };
-    let store = TrustRootStore::new(vec![root.clone()]);
-    store
-        .verify_manifest(&manifest)
-        .map_err(|e| ("ORBIT-E0706", e.to_string()))?;
-    std::fs::write(
-        trust_dir.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest).map_err(|e| ("ORBIT-E0706", e.to_string()))?,
-    )
-    .map_err(ioe)?;
-    std::fs::write(trust_dir.join("operator.key"), hex::encode(sk.to_bytes())).map_err(ioe)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&trust_dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(ioe)?;
-        std::fs::set_permissions(
-            trust_dir.join("manifest.json"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .map_err(ioe)?;
-        std::fs::set_permissions(
-            trust_dir.join("operator.key"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .map_err(ioe)?;
+/// Strip the global home option and the actual command token, retaining every operand.
+fn command_tail(args: &[String]) -> Result<Vec<String>, (&'static str, String)> {
+    let words = positionals(args);
+    let command = words
+        .first()
+        .ok_or(("ORBIT-E1101", "command required".into()))?;
+    let command_index = args
+        .iter()
+        .position(|word| std::ptr::eq(word.as_str(), *command))
+        .ok_or(("ORBIT-E1101", "command required".into()))?;
+    let mut tail = Vec::new();
+    let mut seen_home = false;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--home" {
+            if seen_home
+                || args
+                    .get(index + 1)
+                    .is_none_or(|value| value.is_empty() || value.starts_with("--"))
+            {
+                return Err((
+                    "ORBIT-E1101",
+                    "--home requires one directory and cannot be repeated".into(),
+                ));
+            }
+            seen_home = true;
+            index += 2;
+            continue;
+        }
+        if index != command_index {
+            tail.push(args[index].clone());
+        }
+        index += 1;
     }
-
-    // Initialize PIB. C3: the id is a real ULID minted per install —
-    // every install used to share the hard-coded "01J-LOCAL-PIB".
-    let mut pib = PibRegistry::new();
-    let pib_id = format!("pib-{}", ulid::Ulid::new());
-    pib.register(
-        pib_id.clone(),
-        "local".into(),
-        root.0,
-        hex::encode(Sha256::digest(b"local-host")),
-        "root-1".into(),
-    );
-    std::fs::write(
-        home.join("pib.json"),
-        serde_json::to_vec_pretty(pib.identity().unwrap()).unwrap_or_default(),
-    )
-    .map_err(ioe)?;
-
-    // Initialize Ledger with SessionStart.
-    let ledger_dir = home.join("ledger");
-    let mut w = LedgerWriter::open(&ledger_dir, "writer-init".into(), env!("CARGO_PKG_VERSION"))
-        .map_err(|e| ("ORBIT-E0719", e.to_string()))?;
-    w.append(LedgerEvent::SessionStart(SessionStart {
-        session_id: "session-example".into(),
-        restricted: false,
-        pib_id: Some(pib_id.clone()),
-        policy_snapshot_id: manifest.policy_snapshot_digest().unwrap_or_default(),
-        operator_principal: "local-user".into(),
-    }))
-    .map_err(|e| ("ORBIT-E0700", e.to_string()))?;
-    w.close().map_err(|e| ("ORBIT-E0700", e.to_string()))?;
-
-    // Optional provider/model setup. Non-interactive init never waits for
-    // stdin; scripted flags or a real terminal opt into configuration.
-    let providers = if args.iter().any(|a| a == "--no-provider") {
-        Vec::new()
-    } else if let Some(name) = value_after(args, "--provider") {
-        let gate = value_after(args, "--gate")
-            .ok_or(("ORBIT-E1101", "--provider requires --gate".into()))?;
-        let models = value_after(args, "--model")
-            .ok_or(("ORBIT-E1101", "--provider requires --model M[,M...]".into()))?;
-        let credential_env = value_after(args, "--credential-env");
-        let model_ids: Vec<String> = models
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        add_configured_provider(home, &name, &gate, credential_env, model_ids, None)?;
-        vec![name]
-    } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        interactive_provider_setup(home)?
-    } else {
-        Vec::new()
-    };
-
-    Ok(serde_json::json!({
-        "schema": "orbit.cli/v1", "command": "init", "status": "ok",
-        "trust_root_verified": true, "pib_id": pib_id,
-        "ledger": ledger_dir.to_string_lossy(),
-        "providers_configured": providers,
-    }))
+    Ok(tail)
 }
 
-/// `orbit run example`: phase chain Init→Plan→Execute (example runs locally).
+fn cmd_setup(
+    home: &Path,
+    args: &[String],
+    initialize: bool,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    let tail = command_tail(args)?;
+    let parsed = orbit_cli::cli_release_commands::parse_setup(&tail)?;
+    if parsed.interactive_provider && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(("ORBIT-E1101","--interactive-provider requires a terminal; use manual provider flags for offline setup".into()));
+    }
+    let mut result = if initialize {
+        orbit_cli::cli_release_commands::init(home, &tail)?
+    } else {
+        orbit_cli::cli_release_commands::setup(home, &tail)?
+    };
+    if parsed.interactive_provider {
+        result["providers_configured"] = serde_json::json!(interactive_provider_setup(home)?);
+        result["offline"] = serde_json::json!(false);
+    }
+    Ok(result)
+}
+fn cmd_init(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    cmd_setup(home, args, true)
+}
+
 /// Add one provider to providers.toml (scripted init path). Pricing defaults to
 /// zero unless supplied by the interactive setup. Token values are never
 /// accepted here — only the credential env-var name.
@@ -454,16 +447,14 @@ fn add_configured_provider_kind(
     model_entries: Option<Vec<orbit_cli::config::ModelEntry>>,
 ) -> Result<(), (&'static str, String)> {
     validate_provider_url(gate)?;
-    if model_ids.is_empty() {
-        return Err(("ORBIT-E1101", "at least one model is required".into()));
-    }
-    let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
     let models = model_entries.unwrap_or_else(|| {
         model_ids
             .into_iter()
             .enumerate()
             .map(|(i, id)| orbit_cli::config::ModelEntry {
                 sampling: None,
+                supported_efforts: None,
+                default_effort: None,
                 id,
                 label: None,
                 pricing: pricing
@@ -475,37 +466,101 @@ fn add_configured_provider_kind(
             })
             .collect()
     });
-    cfg.add_provider(orbit_cli::config::ProviderConfig {
+    let provider = orbit_cli::config::ProviderConfig {
         name: name.into(),
         kind: kind.into(),
         url: gate.trim_end_matches('/').into(),
-        env: credential_env.filter(|s| !s.trim().is_empty()),
+        env: credential_env,
         models,
+    };
+    orbit_cli::setup::validate_provider(&provider).map_err(|e| ("ORBIT-E1101", e.to_string()))?;
+    // This operation only edits configuration. Identity creation stays explicit.
+    if !home.try_exists().map_err(ioe)? {
+        return Err((
+            "ORBIT-E0706",
+            "provider add requires an existing private home; run orbit setup first".into(),
+        ));
+    }
+    config::ProvidersConfig::update_atomic(home, |raw| {
+        let mut document = provider_document(raw)?;
+        let providers = document
+            .as_table_mut()
+            .ok_or("provider config must be a table")?
+            .entry("provider")
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or("provider config must be an array")?;
+        if providers
+            .iter()
+            .any(|p| p.get("name").and_then(toml::Value::as_str) == Some(name))
+        {
+            return Err("provider name is already configured".into());
+        }
+        providers
+            .push(toml::Value::try_from(&provider).map_err(|_| "provider serialization failed")?);
+        serialize_provider_document(&document)
     })
     .map_err(|e| ("ORBIT-E1106", e))?;
-    cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))
+    Ok(())
 }
 
-/// URL safety for configured providers: HTTPS anywhere; cleartext HTTP only
-/// for loopback or RFC1918 private-LAN hosts. Reject public cleartext egress.
+fn provider_document(raw: &str) -> Result<toml::Value, String> {
+    toml::from_str(raw).map_err(|_| "providers configuration is invalid".into())
+}
+fn validate_configured_provider_endpoints(
+    config: &config::ProvidersConfig,
+) -> Result<(), (&'static str, String)> {
+    for provider in &config.provider {
+        config::validate_provider_endpoint(&provider.url).map_err(|e| ("ORBIT-E1106", e))?;
+    }
+    Ok(())
+}
+fn serialize_provider_document(document: &toml::Value) -> Result<String, String> {
+    toml::to_string(document).map_err(|_| "provider serialization failed".into())
+}
+fn provider_table<'a>(
+    document: &'a mut toml::Value,
+    key: &str,
+) -> Result<&'a mut toml::map::Map<String, toml::Value>, String> {
+    document
+        .as_table_mut()
+        .ok_or("provider config must be a table")?
+        .entry(key)
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or_else(|| "provider section must be a table".into())
+}
+fn set_provider_role(home: &Path, role: &str, spec: &str) -> Result<(), (&'static str, String)> {
+    if !["main", "subagent", "explore", "compaction"].contains(&role) {
+        return Err(("ORBIT-E1101", "unknown provider role".into()));
+    }
+    config::ProvidersConfig::update_atomic(home, |raw| {
+        let cfg = config::ProvidersConfig::load_from_str(raw)?;
+        if !spec.is_empty() {
+            orbit_cli::phase_routing::resolve_model(&cfg, spec, None)?;
+        }
+        let mut document = provider_document(raw)?;
+        provider_table(&mut document, "roles")?
+            .insert(role.into(), toml::Value::String(spec.into()));
+        serialize_provider_document(&document)
+    })
+    .map_err(|e| ("ORBIT-E1106", e))?;
+    Ok(())
+}
+
+/// The legacy discovery UI retains its private-LAN HTTP policy and uses the same
+/// credential/identity checks as offline setup before any optional request.
 fn validate_provider_url(gate: &str) -> Result<(), (&'static str, String)> {
-    let url =
-        url::Url::parse(gate).map_err(|e| ("ORBIT-E0401", format!("bad provider URL: {e}")))?;
+    let url = config::validate_provider_endpoint(gate).map_err(|e| ("ORBIT-E0401", e))?;
     match url.scheme() {
         "https" => Ok(()),
         "http" => {
-            let host = url.host_str().unwrap_or("");
-            let private = host == "localhost"
-                || host == "127.0.0.1"
-                || host == "::1"
-                || host.starts_with("10.")
-                || host.starts_with("192.168.")
-                || host
-                    .strip_prefix("172.")
-                    .and_then(|rest| rest.split('.').next())
-                    .and_then(|n| n.parse::<u8>().ok())
-                    .map(|n| (16..=31).contains(&n))
-                    .unwrap_or(false);
+            let private = match url.host() {
+                Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unique_local(),
+                None => false,
+            };
             if private {
                 Ok(())
             } else {
@@ -515,142 +570,184 @@ fn validate_provider_url(gate: &str) -> Result<(), (&'static str, String)> {
                 ))
             }
         }
-        other => Err(("ORBIT-E0301", format!("unsupported scheme {other}"))),
+        _ => Err(("ORBIT-E0301", "provider URL must use http(s)".into())),
     }
 }
-
-/// GET the provider's model list, speaking the right dialect per kind:
-/// OpenAI-compatible `{path}/models` (bearer), Anthropic `/v1/models`
-/// (x-api-key + anthropic-version), Ollama `/api/tags` (no credential).
-/// The token is read from the declared env var, borrowed for the request
-/// only; never printed or persisted. Runs on a short-lived tokio runtime
-/// so the interactive flow stays synchronous.
+fn validate_discovery_input(
+    name: &str,
+    gate: &str,
+    credential_env: Option<&str>,
+    kind: &str,
+) -> Result<(), (&'static str, String)> {
+    validate_provider_url(gate)?;
+    orbit_cli::setup::validate_provider(&config::ProviderConfig {
+        name: name.into(),
+        kind: kind.into(),
+        url: gate.into(),
+        env: credential_env.map(String::from),
+        models: vec![config::ModelEntry {
+            id: "discovery-validation".into(),
+            label: None,
+            pricing: Default::default(),
+            max_output_tokens: None,
+            context_window: None,
+            sampling: None,
+            supported_efforts: None,
+            default_effort: None,
+        }],
+    })
+    .map_err(|e| ("ORBIT-E1101", e.to_string()))
+}
+fn provider_models_url(gate: &str, kind: &str, model: Option<&str>) -> Result<url::Url, String> {
+    validate_discovery_input("discovery", gate, None, kind).map_err(|(_, e)| e)?;
+    let mut endpoint = url::Url::parse(gate).map_err(|_| "bad provider URL")?;
+    let base = endpoint.path().trim_end_matches('/').to_string();
+    let path = if kind == "ollama" {
+        if base.ends_with("/api") {
+            format!("{base}/tags")
+        } else {
+            format!("{base}/api/tags")
+        }
+    } else {
+        format!("{}/models", if base.is_empty() { "/v1" } else { &base })
+    };
+    endpoint.set_path(&path);
+    if let Some(model) = model {
+        if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+            return Err("model ID is invalid".into());
+        }
+        endpoint
+            .path_segments_mut()
+            .map_err(|_| "provider URL cannot hold a model path")?
+            .push(model);
+    }
+    Ok(endpoint)
+}
+const PROVIDER_RESPONSE_LIMIT: usize = 128 * 1024;
+async fn bounded_provider_body(mut response: reqwest::Response) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > PROVIDER_RESPONSE_LIMIT as u64)
+    {
+        return Err("provider response exceeds 128 KiB".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "provider response could not be read")?
+    {
+        if chunk.len() > PROVIDER_RESPONSE_LIMIT.saturating_sub(bytes.len()) {
+            return Err("provider response exceeds 128 KiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| "provider response must be UTF-8".into())
+}
+fn parse_discovered_models(raw: &str, kind: &str) -> Result<Vec<String>, String> {
+    let ids = if kind == "ollama" {
+        config::OllamaTagsResponse::parse(raw).map_err(|_| "provider model response is invalid")?
+    } else {
+        config::ModelListResponse::parse(raw).map_err(|_| "provider model response is invalid")?
+    };
+    if ids.is_empty()
+        || ids.len() > 128
+        || ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+    {
+        return Err("model discovery requires 1..128 bounded printable model IDs".into());
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    if ids.iter().any(|id| !unique.insert(id)) {
+        return Err("model discovery returned duplicate model IDs".into());
+    }
+    Ok(ids)
+}
+/// Explicit discovery only; redirects cannot forward a credential to a second endpoint.
 fn discover_models(
     gate: &str,
     credential_env: Option<&str>,
     kind: &str,
 ) -> Result<Vec<String>, String> {
-    // The gate URL's path is the base path (empty = /v1 default); the
-    // discovery URL composes the same way the adapters do.
-    let base = gate.trim_end_matches('/');
-    let url = match kind {
-        "ollama" => format!("{base}/api/tags"),
-        "anthropic" => {
-            let path = url_path_of(gate);
-            let path = if path.is_empty() { "/v1" } else { &path };
-            format!("{base}{path}/models")
-        }
-        _ => {
-            let path = url_path_of(gate);
-            let path = if path.is_empty() { "/v1" } else { &path };
-            format!("{base}{path}/models")
-        }
-    };
-    // reqwest uses rustls in this workspace; install the ring process-default
-    // provider before constructing a standalone discovery client.
-    let _ = orbit_provider_http::tls::client_config(&orbit_adapter::types::TlsPinPolicy {
+    validate_discovery_input("discovery", gate, credential_env, kind).map_err(|(_, e)| e)?;
+    let endpoint = provider_models_url(gate, kind, None)?;
+    orbit_provider_http::tls::client_config(&orbit_adapter::types::TlsPinPolicy {
         webpki: true,
         spki_sha256: None,
     })
-    .map_err(|e| format!("tls init: {e}"))?;
+    .map_err(|_| "provider TLS initialization failed")?;
     tokio::runtime::Runtime::new()
-        .map_err(|e| format!("runtime: {e}"))?
+        .map_err(|_| "provider runtime initialization failed")?
         .block_on(async move {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .map_err(|e| format!("http client: {e}"))?;
-            let mut req = client.get(&url);
-            if let Some(var) = credential_env.filter(|s| !s.trim().is_empty()) {
-                if let Ok(token) = std::env::var(var) {
-                    if kind == "anthropic" {
-                        req = req
-                            .header("x-api-key", &token)
-                            .header("anthropic-version", "2023-06-01");
+                .map_err(|_| "provider HTTP initialization failed")?;
+            let mut request = client.get(endpoint);
+            if kind == "anthropic" {
+                request = request.header("anthropic-version", "2023-06-01");
+            }
+            if kind != "ollama" {
+                if let Some(token) = credential_env.and_then(|var| std::env::var(var).ok()) {
+                    request = if kind == "anthropic" {
+                        request.header("x-api-key", token)
                     } else {
-                        req = req.bearer_auth(token);
-                    }
+                        request.bearer_auth(token)
+                    };
                 }
             }
-            let resp = req
+            let response = request
                 .send()
                 .await
-                .map_err(|e| format!("model discovery: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("model discovery returned {}", resp.status()));
+                .map_err(|_| "model discovery request failed")?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "model discovery returned HTTP {}",
+                    response.status().as_u16()
+                ));
             }
-            let raw = resp.text().await.map_err(|e| format!("read models: {e}"))?;
-            if kind == "ollama" {
-                orbit_cli::config::OllamaTagsResponse::parse(&raw)
-            } else {
-                orbit_cli::config::ModelListResponse::parse(&raw)
-            }
+            let raw = bounded_provider_body(response).await?;
+            parse_discovered_models(&raw, kind)
         })
 }
-
-/// The path component of a gate URL, normalized the way dispatch does:
-/// one leading slash, no trailing slash, empty for `/` or absent.
-fn url_path_of(gate: &str) -> String {
-    match url::Url::parse(gate) {
-        Ok(u) => {
-            let trimmed = u.path().trim_matches('/');
-            if trimmed.is_empty() {
-                String::new()
-            } else {
-                format!("/{trimmed}")
-            }
-        }
-        Err(_) => String::new(),
-    }
-}
-
-/// Fetch an Anthropic model's detail (`/v1/models/{id}`) for its limits.
-/// Best-effort: any failure returns the empty limits and the caller
-/// keeps its static fallbacks.
+/// Best effort, sharing the same bounded endpoint/request policy as discovery.
 fn anthropic_model_limits(
     gate: &str,
     credential_env: Option<&str>,
     model: &str,
 ) -> orbit_cli::config::AnthropicModelLimits {
-    let base = gate.trim_end_matches('/');
-    let path = {
-        let p = url_path_of(gate);
-        if p.is_empty() {
-            "/v1".to_string()
-        } else {
-            p
-        }
-    };
-    let url = format!("{base}{path}/models/{model}");
-    let _ = orbit_provider_http::tls::client_config(&orbit_adapter::types::TlsPinPolicy {
-        webpki: true,
-        spki_sha256: None,
-    });
-    tokio::runtime::Runtime::new()
-        .ok()
-        .and_then(|rt| {
-            rt.block_on(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .ok()?;
-                let mut req = client.get(&url);
-                if let Some(var) = credential_env.filter(|s| !s.trim().is_empty()) {
-                    if let Ok(token) = std::env::var(var) {
-                        req = req
-                            .header("x-api-key", &token)
-                            .header("anthropic-version", "2023-06-01");
-                    }
-                }
-                let resp = req.send().await.ok()?;
-                if !resp.status().is_success() {
-                    return None;
-                }
-                let raw = resp.text().await.ok()?;
-                Some(orbit_cli::config::parse_anthropic_model_detail(&raw))
-            })
+    let result = (|| -> Option<config::AnthropicModelLimits> {
+        validate_discovery_input("discovery", gate, credential_env, "anthropic").ok()?;
+        let endpoint = provider_models_url(gate, "anthropic", Some(model)).ok()?;
+        orbit_provider_http::tls::client_config(&orbit_adapter::types::TlsPinPolicy {
+            webpki: true,
+            spki_sha256: None,
         })
-        .unwrap_or_default()
+        .ok()?;
+        tokio::runtime::Runtime::new().ok()?.block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .ok()?;
+            let mut request = client
+                .get(endpoint)
+                .header("anthropic-version", "2023-06-01");
+            if let Some(token) = credential_env.and_then(|var| std::env::var(var).ok()) {
+                request = request.header("x-api-key", token);
+            }
+            let response = request.send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            Some(config::parse_anthropic_model_detail(
+                &bounded_provider_body(response).await.ok()?,
+            ))
+        })
+    })();
+    result.unwrap_or_default()
 }
 
 /// Guided provider setup for `orbit init` in a real terminal.
@@ -674,6 +771,7 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
             Some(credential_env)
         };
 
+        validate_discovery_input(&name, &gate, credential_env.as_deref(), "openai-compatible")?;
         let discovered =
             match discover_models(&gate, credential_env.as_deref(), "openai-compatible") {
                 Ok(ids) => {
@@ -689,25 +787,13 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
                 }
             };
         let model_ids = if discovered.is_empty() {
-            prompt_line("Enter model ids (comma-separated)", None)?
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
+            parse_provider_models(&prompt_line("Enter model ids (comma-separated)", None)?)?
         } else {
             let sel = prompt_line(
                 "Select models (all or comma-separated numbers)",
                 Some("all"),
             )?;
-            if sel.trim().eq_ignore_ascii_case("all") {
-                discovered
-            } else {
-                sel.split(',')
-                    .filter_map(|s| s.trim().parse::<usize>().ok())
-                    .filter_map(|n| discovered.get(n.saturating_sub(1)).cloned())
-                    .collect()
-            }
+            select_provider_models(&sel, &discovered)?
         };
         if model_ids.is_empty() {
             return Err(("ORBIT-E1101", "no models selected".into()));
@@ -718,10 +804,10 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
             println!("Pricing for {id} (microdollars per million tokens; blank = 0):");
             let input = prompt_line("  input", Some("0"))?
                 .parse::<u64>()
-                .unwrap_or(0);
+                .map_err(|_| ("ORBIT-E1101", "pricing must be an unsigned integer".into()))?;
             let output = prompt_line("  output", Some("0"))?
                 .parse::<u64>()
-                .unwrap_or(0);
+                .map_err(|_| ("ORBIT-E1101", "pricing must be an unsigned integer".into()))?;
             pricing.push(orbit_cli::config::Pricing {
                 input_per_million_microdollars: input,
                 output_per_million_microdollars: output,
@@ -740,6 +826,82 @@ fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str,
     Ok(configured)
 }
 
+fn read_provider_line(
+    reader: &mut impl std::io::BufRead,
+    default: Option<&str>,
+) -> Result<String, (&'static str, String)> {
+    use std::io::BufRead;
+    let mut bytes = Vec::new();
+    let count = std::io::Read::take(&mut *reader, 4097)
+        .read_until(b'\n', &mut bytes)
+        .map_err(ioe)?;
+    if count == 0 {
+        return Err((
+            "ORBIT-E1101",
+            "provider input ended before setup was complete".into(),
+        ));
+    }
+    if count > 4096 {
+        return Err(("ORBIT-E1101", "provider input exceeds 4096 bytes".into()));
+    }
+    let line = std::str::from_utf8(&bytes)
+        .map_err(|_| ("ORBIT-E1101", "provider input must be UTF-8".into()))?;
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.chars().any(char::is_control) {
+        return Err((
+            "ORBIT-E1101",
+            "provider input contains a control character".into(),
+        ));
+    }
+    let value = line.trim();
+    Ok(if value.is_empty() {
+        default.unwrap_or("").into()
+    } else {
+        value.into()
+    })
+}
+fn parse_provider_models(raw: &str) -> Result<Vec<String>, (&'static str, String)> {
+    let ids: Vec<_> = raw.split(',').map(|id| id.trim().to_string()).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    if ids.is_empty()
+        || ids.len() > 128
+        || ids.iter().any(|id| {
+            id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) || !seen.insert(id)
+        })
+    {
+        return Err((
+            "ORBIT-E1101",
+            "provide 1..128 unique printable model IDs without empty entries".into(),
+        ));
+    }
+    Ok(ids)
+}
+fn select_provider_models(
+    selection: &str,
+    offered: &[String],
+) -> Result<Vec<String>, (&'static str, String)> {
+    if selection.trim().eq_ignore_ascii_case("all") {
+        return Ok(offered.to_vec());
+    }
+    let mut selected = Vec::new();
+    for part in selection.split(',') {
+        let model = part
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| offered.get(n))
+            .ok_or((
+                "ORBIT-E1101",
+                "model selection must name offered model numbers".into(),
+            ))?;
+        if selected.contains(model) {
+            return Err(("ORBIT-E1101", "model selection contains duplicates".into()));
+        }
+        selected.push(model.clone());
+    }
+    Ok(selected)
+}
 fn prompt_line(label: &str, default: Option<&str>) -> Result<String, (&'static str, String)> {
     use std::io::Write;
     match default {
@@ -747,14 +909,7 @@ fn prompt_line(label: &str, default: Option<&str>) -> Result<String, (&'static s
         None => print!("{label}: "),
     }
     std::io::stdout().flush().map_err(ioe)?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).map_err(ioe)?;
-    let value = line.trim().to_string();
-    if value.is_empty() {
-        Ok(default.unwrap_or("").to_string())
-    } else {
-        Ok(value)
-    }
+    read_provider_line(&mut std::io::stdin().lock(), default)
 }
 
 fn prompt_yes_no(label: &str, default_yes: bool) -> Result<bool, (&'static str, String)> {
@@ -763,7 +918,11 @@ fn prompt_yes_no(label: &str, default_yes: bool) -> Result<bool, (&'static str, 
     if answer.trim().is_empty() {
         return Ok(default_yes);
     }
-    Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
+    match answer.to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err(("ORBIT-E1101", "answer yes or no".into())),
+    }
 }
 
 /// `orbit run example`: phase chain Init→Plan→Execute (example runs locally).
@@ -1012,21 +1171,24 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     let prompt = args
         .get(1)
         .ok_or(("ORBIT-E1101", "ask requires a prompt".into()))?;
-    let gate = value_after(args, "--gate")
-        .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:4001".into());
     let model = value_after(args, "--model")
         .or_else(|| std::env::var("ORBIT_MODEL").ok())
         .ok_or(("ORBIT-E1101", "ask requires --model or ORBIT_MODEL".into()))?;
     let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-    let provider = value_after(args, "--provider")
-        .and_then(|name| cfg.provider.iter().find(|p| p.name == name))
-        .or_else(|| cfg.provider_for_model(&model));
-    let provider_id = provider
-        .map(|p| p.name.as_str())
-        .unwrap_or("configured-gateway");
-    let resolved_gate = provider.map(|p| p.url.as_str()).unwrap_or(&gate);
-    let credential_env = provider.and_then(|p| p.env.as_deref());
+    let turn = orbit_cli::checked_model_turn(
+        home,
+        &model,
+        value_after(args, "--provider").as_deref(),
+        value_after(args, "--gate")
+            .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
+            .as_deref(),
+        false,
+    )
+    .map_err(|error| ("ORBIT-E0401", error))?;
+    let provider_id = turn.provider_id.as_str();
+    let resolved_gate = turn.gate.as_str();
+    let model = turn.model.clone();
+    let credential_env = turn.credential_env.as_deref();
     let pricing = cfg.pricing_for_model(&model);
 
     let outcome = orbit_cli::run_turn(
@@ -1155,39 +1317,302 @@ fn validate_value(
     }
 }
 
+fn owned_startup_session(
+    home: &Path,
+    args: &[String],
+    kind: &str,
+    fresh_id: &str,
+) -> Result<(sessions::SessionLease, Option<sessions::SessionFile>), String> {
+    let requested = if args.iter().any(|arg| arg == "--resume") {
+        Some(
+            value_after(args, "--resume")
+                .filter(|id| !id.is_empty())
+                .ok_or("--resume requires a session id")?,
+        )
+    } else {
+        None
+    };
+    let continuing = args.iter().any(|arg| arg == "--continue");
+    let forking = args.iter().any(|arg| arg == "--fork-session");
+    let source_id = if continuing || (forking && requested.is_none()) {
+        sessions::list_sessions(home)?
+            .first()
+            .map(|saved| saved.session_id.clone())
+    } else {
+        requested
+    };
+    let Some(source_id) = source_id else {
+        return sessions::SessionLease::acquire(home, fresh_id, kind)
+            .map(|lease| (lease, None))
+            .map_err(|error| error.to_string());
+    };
+    let (source_lease, mut saved) =
+        sessions::SessionLease::acquire_and_load(home, &source_id, kind)
+            .map_err(|error| error.to_string())?;
+    if !forking {
+        return Ok((source_lease, Some(saved)));
+    }
+    let lease =
+        sessions::SessionLease::acquire(home, fresh_id, kind).map_err(|error| error.to_string())?;
+    copy_owned_fork_transcript(home, source_lease.session_id(), lease.session_id())?;
+    saved.session_id = lease.session_id().into();
+    saved.updated_at = orbit_cli::timestamp_now();
+    lease.save(&saved).map_err(|error| error.to_string())?;
+    Ok((lease, Some(saved)))
+}
+
+fn copy_owned_fork_transcript(home: &Path, source: &str, target: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let directory = home.join("projects");
+    let source_path = directory.join(format!("{source}.jsonl"));
+    match std::fs::symlink_metadata(&source_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("fork transcript: {error}")),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err("fork transcript must be a regular file".into())
+        }
+        _ => {}
+    }
+    if !std::fs::symlink_metadata(&directory)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        return Err("fork transcript directory must not be a symlink".into());
+    }
+    let mut source_options = std::fs::OpenOptions::new();
+    source_options.read(true);
+    let mut target_options = std::fs::OpenOptions::new();
+    target_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        source_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        target_options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    let input = source_options
+        .open(source_path)
+        .map_err(|error| error.to_string())?;
+    if !input
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("fork transcript must be a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    input
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("fork transcript exceeds 64 MiB".into());
+    }
+    let mut output = target_options
+        .open(directory.join(format!("{target}.jsonl")))
+        .map_err(|error| error.to_string())?;
+    output
+        .write_all(&bytes)
+        .and_then(|_| output.sync_all())
+        .map_err(|error| error.to_string())?;
+    std::fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod owned_startup_tests {
+    use super::*;
+    use sessions::{SessionFile, SessionLease, SessionLeaseError};
+
+    fn home() -> PathBuf {
+        let home = std::env::temp_dir().join(format!("orbit-p35-startup-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        home
+    }
+    fn saved(home: &Path, id: &str, updated: &str) -> SessionFile {
+        let lease = SessionLease::acquire(home, id, "fixture").unwrap();
+        let mut session =
+            SessionFile::from_chat(id, "m", "http://127.0.0.1:1", "p", &[], 7, 2, 3, 4)
+                .with_effort(Some(EffortSetting::Default));
+        session.updated_at = updated.into();
+        lease.save(&session).unwrap();
+        session
+    }
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn fresh_session_is_owned_before_first_persistence() {
+        let home = home();
+        let (lease, saved) = owned_startup_session(&home, &[], "chat", "fresh").unwrap();
+        assert!(saved.is_none());
+        assert!(!home.join("sessions/fresh.json").exists());
+        assert!(matches!(
+            SessionLease::acquire(&home, "fresh", "other"),
+            Err(SessionLeaseError::Busy { .. })
+        ));
+        drop(lease);
+        assert!(SessionLease::acquire(&home, "fresh", "after").is_ok());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn busy_resume_refuses_without_fresh_fallback_or_disk_change() {
+        let home = home();
+        saved(&home, "busy", "2026-10-14T12:00:00Z");
+        let guard = SessionLease::acquire(&home, "busy", "daemon").unwrap();
+        let before = std::fs::read(home.join("sessions/busy.json")).unwrap();
+        let error = owned_startup_session(&home, &args(&["--resume", "busy"]), "headless", "fresh")
+            .unwrap_err();
+        assert!(error.contains("already owned"), "{error}");
+        assert_eq!(
+            std::fs::read(home.join("sessions/busy.json")).unwrap(),
+            before
+        );
+        assert!(!home.join("sessions/fresh.json").exists());
+        drop(guard);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn resume_loads_exact_saved_identity_and_effort_under_lease() {
+        let home = home();
+        saved(&home, "prior", "2026-10-14T12:00:00Z");
+        let (lease, session) =
+            owned_startup_session(&home, &args(&["--resume", "prior.json"]), "chat", "fresh")
+                .unwrap();
+        let session = session.unwrap();
+        assert_eq!(session.session_id, lease.session_id());
+        assert_eq!(session.turns, 7);
+        assert_eq!(session.effort, Some(EffortSetting::Default));
+        assert!(matches!(
+            SessionLease::acquire(&home, "prior", "other"),
+            Err(SessionLeaseError::Busy { .. })
+        ));
+        drop(lease);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn continue_refuses_busy_latest_instead_of_selecting_older_session() {
+        let home = home();
+        saved(&home, "old", "2026-10-14T11:00:00Z");
+        saved(&home, "latest", "2026-10-14T12:00:00Z");
+        let guard = SessionLease::acquire(&home, "latest", "daemon").unwrap();
+        assert!(
+            owned_startup_session(&home, &args(&["--continue"]), "chat", "fresh")
+                .unwrap_err()
+                .contains("already owned")
+        );
+        assert!(!home.join("sessions/fresh.json").exists());
+        drop(guard);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn fork_acquires_target_before_any_new_saved_state() {
+        let home = home();
+        saved(&home, "source", "2026-10-14T12:00:00Z");
+        let before = std::fs::read(home.join("sessions/source.json")).unwrap();
+        let guard = SessionLease::acquire(&home, "fresh", "other").unwrap();
+        assert!(owned_startup_session(
+            &home,
+            &args(&["--resume", "source", "--fork-session"]),
+            "chat",
+            "fresh"
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(home.join("sessions/source.json")).unwrap(),
+            before
+        );
+        assert!(!home.join("sessions/fresh.json").exists());
+        assert!(SessionLease::acquire(&home, "source", "after").is_ok());
+        drop(guard);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn fork_preserves_source_and_copies_transcript_under_new_target_lease() {
+        let home = home();
+        saved(&home, "source", "2026-10-14T12:00:00Z");
+        std::fs::create_dir(home.join("projects")).unwrap();
+        let history = b"{\"kind\":\"fixture\"}\n";
+        std::fs::write(home.join("projects/source.jsonl"), history).unwrap();
+        let before = std::fs::read(home.join("sessions/source.json")).unwrap();
+        let (lease, session) = owned_startup_session(
+            &home,
+            &args(&["--resume", "source", "--fork-session"]),
+            "chat",
+            "fresh",
+        )
+        .unwrap();
+        assert_eq!(session.unwrap().session_id, "fresh");
+        assert_eq!(
+            std::fs::read(home.join("projects/fresh.jsonl")).unwrap(),
+            history
+        );
+        assert_eq!(
+            std::fs::read(home.join("sessions/source.json")).unwrap(),
+            before
+        );
+        assert!(matches!(
+            SessionLease::acquire(&home, "fresh", "other"),
+            Err(SessionLeaseError::Busy { .. })
+        ));
+        drop(lease);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn malformed_resume_identity_never_loads_or_creates_fresh_state() {
+        let home = home();
+        assert!(
+            owned_startup_session(&home, &args(&["--resume", "../outside"]), "chat", "fresh")
+                .is_err()
+        );
+        assert!(!home.join("sessions/fresh.json").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn missing_or_empty_resume_value_never_acquires_fresh_ownership() {
+        for values in [vec!["--resume"], vec!["--resume", ""]] {
+            let home = home();
+            assert!(owned_startup_session(&home, &args(&values), "chat", "fresh").is_err());
+            assert!(!home.join("sessions/.leases/fresh.lock").exists());
+            assert!(!home.join("sessions/fresh.json").exists());
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+}
+
 fn cmd_headless(args: &[String]) -> i32 {
-    let home = orbit_home(args)
-        .or_else(|| std::env::var("ORBIT_HOME").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(".orbit"));
     let prompt = args.first().map(String::as_str).unwrap_or("");
     if prompt.is_empty() {
         eprintln!("ORBIT-E1101: -p requires a prompt");
         return 1;
     }
+    // The consumed prompt is arbitrary text, never an option token.
+    let args = &args[1..];
+    let options = match headless_execution_options(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("ORBIT-E1101: {error}");
+            return 1;
+        }
+    };
+    let home = orbit_home(args)
+        .or_else(|| std::env::var("ORBIT_HOME").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(".orbit"));
     if let Err((code, msg)) = ensure_initialized(&home) {
         eprintln!("{code}: {msg}");
         return 1;
     }
-    // E9: SessionStart fires when the headless session opens.
-    {
-        let hooks =
-            orbit_engine::hooks::Hooks::load(&home, orbit_engine::hooks::project_trusted(&home));
-        let _ = hooks.fire(
-            orbit_engine::hooks::HookEvent::SessionStart,
-            &serde_json::json!({ "frontend": "headless" }),
-        );
-    }
-    let gate = value_after(args, "--gate")
-        .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:4001".into());
-    let model = match value_after(args, "--model").or_else(|| std::env::var("ORBIT_MODEL").ok()) {
-        Some(m) => m,
-        None => {
-            eprintln!("ORBIT-E1101: -p requires --model or ORBIT_MODEL");
-            return 1;
-        }
-    };
-    let format = value_after(args, "--output-format").unwrap_or_else(|| "text".into());
+    let requested_gate =
+        value_after(args, "--gate").or_else(|| std::env::var("ORBIT_GATE_URL").ok());
+    let requested_model =
+        value_after(args, "--model").or_else(|| std::env::var("ORBIT_MODEL").ok());
+    let format = options.format;
     // --bare: skip discovering hooks, skills, mods, MCP servers and
     // memory files (phase 6 — fast start; recommended for scripts).
     if args.iter().any(|a| a == "--bare") {
@@ -1197,27 +1622,14 @@ fn cmd_headless(args: &[String]) -> i32 {
     // output_config.format natively later; here the honest path for
     // every provider: validate the final text as JSON against the
     // schema and retry once with the validation error appended.
-    let json_schema: Option<serde_json::Value> = value_after(args, "--json-schema")
-        .map(|path| {
-            std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
-        })
-        .transpose()
-        .map_err(|e| {
-            eprintln!("ORBIT-E0401: --json-schema: {e}");
-            1
-        })
-        .unwrap_or(None);
-    let max_rounds: u32 = value_after(args, "--max-turns")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(orbit_engine::DEFAULT_MAX_ROUNDS);
+    let json_schema = options.schema;
+    let max_rounds = options.max_rounds;
     // --auto-tools: up-front consent for pure built-ins (headless CI
     // shape). Without it, dontAsk semantics: anything no allow rule
     // covers is denied — and the exit code says so (2).
     let auto_tools = args.iter().any(|a| a == "--auto-tools");
     let cost_guard = orbit_engine::automation::CostGuard {
-        max_microcents: value_after(args, "--max-cost").and_then(|v| v.parse().ok()),
+        max_microcents: options.max_cost,
     };
     // --permission-mode / --allowedTools / --disallowedTools: the
     // command-line permission scope (review blocker 4), carried in the
@@ -1241,27 +1653,69 @@ fn cmd_headless(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let provider = value_after(args, "--provider")
-        .and_then(|name| cfg.provider.iter().find(|p| p.name == name))
-        .or_else(|| cfg.provider_for_model(&model));
-    let provider_id = provider
-        .map(|p| p.name.as_str())
-        .unwrap_or("configured-gateway")
-        .to_string();
-    let resolved_gate = provider
-        .map(|p| p.url.as_str())
-        .unwrap_or(gate.as_str())
-        .to_string();
-    let credential_env = provider.and_then(|p| p.env.as_deref());
-    let pricing = cfg.pricing_for_model(&model);
-
-    let turn_config = orbit_cli::engine_turn_config(
+    let explicit_provider = value_after(args, "--provider");
+    if let Some(spec) = &requested_model {
+        if let Err(error) = orbit_cli::checked_model_turn(
+            &home,
+            spec,
+            explicit_provider.as_deref(),
+            requested_gate.as_deref(),
+            false,
+        ) {
+            eprintln!("ORBIT-E0401: {error}");
+            return 1;
+        }
+    }
+    let (live_lease, resumed_file) =
+        match owned_startup_session(&home, args, "headless", &format!("p-{}", ulid::Ulid::new())) {
+            Ok(owned) => owned,
+            Err(error) => {
+                eprintln!("cannot open session: {error}");
+                return 1;
+            }
+        };
+    let spec = requested_model
+        .clone()
+        .or_else(|| resumed_file.as_ref().map(|saved| saved.model.clone()))
+        .or_else(|| (!cfg.roles.main.is_empty()).then(|| cfg.roles.main.clone()))
+        .or_else(|| {
+            cfg.provider.iter().find_map(|provider| {
+                provider
+                    .models
+                    .first()
+                    .map(|model| format!("{}/{}", provider.name, model.id))
+            })
+        });
+    let Some(spec) = spec else {
+        eprintln!("ORBIT-E1101: configure a provider/model or supply --model and --gate");
+        return 1;
+    };
+    let saved_identity = requested_model.is_none() && resumed_file.is_some();
+    let provider_hint = explicit_provider
+        .or_else(|| saved_identity.then(|| resumed_file.as_ref().unwrap().provider.clone()));
+    let mut turn_config = match orbit_cli::checked_model_turn(
         &home,
-        &provider_id,
-        &resolved_gate,
-        &model,
-        credential_env,
-        pricing,
+        &spec,
+        provider_hint.as_deref(),
+        requested_gate.as_deref(),
+        saved_identity,
+    ) {
+        Ok(turn) => turn,
+        Err(error) => {
+            eprintln!("ORBIT-E0401: {error}");
+            return 1;
+        }
+    };
+    let model = turn_config.model.clone();
+    let provider_id = turn_config.provider_id.clone();
+    let resolved_gate = turn_config.gate.clone();
+    let credential_env = turn_config.credential_env.clone();
+
+    let selection_origin = orbit_cli::startup_selection_origin(
+        value_after(args, "--model").is_some(),
+        std::env::var("ORBIT_MODEL").is_ok(),
+        resumed_file.as_ref(),
+        !cfg.roles.main.is_empty(),
     );
     // The full resolved config for subagents (phase 5): the Task tool
     // derives its TurnConfig from these env vars, so a subagent matches
@@ -1277,23 +1731,27 @@ fn cmd_headless(args: &[String]) -> i32 {
     // --resume load the prior transcript; after the turn the session
     // is saved so the next --continue finds it. Without this, a
     // killed session's work is lost (gate 4).
-    let resume_id = value_after(args, "--resume");
-    let wants_continue = args.iter().any(|a| a == "--continue");
-    let resumed_file = if wants_continue {
-        match orbit_cli::sessions::list_sessions(&home) {
-            Ok(mut list) if !list.is_empty() => {
-                list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                Some(list.remove(0))
-            }
-            _ => None,
+    // A busy session refuses before any session-start hook can run.
+    {
+        let hooks =
+            orbit_engine::hooks::Hooks::load(&home, orbit_engine::hooks::project_trusted(&home));
+        let _ = hooks.fire(
+            orbit_engine::hooks::HookEvent::SessionStart,
+            &serde_json::json!({ "frontend": "headless" }),
+        );
+    }
+    let selected_effort = match startup_effort_argument(args, std::env::var("ORBIT_EFFORT").ok()) {
+        Ok(s) => sessions::startup_effort(s, resumed_file.as_ref(), &model, &provider_id),
+        Err(e) => {
+            eprintln!("ORBIT-E1101: {e}");
+            return 1;
         }
-    } else {
-        resume_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .and_then(|id| orbit_cli::sessions::load_session(&home, id).ok())
     };
-    let mut session_id = format!("p-{}", ulid::Ulid::new());
+    if let Err(e) = apply_selected_effort(&home, &mut turn_config, selected_effort.as_ref()) {
+        eprintln!("ORBIT-E0401: {e}");
+        return 1;
+    }
+    let mut session_id = live_lease.session_id().to_string();
     let mut turns: u64 = 0;
     let mut in_tokens: u64 = 0;
     let mut out_tokens: u64 = 0;
@@ -1307,10 +1765,50 @@ fn cmd_headless(args: &[String]) -> i32 {
         cost_microcents = sf.cost_microcents;
         transcript = sf.to_transcript();
     }
+    let initial = sessions::SessionFile::from_chat(
+        &session_id,
+        &model,
+        &resolved_gate,
+        &provider_id,
+        &transcript,
+        turns,
+        in_tokens,
+        out_tokens,
+        cost_microcents,
+    )
+    .with_effort(selected_effort.clone())
+    .with_selection_origin(selection_origin);
+    if let Err(error) = live_lease.save(&initial) {
+        eprintln!("ORBIT-E0400: {error}");
+        return 1;
+    }
+    let base_turn_config = turn_config.clone();
+    let (turn_config, routing_decision) = match orbit_cli::try_phase_turn_config(
+        &home,
+        &base_turn_config,
+        prompt,
+        selection_origin,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("ORBIT-E0401: {error}");
+            return 1;
+        }
+    };
     let tool_cx = orbit_tools::ToolContext::new(
         home.clone(),
         session_id.clone(),
         std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+    );
+    tool_runtime::remember_effort_setting(
+        &tool_cx,
+        if turn_config.provider_id == base_turn_config.provider_id
+            && turn_config.model == base_turn_config.model
+        {
+            &selected_effort
+        } else {
+            &None
+        },
     );
     let mut executor = HeadlessToolExecutor {
         home: home.clone(),
@@ -1323,6 +1821,14 @@ fn cmd_headless(args: &[String]) -> i32 {
     use std::io::Write;
     let stream_json = format == "stream-json";
     let json_out = format == "json";
+    if let Some(decision) = &routing_decision {
+        if stream_json {
+            println!(
+                "{}",
+                serde_json::json!({"type":"status","text":format!("route {}/{} → {}/{}",decision.phase.as_str(),decision.difficulty.as_str(),decision.provider_id,decision.raw_model)})
+            );
+        }
+    }
     let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
         if stream_json {
             println!("{}", serde_json::to_string(&ev).unwrap_or_default());
@@ -1344,14 +1850,18 @@ fn cmd_headless(args: &[String]) -> i32 {
         // blocker 5).
         memory_bytes: session_prompt.memory_bytes,
         system_directive: Some(session_prompt.text),
-        window_tokens: orbit_cli::context_window_for(&home, &model),
+        window_tokens: orbit_cli::context_window_for_turn(&home, &turn_config),
         request_stem: "orbit-p".into(),
         session_id: session_id.clone(),
-        compaction_config: Some(orbit_cli::role_turn_config(
-            &home,
-            &turn_config,
-            "compaction",
-        )),
+        compaction_config: Some(
+            match orbit_cli::try_role_turn_config(&home, &turn_config, "compaction") {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("ORBIT-E0401: {e}");
+                    return 1;
+                }
+            },
+        ),
         ..Default::default()
     };
     // The authority extractor (phase 6): "run the tests but never
@@ -1521,8 +2031,10 @@ fn cmd_headless(args: &[String]) -> i32 {
             in_tokens + r.input_tokens,
             out_tokens + r.output_tokens,
             cost_microcents + r.cost_microcents,
-        );
-        if let Err(e) = orbit_cli::sessions::save_session(&home, &sf) {
+        )
+        .with_effort(selected_effort.clone())
+        .with_selection_origin(selection_origin);
+        if let Err(e) = live_lease.save(&sf) {
             eprintln!("warning: cannot save session: {e}");
         }
     };
@@ -1778,7 +2290,76 @@ fn enter_worktree(name: &str) -> Result<PathBuf, String> {
     }
     Ok(wt_path)
 }
+/// Validate chat's complete grammar before worktree, identity or session changes.
+fn validate_chat_arguments(args: &[String]) -> Result<(), String> {
+    let values = [
+        "--home",
+        "--model",
+        "--provider",
+        "--gate",
+        "--resume",
+        "--effort",
+        "--worktree",
+        "--permission-mode",
+        "--allowedTools",
+        "--disallowedTools",
+    ];
+    let toggles = [
+        "--continue",
+        "--fork-session",
+        "--bare",
+        "--tui",
+        "--no-tui",
+        "--old-tui",
+        "--auto-tools",
+        "--safe-customization",
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut command = false;
+    let mut index = 0;
+    while index < args.len() {
+        let word = args[index].as_str();
+        if word == "chat" && !command {
+            command = true;
+            index += 1;
+            continue;
+        }
+        if !seen.insert(word) {
+            return Err(format!("duplicate chat option {word}"));
+        }
+        if values.contains(&word) {
+            if args
+                .get(index + 1)
+                .is_none_or(|value| value.is_empty() || value.starts_with("--"))
+            {
+                return Err(format!("{word} requires a value"));
+            }
+            index += 2;
+        } else if toggles.contains(&word) {
+            index += 1;
+        } else {
+            return Err(format!("unknown chat option {word}"));
+        }
+    }
+    if seen.contains("--resume") && seen.contains("--continue") {
+        return Err("choose --resume or --continue".into());
+    }
+    if seen.contains("--tui") && seen.contains("--no-tui") {
+        return Err("choose --tui or --no-tui".into());
+    }
+    if let Some(mode) = value_after(args, "--permission-mode") {
+        if orbit_tools::permissions::PermissionMode::from_config(&mode).is_none() {
+            return Err("unknown permission mode".into());
+        }
+    }
+    Ok(())
+}
+
 fn cmd_chat(args: &[String]) -> i32 {
+    if let Err(error) = validate_chat_arguments(args) {
+        eprintln!("ORBIT-E1101: {error}");
+        return 2;
+    }
     // The v1 three-pane HUD was removed; say so rather than pretending the
     // flag is unknown (or, worse, quietly starting the default screen).
     if args.iter().any(|a| a == "--old-tui") {
@@ -1811,42 +2392,40 @@ fn cmd_chat(args: &[String]) -> i32 {
         return 2;
     }
 
-    let gate = value_after(args, "--gate")
-        .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:4001".into());
-    let cfg = config::ProvidersConfig::load(&home)
-        .map_err(|e| eprintln!("warning: providers.toml: {e}"))
-        .unwrap_or_default();
-    // The model resolves in priority order: --model / ORBIT_MODEL /
-    // ORBIT_ACTIVE_MODEL / the first configured provider's first
-    // model. A model no provider declares falls back to the default
-    // gate and every turn fails — so prefer a configured one.
-    let mut model = value_after(args, "--model")
+    let requested_gate =
+        value_after(args, "--gate").or_else(|| std::env::var("ORBIT_GATE_URL").ok());
+    let cfg = match config::ProvidersConfig::load(&home) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("ORBIT-E1106: {error}");
+            return 2;
+        }
+    };
+    let requested_model = value_after(args, "--model")
         .or_else(|| std::env::var("ORBIT_MODEL").ok())
-        .or_else(|| std::env::var("ORBIT_ACTIVE_MODEL").ok())
+        .or_else(|| std::env::var("ORBIT_ACTIVE_MODEL").ok());
+    let mut model = requested_model
+        .clone()
+        .or_else(|| (!cfg.roles.main.is_empty()).then(|| cfg.roles.main.clone()))
         .or_else(|| {
-            // roles.main: the configured default for the conversation.
-            let spec = cfg.roles.main.clone();
-            (!spec.is_empty()).then(|| spec.rsplit('/').next().unwrap_or(&spec).to_string())
+            cfg.provider.iter().find_map(|provider| {
+                provider
+                    .models
+                    .first()
+                    .map(|model| format!("{}/{}", provider.name, model.id))
+            })
         })
-        .unwrap_or_else(|| {
-            cfg.provider
-                .iter()
-                .flat_map(|p| p.models.iter().map(|m| m.id.clone()))
-                .next()
-                .unwrap_or_else(|| "glm-5.2".into())
-        });
-    // If the resolved model matches no provider, use the first
-    // configured model instead (the gate fallback would 401/conn-ref).
-    if cfg.provider_for_model(&model).is_none() {
-        if let Some(first) = cfg
-            .provider
-            .iter()
-            .flat_map(|p| p.models.iter().map(|m| m.id.clone()))
-            .next()
-        {
-            eprintln!("warning: model {model} is not configured; using {first}");
-            model = first;
+        .unwrap_or_default();
+    if let Some(spec) = &requested_model {
+        if let Err(error) = orbit_cli::checked_model_turn(
+            &home,
+            spec,
+            value_after(args, "--provider").as_deref(),
+            requested_gate.as_deref(),
+            false,
+        ) {
+            eprintln!("ORBIT-E0401: {error}");
+            return 2;
         }
     }
 
@@ -1854,75 +2433,78 @@ fn cmd_chat(args: &[String]) -> i32 {
     // transcript so the conversation continues across invocations.
     // `--continue` reopens the LATEST session in this directory
     // (phase 4; Claude Code parity).
-    let resume = value_after(args, "--resume");
-    let wants_continue = args.iter().any(|a| a == "--continue");
-    let resumed_file = if wants_continue {
-        match sessions::list_sessions(&home) {
-            Ok(mut list) if !list.is_empty() => {
-                // newest by updated_at
-                list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                let latest = list.remove(0);
-                eprintln!(
-                    "continuing session {} ({} turns)",
-                    latest.session_id, latest.turns
-                );
-                Some(latest)
+    let (mut live_lease, resumed_file) =
+        match owned_startup_session(&home, args, "chat", &orbit_gateway::new_session_id()) {
+            Ok(owned) => owned,
+            Err(error) => {
+                eprintln!("cannot open session: {error}");
+                return 2;
             }
-            _ => {
-                eprintln!("no saved sessions; starting fresh");
-                None
-            }
-        }
-    } else {
-        resume
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .and_then(|id| match sessions::load_session(&home, id) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("warning: cannot resume {id}: {e}; starting fresh");
-                    None
-                }
-            })
-    };
+        };
 
-    // --fork-session (roadmap §Sessions): copy the resumed (or latest)
-    // session's history into a NEW session id and continue there. The
-    // original is untouched — "replay it differently" without losing
-    // the thread you were on.
-    let resumed_file = if args.iter().any(|a| a == "--fork-session") {
-        let source = resumed_file.or_else(|| {
-            // No --resume: fork the latest session in this directory.
-            sessions::list_sessions(&home)
-                .ok()
-                .and_then(|mut list| {
-                    list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                    list.into_iter().next()
-                })
-                .or_else(|| {
-                    eprintln!("no saved sessions to fork; starting fresh");
-                    None
-                })
-        });
-        match source {
-            Some(src) => match sessions::fork_session(&home, &src.session_id) {
-                Ok(fork) => {
-                    eprintln!("forked {} into {}", src.session_id, fork.session_id);
-                    Some(fork)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: cannot fork {}: {e}; continuing the original",
-                        src.session_id
-                    );
-                    Some(src)
-                }
-            },
-            None => None,
+    let saved_identity = requested_model.is_none() && resumed_file.is_some();
+    if saved_identity {
+        model = resumed_file.as_ref().unwrap().model.clone();
+    }
+    let provider_hint = value_after(args, "--provider")
+        .or_else(|| saved_identity.then(|| resumed_file.as_ref().unwrap().provider.clone()));
+    let mut startup_turn = match orbit_cli::checked_model_turn(
+        &home,
+        &model,
+        provider_hint.as_deref(),
+        requested_gate.as_deref(),
+        saved_identity,
+    ) {
+        Ok(turn) => turn,
+        Err(error) => {
+            eprintln!("ORBIT-E0401: {error}");
+            return 2;
         }
-    } else {
-        resumed_file
     };
+    model = startup_turn.model.clone();
+    let mut gate = startup_turn.gate.clone();
+    let mut active_provider = startup_turn.provider_id.clone();
+    let mut selected_effort =
+        match startup_effort_argument(args, std::env::var("ORBIT_EFFORT").ok()) {
+            Ok(s) => sessions::startup_effort(s, resumed_file.as_ref(), &model, &active_provider),
+            Err(e) => {
+                eprintln!("ORBIT-E1101: {e}");
+                return 2;
+            }
+        };
+    if let Err(e) = apply_selected_effort(&home, &mut startup_turn, selected_effort.as_ref()) {
+        eprintln!("ORBIT-E0401: {e}");
+        return 2;
+    }
+
+    let mut selection_origin = orbit_cli::startup_selection_origin(
+        value_after(args, "--model").is_some(),
+        std::env::var("ORBIT_MODEL").is_ok() || std::env::var("ORBIT_ACTIVE_MODEL").is_ok(),
+        resumed_file.as_ref(),
+        !cfg.roles.main.is_empty(),
+    );
+    let initial = sessions::SessionFile::from_chat(
+        live_lease.session_id(),
+        &model,
+        &gate,
+        &active_provider,
+        &resumed_file
+            .as_ref()
+            .map(|saved| saved.to_transcript())
+            .unwrap_or_default(),
+        resumed_file.as_ref().map_or(0, |saved| saved.turns),
+        resumed_file.as_ref().map_or(0, |saved| saved.input_tokens),
+        resumed_file.as_ref().map_or(0, |saved| saved.output_tokens),
+        resumed_file
+            .as_ref()
+            .map_or(0, |saved| saved.cost_microcents),
+    )
+    .with_effort(selected_effort.clone())
+    .with_selection_origin(selection_origin);
+    if let Err(error) = live_lease.save(&initial) {
+        eprintln!("ORBIT-E0400: {error}");
+        return 2;
+    }
 
     // TUI front-end (DR-20): if TTY + --tui (default), forward to the ratatui
     // TUI. --no-tui, non-TTY stdin/stdout, or the `tui` feature off → fall
@@ -1933,19 +2515,14 @@ fn cmd_chat(args: &[String]) -> i32 {
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
             && std::io::IsTerminal::is_terminal(&std::io::stdout());
         if want_tui {
-            let session_id = resumed_file
-                .as_ref()
-                .map(|s| s.session_id.clone())
-                .unwrap_or_else(orbit_gateway::new_session_id);
-            let provider = cfg.provider_for_model(&model);
-            let provider_id = provider
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| "configured-gateway".into());
+            let session_id = live_lease.session_id().to_string();
+            let provider_id = active_provider.clone();
             let tui_config = tui_worker::TuiTurnConfig {
                 home: home.clone(),
                 session_id,
                 gate: gate.clone(),
                 model: model.clone(),
+                effort: selected_effort.clone(),
                 provider_id,
                 auto_tools: args.iter().any(|a| a == "--auto-tools"),
                 scope: tool_runtime::PermissionScope::from_flags(
@@ -1973,9 +2550,16 @@ fn cmd_chat(args: &[String]) -> i32 {
             // and saves `<id>.history` under the session id it shares
             // with the worker's saves.
             std::env::set_var("ORBIT_SESSION_ID", &tui_config.session_id);
-            return orbit_hud_tui::proto::runtime::run_proto(
+            let host = orbit_cli::customization_host::host(
+                &home,
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                tui_config.scope.clone(),
+                args.iter().any(|arg| arg == "--safe-customization"),
+            );
+            return orbit_hud_tui::run_proto_with_customization(
                 args,
-                tui_worker::make_spawner(tui_config),
+                tui_worker::make_spawner_owned(tui_config, live_lease),
+                host,
             );
         }
     }
@@ -1984,14 +2568,14 @@ fn cmd_chat(args: &[String]) -> i32 {
     // stdout lines (§11.4). The TUI never enables this — its worker threads
     // must not print to the alt screen.
     tool_runtime::enable_plain_output();
+    if orbit_cli::mods::validation_status(&home).is_err() {
+        eprintln!("Instruction bundles or enabled metadata are malformed or unsafe. Run orbit doctor; invalid entries remain disabled and stored files are unchanged.");
+    }
 
     if let Some(s) = &resumed_file {
         eprintln!("resumed session {} ({} prior turns)", s.session_id, s.turns);
     }
-    let mut session = resumed_file
-        .as_ref()
-        .map(|s| s.session_id.clone())
-        .unwrap_or_else(orbit_gateway::new_session_id);
+    let mut session = live_lease.session_id().to_string();
     // Conversation transcript: role + content per turn (multi-turn wire payload).
     let mut transcript: Vec<orbit_adapter::types::ChatMessage> = resumed_file
         .as_ref()
@@ -2047,28 +2631,231 @@ fn cmd_chat(args: &[String]) -> i32 {
             // `/resume <id>` needs the mutable session id, so it is handled
             // here (in the loop) rather than in handle_chat_command.
             if let Some(id) = trimmed.strip_prefix("/resume ") {
-                match sessions::load_session(&home, id.trim()) {
-                    Ok(s) => {
+                let id = id.trim();
+                let target = if id.strip_suffix(".json").unwrap_or(id) == live_lease.session_id() {
+                    live_lease.load().map(|saved| (None, saved))
+                } else {
+                    sessions::SessionLease::acquire_and_load(&home, id, "chat")
+                        .map(|(lease, saved)| (Some(lease), saved))
+                };
+                match target {
+                    Ok((candidate_lease, s)) => {
+                        let resolved = match chat_effort_config(
+                            &home,
+                            &s.model,
+                            &s.gate,
+                            Some(&s.provider),
+                            s.effort.as_ref(),
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("cannot resume {id}: {e}");
+                                continue;
+                            }
+                        };
+                        if let Some(candidate_lease) = candidate_lease {
+                            live_lease = candidate_lease;
+                        }
+                        selection_origin = sessions::model_origin(Some(&s));
+                        model = s.model.clone();
+                        selected_effort = s.effort.clone();
+                        active_provider = resolved.provider_id;
+                        gate = resolved.gate;
                         session = s.session_id.clone();
                         transcript = s.to_transcript();
                         turns = s.turns;
                         total_input = s.input_tokens;
                         total_output = s.output_tokens;
+                        total_cost = s.cost_microcents;
                         eprintln!("resumed {id} ({} prior turns)", s.turns);
                     }
                     Err(e) => eprintln!("cannot resume {id}: {e}"),
                 }
                 continue;
             }
+            if trimmed.split_whitespace().next() == Some("/permissions") {
+                let scope = tool_runtime::PermissionScope::from_flags(
+                    value_after(args, "--permission-mode").as_deref(),
+                    value_after(args, "--allowedTools").as_deref(),
+                    value_after(args, "--disallowedTools").as_deref(),
+                );
+                let working_dir = std::env::current_dir().unwrap_or_default();
+                match tool_runtime::permission_command(
+                    &home,
+                    &scope,
+                    &working_dir,
+                    trimmed.strip_prefix("/permissions").unwrap_or_default(),
+                ) {
+                    Ok(text) => println!("{text}"),
+                    Err(error) => eprintln!("permissions: {error}"),
+                }
+                continue;
+            }
+            if trimmed == "/customize"
+                || trimmed.starts_with("/customize ")
+                || trimmed == "/theme"
+                || trimmed.starts_with("/theme ")
+            {
+                let (kind, rest) = trimmed.split_once(' ').unwrap_or((&trimmed, ""));
+                let mut words = Vec::new();
+                if kind == "/theme" {
+                    words.push("theme".into());
+                    if !rest.is_empty() {
+                        words.push(rest.trim().into());
+                    }
+                } else {
+                    let mut parts = rest.trim().splitn(2, char::is_whitespace);
+                    if let Some(operation) = parts.next().filter(|value| !value.is_empty()) {
+                        words.push(operation.into());
+                    }
+                    if let Some(tail) = parts
+                        .next()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        if words.first().is_some_and(|word| word == "set") {
+                            let (key, value) =
+                                tail.split_once(char::is_whitespace).unwrap_or((tail, ""));
+                            words.push(key.into());
+                            words.push(value.trim().into());
+                        } else {
+                            words.push(tail.into());
+                        }
+                    }
+                }
+                let host = orbit_cli::customization_host::host(
+                    &home,
+                    &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    tool_runtime::PermissionScope::from_flags(
+                        value_after(args, "--permission-mode").as_deref(),
+                        value_after(args, "--allowedTools").as_deref(),
+                        value_after(args, "--disallowedTools").as_deref(),
+                    ),
+                    args.iter().any(|arg| arg == "--safe-customization"),
+                );
+                match orbit_cli::customization_host::command_for(host.as_ref(), &words) {
+                    Ok(value) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    ),
+                    Err(error) => eprintln!("customize: {error}"),
+                }
+                continue;
+            }
+            if let Some(command) = trimmed.strip_prefix("/route") {
+                if !command.is_empty() && !command.starts_with(char::is_whitespace) {
+                    eprintln!("unknown command: {trimmed}");
+                    continue;
+                }
+                let words: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+                if words.first().map(String::as_str) == Some("auto") && words.len() == 1 {
+                    let validation = config::ProvidersConfig::load(&home).and_then(|providers| {
+                        orbit_cli::phase_routing::validate_settings(
+                            &providers,
+                            &providers.phase_settings(),
+                        )
+                    });
+                    if let Err(error) = validation {
+                        eprintln!("routing unchanged: {error}");
+                        continue;
+                    }
+                    let saved = sessions::SessionFile::from_chat(
+                        &session,
+                        &model,
+                        &gate,
+                        &active_provider,
+                        &transcript,
+                        turns,
+                        total_input,
+                        total_output,
+                        total_cost,
+                    )
+                    .with_effort(selected_effort.clone())
+                    .with_selection_origin(orbit_cli::phase_routing::SelectionOrigin::Default);
+                    match live_lease.save(&saved) {
+                        Ok(()) => {
+                            selection_origin = orbit_cli::phase_routing::SelectionOrigin::Default;
+                            println!("Automatic routing enabled for this session");
+                        }
+                        Err(error) => eprintln!("routing unchanged: {error}"),
+                    }
+                } else {
+                    match chat_effort_config(
+                        &home,
+                        &model,
+                        &gate,
+                        Some(&active_provider),
+                        selected_effort.as_ref(),
+                    )
+                    .and_then(|base| {
+                        orbit_cli::route_command(&home, &words, Some(&base), selection_origin)
+                    }) {
+                        Ok(value) => println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        ),
+                        Err(error) => eprintln!("route: {error}"),
+                    }
+                }
+                continue;
+            }
+            let prior_selection = (model.clone(), selected_effort.clone(), selection_origin);
             let handled = handle_chat_command(
                 &trimmed,
                 &home,
                 &mut model,
+                &mut selected_effort,
+                &gate,
+                &mut active_provider,
                 &mut transcript,
                 (&turns, &total_input, &total_output, &total_cost),
             );
+            if handled && trimmed.starts_with("/model ") {
+                let requested = trimmed["/model ".len()..].trim();
+                if orbit_cli::checked_model_turn(
+                    &home,
+                    requested,
+                    None,
+                    if cfg.provider.is_empty() {
+                        Some(&gate)
+                    } else {
+                        None
+                    },
+                    false,
+                )
+                .is_ok_and(|turn| turn.model == model && turn.provider_id == active_provider)
+                {
+                    selection_origin = orbit_cli::phase_routing::SelectionOrigin::Interactive;
+                }
+            }
             if !handled {
                 eprintln!("unknown command: {trimmed}; try /help");
+            } else if prior_selection != (model.clone(), selected_effort.clone(), selection_origin)
+            {
+                if let Ok(resolved) = chat_effort_config(
+                    &home,
+                    &model,
+                    &gate,
+                    Some(&active_provider),
+                    selected_effort.as_ref(),
+                ) {
+                    let sf = sessions::SessionFile::from_chat(
+                        &session,
+                        &model,
+                        &resolved.gate,
+                        &resolved.provider_id,
+                        &transcript,
+                        turns,
+                        total_input,
+                        total_output,
+                        total_cost,
+                    )
+                    .with_effort(selected_effort.clone())
+                    .with_selection_origin(selection_origin);
+                    if let Err(e) = live_lease.save(&sf) {
+                        eprintln!("warning: session not saved: {e}");
+                    }
+                }
             }
             continue;
         }
@@ -2079,8 +2866,10 @@ fn cmd_chat(args: &[String]) -> i32 {
 
         // Resolve the provider for the current model (config overrides the
         // default gate). `credential_env` names the env var holding the token.
-        let provider = value_after(args, "--provider")
-            .and_then(|name| cfg.provider.iter().find(|p| p.name == name))
+        let provider = cfg
+            .provider
+            .iter()
+            .find(|p| p.name == active_provider)
             .or_else(|| cfg.provider_for_model(&model));
         let provider_id = provider
             .map(|p| p.name.as_str())
@@ -2105,26 +2894,45 @@ fn cmd_chat(args: &[String]) -> i32 {
         // Phase 2: the loop is the ENGINE's — the REPL supplies only the
         // event adapter (stdout) and the tool executor (StdApprovalChannel,
         // session grants). The old 8-round copy of the loop is gone.
-        let turn_config = orbit_cli::engine_turn_config(
+        let mut base_turn_config = match orbit_cli::try_engine_turn_config(
             &home,
             &provider_id,
             &resolved_gate,
             &model,
             credential_env,
             pricing,
-        );
-        // Difficulty routing (2026-10-10): classify the prompt; hard /
-        // easy signals with armed targets switch the model for this
-        // turn. `routed_turn_config` itself defers to an explicit
-        // --model / ORBIT_MODEL choice (manual wins over the table).
-        let (turn_config, routing_decision) =
-            orbit_cli::routed_turn_config(&home, &turn_config, &trimmed, &session);
-        if turn_config.model != model {
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ORBIT-E0401: {e}");
+                continue;
+            }
+        };
+        if let Err(error) =
+            apply_selected_effort(&home, &mut base_turn_config, selected_effort.as_ref())
+        {
+            eprintln!("ORBIT-E0401: {error}");
+            continue;
+        }
+        let (turn_config, routing_decision) = match orbit_cli::try_phase_turn_config(
+            &home,
+            &base_turn_config,
+            &trimmed,
+            selection_origin,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("ORBIT-E0401: {error}");
+                continue;
+            }
+        };
+        if let Some(decision) = &routing_decision {
             println!(
-                "routed {} → {} ({})",
-                routing_decision.phase.as_str(),
-                turn_config.model,
-                routing_decision.matched.join(", ")
+                "route {}/{} → {}/{}",
+                decision.phase.as_str(),
+                decision.difficulty.as_str(),
+                decision.provider_id,
+                decision.raw_model
             );
         }
         let mut executor = ReplToolExecutor {
@@ -2150,6 +2958,16 @@ fn cmd_chat(args: &[String]) -> i32 {
                 std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
             ),
         };
+        tool_runtime::remember_effort_setting(
+            &executor.tool_cx,
+            if turn_config.provider_id == base_turn_config.provider_id
+                && turn_config.model == base_turn_config.model
+            {
+                &selected_effort
+            } else {
+                &None
+            },
+        );
         let mut stamped = false;
         let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
             use orbit_frontend_protocol::FrontendEvent as E;
@@ -2195,14 +3013,18 @@ fn cmd_chat(args: &[String]) -> i32 {
             tools: tools::session_tool_definitions(&home),
             memory_bytes: session_prompt.memory_bytes,
             system_directive: Some(session_prompt.text),
-            window_tokens: orbit_cli::context_window_for(&home, &model),
+            window_tokens: orbit_cli::context_window_for_turn(&home, &turn_config),
             request_stem: "orbit-repl".into(),
             session_id: session.clone(),
-            compaction_config: Some(orbit_cli::role_turn_config(
-                &home,
-                &turn_config,
-                "compaction",
-            )),
+            compaction_config: Some(
+                match orbit_cli::try_role_turn_config(&home, &turn_config, "compaction") {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("ORBIT-E0401: {e}");
+                        continue;
+                    }
+                },
+            ),
             ..Default::default()
         };
         let report = orbit_engine::run_turn(
@@ -2233,8 +3055,10 @@ fn cmd_chat(args: &[String]) -> i32 {
                     total_input,
                     total_output,
                     total_cost,
-                );
-                if let Err(e) = sessions::save_session(&home, &sf) {
+                )
+                .with_effort(selected_effort.clone())
+                .with_selection_origin(selection_origin);
+                if let Err(e) = live_lease.save(&sf) {
                     eprintln!("warning: session not saved: {e}");
                 }
             }
@@ -2406,119 +3230,125 @@ impl orbit_engine::ToolExecutor for ReplToolExecutor {
     }
 }
 
-/// `orbit models` — list every declared model across all configured providers.
-/// Reads `$ORBIT_HOME/providers.toml` (missing = empty config).
-/// `orbit mod …` — mods as signed plugins (phase 5): a bundle of
-/// instructions, commands, skills, hooks and MCP servers, installed
-/// through orbit-plugin's signed-manifest flow (issuer key, content
-/// digest, operator approval, ledger record).
+/// Signed packages use durable storage; instruction mods retain their own loader.
+fn package_install_arguments(args: &[String]) -> Result<bool, (&'static str, String)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut confirmed = false;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if matches!(flag, "--package" | "--manifest" | "--home") {
+            if !seen.insert(flag) {
+                return Err(("ORBIT-E1101", format!("duplicate {flag}")));
+            }
+            let value = args
+                .get(index + 1)
+                .filter(|value| !value.is_empty() && !value.starts_with('-'));
+            if value.is_none() {
+                return Err((
+                    "ORBIT-E1101",
+                    format!("{flag} requires a path; use ./ for a filename beginning with '-'"),
+                ));
+            }
+            index += 1;
+        } else if flag == "--yes" {
+            if confirmed {
+                return Err(("ORBIT-E1101", "duplicate --yes".into()));
+            }
+            confirmed = true;
+        } else if flag.starts_with('-') {
+            return Err((
+                "ORBIT-E1101",
+                format!("unknown package install flag {flag}"),
+            ));
+        }
+        index += 1;
+    }
+    let pos = positionals(args);
+    if pos.len() > 3 || (pos.get(2).is_some() && seen.contains("--package")) {
+        return Err(("ORBIT-E1101", "choose one package path".into()));
+    }
+    Ok(confirmed)
+}
+
 fn cmd_mod(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     let pos = positionals(args);
     let sub = pos.get(1).copied().unwrap_or("");
-    // Issuer allowlist: $ORBIT_HOME/mods/issuers.txt, one hex key per
-    // line. The operator trusts an issuer explicitly; installs from
-    // anyone else are refused.
-    let issuers_path = home.join("mods").join("issuers.txt");
-    let read_issuers = || -> std::collections::HashSet<String> {
-        std::fs::read_to_string(&issuers_path)
-            .map(|t| {
-                t.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
     match sub {
         "allow-issuer" => {
-            let Some(key) = pos.get(2) else {
-                return Err((
-                    "ORBIT-E1101",
-                    "usage: orbit mod allow-issuer <hex-ed25519-key>".into(),
-                ));
-            };
-            let key = key.trim();
-            if hex::decode(key).map(|b| b.len() != 32).unwrap_or(true) {
-                return Err(("ORBIT-E0806", "issuer key must be 32 bytes of hex".into()));
-            }
-            std::fs::create_dir_all(home.join("mods"))
-                .map_err(|e| ("ORBIT-E0501", e.to_string()))?;
-            let mut existing = read_issuers();
-            existing.insert(key.to_string());
-            let text = existing.into_iter().collect::<Vec<_>>().join("\n");
-            std::fs::write(&issuers_path, format!("{text}\n"))
-                .map_err(|e| ("ORBIT-E0501", e.to_string()))?;
-            Ok(serde_json::json!({
-                "schema": "orbit.cli/v1",
-                "command": "mod allow-issuer",
-                "status": "ok",
-                "issuer": key,
-            }))
+            let key = pos.get(2).ok_or((
+                "ORBIT-E1101",
+                "usage: orbit mod allow-issuer <hex-ed25519-key>".into(),
+            ))?;
+            orbit_cli::signed_packages::trust_issuer(home, key)
+                .map_err(|error| (error.code(), error.to_string()))?;
+            Ok(
+                serde_json::json!({"schema":"orbit.cli/v1","command":"mod allow-issuer","status":"ok","issuer":key.to_ascii_lowercase()}),
+            )
         }
-        "list" => {
-            let issuers = read_issuers();
-            Ok(serde_json::json!({
-                "schema": "orbit.cli/v1",
-                "command": "mod list",
-                "status": "ok",
-                "trusted_issuers": issuers.len(),
-                "issuers": issuers,
-            }))
+        "issuers" => {
+            let issuers = orbit_cli::signed_packages::trusted_issuers(home)
+                .map_err(|error| (error.code(), error.to_string()))?;
+            Ok(
+                serde_json::json!({"schema":"orbit.cli/v1","command":"mod issuers","status":"ok","trusted_issuers":issuers.len(),"issuers":issuers}),
+            )
+        }
+        "list" | "search" | "status" => {
+            let query = if sub == "search" {
+                let term = pos.get(2..).unwrap_or_default().join(" ");
+                if term.is_empty() {
+                    return Err(("ORBIT-E1101", "usage: orbit mod search <text>".into()));
+                }
+                Some(term)
+            } else if sub == "status" {
+                Some(
+                    pos.get(2)
+                        .ok_or(("ORBIT-E1101", "usage: orbit mod status <name>".into()))?
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            let catalog = if sub == "status" {
+                orbit_cli::signed_packages::status(home, query.as_deref().unwrap_or_default())
+            } else {
+                orbit_cli::signed_packages::catalog(home, query.as_deref())
+            }
+            .map_err(|error| (error.code(), error.to_string()))?;
+            Ok(
+                serde_json::json!({"schema":"orbit.cli/v1","command":format!("mod {sub}"),"status":"ok","catalog":catalog}),
+            )
         }
         "install" => {
-            let pkg = value_after(args, "--package")
-                .or_else(|| pos.get(2).map(|s| s.to_string()))
-                .ok_or_else(|| {
-                    (
-                        "ORBIT-E1101",
-                        "usage: orbit mod install <package.wasm> --manifest <manifest.json>".into(),
-                    )
-                })?;
-            let manifest_path = value_after(args, "--manifest").ok_or_else(|| {
-                (
+            let confirmed = package_install_arguments(args)?;
+            let package = value_after(args, "--package")
+                .or_else(|| pos.get(2).map(|path| path.to_string()))
+                .ok_or((
                     "ORBIT-E1101",
-                    "install needs --manifest <manifest.json>".into(),
-                )
-            })?;
-            let manifest_text = std::fs::read_to_string(&manifest_path)
-                .map_err(|e| ("ORBIT-E0401", format!("read manifest: {e}")))?;
-            let manifest: orbit_plugin::PluginManifest = serde_json::from_str(&manifest_text)
-                .map_err(|e| ("ORBIT-E0401", format!("parse manifest: {e}")))?;
-            let package_bytes =
-                std::fs::read(&pkg).map_err(|e| ("ORBIT-E0401", format!("read package: {e}")))?;
-            let issuers = read_issuers();
-            if !issuers.contains(&manifest.issuer_public_key) {
-                return Err((
-                    "ORBIT-E0806",
-                    format!(
-                        "issuer {} is not trusted; run: orbit mod allow-issuer {}",
-                        &manifest.issuer_public_key[..8.min(manifest.issuer_public_key.len())],
-                        manifest.issuer_public_key
-                    ),
-                ));
+                    "usage: orbit mod install <package.wasm> --manifest <manifest.json> --yes"
+                        .into(),
+                ))?;
+            let manifest = value_after(args, "--manifest").ok_or((
+                "ORBIT-E1101",
+                "install needs --manifest <manifest.json>".into(),
+            ))?;
+            let (manifest, bytes) = orbit_cli::signed_packages::read_install_inputs(
+                Path::new(&manifest),
+                Path::new(&package),
+            )
+            .map_err(|error| (error.code(), error.to_string()))?;
+            if !confirmed {
+                return Err(("ORBIT-E1101", "installation requires explicit confirmation; add --yes after reviewing the signed manifest".into()));
             }
-            let mut registry = orbit_plugin::PluginRegistry::new(4);
-            for i in issuers {
-                registry.allow_issuer(i);
-            }
-            registry.attach_ledger();
-            let allowlist = orbit_plugin::WasiHostAllowlist::canonical();
-            match registry.install(&manifest, &allowlist, &package_bytes) {
-                Ok(installed) => Ok(serde_json::json!({
-                    "schema": "orbit.cli/v1",
-                    "command": "mod install",
-                    "status": "ok",
-                    "mod": installed.name,
-                    "version": installed.version,
-                    "issuer": installed.issuer_fingerprint,
-                })),
-                Err(e) => Err(("ORBIT-E0806", e.to_string())),
-            }
+            let receipt = orbit_cli::signed_packages::install(home, &manifest, &bytes, confirmed)
+                .map_err(|error| (error.code(), error.to_string()))?;
+            Ok(
+                serde_json::json!({"schema":"orbit.cli/v1","command":"mod install","status":"ok","installation":receipt}),
+            )
         }
-        other => Err((
+        _ => Err((
             "ORBIT-E1101",
-            format!("unknown mod subcommand {other:?} (install, list, allow-issuer)"),
+            "usage: orbit mod install|list|search|status|issuers|allow-issuer".into(),
         )),
     }
 }
@@ -2538,7 +3368,7 @@ fn cmd_folder(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
         let a = args[i].as_str();
         if matches!(
             a,
-            "--home" | "--model" | "--gate" | "--resume" | "--provider"
+            "--home" | "--model" | "--effort" | "--gate" | "--resume" | "--provider"
         ) {
             i += 2;
             continue;
@@ -2593,164 +3423,197 @@ fn cmd_folder(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
 /// without sending anything, so the table can be tuned before it
 /// spends money.
 fn cmd_route(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
-    use orbit_engine::routing as r;
     let pos = positionals(args);
     let sub = pos.get(1).copied().unwrap_or("status");
-    let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-    match sub {
-        "status" => {
-            let table = cfg.routing_table();
-            fn spec(s: &str) -> String {
-                if s.is_empty() {
-                    "(off — this phase keeps the session model)".to_string()
-                } else {
-                    s.to_string()
-                }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let word = args[index].as_str();
+        if word.starts_with("--") {
+            if !seen.insert(word) {
+                return Err(("ORBIT-E1101", format!("duplicate route option {word}")));
             }
-            Ok(serde_json::json!({
-                "schema": "orbit.cli/v1",
-                "command": "route status",
-                "status": "ok",
-                "enabled": table.enabled(),
-                "hard": spec(&table.hard),
-                "easy": spec(&table.easy),
-                "hard_keywords": table.hard_keywords,
-                "easy_keywords": table.easy_keywords,
-                "hint": if table.enabled() {
-                    "routing is on: hard/easy signals switch the turn's model (orbit route test \"<prompt>\" to preview)"
-                } else {
-                    "routing is off: set targets with `orbit route hard <model>` and `orbit route easy <model>`"
-                },
-            }))
-        }
-        "hard" | "easy" => {
-            let spec = pos.get(2).copied().unwrap_or("");
-            if spec == "off" || spec.is_empty() {
-                cfg.set_routing_target(sub, "")
-                    .map_err(|e| ("ORBIT-E1101", e))?;
-            } else {
-                cfg.set_routing_target(sub, spec)
-                    .map_err(|e| ("ORBIT-E1101", e))?;
+            if [
+                "--home",
+                "--model",
+                "--provider",
+                "--gate",
+                "--easy",
+                "--hard",
+                "--session",
+                "--resume",
+            ]
+            .contains(&word)
+            {
+                if args
+                    .get(index + 1)
+                    .is_none_or(|value| value.is_empty() || value.starts_with("--"))
+                {
+                    return Err(("ORBIT-E1101", format!("{word} requires a value")));
+                }
+                index += 2;
+                continue;
             }
-            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
-            let table = cfg.routing_table();
-            Ok(serde_json::json!({
-                "schema": "orbit.cli/v1",
-                "command": format!("route {sub}"),
-                "status": "ok",
-                "hard": table.hard,
-                "easy": table.easy,
-                "enabled": table.enabled(),
-            }))
-        }
-        "off" => {
-            cfg.set_routing_target("hard", "")
-                .map_err(|e| ("ORBIT-E1101", e))?;
-            cfg.set_routing_target("easy", "")
-                .map_err(|e| ("ORBIT-E1101", e))?;
-            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
-            Ok(serde_json::json!({
-                "schema": "orbit.cli/v1",
-                "command": "route off",
-                "status": "ok",
-                "enabled": false,
-            }))
-        }
-        "keywords" => {
-            // route keywords add hard|easy <word...>
-            // route keywords remove hard|easy <word>
-            // route keywords clear
-            let action = pos.get(2).copied().unwrap_or("");
-            let list_name = pos.get(3).copied().unwrap_or("");
-            let word = pos.get(4..).map(|w| w.join(" ")).unwrap_or_default();
-            let (list, name) = match list_name {
-                "hard" => (&mut cfg.routing.keywords.hard, "hard"),
-                "easy" => (&mut cfg.routing.keywords.easy, "easy"),
-                other => {
-                    return Err((
-                        "ORBIT-E1101",
-                        format!(
-                        "usage: orbit route keywords add|remove hard|easy <word>  (got '{other}')"
-                    ),
-                    ))
-                }
-            };
-            match action {
-                "add" => {
-                    let w = word.trim().to_lowercase();
-                    if w.is_empty() {
-                        return Err((
-                            "ORBIT-E1101",
-                            "usage: orbit route keywords add hard|easy <word>".into(),
-                        ));
-                    }
-                    if !list.iter().any(|x| x == &w) {
-                        list.push(w);
-                    }
-                }
-                "remove" => {
-                    let w = word.trim().to_lowercase();
-                    list.retain(|x| x != &w);
-                }
-                "clear" => {
-                    cfg.routing.keywords.clear = true;
-                    cfg.routing.keywords.hard.clear();
-                    cfg.routing.keywords.easy.clear();
-                }
-                other => {
-                    return Err((
-                        "ORBIT-E1101",
-                        format!("usage: orbit route keywords add|remove|clear … (got '{other}')"),
-                    ))
-                }
+            if word != "--json" {
+                return Err(("ORBIT-E1101", format!("unknown route option {word}")));
             }
-            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
-            let _ = name;
-            Ok(serde_json::json!({
-                "schema": "orbit.cli/v1",
-                "command": "route keywords",
-                "status": "ok",
-                "hard_keywords": cfg.routing_table().hard_keywords,
-                "easy_keywords": cfg.routing_table().easy_keywords,
-            }))
         }
-        "test" => {
-            // The prompt is everything after `test`, verbatim.
-            let prompt = args
-                .iter()
-                .skip_while(|a| *a != "test")
-                .nth(1)
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            if prompt.is_empty() {
-                return Err(("ORBIT-E1101", "usage: orbit route test \"<prompt>\"".into()));
-            }
-            let table = cfg.routing_table();
-            let d = r::classify(&table, prompt);
-            let target = match d.phase {
-                r::RoutingPhase::Hard => &table.hard,
-                r::RoutingPhase::Easy => &table.easy,
-                r::RoutingPhase::Main => &cfg.roles.main,
-            };
-            Ok(serde_json::json!({
-                "schema": "orbit.cli/v1",
-                "command": "route test",
-                "status": "ok",
-                "prompt_chars": prompt.len(),
-                "phase": d.phase.as_str(),
-                "matched": d.matched,
-                "model": if target.is_empty() { "(session model)" } else { target },
-                "routing_enabled": table.enabled(),
-            }))
-        }
-        other => Err((
-            "ORBIT-E1101",
-            format!("unknown route subcommand '{other}' (status, hard, easy, off, keywords, test)"),
-        )),
+        index += 1;
     }
+    if (seen.contains("--easy") || seen.contains("--hard")) && sub != "setup" {
+        return Err((
+            "ORBIT-E1101",
+            "--easy/--hard are only valid with route setup".into(),
+        ));
+    }
+    if (seen.contains("--session") || seen.contains("--resume")) && sub != "auto" {
+        return Err((
+            "ORBIT-E1101",
+            "--session/--resume are only valid with route auto".into(),
+        ));
+    }
+    if sub != "test"
+        && ["--model", "--provider", "--gate"]
+            .iter()
+            .any(|flag| seen.contains(flag))
+    {
+        return Err((
+            "ORBIT-E1101",
+            "selection flags are only valid with route test".into(),
+        ));
+    }
+    if sub == "auto" {
+        if pos.len() != 2 || (seen.contains("--session") && seen.contains("--resume")) {
+            return Err(("ORBIT-E1101", "usage: route auto --session ID".into()));
+        }
+        let providers =
+            config::ProvidersConfig::load(home).map_err(|error| ("ORBIT-E1106", error))?;
+        orbit_cli::phase_routing::validate_settings(&providers, &providers.phase_settings())
+            .map_err(|error| ("ORBIT-E1106", error))?;
+        let id = value_after(args, "--session")
+            .or_else(|| value_after(args, "--resume"))
+            .ok_or((
+                "ORBIT-E1101",
+                "route auto requires --session ID; live chats use /route auto".into(),
+            ))?;
+        let (lease, mut saved) =
+            sessions::SessionLease::acquire_and_load(home, &id, "route-settings")
+                .map_err(|error| ("ORBIT-E0400", error.to_string()))?;
+        saved.selection_origin = Some(orbit_cli::phase_routing::SelectionOrigin::Default);
+        lease
+            .save(&saved)
+            .map_err(|error| ("ORBIT-E0400", error.to_string()))?;
+        return Ok(
+            serde_json::json!({"schema":"orbit.cli/v1","command":"route auto","status":"ok","session_id":saved.session_id,"selection_origin":"default"}),
+        );
+    }
+    let words = if sub == "setup" {
+        if pos.len() != 2 {
+            return Err((
+                "ORBIT-E1101",
+                "usage: route setup --easy MODEL --hard MODEL".into(),
+            ));
+        }
+        vec![
+            "setup".into(),
+            "--easy".into(),
+            value_after(args, "--easy")
+                .ok_or(("ORBIT-E1101", "route setup requires --easy".into()))?,
+            "--hard".into(),
+            value_after(args, "--hard")
+                .ok_or(("ORBIT-E1101", "route setup requires --hard".into()))?,
+        ]
+    } else {
+        pos.iter().skip(1).map(|word| word.to_string()).collect()
+    };
+    let cfg = config::ProvidersConfig::load(home).map_err(|error| ("ORBIT-E1106", error))?;
+    let manual = (sub == "test")
+        .then(|| value_after(args, "--model").or_else(|| std::env::var("ORBIT_MODEL").ok()))
+        .flatten();
+    if sub == "test" && manual.is_none() && (seen.contains("--provider") || seen.contains("--gate"))
+    {
+        return Err((
+            "ORBIT-E1101",
+            "--provider/--gate preview constraints require --model or ORBIT_MODEL".into(),
+        ));
+    }
+    let gate = value_after(args, "--gate").or_else(|| std::env::var("ORBIT_GATE_URL").ok());
+    let base = manual
+        .as_ref()
+        .map(|model| {
+            orbit_cli::checked_model_turn(
+                home,
+                model,
+                value_after(args, "--provider").as_deref(),
+                gate.as_deref(),
+                false,
+            )
+        })
+        .transpose()
+        .map_err(|error| ("ORBIT-E0401", error))?;
+    let origin = if sub == "test" {
+        orbit_cli::startup_selection_origin(
+            value_after(args, "--model").is_some(),
+            std::env::var("ORBIT_MODEL").is_ok(),
+            None,
+            !cfg.roles.main.is_empty(),
+        )
+    } else {
+        orbit_cli::phase_routing::SelectionOrigin::Default
+    };
+    let mut result = orbit_cli::route_command(home, &words, base.as_ref(), origin)
+        .map_err(|error| ("ORBIT-E1101", error))?;
+    result["schema"] = serde_json::json!("orbit.cli/v1");
+    Ok(result)
 }
 
+fn validate_provider_arguments(args: &[String]) -> Result<(), (&'static str, String)> {
+    let tail = command_tail(args)?;
+    let positions = positionals(args);
+    let sub = positions.get(1).copied().unwrap_or("list");
+    let mut flags = std::collections::BTreeSet::new();
+    let mut index = 0;
+    while index < tail.len() {
+        let word = tail[index].as_str();
+        if word.starts_with('-') {
+            if !flags.insert(word) {
+                return Err(("ORBIT-E1101", "provider flag cannot be repeated".into()));
+            }
+            if word == "--json" {
+                index += 1;
+                continue;
+            }
+            if sub != "add"
+                || !["--model", "--url", "--credential-env", "--kind", "--name"].contains(&word)
+            {
+                return Err(("ORBIT-E1101", "unknown provider flag".into()));
+            }
+            if tail
+                .get(index + 1)
+                .is_none_or(|v| v.is_empty() || v.starts_with('-'))
+            {
+                return Err(("ORBIT-E1101", "provider flag requires a value".into()));
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    let count = positions.len();
+    let valid = match sub {
+        "list" | "presets" => count <= 2,
+        "add" => (2..=3).contains(&count),
+        "remove" => count == 3,
+        "role" => (3..=4).contains(&count),
+        _ => false,
+    };
+    if !valid {
+        return Err(("ORBIT-E1101", "invalid provider command arguments".into()));
+    }
+    Ok(())
+}
 fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    validate_provider_arguments(args)?;
     let pos = positionals(args);
     let sub = pos.get(1).copied().unwrap_or("list");
     match sub {
@@ -2777,6 +3640,7 @@ fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
         }
         "list" => {
             let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+            validate_configured_provider_endpoints(&cfg)?;
             Ok(serde_json::json!({
                 "schema": "orbit.cli/v1",
                 "command": "provider list",
@@ -2788,16 +3652,22 @@ fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
             let name = pos
                 .get(2)
                 .ok_or(("ORBIT-E1101", "usage: orbit provider remove <name>".into()))?;
-            let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-            let before = cfg.provider.len();
-            cfg.provider.retain(|p| p.name != *name);
-            if cfg.provider.len() == before {
-                return Err((
-                    "ORBIT-E1106",
-                    format!("provider '{name}' is not configured"),
-                ));
-            }
-            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            config::ProvidersConfig::update_atomic(home, |raw| {
+                let mut document = provider_document(raw)?;
+                let providers = document
+                    .get_mut("provider")
+                    .and_then(toml::Value::as_array_mut)
+                    .ok_or("no providers are configured")?;
+                let before = providers.len();
+                providers.retain(|provider| {
+                    provider.get("name").and_then(toml::Value::as_str) != Some(*name)
+                });
+                if providers.len() == before {
+                    return Err("provider is not configured".into());
+                }
+                serialize_provider_document(&document)
+            })
+            .map_err(|e| ("ORBIT-E1106", e))?;
             Ok(serde_json::json!({
                 "schema": "orbit.cli/v1",
                 "command": "provider remove",
@@ -2830,9 +3700,7 @@ fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
                     ));
                 }
             };
-            let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-            cfg.set_role(&role, &spec).map_err(|e| ("ORBIT-E1106", e))?;
-            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
+            set_provider_role(home, &role, &spec)?;
             Ok(serde_json::json!({
                 "schema": "orbit.cli/v1",
                 "command": "provider role",
@@ -2876,14 +3744,7 @@ fn cmd_provider_add(
             println!("  {}. {:<12} {}", i + 1, p.id, p.blurb);
         }
         let sel = prompt_line("Provider (name or number)", None)?;
-        let preset = if let Ok(n) = sel.trim().parse::<usize>() {
-            all.get(n.saturating_sub(1)).cloned()
-        } else {
-            orbit_cli::presets::preset_by_id(sel.trim())
-        };
-        let Some(preset) = preset else {
-            return Err(("ORBIT-E1101", format!("unknown provider '{sel}'")));
-        };
+        let preset = select_provider_preset(&sel)?;
         run_provider_add_interactive(home, &preset)
     } else {
         let Some(preset) = orbit_cli::presets::preset_by_id(&preset_id) else {
@@ -2907,6 +3768,22 @@ fn cmd_provider_add(
     }
 }
 
+fn select_provider_preset(
+    selection: &str,
+) -> Result<orbit_cli::presets::ProviderPreset, (&'static str, String)> {
+    let preset = if let Ok(number) = selection.trim().parse::<usize>() {
+        number
+            .checked_sub(1)
+            .and_then(|index| orbit_cli::presets::presets().get(index).cloned())
+    } else {
+        orbit_cli::presets::preset_by_id(selection.trim())
+    };
+    preset.ok_or((
+        "ORBIT-E1101",
+        "choose an offered provider name or number".into(),
+    ))
+}
+
 fn run_provider_add_interactive(
     home: &Path,
     preset: &orbit_cli::presets::ProviderPreset,
@@ -2924,15 +3801,21 @@ fn run_provider_add_interactive(
             println!("  {}. {url} ({label})", i + 2);
         }
         let sel = prompt_line("Endpoint (number)", Some("1"))?;
-        let n = sel.trim().parse::<usize>().unwrap_or(1);
+        let n = sel
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| ("ORBIT-E1101", "choose an offered endpoint number".into()))?;
         if n == 1 {
             preset.url.to_string()
         } else {
             preset
                 .alt_urls
-                .get(n - 2)
+                .get(
+                    n.checked_sub(2)
+                        .ok_or(("ORBIT-E1101", "choose an offered endpoint number".into()))?,
+                )
                 .map(|(_, u)| u.to_string())
-                .unwrap_or_else(|| preset.url.to_string())
+                .ok_or(("ORBIT-E1101", "choose an offered endpoint number".into()))?
         }
     };
     validate_provider_url(&gate)?;
@@ -2954,6 +3837,7 @@ fn run_provider_add_interactive(
             Some(v)
         }
     };
+    validate_discovery_input(&name, &gate, credential_env.as_deref(), preset.kind)?;
     if let Some(var) = credential_env.as_deref().filter(|v| !v.trim().is_empty()) {
         if std::env::var(var).is_err() {
             println!("note: export {var}=<your key> before orbit needs it");
@@ -2962,7 +3846,7 @@ fn run_provider_add_interactive(
 
     // Discovery against the real endpoint.
     let kind = preset.kind;
-    println!("Discovering models at {gate} ({kind})…");
+    println!("Discovering models using the selected endpoint ({kind})…");
     let discovered = match discover_models(&gate, credential_env.as_deref(), kind) {
         Ok(ids) => {
             println!("Discovered models:");
@@ -2998,14 +3882,7 @@ fn run_provider_add_interactive(
         "Select models (all or comma-separated numbers)",
         Some("all"),
     )?;
-    let chosen: Vec<String> = if sel.trim().eq_ignore_ascii_case("all") {
-        offered
-    } else {
-        sel.split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .filter_map(|n| offered.get(n.saturating_sub(1)).cloned())
-            .collect()
-    };
+    let chosen = select_provider_models(&sel, &offered)?;
     if chosen.is_empty() {
         return Err(("ORBIT-E1101", "no models selected".into()));
     }
@@ -3015,6 +3892,14 @@ fn run_provider_add_interactive(
         .iter()
         .map(|id| orbit_cli::presets::preset_model_entry(preset, id))
         .collect();
+    orbit_cli::setup::validate_provider(&config::ProviderConfig {
+        name: name.clone(),
+        kind: kind.into(),
+        url: gate.clone(),
+        env: credential_env.clone(),
+        models: entries.clone(),
+    })
+    .map_err(|e| ("ORBIT-E1101", e.to_string()))?;
     if kind == "anthropic" {
         if let Some(idx) = entries
             .iter()
@@ -3045,107 +3930,31 @@ fn run_provider_add_interactive(
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
-    // Roles offer: fill unset roles from what was just added. The
-    // presets' own model facts suggest the natural mapping (a big model
-    // for main, cheap ones for explore/compaction); anything already
-    // set stays untouched.
-    let mut roles_set: Vec<(String, String)> = Vec::new();
-    if prompt_yes_no("Fill unset task roles from these models?", true)? {
-        let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-        // First chosen model = main; preset facts suggest the cheap ones.
-        let cheap_hint = |id: &str| {
-            orbit_cli::presets::preset_model(preset, id)
-                .map(|f| f.pricing.0)
-                .unwrap_or(u64::MAX)
-        };
-        let (cheapest, rest): (Vec<&String>, Vec<&String>) =
-            model_ids.iter().partition(|id| cheap_hint(id) <= 1_000_000);
-        let suggest = |role: &str| -> Option<String> {
-            match role {
-                "main" => rest.first().or(cheapest.first()).map(|s| s.to_string()),
-                // Cheap tiers serve explore/compaction when present.
-                _ => cheapest.first().or(rest.first()).map(|s| s.to_string()),
-            }
-        };
-        for role in ["main", "subagent", "explore", "compaction"] {
-            if cfg.roles.get(role).is_some() {
-                continue;
-            }
-            if let Some(m) = suggest(role) {
-                if cfg.set_role(role, &format!("{name}/{m}")).is_ok() {
-                    roles_set.push((role.to_string(), format!("{name}/{m}")));
-                }
-            }
+    let roles_set = if prompt_yes_no("Fill unset task roles from these models?", true)? {
+        let roles = fill_unset_provider_roles(home, &name, &model_ids, preset)?;
+        for (role, model) in &roles {
+            println!("  {role:<11} {model}");
         }
-        if !roles_set.is_empty() {
-            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
-            println!("roles:");
-            for (r, m) in &roles_set {
-                println!("  {r:<11} {m}");
-            }
-        }
-    }
-
-    // Routing offer (2026-10-10): difficulty routing needs two tiers
-    // and a second distinct model. Offer it once the config can arm
-    // both — the roles suggestion above already picked the big and
-    // cheap candidates.
-    let mut routing_set: Vec<(String, String)> = Vec::new();
-    let total_models: usize = {
-        let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-        cfg.all_models().len()
+        roles
+    } else {
+        Vec::new()
     };
-    if total_models >= 2
+    let mut routing_set = Vec::new();
+    if config::ProvidersConfig::load(home)
+        .map_err(|e| ("ORBIT-E1106", e))?
+        .all_models()
+        .len()
+        >= 2
         && prompt_yes_no(
-            "Turn on difficulty routing? (hard prompts → the strong model, easy → the cheap one)",
+            "Fill unset difficulty routes? (hard prompts → the strong model, easy → the cheap one)",
             false,
         )?
     {
-        let mut cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-        // Suggest from the just-added provider: the priciest
-        // choice = hard, the cheapest = easy. Roles already set
-        // main, so routing switches only what it recognizes.
-        let cheap_hint = |id: &str| {
-            orbit_cli::presets::preset_model(preset, id)
-                .map(|f| f.pricing.0)
-                .unwrap_or(u64::MAX)
-        };
-        let mut ranked = model_ids.clone();
-        ranked.sort_by_key(|id| cheap_hint(id));
-        let (cheap, big) = if ranked.len() >= 2 {
-            let big = ranked.last().unwrap().clone();
-            let cheap = ranked.first().unwrap().clone();
-            (cheap, big)
-        } else {
-            // One model on this provider: pick a second from the
-            // rest of the config (any distinct id).
-            let other = cfg
-                .all_models()
-                .iter()
-                .map(|(p, m)| format!("{p}/{m}"))
-                .find(|s| !model_ids.iter().any(|id| s.ends_with(id)))
-                .unwrap_or_default();
-            (model_ids[0].clone(), other)
-        };
-        let targets = [("hard", big), ("easy", cheap)];
-        for (phase, spec) in targets {
-            let spec = if cfg.provider_for_role_spec(&spec).is_some() {
-                spec
-            } else {
-                format!("{name}/{spec}")
-            };
-            if cfg.set_routing_target(phase, &spec).is_ok() {
-                routing_set.push((phase.to_string(), spec));
-            }
+        routing_set = fill_unset_provider_routes(home, &name, &model_ids, preset)?;
+        for (difficulty, model) in &routing_set {
+            println!("  {difficulty:<5} {model}");
         }
-        if !routing_set.is_empty() {
-            cfg.save_atomic(home).map_err(|e| ("ORBIT-E1106", e))?;
-            println!("routing:");
-            for (phase, spec) in &routing_set {
-                println!("  {phase:<5} {spec}");
-            }
-            println!("  preview with: orbit route test \"<prompt>\"");
-        }
+        println!("  preview with: orbit route test \"<prompt>\"");
     }
 
     Ok(serde_json::json!({
@@ -3159,6 +3968,95 @@ fn run_provider_add_interactive(
         "roles_set": roles_set,
         "routing_set": routing_set,
     }))
+}
+
+fn ranked_provider_models(
+    name: &str,
+    models: &[String],
+    preset: &orbit_cli::presets::ProviderPreset,
+) -> Vec<String> {
+    let mut models = models.to_vec();
+    models.sort_by_key(|id| {
+        orbit_cli::presets::preset_model(preset, id)
+            .map(|fact| fact.pricing.0)
+            .unwrap_or(u64::MAX)
+    });
+    models
+        .into_iter()
+        .map(|id| format!("{name}/{id}"))
+        .collect()
+}
+fn fill_unset_provider_roles(
+    home: &Path,
+    name: &str,
+    models: &[String],
+    preset: &orbit_cli::presets::ProviderPreset,
+) -> Result<Vec<(String, String)>, (&'static str, String)> {
+    let ranked = ranked_provider_models(name, models, preset);
+    let cheap = ranked
+        .first()
+        .ok_or(("ORBIT-E1101", "no models selected".into()))?;
+    let main = ranked.last().unwrap();
+    let mut applied = Vec::new();
+    config::ProvidersConfig::update_atomic(home, |raw| {
+        let cfg = config::ProvidersConfig::load_from_str(raw)?;
+        let mut document = provider_document(raw)?;
+        for role in ["main", "subagent", "explore", "compaction"] {
+            if cfg.roles.get(role).is_some() {
+                continue;
+            }
+            let spec = if role == "main" { main } else { cheap };
+            orbit_cli::phase_routing::resolve_model(&cfg, spec, None)?;
+            provider_table(&mut document, "roles")?
+                .insert(role.into(), toml::Value::String(spec.clone()));
+            applied.push((role.into(), spec.clone()));
+        }
+        serialize_provider_document(&document)
+    })
+    .map_err(|e| ("ORBIT-E1106", e))?;
+    Ok(applied)
+}
+fn fill_unset_provider_routes(
+    home: &Path,
+    name: &str,
+    models: &[String],
+    preset: &orbit_cli::presets::ProviderPreset,
+) -> Result<Vec<(String, String)>, (&'static str, String)> {
+    let ranked = ranked_provider_models(name, models, preset);
+    let cheap = ranked
+        .first()
+        .ok_or(("ORBIT-E1101", "no models selected".into()))?;
+    let mut applied = Vec::new();
+    config::ProvidersConfig::update_atomic(home, |raw| {
+        let cfg = config::ProvidersConfig::load_from_str(raw)?;
+        let big = if ranked.len() > 1 {
+            ranked.last().unwrap().clone()
+        } else {
+            cfg.all_models()
+                .iter()
+                .map(|(p, m)| format!("{p}/{m}"))
+                .find(|spec| spec != cheap)
+                .ok_or("difficulty routing requires two distinct declared models")?
+        };
+        let mut document = provider_document(raw)?;
+        for (difficulty, spec) in [("easy", cheap.clone()), ("hard", big)] {
+            let existing = if difficulty == "easy" {
+                &cfg.routing.easy
+            } else {
+                &cfg.routing.hard
+            };
+            if !existing.is_empty() {
+                continue;
+            }
+            orbit_cli::phase_routing::resolve_model(&cfg, &spec, None)?;
+            provider_table(&mut document, "routing")?
+                .insert(difficulty.into(), toml::Value::String(spec.clone()));
+            applied.push((difficulty.into(), spec));
+        }
+        serialize_provider_document(&document)
+    })
+    .map_err(|e| ("ORBIT-E1106", e))?;
+    Ok(applied)
 }
 
 fn run_provider_add_scripted(
@@ -3177,15 +4075,7 @@ fn run_provider_add_scripted(
     validate_provider_url(&gate)?;
     let credential_env = value_after(args, "--credential-env");
     let kind = value_after(args, "--kind").unwrap_or_else(|| preset.kind.to_string());
-    let model_ids: Vec<String> = models
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if model_ids.is_empty() {
-        return Err(("ORBIT-E1101", "at least one model is required".into()));
-    }
+    let model_ids = parse_provider_models(models)?;
     let entries: Vec<orbit_cli::config::ModelEntry> = model_ids
         .iter()
         .map(|id| orbit_cli::presets::preset_model_entry(preset, id))
@@ -3214,6 +4104,7 @@ fn run_provider_add_scripted(
 
 fn cmd_models(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     let cfg = config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
+    validate_configured_provider_endpoints(&cfg)?;
     let entries: Vec<(String, String)> = cfg.all_models();
     let roles: std::collections::BTreeMap<String, String> = cfg
         .roles
@@ -3234,16 +4125,20 @@ fn cmd_models(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stat
 }
 
 /// Handle REPL slash commands. Returns true if recognized.
+#[allow(clippy::too_many_arguments)]
 fn handle_chat_command(
     cmd: &str,
     home: &Path,
     model: &mut String,
+    effort: &mut Option<EffortSetting>,
+    gate: &str,
+    provider: &mut String,
     transcript: &mut Vec<orbit_adapter::types::ChatMessage>,
     usage: (&u64, &u64, &u64, &u64), // (turns, input, output, cost µ¢)
 ) -> bool {
     match cmd {
         "/help" => {
-            println!("commands: exit, /help, /model <M>, /clear, /usage, /models");
+            println!("commands: exit, /help, /model <M>, /effort [VALUE|default], /permissions [<tool>|allow|ask|deny|reset <tool>], /clear, /usage, /models, /sessions, /resume <ID>");
             true
         }
         "/clear" => {
@@ -3307,8 +4202,50 @@ fn handle_chat_command(
             true
         }
         c if c.starts_with("/model ") => {
-            *model = c["/model ".len()..].trim().to_string();
-            println!("model -> {model}");
+            let candidate = c["/model ".len()..].trim();
+            let result = (|| -> Result<orbit_engine::TurnConfig, String> {
+                let legacy = config::ProvidersConfig::load(home)?.provider.is_empty();
+                let mut turn = orbit_cli::checked_model_turn(
+                    home,
+                    candidate,
+                    None,
+                    legacy.then_some(gate),
+                    false,
+                )?;
+                apply_selected_effort(home, &mut turn, effort.as_ref())?;
+                Ok(turn)
+            })();
+            match result {
+                Ok(resolved) => {
+                    *provider = resolved.provider_id;
+                    *model = resolved.model;
+                    println!("model -> {model}");
+                }
+                Err(error) => {
+                    eprintln!("model unchanged: {error}; use /effort default before switching")
+                }
+            }
+            true
+        }
+        "/effort" => {
+            match chat_effort_config(home, model, gate, Some(provider.as_str()), effort.as_ref()) {
+                Ok(config) => println!("{}", orbit_cli::effort_status(home, &config)),
+                Err(e) => eprintln!("effort: {e}"),
+            }
+            true
+        }
+        c if c.starts_with("/effort ") => {
+            let candidate = orbit_cli::parse_effort_setting(c["/effort ".len()..].trim());
+            match candidate.and_then(|choice| {
+                chat_effort_config(home, model, gate, Some(provider.as_str()), Some(&choice))
+                    .map(|config| (choice, config))
+            }) {
+                Ok((choice, config)) => {
+                    *effort = Some(choice);
+                    println!("{}", orbit_cli::effort_status(home, &config));
+                }
+                Err(e) => eprintln!("effort unchanged: {e}"),
+            }
             true
         }
         _ => false,
@@ -3390,6 +4327,190 @@ fn value_after(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
+fn startup_effort_argument(
+    args: &[String],
+    environment: Option<String>,
+) -> Result<Option<EffortSetting>, String> {
+    let flag = args.iter().position(|a| a == "--effort");
+    let value = match flag {
+        Some(index) => Some(
+            args.get(index + 1)
+                .filter(|v| !v.starts_with('-'))
+                .ok_or_else(|| "--effort requires a value (or default)".to_string())?
+                .clone(),
+        ),
+        None => environment,
+    };
+    value
+        .map(|v| orbit_cli::parse_effort_setting(&v))
+        .transpose()
+}
+
+fn headless_prompt_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index).map(String::as_str) {
+        match argument {
+            "-p" => return Some(index),
+            "--help" | "-h" | "--version" | "-V" => return None,
+            "--home" | "--model" | "--provider" | "--gate" | "--effort" | "--resume"
+            | "--permission-mode" | "--allowedTools" | "--disallowedTools" | "--output-format"
+            | "--json-schema" | "--max-turns" | "--max-cost" => index += 2,
+            value if value.starts_with('-') => index += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn headless_arguments(args: &[String]) -> Result<Vec<String>, String> {
+    let index = headless_prompt_index(args).ok_or("-p must be a top-level option")?;
+    let prompt = args
+        .get(index + 1)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "-p requires a prompt".to_string())?;
+    let mut remaining = args.to_vec();
+    remaining.drain(index..=index + 1);
+    validate_headless_arguments(&remaining)?;
+    remaining.insert(0, prompt.clone());
+    Ok(remaining)
+}
+
+fn validate_headless_arguments(args: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut index = 0;
+    while let Some(argument) = args.get(index).map(String::as_str) {
+        if !seen.insert(argument) {
+            return Err(format!("duplicate {argument}"));
+        }
+        match argument {
+            "--home" | "--model" | "--provider" | "--gate" | "--effort" | "--resume"
+            | "--permission-mode" | "--allowedTools" | "--disallowedTools" | "--output-format"
+            | "--json-schema" | "--max-turns" | "--max-cost" => {
+                index += 1;
+                args.get(index)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or_else(|| format!("{argument} requires a value"))?;
+            }
+            "--continue" | "--fork-session" | "--bare" | "--auto-tools" | "--spoken-rules" => {}
+            _ => return Err(format!("unknown headless argument {argument}")),
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+struct HeadlessExecutionOptions {
+    format: String,
+    max_rounds: u32,
+    max_cost: Option<u64>,
+    schema: Option<serde_json::Value>,
+}
+
+fn headless_execution_options(args: &[String]) -> Result<HeadlessExecutionOptions, String> {
+    use std::io::Read;
+    validate_headless_arguments(args)?;
+    if value_after(args, "--resume").is_some() && args.iter().any(|arg| arg == "--continue") {
+        return Err("--resume and --continue cannot be combined".into());
+    }
+    if value_after(args, "--permission-mode")
+        .is_some_and(|mode| orbit_tools::permissions::PermissionMode::from_config(&mode).is_none())
+    {
+        return Err("unknown --permission-mode".into());
+    }
+    let format = value_after(args, "--output-format").unwrap_or_else(|| "text".into());
+    if !matches!(format.as_str(), "text" | "json" | "stream-json") {
+        return Err("--output-format must be text, json or stream-json".into());
+    }
+    let max_rounds = value_after(args, "--max-turns")
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| "--max-turns must be an unsigned 32-bit integer")
+        })
+        .transpose()?
+        .unwrap_or(orbit_engine::DEFAULT_MAX_ROUNDS);
+    let max_cost = value_after(args, "--max-cost")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "--max-cost must be an unsigned integer in microcents")
+        })
+        .transpose()?;
+    let schema = value_after(args, "--json-schema")
+        .map(|path| {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let file = options
+                .open(path)
+                .map_err(|_| "cannot open --json-schema file")?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| "cannot inspect --json-schema file")?;
+            const LIMIT: u64 = 128 * 1024;
+            if !metadata.is_file() || metadata.len() > LIMIT {
+                return Err("--json-schema must be a regular file of at most 128 KiB".to_string());
+            }
+            let mut bytes = Vec::new();
+            file.take(LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "cannot read --json-schema file")?;
+            if bytes.len() as u64 > LIMIT {
+                return Err("--json-schema exceeds 128 KiB".to_string());
+            }
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|_| "--json-schema file must contain valid JSON")?;
+            if !value.is_object() {
+                return Err("--json-schema must contain a schema object".to_string());
+            }
+            Ok(value)
+        })
+        .transpose()?;
+    Ok(HeadlessExecutionOptions {
+        format,
+        max_rounds,
+        max_cost,
+        schema,
+    })
+}
+
+fn apply_selected_effort(
+    home: &Path,
+    config: &mut orbit_engine::TurnConfig,
+    selected: Option<&EffortSetting>,
+) -> Result<(), String> {
+    if let Some(choice) = selected {
+        orbit_cli::apply_effort_setting(home, config, choice)?;
+    }
+    config.validate_effort()
+}
+
+fn chat_effort_config(
+    home: &Path,
+    model: &str,
+    gate: &str,
+    provider_override: Option<&str>,
+    selected: Option<&EffortSetting>,
+) -> Result<orbit_engine::TurnConfig, String> {
+    let mut turn = orbit_cli::checked_model_turn(
+        home,
+        model,
+        provider_override,
+        if config::ProvidersConfig::load(home)?.provider.is_empty() {
+            Some(gate)
+        } else {
+            None
+        },
+        true,
+    )?;
+    apply_selected_effort(home, &mut turn, selected)?;
+    Ok(turn)
+}
+
 /// The positional words of an argument list: flag/value pairs and bare
 /// flags removed, verbs and their operands kept, in order. `--home X
 /// provider add ollama` yields `[provider, add, ollama]`, so a
@@ -3398,6 +4519,7 @@ fn positionals(args: &[String]) -> Vec<&str> {
     let value_flags = [
         "--home",
         "--model",
+        "--effort",
         "--gate",
         "--resume",
         "--credential-env",
@@ -3406,6 +4528,15 @@ fn positionals(args: &[String]) -> Vec<&str> {
         "--kind",
         "--manifest",
         "--package",
+        "--socket",
+        "--session",
+        "--provider",
+        "--worktree",
+        "--easy",
+        "--hard",
+        "--permission-mode",
+        "--allowedTools",
+        "--disallowedTools",
     ];
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -3438,4 +4569,1021 @@ fn collect_ledger_bytes(dir: &Path) -> Result<Vec<u8>, (&'static str, String)> {
 
 fn ioe(e: std::io::Error) -> (&'static str, String) {
     ("ORBIT-E0700", e.to_string())
+}
+
+fn command_home(args: &[String]) -> PathBuf {
+    config::resolve_home(args)
+}
+
+fn owner_model_entry<'a>(
+    providers: &'a config::ProvidersConfig,
+    model: &str,
+    provider_hint: Option<&str>,
+    saved_identity: bool,
+) -> Result<(&'a config::ProviderConfig, &'a config::ModelEntry), String> {
+    let resolved =
+        orbit_cli::resolve_selected_model(providers, model, provider_hint, saved_identity)?;
+    providers
+        .model_entry(&resolved.provider_id, &resolved.raw_model)
+        .ok_or_else(|| "selected model disappeared from configuration".into())
+}
+
+#[cfg(unix)]
+fn cmd_serve(args: &[String]) -> i32 {
+    let result = (|| -> Result<(), String> {
+        orbit_cli::validate_owner_arguments("serve", args).map_err(|error| error.to_string())?;
+        let home = command_home(args);
+        ensure_initialized(&home).map_err(|(code, text)| format!("{code}: {text}"))?;
+        let socket = value_after(args, "--socket")
+            .filter(|value| !value.is_empty())
+            .ok_or("serve requires --socket <private Unix socket path>")?;
+        let named = value_after(args, "--session");
+        if named.is_some()
+            && args
+                .iter()
+                .any(|value| matches!(value.as_str(), "--resume" | "--continue" | "--fork-session"))
+        {
+            return Err(
+                "--session names a new session; use --resume to reopen an existing session".into(),
+            );
+        }
+        let providers = config::ProvidersConfig::load(&home)?;
+        let manual = value_after(args, "--model").or_else(|| std::env::var("ORBIT_MODEL").ok());
+        if let Some(spec) = &manual {
+            orbit_cli::resolve_selected_model(
+                &providers,
+                spec,
+                value_after(args, "--provider").as_deref(),
+                false,
+            )?;
+        }
+        let fresh_id = named.unwrap_or_else(orbit_gateway::new_session_id);
+        let (lease, saved) = owned_startup_session(&home, args, "daemon", &fresh_id)?;
+        if saved.is_none() {
+            match std::fs::symlink_metadata(
+                home.join("sessions")
+                    .join(format!("{}.json", lease.session_id())),
+            ) {
+                Ok(_) => return Err("session already exists; use --resume <id>".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot inspect new session: {error}")),
+            }
+        }
+        let model = manual
+            .clone()
+            .or_else(|| saved.as_ref().map(|session| session.model.clone()))
+            .or_else(|| (!providers.roles.main.is_empty()).then(|| providers.roles.main.clone()))
+            .or_else(|| {
+                providers.provider.iter().find_map(|provider| {
+                    provider
+                        .models
+                        .first()
+                        .map(|model| format!("{}/{}", provider.name, model.id))
+                })
+            })
+            .ok_or("configure a provider/model before starting the owner")?;
+        let provider_hint = value_after(args, "--provider").or_else(|| {
+            manual
+                .is_none()
+                .then(|| saved.as_ref().map(|session| session.provider.clone()))
+                .flatten()
+        });
+        let (provider, entry) = owner_model_entry(
+            &providers,
+            &model,
+            provider_hint.as_deref(),
+            manual.is_none() && saved.is_some(),
+        )?;
+        let mut checked =
+            chat_effort_config(&home, &entry.id, &provider.url, Some(&provider.name), None)?;
+        let requested = startup_effort_argument(args, std::env::var("ORBIT_EFFORT").ok())?;
+        let effort = sessions::startup_effort(requested, saved.as_ref(), &entry.id, &provider.name);
+        apply_selected_effort(&home, &mut checked, effort.as_ref())?;
+        if let Some(mode) = value_after(args, "--permission-mode") {
+            if orbit_tools::permissions::PermissionMode::from_config(&mode).is_none() {
+                return Err(format!("unknown permission mode {mode}"));
+            }
+        }
+        let turn = tui_worker::TuiTurnConfig {
+            home: home.clone(),
+            session_id: lease.session_id().into(),
+            gate: checked.gate.clone(),
+            model: entry.id.clone(),
+            provider_id: provider.name.clone(),
+            effort,
+            auto_tools: args.iter().any(|value| value == "--auto-tools"),
+            scope: tool_runtime::PermissionScope::from_flags(
+                value_after(args, "--permission-mode").as_deref(),
+                value_after(args, "--allowedTools").as_deref(),
+                value_after(args, "--disallowedTools").as_deref(),
+            ),
+            initial_transcript: saved
+                .as_ref()
+                .map(|session| session.to_transcript())
+                .unwrap_or_default(),
+            initial_turns: saved.as_ref().map(|session| session.turns).unwrap_or(0),
+            initial_input_tokens: saved
+                .as_ref()
+                .map(|session| session.input_tokens)
+                .unwrap_or(0),
+            initial_output_tokens: saved
+                .as_ref()
+                .map(|session| session.output_tokens)
+                .unwrap_or(0),
+            initial_cost_microcents: saved
+                .as_ref()
+                .map(|session| session.cost_microcents)
+                .unwrap_or(0),
+        };
+        let origin = orbit_cli::startup_selection_origin(
+            value_after(args, "--model").is_some(),
+            std::env::var("ORBIT_MODEL").is_ok(),
+            saved.as_ref(),
+            !providers.roles.main.is_empty(),
+        );
+        lease
+            .save(
+                &sessions::SessionFile::from_chat(
+                    &turn.session_id,
+                    &turn.model,
+                    &turn.gate,
+                    &turn.provider_id,
+                    &turn.initial_transcript,
+                    turn.initial_turns,
+                    turn.initial_input_tokens,
+                    turn.initial_output_tokens,
+                    turn.initial_cost_microcents,
+                )
+                .with_effort(turn.effort.clone())
+                .with_selection_origin(origin),
+            )
+            .map_err(|error| error.to_string())?;
+        let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        if args.iter().any(|argument| argument == "--bare") {
+            std::env::set_var("ORBIT_BARE", "1");
+        }
+        eprintln!("Starting session {} at {}", lease.session_id(), socket);
+        foreground_owner(
+            orbit_cli::daemon::OwnerConfig::new(turn, cwd),
+            lease,
+            Path::new(&socket),
+        )
+        .map_err(|error| error.to_string())
+    })();
+    let code = match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("orbit serve: {error}");
+            2
+        }
+    };
+    let signal = OWNER_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+    if signal == 0 {
+        code
+    } else {
+        128 + signal
+    }
+}
+
+#[cfg(unix)]
+static OWNER_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn owner_signal(signal: i32) {
+    OWNER_SIGNAL.store(signal, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn foreground_owner(
+    config: orbit_cli::daemon::OwnerConfig,
+    lease: sessions::SessionLease,
+    socket: &Path,
+) -> Result<(), orbit_cli::daemon::OwnerError> {
+    struct Handlers(Vec<(i32, libc::sighandler_t)>);
+    impl Drop for Handlers {
+        fn drop(&mut self) {
+            for (signal, handler) in &self.0 {
+                // Restore exactly the handlers replaced in this foreground process.
+                unsafe {
+                    libc::signal(*signal, *handler);
+                }
+            }
+        }
+    }
+    OWNER_SIGNAL.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut handlers = Handlers(vec![]);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // The handler only writes a lock-free flag; the watcher cancels outside it.
+        let previous =
+            unsafe { libc::signal(signal, owner_signal as *const () as libc::sighandler_t) };
+        if previous == libc::SIG_ERR {
+            return Err(orbit_cli::daemon::OwnerError::Runtime(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        handlers.0.push((signal, previous));
+    }
+    let shutdown = orbit_provider_http::CancelToken::new();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watch_done = done.clone();
+    let watch_token = shutdown.clone();
+    let watcher = std::thread::spawn(move || {
+        while !watch_done.load(std::sync::atomic::Ordering::Relaxed) {
+            if OWNER_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                watch_token.cancel();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    let result = orbit_cli::daemon::run_server(config, lease, socket, &shutdown);
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watcher.join();
+    result
+}
+
+#[cfg(unix)]
+fn cmd_attach(args: &[String]) -> i32 {
+    let result = (|| -> Result<(), String> {
+        orbit_cli::validate_owner_arguments("attach", args).map_err(|error| error.to_string())?;
+        let socket = value_after(args, "--socket")
+            .filter(|value| !value.is_empty())
+            .ok_or("attach requires --socket <private Unix socket path>")?;
+        let commands: Vec<_> = ["--status", "--logs", "--cancel", "--stop"]
+            .into_iter()
+            .filter(|flag| args.iter().any(|value| value == flag))
+            .collect();
+        if commands.len() > 1 {
+            return Err("choose one attach control command".into());
+        }
+        let path = Path::new(&socket);
+        let value = match commands.first().copied() {
+            Some("--status") => serde_json::to_value(
+                orbit_cli::attach::status(path).map_err(|error| error.to_string())?,
+            ),
+            Some("--logs") => serde_json::to_value(
+                orbit_cli::attach::logs(path, None).map_err(|error| error.to_string())?,
+            ),
+            Some("--cancel") => serde_json::to_value(
+                orbit_cli::attach::cancel(path).map_err(|error| error.to_string())?,
+            ),
+            Some("--stop") => serde_json::to_value(
+                orbit_cli::attach::stop(path).map_err(|error| error.to_string())?,
+            ),
+            _ => {
+                return orbit_cli::attach::run_interactive(path).map_err(|error| error.to_string())
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        println!("{value}");
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("orbit attach: {error}");
+            2
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn cmd_serve(_: &[String]) -> i32 {
+    eprintln!("foreground ownership requires Unix");
+    2
+}
+#[cfg(not(unix))]
+fn cmd_attach(_: &[String]) -> i32 {
+    eprintln!("local attach requires Unix");
+    2
+}
+
+#[cfg(test)]
+mod owner_cli_tests {
+    use super::*;
+
+    #[test]
+    fn saved_provider_prefixed_raw_model_is_not_reinterpreted_as_a_spec() {
+        let providers: config::ProvidersConfig = toml::from_str(
+            r#"
+[[provider]]
+name="p"
+url="http://127.0.0.1:1"
+[[provider.models]]
+id="p/foo"
+supported_efforts=["high"]
+[[provider.models]]
+id="foo"
+supported_efforts=["low"]
+"#,
+        )
+        .unwrap();
+        let (provider, entry) = owner_model_entry(&providers, "p/foo", Some("p"), true).unwrap();
+        assert_eq!(
+            (&provider.name, entry.id.as_str()),
+            (&"p".to_owned(), "p/foo")
+        );
+        assert_eq!(
+            entry.supported_efforts,
+            Some(vec![orbit_adapter::types::EffortValue::Level(
+                "high".into()
+            )])
+        );
+        assert_eq!(
+            owner_model_entry(&providers, "p/foo", Some("p"), false)
+                .unwrap()
+                .1
+                .id,
+            "foo"
+        );
+        assert!(owner_model_entry(&providers, "missing", Some("p"), true).is_err());
+    }
+
+    #[test]
+    fn leading_owner_value_options_preserve_command_discovery() {
+        for (flag, value) in [
+            ("--permission-mode", "dontAsk"),
+            ("--allowedTools", "Read"),
+            ("--disallowedTools", "Bash"),
+            ("--provider", "p"),
+            ("--socket", "owner.sock"),
+        ] {
+            let args: Vec<String> = [flag, value, "serve", "--home", "private"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            assert_eq!(positionals(&args), ["serve"]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod effort_frontend_tests {
+    use super::*;
+    use orbit_adapter::types::EffortValue;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn headless_selection_respects_commands_and_consumed_values() {
+        assert!(
+            headless_prompt_index(&args(&["customize", "set", "name", "-p", "hello"])).is_none()
+        );
+        assert!(
+            headless_prompt_index(&args(&["--home", "fixture", "setup", "-p", "hello"])).is_none()
+        );
+        assert!(headless_prompt_index(&args(&["--model", "-p", "chat"])).is_none());
+        assert!(headless_arguments(&args(&["-p", "hello", "extra"])).is_err());
+        assert!(headless_arguments(&args(&["-p", "hello", "--unknown"])).is_err());
+        assert!(headless_arguments(&args(&["-p", "hello", "-p", "again"])).is_err());
+        for prompt in ["setup", "web", "--help", "--effort"] {
+            assert_eq!(
+                headless_arguments(&args(&["-p", prompt, "--bare"])).unwrap(),
+                [prompt, "--bare"]
+            );
+        }
+    }
+
+    #[test]
+    fn headless_limits_refuse_invalid_budgets_and_schema_instead_of_disabling_them() {
+        for values in [
+            vec!["--max-cost", "typo"],
+            vec!["--max-cost", "-1"],
+            vec!["--max-cost", "18446744073709551616"],
+            vec!["--max-turns", "4294967296"],
+            vec!["--max-turns", "typo"],
+            vec!["--output-format", "unknown"],
+            vec!["--permission-mode", "unknown"],
+        ] {
+            assert!(headless_execution_options(&args(&values)).is_err());
+        }
+        let limits =
+            headless_execution_options(&args(&["--max-cost", "0", "--max-turns", "2"])).unwrap();
+        assert_eq!(limits.max_cost, Some(0));
+        assert_eq!(limits.max_rounds, 2);
+        let path =
+            std::env::temp_dir().join(format!("orbit-headless-schema-{}", ulid::Ulid::new()));
+        let options = args(&["--json-schema", path.to_str().unwrap()]);
+        assert!(headless_execution_options(&options).is_err());
+        std::fs::write(&path, b"{broken").unwrap();
+        assert!(headless_execution_options(&options).is_err());
+        std::fs::write(&path, vec![b' '; 128 * 1024 + 1]).unwrap();
+        assert!(headless_execution_options(&options).is_err());
+        std::fs::write(&path, br#"{"type":"object","required":["result"]}"#).unwrap();
+        assert_eq!(
+            headless_execution_options(&options)
+                .unwrap()
+                .schema
+                .unwrap()["required"][0],
+            "result"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn effort_flag_beats_environment_and_is_not_a_positional() {
+        let a = args(&["--effort", "default", "--model", "a", "chat"]);
+        assert_eq!(
+            startup_effort_argument(&a, Some("high".into())).unwrap(),
+            Some(EffortSetting::Default)
+        );
+        assert_eq!(positionals(&a), ["chat"]);
+        assert_eq!(
+            startup_effort_argument(&[], Some("false".into())).unwrap(),
+            Some(EffortSetting::Value(EffortValue::Bool(false)))
+        );
+        assert!(startup_effort_argument(&args(&["--effort"]), None).is_err());
+        assert!(startup_effort_argument(&args(&["--effort", "--model", "a"]), None).is_err());
+        let headless = headless_arguments(&args(&[
+            "--effort",
+            "high",
+            "-p",
+            "actual prompt",
+            "--model",
+            "a",
+        ]))
+        .unwrap();
+        assert_eq!(headless[0], "actual prompt");
+        let dash_prompt = headless_arguments(&args(&[
+            "-p",
+            "- inspect this module",
+            "--effort",
+            "default",
+        ]))
+        .unwrap();
+        assert_eq!(dash_prompt[0], "- inspect this module");
+        let flag_prompt = headless_arguments(&args(&["-p", "--effort", "--model", "a"])).unwrap();
+        assert_eq!(flag_prompt[0], "--effort");
+        assert_eq!(
+            startup_effort_argument(&flag_prompt[1..], None).unwrap(),
+            None
+        );
+        assert_eq!(
+            startup_effort_argument(&headless[1..], None).unwrap(),
+            Some(EffortSetting::Value(EffortValue::Level("high".into())))
+        );
+    }
+
+    #[test]
+    fn hot_plain_model_changes_revalidate_explicit_and_resolve_implicit_defaults() {
+        let home = std::env::temp_dir().join(format!("orbit-effort-main-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("providers.toml"),
+            r#"
+[[provider]]
+name = "fixture"
+url = "http://127.0.0.1:1"
+[[provider.models]]
+id = "a"
+supported_efforts = ["low", "high"]
+default_effort = "low"
+[[provider.models]]
+id = "b"
+supported_efforts = ["medium"]
+default_effort = "medium"
+"#,
+        )
+        .unwrap();
+        let mut model = "a".to_string();
+        let mut selected = None;
+        let mut transcript = vec![];
+        let mut provider = "fixture".to_string();
+        let gate = "http://127.0.0.1:1";
+        let usage = (0, 0, 0, 0);
+        let mut command = |text: &str, model: &mut String, selected: &mut Option<EffortSetting>| {
+            handle_chat_command(
+                text,
+                &home,
+                model,
+                selected,
+                gate,
+                &mut provider,
+                &mut transcript,
+                (&usage.0, &usage.1, &usage.2, &usage.3),
+            )
+        };
+        assert!(command("/effort high", &mut model, &mut selected));
+        command("/model b", &mut model, &mut selected);
+        assert_eq!(model, "a", "invalid switch cannot change live model");
+        assert_eq!(
+            selected,
+            Some(EffortSetting::Value(EffortValue::Level("high".into())))
+        );
+        command("/effort default", &mut model, &mut selected);
+        command("/model b", &mut model, &mut selected);
+        assert_eq!(model, "b");
+        assert_eq!(selected, Some(EffortSetting::Default));
+        assert_eq!(
+            chat_effort_config(&home, &model, gate, None, selected.as_ref())
+                .unwrap()
+                .effort,
+            Some(EffortValue::Level("medium".into()))
+        );
+        selected = None;
+        command("/model a", &mut model, &mut selected);
+        assert_eq!(
+            chat_effort_config(&home, &model, gate, None, None)
+                .unwrap()
+                .effort,
+            Some(EffortValue::Level("low".into()))
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod provider_wizard_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("orbit-provider-wizard-{}", ulid::Ulid::new()));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+        fn raw(&self) -> String {
+            std::fs::read_to_string(self.0.join("providers.toml")).unwrap()
+        }
+        fn seed(&self) {
+            std::fs::write(self.0.join("providers.toml"), "site_label='retain'\n[future]\noption='original'\n[[provider]]\nname='p'\nurl='https://example.invalid/v1'\ncustom='preserve'\n[[provider.models]]\nid='raw/shared'\ncontext_window=99000\n").unwrap();
+            std::fs::set_permissions(
+                self.0.join("providers.toml"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn add(home: &Path, name: &str) -> Result<(), (&'static str, String)> {
+        add_configured_provider(
+            home,
+            name,
+            "https://example.invalid/v1",
+            Some("FIXTURE_PROVIDER_KEY".into()),
+            vec!["vendor/raw".into()],
+            None,
+        )
+    }
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).into()).collect()
+    }
+    fn server(response: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(2))
+                    }
+                    other => panic!("fixture request missing: {other:?}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0; 1024];
+            while bytes.len() < 16384 && !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut buf).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buf[..count]);
+            }
+            let _ = socket.write_all(&response);
+            String::from_utf8(bytes).unwrap()
+        });
+        (endpoint, thread)
+    }
+    fn response(body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+    }
+
+    #[test]
+    fn endpoint_paths_compose_once_and_encode_raw_model_identity() {
+        for (base, kind, expected) in [
+            ("https://example.invalid", "openai-compatible", "/v1/models"),
+            ("https://example.invalid/v1/", "anthropic", "/v1/models"),
+            (
+                "https://example.invalid/gateway/v1",
+                "openai-compatible",
+                "/gateway/v1/models",
+            ),
+            ("http://127.0.0.1:1", "ollama", "/api/tags"),
+            ("http://127.0.0.1:1/api", "ollama", "/api/tags"),
+        ] {
+            assert_eq!(
+                provider_models_url(base, kind, None).unwrap().path(),
+                expected
+            );
+        }
+        assert_eq!(
+            provider_models_url(
+                "https://example.invalid/v1",
+                "anthropic",
+                Some("vendor/raw?x#y")
+            )
+            .unwrap()
+            .path(),
+            "/v1/models/vendor%2Fraw%3Fx%23y"
+        );
+    }
+    #[test]
+    fn unsafe_urls_and_credential_references_fail_without_discovery() {
+        for url in [
+            "https://user:PRIVATE@localhost/v1",
+            "https://localhost/v1#PRIVATE",
+            "http://10.evil.invalid/v1",
+            "http://172.16.evil.invalid/v1",
+            "ftp://localhost",
+            "https://",
+            "https://localhost/v1?%61Pi%2DKey=PRIVATE",
+            "https://localhost/v1?Access.Token=PRIVATE",
+            "https://localhost/v1?client_secret=PRIVATE",
+        ] {
+            let error =
+                validate_discovery_input("p", url, Some("FIXTURE_KEY"), "openai-compatible")
+                    .unwrap_err();
+            assert!(!error.1.contains("PRIVATE"));
+        }
+        for (name, env, kind) in [
+            ("bad/name", "FIXTURE_KEY", "openai-compatible"),
+            ("p", "KEY=PRIVATE", "openai-compatible"),
+            ("p", "KEY", "unknown"),
+        ] {
+            assert!(
+                validate_discovery_input(name, "https://example.invalid", Some(env), kind).is_err()
+            );
+        }
+        assert!(validate_discovery_input(
+            "p",
+            "https://example.invalid/v1?api-version=2026-01-01",
+            Some("KEY"),
+            "openai-compatible"
+        )
+        .is_ok());
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        assert!(discover_models(&url, Some("INVALID=ENV"), "openai-compatible").is_err());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let f = Fixture::new();
+        f.seed();
+        let before = f.raw().replace(
+            "https://example.invalid/v1",
+            "https://example.invalid/v1?api_key=PRIVATE",
+        );
+        std::fs::write(f.0.join("providers.toml"), &before).unwrap();
+        let error = cmd_provider(&f.0, &argv(&["provider", "list"])).unwrap_err();
+        assert!(!error.1.contains("PRIVATE"));
+        assert_eq!(f.raw(), before);
+    }
+    #[test]
+    fn provider_preset_zero_and_out_of_range_never_choose_a_provider() {
+        assert!(select_provider_preset("0").is_err());
+        assert!(select_provider_preset("999999").is_err());
+        assert_eq!(
+            select_provider_preset("1").unwrap().id,
+            orbit_cli::presets::presets()[0].id
+        );
+        assert_eq!(select_provider_preset("custom").unwrap().id, "custom");
+    }
+    #[test]
+    fn bounded_prompt_refuses_oversize_invalid_utf8_controls_and_eof() {
+        for bytes in [
+            vec![b'x'; 4097],
+            vec![0xff, b'\n'],
+            b"\tPRIVATE\n".to_vec(),
+            Vec::new(),
+        ] {
+            let error = read_provider_line(&mut std::io::Cursor::new(bytes), None).unwrap_err();
+            assert!(!error.1.contains("PRIVATE"));
+        }
+        assert_eq!(
+            read_provider_line(&mut std::io::Cursor::new(b"\r\n"), Some("default")).unwrap(),
+            "default"
+        );
+        assert_eq!(
+            read_provider_line(&mut std::io::Cursor::new(b" vendor/raw \n"), None).unwrap(),
+            "vendor/raw"
+        );
+    }
+    #[test]
+    fn model_selection_and_csv_refuse_partial_or_ambiguous_input() {
+        for csv in ["", "a,", "a,,b", "a,a", "a,\u{1b}b"] {
+            assert!(parse_provider_models(csv).is_err());
+        }
+        assert_eq!(
+            parse_provider_models("vendor/raw,other").unwrap(),
+            ["vendor/raw", "other"]
+        );
+        let offered = vec!["a".into(), "b".into()];
+        for selection in ["0", "1,garbage", "3", "1,1", ""] {
+            assert!(select_provider_models(selection, &offered).is_err());
+        }
+        assert_eq!(select_provider_models("2,1", &offered).unwrap(), ["b", "a"]);
+    }
+    #[test]
+    fn model_response_enforces_count_ids_and_secret_free_parse_errors() {
+        for raw in [r#"{"data":[{"id":"a"},{"id":"a"}]}"#.to_string(), serde_json::json!({"data": (0..129).map(|n| serde_json::json!({"id":format!("m{n}")})).collect::<Vec<_>>()}).to_string(), r#"{"data":"PRIVATE RESPONSE"}"#.to_string(), r#"{"data":[{"id":"\u001bsecret"}]}"#.to_string()] {
+            let error = parse_discovered_models(&raw, "openai-compatible").unwrap_err();
+            assert!(!error.contains("PRIVATE RESPONSE"));
+        }
+    }
+    #[test]
+    fn add_preserves_raw_unknown_metadata_exact_caps_pricing_and_identity() {
+        let f = Fixture::new();
+        let plan =
+            orbit_cli::setup::plan_setup(&f.0, &orbit_cli::setup::SetupRequest::default()).unwrap();
+        orbit_cli::setup::apply_setup(&plan).unwrap();
+        let identity: Vec<_> = ["trust/operator.key", "trust/manifest.json", "pib.json"]
+            .map(|path| std::fs::read(f.0.join(path)).unwrap())
+            .into();
+        f.seed();
+        let model = config::ModelEntry {
+            id: "vendor/raw".into(),
+            label: Some("Exact".into()),
+            pricing: config::Pricing {
+                input_per_million_microdollars: 123,
+                output_per_million_microdollars: 456,
+                ..Default::default()
+            },
+            max_output_tokens: Some(12345),
+            context_window: Some(200000),
+            sampling: None,
+            supported_efforts: Some(vec![orbit_adapter::types::EffortValue::Level(
+                "high".into(),
+            )]),
+            default_effort: Some(orbit_adapter::types::EffortValue::Level("high".into())),
+        };
+        add_configured_provider_kind(
+            &f.0,
+            "q",
+            "https://example.invalid/v1",
+            "openai-compatible",
+            Some("FIXTURE_KEY".into()),
+            vec![model.id.clone()],
+            None,
+            Some(vec![model.clone()]),
+        )
+        .unwrap();
+        let document: toml::Value = toml::from_str(&f.raw()).unwrap();
+        assert_eq!(document["site_label"].as_str(), Some("retain"));
+        assert_eq!(document["future"]["option"].as_str(), Some("original"));
+        assert_eq!(document["provider"][0]["custom"].as_str(), Some("preserve"));
+        assert_eq!(
+            config::ProvidersConfig::load(&f.0).unwrap().provider[1].models,
+            [model]
+        );
+        for (index, path) in ["trust/operator.key", "trust/manifest.json", "pib.json"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(std::fs::read(f.0.join(path)).unwrap(), identity[index]);
+        }
+        assert_eq!(
+            std::fs::metadata(f.0.join("providers.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    #[test]
+    fn duplicate_or_invalid_provider_add_preserves_existing_bytes_and_missing_home() {
+        let f = Fixture::new();
+        f.seed();
+        let before = f.raw();
+        assert!(add(&f.0, "p").is_err());
+        assert_eq!(f.raw(), before);
+        let missing = f.0.join("absent");
+        assert!(add(&missing, "q").unwrap_err().1.contains("setup"));
+        assert!(!missing.exists());
+        assert!(add_configured_provider(
+            &missing,
+            "q",
+            "https://user:PRIVATE@example.invalid",
+            None,
+            vec!["m".into()],
+            None
+        )
+        .is_err());
+        assert!(!missing.exists());
+    }
+    #[test]
+    fn provider_mutations_observe_shared_lock_and_latest_unknown_settings() {
+        let f = Fixture::new();
+        f.seed();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(f.0.join(".config.lock"))
+            .unwrap();
+        std::fs::set_permissions(
+            f.0.join(".config.lock"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        lock.lock().unwrap();
+        let before = f.raw();
+        assert!(add(&f.0, "q").is_err());
+        assert_eq!(f.raw(), before);
+        std::fs::File::unlock(&lock).unwrap();
+        config::ProvidersConfig::update_atomic(&f.0, |raw| {
+            let mut document = provider_document(raw)?;
+            document["future"]["option"] = toml::Value::String("concurrent-edit".into());
+            serialize_provider_document(&document)
+        })
+        .unwrap();
+        add(&f.0, "q").unwrap();
+        let document: toml::Value = toml::from_str(&f.raw()).unwrap();
+        assert_eq!(
+            document["future"]["option"].as_str(),
+            Some("concurrent-edit")
+        );
+        assert_eq!(
+            config::ProvidersConfig::load(&f.0).unwrap().provider.len(),
+            2
+        );
+    }
+    #[test]
+    fn role_edit_resolves_exact_identity_and_preserves_unknown_tables() {
+        let f = Fixture::new();
+        f.seed();
+        set_provider_role(&f.0, "main", "p/raw/shared").unwrap();
+        let before = f.raw();
+        assert!(set_provider_role(&f.0, "main", "p/missing").is_err());
+        assert_eq!(f.raw(), before);
+        let document: toml::Value = toml::from_str(&f.raw()).unwrap();
+        assert_eq!(document["roles"]["main"].as_str(), Some("p/raw/shared"));
+        assert_eq!(document["provider"][0]["custom"].as_str(), Some("preserve"));
+    }
+    #[test]
+    fn removal_refuses_dangling_role_then_preserves_other_provider_metadata() {
+        let f = Fixture::new();
+        f.seed();
+        add(&f.0, "q").unwrap();
+        set_provider_role(&f.0, "main", "q/vendor/raw").unwrap();
+        let before = f.raw();
+        assert!(cmd_provider(&f.0, &argv(&["provider", "remove", "q"])).is_err());
+        assert_eq!(f.raw(), before);
+        set_provider_role(&f.0, "main", "").unwrap();
+        cmd_provider(&f.0, &argv(&["provider", "remove", "q"])).unwrap();
+        let document: toml::Value = toml::from_str(&f.raw()).unwrap();
+        assert_eq!(document["future"]["option"].as_str(), Some("original"));
+        assert_eq!(document["provider"][0]["custom"].as_str(), Some("preserve"));
+        assert_eq!(
+            config::ProvidersConfig::load(&f.0).unwrap().provider.len(),
+            1
+        );
+    }
+    #[test]
+    fn role_and_route_offers_preserve_concurrent_selections_and_exact_second_identity() {
+        let f = Fixture::new();
+        f.seed();
+        add(&f.0, "q").unwrap();
+        set_provider_role(&f.0, "main", "p/raw/shared").unwrap();
+        config::ProvidersConfig::update_atomic(&f.0, |raw| {
+            let mut document = provider_document(raw)?;
+            provider_table(&mut document, "routing")?
+                .insert("hard".into(), toml::Value::String("p/raw/shared".into()));
+            serialize_provider_document(&document)
+        })
+        .unwrap();
+        let preset = orbit_cli::presets::preset_by_id("custom").unwrap();
+        let roles = fill_unset_provider_roles(&f.0, "q", &["vendor/raw".into()], &preset).unwrap();
+        assert!(!roles.iter().any(|(role, _)| role == "main"));
+        let routes =
+            fill_unset_provider_routes(&f.0, "q", &["vendor/raw".into()], &preset).unwrap();
+        assert_eq!(routes, [("easy".into(), "q/vendor/raw".into())]);
+        let cfg = config::ProvidersConfig::load(&f.0).unwrap();
+        assert_eq!(cfg.roles.main, "p/raw/shared");
+        assert_eq!(cfg.routing.hard, "p/raw/shared");
+        assert!(
+            fill_unset_provider_routes(&f.0, "q", &["vendor/raw".into()], &preset)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn unknown_duplicate_and_incomplete_provider_flags_fail_before_mutation() {
+        let f = Fixture::new();
+        let missing = f.0.join("absent");
+        for words in [
+            vec!["provider", "add", "custom", "--model", "m", "--unknown"],
+            vec!["provider", "add", "custom", "--model", "m", "--model", "n"],
+            vec!["provider", "add", "custom", "--url"],
+            vec!["provider", "remove", "p", "unexpected"],
+        ] {
+            assert!(cmd_provider(&missing, &argv(&words)).is_err());
+            assert!(!missing.exists());
+        }
+    }
+    #[test]
+    fn actual_discovery_uses_single_base_path_for_all_three_dialects() {
+        for (kind, base, path, body) in [
+            (
+                "openai-compatible",
+                "/v1",
+                "/v1/models",
+                r#"{"data":[{"id":"vendor/raw"}]}"#,
+            ),
+            (
+                "anthropic",
+                "/gateway/v1",
+                "/gateway/v1/models",
+                r#"{"data":[{"id":"vendor/raw"}]}"#,
+            ),
+            (
+                "ollama",
+                "/api",
+                "/api/tags",
+                r#"{"models":[{"name":"vendor/raw"}]}"#,
+            ),
+        ] {
+            let (endpoint, thread) = server(response(body));
+            assert_eq!(
+                discover_models(&format!("{endpoint}{base}"), None, kind).unwrap(),
+                ["vendor/raw"]
+            );
+            let request = thread.join().unwrap();
+            assert!(
+                request.starts_with(&format!("GET {path} HTTP/1.1\r\n")),
+                "unexpected fixture endpoint"
+            );
+            if kind == "anthropic" {
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("anthropic-version: 2023-06-01"));
+            }
+        }
+    }
+    #[test]
+    fn actual_anthropic_detail_uses_encoded_identity_and_retains_limits() {
+        let (endpoint, thread) = server(response(
+            r#"{"max_input_tokens":190000,"max_tokens":24000}"#,
+        ));
+        let limits = anthropic_model_limits(&format!("{endpoint}/v1"), None, "vendor/raw");
+        assert_eq!(limits.context_window, Some(190000));
+        assert_eq!(limits.max_output_tokens, Some(24000));
+        assert!(thread
+            .join()
+            .unwrap()
+            .starts_with("GET /v1/models/vendor%2Fraw HTTP/1.1\r\n"));
+    }
+    #[test]
+    fn actual_discovery_caps_declared_and_chunked_response_bodies() {
+        let (endpoint, thread) = server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 131073\r\nConnection: close\r\n\r\n".to_vec(),
+        );
+        assert!(discover_models(&endpoint, None, "openai-compatible")
+            .unwrap_err()
+            .contains("128 KiB"));
+        assert!(thread.join().unwrap().starts_with("GET /v1/models "));
+        let body = "x".repeat(PROVIDER_RESPONSE_LIMIT + 1);
+        let bytes = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).into_bytes();
+        let (endpoint, thread) = server(bytes);
+        assert!(discover_models(&endpoint, None, "openai-compatible")
+            .unwrap_err()
+            .contains("128 KiB"));
+        thread.join().unwrap();
+    }
+    #[test]
+    fn actual_discovery_refuses_redirect_without_contacting_second_endpoint() {
+        let destination = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let (endpoint, thread) = server(format!("HTTP/1.1 302 Found\r\nLocation: http://{}/PRIVATE\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", destination.local_addr().unwrap()).into_bytes());
+        let error = discover_models(&endpoint, None, "openai-compatible").unwrap_err();
+        assert!(error.contains("302"));
+        assert!(!error.contains("PRIVATE"));
+        thread.join().unwrap();
+        assert!(
+            matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
 }

@@ -11,19 +11,26 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// Map a token to a ratatui colour (true-colour tier).
-pub fn colour(t: Token) -> Color {
-    let (r, g, b) = t.rgb();
+pub fn colour_themed(colors: crate::proto::shell::pal::Palette, t: Token) -> Color {
+    let (r, g, b) = colors.token(t);
     Color::Rgb(r, g, b)
 }
 
 /// M05 — the thinking line: "waiting for {model}" with the star.
 /// Replaced by the first token in the same row.
-pub fn thinking_line(model: &str, star: &str) -> Line<'static> {
+pub fn thinking_line_themed(
+    colors: crate::proto::shell::pal::Palette,
+    model: &str,
+    star: &str,
+) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{star} "), Style::default().fg(colour(Token::Cyan))),
+        Span::styled(
+            format!("{star} "),
+            Style::default().fg(colour_themed(colors, Token::Cyan)),
+        ),
         Span::styled(
             format!("waiting for {model}"),
-            Style::default().fg(colour(Token::Muted)),
+            Style::default().fg(colour_themed(colors, Token::Muted)),
         ),
     ])
 }
@@ -31,9 +38,14 @@ pub fn thinking_line(model: &str, star: &str) -> Line<'static> {
 /// M06 — fresh ink: a chunk lands near white and fades to ink in
 /// 450 ms, ease-out. Returns the style for a delta that arrived at
 /// `arrived_ms`.
-pub fn fresh_ink_style(now_ms: u64, arrived_ms: u64, reduced: bool) -> Style {
+pub fn fresh_ink_style_themed(
+    colors: crate::proto::shell::pal::Palette,
+    now_ms: u64,
+    arrived_ms: u64,
+    reduced: bool,
+) -> Style {
     if reduced {
-        return Style::default().fg(colour(Token::Ink));
+        return Style::default().fg(colour_themed(colors, Token::Ink));
     }
     let a = Anim::new(arrived_ms, 450, Curve::EaseOut);
     let p = a.progress(now_ms); // 0 → 1
@@ -41,27 +53,36 @@ pub fn fresh_ink_style(now_ms: u64, arrived_ms: u64, reduced: bool) -> Style {
                                 // (0xFF-ish) to ink (0xEE,0xEA,0xF5) is subtle; the design means
                                 // bright white → normal ink, i.e. bold-white → ink. Use the ink
                                 // channel lerp from white.
-    let (ir, ig, ib) = Token::Ink.rgb();
+    let (ir, ig, ib) = colors.token(Token::Ink);
     let (r, g, b) = (lerp(0xFF, ir, p), lerp(0xFF, ig, p), lerp(0xFF, ib, p));
     Style::default().fg(Color::Rgb(r, g, b))
 }
 
 /// The caret `▍`: follows the ink, breathes at 0.9 Hz after 400 ms
 /// without data.
-pub fn caret(now_ms: u64, last_data_ms: u64, reduced: bool) -> Span<'static> {
+pub fn caret_themed(
+    colors: crate::proto::shell::pal::Palette,
+    now_ms: u64,
+    last_data_ms: u64,
+    reduced: bool,
+) -> Span<'static> {
     if reduced || now_ms.saturating_sub(last_data_ms) < 400 {
-        return Span::styled("▍", Style::default().fg(colour(Token::Cyan)));
+        return Span::styled("▍", Style::default().fg(colour_themed(colors, Token::Cyan)));
     }
     let bright = pulse(now_ms, 0.9) > 0.5;
     Span::styled(
         "▍",
-        Style::default().fg(colour(if bright { Token::Ink } else { Token::Muted })),
+        Style::default().fg(colour_themed(
+            colors,
+            if bright { Token::Ink } else { Token::Muted },
+        )),
     )
 }
 
 /// M07 — a tool line enters: target types in at 240 cps; the kind
 /// chip flashes for 250 ms. `typed` returns the visible prefix.
-pub fn tool_line(
+pub fn tool_line_themed(
+    colors: crate::proto::shell::pal::Palette,
     kind: &str,
     target: &str,
     started_ms: u64,
@@ -76,14 +97,17 @@ pub fn tool_line(
     let chip_flash = !reduced && now_ms.saturating_sub(started_ms) < 250;
     let chip_style = if chip_flash {
         Style::default()
-            .fg(colour(Token::Ink))
+            .fg(colour_themed(colors, Token::Ink))
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(colour(Token::Cyan))
+        Style::default().fg(colour_themed(colors, Token::Cyan))
     };
     Line::from(vec![
         Span::styled(format!("{kind} "), chip_style),
-        Span::styled(visible_target, Style::default().fg(colour(Token::Ink))),
+        Span::styled(
+            visible_target,
+            Style::default().fg(colour_themed(colors, Token::Ink)),
+        ),
     ])
 }
 
@@ -112,11 +136,16 @@ pub fn comet_column(now_ms: u64, track_width: u16, reduced: bool) -> Option<u16>
 
 /// Draw the comet row: `track_width` cells, head bright cyan, tail
 /// fading behind.
-pub fn comet_row(now_ms: u64, track_width: u16, reduced: bool) -> Line<'static> {
+pub fn comet_row_themed(
+    colors: crate::proto::shell::pal::Palette,
+    now_ms: u64,
+    track_width: u16,
+    reduced: bool,
+) -> Line<'static> {
     let Some(head) = comet_column(now_ms, track_width, reduced) else {
         return Line::from(Span::styled(
             "─".repeat(track_width as usize),
-            Style::default().fg(colour(Token::Rule)),
+            Style::default().fg(colour_themed(colors, Token::Rule)),
         ));
     };
     let mut spans = Vec::new();
@@ -127,13 +156,13 @@ pub fn comet_row(now_ms: u64, track_width: u16, reduced: bool) -> Line<'static> 
             (
                 "●",
                 Style::default()
-                    .fg(colour(Token::Cyan))
+                    .fg(colour_themed(colors, Token::Cyan))
                     .add_modifier(Modifier::BOLD),
             )
         } else if dist <= 10 {
             // tail fades: 10 cells behind the head
             let fade = 1.0 - dist as f64 / 10.0;
-            let (r, g, b) = Token::Cyan.rgb();
+            let (r, g, b) = colors.token(Token::Cyan);
             let dim = Style::default().fg(Color::Rgb(
                 (r as f64 * fade) as u8,
                 (g as f64 * fade) as u8,
@@ -141,7 +170,7 @@ pub fn comet_row(now_ms: u64, track_width: u16, reduced: bool) -> Line<'static> 
             ));
             ("·", dim)
         } else {
-            ("─", Style::default().fg(colour(Token::Rule)))
+            ("─", Style::default().fg(colour_themed(colors, Token::Rule)))
         };
         spans.push(Span::styled(ch.to_string(), st));
         col += 1;
@@ -151,19 +180,25 @@ pub fn comet_row(now_ms: u64, track_width: u16, reduced: bool) -> Line<'static> 
 
 /// M10 — settle: `✓` white → green in 250 ms; the stripe settles
 /// cyan → green/red in 300 ms.
-pub fn settle_glyph(now_ms: u64, finished_ms: u64, ok: bool, reduced: bool) -> Span<'static> {
+pub fn settle_glyph_themed(
+    colors: crate::proto::shell::pal::Palette,
+    now_ms: u64,
+    finished_ms: u64,
+    ok: bool,
+    reduced: bool,
+) -> Span<'static> {
     let g = if ok { glyphs::DONE } else { glyphs::FAILED };
     if reduced {
         let t = if ok { Token::Green } else { Token::Red };
-        return Span::styled(g, Style::default().fg(colour(t)));
+        return Span::styled(g, Style::default().fg(colour_themed(colors, t)));
     }
     let a = Anim::new(finished_ms, 250, Curve::EaseOut);
     let p = a.progress(now_ms);
     let (wr, wg, wb) = (0xFFu8, 0xFFu8, 0xFFu8);
     let (er, eg, eb) = if ok {
-        Token::Green.rgb()
+        colors.token(Token::Green)
     } else {
-        Token::Red.rgb()
+        colors.token(Token::Red)
     };
     Span::styled(
         g,
@@ -178,20 +213,29 @@ pub fn settle_glyph(now_ms: u64, finished_ms: u64, ok: bool, reduced: bool) -> S
 /// M13 — the approval card rises from the composer in 200 ms; border
 /// and badge breathe at 1 Hz for 3 s, then hold. The rise is the
 /// caller's layout concern (a rect lerp); this returns the badge.
-pub fn approval_badge(now_ms: u64, requested_ms: u64, reduced: bool) -> Span<'static> {
+pub fn approval_badge_themed(
+    colors: crate::proto::shell::pal::Palette,
+    now_ms: u64,
+    requested_ms: u64,
+    reduced: bool,
+) -> Span<'static> {
     let age = now_ms.saturating_sub(requested_ms);
     let breathing = !reduced && age < 3000;
     let bright = !breathing || pulse(now_ms, 1.0) > 0.5;
     let t = if bright { Token::Magenta } else { Token::Muted };
     Span::styled(
         format!("{} needs you", glyphs::NEEDS_YOU),
-        Style::default().fg(colour(t)).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(colour_themed(colors, t))
+            .add_modifier(Modifier::BOLD),
     )
 }
 
 /// M18 — the context meter: eases in 300 ms; compaction drains it
 /// over 1.2 s while amber.
-pub fn context_meter(
+#[allow(clippy::too_many_arguments)]
+pub fn context_meter_themed(
+    colors: crate::proto::shell::pal::Palette,
     used: u64,
     window: u64,
     now_ms: u64,
@@ -216,44 +260,58 @@ pub fn context_meter(
     Line::from(vec![
         Span::styled(
             glyphs::BAR_FULL.repeat(full as usize),
-            Style::default().fg(colour(token)),
+            Style::default().fg(colour_themed(colors, token)),
         ),
         Span::styled(
             glyphs::BAR_EMPTY.repeat((width - full) as usize),
-            Style::default().fg(colour(Token::Rule)),
+            Style::default().fg(colour_themed(colors, Token::Rule)),
         ),
         Span::styled(
             format!(" {used}"),
-            Style::default().fg(colour(Token::Muted)),
+            Style::default().fg(colour_themed(colors, Token::Muted)),
         ),
     ])
 }
 
 /// M15 — agent arcs `◜◝◞◟` at 10 fps in the agent's colour.
-pub fn agent_arc(now_ms: u64, agent_running: bool, reduced: bool) -> Span<'static> {
+pub fn agent_arc_themed(
+    colors: crate::proto::shell::pal::Palette,
+    now_ms: u64,
+    agent_running: bool,
+    reduced: bool,
+) -> Span<'static> {
     if !agent_running || reduced {
-        return Span::styled("●", Style::default().fg(colour(Token::Cyan)));
+        return Span::styled("●", Style::default().fg(colour_themed(colors, Token::Cyan)));
     }
     let frame = ((now_ms / 100) % 4) as usize;
     Span::styled(
         glyphs::AGENT_ARCS[frame],
-        Style::default().fg(colour(Token::Cyan)),
+        Style::default().fg(colour_themed(colors, Token::Cyan)),
     )
 }
 
 /// M24 — a toast: slides in 160 ms, stays 4 s with a draining line,
 /// slides out 160 ms.
-pub fn toast(text: &str, now_ms: u64, shown_ms: u64, width: u16) -> Line<'static> {
+pub fn toast_themed(
+    colors: crate::proto::shell::pal::Palette,
+    text: &str,
+    now_ms: u64,
+    shown_ms: u64,
+    width: u16,
+) -> Line<'static> {
     let age = now_ms.saturating_sub(shown_ms);
     // drain: full → empty over 4 s
     let drain = (1.0 - (age as f64 / 4000.0).min(1.0)) * width as f64;
     let full = drain.round() as u16;
     Line::from(vec![
-        Span::styled(text.to_string(), Style::default().fg(colour(Token::Ink))),
+        Span::styled(
+            text.to_string(),
+            Style::default().fg(colour_themed(colors, Token::Ink)),
+        ),
         Span::styled(" ", Style::default()),
         Span::styled(
             glyphs::BAR_FULL.repeat(full as usize),
-            Style::default().fg(colour(Token::Muted)),
+            Style::default().fg(colour_themed(colors, Token::Muted)),
         ),
     ])
 }
@@ -262,6 +320,106 @@ fn lerp(a: u8, b: u8, t: f64) -> u8 {
     (a as f64 + (b as f64 - a as f64) * t).round() as u8
 }
 
+pub fn colour(t: Token) -> Color {
+    colour_themed(crate::proto::shell::pal::Palette::default(), t)
+}
+pub fn thinking_line(model: &str, star: &str) -> Line<'static> {
+    thinking_line_themed(crate::proto::shell::pal::Palette::default(), model, star)
+}
+pub fn fresh_ink_style(now_ms: u64, arrived_ms: u64, reduced: bool) -> Style {
+    fresh_ink_style_themed(
+        crate::proto::shell::pal::Palette::default(),
+        now_ms,
+        arrived_ms,
+        reduced,
+    )
+}
+pub fn caret(now_ms: u64, last_data_ms: u64, reduced: bool) -> Span<'static> {
+    caret_themed(
+        crate::proto::shell::pal::Palette::default(),
+        now_ms,
+        last_data_ms,
+        reduced,
+    )
+}
+pub fn tool_line(
+    kind: &str,
+    target: &str,
+    started_ms: u64,
+    now_ms: u64,
+    reduced: bool,
+) -> Line<'static> {
+    tool_line_themed(
+        crate::proto::shell::pal::Palette::default(),
+        kind,
+        target,
+        started_ms,
+        now_ms,
+        reduced,
+    )
+}
+pub fn comet_row(now_ms: u64, track_width: u16, reduced: bool) -> Line<'static> {
+    comet_row_themed(
+        crate::proto::shell::pal::Palette::default(),
+        now_ms,
+        track_width,
+        reduced,
+    )
+}
+pub fn settle_glyph(now_ms: u64, finished_ms: u64, ok: bool, reduced: bool) -> Span<'static> {
+    settle_glyph_themed(
+        crate::proto::shell::pal::Palette::default(),
+        now_ms,
+        finished_ms,
+        ok,
+        reduced,
+    )
+}
+pub fn approval_badge(now_ms: u64, requested_ms: u64, reduced: bool) -> Span<'static> {
+    approval_badge_themed(
+        crate::proto::shell::pal::Palette::default(),
+        now_ms,
+        requested_ms,
+        reduced,
+    )
+}
+pub fn context_meter(
+    used: u64,
+    window: u64,
+    now_ms: u64,
+    shown_ms: u64,
+    compacting: bool,
+    reduced: bool,
+    width: u16,
+) -> Line<'static> {
+    context_meter_themed(
+        crate::proto::shell::pal::Palette::default(),
+        used,
+        window,
+        now_ms,
+        shown_ms,
+        compacting,
+        reduced,
+        width,
+    )
+}
+pub fn agent_arc(now_ms: u64, agent_running: bool, reduced: bool) -> Span<'static> {
+    agent_arc_themed(
+        crate::proto::shell::pal::Palette::default(),
+        now_ms,
+        agent_running,
+        reduced,
+    )
+}
+pub fn toast(text: &str, now_ms: u64, shown_ms: u64, width: u16) -> Line<'static> {
+    toast_themed(
+        crate::proto::shell::pal::Palette::default(),
+        text,
+        now_ms,
+        shown_ms,
+        width,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;

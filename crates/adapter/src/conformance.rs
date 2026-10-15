@@ -104,6 +104,7 @@ pub fn canonical_request(route: &ProviderRouteBinding, input: &[u8]) -> Provider
     use sha2::{Digest, Sha256};
     let input_digest = Sha256Digest(hex::encode(Sha256::digest(input)));
     ProviderRequest {
+        effort: None,
         schema_version: 1,
         request_id: RequestId("req-1".into()),
         decision_id: crate::types::DecisionId("decision-1".into()),

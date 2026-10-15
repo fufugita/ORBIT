@@ -11,6 +11,24 @@ use unicode_width::UnicodeWidthChar;
 /// A true-colour value.
 pub type Rgb = (u8, u8, u8);
 
+/// Furniture only: user text remains readable and no terminal escapes are introduced.
+pub fn ascii_glyph(ch: char) -> char {
+    match ch {
+        '─' | '━' | '╌' | '┄' | '▰' | '▱' => '-',
+        '│' | '┃' | '▏' | '▎' | '▍' | '▌' | '▐' => '|',
+        '╭' | '╮' | '╰' | '╯' | '┏' | '┓' | '┗' | '┛' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬'
+        | '┴' | '┼' => '+',
+        '✓' => '+',
+        '✕' | '×' | '⊘' | '⊖' => 'x',
+        '✦' | '◆' | '◇' | '●' | '◉' | '○' | '◌' | '◐' | '◓' | '◑' | '◒' | '◜' | '◝' | '◞' | '◟'
+        | '∙' | '·' => '*',
+        '›' | '→' | '▶' | '▸' => '>',
+        '‹' | '←' | '◀' | '▾' => '<',
+        '…' => '.',
+        _ => ch,
+    }
+}
+
 /// Linear mix: `t = 0` → `a`, `t = 1` → `b`.
 pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let t = t.clamp(0.0, 1.0);
@@ -118,6 +136,9 @@ pub fn clip_path(s: &str, n: i32) -> String {
 pub struct Cv<'a> {
     pub buf: &'a mut Buffer,
     pub clip: Rect,
+    pub palette: super::pal::Palette,
+    pub compact: bool,
+    pub ascii: bool,
     hits: std::rc::Rc<std::cell::RefCell<Vec<super::hits::Hit>>>,
 }
 
@@ -127,8 +148,22 @@ impl<'a> Cv<'a> {
         Cv {
             buf,
             clip,
+            palette: super::pal::Palette::default(),
+            compact: false,
+            ascii: false,
             hits: Default::default(),
         }
+    }
+
+    pub fn with_profile(
+        buf: &'a mut Buffer,
+        profile: &orbit_frontend_protocol::customization::Profile,
+    ) -> Self {
+        let mut cv = Self::new(buf);
+        cv.palette = super::pal::Palette::from_profile(profile);
+        cv.compact = profile.density == orbit_frontend_protocol::customization::Density::Compact;
+        cv.ascii = profile.glyphs == orbit_frontend_protocol::customization::Glyphs::Ascii;
+        cv
     }
 
     /// Run `f` with the clip narrowed to `r` (intersected).
@@ -137,6 +172,9 @@ impl<'a> Cv<'a> {
         let mut inner = Cv {
             buf: &mut *self.buf,
             clip: inter,
+            palette: self.palette,
+            compact: self.compact,
+            ascii: self.ascii,
             hits: std::rc::Rc::clone(&self.hits),
         };
         f(&mut inner)
@@ -201,7 +239,12 @@ impl<'a> Cv<'a> {
         mods: Modifier,
     ) -> i32 {
         let mut cx = x;
-        for ch in s.chars() {
+        for original in s.chars() {
+            let ch = if self.ascii {
+                ascii_glyph(original)
+            } else {
+                original
+            };
             let w = ch.width().unwrap_or(0) as i32;
             if w == 0 {
                 continue;

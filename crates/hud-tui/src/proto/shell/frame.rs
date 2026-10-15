@@ -3,7 +3,7 @@
 //! hints — ported from the prototype's `panelFrame`.
 
 use super::canvas::{clip_text, mix, segs_width, text_width, tint, Cv, Rgb, Seg};
-use super::pal::*;
+use super::pal::Palette;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 
@@ -27,14 +27,20 @@ pub enum BadgeState {
 }
 
 /// The badge's segments for `state` (glyph + word, optional extra).
-pub fn badge(state: BadgeState, extra: Option<&str>, now_ms: u64, reduced: bool) -> Vec<Seg> {
+pub fn badge_themed(
+    colors: Palette,
+    state: BadgeState,
+    extra: Option<&str>,
+    now_ms: u64,
+    reduced: bool,
+) -> Vec<Seg> {
     let (g, col, word): (String, Rgb, &str) = match state {
-        BadgeState::Working => (star_frame(now_ms, reduced).into(), CYAN, "working"),
-        BadgeState::Running => (star_frame(now_ms, reduced).into(), CYAN, "running"),
-        BadgeState::Needs => ("◆".into(), MAGENTA, "needs you"),
-        BadgeState::Done => ("✓".into(), GREEN, "done"),
-        BadgeState::Idle => ("○".into(), MUTED, "idle"),
-        BadgeState::Failed => ("✕".into(), RED, "failed"),
+        BadgeState::Working => (star_frame(now_ms, reduced).into(), colors.cyan, "working"),
+        BadgeState::Running => (star_frame(now_ms, reduced).into(), colors.cyan, "running"),
+        BadgeState::Needs => ("◆".into(), colors.magenta, "needs you"),
+        BadgeState::Done => ("✓".into(), colors.green, "done"),
+        BadgeState::Idle => ("○".into(), colors.muted, "idle"),
+        BadgeState::Failed => ("✕".into(), colors.red, "failed"),
     };
     let strong = matches!(state, BadgeState::Needs | BadgeState::Failed);
     let mut parts = vec![
@@ -51,7 +57,7 @@ pub fn badge(state: BadgeState, extra: Option<&str>, now_ms: u64, reduced: bool)
             if state == BadgeState::Needs {
                 col
             } else {
-                MUTED
+                colors.muted
             },
         ));
     }
@@ -72,24 +78,26 @@ pub fn pill_width(parts: &[Seg]) -> i32 {
 
 /// A keycap (` k `), hot = the accent one.
 pub fn keycap(cv: &mut Cv, x: i32, y: i32, k: &str, hot: bool) -> i32 {
+    let colors = cv.palette;
     let (fg, bg) = if hot {
-        (ON_ACCENT, MAGENTA)
+        (colors.on_accent, colors.magenta)
     } else {
-        (INK, RULE_HI)
+        (colors.ink, colors.rule_hi)
     };
     cv.put(x, y, &format!(" {k} "), fg, Some(bg), Modifier::BOLD)
 }
 
 /// Key hints: `key label   key label …`. Returns next x.
 pub fn keyhints(cv: &mut Cv, x: i32, y: i32, pairs: &[(&str, &str)], bg: Option<Rgb>) -> i32 {
+    let colors = cv.palette;
     let mut x = x;
     for (i, (k, l)) in pairs.iter().enumerate() {
         if i > 0 {
             x += 3;
         }
         let from = x;
-        x = cv.put(x, y, k, INK2, bg, Modifier::BOLD);
-        x = cv.text(x + 1, y, l, FAINT, bg);
+        x = cv.put(x, y, k, colors.ink2, bg, Modifier::BOLD);
+        x = cv.text(x + 1, y, l, colors.faint, bg);
         // Clicking a hint presses the key it names (when it names one).
         if let Some((code, mods)) = super::hits::parse_key(k) {
             cv.hit(from, y, x - from, 1, super::hits::Click::Key(code, mods));
@@ -157,11 +165,17 @@ pub struct FrameSpec<'a> {
 /// Draw a panel frame into `r`; returns the content rect (inside the
 /// border, below the header band), or `None` when too small.
 pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
+    let colors = cv.palette;
+    let ident = if spec.focused {
+        colors.focus_override.unwrap_or(spec.ident)
+    } else {
+        spec.ident
+    };
     let (x, y, w, h) = (r.x as i32, r.y as i32, r.width as i32, r.height as i32);
     if w < 4 || h < 3 {
         return None;
     }
-    cv.fill(x, y, w, h, PANEL);
+    cv.fill(x, y, w, h, colors.panel);
     // The border runs around the perimeter; the heavy part grows from
     // the number chip (index 3) both ways as `sweep` rises.
     let mut per: Vec<(i32, i32, &str)> = Vec::new();
@@ -204,11 +218,11 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
         let d = (i - 3).abs().min(n - (i - 3).abs());
         let heavy = spec.focus_fx.sweep > 0.0 && d as f32 <= reach;
         let col = if heavy {
-            spec.ident
+            ident
         } else if let Some(f) = spec.focus_fx.fade {
-            mix(spec.ident, RULE, f)
+            mix(ident, colors.rule, f)
         } else {
-            RULE
+            colors.rule
         };
         let g = match (*kind, heavy) {
             ("tl", true) => "┏",
@@ -224,12 +238,12 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
             ("h", false) => "─",
             _ => "│",
         };
-        cv.text(*px, *py, g, col, Some(PANEL));
+        cv.text(*px, *py, g, col, Some(colors.panel));
     }
     // Header band.
     let band = tint(
-        spec.ident,
-        PANEL,
+        ident,
+        colors.panel,
         0.09 + 0.11 * if spec.focused { 1.0 } else { 0.0 },
     );
     cv.fill(x + 1, y + 1, w - 2, 1, band);
@@ -239,8 +253,8 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
             x + 2,
             y + 1,
             &num,
-            ON_ACCENT,
-            Some(spec.ident),
+            colors.on_accent,
+            Some(ident),
             Modifier::BOLD,
         )
     } else {
@@ -248,8 +262,8 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
             x + 2,
             y + 1,
             &num,
-            spec.ident,
-            Some(tint(spec.ident, PANEL, 0.3)),
+            ident,
+            Some(tint(ident, colors.panel, 0.3)),
             Modifier::BOLD,
         )
     };
@@ -276,19 +290,23 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
         xx + 1,
         y + 1,
         &clip_text(spec.title, room.max(1)),
-        if spec.focused { INK } else { INK2 },
+        if spec.focused {
+            colors.ink
+        } else {
+            colors.ink2
+        },
         Some(band),
         Modifier::BOLD,
     );
     if let Some(b) = &badge {
-        let lead = b.first().map(|s| s.fg).unwrap_or(MUTED);
+        let lead = b.first().map(|s| s.fg).unwrap_or(colors.muted);
         pill(
             cv,
             x + w - 2 - bw,
             y + 1,
             b,
             lead,
-            PANEL,
+            colors.panel,
             0.16 + 0.22 * spec.attention,
         );
     }
@@ -296,8 +314,8 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
     if !spec.footer.is_empty() {
         let fh = fit_hints(&spec.footer, w - 6);
         if !fh.is_empty() {
-            cv.fill(x + 2, y + h - 1, hints_width(&fh) + 2, 1, PANEL);
-            keyhints(cv, x + 3, y + h - 1, &fh, Some(PANEL));
+            cv.fill(x + 2, y + h - 1, hints_width(&fh) + 2, 1, colors.panel);
+            keyhints(cv, x + 3, y + h - 1, &fh, Some(colors.panel));
         }
     }
     if !spec.footer_parts.is_empty() {
@@ -306,8 +324,8 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
             parts.pop();
         }
         if segs_width(&parts) <= w - 6 {
-            cv.fill(x + 2, y + h - 1, segs_width(&parts) + 2, 1, PANEL);
-            cv.spans(x + 3, y + h - 1, &parts, Some(PANEL));
+            cv.fill(x + 2, y + h - 1, segs_width(&parts) + 2, 1, colors.panel);
+            cv.spans(x + 3, y + h - 1, &parts, Some(colors.panel));
         }
     }
     let _ = mix; // palette helpers re-exported for siblings
@@ -321,14 +339,19 @@ pub fn panel_frame(cv: &mut Cv, r: Rect, spec: &FrameSpec) -> Option<Rect> {
 
 /// An empty-state block: glyph + title + wrapped body.
 pub fn empty_state(cv: &mut Cv, inner: Rect, glyph: &str, col: Rgb, title: &str, body: &str) {
+    let colors = cv.palette;
     let (x, y, w) = (inner.x as i32, inner.y as i32, inner.width as i32);
     cv.bold(x + 1, y + 1, glyph, col, None);
-    cv.bold(x + 3, y + 1, title, INK2, None);
+    cv.bold(x + 3, y + 1, title, colors.ink2, None);
     for (i, (a, b)) in super::canvas::wrap_ranges(body, w - 4)
         .into_iter()
         .enumerate()
     {
         let line: String = body.chars().skip(a).take(b - a).collect();
-        cv.text(x + 3, y + 3 + i as i32, &line, MUTED, None);
+        cv.text(x + 3, y + 3 + i as i32, &line, colors.muted, None);
     }
+}
+
+pub fn badge(state: BadgeState, extra: Option<&str>, now_ms: u64, reduced: bool) -> Vec<Seg> {
+    badge_themed(Palette::default(), state, extra, now_ms, reduced)
 }

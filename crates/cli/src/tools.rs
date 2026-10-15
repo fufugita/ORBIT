@@ -62,6 +62,18 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 /// trusted scopes are spawned once, their tools declared up front so
 /// the list never changes mid-conversation (phase 5).
 pub fn session_tool_definitions(home: &std::path::Path) -> Vec<ToolDefinition> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let cx = orbit_tools::ToolContext::new(home.into(), String::new(), cwd);
+    session_tool_definitions_with_context(home, &cx, None)
+}
+
+/// Discover only the MCP servers relevant to this caller, before spawning them.
+/// An empty profile retains its existing unrestricted meaning.
+pub fn session_tool_definitions_with_context(
+    home: &std::path::Path,
+    cx: &orbit_tools::ToolContext,
+    selection: Option<&[String]>,
+) -> Vec<ToolDefinition> {
     // --bare skips discovering skills, mods, MCP servers and memory
     // files (phase 6: fast start for scripts).
     if std::env::var("ORBIT_BARE")
@@ -77,19 +89,63 @@ pub fn session_tool_definitions(home: &std::path::Path) -> Vec<ToolDefinition> {
 
     // The Task tool: spawn a subagent (phase 5).
     defs.push(task_tool_definition());
+    defs.extend(agent_control_definitions());
+
+    // Availability reads only trusted configuration; diagnostics launch on demand.
+    if selection
+        .is_none_or(|names| names.is_empty() || names.iter().any(|name| name == "LspDiagnostics"))
+        && cx
+            .ext::<crate::tool_runtime::LspToolSelection>()
+            .is_none_or(|allowed| allowed.0)
+        && crate::lsp::availability(home, cx).is_ok_and(|available| available.is_some())
+    {
+        defs.push(crate::lsp::tool_definition());
+    }
 
     // MCP tools.
-    let trusted = {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
+    let trusted =
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cx.working_dir);
+    let Ok(cfg) = orbit_mcp::McpConfig::try_load_at(home, &cx.working_dir, trusted) else {
+        return defs;
     };
-    let cfg = orbit_mcp::McpConfig::load(home, trusted);
+    let selected = crate::tool_runtime::effective_mcp_tool_selection(cx, selection);
+    let selection = selected.as_deref();
+    let mut emitted_mcp = std::collections::HashSet::new();
     for (name, server) in &cfg.servers {
+        if !server.enabled
+            || server.tools.as_ref().is_some_and(Vec::is_empty)
+            || selection.is_some_and(|names| {
+                !names.iter().any(|wire| {
+                    crate::tool_runtime::resolve_mcp_target_in(&cfg, wire).is_ok_and(
+                        |(selected_server, tool)| {
+                            selected_server == *name && server.tool_enabled(&tool)
+                        },
+                    )
+                })
+            })
+        {
+            continue;
+        }
         // The process-lifetime pool: one server process per name,
         // reused across calls and definition builds (phase 5).
-        if let Ok(tools) = orbit_mcp::POOL.list_tools(name, server) {
+        let mut options =
+            orbit_mcp::McpCallOptions::new(std::time::Duration::from_millis(server.timeout_ms));
+        options.cancel = cx.cancel_check();
+        options.working_dir = Some(cx.working_dir.clone());
+        if let Ok(tools) = orbit_mcp::POOL.list_tools_with_options(name, server, &options) {
             for t in tools {
                 let wire = orbit_mcp::wire_name(name, &t.name);
+                if !server.tool_enabled(&t.name)
+                    || selection.is_some_and(|names| !names.contains(&wire))
+                    || !crate::tool_runtime::resolve_mcp_target_in(&cfg, &wire).is_ok_and(
+                        |(resolved_server, resolved_tool)| {
+                            resolved_server == *name && resolved_tool == t.name
+                        },
+                    )
+                    || !emitted_mcp.insert(wire.clone())
+                {
+                    continue;
+                }
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(wire.as_bytes());
                 bytes.extend_from_slice(t.description.as_bytes());
@@ -148,12 +204,16 @@ fn skill_tool_definition() -> ToolDefinition {
 /// report.
 fn task_tool_definition() -> ToolDefinition {
     let name = "Task";
-    let description = "Run a subagent: Explore (read-only research), Plan (implementation plan), or general-purpose (delegated work). Returns the subagent's final report.";
+    let description = "Run or resume a subagent: Explore (read-only research), Plan (implementation plan), or general-purpose (delegated work). Returns its stable agent_id and final report. Resume retains the conversation and model. Queued messages are delivered only on an explicit resume.";
     let parameters = serde_json::json!({
         "type": "object",
         "properties": {
             "agent": { "type": "string", "description": "The subagent to run (Explore, Plan, general-purpose)" },
-            "prompt": { "type": "string", "description": "The task for the subagent" }
+            "prompt": { "type": "string", "description": "The task for the subagent" },
+            "name": { "type": "string", "description": "Optional display name when creating an agent" },
+            "resume": { "type": "string", "description": "Stable agent_id to resume with the same agent type" },
+            "model": { "type": "string", "description": "Explicit configured model or provider/model override" },
+            "effort": { "type": ["boolean", "string", "null"], "description": "Exact declared boolean or level; null or default resets to this model's default. Absent retains the saved/profile/same-model parent selection." }
         },
         "required": ["agent", "prompt"]
     });
@@ -173,6 +233,45 @@ fn task_tool_definition() -> ToolDefinition {
             &bytes,
         ))),
     }
+}
+
+fn agent_control_definitions() -> Vec<ToolDefinition> {
+    [
+        (
+            "ListAgents",
+            "List this session's agents, IDs, names, models, status and pending message counts. Does not include conversation or message contents.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "offset": { "type": "integer", "minimum": 0, "description": "Start at next_offset from the previous page; default 0" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Maximum agents to return; default 20" }
+                }
+            }),
+        ),
+        (
+            "AgentSendMessage",
+            "Queue a message for this session's agent. Delivery occurs only on its next explicit Task resume; this does not start or steer a running agent.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "message": { "type": "string" }
+                },
+                "required": ["agent_id", "message"]
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, parameters)| {
+        BuiltinTool {
+            name,
+            description,
+            parameters,
+            execute: |_| Err("agent control requires a session context".into()),
+        }
+        .to_definition()
+    })
+    .collect()
 }
 
 /// Keeps a child turn's cancel token in step with its parent's check: a
@@ -218,33 +317,288 @@ pub fn link_cancel(
 /// Execute the Task tool: run a subagent as a nested engine turn.
 /// `turn_config` carries the provider/gate/model the session already
 /// uses; the subagent's own tool set comes from its definition.
+#[allow(dead_code)] // compatibility for existing callers without a session context
 pub fn execute_task(
     home: &std::path::Path,
     agent_name: &str,
     prompt: &str,
     turn_config: &orbit_engine::TurnConfig,
     approval: &mut dyn crate::tool_runtime::ApprovalChannel,
-    // The parent turn's cancel check: Esc on the parent must stop the
-    // subagent too.
     parent_cancel: Option<orbit_tools::CancelCheck>,
-    // Told when the subagent starts, what it is doing, and how it ended.
     observe: Option<&(dyn Fn(&crate::tool_runtime::SubagentUpdate) + Send + Sync)>,
 ) -> Result<serde_json::Value, String> {
-    use crate::tool_runtime::SubagentUpdate;
-    let trusted = {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd)
-    };
-    let agents = orbit_engine::skills::load_agents(home, trusted);
-    let agent = agents
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| format!("unknown subagent: {agent_name}"))?;
+    let session_id = format!("legacy-task-{}", ulid::Ulid::new());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let cx = orbit_tools::ToolContext::new(home.into(), session_id.clone(), cwd);
+    crate::tool_runtime::remember_turn_config(&cx, turn_config);
+    if let Some(check) = parent_cancel {
+        cx.push_cancel_check(check);
+    }
+    execute_task_in_session(
+        home,
+        &session_id,
+        &serde_json::json!({ "agent": agent_name, "prompt": prompt }),
+        &cx,
+        &crate::tool_runtime::PermissionScope::default(),
+        approval,
+        observe,
+    )
+    .map_err(|error| error.message)
+}
 
-    // The subagent's tool set: its allowlist intersected with the
-    // session's tools (a subagent never gets tools the session lacks).
-    let session_tools = session_tool_definitions(home);
-    let sub_tools: Vec<ToolDefinition> = if agent.tools.is_empty() {
+pub(crate) struct AgentTaskError {
+    message: String,
+    agent_id: Option<String>,
+}
+
+impl From<String> for AgentTaskError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            agent_id: None,
+        }
+    }
+}
+
+impl AgentTaskError {
+    fn for_agent(message: String, id: &str) -> Self {
+        Self {
+            message,
+            agent_id: Some(id.into()),
+        }
+    }
+
+    pub(crate) fn into_value(self) -> serde_json::Value {
+        serde_json::json!({ "ok": false, "error": self.message, "agent_id": self.agent_id })
+    }
+}
+
+fn optional_task_string<'a>(
+    args: &'a serde_json::Value,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(Some)
+            .ok_or_else(|| format!("Task/Agent '{key}' must be a non-empty string")),
+    }
+}
+
+fn task_effort_setting(
+    args: &serde_json::Value,
+) -> Result<Option<orbit_adapter::types::EffortSetting>, String> {
+    use orbit_adapter::types::{EffortSetting, EffortValue};
+    match args.get("effort") {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => Ok(Some(EffortSetting::Default)),
+        Some(serde_json::Value::Bool(value)) => {
+            Ok(Some(EffortSetting::Value(EffortValue::Bool(*value))))
+        }
+        Some(serde_json::Value::String(value)) if value == "default" => {
+            Ok(Some(EffortSetting::Default))
+        }
+        Some(serde_json::Value::String(value)) => {
+            let value = EffortValue::Level(value.clone());
+            value.validate()?;
+            Ok(Some(EffortSetting::Value(value)))
+        }
+        Some(_) => {
+            Err("Task/Agent 'effort' must be a boolean, exact level, null, or default".into())
+        }
+    }
+}
+
+fn resolve_agent_effort(
+    home: &std::path::Path,
+    parent_cx: &orbit_tools::ToolContext,
+    config: &mut orbit_engine::TurnConfig,
+    explicit: Option<&orbit_adapter::types::EffortSetting>,
+    saved: Option<&orbit_engine::agent_store::AgentSnapshot>,
+    profile: Option<&orbit_adapter::types::EffortSetting>,
+    explicit_model: bool,
+) -> Result<orbit_adapter::types::EffortSetting, String> {
+    use orbit_adapter::types::EffortSetting;
+    let parent = crate::tool_runtime::session_subagent_config(parent_cx, home);
+    let same_parent = parent.provider_id == config.provider_id && parent.model == config.model;
+    let model_spec = format!("{}/{}", config.provider_id, config.model);
+    let model_changed = explicit_model && saved.is_some_and(|s| s.model != model_spec);
+    // An explicit new target also discards a parent override. Equality alone is
+    // insufficient to revive old saved choices after a real model change.
+    let parent_selection = parent_cx.ext::<crate::tool_runtime::SessionEffortSetting>();
+    let setting = explicit
+        .or_else(|| {
+            (!model_changed)
+                .then(|| saved.and_then(|s| s.effort.as_ref()))
+                .flatten()
+        })
+        .or(profile)
+        .or_else(|| {
+            (same_parent && !model_changed)
+                .then(|| parent_selection.as_ref().and_then(|s| s.0.as_ref()))
+                .flatten()
+        })
+        .cloned()
+        .unwrap_or(EffortSetting::Default);
+    crate::apply_effort_setting(home, config, &setting)?;
+    Ok(setting)
+}
+
+/// Run an owned, durable agent conversation through the existing synchronous
+/// engine. No stored state restores permissions or credentials.
+pub(crate) fn execute_task_in_session(
+    home: &std::path::Path,
+    session_id: &str,
+    args: &serde_json::Value,
+    parent_cx: &orbit_tools::ToolContext,
+    scope: &crate::tool_runtime::PermissionScope,
+    approval: &mut dyn crate::tool_runtime::ApprovalChannel,
+    observe: Option<&(dyn Fn(&crate::tool_runtime::SubagentUpdate) + Send + Sync)>,
+) -> Result<serde_json::Value, AgentTaskError> {
+    use crate::tool_runtime::SubagentUpdate;
+    use orbit_engine::agent_store::AgentStatus;
+
+    // This check precedes model resolution and creation of any persisted agent.
+    let parent_agent_id = crate::tool_runtime::agent_parent_and_depth(parent_cx, session_id)?;
+    let agent_type = orbit_tools::agent_permission_key(args).pattern;
+    let prompt = args
+        .get("prompt")
+        .or_else(|| args.get("description"))
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| "Task/Agent requires a 'prompt'".to_string())?;
+    let resume = optional_task_string(args, "resume")?;
+    let name = optional_task_string(args, "name")?;
+    let explicit = optional_task_string(args, "model")?;
+    let explicit_effort = task_effort_setting(args)?;
+    if resume.is_some() && name.is_some() {
+        return Err("Task/Agent 'name' is only accepted when creating an agent"
+            .to_string()
+            .into());
+    }
+    let trusted =
+        orbit_tools::permissions::FolderTrust::new(home.into()).is_trusted(&parent_cx.working_dir);
+    let agent = orbit_engine::skills::load_agents(home, trusted)
+        .into_iter()
+        .find(|a| a.name == agent_type)
+        .ok_or_else(|| format!("unknown subagent: {agent_type}"))?;
+    let store = crate::tool_runtime::agent_store_for_context(home, session_id, parent_cx)?;
+    let saved = resume.map(|id| store.load(id)).transpose()?;
+    if let Some(saved) = &saved {
+        if saved.agent_type != agent_type {
+            return Err(AgentTaskError::for_agent(
+                format!(
+                    "agent type mismatch: stored '{}', requested '{}'",
+                    saved.agent_type, agent_type
+                ),
+                &saved.agent_id,
+            ));
+        }
+    }
+    let mut turn_config = crate::tool_runtime::task_config_for(
+        parent_cx,
+        home,
+        &agent_type,
+        explicit,
+        saved.as_ref().map(|s| s.model.as_str()),
+    )?;
+    let fresh = saved.is_none();
+    if fresh {
+        let origin = if explicit.is_some() || !agent.model.trim().is_empty() {
+            crate::phase_routing::SelectionOrigin::AgentExplicit
+        } else {
+            crate::phase_routing::SelectionOrigin::Role
+        };
+        // Classify once before creating the durable agent. The actual selected
+        // identity and compatible effort are persisted before any provider call.
+        turn_config = crate::try_phase_turn_config(home, &turn_config, prompt, origin)?.0;
+        turn_config.sampling = None;
+    }
+    let snapshot = match saved {
+        Some(snapshot) => snapshot,
+        None => {
+            let setting = resolve_agent_effort(
+                home,
+                parent_cx,
+                &mut turn_config,
+                explicit_effort.as_ref(),
+                None,
+                agent.effort.as_ref(),
+                explicit.is_some(),
+            )?;
+            let model_spec = format!("{}/{}", turn_config.provider_id, turn_config.model);
+            store.create_with_effort(
+                &agent_type,
+                name,
+                &model_spec,
+                Some(setting),
+                parent_agent_id.as_deref(),
+            )?
+        }
+    };
+    let id = snapshot.agent_id.clone();
+    let run = store
+        .begin_resolved(&id, |leased| {
+            if leased.agent_type != agent_type {
+                return Err("leased agent type changed".into());
+            }
+            turn_config = crate::tool_runtime::task_config_for(
+                parent_cx,
+                home,
+                &agent_type,
+                explicit,
+                Some(&leased.model),
+            )?;
+            if !fresh {
+                // Resumed identity is read under its lease and remains an
+                // explicit pin even when its model equals a configured default.
+                turn_config = crate::try_phase_turn_config(
+                    home,
+                    &turn_config,
+                    prompt,
+                    crate::phase_routing::SelectionOrigin::AgentExplicit,
+                )?
+                .0;
+                turn_config.sampling = None;
+            }
+            let setting = resolve_agent_effort(
+                home,
+                parent_cx,
+                &mut turn_config,
+                explicit_effort.as_ref(),
+                Some(leased),
+                agent.effort.as_ref(),
+                explicit.is_some(),
+            )?;
+            Ok((
+                format!("{}/{}", turn_config.provider_id, turn_config.model),
+                Some(setting),
+            ))
+        })
+        .map_err(|error| AgentTaskError::for_agent(error, &id))?;
+
+    let mut input = String::new();
+    if run.interrupted_previous_run() {
+        input.push_str("The previous run was interrupted. Inspect the actual work and tool results before continuing; do not automatically replay the previous task.\n\n");
+    }
+    for message in run.messages() {
+        input.push_str(&format!(
+            "Queued message {} from {}:\n{}\n\n",
+            message.message_id,
+            message
+                .sender_agent_id
+                .as_deref()
+                .unwrap_or("owning session"),
+            message.text
+        ));
+    }
+    input.push_str(prompt);
+    let mut transcript = run.snapshot().transcript.clone();
+    let turns = run.snapshot().turns.saturating_add(1);
+    let session_tools = session_tool_definitions_with_context(home, parent_cx, Some(&agent.tools));
+    let sub_tools = if agent.tools.is_empty() {
         session_tools
     } else {
         session_tools
@@ -252,114 +606,122 @@ pub fn execute_task(
             .filter(|t| agent.tools.contains(&t.name))
             .collect()
     };
-
-    // E9: SubagentStart fires at spawn.
     let hooks = orbit_engine::hooks::Hooks::load(home, trusted);
     let _ = hooks.fire(
         orbit_engine::hooks::HookEvent::SubagentStart,
-        &serde_json::json!({ "agent": agent.name, "prompt_bytes": prompt.len() }),
+        &serde_json::json!({ "agent": agent.name, "agent_id": id, "prompt_bytes": prompt.len() }),
     );
-
-    // A fresh transcript: the subagent does not see the parent's
-    // conversation, only its prompt.
-    let mut transcript: Vec<orbit_adapter::types::ChatMessage> = Vec::new();
-    // The subagent's own token follows the parent's: it used to be a
-    // fresh token nobody could cancel, so Esc during a subagent stopped
-    // neither its stream nor its commands.
     let cancel = orbit_provider_http::CancelToken::new();
+    let parent_cancel = parent_cx.cancel_check();
+    if parent_cancel.as_ref().is_some_and(|check| check()) {
+        cancel.cancel();
+    }
     let _link = link_cancel(parent_cancel, &cancel);
     let options = orbit_engine::TurnOptions {
+        session_id: id.clone(),
         tools: sub_tools,
         max_rounds: agent.max_turns,
         system_directive: Some(format!(
             "You are {name}, a subagent. {desc}\n\nComplete the task and reply with your final report. You do not see the parent conversation.",
-            name = agent.name,
-            desc = agent.description
+            name = agent.name, desc = agent.description
         )),
-        request_stem: format!("orbit-task-{}", agent.name),
+        request_stem: format!("orbit-task-{id}"),
         ..Default::default()
     };
-
-    // The subagent's tool calls go through the same permission path as
-    // the parent's — the approval channel is shared, so a subagent's
-    // approval request appears in the main session (roadmap gate 5).
-    let mut executor = crate::tool_runtime::SubagentExecutor::new(home.to_path_buf(), approval);
-    let id = executor.id().to_string();
-    let notify = |u: SubagentUpdate| {
+    let child_cx = crate::tool_runtime::child_agent_context(home, session_id, &id, parent_cx);
+    crate::tool_runtime::remember_effort_setting(&child_cx, &run.snapshot().effort);
+    crate::tool_runtime::set_mcp_tool_selection(&child_cx, parent_cx, &agent.tools);
+    crate::tool_runtime::set_lsp_tool_selection(&child_cx, parent_cx, &agent.tools);
+    let mut executor = crate::tool_runtime::SubagentExecutor::with_context(
+        home.into(),
+        id.clone(),
+        child_cx,
+        scope.clone(),
+        approval,
+    );
+    let notify = |update: SubagentUpdate| {
         if let Some(observe) = observe {
-            observe(&u);
+            observe(&update);
         }
     };
     notify(SubagentUpdate::Started {
         id: id.clone(),
         name: agent.name.clone(),
+        model: turn_config.model.clone(),
         task: prompt
             .lines()
             .map(str::trim)
-            .find(|l| !l.is_empty())
+            .find(|line| !line.is_empty())
             .unwrap_or("")
-            .to_string(),
+            .into(),
     });
-    let report = match orbit_engine::run_turn(
+    let result = orbit_engine::run_turn(
         home,
-        turn_config,
+        &turn_config,
         &options,
-        prompt,
+        &input,
         &mut transcript,
         &mut executor,
         &cancel,
-        &mut |ev| {
-            use orbit_frontend_protocol::FrontendEvent as E;
-            // What it is doing now: the tool it just started.
-            if let E::ToolStartedFull { kind, target, .. } = ev {
+        &mut |event| {
+            if let orbit_frontend_protocol::FrontendEvent::ToolStartedFull {
+                kind, target, ..
+            } = event
+            {
                 notify(SubagentUpdate::Progress {
                     id: id.clone(),
-                    action: format!("{kind} {target}").trim().to_string(),
+                    action: format!("{kind} {target}").trim().into(),
                 });
             }
         },
-    ) {
-        Ok(report) => report,
-        Err(e) => {
-            notify(SubagentUpdate::Finished {
-                id,
-                ok: false,
-                report: e.clone(),
-            });
-            return Err(e);
+    );
+    let (ok, rounds, status, report_text, failure) = match result {
+        Ok(report) => {
+            let text = report.final_text;
+            let status = if report.interrupted {
+                AgentStatus::Cancelled
+            } else if report.ok {
+                AgentStatus::Completed
+            } else {
+                AgentStatus::Failed
+            };
+            (report.ok, report.rounds, status, text, None)
+        }
+        Err(error) => {
+            let status = if cancel.is_cancelled() {
+                AgentStatus::Cancelled
+            } else {
+                AgentStatus::Failed
+            };
+            (false, 0, status, error.clone(), Some(error))
         }
     };
-
-    // E9: SubagentStop fires when the subagent's turn ends.
+    let persisted = run.finish(transcript, report_text.clone(), status, turns);
     let _ = hooks.fire(
         orbit_engine::hooks::HookEvent::SubagentStop,
-        &serde_json::json!({ "agent": agent.name, "ok": report.ok }),
+        &serde_json::json!({ "agent": agent.name, "agent_id": id, "ok": ok }),
     );
-
-    // The final assistant text is the report.
-    let report_text = transcript
-        .iter()
-        .rev()
-        .find(|m| m.role == orbit_adapter::types::ChatRole::Assistant)
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
     notify(SubagentUpdate::Finished {
-        id,
-        ok: report.ok,
-        report: if report.ok || !report_text.is_empty() {
-            report_text.clone()
-        } else if report.interrupted {
-            "cancelled".to_string()
-        } else {
-            "stopped before it finished".to_string()
-        },
+        id: id.clone(),
+        ok: ok && persisted.is_ok(),
+        report: persisted.as_ref().err().cloned().unwrap_or_else(|| {
+            if !report_text.is_empty() {
+                report_text.clone()
+            } else if status == AgentStatus::Cancelled {
+                "cancelled".into()
+            } else {
+                "stopped before it finished".into()
+            }
+        }),
     });
-
+    let snapshot = persisted.map_err(|error| AgentTaskError::for_agent(error, &id))?;
+    if let Some(error) = failure {
+        return Err(AgentTaskError::for_agent(error, &id));
+    }
     Ok(serde_json::json!({
-        "ok": report.ok,
-        "agent": agent.name,
-        "rounds": report.rounds,
-        "report": report_text,
+        "ok": ok, "agent": agent.name, "agent_id": id, "name": snapshot.name,
+        "model": snapshot.model, "effort": snapshot.effort, "status": snapshot.status, "turns": snapshot.turns,
+        "rounds": rounds, "report": report_text,
     }))
 }
 
@@ -770,7 +1132,10 @@ pub fn parse_arguments(accumulated: &[u8]) -> Result<serde_json::Value, String> 
 /// (fail toward caution, like `tool_risk`).
 pub fn is_read_only(name: &str) -> bool {
     orbit_tools::is_read_only(name)
-        || matches!(name, "calculator" | "current_session" | "list_models")
+        || matches!(
+            name,
+            "calculator" | "current_session" | "list_models" | "ListAgents" | "LspDiagnostics"
+        )
 }
 
 pub fn is_known_tool(name: &str) -> bool {
@@ -783,6 +1148,10 @@ pub fn is_known_tool(name: &str) -> bool {
         // to the model in the same request.
         || name == "Skill"
         || name == "Task"
+        || name == "Agent"
+        || name == "ListAgents"
+        || name == "AgentSendMessage"
+        || name == "LspDiagnostics"
         || name.starts_with("mcp__")
 }
 
@@ -873,6 +1242,8 @@ fn advertised_tools_all_dispatch() {
             || builtin_tools().iter().any(|t| t.name == name)
             || name == "Skill"
             || name == "Task"
+            || name == "ListAgents"
+            || name == "AgentSendMessage"
             || name.starts_with("mcp__");
         assert!(handled, "{name} is advertised but has no handler (B3)");
     }

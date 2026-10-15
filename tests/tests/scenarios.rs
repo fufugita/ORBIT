@@ -102,6 +102,9 @@ impl Home {
     fn init(mock: &Mock, wire: &str, extra_model: &str) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().to_path_buf();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("private fixture home");
         let kind = match wire {
             "anthropic" => "anthropic",
             _ => "openai-compatible",
@@ -112,6 +115,11 @@ impl Home {
             mock.port
         );
         std::fs::write(path.join("providers.toml"), toml).expect("write providers.toml");
+        std::fs::set_permissions(
+            path.join("providers.toml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("private fixture providers");
         let out = Command::new(orbit_binary())
             .arg("--home")
             .arg(&path)
@@ -1821,9 +1829,9 @@ fn scenario_c4_denial_is_typed_not_silent() {
 
 // ── SA1: a subagent runs on the SESSION's provider ─────────────────
 // The Task tool derived its provider from ORBIT_GATE_URL / ORBIT_MODEL
-// and otherwise from a hard-coded 127.0.0.1:4001 and `glm-5.2`, so a
-// subagent never reached the gateway or model the session was using:
-// it failed (or, worse, went to whatever listened on 4001).
+// and otherwise from hard-coded defaults, so a subagent never reached
+// the gateway or model the session was using: it failed or contacted
+// an unrelated local service.
 #[test]
 fn scenario_sa1_subagent_runs_on_the_sessions_provider() {
     let script: serde_json::Value = serde_json::json!({

@@ -7,7 +7,7 @@
 //! This is the TUI-specific counterpart to the REPL loop — the REPL's inline
 //! logic in `cmd_chat` is untouched.
 
-use orbit_adapter::types::{ChatMessage, ChatRole};
+use orbit_adapter::types::{ChatMessage, ChatRole, ContentBlock, EffortSetting};
 use orbit_hud_tui::bus::BusSender;
 use orbit_hud_tui::model::TranscriptLine;
 use orbit_hud_tui::msg::Msg;
@@ -23,6 +23,8 @@ pub struct TuiTurnConfig {
     pub session_id: String,
     pub gate: String,
     pub model: String,
+    /// Selection provenance, independent of the resolved provider wire value.
+    pub effort: Option<EffortSetting>,
     pub provider_id: String,
     pub auto_tools: bool,
     /// The session's permission scope (S5): mode + operator lists.
@@ -36,11 +38,74 @@ pub struct TuiTurnConfig {
     pub initial_cost_microcents: u64,
 }
 
+fn configured_turn(config: &TuiTurnConfig) -> Result<orbit_engine::TurnConfig, String> {
+    let declared = crate::config::ProvidersConfig::load(&config.home)?;
+    let mut turn = crate::checked_model_turn(
+        &config.home,
+        &config.model,
+        Some(&config.provider_id),
+        declared.provider.is_empty().then_some(config.gate.as_str()),
+        true,
+    )?;
+    if let Some(choice) = &config.effort {
+        crate::apply_effort_setting(&config.home, &mut turn, choice)?;
+    }
+    turn.validate_effort()?;
+    Ok(turn)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_controls(
+    config: &TuiTurnConfig,
+    lease: &crate::sessions::SessionLease,
+    transcript: &[ChatMessage],
+    turns: u64,
+    input: u64,
+    output: u64,
+    cost: u64,
+    sender: &BusSender,
+    origin: crate::phase_routing::SelectionOrigin,
+) -> bool {
+    let sf = crate::sessions::SessionFile::from_chat(
+        &config.session_id,
+        &config.model,
+        &config.gate,
+        &config.provider_id,
+        transcript,
+        turns,
+        input,
+        output,
+        cost,
+    )
+    .with_effort(config.effort.clone())
+    .with_selection_origin(origin);
+    if let Err(e) = lease.save(&sf) {
+        orbit_hud_tui::emit_error(sender, &format!("settings unchanged: {e}"));
+        return false;
+    }
+    true
+}
+
 /// Build the worker spawner closure for the TUI. The CLI owns `run_turn`;
 /// this closure captures the turn config and spawns a thread that drives it.
 /// Returns a `CancelHandle` that cancels the turn currently in flight.
 pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
+    Box::new(move |ctx, sink| {
+        let lease = crate::sessions::SessionLease::acquire(&config.home, &config.session_id, "tui")
+            .map_err(|error| error.to_string())?;
+        make_spawner_owned(config, lease)(ctx, sink)
+    })
+}
+
+/// Start with the lease already held before startup state was loaded.
+pub fn make_spawner_owned(
+    config: TuiTurnConfig,
+    lease: crate::sessions::SessionLease,
+) -> orbit_hud_tui::WorkerSpawner {
     Box::new(move |ctx: WorkerCtx, _command_sink: CommandSink| {
+        if lease.session_id() != config.session_id {
+            return Err("TUI session identity differs from its held lease".into());
+        }
         // Shared slot: worker_main installs the CURRENT turn's CancelToken;
         // the handle fires it. None when no turn is running.
         let slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>> =
@@ -106,7 +171,7 @@ pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
         })));
         std::thread::Builder::new()
             .name("orbit-tui-worker".into())
-            .spawn(move || worker_main(ctx, config, slot))
+            .spawn(move || worker_main_owned(ctx, config, slot, lease))
             .map(|_| {
                 let cancel_handle: orbit_hud_tui::worker::CancelHandle =
                     std::sync::Arc::new(move || {
@@ -150,9 +215,18 @@ fn session_tool_context(config: &TuiTurnConfig, sender: &BusSender) -> orbit_too
         move |u: &crate::tool_runtime::SubagentUpdate| {
             use crate::tool_runtime::SubagentUpdate as U;
             match u {
-                U::Started { id, name, task } => {
-                    orbit_hud_tui::emit_subagent_started(&agent_sender, id, name, task)
-                }
+                U::Started {
+                    id,
+                    name,
+                    model,
+                    task,
+                } => orbit_hud_tui::emit_subagent_started_with_model(
+                    &agent_sender,
+                    id,
+                    name,
+                    task,
+                    model,
+                ),
                 U::Progress { id, action } => orbit_hud_tui::emit_subagent_progress(
                     &agent_sender,
                     id,
@@ -170,11 +244,31 @@ fn session_tool_context(config: &TuiTurnConfig, sender: &BusSender) -> orbit_too
 /// The worker's event loop — waits for prompts, runs turns, reports results.
 /// Each turn gets a fresh CancelToken installed in the shared slot so the
 /// TUI's Ctrl+C can abort the in-flight stream.
+#[cfg(test)]
 fn worker_main(
+    ctx: WorkerCtx,
+    config: TuiTurnConfig,
+    cancel_slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
+) {
+    let lease = crate::sessions::SessionLease::acquire(&config.home, &config.session_id, "tui")
+        .expect("private test session ownership");
+    worker_main_owned(ctx, config, cancel_slot, lease);
+}
+
+fn worker_main_owned(
     ctx: WorkerCtx,
     mut config: TuiTurnConfig,
     cancel_slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
+    mut lease: crate::sessions::SessionLease,
 ) {
+    let mut selection_origin =
+        match crate::sessions::read_selection_origin(lease.home(), lease.session_id()) {
+            Ok(origin) => origin,
+            Err(error) => {
+                orbit_hud_tui::emit_error(&ctx.sender, &error);
+                return;
+            }
+        };
     let mut transcript: Vec<ChatMessage> = config.initial_transcript.clone();
     let mut turns: u64 = config.initial_turns;
     let mut tool_cx = session_tool_context(&config, &ctx.sender);
@@ -195,7 +289,7 @@ fn worker_main(
     let mut auto_grants = crate::tool_runtime::AutoGrants::new();
     // The SESSION-scoped tool context (B2/E7): read-before-edit map and
     // the turn checkpoint id live here, reset per prompt.
-    let session_tool_cx = orbit_tools::ToolContext::new(
+    let mut session_tool_cx = orbit_tools::ToolContext::new(
         config.home.clone(),
         config.session_id.clone(),
         std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
@@ -204,12 +298,15 @@ fn worker_main(
     // runtime. The directive is rebuilt whenever the enabled set changes.
     let mut mods = crate::mods::load_all(&config.home);
     let mut mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
+    if crate::mods::validation_status(&config.home).is_err() {
+        ctx.sender.send(Msg::SystemMessage("Instruction bundles or enabled metadata are malformed or unsafe. Invalid entries remain disabled; run orbit doctor. Stored files are unchanged.".into()));
+    }
 
     // The JSONL transcript (phase 4): one fsynced line per event —
     // the content record that stays on the machine. Opened once;
     // appended by each turn (user prompt, assistant blocks, tool
     // results, notes).
-    let transcript_log =
+    let mut transcript_log =
         orbit_engine::transcript::Transcript::open(&config.home, &config.session_id).ok();
 
     // The frozen system prompt (phase 4): built once per session —
@@ -288,6 +385,7 @@ fn worker_main(
                     &config,
                     &mut transcript,
                     &prompt,
+                    None,
                     &ctx.sender,
                     &ctx.approvals,
                     &token,
@@ -302,6 +400,13 @@ fn worker_main(
                     Err(e) => {
                         config.scope = scope;
                         orbit_hud_tui::emit_error(&ctx.sender, &e);
+                        orbit_hud_tui::emit_response_finished(
+                            &ctx.sender,
+                            "",
+                            cum_input,
+                            cum_output,
+                            cum_cost,
+                        );
                         if let Ok(mut guard) = cancel_slot.lock() {
                             *guard = None;
                         }
@@ -333,6 +438,7 @@ fn worker_main(
                 // ORIGINAL prompt (what the operator typed); the
                 // expansion is what the model sees.
                 let expanded = expand_file_mentions(&prompt, &session_tool_cx);
+                let (expanded_prompt, user_blocks) = expanded.into_prompt();
                 if let Some(log) = &transcript_log {
                     let _ = log.append(&orbit_engine::transcript::TranscriptEvent::UserPrompt {
                         text: prompt.clone(),
@@ -344,7 +450,8 @@ fn worker_main(
                 let (_ok, input, output, cost, _final) = match run_tui_turn(
                     &config,
                     &mut transcript,
-                    &expanded,
+                    &expanded_prompt,
+                    user_blocks,
                     &ctx.sender,
                     &ctx.approvals,
                     &token,
@@ -359,6 +466,13 @@ fn worker_main(
                     Err(e) => {
                         config.scope = scope;
                         orbit_hud_tui::emit_error(&ctx.sender, &e);
+                        orbit_hud_tui::emit_response_finished(
+                            &ctx.sender,
+                            "",
+                            cum_input,
+                            cum_output,
+                            cum_cost,
+                        );
                         if let Ok(mut guard) = cancel_slot.lock() {
                             *guard = None;
                         }
@@ -417,8 +531,10 @@ fn worker_main(
                     cum_input,
                     cum_output,
                     cum_cost,
-                );
-                if let Err(e) = crate::sessions::save_session(&config.home, &sf) {
+                )
+                .with_effort(config.effort.clone())
+                .with_selection_origin(selection_origin);
+                if let Err(e) = lease.save(&sf) {
                     orbit_hud_tui::emit_error(
                         &ctx.sender,
                         &format!("warning: session not saved: {e}"),
@@ -467,10 +583,148 @@ fn worker_main(
                 if model.is_empty() {
                     continue;
                 }
+                let providers = match crate::config::ProvidersConfig::load(&config.home) {
+                    Ok(providers) => providers,
+                    Err(error) => {
+                        ctx.sender
+                            .send(Msg::EffortStatus(format!("Model unchanged:\n{error}")));
+                        continue;
+                    }
+                };
+                let selected = match crate::resolve_selected_model(&providers, &model, None, false)
+                {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        ctx.sender
+                            .send(Msg::EffortStatus(format!("Model unchanged:\n{error}")));
+                        continue;
+                    }
+                };
+                let mut candidate = config.clone();
+                candidate.model = selected.raw_model;
+                candidate.provider_id = selected.provider_id;
+                candidate.gate = selected.url;
+                let resolved = match configured_turn(&candidate) {
+                    Ok(turn) => turn,
+                    Err(e) => {
+                        ctx.sender.send(Msg::EffortStatus(format!(
+                            "Model unchanged:\n{e}\nUse /effort default before switching."
+                        )));
+                        continue;
+                    }
+                };
+                if !save_controls(
+                    &candidate,
+                    &lease,
+                    &transcript,
+                    turns,
+                    cum_input,
+                    cum_output,
+                    cum_cost,
+                    &ctx.sender,
+                    crate::phase_routing::SelectionOrigin::Interactive,
+                ) {
+                    continue;
+                }
+                selection_origin = crate::phase_routing::SelectionOrigin::Interactive;
                 let old = config.model.clone();
-                config.model = model.clone();
-                ctx.sender.send(Msg::ModelChanged(model.clone()));
+                candidate.provider_id = resolved.provider_id;
+                candidate.gate = resolved.gate;
+                config = candidate;
+                let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                system_prompt = built.text;
+                ctx.sender.send(Msg::ModelChanged(config.model.clone()));
                 orbit_hud_tui::emit_status(&ctx.sender, &format!("model → {model} (was {old})"));
+            }
+            WorkerCommand::Effort(value) => {
+                let mut candidate = config.clone();
+                if !value.is_empty() {
+                    match crate::parse_effort_setting(&value) {
+                        Ok(choice) => candidate.effort = Some(choice),
+                        Err(e) => {
+                            ctx.sender
+                                .send(Msg::EffortStatus(format!("Effort unchanged:\n{e}")));
+                            continue;
+                        }
+                    }
+                }
+                match configured_turn(&candidate) {
+                    Ok(turn) => {
+                        if !value.is_empty() {
+                            if !save_controls(
+                                &candidate,
+                                &lease,
+                                &transcript,
+                                turns,
+                                cum_input,
+                                cum_output,
+                                cum_cost,
+                                &ctx.sender,
+                                selection_origin,
+                            ) {
+                                continue;
+                            }
+                            config = candidate;
+                        }
+                        ctx.sender
+                            .send(Msg::EffortStatus(crate::effort_status(&config.home, &turn)));
+                    }
+                    Err(e) => ctx
+                        .sender
+                        .send(Msg::EffortStatus(format!("Effort unchanged:\n{e}"))),
+                }
+            }
+            WorkerCommand::Route(argument) => {
+                let words: Vec<String> = argument.split_whitespace().map(str::to_owned).collect();
+                let base = match configured_turn(&config) {
+                    Ok(base) => base,
+                    Err(error) => {
+                        ctx.sender
+                            .send(Msg::SystemMessage(format!("route: {error}")));
+                        continue;
+                    }
+                };
+                if words.as_slice() == ["auto"] {
+                    let validation = crate::route_command(
+                        &config.home,
+                        &["status".into()],
+                        Some(&base),
+                        selection_origin,
+                    );
+                    if let Err(error) = validation {
+                        ctx.sender
+                            .send(Msg::SystemMessage(format!("routing unchanged: {error}")));
+                        continue;
+                    }
+                    if save_controls(
+                        &config,
+                        &lease,
+                        &transcript,
+                        turns,
+                        cum_input,
+                        cum_output,
+                        cum_cost,
+                        &ctx.sender,
+                        crate::phase_routing::SelectionOrigin::Default,
+                    ) {
+                        selection_origin = crate::phase_routing::SelectionOrigin::Default;
+                        ctx.sender.send(Msg::Routing(Vec::new()));
+                        ctx.sender.send(Msg::SystemMessage(
+                            "Automatic routing enabled for this session".into(),
+                        ));
+                    }
+                } else {
+                    match crate::route_command(&config.home, &words, Some(&base), selection_origin)
+                    {
+                        Ok(value) => ctx.sender.send(Msg::SystemMessage(
+                            serde_json::to_string_pretty(&value).unwrap_or_default(),
+                        )),
+                        Err(error) => ctx
+                            .sender
+                            .send(Msg::SystemMessage(format!("route: {error}"))),
+                    }
+                }
             }
             WorkerCommand::ListModels => {
                 let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
@@ -504,13 +758,64 @@ fn worker_main(
                 ctx.sender.send(Msg::SystemMessage(text));
             }
             WorkerCommand::ResumeSession(id) => {
-                match crate::sessions::load_session(&config.home, &id) {
-                    Ok(s) => {
+                let target = if id.strip_suffix(".json").unwrap_or(&id) == lease.session_id() {
+                    lease.load().map(|saved| (None, saved))
+                } else {
+                    crate::sessions::SessionLease::acquire_and_load(&config.home, &id, "tui")
+                        .map(|(guard, saved)| (Some(guard), saved))
+                };
+                match target {
+                    Ok((candidate_lease, s)) => {
+                        let mut candidate = config.clone();
+                        candidate.session_id = s.session_id.clone();
+                        candidate.model = s.model.clone();
+                        candidate.gate = s.gate.clone();
+                        candidate.provider_id = s.provider.clone();
+                        candidate.effort = s.effort.clone();
+                        match configured_turn(&candidate) {
+                            Ok(turn) => {
+                                candidate.gate = turn.gate;
+                                candidate.provider_id = turn.provider_id;
+                            }
+                            Err(e) => {
+                                ctx.sender
+                                    .send(Msg::SystemMessage(format!("cannot resume {id}: {e}")));
+                                continue;
+                            }
+                        }
+                        let candidate_log = match orbit_engine::transcript::Transcript::open(
+                            &config.home,
+                            &s.session_id,
+                        ) {
+                            Ok(log) => log,
+                            Err(error) => {
+                                ctx.sender.send(Msg::SystemMessage(format!(
+                                    "cannot resume {id}: transcript: {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                        transcript_log = Some(candidate_log);
+                        selection_origin = crate::sessions::model_origin(Some(&s));
+                        ctx.sender.send(Msg::Routing(Vec::new()));
+                        config = candidate;
+                        if let Some(candidate_lease) = candidate_lease {
+                            lease = candidate_lease;
+                        }
                         transcript = s.to_transcript();
                         turns = s.turns;
                         config.session_id = s.session_id.clone();
                         config.model = s.model.clone();
                         tool_cx = session_tool_context(&config, &ctx.sender);
+                        session_tool_cx = orbit_tools::ToolContext::new(
+                            config.home.clone(),
+                            config.session_id.clone(),
+                            tool_cx.working_dir.clone(),
+                        );
+                        let built =
+                            build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                        tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                        system_prompt = built.text;
                         let lines = session_to_transcript_lines(&s.transcript);
                         ctx.sender.send(Msg::TranscriptLoaded {
                             lines,
@@ -601,30 +906,22 @@ fn worker_main(
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = Some(token.clone());
                 }
-                let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
-                let provider = cfg.provider_for_model(&config.model);
-                let pricing = cfg.pricing_for_model(&config.model);
-                let provider_id = provider
-                    .map(|p| p.name.as_str())
-                    .unwrap_or(config.provider_id.as_str());
-                let gate = provider
-                    .map(|p| p.url.as_str())
-                    .unwrap_or(config.gate.as_str());
-                let cred = provider.and_then(|p| p.env.as_deref());
-                let outcome = crate::run_turn_with_tools(
-                    &config.home,
-                    provider_id,
-                    gate,
-                    &config.model,
-                    cred,
-                    pricing,
-                    &prompt,
-                    Some(vec![]),
-                    None,
-                    token.clone(),
-                    vec![],
-                    &config.session_id,
-                );
+                let outcome = configured_turn(&config)
+                    .and_then(|turn| crate::try_role_turn_config(&config.home, &turn, "compaction"))
+                    .map_err(|e| ("ORBIT-E0401", e))
+                    .and_then(|turn| {
+                        orbit_engine::run_dispatch(
+                            &config.home,
+                            &turn,
+                            &prompt,
+                            Some(vec![]),
+                            None,
+                            token.clone(),
+                            vec![],
+                            "orbit-compact",
+                            &config.session_id,
+                        )
+                    });
                 if let Ok(mut guard) = cancel_slot.lock() {
                     *guard = None;
                 }
@@ -648,6 +945,7 @@ fn worker_main(
                             tool_result: None,
                             blocks: None,
                             origin_model: None,
+                            origin_provider: None,
                         });
                         // Usage counts for the compaction request itself.
                         cum_input = cum_input.saturating_add(o.input_tokens);
@@ -670,8 +968,10 @@ fn worker_main(
                             cum_input,
                             cum_output,
                             cum_cost,
-                        );
-                        if let Err(e) = crate::sessions::save_session(&config.home, &sf) {
+                        )
+                        .with_effort(config.effort.clone())
+                        .with_selection_origin(selection_origin);
+                        if let Err(e) = lease.save(&sf) {
                             orbit_hud_tui::emit_error(
                                 &ctx.sender,
                                 &format!("warning: session not saved: {e}"),
@@ -688,6 +988,10 @@ fn worker_main(
                 }
             }
             WorkerCommand::ListInstalledMods => {
+                if crate::mods::validation_status(&config.home).is_err() {
+                    ctx.sender.send(Msg::SystemMessage("Instruction bundle validation failed; run orbit doctor. Malformed enabled metadata is preserved and defaults stay disabled.".into()));
+                }
+
                 if mods.is_empty() {
                     ctx.sender.send(Msg::SystemMessage(
                         "no mods installed — add $ORBIT_HOME/mods/<name>/instructions.md".into(),
@@ -840,8 +1144,10 @@ fn worker_main(
                             cum_input,
                             cum_output,
                             cum_cost,
-                        );
-                        match crate::sessions::save_session(&config.home, &sf) {
+                        )
+                        .with_effort(config.effort.clone())
+                        .with_selection_origin(selection_origin);
+                        match lease.save(&sf) {
                             Ok(()) => {
                                 ctx.sender.send(Msg::SystemMessage(format!(
                                     "undid last exchange ({})",
@@ -885,51 +1191,14 @@ fn worker_main(
                 }
             }
             WorkerCommand::Permissions(arg) => {
-                let sub = arg.split_whitespace().next().unwrap_or("");
-                let tool = arg.split_whitespace().nth(1).unwrap_or("");
-                match crate::permissions::PermissionRules::load(&config.home) {
-                    Err(e) => {
-                        ctx.sender
-                            .send(Msg::SystemMessage(format!("permissions.toml: {e}")));
-                    }
-                    Ok(mut rules) => match (sub, tool) {
-                        ("allow", t) if !t.is_empty() => {
-                            let msg = rules
-                                .allow_tool(&config.home, t)
-                                .map(|_| format!("allow rule added: {t}"))
-                                .unwrap_or_else(|e| format!("error: {e}"));
-                            ctx.sender.send(Msg::SystemMessage(msg));
-                        }
-                        ("deny", t) if !t.is_empty() => {
-                            let msg = rules
-                                .deny_tool(&config.home, t)
-                                .map(|_| format!("deny rule added: {t}"))
-                                .unwrap_or_else(|e| format!("error: {e}"));
-                            ctx.sender.send(Msg::SystemMessage(msg));
-                        }
-                        ("reset", t) if !t.is_empty() => {
-                            let msg = rules
-                                .reset_tool(&config.home, t)
-                                .map(|_| format!("rules cleared: {t}"))
-                                .unwrap_or_else(|e| format!("error: {e}"));
-                            ctx.sender.send(Msg::SystemMessage(msg));
-                        }
-                        ("", _) => {
-                            let allow: Vec<String> = rules.allow.tools.iter().cloned().collect();
-                            let deny: Vec<String> = rules.deny.tools.iter().cloned().collect();
-                            ctx.sender.send(Msg::SystemMessage(format!(
-                                "allow: [{}] · deny: [{}] · usage: /permissions allow|deny|reset <tool>",
-                                allow.join(", "),
-                                deny.join(", ")
-                            )));
-                        }
-                        _ => {
-                            ctx.sender.send(Msg::SystemMessage(
-                                "usage: /permissions [allow|deny|reset <tool>]".into(),
-                            ));
-                        }
-                    },
-                }
+                let text = crate::tool_runtime::permission_command(
+                    &config.home,
+                    &config.scope,
+                    &tool_cx.working_dir,
+                    &arg,
+                )
+                .unwrap_or_else(|error| format!("permissions: {error}"));
+                ctx.sender.send(Msg::SystemMessage(text));
             }
             WorkerCommand::ShellBang(command) => {
                 // The shell bang (gate 1): one command through the Bash
@@ -1389,6 +1658,7 @@ pub fn run_tui_turn(
     config: &TuiTurnConfig,
     transcript: &mut Vec<ChatMessage>,
     prompt: &str,
+    user_blocks: Option<Vec<ContentBlock>>,
     sender: &BusSender,
     approvals: &ApprovalRegistry,
     cancel: &orbit_provider_http::CancelToken,
@@ -1408,44 +1678,34 @@ pub fn run_tui_turn(
     // One checkpoint per prompt (E7): /rewind restores a turn. The context
     // is the session's now, so the turn boundary is marked here.
     tool_cx.reset_turn_checkpoint();
-    // Resolve provider / pricing from config (same as REPL).
-    let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
-    let provider = cfg.provider_for_model(&config.model);
-    let pricing = cfg.pricing_for_model(&config.model);
-    let provider_id = provider
-        .map(|p| p.name.as_str())
-        .unwrap_or(config.provider_id.as_str())
-        .to_string();
-    let resolved_gate = provider
-        .map(|p| p.url.as_str())
-        .unwrap_or(config.gate.as_str())
-        .to_string();
-    let credential_env = provider.and_then(|p| p.env.as_deref());
-
-    let base_turn_config = crate::engine_turn_config(
-        &config.home,
-        &provider_id,
-        &resolved_gate,
-        &config.model,
-        credential_env,
-        pricing,
-    );
-    // Difficulty routing (2026-10-10): classify the prompt; a hard or
-    // easy signal with an armed target switches the turn's model. An
-    // explicit /model or --model keeps its choice (manual wins). The
-    // status line says what happened and why.
+    let base_turn_config = configured_turn(config)?;
+    let origin = crate::sessions::read_selection_origin(&config.home, &config.session_id)?;
     let (turn_config, routing_decision) =
-        crate::routed_turn_config(&config.home, &base_turn_config, prompt, &config.session_id);
-    if turn_config.model != base_turn_config.model {
-        orbit_hud_tui::emit_status(
-            sender,
-            &format!(
-                "routed {} → {} ({})",
-                routing_decision.phase.as_str(),
-                turn_config.model,
-                routing_decision.matched.join(", ")
-            ),
-        );
+        crate::try_phase_turn_config(&config.home, &base_turn_config, prompt, origin)?;
+    let resolved_gate = turn_config.gate.clone();
+    turn_config.validate_effort()?;
+    let compaction_config = crate::try_role_turn_config(&config.home, &turn_config, "compaction")?;
+    crate::tool_runtime::remember_effort_setting(
+        tool_cx,
+        if turn_config.provider_id == base_turn_config.provider_id
+            && turn_config.model == base_turn_config.model
+        {
+            &config.effort
+        } else {
+            &None
+        },
+    );
+    if let Some(decision) = routing_decision {
+        let line = crate::daemon::scan_display(&format!(
+            "route {}/{} → {}/{} ({:?})",
+            decision.phase.as_str(),
+            decision.difficulty.as_str(),
+            decision.provider_id,
+            decision.raw_model,
+            decision.source
+        ));
+        orbit_hud_tui::emit_status(sender, &line);
+        sender.send(Msg::Routing(vec![line]));
     }
 
     // The workspace rail tracks the turn's phases (§6.10):
@@ -1674,21 +1934,18 @@ pub fn run_tui_turn(
     };
 
     let options = orbit_engine::TurnOptions {
+        user_blocks,
         tools: crate::tools::session_tool_definitions(&config.home),
         session_id: config.session_id.clone(),
         system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
         memory_bytes: tool_cx.ext::<MemoryBytes>().map_or(0, |m| m.0),
         // The model's window: auto-compaction triggers at 90% of
         // window minus the output reserve (phase 4).
-        window_tokens: crate::context_window_for(&config.home, &config.model),
+        window_tokens: crate::context_window_for_turn(&config.home, &turn_config),
         request_stem: "orbit-tui".into(),
         // The compaction role: a cheap model may summarize while the
         // conversation keeps its own. None = same model summarizes.
-        compaction_config: Some(crate::role_turn_config(
-            &config.home,
-            &turn_config,
-            "compaction",
-        )),
+        compaction_config: Some(compaction_config),
         ..Default::default()
     };
 
@@ -2007,11 +2264,17 @@ mod session_tests {
     use super::*;
 
     fn config(home: &std::path::Path) -> TuiTurnConfig {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         TuiTurnConfig {
             home: home.to_path_buf(),
             session_id: "session-test".into(),
             gate: "http://127.0.0.1:1".into(),
             model: "m".into(),
+            effort: None,
             provider_id: "p".into(),
             auto_tools: true,
             scope: Default::default(),
@@ -2021,6 +2284,517 @@ mod session_tests {
             initial_output_tokens: 0,
             initial_cost_microcents: 0,
         }
+    }
+
+    #[test]
+    fn successful_resume_moves_the_jsonl_writer_before_releasing_old_ownership() {
+        use crate::sessions::{SessionFile, SessionLease, SessionLeaseError};
+        use orbit_engine::transcript::{Checkpoints, Transcript, TranscriptEvent};
+        let home = std::env::temp_dir().join(format!("orbit-p35-log-switch-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("providers.toml"),
+            "[[provider]]\nname=\"p\"\nurl=\"http://127.0.0.1:1\"\n[[provider.models]]\nid=\"m\"\n",
+        )
+        .unwrap();
+        let initial = config(&home);
+        let target = SessionLease::acquire(&home, "target", "fixture").unwrap();
+        target
+            .save(&SessionFile::from_chat(
+                "target",
+                "m",
+                "http://127.0.0.1:1",
+                "p",
+                &[],
+                0,
+                0,
+                0,
+                0,
+            ))
+            .unwrap();
+        drop(target);
+        let restored_file = home.join("restored.txt");
+        std::fs::write(&restored_file, "before").unwrap();
+        Checkpoints::new(&home, "target")
+            .snapshot_file("cp1", &restored_file)
+            .unwrap();
+        std::fs::write(&restored_file, "after").unwrap();
+        let current = SessionLease::acquire(&home, "session-test", "tui").unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_main_owned(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                initial,
+                Default::default(),
+                current,
+            )
+        });
+        commands
+            .send(WorkerCommand::ResumeSession("target".into()))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut switched = false;
+        while std::time::Instant::now() < deadline {
+            if matches!(bus.try_recv(), Some(Msg::Identity { session_id, .. }) if session_id == "target")
+            {
+                switched = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let previous = SessionLease::acquire(&home, "session-test", "another-frontend").ok();
+        let old_path = home.join("projects/session-test.jsonl");
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        commands.send(WorkerCommand::Rewind("cp1".into())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut rewound = false;
+        while std::time::Instant::now() < deadline {
+            if matches!(bus.try_recv(), Some(Msg::SystemMessage(text)) if text.starts_with("restored 1 file"))
+            {
+                rewound = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let target_owned = matches!(
+            SessionLease::acquire(&home, "target", "other"),
+            Err(SessionLeaseError::Busy { .. })
+        );
+        drop(commands);
+        worker.join().unwrap();
+        assert!(switched && rewound && previous.is_some() && target_owned);
+        assert_eq!(
+            std::fs::read(old_path).unwrap(),
+            old_bytes,
+            "released session's log must stay unchanged"
+        );
+        assert_eq!(std::fs::read_to_string(restored_file).unwrap(), "before");
+        assert!(Transcript::open(&home, "target").unwrap().events().iter().any(|event| matches!(event, TranscriptEvent::Rewound { to_checkpoint } if to_checkpoint == "cp1")));
+        drop(previous);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn failed_candidate_jsonl_open_keeps_the_old_session_owned() {
+        use crate::sessions::{SessionFile, SessionLease, SessionLeaseError};
+        let home =
+            std::env::temp_dir().join(format!("orbit-p35-log-refusal-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("providers.toml"),
+            "[[provider]]\nname=\"p\"\nurl=\"http://127.0.0.1:1\"\n[[provider.models]]\nid=\"m\"\n",
+        )
+        .unwrap();
+        let initial = config(&home);
+        let target = SessionLease::acquire(&home, "target", "fixture").unwrap();
+        target
+            .save(&SessionFile::from_chat(
+                "target",
+                "m",
+                "http://127.0.0.1:1",
+                "p",
+                &[],
+                0,
+                0,
+                0,
+                0,
+            ))
+            .unwrap();
+        drop(target);
+        std::fs::create_dir_all(home.join("projects/target.jsonl")).unwrap();
+        let current = SessionLease::acquire(&home, "session-test", "tui").unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_main_owned(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                initial,
+                Default::default(),
+                current,
+            )
+        });
+        commands
+            .send(WorkerCommand::ResumeSession("target".into()))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut refused = false;
+        let mut backend_failure = false;
+        while std::time::Instant::now() < deadline {
+            match bus.try_recv() {
+                Some(Msg::SystemMessage(text))
+                    if text.contains("cannot resume target: transcript") =>
+                {
+                    refused = true;
+                    break;
+                }
+                Some(Msg::BackendError(_)) => backend_failure = true,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        let old_owned = matches!(
+            SessionLease::acquire(&home, "session-test", "other"),
+            Err(SessionLeaseError::Busy { .. })
+        );
+        let candidate_released = SessionLease::acquire(&home, "target", "other").is_ok();
+        drop(commands);
+        worker.join().unwrap();
+        assert!(refused && old_owned && candidate_released && !backend_failure);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn busy_resume_keeps_the_current_lease_and_saved_controls() {
+        use crate::sessions::{SessionFile, SessionLease, SessionLeaseError};
+        use orbit_adapter::types::EffortValue;
+        let home = std::env::temp_dir().join(format!("orbit-p35-worker-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("providers.toml"),
+            r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:1"
+[[provider.models]]
+id = "m"
+supported_efforts = ["low", "high"]
+default_effort = "low"
+"#,
+        )
+        .unwrap();
+        let initial = config(&home);
+        let busy = SessionLease::acquire(&home, "busy", "test").unwrap();
+        busy.save(&SessionFile::from_chat(
+            "busy",
+            "m",
+            "http://127.0.0.1:1",
+            "p",
+            &[],
+            9,
+            0,
+            0,
+            0,
+        ))
+        .unwrap();
+        let before = std::fs::read(home.join("sessions/busy.json")).unwrap();
+        let current = SessionLease::acquire(&home, "session-test", "tui").unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_main_owned(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                initial,
+                Default::default(),
+                current,
+            )
+        });
+        commands.send(WorkerCommand::Effort("high".into())).unwrap();
+        commands
+            .send(WorkerCommand::ResumeSession("busy".into()))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut refused = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(message) = bus.try_recv() {
+                match message {
+                    Msg::SystemMessage(text) if text.contains("already owned") => {
+                        refused = true;
+                        break;
+                    }
+                    Msg::BackendError(error) => {
+                        panic!("idle rejection failed a provider turn: {error}")
+                    }
+                    _ => {}
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let still_owned = matches!(
+            SessionLease::acquire(&home, "session-test", "other"),
+            Err(SessionLeaseError::Busy { .. })
+        );
+        drop(commands);
+        worker.join().unwrap();
+        assert!(
+            refused,
+            "busy target must be refused through the worker control path"
+        );
+        assert!(
+            still_owned,
+            "a failed switch must retain the original live lease"
+        );
+        let saved = crate::sessions::load_session(&home, "session-test").unwrap();
+        assert_eq!(saved.model, "m");
+        assert_eq!(saved.provider, "p");
+        assert_eq!(saved.turns, 0);
+        assert_eq!(
+            saved.effort,
+            Some(EffortSetting::Value(EffortValue::Level("high".into())))
+        );
+        assert_eq!(
+            std::fs::read(home.join("sessions/busy.json")).unwrap(),
+            before
+        );
+        assert!(SessionLease::acquire(&home, "session-test", "after").is_ok());
+        drop(busy);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn idle_effort_controls_persist_reset_and_reject_incompatible_model_and_resume() {
+        use orbit_adapter::types::EffortValue;
+        let home = std::env::temp_dir().join(format!("orbit-effort-worker-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("providers.toml"),
+            r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:1"
+[[provider.models]]
+id = "m"
+supported_efforts = ["low", "high"]
+default_effort = "low"
+[[provider.models]]
+id = "other"
+supported_efforts = ["medium"]
+default_effort = "medium"
+"#,
+        )
+        .unwrap();
+        let bad = crate::sessions::SessionFile::from_chat(
+            "bad",
+            "other",
+            "http://127.0.0.1:1",
+            "p",
+            &[],
+            7,
+            0,
+            0,
+            0,
+        )
+        .with_effort(Some(EffortSetting::Value(EffortValue::Level(
+            "high".into(),
+        ))));
+        crate::sessions::save_session(&home, &bad).unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        commands.send(WorkerCommand::Effort("high".into())).unwrap();
+        commands
+            .send(WorkerCommand::SetModel("other".into()))
+            .unwrap();
+        commands
+            .send(WorkerCommand::ResumeSession("bad".into()))
+            .unwrap();
+        drop(commands);
+        worker_main(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            config(&home),
+            Default::default(),
+        );
+        let saved = crate::sessions::load_session(&home, "session-test").unwrap();
+        assert_eq!(saved.model, "m");
+        assert_eq!(
+            saved.effort,
+            Some(EffortSetting::Value(EffortValue::Level("high".into())))
+        );
+        drop(bus);
+        let (_, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        let mut resumed = config(&home);
+        resumed.effort = saved.effort;
+        commands
+            .send(WorkerCommand::Effort("default".into()))
+            .unwrap();
+        commands
+            .send(WorkerCommand::SetModel("other".into()))
+            .unwrap();
+        drop(commands);
+        worker_main(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            resumed,
+            Default::default(),
+        );
+        let saved = crate::sessions::load_session(&home, "session-test").unwrap();
+        assert_eq!(saved.model, "other");
+        assert_eq!(saved.effort, Some(EffortSetting::Default));
+        assert_eq!(
+            configured_turn(&TuiTurnConfig {
+                model: saved.model,
+                effort: saved.effort,
+                ..config(&home)
+            })
+            .unwrap()
+            .effort,
+            Some(EffortValue::Level("medium".into()))
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn saved_provider_owns_effort_when_model_ids_overlap() {
+        use orbit_adapter::types::EffortValue;
+        let home = std::env::temp_dir().join(format!("orbit-effort-owner-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("providers.toml"),
+            r#"
+[[provider]]
+name = "first"
+url = "http://127.0.0.1:1"
+[[provider.models]]
+id = "shared"
+supported_efforts = ["low", "high"]
+default_effort = "low"
+[[provider]]
+name = "second"
+url = "http://127.0.0.1:2"
+[[provider.models]]
+id = "shared"
+supported_efforts = ["medium"]
+default_effort = "medium"
+"#,
+        )
+        .unwrap();
+        let saved = crate::sessions::SessionFile::from_chat(
+            "owner",
+            "shared",
+            "http://127.0.0.1:2",
+            "second",
+            &[],
+            0,
+            0,
+            0,
+            0,
+        )
+        .with_effort(Some(EffortSetting::Value(EffortValue::Level(
+            "medium".into(),
+        ))));
+        crate::sessions::save_session(&home, &saved).unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        commands
+            .send(WorkerCommand::ResumeSession("owner".into()))
+            .unwrap();
+        commands
+            .send(WorkerCommand::Effort("default".into()))
+            .unwrap();
+        drop(commands);
+        worker_main(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            config(&home),
+            Default::default(),
+        );
+        let after = crate::sessions::load_session(&home, "owner").unwrap();
+        assert_eq!(after.provider, "second");
+        assert_eq!(after.effort, Some(EffortSetting::Default));
+        let turn = configured_turn(&TuiTurnConfig {
+            provider_id: after.provider,
+            model: after.model,
+            effort: after.effort,
+            ..config(&home)
+        })
+        .unwrap();
+        assert_eq!(turn.gate, "http://127.0.0.1:2");
+        assert_eq!(turn.effort, Some(EffortValue::Level("medium".into())));
+        drop(bus);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn idle_effort_rejections_do_not_report_a_failed_provider_turn() {
+        let home =
+            std::env::temp_dir().join(format!("orbit-effort-rejection-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("providers.toml"),
+            r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:1"
+[[provider.models]]
+id = "m"
+supported_efforts = ["low", "high"]
+default_effort = "low"
+[[provider.models]]
+id = "other"
+supported_efforts = ["medium"]
+default_effort = "medium"
+"#,
+        )
+        .unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        for value in ["high", "false", "\"unterminated", "unsupported"] {
+            commands.send(WorkerCommand::Effort(value.into())).unwrap();
+        }
+        commands
+            .send(WorkerCommand::SetModel("other".into()))
+            .unwrap();
+        drop(commands);
+        worker_main(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            config(&home),
+            Default::default(),
+        );
+        let mut reports = vec![];
+        while let Some(message) = bus.try_recv() {
+            match message {
+                Msg::BackendError(error) => {
+                    panic!("idle control emitted a backend failure: {error}")
+                }
+                Msg::EffortStatus(text) => reports.push(text),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|s| s.starts_with("Effort unchanged:"))
+                .count(),
+            3
+        );
+        assert!(reports
+            .iter()
+            .any(|s| s.contains("reasoning_effort requires a named level")));
+        assert!(reports.iter().any(|s| s.starts_with("Model unchanged:")
+            && s.contains("Use /effort default before switching.")));
+        let saved = crate::sessions::load_session(&home, "session-test").unwrap();
+        assert_eq!(saved.model, "m");
+        assert_eq!(
+            saved.effort,
+            Some(crate::parse_effort_setting("high").unwrap())
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -2145,62 +2919,224 @@ mod session_tests {
     }
 }
 
-/// Expand `@path` mentions in a prompt into inline file contents —
-/// through the Read tool, so the mention inherits the tool's whole
-/// contract: the deny-read list (credentials never reach the provider
-/// through a mention either), the secret scanner, and the
-/// read-before-edit record (an Edit after a mention is grounded).
+#[derive(Debug, Default)]
+struct FileMentionExpansion {
+    text: String,
+    images: Vec<ContentBlock>,
+}
+
+impl FileMentionExpansion {
+    /// Text remains the routing/display input; structured blocks carry images
+    /// only to the provider and persisted conversation, never to the screen.
+    fn into_prompt(self) -> (String, Option<Vec<ContentBlock>>) {
+        let blocks = if self.images.is_empty() {
+            None
+        } else {
+            let mut blocks = Vec::with_capacity(self.images.len() + 1);
+            blocks.push(ContentBlock::Text {
+                text: self.text.clone(),
+            });
+            blocks.extend(self.images);
+            Some(blocks)
+        };
+        (self.text, blocks)
+    }
+}
+
+const MAX_MENTION_IMAGES: usize = 5;
+const MAX_MENTION_IMAGE_DATA: usize = 20 * 1024 * 1024;
+
+/// Expand explicit file mentions through Read so deny-read rules, scanning,
+/// size limits and read-before-edit records apply exactly as for a tool read.
 ///
-/// Each mention becomes `@path`, then a fenced code block tagged with
-/// the file's language, holding the contents capped at 10k chars.
+/// Mentions start at whitespace or an opening punctuation cluster. Bare paths
+/// retain internal filename punctuation; trailing sentence punctuation and an
+/// unmatched closing bracket end the mention.
+/// Use @"quoted paths" (or single quotes) for spaces, embedded @, or ambiguous
+/// punctuation. Quotes escape only their delimiter and backslash.
 ///
-/// A path that does not read (missing, denied, a directory) leaves the
-/// mention untouched — the model (and the operator) see the literal
-/// `@path`, never a silent drop.
-fn expand_file_mentions(text: &str, tool_cx: &orbit_tools::ToolContext) -> String {
+/// Failed, denied or malformed mentions retain their exact original spelling.
+fn expand_file_mentions(text: &str, tool_cx: &orbit_tools::ToolContext) -> FileMentionExpansion {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find('@') {
-        let (before, after) = rest.split_at(at);
-        out.push_str(before);
-        let candidate: String = after[1..]
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '@')
-            .collect();
-        if candidate.is_empty() {
-            out.push('@');
-            rest = &after[1..];
+    let mut images = Vec::new();
+    let mut image_paths = std::collections::HashSet::new();
+    let mut image_data_size = 0usize;
+    let mut copied_to = 0;
+    let mut search_from = 0;
+    while let Some(relative_at) = text[search_from..].find('@') {
+        let at = search_from + relative_at;
+        search_from = at + 1;
+        if !file_mention_start(text, at) {
             continue;
         }
-        out.push_str(&expand_one_mention(&candidate, tool_cx));
-        let consumed = 1 + candidate.chars().count();
-        let skip: usize = after
-            .char_indices()
-            .nth(consumed)
-            .map(|(i, _)| i)
-            .unwrap_or(after.len());
-        rest = &after[skip..];
+        let (end, path) = file_mention_path(text, at);
+        search_from = end;
+        let Some(path) = path else {
+            continue;
+        };
+        out.push_str(&text[copied_to..at]);
+        let literal = &text[at..end];
+        let (expanded, image) = expand_one_mention(&path, literal, tool_cx);
+        let mut attached = true;
+        if let Some(ContentBlock::Image { data, media_type }) = image {
+            let resolved = orbit_tools::resolve_path(tool_cx, &path);
+            let identity = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+            if !image_paths.contains(&identity) {
+                let total = image_data_size.saturating_add(data.len());
+                if images.len() < MAX_MENTION_IMAGES && total <= MAX_MENTION_IMAGE_DATA {
+                    image_paths.insert(identity);
+                    image_data_size = total;
+                    images.push(ContentBlock::Image { data, media_type });
+                } else {
+                    attached = false;
+                }
+            }
+        }
+        if attached {
+            out.push_str(&expanded);
+        } else {
+            out.push_str(literal);
+            out.push_str(" [image not attached: prompt image limit reached]");
+        }
+        copied_to = end;
     }
-    out.push_str(rest);
-    out
+    out.push_str(&text[copied_to..]);
+    FileMentionExpansion { text: out, images }
+}
+
+fn file_mention_start(text: &str, at: usize) -> bool {
+    for c in text[..at].chars().rev() {
+        if c.is_whitespace() {
+            return true;
+        }
+        if !matches!(c, '(' | '[' | '{' | '<' | '"' | '\'' | '`') {
+            return false;
+        }
+    }
+    true
+}
+
+// Return the token's byte end even when it is malformed, so a second @ inside
+// a rejected token or an unclosed quoted path cannot become a separate read.
+fn file_mention_path(text: &str, at: usize) -> (usize, Option<String>) {
+    let tail = &text[at + 1..];
+    if let Some(quote @ ('"' | '\'')) = tail.chars().next() {
+        let mut path = String::new();
+        let mut chars = tail[quote.len_utf8()..].char_indices().peekable();
+        while let Some((offset, c)) = chars.next() {
+            if c == quote {
+                let end = at + 1 + quote.len_utf8() + offset + c.len_utf8();
+                let separated = text[end..].chars().next().is_none_or(|next| {
+                    next.is_whitespace()
+                        || matches!(
+                            next,
+                            ')' | ']'
+                                | '}'
+                                | '>'
+                                | ','
+                                | '.'
+                                | ';'
+                                | ':'
+                                | '!'
+                                | '?'
+                                | '"'
+                                | '\''
+                                | '`'
+                        )
+                });
+                return (end, (!path.is_empty() && separated).then_some(path));
+            }
+            if c.is_control() {
+                return (text.len(), None);
+            }
+            if c == '\\'
+                && chars
+                    .peek()
+                    .is_some_and(|(_, next)| *next == quote || *next == '\\')
+            {
+                path.push(chars.next().unwrap().1);
+            } else {
+                path.push(c);
+            }
+        }
+        return (text.len(), None);
+    }
+
+    let opening = text[..at].chars().next_back();
+    let closing = opening.and_then(|c| match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '<' => Some('>'),
+        '"' | '\'' | '`' => Some(c),
+        _ => None,
+    });
+    let mut brackets = Vec::new();
+    let mut end = text.len();
+    for (offset, c) in tail.char_indices() {
+        if c.is_whitespace()
+            || (Some(c) == closing && brackets.is_empty())
+            || (matches!(c, ')' | ']' | '}' | '>') && brackets.last() != Some(&c))
+        {
+            end = at + 1 + offset;
+            break;
+        }
+        match c {
+            '(' => brackets.push(')'),
+            '[' => brackets.push(']'),
+            '{' => brackets.push('}'),
+            '<' => brackets.push('>'),
+            ')' | ']' | '}' | '>' if brackets.last() == Some(&c) => {
+                brackets.pop();
+            }
+            _ => {}
+        }
+    }
+    while text[at + 1..end]
+        .chars()
+        .next_back()
+        .is_some_and(|c| matches!(c, ',' | '.' | ';' | ':' | '!' | '?'))
+    {
+        end -= 1;
+    }
+    let path = &text[at + 1..end];
+    (
+        end,
+        (!path.is_empty() && !path.contains('@')).then(|| path.to_string()),
+    )
 }
 
 /// One mention's expansion: the Read tool's own output, fenced. The
 /// tool's payload is JSON (`{"ok":true,"content":"…"}` or a typed
 /// denial/error); a denial or an error leaves the mention as-is.
-fn expand_one_mention(candidate: &str, tool_cx: &orbit_tools::ToolContext) -> String {
+fn expand_one_mention(
+    candidate: &str,
+    literal: &str,
+    tool_cx: &orbit_tools::ToolContext,
+) -> (String, Option<ContentBlock>) {
     use orbit_tools::Tool as _;
     let input = serde_json::json!({ "file_path": candidate });
     let result = orbit_tools::ReadTool.run(&input, tool_cx);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&result.payload) else {
-        return format!("@{candidate}");
+        return (literal.to_string(), None);
     };
     if !v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
-        return format!("@{candidate}");
+        return (literal.to_string(), None);
     }
     let Some(content) = v.get("content").and_then(|c| c.as_str()) else {
-        return format!("@{candidate}");
+        return (literal.to_string(), None);
     };
+    let image = v
+        .get("image_base64")
+        .and_then(|data| data.as_str())
+        .zip(v.get("image_media_type").and_then(|media| media.as_str()))
+        .map(|(data, media_type)| ContentBlock::Image {
+            data: data.to_string(),
+            media_type: media_type.to_string(),
+        });
+    if image.is_some() {
+        return (format!("{literal}\n{content}"), image);
+    }
     const MAX: usize = 10_000;
     let mut body = content.to_string();
     if body.chars().count() > MAX {
@@ -2212,7 +3148,10 @@ fn expand_one_mention(candidate: &str, tool_cx: &orbit_tools::ToolContext) -> St
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    format!("@{candidate}\n```{lang}\n{}\n```", body.trim_end())
+    (
+        format!("{literal}\n```{lang}\n{}\n```", body.trim_end()),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -2237,7 +3176,7 @@ mod mention_tests {
         let d = temp_home("expand");
         std::fs::write(d.join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
         let cx = cx_in(&d);
-        let out = expand_file_mentions("look at @calc.py please", &cx);
+        let out = expand_file_mentions("look at @calc.py please", &cx).text;
         assert!(out.contains("@calc.py"), "the mention itself stays: {out}");
         assert!(
             out.contains("```py") && out.contains("return a + b"),
@@ -2253,8 +3192,29 @@ mod mention_tests {
     fn a_missing_file_leaves_the_mention_untouched() {
         let d = temp_home("missing");
         let cx = cx_in(&d);
-        let out = expand_file_mentions("see @nope.txt", &cx);
+        let out = expand_file_mentions("see @nope.txt", &cx).text;
         assert_eq!(out, "see @nope.txt");
+    }
+
+    #[test]
+    fn a_directory_mention_keeps_its_literal() {
+        let d = temp_home("directory");
+        std::fs::create_dir_all(d.join("folder with spaces")).unwrap();
+        let text = r#"see @"folder with spaces""#;
+        let expanded = expand_file_mentions(text, &cx_in(&d));
+        assert_eq!(expanded.text, text);
+        assert!(expanded.images.is_empty());
+    }
+
+    #[test]
+    fn text_mentions_inherit_read_secret_redaction() {
+        let d = temp_home("scanner");
+        let token = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        std::fs::write(d.join("notes.txt"), format!("the key is {token} and more")).unwrap();
+        let expanded = expand_file_mentions("@notes.txt", &cx_in(&d));
+        assert!(expanded.text.contains("[redacted:api token]"));
+        assert!(!expanded.text.contains(token));
+        assert!(expanded.text.contains("and more"));
     }
 
     /// The deny-read list holds for mentions: a credential path never
@@ -2264,7 +3224,7 @@ mod mention_tests {
     fn a_deny_read_path_does_not_expand() {
         let d = temp_home("denyread");
         let cx = cx_in(&d);
-        let out = expand_file_mentions("read @~/.ssh/id_rsa now", &cx);
+        let out = expand_file_mentions("read @~/.ssh/id_rsa now", &cx).text;
         assert_eq!(
             out, "read @~/.ssh/id_rsa now",
             "the deny-read path must not expand — the Read tool refused it"
@@ -2276,8 +3236,8 @@ mod mention_tests {
     fn a_bare_at_is_not_a_mention() {
         let d = temp_home("bare");
         let cx = cx_in(&d);
-        assert_eq!(expand_file_mentions("email me@", &cx), "email me@");
-        assert_eq!(expand_file_mentions("a @ b", &cx), "a @ b");
+        assert_eq!(expand_file_mentions("email me@", &cx).text, "email me@");
+        assert_eq!(expand_file_mentions("a @ b", &cx).text, "a @ b");
     }
 
     /// The read-before-edit record: a mention grounds a later Edit the
@@ -2292,5 +3252,218 @@ mod mention_tests {
             cx.was_read(&d.join("a.txt")),
             "the mention recorded the read, so a later Edit is grounded"
         );
+    }
+
+    #[test]
+    fn email_urls_and_inline_at_signs_never_read_files() {
+        let d = temp_home("boundaries");
+        std::fs::write(d.join("secret.txt"), "private fixture").unwrap();
+        let cx = cx_in(&d);
+        for text in [
+            "email name@secret.txt",
+            "https://example.test/@secret.txt",
+            "https://user@secret.txt",
+            "https://example.test/(@secret.txt)",
+            "mailto:user@secret.txt",
+            "name(@secret.txt)",
+            "é@secret.txt",
+            "@name@secret.txt",
+        ] {
+            assert_eq!(expand_file_mentions(text, &cx).text, text);
+            assert!(!cx.was_read(&d.join("secret.txt")), "{text}");
+        }
+    }
+
+    #[test]
+    fn prose_punctuation_and_balanced_path_brackets_work() {
+        let d = temp_home("punctuation");
+        std::fs::write(d.join("a.txt"), "ordinary fixture").unwrap();
+        std::fs::write(d.join("report(1).txt"), "bracket fixture").unwrap();
+        let cx = cx_in(&d);
+        for (text, ending) in [
+            ("see @a.txt, please", ", please"),
+            ("see @a.txt.", "."),
+            ("see (@a.txt).", ")."),
+            ("see [(@a.txt)], please", ")], please"),
+            ("see `@a.txt`!", "`!"),
+            ("see @a.txt)", ")"),
+        ] {
+            let out = expand_file_mentions(text, &cx).text;
+            assert!(out.contains("ordinary fixture"), "{text}: {out}");
+            assert!(out.ends_with(ending), "{text}: {out}");
+        }
+        let out = expand_file_mentions("see (@report(1).txt)", &cx).text;
+        assert!(out.contains("bracket fixture"));
+        assert!(out.ends_with(')'));
+    }
+
+    #[test]
+    fn quoted_paths_preserve_spaces_punctuation_unicode_and_escaped_characters() {
+        let d = temp_home("quotes");
+        let cx = cx_in(&d);
+        for (name, mention) in [
+            ("two words.txt", r#"@"two words.txt""#),
+            ("日本語-é.txt", r#"@"日本語-é.txt""#),
+            ("report,final!.txt", r#"@"report,final!.txt""#),
+            ("quoted\"name.txt", r#"@"quoted\"name.txt""#),
+            ("single'name.txt", r#"@'single\'name.txt'"#),
+            ("back\\slash.txt", r#"@"back\\slash.txt""#),
+            ("literal\\q.txt", r#"@"literal\q.txt""#),
+            ("name@host.txt", r#"@"name@host.txt""#),
+            ("ends-in-dot.", r#"@"ends-in-dot.""#),
+        ] {
+            std::fs::write(d.join(name), "quoted fixture").unwrap();
+            let text = format!("see ({mention}), please");
+            let out = expand_file_mentions(&text, &cx).text;
+            assert!(out.contains("quoted fixture"), "{mention}: {out}");
+            assert!(out.contains(mention), "literal retained: {out}");
+            assert!(out.ends_with("), please"));
+            assert!(cx.was_read(&d.join(name)), "{mention}");
+        }
+    }
+
+    #[test]
+    fn failed_or_malformed_quotes_keep_exact_literals_without_inner_reads() {
+        let d = temp_home("malformed");
+        std::fs::write(d.join("a.txt"), "must not read").unwrap();
+        let cx = cx_in(&d);
+        for text in [
+            r#"see @"missing file.txt", please"#,
+            r#"see @'missing file.txt'"#,
+            r#"see @"unterminated @a.txt"#,
+            r#"see @"a.txt"suffix"#,
+            r#"see @"""#,
+            "see @\"a\n@a.txt\"",
+        ] {
+            assert_eq!(expand_file_mentions(text, &cx).text, text);
+            assert!(!cx.was_read(&d.join("a.txt")), "{text}");
+        }
+    }
+
+    #[test]
+    fn unicode_bare_mentions_use_byte_boundaries_and_preserve_surrounding_text() {
+        let d = temp_home("unicode");
+        std::fs::write(d.join("café.txt"), "Unicode fixture").unwrap();
+        let cx = cx_in(&d);
+        let out = expand_file_mentions("🛰 see @café.txt, then @missing.txt — done", &cx).text;
+        assert!(out.starts_with("🛰 see @café.txt\n```txt"));
+        assert!(out.ends_with(", then @missing.txt — done"));
+        assert!(out.contains("Unicode fixture"));
+    }
+
+    fn write_image(path: &std::path::Path) {
+        // A tiny deterministic fixture; Read transports image bytes unchanged.
+        std::fs::write(path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+    }
+
+    #[test]
+    fn an_image_mention_attaches_a_block_without_displaying_base64() {
+        let d = temp_home("image");
+        write_image(&d.join("screenshot.png"));
+        let expanded = expand_file_mentions("inspect @screenshot.png please", &cx_in(&d));
+        assert!(expanded.text.contains("[image: screenshot.png,"));
+        let [ContentBlock::Image { data, media_type }] = expanded.images.as_slice() else {
+            panic!("expected one image");
+        };
+        assert_eq!(media_type, "image/png");
+        assert!(!data.is_empty());
+        assert!(!expanded.text.contains(data));
+        let (prompt, blocks) = expanded.into_prompt();
+        let blocks = blocks.unwrap();
+        assert_eq!(blocks[0], ContentBlock::Text { text: prompt });
+        assert!(matches!(blocks[1], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn denied_and_missing_images_remain_literals_and_have_no_blocks() {
+        let d = temp_home("denied-image");
+        write_image(&d.join("secrets.png"));
+        let cx = cx_in(&d);
+        for text in [
+            "inspect @secrets.png",
+            r#"inspect @"secrets.png""#,
+            "inspect @missing.png",
+        ] {
+            let expanded = expand_file_mentions(text, &cx);
+            assert_eq!(expanded.text, text);
+            assert!(expanded.images.is_empty());
+            assert!(expanded.into_prompt().1.is_none());
+        }
+    }
+
+    #[test]
+    fn repeated_image_mentions_and_aliases_share_one_attachment() {
+        let d = temp_home("repeat-image");
+        write_image(&d.join("capture.png"));
+        let expanded =
+            expand_file_mentions(r#"@capture.png @./capture.png @"capture.png""#, &cx_in(&d));
+        assert_eq!(expanded.images.len(), 1);
+        assert_eq!(expanded.text.matches("[image:").count(), 3);
+    }
+
+    #[test]
+    fn image_count_limit_is_per_prompt_and_reported_in_text() {
+        let d = temp_home("image-count");
+        let mut mentions = Vec::new();
+        for i in 0..=MAX_MENTION_IMAGES {
+            let name = format!("capture{i}.png");
+            write_image(&d.join(&name));
+            mentions.push(format!("@{name}"));
+        }
+        let expanded = expand_file_mentions(&mentions.join(" "), &cx_in(&d));
+        assert_eq!(expanded.images.len(), MAX_MENTION_IMAGES);
+        assert!(expanded
+            .text
+            .ends_with(" [image not attached: prompt image limit reached]"));
+        assert!(expanded
+            .text
+            .contains(&format!("@capture{MAX_MENTION_IMAGES}.png")));
+    }
+
+    #[test]
+    fn total_encoded_image_size_is_bounded_across_the_prompt() {
+        let d = temp_home("image-data-limit");
+        let image = vec![0u8; 4 * 1024 * 1024];
+        for i in 0..4 {
+            std::fs::write(d.join(format!("capture{i}.png")), &image).unwrap();
+        }
+        let expanded = expand_file_mentions(
+            "@capture0.png @capture1.png @capture2.png @capture3.png",
+            &cx_in(&d),
+        );
+        assert_eq!(expanded.images.len(), 3);
+        let encoded_bytes: usize = expanded
+            .images
+            .iter()
+            .map(|image| {
+                let ContentBlock::Image { data, .. } = image else {
+                    panic!("expected image");
+                };
+                data.len()
+            })
+            .sum();
+        assert!(encoded_bytes <= MAX_MENTION_IMAGE_DATA);
+        assert!(expanded
+            .text
+            .ends_with("@capture3.png [image not attached: prompt image limit reached]"));
+    }
+
+    #[test]
+    fn an_oversized_image_preserves_the_literal_without_attachment() {
+        let d = temp_home("oversized-image");
+        std::fs::write(d.join("huge.png"), vec![0u8; 5 * 1024 * 1024 + 1]).unwrap();
+        let expanded = expand_file_mentions("inspect @huge.png", &cx_in(&d));
+        assert_eq!(expanded.text, "inspect @huge.png");
+        assert!(expanded.images.is_empty());
+    }
+
+    #[test]
+    fn text_mentions_remain_text_only_and_keep_the_character_limit() {
+        let d = temp_home("text-limit");
+        std::fs::write(d.join("large.txt"), "é".repeat(10_001)).unwrap();
+        let expanded = expand_file_mentions("@large.txt", &cx_in(&d));
+        assert!(expanded.text.contains("truncated"));
+        assert!(expanded.images.is_empty());
+        assert!(expanded.into_prompt().1.is_none());
     }
 }

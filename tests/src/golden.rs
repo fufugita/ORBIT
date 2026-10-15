@@ -123,13 +123,71 @@ fn cli_command_tree_golden() {
         "version",
         "chat",
         "web",
+        "serve",
+        "attach",
     ];
     assert_eq!(orbit_cli::COMMANDS, expected.as_slice());
     // Remaining v0.2 commands are gated (CLI-26).
-    for cmd in ["import", "serve", "attach", "admin"] {
+    for cmd in ["import", "admin"] {
         let args: Vec<String> = vec![cmd.into()];
         assert_eq!(parse_args(&args).unwrap_err().code(), "E110C");
     }
+    for command in ["serve", "attach"] {
+        let args = vec![
+            command.into(),
+            "--socket".into(),
+            "/tmp/example.sock".into(),
+        ];
+        assert_eq!(parse_args(&args).unwrap().command, command);
+        assert_eq!(parse_args(&[command.into()]).unwrap_err().code(), "E1101");
+    }
+}
+
+#[test]
+fn owner_arguments_reject_ambiguous_or_unsupported_controls() {
+    for values in [
+        vec!["serve", "--socket", ""],
+        vec!["serve", "--socket", "--bare"],
+        vec!["serve", "--socket", "one", "--socket", "two"],
+        vec![
+            "serve",
+            "--socket",
+            "one",
+            "--gate",
+            "http://example.invalid",
+        ],
+        vec!["serve", "--socket", "one", "--status"],
+        vec!["attach", "--socket", "one", "--effort", "high"],
+        vec!["attach", "--socket", "one", "unexpected"],
+        vec!["attach", "--socket", "one", "--unknown"],
+        vec!["attach", "--socket", "one", "--status", "--stop"],
+        vec!["serve", "--socket", "one", "--resume", "A", "--continue"],
+        vec![
+            "serve",
+            "--socket",
+            "one",
+            "--session",
+            "A",
+            "--resume",
+            "B",
+        ],
+    ] {
+        let args: Vec<String> = values.into_iter().map(String::from).collect();
+        assert_eq!(parse_args(&args).unwrap_err().code(), "E1101", "{args:?}");
+    }
+    let args: Vec<String> = [
+        "--home",
+        "/tmp/example",
+        "serve",
+        "--socket",
+        "one",
+        "--allowedTools",
+        "",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    orbit_cli::validate_owner_arguments("serve", &args).unwrap();
 }
 
 #[test]

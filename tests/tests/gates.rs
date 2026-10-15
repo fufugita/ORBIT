@@ -237,8 +237,23 @@ fn run_orbit_p_with_model(
 fn fresh_home(tag: &str) -> std::path::PathBuf {
     let home = std::env::temp_dir().join(format!("orbit-gate-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).unwrap();
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&home)
+        .unwrap();
     home
+}
+
+fn write_providers(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
+    std::fs::write(path, contents)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 fn init_home(bin: &str, home: &std::path::Path) {
@@ -347,7 +362,7 @@ fn gate4_auto_compaction_through_the_binary() {
     // A tiny window: 100 tokens → threshold = 90. init does not write
     // providers.toml, so write a complete valid one.
     let providers = home.join("providers.toml");
-    std::fs::write(
+    write_providers(
         &providers,
         format!(
             r#"[[provider]]
@@ -420,6 +435,7 @@ fn gate4_continue_after_kill9() {
     let mut child = Command::new(&bin)
         .arg("-p")
         .arg("you will not finish this")
+        .arg("--continue")
         .arg("--home")
         .arg(&home)
         .arg("--gate")
@@ -515,7 +531,7 @@ fn mod_install_signed_flow_through_binary() {
 
     // 1. Install WITHOUT trusting the issuer → refused.
     let out = Command::new(&bin)
-        .args(["mod", "install"])
+        .args(["mod", "install", "--yes"])
         .arg(&package)
         .arg("--manifest")
         .arg(&manifest)
@@ -544,7 +560,7 @@ fn mod_install_signed_flow_through_binary() {
     );
 
     let out = Command::new(&bin)
-        .args(["mod", "install"])
+        .args(["mod", "install", "--yes"])
         .arg(&package)
         .arg("--manifest")
         .arg(&manifest)
@@ -562,7 +578,7 @@ fn mod_install_signed_flow_through_binary() {
     // 3. Tampered package → digest mismatch, refused.
     std::fs::write(&package, b"package-bytes-tampered").unwrap();
     let out = Command::new(&bin)
-        .args(["mod", "install"])
+        .args(["mod", "install", "--yes"])
         .arg(&package)
         .arg("--manifest")
         .arg(&manifest)
@@ -681,6 +697,15 @@ fn gate2_one_loop_same_event_stream() {
         &workspace_target().join("debug/orbit").display().to_string(),
         &home,
     );
+    // Both frontends use the same declared provider identity. The browser
+    // refuses undeclared models rather than adopting the legacy headless gate.
+    write_providers(
+        home.join("providers.toml"),
+        format!(
+            "[[provider]]\nname='gate'\nkind='openai-compatible'\nurl='http://127.0.0.1:{port}'\n[[provider.models]]\nid='gate-test-model'\n"
+        ),
+    )
+    .unwrap();
 
     // The reference stream: `orbit -p` (the REPL/headless front-end),
     // stream-json = FrontendEvent serde.
@@ -691,19 +716,41 @@ fn gate2_one_loop_same_event_stream() {
         .collect();
     // The session's happenings in protocol terms (the scripted mock
     // plays one calculator call, then the final text).
-    let seq_a: Vec<&str> = types_a
-        .iter()
-        .map(|t| match t.as_str() {
-            "round_started" => "round_started",
-            "cost_updated" => "cost_updated",
-            "tool_started_full" => "tool_started",
-            "tool_finished_full" => "tool_finished",
-            "text_delta" => "text_delta",
-            "response_finished" => "response_finished",
-            "turn_ended" => "turn_ended",
-            other => other,
-        })
-        .collect();
+    // The owned browser buffers complete lines for its display scanner.
+    // Adjacent text chunks may coalesce; every other event keeps its position
+    // and multiplicity, and the complete text is compared below as well.
+    fn normalize_text_chunks<'a>(sequence: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+        let mut normalized = Vec::new();
+        let mut pending_text = false;
+        for kind in sequence {
+            if kind == "text_delta" {
+                pending_text = true;
+                continue;
+            }
+            // DisplayStream flushes its scanned line at response completion;
+            // accounting can therefore precede the displayed text. Defer only
+            // across these accounting events, never tools, rounds or statuses.
+            if pending_text && !matches!(kind, "ledger_appended" | "cost_updated" | "usage") {
+                normalized.push("text_delta");
+                pending_text = false;
+            }
+            normalized.push(kind);
+        }
+        if pending_text {
+            normalized.push("text_delta");
+        }
+        normalized
+    }
+    let seq_a = normalize_text_chunks(types_a.iter().map(|t| match t.as_str() {
+        "round_started" => "round_started",
+        "cost_updated" => "cost_updated",
+        "tool_started_full" => "tool_started",
+        "tool_finished_full" => "tool_finished",
+        "text_delta" => "text_delta",
+        "response_finished" => "response_finished",
+        "turn_ended" => "turn_ended",
+        other => other,
+    }));
     assert!(
         seq_a.contains(&"tool_started")
             && seq_a.contains(&"tool_finished")
@@ -721,26 +768,36 @@ fn gate2_one_loop_same_event_stream() {
         .local_addr()
         .unwrap()
         .port();
-    #[allow(clippy::zombie_processes)] // killed at test end below
-    let mut web = Command::new(&web_bin)
+    let token = format!("gate2-local-{}-{bport}", std::process::id());
+    let web_child = Command::new(&web_bin)
         .arg("--home")
         .arg(&home)
         .arg("--model")
         .arg("gate-test-model")
+        .arg("--provider")
+        .arg("gate")
         .arg("--gate")
         .arg(format!("http://127.0.0.1:{port}"))
         .arg("--auto-tools")
         .arg("--no-browser")
         .arg("--port")
         .arg(bport.to_string())
+        .arg("--token")
+        .arg(&token)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn orbit-web");
+    let mut web = MockGuard {
+        child: Some(web_child),
+    };
     let mut up = false;
     for _ in 0..50 {
         if std::net::TcpStream::connect(("127.0.0.1", bport)).is_ok() {
             up = true;
+            break;
+        }
+        if web.child.as_mut().unwrap().try_wait().unwrap().is_some() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -750,14 +807,15 @@ fn gate2_one_loop_same_event_stream() {
     // SSE reader thread (raw HTTP over loopback).
     let sse_frames: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
     let sse2 = sse_frames.clone();
-    let _reader = std::thread::spawn(move || {
+    let sse_token = token.clone();
+    let reader = std::thread::spawn(move || {
         use std::io::{BufRead, BufReader, Write};
         let mut sock = match std::net::TcpStream::connect(("127.0.0.1", bport)) {
             Ok(s) => s,
             Err(_) => return,
         };
         let req = format!(
-            "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{bport}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+            "GET /events?token={sse_token} HTTP/1.1\r\nHost: 127.0.0.1:{bport}\r\nOrigin: http://127.0.0.1:{bport}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
         );
         if sock.write_all(req.as_bytes()).is_err() {
             return;
@@ -784,25 +842,62 @@ fn gate2_one_loop_same_event_stream() {
     while sse_frames.lock().unwrap().is_empty() && std::time::Instant::now() < live_by {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    assert!(
+        !sse_frames.lock().unwrap().is_empty(),
+        "the browser SSE stream must be connected before sending the prompt"
+    );
 
     // The same prompt over the WS actions endpoint (raw client).
     {
         use std::io::{Read, Write};
         use std::net::TcpStream;
         let mut sock = TcpStream::connect(("127.0.0.1", bport)).unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
         let key = "AAAAAAAAAAAAAAAAAAAAAA==";
         let req = format!(
-            "GET /actions HTTP/1.1\r\nHost: 127.0.0.1:{bport}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            "GET /actions?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{bport}\r\nOrigin: http://127.0.0.1:{bport}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
         sock.write_all(req.as_bytes()).unwrap();
-        let mut hdr = [0u8; 2048];
-        let n = sock.read(&mut hdr).unwrap();
-        let handshake = String::from_utf8_lossy(&hdr[..n]).to_string();
+        // Read exactly the HTTP header; a coalesced controller_ready frame
+        // must remain available to the WebSocket reader.
+        let mut hdr = Vec::new();
+        while !hdr.ends_with(b"\r\n\r\n") {
+            let mut byte = [0_u8; 1];
+            sock.read_exact(&mut byte).unwrap();
+            hdr.push(byte[0]);
+            assert!(hdr.len() <= 8192, "oversized WS handshake");
+        }
+        let handshake = String::from_utf8_lossy(&hdr).to_string();
         assert!(
             handshake.starts_with("HTTP/1.1 101"),
             "WS handshake failed: {handshake}"
         );
-        let payload = br#"{"type":"prompt","text":"go"}"#;
+        fn read_ws_json(sock: &mut TcpStream) -> serde_json::Value {
+            let mut header = [0_u8; 2];
+            sock.read_exact(&mut header).unwrap();
+            assert_eq!(header[0], 0x81, "expected one complete WS text frame");
+            assert_eq!(header[1] & 0x80, 0, "server WS frame must be unmasked");
+            let size = match header[1] & 0x7f {
+                126 => {
+                    let mut length = [0_u8; 2];
+                    sock.read_exact(&mut length).unwrap();
+                    u16::from_be_bytes(length) as u64
+                }
+                127 => {
+                    let mut length = [0_u8; 8];
+                    sock.read_exact(&mut length).unwrap();
+                    u64::from_be_bytes(length)
+                }
+                size => size as u64,
+            };
+            assert!(size <= 1024 * 1024, "oversized WS reply");
+            let mut payload = vec![0_u8; size as usize];
+            sock.read_exact(&mut payload).unwrap();
+            serde_json::from_slice(&payload).expect("WS JSON reply")
+        }
+        assert_eq!(read_ws_json(&mut sock)["type"], "controller_ready");
+        let payload = br#"{"type":"prompt","request_id":"gate2-prompt","text":"go"}"#;
         let mask = [0x11u8, 0x22, 0x33, 0x44];
         let mut frame = vec![0x81u8, 0x80 | payload.len() as u8];
         frame.extend_from_slice(&mask);
@@ -810,6 +905,8 @@ fn gate2_one_loop_same_event_stream() {
             frame.push(b ^ mask[i % 4]);
         }
         sock.write_all(&frame).unwrap();
+        let ack = read_ws_json(&mut sock);
+        assert_eq!(ack["type"], "action_ack", "prompt must be accepted: {ack}");
         // The turn is over when the stream says so, not after a guess.
         let done_by = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !sse_frames
@@ -822,37 +919,75 @@ fn gate2_one_loop_same_event_stream() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
-    let _ = web.kill();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    if let Some(mut child) = web.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    reader
+        .join()
+        .expect("SSE reader must finish after bridge exit");
     let frames = sse_frames.lock().unwrap().clone();
 
     // Extract the web front-end's turn happenings as protocol names.
     // Web-only service events (identity/resumed/models/…) are outside
     // the turn stream and ignored; the comparison is the SESSION's
     // protocol stream.
-    let seq_b: Vec<&str> = frames
+    let seq_b = normalize_text_chunks(
+        frames
+            .iter()
+            .filter(|(k, _)| {
+                matches!(
+                    k.as_str(),
+                    "round_started"
+                        | "ledger_appended"
+                        | "cost_updated"
+                        | "usage"
+                        | "status"
+                        | "routing"
+                        | "tool_started"
+                        | "tool_started_full"
+                        | "tool_finished"
+                        | "tool_finished_full"
+                        | "text_delta"
+                        | "response_finished"
+                        | "turn_ended"
+                )
+            })
+            .map(|(k, _)| match k.as_str() {
+                "tool_started_full" => "tool_started",
+                "tool_finished_full" => "tool_finished",
+                // Headless reports the same selection as a status event; the
+                // owned browser carries the structured routing service event.
+                "routing" => "status",
+                other => other,
+            }),
+    );
+
+    let text_a = events_a
         .iter()
-        .filter(|(k, _)| {
-            matches!(
-                k.as_str(),
-                "round_started"
-                    | "ledger_appended"
-                    | "cost_updated"
-                    | "tool_started"
-                    | "tool_started_full"
-                    | "tool_finished"
-                    | "tool_finished_full"
-                    | "text_delta"
-                    | "response_finished"
-                    | "turn_ended"
-            )
+        .filter(|event| event["type"] == "text_delta")
+        .map(|event| event["text"].as_str().expect("headless text chunk"))
+        .collect::<String>();
+    let text_b = frames
+        .iter()
+        .filter(|(kind, _)| kind == "text_delta")
+        .map(|(_, payload)| {
+            let value: serde_json::Value =
+                serde_json::from_str(payload).expect("SSE JSON text chunk");
+            value["text"]
+                .as_str()
+                .expect("browser text chunk")
+                .to_owned()
         })
-        .map(|(k, _)| match k.as_str() {
-            "tool_started_full" => "tool_started",
-            "tool_finished_full" => "tool_finished",
-            other => other,
-        })
-        .collect();
+        .collect::<String>();
+    assert!(
+        !text_a.is_empty(),
+        "the shared stream must contain reply text"
+    );
+    assert_eq!(
+        text_a, text_b,
+        "all reply text must survive browser display buffering"
+    );
 
     assert_eq!(
         seq_a, seq_b,
@@ -1042,7 +1177,7 @@ fn route_command_sets_targets_and_previews() {
     // Two models on the mock-less config (no provider needed for the
     // classifier; targets must name a declared model, so declare one
     // provider with two).
-    std::fs::write(
+    write_providers(
         home.join("providers.toml"),
         "[[provider]]\nname = \"p\"\nurl = \"http://127.0.0.1:9\"\n\
          [[provider.models]]\nid = \"big-model\"\n\
@@ -1070,28 +1205,53 @@ fn route_command_sets_targets_and_previews() {
     // The dry run: hard prompt → hard target, with the keyword shown.
     let (v, code) = run_route(&home, &["test", "please refactor the parser"]);
     assert_eq!(code, 0, "route test must succeed: {v}");
-    assert_eq!(v["phase"], "hard", "refactor is a hard signal: {v}");
-    assert_eq!(v["model"], "big-model");
-    let matched = v["matched"].as_array().expect("matched array");
+    assert_eq!(
+        v["phase"], "general",
+        "legacy targets keep general task phase: {v}"
+    );
+    assert_eq!(v["difficulty"], "hard", "refactor is a hard signal: {v}");
+    assert_eq!(v["provider_id"], "p");
+    assert_eq!(v["source"], "legacy_difficulty");
+    assert_eq!(v["raw_model"], "big-model");
+    assert_eq!(v["model"], "p/big-model");
+    let matched = v["matched"]["hard_hits"]
+        .as_array()
+        .expect("hard hits array");
     assert!(
-        matched.iter().any(|m| m == "refactor"),
+        matched
+            .iter()
+            .any(|m| m["keyword"] == "refactor" && m["occurrences"].as_u64().unwrap_or(0) > 0),
         "the matched list names the keyword: {v}"
     );
 
     // An easy prompt with no hard word goes to the cheap tier.
     let (v, _) = run_route(&home, &["test", "briefly summarize this file"]);
-    assert_eq!(v["phase"], "easy", "{v}");
-    assert_eq!(v["model"], "small-model");
+    assert_eq!(v["phase"], "general", "{v}");
+    assert_eq!(v["difficulty"], "easy", "{v}");
+    assert_eq!(v["raw_model"], "small-model");
+    assert_eq!(v["model"], "p/small-model");
+    assert_eq!(v["provider_id"], "p");
+    assert_eq!(v["source"], "legacy_difficulty");
 
     // No signal keeps the session model.
     let (v, _) = run_route(&home, &["test", "add a button"]);
-    assert_eq!(v["phase"], "main", "{v}");
+    assert_eq!(v["phase"], "general", "{v}");
+    assert_eq!(v["difficulty"], "normal", "{v}");
+    assert_eq!(v["source"], "base", "{v}");
+    assert_eq!(v["raw_model"], "big-model");
 
     // Custom keywords extend the defaults and survive the roundtrip.
     let (v, code) = run_route(&home, &["keywords", "add", "hard", "orbitstuff"]);
     assert_eq!(code, 0, "keyword add: {v}");
     let (v, _) = run_route(&home, &["test", "orbitstuff the config"]);
-    assert_eq!(v["phase"], "hard", "custom keyword routes: {v}");
+    assert_eq!(v["phase"], "general", "{v}");
+    assert_eq!(v["difficulty"], "hard", "custom keyword routes: {v}");
+    assert_eq!(v["raw_model"], "big-model");
+    assert!(v["matched"]["hard_hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hit| hit["keyword"] == "orbitstuff" && hit["occurrences"].as_u64().unwrap_or(0) > 0));
 
     // Disarm: off clears both tiers.
     let (v, code) = run_route(&home, &["off"]);
@@ -1107,7 +1267,7 @@ fn routed_turn_switches_model_and_defers_to_explicit() {
     let home = fresh_home("route-turn");
     let bin = orbit_bin();
     init_home(bin.to_str().unwrap(), &home);
-    std::fs::write(
+    write_providers(
         home.join("providers.toml"),
         format!(
             "[[provider]]\nname = \"mock\"\nurl = \"http://127.0.0.1:{port}\"\n\n\
@@ -1123,12 +1283,7 @@ fn routed_turn_switches_model_and_defers_to_explicit() {
 
     // With an explicit --model, the operator's choice stands: the
     // turn runs on gate-test-model even for a hard prompt.
-    let (events, code) = run_orbit_p(
-        port,
-        &home,
-        "please refactor the parser",
-        &["--output-format", "stream-json"],
-    );
+    let (events, code) = run_orbit_p(port, &home, "please refactor the parser", &[]);
     assert_eq!(code, 0, "explicit-model turn must succeed");
     let all = serde_json::to_string(&events).unwrap_or_default();
     assert!(

@@ -176,3 +176,57 @@ button:hover { color: var(--text); border-color: var(--accent-dim); }
   #panes { grid-template-columns: 1fr; }
   aside { display: none; }
 }
+
+/* Typed settings remain separate from the prompt composer. */
+#effort-controls { padding: 6px 12px 12px; border-bottom: 1px solid var(--line); }
+#effort-controls label { display: block; color: var(--dim); margin-bottom: 5px; }
+#effort-select { width: 100%; background: var(--bg-inset); color: var(--text); font: inherit; border: 1px solid var(--line); border-radius: 6px; padding: 7px; }
+#effort-actions { display: flex; gap: 6px; margin-top: 7px; }
+#effort-actions button { padding: 5px 8px; font-size: 11px; }
+#effort-provenance, #effort-status { color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; margin: 7px 0 0; }
+button:disabled, select:disabled { opacity: .5; cursor: default; }
+@media (max-width: 900px) { #work-pane { display: flex; max-height: 180px; border-top: 1px solid var(--line); } #work-pane > h2:not(:first-child), #activity-list, #usage { display: none; } #panes { grid-template-rows: 1fr auto; } }
+
+/* Portable profile presentation uses individual bounded properties. */
+body { font-size: var(--font-size, 13.5px); }
+#profile-area { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+#profile-area[hidden], #customization-settings[hidden] { display: none; }
+#profile-tabs { display: flex; gap: 3px; overflow-x: auto; border-bottom: 1px solid var(--line); padding: 4px; flex-shrink: 0; }
+#profile-tabs button { padding: 4px 8px; border-radius: 4px; white-space: nowrap; }
+#profile-tabs button[aria-selected="true"] { color: var(--accent); border-color: var(--accent); }
+#profile-layout { flex: 1; min-height: 0; min-width: 0; display: flex; }
+.profile-split { display: flex; min-width: 0; min-height: 0; flex: 1; gap: 1px; background: var(--line); }
+.layout-leaf { min-width: 0; min-height: 0; overflow: auto; background: var(--bg); }
+.layout-leaf h2 { margin: 0; padding: 8px 10px; font-size: .9em; color: var(--accent); border-bottom: 1px solid var(--line); }
+.custom-pane, .builtin-pane { display: flex; flex-direction: column; }
+.pane-content { margin: 0; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; font: inherit; flex: 1; user-select: text; }
+.pane-state { color: var(--dim); font-size: .85em; padding: 3px 10px; }
+.pane-actions { display: flex; gap: 4px; padding: 6px; flex-wrap: wrap; }
+.pane-actions button { padding: 4px 7px; }
+#customization-settings { border-bottom: 1px solid var(--line); }
+#customization-settings summary { cursor: pointer; padding: 8px 10px; color: var(--accent); }
+#custom-controls { padding: 0 10px 10px; max-height: 60vh; overflow: auto; }
+#custom-controls label { display: block; color: var(--dim); margin: 6px 0; }
+#custom-controls input:not([type="checkbox"]), #custom-controls select, #custom-controls textarea { width: 100%; display: block; background: var(--bg-inset); color: var(--text); border: 1px solid var(--line); padding: 5px; font: inherit; }
+#custom-controls textarea { resize: vertical; }
+#custom-controls button { padding: 4px 6px; margin: 3px 0; }
+.custom-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+#custom-status, #custom-capabilities { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85em; color: var(--dim); max-height: 12em; overflow: auto; }
+:root[data-density="compact"] .msg { margin: 4px 0; }
+:root[data-density="compact"] #transcript { padding: 6px 10px; }
+:root[data-density="compact"] .layout-leaf h2 { padding: 3px 7px; }
+:root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+:root[data-glyphs="ascii"] .msg.user .who::before { content: "> "; }
+:root[data-glyphs="ascii"] .msg.assistant .who::before { content: "* "; }
+:root[data-glyphs="ascii"] #activity-list li.ok::before { content: "+ "; }
+:root[data-glyphs="ascii"] #activity-list li.err::before { content: "x "; }
+:root[data-glyphs="ascii"] #activity-list li.denied::before { content: "- "; }
+button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 900px) {
+  #profile-area { grid-row: 1; }
+  #profile-layout .profile-split { flex-direction: column !important; }
+  #profile-layout .layout-leaf:not([data-active="true"]) { display: none; }
+  #profile-layout .layout-leaf[data-active="true"] { flex: 1 !important; }
+  #work-pane { overflow: auto; }
+  #custom-controls { max-height: 40vh; }
+}

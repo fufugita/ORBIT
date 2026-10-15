@@ -13,6 +13,7 @@
 pub mod anim;
 pub mod app;
 pub mod chrome;
+pub mod composer;
 pub mod comps;
 pub mod core;
 pub mod layout;

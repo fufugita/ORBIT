@@ -511,10 +511,22 @@ pub fn emit_file_changed(
 
 /// Emit a subagent lifecycle event.
 pub fn emit_subagent_started(sender: &BusSender, id: &str, name: &str, task: &str) {
+    emit_subagent_started_with_model(sender, id, name, task, "");
+}
+
+/// Emit a subagent start with the model selected by its runtime.
+pub fn emit_subagent_started_with_model(
+    sender: &BusSender,
+    id: &str,
+    name: &str,
+    task: &str,
+    model: &str,
+) {
     sender.send(Msg::SubagentStarted {
         id: id.to_string(),
         name: safe_text(name),
         task: safe_text(task),
+        model: safe_text(model),
     });
 }
 
@@ -611,6 +623,42 @@ mod tests {
             out.push(msg);
         }
         out
+    }
+
+    #[test]
+    fn subagent_start_preserves_the_selected_model_and_profile() {
+        let (bus, sender) = Bus::new();
+        emit_subagent_started_with_model(
+            &sender,
+            "a1",
+            "Explore",
+            "find add()",
+            "test-child-model\u{7}",
+        );
+        assert_eq!(
+            drain(&bus),
+            vec![Msg::SubagentStarted {
+                id: "a1".into(),
+                name: "Explore".into(),
+                task: "find add()".into(),
+                model: "test-child-model".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_subagent_start_leaves_the_model_unspecified() {
+        let (bus, sender) = Bus::new();
+        emit_subagent_started(&sender, "a1", "Explore", "find add()");
+        assert_eq!(
+            drain(&bus),
+            vec![Msg::SubagentStarted {
+                id: "a1".into(),
+                name: "Explore".into(),
+                task: "find add()".into(),
+                model: String::new(),
+            }]
+        );
     }
 
     #[test]
@@ -732,11 +780,11 @@ mod tests {
     #[test]
     fn emit_status_gates() {
         let (bus, sender) = Bus::new();
-        emit_status(&sender, "model → glm-5.2");
+        emit_status(&sender, "model → fixture-model");
         let msgs = drain(&bus);
         assert_eq!(msgs.len(), 1);
         match &msgs[0] {
-            Msg::Status(s) => assert_eq!(s, "model → glm-5.2"),
+            Msg::Status(s) => assert_eq!(s, "model → fixture-model"),
             other => panic!("expected Status, got {other:?}"),
         }
     }

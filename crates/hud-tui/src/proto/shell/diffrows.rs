@@ -4,7 +4,6 @@
 //! `FileChanged` event carried — nothing here invents a line.
 
 use super::canvas::{clip_text, tint, Cv, Rgb};
-use super::pal::*;
 use orbit_frontend_protocol::DiffHunk;
 
 /// One displayable row: its marker (`@` hunk header, `+`, `-`, ` `
@@ -36,17 +35,18 @@ pub fn rows(hunks: &[DiffHunk]) -> (Vec<Row>, Vec<usize>) {
 /// A `+`/`-` line keeps its glyph as well as its tinted bar: colour is
 /// never the only signal (it must still read under NO_COLOR).
 pub fn draw(cv: &mut Cv, x: i32, y: i32, w: i32, rows: &[Row], base: Rgb) {
+    let colors = cv.palette;
     for (i, (marker, text)) in rows.iter().enumerate() {
         let yy = y + i as i32;
         match marker {
             '@' => {
-                cv.bold(x, yy, &clip_text(text, w), VIOLET, Some(base));
+                cv.bold(x, yy, &clip_text(text, w), colors.violet, Some(base));
             }
             '+' | '-' => {
                 let (glyph, fg) = if *marker == '+' {
-                    ("+ ", GREEN)
+                    ("+ ", colors.green)
                 } else {
-                    ("- ", RED)
+                    ("- ", colors.red)
                 };
                 let bg = tint(fg, base, 0.10);
                 cv.fill(x, yy, w, 1, bg);
@@ -63,7 +63,7 @@ pub fn draw(cv: &mut Cv, x: i32, y: i32, w: i32, rows: &[Row], base: Rgb) {
                     x,
                     yy,
                     &format!("  {}", clip_text(text, w - 2)),
-                    FAINT,
+                    colors.faint,
                     Some(base),
                 );
             }
@@ -72,7 +72,7 @@ pub fn draw(cv: &mut Cv, x: i32, y: i32, w: i32, rows: &[Row], base: Rgb) {
                     x,
                     yy,
                     &format!("  {}", clip_text(text, w - 2)),
-                    INK2,
+                    colors.ink2,
                     Some(base),
                 );
             }

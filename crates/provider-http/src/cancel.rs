@@ -1,8 +1,8 @@
 //! Cooperative cancellation token (DR-09 §4, GW-10).
 //!
 //! A `CancelToken` is shared between the dispatcher and the adapter stream.
-//! `cancel()` notifies waiters; the adapter checks `is_cancelled()` between
-//! events and terminates with a partial result.
+//! `cancel()` notifies waiters; adapters race pending network waits against
+//! the signal and terminate with a partial result.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,12 +39,52 @@ impl CancelToken {
             return;
         }
         let notified = self.notify.notified();
-        // Re-check after arming to avoid a lost-wakeup race.
+        tokio::pin!(notified);
+        // Constructing Notified does not register it with notify_waiters.
+        // Enable the pinned waiter before the final flag check so cancellation
+        // cannot fall between that check and the first poll of the waiter.
+        notified.as_mut().enable();
         if self.flag.load(Ordering::SeqCst) {
             return;
         }
         notified.await;
     }
+
+    /// Do not poll network work after cancellation, including when both
+    /// branches become ready together. Dropping the losing HTTP future also
+    /// releases its connection/body rather than leaving background work alive.
+    pub(crate) async fn until_cancelled<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            () = self.cancelled() => None,
+            value = future => Some(value),
+        }
+    }
+}
+
+/// Cancellation before a response body exists uses the same successful partial
+/// terminal contract as cancellation during streaming. It is never a retryable
+/// timeout or transport error.
+pub(crate) fn cancelled_stream() -> crate::AsyncProviderEventStream {
+    use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent, ProviderUsage};
+    Box::pin(futures::stream::iter([
+        Ok(ProviderStreamEvent {
+            sequence: 0,
+            event: ProviderEventKind::ResponseStarted {
+                upstream_request_id: None,
+            },
+        }),
+        Ok(ProviderStreamEvent {
+            sequence: 1,
+            event: ProviderEventKind::Finished {
+                finish_reason: Some("cancelled".into()),
+                final_usage: Some(ProviderUsage::default()),
+            },
+        }),
+    ]))
 }
 
 impl std::fmt::Debug for CancelToken {

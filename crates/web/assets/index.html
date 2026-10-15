@@ -37,6 +37,11 @@
       </div>
     </aside>
 
+    <section id="profile-area" hidden>
+      <nav id="profile-tabs" role="tablist" aria-label="Workspace panes"></nav>
+      <div id="profile-layout"></div>
+    </section>
+
     <section id="chat-pane">
       <div id="transcript" aria-live="polite"></div>
       <div id="composer-wrap">
@@ -48,6 +53,42 @@
     </section>
 
     <aside id="work-pane">
+      <details id="customization-settings" hidden>
+        <summary>Appearance and panes</summary>
+        <div id="custom-controls">
+          <label>Theme<select id="custom-theme" data-custom-write><option value="orbit">Orbit</option><option value="midnight">Midnight</option><option value="paper">Paper</option></select></label>
+          <label>Spacing<select id="custom-density" data-custom-write><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></label>
+          <label>Symbols<select id="custom-glyphs" data-custom-write><option value="auto">Automatic</option><option value="unicode">Unicode</option><option value="ascii">ASCII</option></select></label>
+          <label>Terminal color mode<select id="custom-mode" data-custom-write><option value="auto">Automatic</option><option value="truecolor">Full color</option><option value="256">256 colors</option><option value="16">16 colors</option><option value="mono">Monochrome</option></select></label>
+          <label><input id="custom-motion" type="checkbox" data-custom-write> Reduce motion</label>
+          <label>Browser font<input id="custom-font" type="text" maxlength="128" placeholder="monospace" data-custom-write></label>
+          <label>Font size<input id="custom-font-size" type="number" min="10" max="24" step="0.5" data-custom-write></label>
+          <button id="custom-font-apply" data-custom-write>Apply font</button>
+          <label>Color role<input id="custom-color-key" value="ink" maxlength="64" data-custom-write></label>
+          <label>Color<input id="custom-color" type="color" value="#eeeaF5" data-custom-write></label>
+          <button id="custom-color-apply" data-custom-write>Apply color</button>
+          <label>Layout<select id="custom-layout" data-custom-write><option value="columns">Columns</option><option value="build">Build</option><option value="agents">Agents</option><option value="review">Review</option><option value="custom" disabled>Custom</option></select></label>
+          <details><summary>Custom layout and panes</summary>
+            <label>Layout tree<textarea id="custom-tree" rows="4" maxlength="32768" data-custom-write></textarea></label>
+            <button id="custom-tree-apply" data-custom-write>Apply layout</button>
+            <label>Named panes<textarea id="custom-panes" rows="5" maxlength="65536" data-custom-write></textarea></label>
+            <button id="custom-panes-apply" data-custom-write>Apply panes</button>
+          </details>
+          <label>Portable profile file<input id="custom-path" type="text" maxlength="256" placeholder="profile.json" data-custom-write></label>
+          <div class="custom-actions"><button id="custom-validate" data-custom-write>Validate</button><button id="custom-import" data-custom-write>Import</button><button id="custom-export" data-custom-write>Export</button></div>
+          <div class="custom-actions"><button id="custom-reload">Reload</button><button id="custom-reset" data-custom-write>Reset</button></div>
+          <p id="custom-status" role="status" aria-live="polite"></p>
+          <p id="custom-capabilities"></p>
+        </div>
+      </details>
+      <h2>effort</h2>
+      <div id="effort-controls">
+        <label for="effort-select">Reasoning effort</label>
+        <select id="effort-select" aria-describedby="effort-provenance effort-status"></select>
+        <div id="effort-actions"><button id="effort-query">Refresh</button><button id="effort-reset">Use default</button></div>
+        <p id="effort-provenance" aria-live="polite"></p>
+        <p id="effort-status" aria-live="polite"></p>
+      </div>
       <h2>activity</h2>
       <ul id="activity-list"></ul>
       <h2>usage</h2>

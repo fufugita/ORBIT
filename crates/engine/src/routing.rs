@@ -204,17 +204,303 @@ fn normalize(s: &str) -> String {
 /// appear starting and ending at a word boundary. `;` `:` `.` `,`
 /// count as boundaries too (a keyword before punctuation matches).
 fn contains_phrase(hay: &str, needle: &str) -> bool {
-    let Some(at) = hay.find(needle) else {
-        return false;
-    };
-    let before_ok = at == 0 || !is_word_char(hay.as_bytes()[at - 1]);
-    let end = at + needle.len();
-    let after_ok = end >= hay.len() || !is_word_char(hay.as_bytes()[end]);
-    before_ok && after_ok
+    !phrase_ranges(hay, needle).is_empty()
 }
 
-fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+/// Maximum UTF-8 prompt and keyword sizes accepted by the phase classifier.
+pub const MAX_ROUTING_PROMPT_BYTES: usize = 256 * 1024;
+pub const MAX_ROUTING_KEYWORDS: usize = 128;
+pub const MAX_ROUTING_KEYWORD_BYTES: usize = 96;
+
+/// The type of work, independent of its difficulty.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskPhase {
+    General,
+    Thinking,
+    Planning,
+    Coding,
+    Design,
+    Orchestration,
+    Pentest,
+}
+impl TaskPhase {
+    pub const ALL: [Self; 7] = [
+        Self::General,
+        Self::Thinking,
+        Self::Planning,
+        Self::Coding,
+        Self::Design,
+        Self::Orchestration,
+        Self::Pentest,
+    ];
+    pub const PRECEDENCE: [Self; 6] = [
+        Self::Pentest,
+        Self::Design,
+        Self::Planning,
+        Self::Coding,
+        Self::Orchestration,
+        Self::Thinking,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Thinking => "thinking",
+            Self::Planning => "planning",
+            Self::Coding => "coding",
+            Self::Design => "design",
+            Self::Orchestration => "orchestration",
+            Self::Pentest => "pentest",
+        }
+    }
+}
+impl std::str::FromStr for TaskPhase {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|p| p.as_str() == value)
+            .ok_or_else(|| "unknown task phase".into())
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Difficulty {
+    Normal,
+    Easy,
+    Hard,
+}
+impl Difficulty {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Easy => "easy",
+            Self::Hard => "hard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct KeywordHit {
+    pub keyword: String,
+    pub occurrences: usize,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TaskDecision {
+    pub phase: TaskPhase,
+    pub difficulty: Difficulty,
+    pub phase_hits: std::collections::BTreeMap<TaskPhase, Vec<KeywordHit>>,
+    pub hard_hits: Vec<KeywordHit>,
+    pub easy_hits: Vec<KeywordHit>,
+    pub phase_override: bool,
+}
+
+pub fn default_phase_keywords() -> std::collections::BTreeMap<TaskPhase, Vec<String>> {
+    use TaskPhase::*;
+    [
+        (
+            Thinking,
+            &[
+                "analyze",
+                "analyse",
+                "explain",
+                "reason",
+                "compare",
+                "understand",
+            ] as &[&str],
+        ),
+        (
+            Planning,
+            &["plan", "planning", "roadmap", "milestone", "strategy"],
+        ),
+        (
+            Coding,
+            &[
+                "code",
+                "coding",
+                "implement",
+                "fix",
+                "debug",
+                "refactor",
+                "function",
+                "test",
+            ],
+        ),
+        (
+            Design,
+            &[
+                "design",
+                "redesign",
+                "layout",
+                "theme",
+                "interface",
+                "typography",
+            ],
+        ),
+        (
+            Orchestration,
+            &[
+                "orchestrate",
+                "orchestration",
+                "delegate",
+                "spawn agents",
+                "coordinate",
+            ],
+        ),
+        (
+            Pentest,
+            &[
+                "pentest",
+                "penetration test",
+                "security review",
+                "vulnerability",
+                "exploit",
+                "recon",
+                "audit",
+            ],
+        ),
+    ]
+    .into_iter()
+    .map(|(p, words)| (p, words.iter().map(|s| (*s).into()).collect()))
+    .collect()
+}
+
+pub fn validate_keyword_list(words: &[String]) -> Result<(), String> {
+    if words.len() > MAX_ROUTING_KEYWORDS {
+        return Err("routing keyword category exceeds 128 entries".into());
+    }
+    for word in words {
+        if word.len() > MAX_ROUTING_KEYWORD_BYTES
+            || normalize(word).is_empty()
+            || word.chars().any(|c| c.is_control() && !c.is_whitespace())
+        {
+            return Err("routing keyword must be nonempty, printable and at most 96 bytes".into());
+        }
+    }
+    Ok(())
+}
+
+/// Match every valid occurrence. A substring within a larger Unicode word is not a hit.
+fn phrase_ranges(hay: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    hay.match_indices(needle)
+        .filter_map(|(at, _)| {
+            let end = at + needle.len();
+            let word = |c: char| {
+                c.is_alphanumeric()
+                    || c == '_'
+                    || matches!(c,
+                    '\u{0300}'..='\u{036f}' | '\u{1ab0}'..='\u{1aff}' |
+                    '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}' |
+                    '\u{fe20}'..='\u{fe2f}' | '\u{200c}' | '\u{200d}')
+            };
+            let before = hay[..at].chars().next_back().is_none_or(|c| !word(c));
+            let after = hay[end..].chars().next().is_none_or(|c| !word(c));
+            (before && after).then_some(at..end)
+        })
+        .collect()
+}
+fn keyword_hits(hay: &str, words: &[String]) -> Vec<KeywordHit> {
+    let mut seen = std::collections::BTreeSet::new();
+    words
+        .iter()
+        .filter_map(|word| {
+            let keyword = normalize(word);
+            if !seen.insert(keyword.clone()) {
+                return None;
+            }
+            let occurrences = phrase_ranges(hay, &keyword).len();
+            (occurrences > 0).then_some(KeywordHit {
+                keyword,
+                occurrences,
+            })
+        })
+        .collect()
+}
+
+/// Classify phase mode without treating domain names as complexity evidence.
+/// The returned matches contain keywords/counts only, never prompt content.
+pub fn classify_task(
+    phases: &std::collections::BTreeMap<TaskPhase, Vec<String>>,
+    hard: &[String],
+    easy: &[String],
+    prompt: &str,
+    phase_override: Option<TaskPhase>,
+) -> Result<TaskDecision, String> {
+    if prompt.len() > MAX_ROUTING_PROMPT_BYTES {
+        return Err("routing prompt exceeds 256 KiB".into());
+    }
+    for words in phases.values().map(Vec::as_slice).chain([hard, easy]) {
+        validate_keyword_list(words)?;
+    }
+    let hay = normalize(prompt);
+    let phase_hits: std::collections::BTreeMap<_, _> = phases
+        .iter()
+        .filter_map(|(phase, words)| {
+            let hits = keyword_hits(&hay, words);
+            (!hits.is_empty()).then_some((*phase, hits))
+        })
+        .collect();
+    let selected = phase_override.unwrap_or_else(|| {
+        TaskPhase::PRECEDENCE
+            .into_iter()
+            .find(|p| phase_hits.contains_key(p))
+            .unwrap_or(TaskPhase::General)
+    });
+    // Labels identify a domain; they do not make every task in that domain hard.
+    // Keep action/complexity signals such as refactor, redesign and root cause.
+    let labels = [
+        "general",
+        "thinking",
+        "planning",
+        "coding",
+        "design",
+        "orchestration",
+        "pentest",
+        "penetration test",
+        "security review",
+        "vulnerability",
+        "exploit",
+        "recon",
+        "audit",
+    ];
+    let mut ranges: Vec<_> = labels
+        .into_iter()
+        .flat_map(|label| phrase_ranges(&hay, label))
+        .collect();
+    ranges.sort_by_key(|r| r.start);
+    let mut stripped = String::with_capacity(hay.len());
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start < cursor {
+            continue;
+        }
+        stripped.push_str(&hay[cursor..range.start]);
+        stripped.push(' ');
+        cursor = range.end;
+    }
+    stripped.push_str(&hay[cursor..]);
+    let hard_hits = keyword_hits(&stripped, hard);
+    let easy_hits = keyword_hits(&stripped, easy);
+    let difficulty = if !hard_hits.is_empty() {
+        Difficulty::Hard
+    } else if !easy_hits.is_empty() {
+        Difficulty::Easy
+    } else {
+        Difficulty::Normal
+    };
+    Ok(TaskDecision {
+        phase: selected,
+        difficulty,
+        phase_hits,
+        hard_hits,
+        easy_hits,
+        phase_override: phase_override.is_some(),
+    })
 }
 
 /// Record one routing outcome under the session dir, the same pattern
@@ -261,6 +547,24 @@ pub fn strip_foreign_opaque_blocks(
     transcript: &mut [orbit_adapter::types::ChatMessage],
     keep_for: &str,
 ) -> usize {
+    strip_opaque_blocks(transcript, None, keep_for)
+}
+
+/// Provider-aware dispatch guard. Legacy history without both provenance fields
+/// cannot prove ownership, even if its raw model happens to match the target.
+pub fn strip_foreign_opaque_blocks_for(
+    transcript: &mut [orbit_adapter::types::ChatMessage],
+    provider: &str,
+    model: &str,
+) -> usize {
+    strip_opaque_blocks(transcript, Some(provider), model)
+}
+
+fn strip_opaque_blocks(
+    transcript: &mut [orbit_adapter::types::ChatMessage],
+    provider: Option<&str>,
+    keep_for: &str,
+) -> usize {
     use orbit_adapter::types::{ChatRole, ContentBlock};
     let mut dropped = 0usize;
     for m in transcript.iter_mut() {
@@ -279,16 +583,18 @@ pub fn strip_foreign_opaque_blocks(
             .origin_model
             .as_deref()
             .map(|om| om == keep_for)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && provider.is_none_or(|provider| m.origin_provider.as_deref() == Some(provider));
         if same {
             continue;
         }
         let blocks = m.blocks.take().unwrap_or_default();
+        let before = blocks.len();
         let kept: Vec<ContentBlock> = blocks
             .into_iter()
             .filter(|b| !matches!(b, ContentBlock::Opaque { .. }))
             .collect();
-        dropped += 1;
+        dropped += usize::from(kept.len() != before);
         m.blocks = (!kept.is_empty()).then_some(kept);
     }
     dropped
@@ -398,6 +704,7 @@ mod tests {
                     json: r#"{"type":"thinking"}"#.into(),
                 }]),
                 origin_model: Some("old-model".into()),
+                origin_provider: None,
             },
             ChatMessage {
                 role: ChatRole::Assistant,
@@ -409,6 +716,7 @@ mod tests {
                     json: r#"{"type":"thinking"}"#.into(),
                 }]),
                 origin_model: Some("new-model".into()),
+                origin_provider: None,
             },
         ];
         let dropped = strip_foreign_opaque_blocks(&mut transcript, "new-model");

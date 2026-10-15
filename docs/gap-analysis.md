@@ -1,5 +1,88 @@
 # ORBIT: competitive gap analysis
 
+## Current implementation status — 15 Oct 2026
+
+The current candidate adds a shared, deterministic phase router. Phase and
+difficulty are separate decisions, exact provider/model identities are checked
+before dispatch, and previews use the same selection path as live turns.
+Explicit model selections pin a session; `/route auto` clears the pin. Saved
+sessions and agents retain that choice. Provider/model changes discard foreign
+signed thinking from the outgoing copy while preserving saved history.
+
+Offline `setup`, idempotent `init`, and `doctor` expose installation and local
+readiness. Managed Linux bundles contain both command-line and browser
+executables, verified before an atomic activation. Setup stores credential
+environment-variable names and preserves existing signing identity and ledger.
+See [setup](setup.md) for supported installation and configuration paths.
+
+Terminal and browser use a versioned appearance profile with three themes,
+semantic color overrides, density, glyphs, reduced motion, layouts and named
+panes. Browser fonts are configurable; terminal fonts belong to the terminal
+application. Portable profiles contain inert text, permitted local Markdown,
+or bounded context snapshots. Pane actions can refresh, focus, prepare a draft
+or request an authorized cancellation. They cannot execute arbitrary extension
+code. See [customization](customization.md) for the schema and limits.
+
+`pentest init` provides an explicit local scaffold with empty scope, evidence,
+findings, reports, workflow skills, a triage agent and a portable pane profile.
+It preserves existing work and leaves folder trust, profile import and external
+actions explicit. See [pentest workspaces](pentest.md).
+
+MCP policy now exposes exact server/tool Allow, Deny and Ask decisions. Local
+owners and attach clients share one session with exclusive control, durable
+leases, reconnect recovery and cancellation. The browser consumes that owner.
+Opt-in LSP diagnostics and browser tools through configured stdio MCP servers
+use inherited scope, bounded results and cancellation. Signed content packages
+have checked installation, local catalog/status and durable install records.
+
+Live-provider acceptance for this candidate remains a separate step; follow the
+[provider trial](provider-acceptance.md). Remaining gaps include remote HTTP MCP,
+argument-aware MCP grants, live agent steering/background scheduling, native
+IDE integration, a hosted marketplace and arbitrary JavaScript extension APIs.
+Reference comparisons use bounded help, schema, documentation and package-source
+evidence; they do not establish exhaustive runtime parity.
+
+## Earlier checkpoints
+
+The comparison below records the earlier checkpoint. The latest pass adds
+workspace file completion, URL/email-safe mentions, quoted paths, Ctrl-R
+history search, exact multiline history persistence with legacy-file support,
+and image attachments from file mentions. Suggestions and search results
+edit the draft; they do not send a turn. Read permissions, deny-read defaults,
+scanning, cancellation, and image size limits still apply.
+
+Agents now have stable IDs, display names, persisted conversations, explicit
+configured model choices and bounded message queues. `Task`/`Agent` resumes
+the saved profile and model; `ListAgents` provides paged discovery, and
+`AgentSendMessage` queues input for the next explicit resume. Runs remain
+synchronous. The panel shows the actual model, and child runs inherit
+parent permissions, directories and cancellation with a three-level
+nesting limit. Saved state does not restore grants or credentials.
+
+The native Unix MCP path now isolates each server, applies absolute
+deadlines and cancellation to lock/pipe/protocol waits, bounds frames
+and paged discovery, and supports exact tool exposure filters. Dispatch
+checks those filters and inherited caller scope, preserves server error
+flags and structured results, scans success/error content, and bounds
+the encoded response. Failed calls are not automatically replayed.
+
+Provider-specific effort controls now use declared model choices and
+defaults. Startup flags and chat commands select or reset the setting;
+saved chats and named agents retain selection provenance. Dispatch validates
+the actual model and uses each adapter's effort/thinking field. Missing
+capability metadata remains unknown, and explicit choices require a declared
+match. Existing provider defaults remain unchanged when no choice is set.
+
+Remaining agent work includes live steering and background scheduling.
+Remaining MCP work includes argument-aware
+rules and narrow grants, remote HTTP transport and broader server attachment.
+At that checkpoint, other follow-up areas were LSP diagnostics, browser
+integration and distribution. The lifecycle pass used REA to generate and inspect the
+reference's declared app-server schemas; this establishes interface
+contracts, not exercised reference lifecycle behavior.
+The seven-reference survey has bounded help and package-source coverage;
+it does not establish exhaustive feature parity or native decompilation.
+
 Oct 10–11, 2026 · @fugi · built from the code on `night-2026-10-10-router-and-subagents` (off `main` at `5a172eb`)
 
 ## Method
@@ -40,7 +123,7 @@ third is deliberate scope.
 | LSP diagnostics in context | partial (IDE surface) | — | yes | **yes** | — | none | Later |
 | Browser-use tool | — | — | **headless browser** | — | — | WebFetch only | Later |
 | Session share URL | — | — | — | yes | — | encrypted export + verify (provable, offline) | Different axis — ours is stronger for audit, theirs for collaboration |
-| Thinking display / effort control | toggle + levels | levels | — | — | — | adaptive only, hardcoded | Later |
+| Thinking display / effort control | toggle + levels | levels | — | — | — | model-declared effort choices, startup/chat controls, saved selections | Built; dynamic capability discovery remains open |
 | Plugin marketplace | plugins | — | **MCP marketplace** | — | — | signed mods (`orbit mod install`) | Later |
 | Checkpoints / rewind | `/rewind` | — | checkpoints | — | session branch | checkpoints + `/rewind` + `/undo` | Parity |
 | Permission rules w/ patterns | yes | sandbox-first | yes | yes | ask-always | 5 scopes, deny-read defaults, folder trust | **Ahead** |
@@ -85,9 +168,8 @@ from prior verified reading).
 | 5 | @-mentions + input history | day-one ergonomics; both small, both expected. |
 | 6 | Image reads → Image blocks | the adapter type exists; Read needs to produce it. |
 
-Deliberately **not now**: LSP diagnostics (valuable, but a context-
+At that earlier checkpoint, deferred work included LSP diagnostics (valuable, but a context-
 quality project, not a correctness one), browser-use (Cline's niche;
-ORBIT is not a browser harness), thinking-effort control (adaptive
-thinking is wired; effort levels are provider-specific and shallow),
+ORBIT is not a browser harness), thinking-effort control,
 marketplace (signed mods already install; distribution is a later
 problem).

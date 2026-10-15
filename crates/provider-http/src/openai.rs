@@ -65,6 +65,11 @@ impl OpenAiCompatibleHttpV1 {
     ) -> Result<AsyncProviderEventStream, AdapterError> {
         // Validate the route offline (DR-09 §3 — no I/O).
         self.validate_route(&request.route)?;
+        if let Some(effort) = &request.effort {
+            effort
+                .validate_for_openai()
+                .map_err(AdapterError::ProviderConfigurationInvalid)?;
+        }
 
         // URL from the route: scheme (HttpLoopback → http, else https with
         // SPKI pinning) + host/port + the gate URL's base path (empty =
@@ -138,6 +143,9 @@ impl OpenAiCompatibleHttpV1 {
             body["tools"] = serde_json::Value::Array(tools);
             body["tool_choice"] = serde_json::Value::String("auto".into());
         }
+        if let Some(effort) = &request.effort {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
         // E8: sampling is opt-in per model. Zero means unset — omit it
         // entirely (OpenAI reasoning models reject `temperature`).
         if request.sampling.temperature_milliunits > 0 {
@@ -162,15 +170,33 @@ impl OpenAiCompatibleHttpV1 {
         }
 
         let connect_timeout = std::time::Duration::from_millis(request.connect_timeout_ms);
-        let resp = tokio::time::timeout(connect_timeout, req.send())
+        let Some(response) = cancel
+            .until_cancelled(tokio::time::timeout(connect_timeout, req.send()))
             .await
+        else {
+            return Ok(crate::cancel::cancelled_stream());
+        };
+        let resp = response
             .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
             .map_err(|e| AdapterError::ProviderTransportFailure(format!("send: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
             // E1/E2: read the body, classify precisely, retry 5xx.
-            let body = resp.text().await.unwrap_or_default();
+            let Some(body) = cancel
+                .until_cancelled(tokio::time::timeout(
+                    std::time::Duration::from_millis(request.idle_timeout_ms),
+                    resp.text(),
+                ))
+                .await
+            else {
+                return Ok(crate::cancel::cancelled_stream());
+            };
+            let body = body
+                .map_err(|_| {
+                    AdapterError::ProviderTimeout("error response body stalled (E0409)".into())
+                })?
+                .unwrap_or_default();
             return Err(crate::error::status_error(status, body).await);
         }
 
@@ -215,9 +241,10 @@ fn openai_stream(
             } else {
                 idle_timeout_ms
             });
-            match tokio::time::timeout(budget, bytes.next()).await {
-                Ok(item) => item,
-                Err(_) => {
+            match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
+                None => None,
+                Some(Ok(item)) => item,
+                Some(Err(_)) => {
                     yield Err(AdapterError::ProviderTimeout(
                         "stream stalled: no bytes within the idle timeout (E0409)".into(),
                     ));
@@ -362,6 +389,9 @@ fn openai_stream(
                 event: ProviderEventKind::ToolCallFinished { call_index: index },
             });
             seq += 1;
+        }
+        if cancel.is_cancelled() {
+            finish_reason = Some("cancelled".into());
         }
         yield Ok(ProviderStreamEvent {
             sequence: seq,

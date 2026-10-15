@@ -2521,6 +2521,7 @@ dependencies = [
  "orbit-hud-tui",
  "orbit-ledger",
  "orbit-mcp",
+ "orbit-mock-provider",
  "orbit-pib",
  "orbit-plugin",
  "orbit-provider-http",
@@ -2530,6 +2531,7 @@ dependencies = [
  "orbit-trust",
  "rand 0.8.7",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2666,6 +2668,7 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "crossterm",
+ "ignore",
  "orbit-frontend-protocol",
  "orbit-hud",
  "ratatui",
@@ -2715,6 +2718,7 @@ name = "orbit-mcp"
 version = "0.2.0"
 dependencies = [
  "hex",
+ "libc",
  "orbit-adapter",
  "serde",
  "serde_json",

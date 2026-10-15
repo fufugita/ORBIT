@@ -8,6 +8,9 @@ use super::anim::StarState;
 /// FrontendEvent maps to a state change (or an explicit ignore).
 #[derive(Debug, Clone, Default)]
 pub struct Scenario {
+    pub routing_lines: Vec<String>,
+    pub custom_panes:
+        std::collections::BTreeMap<String, orbit_frontend_protocol::customization::PaneOutput>,
     /// The model being waited on (M05's "waiting for {model}").
     pub model: String,
     /// The session's permission mode (S5), updated by ModeChanged and
@@ -209,6 +212,8 @@ pub struct TurnReport {
 pub struct TranscriptLine {
     pub kind: LineKind,
     pub text: String,
+    /// A structured control report whose full text must remain readable.
+    pub wrap: bool,
     /// Tool lines (§9.8): the tool name and state, rendered as
     /// `{glyph} {name}  {arg}` with right-aligned meta.
     pub tool_name: String,
@@ -239,6 +244,7 @@ impl Default for TranscriptLine {
         TranscriptLine {
             kind: LineKind::System,
             text: String::new(),
+            wrap: false,
             tool_name: String::new(),
             tool_state: ToolState::Queued,
             call_id: String::new(),
@@ -301,6 +307,8 @@ pub enum LineKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agent {
     pub name: String,
+    /// The runtime's selected model; empty if it was not supplied.
+    pub model: String,
     /// What it was asked to do (its prompt's first line).
     pub task: String,
     /// What it is doing now (its latest tool call); empty until it starts one.

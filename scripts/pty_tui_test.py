@@ -14,6 +14,7 @@ Usage:
 import argparse
 import fcntl
 import os
+from pathlib import Path
 import pty
 import re
 import select
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import termios
 import time
+from urllib.parse import urlsplit
 
 try:
     import pyte
@@ -301,14 +303,22 @@ def make_providers(home, provider, gate, model):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", default="/media/hanu/HANU/ORBIT/target/debug/orbit")
-    ap.add_argument("--mock", default="/media/hanu/HANU/ORBIT/target/debug/orbit-mock-provider")
+    repo = Path(__file__).resolve().parents[1]
+    ap.add_argument("--binary", default=str(repo / "target/debug/orbit"))
+    ap.add_argument("--mock", default=str(repo / "target/debug/orbit-mock-provider"))
     ap.add_argument("--home", default="/tmp/orbit-pty-home")
     ap.add_argument("--model", default="mock-slow")
     ap.add_argument("--provider", default="local")
     ap.add_argument("--gate", default="http://127.0.0.1:8088")
     ap.add_argument("--token", default="test-token")
     args = ap.parse_args()
+    gate = urlsplit(args.gate)
+    if (gate.scheme != "http" or gate.hostname != "127.0.0.1"
+            or gate.username is not None or gate.password is not None
+            or gate.path not in ("", "/") or gate.query or gate.fragment
+            or gate.port is None):
+        ap.error("--gate must be an explicit HTTP loopback port")
+    mock_port = gate.port
     # Absolute: some sessions run in another working directory.
     args.binary = os.path.abspath(args.binary)
     args.mock = os.path.abspath(args.mock)
@@ -344,7 +354,7 @@ def main():
     make_providers(args.home, args.provider, args.gate, args.model)
 
     # Ensure the mock server is up.
-    mock_proc = start_mock(args.mock, 8088)
+    mock_proc = start_mock(args.mock, mock_port)
     if mock_proc is None:
         print("mock provider: already running")
     else:
@@ -457,12 +467,12 @@ def main():
     # after the tool result. Calculator never asks: it is a pure
     # built-in, safe by construction (gate 6 depends on that).
     # Ensure the mock is still up (it can die mid-test); restart if needed.
-    print(f"  [health] before approval: port8088={_port_open(8088)} mock_alive={mock_proc is not None and mock_proc.poll() is None}")
-    if not _port_open(8088):
+    print(f"  [health] before approval: port{mock_port}={_port_open(mock_port)} mock_alive={mock_proc is not None and mock_proc.poll() is None}")
+    if not _port_open(mock_port):
         if mock_proc is not None:
             mock_proc.kill()
             mock_proc.wait()
-        mock_proc = start_mock(args.mock, 8088)
+        mock_proc = start_mock(args.mock, mock_port)
         print("mock provider: restarted for approval test")
     # Switch to the bash-tool model for this section (§11.6 /model).
     s.type("/model mock-bash")
@@ -478,7 +488,7 @@ def main():
     # the composer instead of resolving the modal (race).
     ok, buf = s.wait_for("Allow Bash", timeout=15)
     check("approval card appears", ok, buf[-300:])
-    print(f"  [health] after modal: port8088={_port_open(8088)} mock_alive={mock_proc is not None and mock_proc.poll() is None}")
+    print(f"  [health] after modal: port{mock_port}={_port_open(mock_port)} mock_alive={mock_proc is not None and mock_proc.poll() is None}")
     if ok:
         # §9.14 arming: decision keys stay disabled for 1000 ms after
         # the last keypress; wait it out, then allow.
@@ -701,14 +711,16 @@ def main():
             pump(s3, 0.6)
     check("a round that edits one file and creates another completes", done3,
           s3.screen_text()[-300:])
-    # Esc arranges; `]` x3 reaches the review layout; Esc again leaves
-    # arranging with focus still on the Review panel.
+    # Esc arranges; `]` x3 reaches the review layout. The portable
+    # layout keeps Conversation first; Tab explicitly focuses Review.
     s3.key("esc")
     pump(s3, 0.5)
     for _ in range(3):
         s3.type("]")
         pump(s3, 0.6)
     s3.key("esc")
+    pump(s3, 0.6)
+    s3.key("tab")
     pump(s3, 0.6)
     t = s3.screen_text()
     check("review lists both files, the created one too",
@@ -873,7 +885,7 @@ def main():
 
     # ── 5f. A subagent runs on the session's provider, and shows ───────────
     # The Task tool took its gateway and model from ORBIT_GATE_URL/ORBIT_MODEL
-    # and otherwise from 127.0.0.1:4001 / glm-5.2. Only `-p` exports those, so
+    # and otherwise from hard-coded defaults. Only `-p` exports those, so
     # in the TUI a subagent never reached the session's provider: it failed,
     # and no event ever told the Agent panel it existed.
     work5 = _tempfile.mkdtemp(prefix="orbit-pty-agent-")

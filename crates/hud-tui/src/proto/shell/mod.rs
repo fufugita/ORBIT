@@ -259,6 +259,8 @@ pub struct DrawIn<'a> {
     pub composer: &'a str,
     /// The highlighted row of the `/` command list.
     pub completion_sel: usize,
+    pub file_completion: Option<&'a crate::proto::composer::FileCompletion>,
+    pub history_search: Option<&'a crate::proto::composer::HistorySearch>,
     pub now_ms: u64,
     pub reduced: bool,
     /// Colour effects off (the spec): under 16 colours or no colour,
@@ -309,18 +311,32 @@ pub fn draw(f: &mut ratatui::Frame, inp: &DrawIn) {
 /// Draw the whole screen into `f` and return what the frame made
 /// clickable, in drawing order (later = on top).
 pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
+    draw_with_profile(
+        f,
+        inp,
+        &orbit_frontend_protocol::customization::Profile::default(),
+    )
+}
+
+/// Render with a validated, immutable profile. Semantic colors precede blending and tier mapping.
+pub fn draw_with_profile(
+    f: &mut ratatui::Frame,
+    inp: &DrawIn,
+    profile: &orbit_frontend_protocol::customization::Profile,
+) -> Vec<hits::Hit> {
+    let palette = pal::Palette::from_profile(profile);
     let area = f.area();
     let (w, h) = (area.width as i32, area.height as i32);
     let s = inp.scenario;
     let sh = inp.app;
     let now = secs(inp.now_ms);
-    let red = inp.reduced;
+    let red = inp.reduced || profile.reduced_motion;
     let narrow = area.width < 120;
     // A zoomed panel fills the screen the way a narrow one does.
     let one_at_a_time = narrow || sh.zoom;
     let hits = {
-        let mut cv = Cv::new(f.buffer_mut());
-        cv.fill(0, 0, w, h, pal::APP);
+        let mut cv = Cv::with_profile(f.buffer_mut(), profile);
+        cv.fill(0, 0, w, h, palette.app);
 
         let (new_areas, side_w) = layout(area, &sh.tree, sh.sidebar && !sh.zoom);
         let focus = sh.focus.min(new_areas.len().saturating_sub(1));
@@ -397,7 +413,13 @@ pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
                 .enumerate()
                 .map(|(i, (_, v))| {
                     let attn = *v == View::Conversation && s.approval_pending.is_some();
-                    (i + 1, v.title().to_string(), attn)
+                    (
+                        i + 1,
+                        crate::customization::pane_title(&sh.tree, i, &s.custom_panes)
+                            .unwrap_or(v.title())
+                            .to_string(),
+                        attn,
+                    )
                 })
                 .collect::<Vec<_>>()
         });
@@ -450,7 +472,7 @@ pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
                     1,
                     side_w as i32,
                     side_rect.height as i32,
-                    pal::SIDEBAR,
+                    palette.sidebar,
                     1.0 - side_reveal,
                 );
                 cv.clipped(side_rect, |cv| {
@@ -504,6 +526,8 @@ pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
                             mono: inp.mono,
                             composer: inp.composer,
                             completion_sel: inp.completion_sel,
+                            file_completion: inp.file_completion,
+                            history_search: inp.history_search,
                             focused: *i == focus,
                             focus_fx: focus_in,
                             scroll_offset: inp
@@ -514,6 +538,17 @@ pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
                             num: i + 1,
                             brand: inp.brand,
                         },
+                    );
+                } else if *view == View::Custom {
+                    let id = sh.tree.custom_id_at(*i).unwrap_or_default();
+                    crate::customization::draw_pane(
+                        cv,
+                        *r,
+                        &id,
+                        s.custom_panes.get(&id),
+                        i + 1,
+                        *i == focus,
+                        inp.scrolls.get(*i).copied().unwrap_or(0),
                     );
                 } else {
                     panes::draw(
@@ -549,22 +584,22 @@ pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
             if *fade <= 0.02 {
                 continue;
             }
-            let col = view_colour(*view);
+            let col = view_colour_themed(palette, *view);
             cv.clipped(*r, |cv| {
                 cv.fill(
                     r.x as i32,
                     r.y as i32,
                     r.width as i32,
                     r.height as i32,
-                    mix(pal::PANEL, col, 0.25 * fade),
+                    mix(palette.panel, col, 0.25 * fade),
                 );
                 let title = clip_text(view.title(), r.width as i32 - 4);
                 cv.text(
                     r.x as i32 + 2,
                     r.y as i32,
                     &title,
-                    mix(pal::FAINT, col, *fade),
-                    Some(mix(pal::PANEL, col, 0.25 * fade)),
+                    mix(palette.faint, col, *fade),
+                    Some(mix(palette.panel, col, 0.25 * fade)),
                 );
             });
         }
@@ -574,7 +609,7 @@ pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
         if let Some(sel) = &inp.selection {
             if let Some((_, r, _)) = areas.iter().find(|(i, _, _)| *i == sel.panel) {
                 for (x, y, w) in sel.rows(content_rect(*r)) {
-                    cv.wash(x, y, w, 1, canvas::mix(pal::PANEL, pal::CYAN, 0.32));
+                    cv.wash(x, y, w, 1, palette.selection);
                 }
             }
         }
@@ -593,10 +628,17 @@ pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
                     r.y as i32,
                     r.width as i32,
                     r.height as i32,
-                    pal::APP,
+                    palette.app,
                     0.55 * nav_a,
                 );
-                overlays::nav_badge(&mut cv, *r, i + 1, view_colour(*view), nav_a, view.title());
+                overlays::nav_badge(
+                    &mut cv,
+                    *r,
+                    i + 1,
+                    view_colour_themed(palette, *view),
+                    nav_a,
+                    view.title(),
+                );
             }
         }
 
@@ -636,19 +678,44 @@ pub fn draw_with_hits(f: &mut ratatui::Frame, inp: &DrawIn) -> Vec<hits::Hit> {
         }
         cv.take_hits()
     };
-    tier::apply(f.buffer_mut(), inp.tier);
+    tier::apply(
+        f.buffer_mut(),
+        effective_tier(inp.tier, profile.color_mode, false),
+    );
     hits
 }
 
-fn view_colour(v: View) -> canvas::Rgb {
+fn view_colour_themed(palette: pal::Palette, v: View) -> canvas::Rgb {
     match v {
-        View::Conversation | View::Agent => pal::MAGENTA,
-        View::Changes | View::Review => pal::VIOLET,
-        View::Terminal => pal::AMBER,
-        View::Plan => pal::CYAN,
-        View::Activity => pal::GREEN,
-        View::Context => pal::BLUE,
+        View::Conversation | View::Agent => palette.magenta,
+        View::Custom => palette.cyan,
+
+        View::Changes | View::Review => palette.violet,
+        View::Terminal => palette.amber,
+        View::Plan => palette.cyan,
+        View::Activity => palette.green,
+        View::Context => palette.blue,
     }
+}
+
+/// User preferences can reduce terminal capabilities; NO_COLOR always wins.
+pub fn effective_tier(
+    detected: Tier,
+    selected: orbit_frontend_protocol::customization::ColorMode,
+    no_color: bool,
+) -> Tier {
+    use orbit_frontend_protocol::customization::ColorMode;
+    if no_color {
+        return Tier::None;
+    }
+    let requested = match selected {
+        ColorMode::Auto => detected,
+        ColorMode::Truecolor => Tier::TrueColor,
+        ColorMode::Ansi256 => Tier::T256,
+        ColorMode::Ansi16 => Tier::T16,
+        ColorMode::Mono => Tier::None,
+    };
+    detected.max(requested)
 }
 
 #[cfg(test)]
@@ -667,6 +734,8 @@ mod tests {
                     scenario: s,
                     composer: "",
                     completion_sel: 0,
+                    file_completion: None,
+                    history_search: None,
                     now_ms: 5_000,
                     reduced: true,
                     tier: Tier::TrueColor,
@@ -843,6 +912,8 @@ mod tests {
                     scenario: &s,
                     composer: "",
                     completion_sel: 0,
+                    file_completion: None,
+                    history_search: None,
                     now_ms: 5_000,
                     reduced: true,
                     tier: Tier::TrueColor,
@@ -1076,6 +1147,7 @@ mod tests {
     ) -> crate::proto::scenario::Agent {
         crate::proto::scenario::Agent {
             name: name.into(),
+            model: String::new(),
             task: task.into(),
             action: action.into(),
             report: done.map(|(_, r)| r.to_string()).unwrap_or_default(),
@@ -1112,6 +1184,51 @@ mod tests {
         }
         // The panel named `review` shows nobody else's agent.
         assert!(out.contains("No agent yet"), "{out}");
+        assert!(
+            !out.contains("model ·"),
+            "an unknown model is omitted\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_agent_panel_follows_model_updates_without_changing_profile_filtering() {
+        let mut s = busy();
+        s.model = "test-parent-model".into();
+        let mut a = agent("Explore", "find add()", "Read calc.py", None);
+        a.model = "test-child-model".into();
+        s.agents.insert("a1".into(), a);
+
+        let out = render(&app_with(Preset::Agents), &s, 164, 48);
+        for want in [
+            "Agent · explore",
+            "Explore",
+            "model · test-child-model",
+            "find add()",
+            "▸ Read calc.py",
+        ] {
+            assert!(out.contains(want), "missing {want:?}\n{out}");
+        }
+        assert_eq!(out.matches("model · test-child-model").count(), 1, "{out}");
+        assert!(!out.contains("model · test-parent-model"), "{out}");
+        assert!(
+            out.contains("No agent yet"),
+            "the review pane stays empty\n{out}"
+        );
+
+        let mut resumed = agent("Explore", "check callers", "Read caller.py", None);
+        resumed.model = "test-resumed-model".into();
+        s.agents.insert("a1".into(), resumed);
+        let out = render(&app_with(Preset::Agents), &s, 164, 48);
+        assert_eq!(
+            out.matches("model · test-resumed-model").count(),
+            1,
+            "{out}"
+        );
+        assert!(!out.contains("test-child-model"), "{out}");
+        assert!(
+            out.contains("check callers") && out.contains("Read caller.py"),
+            "{out}"
+        );
     }
 
     /// A finished subagent shows its report, wrapped; a failed one says
@@ -1485,6 +1602,8 @@ mod tests {
                     scenario: s,
                     composer: "",
                     completion_sel: 0,
+                    file_completion: None,
+                    history_search: None,
                     now_ms,
                     reduced: false,
                     tier,
@@ -1762,6 +1881,8 @@ mod tests {
                         scenario: &s,
                         composer: "",
                         completion_sel: 0,
+                        file_completion: None,
+                        history_search: None,
                         now_ms: 5_000,
                         reduced: true,
                         tier: Tier::TrueColor,

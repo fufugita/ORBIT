@@ -218,6 +218,21 @@ pub struct ToolResult {
     pub output_bytes: u64,
 }
 
+/// Durable identity of an explicitly confirmed signed package installation.
+/// Digests identify the complete signed manifest and package bytes; content,
+/// installation paths and instructions are never recorded in this event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInstall {
+    pub install_id: String,
+    pub name: String,
+    pub version: String,
+    pub issuer_public_key: String,
+    pub manifest_digest: String,
+    pub content_digest: String,
+    pub package_bytes: u64,
+    pub operator_confirmed: bool,
+}
+
 /// The full event taxonomy (DR-06 §5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "variant", rename_all = "snake_case")]
@@ -234,6 +249,7 @@ pub enum LedgerEvent {
     ToolIntent(ToolIntent),
     ToolVerdict(ToolVerdict),
     ToolResult(ToolResult),
+    PluginInstall(PluginInstall),
 }
 
 /// The hash-chained on-disk record (DR-06 §2.2).

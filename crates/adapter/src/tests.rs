@@ -12,6 +12,61 @@ use crate::redaction::{
 use crate::stream::{canonical_output_sha256, output_evidence, validate_stream};
 use crate::types::*;
 
+#[test]
+fn effort_values_preserve_typed_wire_values_and_validate_shape() {
+    for value in [
+        EffortValue::Bool(false),
+        EffortValue::Bool(true),
+        EffortValue::Level("high".into()),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<EffortValue>(serde_json::to_value(&value).unwrap()).unwrap(),
+            value
+        );
+        assert!(value.validate().is_ok());
+    }
+    assert_eq!(
+        serde_json::to_value(EffortValue::Bool(false)).unwrap(),
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        serde_json::to_value(EffortValue::Level("false".into())).unwrap(),
+        serde_json::json!("false")
+    );
+    for invalid in ["", " high", "high ", "hi\ngh", "default"] {
+        assert!(EffortValue::Level(invalid.into()).validate().is_err());
+    }
+    assert!(EffortValue::Level("x".repeat(65)).validate().is_err());
+    assert!(EffortValue::Level("é".repeat(33)).validate().is_err());
+    assert!(EffortValue::Level("é".repeat(32)).validate().is_ok());
+    for invalid in [
+        serde_json::json!(3),
+        serde_json::json!(null),
+        serde_json::json!({}),
+    ] {
+        assert!(serde_json::from_value::<EffortValue>(invalid).is_err());
+    }
+}
+
+#[test]
+fn effort_setting_preserves_explicit_default_and_value() {
+    assert_eq!(
+        serde_json::to_value(EffortSetting::Default).unwrap(),
+        serde_json::json!({"mode":"default"})
+    );
+    for setting in [
+        EffortSetting::Default,
+        EffortSetting::Value(EffortValue::Bool(false)),
+        EffortSetting::Value(EffortValue::Level("high".into())),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<EffortSetting>(serde_json::to_value(&setting).unwrap())
+                .unwrap(),
+            setting
+        );
+    }
+}
+
 fn test_route(kind: AdapterKind) -> ProviderRouteBinding {
     ProviderRouteBinding {
         provider_id: ProviderId(String::from("test-provider")),

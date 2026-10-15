@@ -19,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod customization;
+
 // ── Events: harness → frontend ──────────────────────────────────────────────
 
 fn is_zero(n: &u64) -> bool {

@@ -5,9 +5,9 @@
 use super::canvas::{clip_path, clip_text, mix, text_width, tint, wrap_ranges, Cv, Rgb, Seg};
 use super::convo::kind_of;
 use super::diffrows;
-use super::frame::{badge, empty_state, panel_frame, BadgeState, FrameSpec};
+use super::frame::{badge_themed, empty_state, panel_frame, BadgeState, FrameSpec};
 use super::motion::{ease_out, flash, prog, pulse, secs};
-use super::pal::*;
+use super::pal::Palette;
 use crate::proto::layout::View;
 use crate::proto::panels::FileChangeRow;
 use crate::proto::scenario::{LineKind, Scenario, ToolState};
@@ -30,15 +30,15 @@ pub struct PaneIn<'a> {
     pub agent: &'a str,
 }
 
-fn ident(view: View) -> super::canvas::Rgb {
+fn ident_themed(colors: Palette, view: View) -> super::canvas::Rgb {
     match view {
-        View::Conversation => MAGENTA,
-        View::Changes | View::Review => VIOLET,
-        View::Terminal => AMBER,
-        View::Plan => CYAN,
-        View::Activity => GREEN,
-        View::Context => BLUE,
-        View::Agent => MAGENTA,
+        View::Conversation => colors.magenta,
+        View::Changes | View::Review => colors.violet,
+        View::Terminal => colors.amber,
+        View::Plan => colors.cyan,
+        View::Activity => colors.green,
+        View::Context => colors.blue,
+        View::Agent | View::Custom => colors.magenta,
     }
 }
 
@@ -52,6 +52,8 @@ pub fn draw(cv: &mut Cv, r: Rect, view: View, inp: &PaneIn) {
         View::Context => context(cv, r, inp),
         View::Review => review(cv, r, inp),
         View::Agent => agent(cv, r, inp),
+        View::Custom => {}
+
         View::Conversation => {}
     }
 }
@@ -65,13 +67,14 @@ fn frame<'a>(
     footer: Vec<(&'a str, &'a str)>,
     footer_parts: Vec<Seg>,
 ) -> Option<Rect> {
+    let colors = cv.palette;
     panel_frame(
         cv,
         r,
         &FrameSpec {
             num: inp.num,
             title: view.title(),
-            ident: ident(view),
+            ident: ident_themed(colors, view),
             focused: inp.focused,
             focus_fx: inp.focus_fx,
             badge: Some(badge),
@@ -83,11 +86,12 @@ fn frame<'a>(
 }
 
 fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
+    let colors = cv.palette;
     let files = &inp.s.file_changes;
     let add: u32 = files.iter().map(|f| f.added).sum();
     let del: u32 = files.iter().map(|f| f.removed).sum();
     let b = if files.is_empty() {
-        vec![Seg::new("none", FAINT)]
+        vec![Seg::new("none", colors.faint)]
     } else {
         vec![
             Seg::new(
@@ -96,10 +100,10 @@ fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                     files.len(),
                     if files.len() > 1 { "s" } else { "" }
                 ),
-                MUTED,
+                colors.muted,
             ),
-            Seg::bold(format!("+{add}"), GREEN),
-            Seg::bold(format!(" −{del}"), RED),
+            Seg::bold(format!("+{add}"), colors.green),
+            Seg::bold(format!(" −{del}"), colors.red),
         ]
     };
     let Some(inner) = frame(
@@ -125,7 +129,7 @@ fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 cv,
                 inner,
                 "◌",
-                VIOLET,
+                colors.violet,
                 "No changes yet",
                 "Files ORBIT edits appear here. A checkpoint is taken before every prompt, so each change can be rewound.",
             );
@@ -146,25 +150,25 @@ fn changes(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             let changed = inp.s.file_changed_ms.get(i).copied().filter(|t| *t > 0).map(secs);
             let fl = flash(secs(inp.now_ms), changed, 0.6, inp.reduced || inp.mono);
             let roll = ease_out(prog(secs(inp.now_ms), changed, 0.3, inp.reduced));
-            let base = if sel { tint(VIOLET, PANEL, 0.12) } else { PANEL };
-            let bg = mix(base, tint(VIOLET, PANEL, 0.35), fl);
+            let base = if sel { tint(colors.violet, colors.panel, 0.12) } else { colors.panel };
+            let bg = mix(base, tint(colors.violet, colors.panel, 0.35), fl);
             cv.fill(r.x as i32 + 1, yy, r.width as i32 - 2, 1, bg);
             if sel {
-                cv.text(r.x as i32 + 1, yy, "▌", VIOLET, Some(bg));
+                cv.text(r.x as i32 + 1, yy, "▌", colors.violet, Some(bg));
             }
-            cv.put(x, yy, " M ", ON_ACCENT, Some(AMBER), Modifier::BOLD);
+            cv.put(x, yy, " M ", colors.on_accent, Some(colors.amber), Modifier::BOLD);
             let added = (f.added as f32 * roll).round() as u32;
             let removed = (f.removed as f32 * roll).round() as u32;
-            let mut cnt = vec![Seg::bold(format!("+{added}"), GREEN)];
+            let mut cnt = vec![Seg::bold(format!("+{added}"), colors.green)];
             if f.removed > 0 {
-                cnt.push(Seg::bold(format!(" −{removed}"), RED));
+                cnt.push(Seg::bold(format!(" −{removed}"), colors.red));
             }
             let cw = super::canvas::segs_width(&cnt);
             cv.put(
                 x + 4,
                 yy,
                 &clip_path(&f.path, w - 14),
-                if sel { INK } else { INK2 },
+                if sel { colors.ink } else { colors.ink2 },
                 Some(bg),
                 if sel { Modifier::BOLD } else { Modifier::empty() },
             );
@@ -195,14 +199,14 @@ fn tape_card(s: &Scenario, i: usize) -> Option<&crate::proto::scenario::Transcri
 }
 
 /// The glyph and colour a command's state shows (the card's own, §9.8).
-fn tape_tone(state: ToolState) -> (&'static str, Rgb) {
+fn tape_tone_themed(colors: Palette, state: ToolState) -> (&'static str, Rgb) {
     match state {
-        ToolState::Running => ("◐", AMBER),
-        ToolState::Done => ("✓", GREEN),
-        ToolState::Failed => ("✕", RED),
-        ToolState::AwaitingYou => ("◆", MAGENTA),
-        ToolState::Cancelled | ToolState::Denied | ToolState::Blocked => ("⊘", MUTED),
-        ToolState::Queued => ("◌", MUTED),
+        ToolState::Running => ("◐", colors.amber),
+        ToolState::Done => ("✓", colors.green),
+        ToolState::Failed => ("✕", colors.red),
+        ToolState::AwaitingYou => ("◆", colors.magenta),
+        ToolState::Cancelled | ToolState::Denied | ToolState::Blocked => ("⊘", colors.muted),
+        ToolState::Queued => ("◌", colors.muted),
     }
 }
 
@@ -220,6 +224,7 @@ fn tape_label(command: &str) -> String {
 /// are shown with the selected one always in view (`‹ ›` mark what is cut).
 /// Every tab is a click target.
 fn terminal_tabs(cv: &mut Cv, x: i32, y: i32, w: i32, s: &Scenario, sel: usize) {
+    let colors = cv.palette;
     let n = s.tapes.len();
     let states: Vec<ToolState> = (0..n)
         .map(|i| tape_card(s, i).map(|c| c.tool_state).unwrap_or_default())
@@ -253,10 +258,10 @@ fn terminal_tabs(cv: &mut Cv, x: i32, y: i32, w: i32, s: &Scenario, sel: usize) 
     };
     let mut cx = x;
     if lo > 0 {
-        cx = cv.text(cx, y, "‹", FAINT, None);
+        cx = cv.text(cx, y, "‹", colors.faint, None);
     }
     for (i, state) in states.iter().enumerate().take(hi + 1).skip(lo) {
-        let (g, col) = tape_tone(*state);
+        let (g, col) = tape_tone_themed(colors, *state);
         let from = cx;
         if i == sel {
             let text = if label.is_empty() {
@@ -264,36 +269,42 @@ fn terminal_tabs(cv: &mut Cv, x: i32, y: i32, w: i32, s: &Scenario, sel: usize) 
             } else {
                 format!(" {g}{} {label} ", i + 1)
             };
-            cx = cv.put(cx, y, &text, ON_ACCENT, Some(col), Modifier::BOLD);
+            cx = cv.put(cx, y, &text, colors.on_accent, Some(col), Modifier::BOLD);
         } else {
-            cx = cv.text(cx, y, " ", MUTED, None);
+            cx = cv.text(cx, y, " ", colors.muted, None);
             cx = cv.bold(cx, y, g, col, None);
-            cx = cv.text(cx, y, &format!("{} ", i + 1), MUTED, None);
+            cx = cv.text(cx, y, &format!("{} ", i + 1), colors.muted, None);
         }
         cv.hit(from, y, cx - from, 1, super::hits::Click::Tape(i));
         cx += 1;
     }
     if hi + 1 < n {
-        cv.text(x + w - 1, y, "›", FAINT, None);
+        cv.text(x + w - 1, y, "›", colors.faint, None);
     }
 }
 
 fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
+    let colors = cv.palette;
     let s = inp.s;
     let sel = s.selected_tape();
     let card = sel.and_then(|i| tape_card(s, i));
     let b = match card {
-        None => vec![Seg::new("none", FAINT)],
+        None => vec![Seg::new("none", colors.faint)],
         Some(l) => match l.tool_state {
-            ToolState::Running => badge(BadgeState::Running, None, inp.now_ms, inp.reduced),
-            ToolState::Done => badge(
+            ToolState::Running => {
+                badge_themed(colors, BadgeState::Running, None, inp.now_ms, inp.reduced)
+            }
+            ToolState::Done => badge_themed(
+                colors,
                 BadgeState::Done,
                 Some(l.meta.trim_start_matches("done · ")),
                 inp.now_ms,
                 inp.reduced,
             ),
-            ToolState::Failed => badge(BadgeState::Failed, None, inp.now_ms, inp.reduced),
-            _ => badge(BadgeState::Idle, None, inp.now_ms, inp.reduced),
+            ToolState::Failed => {
+                badge_themed(colors, BadgeState::Failed, None, inp.now_ms, inp.reduced)
+            }
+            _ => badge_themed(colors, BadgeState::Idle, None, inp.now_ms, inp.reduced),
         },
     };
     let footer = if s.tapes.len() > 1 {
@@ -316,7 +327,7 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 cv,
                 inner,
                 "◌",
-                AMBER,
+                colors.amber,
                 "No commands yet",
                 "Commands ORBIT runs stream here, inside the sandbox. Start a line with ! in the composer to run your own.",
             );
@@ -329,10 +340,10 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         // Output inset: the full command line, then the tape.
         let top = y + 2;
         let bottom = y + h - 1;
-        cv.fill(r.x as i32 + 1, top - 1, r.width as i32 - 2, (bottom - top + 1).max(0), INSET);
+        cv.fill(r.x as i32 + 1, top - 1, r.width as i32 - 2, (bottom - top + 1).max(0), colors.inset);
         let command = card.map(|c| c.text.as_str()).unwrap_or("");
-        cv.bold(x, top, "$ ", AMBER, Some(INSET));
-        cv.bold(x + 2, top, &clip_text(command, w - 2), INK, Some(INSET));
+        cv.bold(x, top, "$ ", colors.amber, Some(colors.inset));
+        cv.bold(x + 2, top, &clip_text(command, w - 2), colors.ink, Some(colors.inset));
         // How it ended takes the last row, so the person need not scroll
         // to learn whether it worked.
         let ended = card.filter(|c| {
@@ -346,15 +357,15 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         let note = (tape.dropped > 0).then(|| format!("… {} earlier lines not kept", tape.dropped));
         let rows: Vec<(&str, Rgb)> = note
             .iter()
-            .map(|n| (n.as_str(), FAINT))
-            .chain(tape.lines.iter().map(|l| (l.as_str(), INK2)))
+            .map(|n| (n.as_str(), colors.faint))
+            .chain(tape.lines.iter().map(|l| (l.as_str(), colors.ink2)))
             .collect();
         let start = rows.len().saturating_sub(avail + inp.scroll.min(rows.len()));
         for (i, (line, col)) in rows.iter().skip(start).take(avail).enumerate() {
-            cv.text(x, top + 1 + i as i32, &clip_text(line, w), *col, Some(INSET));
+            cv.text(x, top + 1 + i as i32, &clip_text(line, w), *col, Some(colors.inset));
         }
         if let Some(c) = ended {
-            let (g, col) = tape_tone(c.tool_state);
+            let (g, col) = tape_tone_themed(colors, c.tool_state);
             let what = if c.meta.is_empty() {
                 match c.tool_state {
                     ToolState::Denied => "denied".to_string(),
@@ -364,19 +375,23 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             } else {
                 c.meta.clone()
             };
-            cv.bold(x, bottom, g, col, Some(INSET));
-            cv.text(x + 2, bottom, &clip_text(&what, w - 2), col, Some(INSET));
+            cv.bold(x, bottom, g, col, Some(colors.inset));
+            cv.text(x + 2, bottom, &clip_text(&what, w - 2), col, Some(colors.inset));
         }
     });
 }
 
 fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
+    let colors = cv.palette;
     let tasks = &inp.s.tasks;
     let done = tasks.iter().filter(|t| t.status == "done").count();
     let b = if tasks.is_empty() {
-        vec![Seg::new("none", FAINT)]
+        vec![Seg::new("none", colors.faint)]
     } else {
-        vec![Seg::bold(format!("{done}/{} done", tasks.len()), CYAN)]
+        vec![Seg::bold(
+            format!("{done}/{} done", tasks.len()),
+            colors.cyan,
+        )]
     };
     let Some(inner) = frame(cv, r, View::Plan, inp, b, vec![], vec![]) else {
         return;
@@ -393,7 +408,7 @@ fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 cv,
                 inner,
                 "◌",
-                CYAN,
+                colors.cyan,
                 "Nothing planned yet",
                 "When a task has steps, the plan collects here.",
             );
@@ -415,13 +430,19 @@ fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             + (target - from) * ease_out(prog(secs(inp.now_ms), last.map(secs), 0.3, inp.reduced));
         let bw = (w - 6).max(4);
         let k = (pct * bw as f32).round() as i32;
-        cv.text(x, y + 1, &"━".repeat(k as usize), CYAN, None);
-        cv.text(x + k, y + 1, &"─".repeat((bw - k) as usize), RULE_HI, None);
+        cv.text(x, y + 1, &"━".repeat(k as usize), colors.cyan, None);
+        cv.text(
+            x + k,
+            y + 1,
+            &"─".repeat((bw - k) as usize),
+            colors.rule_hi,
+            None,
+        );
         cv.text(
             x + w - 4,
             y + 1,
             &format!("{:>3}%", (pct * 100.0).round() as u32),
-            MUTED,
+            colors.muted,
             None,
         );
         for (i, t) in tasks.iter().enumerate() {
@@ -438,18 +459,18 @@ fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 .map(secs);
             let fl = flash(secs(inp.now_ms), changed, 0.45, inp.reduced || inp.mono);
             let (g, gc) = if t.status == "done" {
-                ("✓", mix(GREEN, WHITE, fl))
+                ("✓", mix(colors.green, colors.white, fl))
             } else if active {
                 (
                     "◉",
                     mix(
-                        tint(CYAN, PANEL, 0.5),
-                        CYAN,
+                        tint(colors.cyan, colors.panel, 0.5),
+                        colors.cyan,
                         0.55 + 0.45 * pulse(secs(inp.now_ms), 0.5, inp.reduced),
                     ),
                 )
             } else {
-                ("○", FAINT)
+                ("○", colors.faint)
             };
             cv.bold(x, yy, g, gc, None);
             cv.put(
@@ -457,11 +478,11 @@ fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 yy,
                 &clip_text(&t.title, w - 3),
                 if active {
-                    INK
+                    colors.ink
                 } else if t.status == "done" {
-                    INK2
+                    colors.ink2
                 } else {
-                    MUTED
+                    colors.muted
                 },
                 None,
                 if active {
@@ -477,19 +498,19 @@ fn plan(cv: &mut Cv, r: Rect, inp: &PaneIn) {
 /// The glyph and colour of an Activity row, from what it is and what it
 /// says. Green is reserved for outcomes the ledger backs (design law 4);
 /// magenta marks an authority decision (law 2).
-fn activity_tone(kind: &str, fact: &str) -> (&'static str, Rgb) {
+fn activity_tone_themed(colors: Palette, kind: &str, fact: &str) -> (&'static str, Rgb) {
     match kind {
-        "intent" => ("→", FAINT),
-        "verdict" if fact.starts_with("allowed") => ("◆", MAGENTA),
-        "verdict" => ("⊘", MUTED),
+        "intent" => ("→", colors.faint),
+        "verdict" if fact.starts_with("allowed") => ("◆", colors.magenta),
+        "verdict" => ("⊘", colors.muted),
         "result" => match fact {
-            "ok" => ("✓", GREEN),
-            "denied" => ("⊘", MUTED),
-            _ => ("✕", RED),
+            "ok" => ("✓", colors.green),
+            "denied" => ("⊘", colors.muted),
+            _ => ("✕", colors.red),
         },
-        "egress" | "request" => ("↗", CYAN),
-        "compaction" | "retry" => ("◌", AMBER),
-        _ => ("∙", MUTED),
+        "egress" | "request" => ("↗", colors.cyan),
+        "compaction" | "retry" => ("◌", colors.amber),
+        _ => ("∙", colors.muted),
     }
 }
 
@@ -513,15 +534,16 @@ fn activity_parts(a: &crate::proto::scenario::ActivityRow) -> (String, String) {
 }
 
 fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
+    let colors = cv.palette;
     let s = inp.s;
     let rows = &s.activity;
     let proof = rows.iter().filter(|a| a.digest.is_some()).count();
     let b = if rows.is_empty() {
-        vec![Seg::new("none", FAINT)]
+        vec![Seg::new("none", colors.faint)]
     } else {
         vec![
-            Seg::bold(format!("{} events", rows.len()), GREEN),
-            Seg::new(format!(" · {proof} on the ledger"), MUTED),
+            Seg::bold(format!("{} events", rows.len()), colors.green),
+            Seg::new(format!(" · {proof} on the ledger"), colors.muted),
         ]
     };
     let Some(inner) = frame(
@@ -547,7 +569,7 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 cv,
                 inner,
                 "◌",
-                GREEN,
+                colors.green,
                 "No activity yet",
                 "Every request, decision and result is listed here as it is recorded. Ledger records carry their hash.",
             );
@@ -575,9 +597,9 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             .saturating_sub(visible + inp.scroll.min(rows.len()));
         for (i, a) in rows.iter().skip(start).take(visible).enumerate() {
             let y0 = y + (i * per) as i32;
-            let (g, gcol) = activity_tone(&a.kind, &a.fact);
+            let (g, gcol) = activity_tone_themed(colors, &a.kind, &a.fact);
             let (head, detail) = activity_parts(a);
-            cv.text(x, y0, &a.time, FAINT, None);
+            cv.text(x, y0, &a.time, colors.faint, None);
             cv.bold(x + 9, y0, g, gcol, None);
             let hash = a
                 .digest
@@ -585,7 +607,7 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 .map(|d| format!("#{}", d.chars().take(6).collect::<String>()));
             let hash_w = hash.as_ref().map_or(0, |h| text_width(h) + 1);
             if let Some(h) = &hash {
-                cv.text(x + w - text_width(h), y0, h, FAINT, None);
+                cv.text(x + w - text_width(h), y0, h, colors.faint, None);
             }
             let body = if detail.is_empty() {
                 a.target.clone()
@@ -597,7 +619,7 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 // the headline column carries the outcome.
                 let bx = x + 11 + 10;
                 cv.bold(x + 11, y0, &clip_text(&head, 9), gcol, None);
-                cv.text(bx, y0, &clip_text(&body, x + w - bx - hash_w - 1), INK, None);
+                cv.text(bx, y0, &clip_text(&body, x + w - bx - hash_w - 1), colors.ink, None);
             } else {
                 cv.bold(
                     x + 11,
@@ -606,7 +628,7 @@ fn activity(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                     gcol,
                     None,
                 );
-                cv.text(x + 9, y0 + 1, &clip_text(&body, w - 9), INK, None);
+                cv.text(x + 9, y0 + 1, &clip_text(&body, w - 9), colors.ink, None);
             }
         }
     });
@@ -635,6 +657,7 @@ pub fn tokens_short(n: u64) -> String {
 /// provider reports one total, never the parts) and say so; the total in
 /// the header is the provider's.
 fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
+    let colors = cv.palette;
     let s = inp.s;
     let ctx = if s.window_tokens > 0 {
         (s.used_tokens as f32 / s.window_tokens as f32).clamp(0.0, 1.0)
@@ -643,7 +666,11 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
     };
     let b = vec![Seg::bold(
         format!("{}%", (ctx * 100.0).round() as u32),
-        if ctx > 0.85 { AMBER } else { BLUE },
+        if ctx > 0.85 {
+            colors.amber
+        } else {
+            colors.blue
+        },
     )];
     let Some(inner) = frame(cv, r, View::Context, inp, b, vec![], vec![]) else {
         return;
@@ -666,7 +693,7 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 cv,
                 inner,
                 "◌",
-                BLUE,
+                colors.blue,
                 "No usage yet",
                 "The context meter fills as the conversation grows.",
             );
@@ -684,7 +711,7 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 &format!("{} of {} tokens", tokens_short(s.used_tokens), tokens_short(window)),
                 w,
             ),
-            INK2,
+            colors.ink2,
             None,
         );
         let mut yy = y + 1;
@@ -696,31 +723,31 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 x,
                 yy,
                 &"▰".repeat(k as usize),
-                mix(CYAN, if ctx > 0.85 { AMBER } else { CYAN }, ctx),
+                mix(colors.cyan, if ctx > 0.85 { colors.amber } else { colors.cyan }, ctx),
                 None,
             );
-            cv.text(x + k, yy, &"▱".repeat((bw - k) as usize), RULE_HI, None);
+            cv.text(x + k, yy, &"▱".repeat((bw - k) as usize), colors.rule_hi, None);
             cv.text(
                 x,
                 yy + 2,
                 &format!("{} of {} tokens", s.used_tokens, window),
-                INK2,
+                colors.ink2,
                 None,
             );
             cv.text(
                 x,
                 yy + 4,
                 &format!("in {}  out {}", s.input_tokens, s.output_tokens),
-                MUTED,
+                colors.muted,
                 None,
             );
             return;
         };
         let parts: [(&str, u64, Rgb); 4] = [
-            ("system", bd.system, BLUE),
-            ("tools", bd.tools, CYAN),
-            ("memory", bd.memory, VIOLET),
-            ("messages", bd.messages, MAGENTA),
+            ("system", bd.system, colors.blue),
+            ("tools", bd.tools, colors.cyan),
+            ("memory", bd.memory, colors.violet),
+            ("messages", bd.messages, colors.magenta),
         ];
         let measured: u64 = parts.iter().map(|p| p.1).sum();
         // The estimates can undershoot the provider's own count (different
@@ -734,7 +761,7 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         let mut left = bw;
         let mut stack: Vec<(u64, Rgb)> = parts.iter().map(|(_, n, c)| (*n, *c)).collect();
         if other > 0 {
-            stack.push((other, FAINT));
+            stack.push((other, colors.faint));
         }
         for (n, col) in stack {
             if n == 0 || left == 0 {
@@ -745,35 +772,35 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             x_cur += c;
             left -= c;
         }
-        cv.text(x_cur, yy, &"░".repeat(left as usize), RULE_HI, None);
+        cv.text(x_cur, yy, &"░".repeat(left as usize), colors.rule_hi, None);
         // Where compaction starts: the conversation reaching `compact_at`
         // on top of everything that is always sent.
         let fixed = bd.system + bd.tools + bd.memory;
         let marker_at = fixed + bd.compact_at;
         if bd.compact_at > 0 {
             let mx = x + cells(marker_at.min(window)).clamp(0, bw - 1);
-            cv.bold(mx, yy + 1, "▲", AMBER, None);
+            cv.bold(mx, yy + 1, "▲", colors.amber, None);
         }
         yy += 3;
         // The legend: the parts, then what is left.
         let mut rows: Vec<(&str, u64, Rgb)> = parts.to_vec();
         if other > 0 {
-            rows.push(("other", other, FAINT));
+            rows.push(("other", other, colors.faint));
         }
         for (name, n, col) in &rows {
             let pct = (*n as f64 / window as f64 * 100.0).round() as u32;
             let num = format!("~{}", tokens_short(*n));
             cv.text(x, yy, "■", *col, None);
-            cv.text(x + 2, yy, name, INK2, None);
-            cv.text(x + w - 5 - text_width(&num), yy, &num, INK, None);
-            cv.text(x + w - 4, yy, &format!("{pct:>3}%"), MUTED, None);
+            cv.text(x + 2, yy, name, colors.ink2, None);
+            cv.text(x + w - 5 - text_width(&num), yy, &num, colors.ink, None);
+            cv.text(x + w - 4, yy, &format!("{pct:>3}%"), colors.muted, None);
             yy += 1;
         }
         let free = window.saturating_sub(total);
         let num = format!("~{}", tokens_short(free));
-        cv.text(x, yy, "□", RULE_HI, None);
-        cv.text(x + 2, yy, "free", INK2, None);
-        cv.text(x + w - 5 - text_width(&num), yy, &num, INK, None);
+        cv.text(x, yy, "□", colors.rule_hi, None);
+        cv.text(x + 2, yy, "free", colors.ink2, None);
+        cv.text(x + w - 5 - text_width(&num), yy, &num, colors.ink, None);
         cv.text(
             x + w - 4,
             yy,
@@ -781,7 +808,7 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 "{:>3}%",
                 (free as f64 / window as f64 * 100.0).round() as u32
             ),
-            MUTED,
+            colors.muted,
             None,
         );
         yy += 2;
@@ -791,7 +818,7 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 x,
                 yy,
                 &clip_text(&format!("▲ compacts at ~{}", tokens_short(bd.compact_at)), w),
-                MUTED,
+                colors.muted,
                 None,
             );
             yy += 1;
@@ -802,7 +829,7 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             let chars: Vec<char> = why.chars().collect();
             for (a, b) in wrap_ranges(&why, w - 2).into_iter().take(3) {
                 let line: String = chars[a..b].iter().collect();
-                cv.text(x + 2, yy, &line, FAINT, None);
+                cv.text(x + 2, yy, &line, colors.faint, None);
                 yy += 1;
             }
             yy += 1;
@@ -814,20 +841,20 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 &format!("provider: {} in · {} out", s.input_tokens, s.output_tokens),
                 w,
             ),
-            FAINT,
+            colors.faint,
             None,
         );
         yy += 1;
-        cv.text(x, yy, &clip_text("the parts are estimates", w), FAINT, None);
+        cv.text(x, yy, &clip_text("the parts are estimates", w), colors.faint, None);
         yy += 2;
         // What compaction did, newest last.
         if !s.compactions.is_empty() && yy + 2 < y + h {
-            cv.text(x, yy, "COMPACTED", FAINT, None);
+            cv.text(x, yy, "COMPACTED", colors.faint, None);
             yy += 1;
             let room = (y + h - yy).max(0) as usize;
             let skip = s.compactions.len().saturating_sub(room);
             for c in s.compactions.iter().skip(skip) {
-                cv.text(x, yy, &c.time, FAINT, None);
+                cv.text(x, yy, &c.time, colors.faint, None);
                 cv.text(
                     x + 9,
                     yy,
@@ -835,7 +862,7 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                         &format!("~{} → ~{}", tokens_short(c.before), tokens_short(c.after)),
                         w - 9,
                     ),
-                    INK2,
+                    colors.ink2,
                     None,
                 );
                 yy += 1;
@@ -845,11 +872,12 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
 }
 
 fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
+    let colors = cv.palette;
     let files = &inp.s.file_changes;
     let add: u32 = files.iter().map(|f| f.added).sum();
     let del: u32 = files.iter().map(|f| f.removed).sum();
     let b = if files.is_empty() {
-        vec![Seg::new("none", MUTED)]
+        vec![Seg::new("none", colors.muted)]
     } else {
         vec![
             Seg::new(
@@ -858,10 +886,10 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                     files.len(),
                     if files.len() == 1 { "" } else { "s" }
                 ),
-                MUTED,
+                colors.muted,
             ),
-            Seg::bold(format!("+{add}"), GREEN),
-            Seg::bold(format!(" −{del}"), RED),
+            Seg::bold(format!("+{add}"), colors.green),
+            Seg::bold(format!(" −{del}"), colors.red),
         ]
     };
     let Some(inner) = frame(
@@ -887,7 +915,7 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 cv,
                 inner,
                 "◌",
-                VIOLET,
+                colors.violet,
                 "Nothing to review",
                 "Changed files, checkpoints and proof appear here once ORBIT edits something.",
             );
@@ -901,7 +929,7 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         );
         // Files on the left, the selected file on the right.
         let lw = (w * 2 / 5).clamp(24, 40).min(w - 10);
-        cv.text(x, y, "FILES", FAINT, None);
+        cv.text(x, y, "FILES", colors.faint, None);
         let selected = inp.s.selected_file().unwrap_or(0);
         let rows = ((h - 1).max(1)) as usize;
         let first = (selected + 1).saturating_sub(rows);
@@ -910,13 +938,13 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             cv.hit(x, yy, lw, 1, super::hits::Click::File(i));
             let sel = i == selected;
             let bg = if sel {
-                Some(tint(VIOLET, PANEL, 0.12))
+                Some(tint(colors.violet, colors.panel, 0.12))
             } else {
                 None
             };
             if sel {
-                cv.fill(x, yy, lw, 1, tint(VIOLET, PANEL, 0.12));
-                cv.text(x, yy, "▌", VIOLET, bg);
+                cv.fill(x, yy, lw, 1, tint(colors.violet, colors.panel, 0.12));
+                cv.text(x, yy, "▌", colors.violet, bg);
             }
             let cnt = if f.removed > 0 {
                 format!("+{} −{}", f.added, f.removed)
@@ -927,7 +955,7 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 x + 2,
                 yy,
                 &clip_path(&f.path, lw - 4 - text_width(&cnt)),
-                if sel { INK } else { INK2 },
+                if sel { colors.ink } else { colors.ink2 },
                 bg,
                 if sel {
                     Modifier::BOLD
@@ -935,10 +963,10 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                     Modifier::empty()
                 },
             );
-            cv.text(x + lw - 1 - text_width(&cnt), yy, &cnt, GREEN, bg);
+            cv.text(x + lw - 1 - text_width(&cnt), yy, &cnt, colors.green, bg);
         }
         for yy in y..y + h {
-            cv.text(x + lw, yy, "│", RULE, None);
+            cv.text(x + lw, yy, "│", colors.rule, None);
         }
         let rx = x + lw + 2;
         let rw = w - lw - 2;
@@ -952,10 +980,11 @@ fn review(cv: &mut Cv, r: Rect, inp: &PaneIn) {
 /// current one down. Says plainly when the engine had nothing to diff
 /// against — it never shows a placeholder as if it were a diff.
 fn review_diff(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, f: &FileChangeRow, hunk: usize) {
+    let colors = cv.palette;
     match &f.hunks {
         None => {
-            cv.bold(x, y, &clip_path(&f.path, w), BLUE, None);
-            cv.text(x, y + 2, "◌ no diff captured", MUTED, None);
+            cv.bold(x, y, &clip_path(&f.path, w), colors.blue, None);
+            cv.text(x, y + 2, "◌ no diff captured", colors.muted, None);
             cv.text(
                 x,
                 y + 3,
@@ -963,26 +992,26 @@ fn review_diff(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, f: &FileChangeRow, h
                     "this change arrived without a \"before\" to diff against",
                     w,
                 ),
-                FAINT,
+                colors.faint,
                 None,
             );
         }
         Some(hs) if hs.is_empty() => {
-            cv.bold(x, y, &clip_path(&f.path, w), BLUE, None);
-            cv.text(x, y + 2, "◌ no visible changes", MUTED, None);
+            cv.bold(x, y, &clip_path(&f.path, w), colors.blue, None);
+            cv.text(x, y + 2, "◌ no visible changes", colors.muted, None);
             cv.text(
                 x,
                 y + 3,
                 &clip_text("the edit touched only lines the bounds cut", w),
-                FAINT,
+                colors.faint,
                 None,
             );
         }
         Some(hs) => {
             let counter = format!("hunk {}/{}", hunk + 1, hs.len());
             let cw = text_width(&counter);
-            cv.bold(x, y, &clip_path(&f.path, w - cw - 2), BLUE, None);
-            cv.text(x + w - cw, y, &counter, FAINT, None);
+            cv.bold(x, y, &clip_path(&f.path, w - cw - 2), colors.blue, None);
+            cv.text(x + w - cw, y, &counter, colors.faint, None);
             let (rows, starts) = diffrows::rows(hs);
             let top = starts[hunk.min(starts.len() - 1)];
             let room = (h - 2).max(1) as usize;
@@ -990,13 +1019,13 @@ fn review_diff(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, f: &FileChangeRow, h
             // When the hunk (and the ones after it) do not fit, give the
             // last row to "N more" instead of cutting a line mid-thought.
             let shown = if left > room { room - 1 } else { left };
-            diffrows::draw(cv, x, y + 2, w, &rows[top..top + shown], PANEL);
+            diffrows::draw(cv, x, y + 2, w, &rows[top..top + shown], colors.panel);
             if left > shown {
                 cv.text(
                     x,
                     y + 2 + shown as i32,
                     &clip_text(&format!("… {} more · ⏎ full diff", left - shown), w),
-                    FAINT,
+                    colors.faint,
                     None,
                 );
             }
@@ -1005,6 +1034,7 @@ fn review_diff(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, f: &FileChangeRow, h
 }
 
 fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
+    let colors = cv.palette;
     let s = inp.s;
     let mine: Vec<_> = s
         .agents
@@ -1013,11 +1043,11 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         .filter(|a| inp.agent.is_empty() || a.name.eq_ignore_ascii_case(inp.agent))
         .collect();
     let b = if mine.iter().any(|a| !a.done) {
-        badge(BadgeState::Working, None, inp.now_ms, inp.reduced)
+        badge_themed(colors, BadgeState::Working, None, inp.now_ms, inp.reduced)
     } else if mine.is_empty() {
-        vec![Seg::new("none", FAINT)]
+        vec![Seg::new("none", colors.faint)]
     } else {
-        badge(BadgeState::Done, None, inp.now_ms, inp.reduced)
+        badge_themed(colors, BadgeState::Done, None, inp.now_ms, inp.reduced)
     };
     let title = if inp.agent.is_empty() {
         "Agent".to_string()
@@ -1030,7 +1060,11 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         &FrameSpec {
             num: inp.num,
             title: &title,
-            ident: if inp.agent == "review" { GREEN } else { BLUE },
+            ident: if inp.agent == "review" {
+                colors.green
+            } else {
+                colors.blue
+            },
             focused: inp.focused,
             focus_fx: inp.focus_fx,
             badge: Some(b),
@@ -1053,7 +1087,7 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 cv,
                 inner,
                 "◌",
-                BLUE,
+                colors.blue,
                 "No agent yet",
                 "A subagent ORBIT starts shows its task and what it is doing here.",
             );
@@ -1065,10 +1099,11 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             inner.width as i32,
             inner.height as i32,
         );
-        // One block per agent: who and how long, what it was asked, then
+        // One block per agent: who and how long, its model, what it was asked, then
         // what it is doing — or, once it has finished, what it reported.
         //
         //   ◜ Explore                                    12s
+        //     model · selected-model
         //     find where add() is defined
         //     ▸ Read calc.py
         let mut yy = y;
@@ -1083,32 +1118,42 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 ["◜", "◝", "◞", "◟"][((secs(inp.now_ms) * 10.0) as usize) & 3]
             };
             let (glyph, gcol) = match (a.done, a.ok) {
-                (false, _) => (arc, CYAN),
-                (true, true) => ("✓", GREEN),
-                (true, false) => ("✕", RED),
+                (false, _) => (arc, colors.cyan),
+                (true, true) => ("✓", colors.green),
+                (true, false) => ("✕", colors.red),
             };
             let (dur, _) = crate::proto::runtime::format_duration(
                 a.done_ms.unwrap_or(inp.now_ms).saturating_sub(a.started_ms),
             );
             let (status, scol) = match (a.done, a.ok) {
-                (false, _) => (dur, MUTED),
-                (true, true) => (format!("done · {dur}"), GREEN),
-                (true, false) => (format!("failed · {dur}"), RED),
+                (false, _) => (dur, colors.muted),
+                (true, true) => (format!("done · {dur}"), colors.green),
+                (true, false) => (format!("failed · {dur}"), colors.red),
             };
             let sw = text_width(&status);
             cv.bold(x, yy, glyph, gcol, None);
-            cv.bold(x + 2, yy, &clip_text(&a.name, w - 5 - sw), INK, None);
+            cv.bold(x + 2, yy, &clip_text(&a.name, w - 5 - sw), colors.ink, None);
             cv.text(x + w - sw, yy, &status, scol, None);
             yy += 1;
+            if !a.model.is_empty() {
+                cv.text(
+                    x + 2,
+                    yy,
+                    &clip_text(&format!("model · {}", a.model), w - 3),
+                    colors.faint,
+                    None,
+                );
+                yy += 1;
+            }
             if !a.task.is_empty() {
-                cv.text(x + 2, yy, &clip_text(&a.task, w - 3), MUTED, None);
+                cv.text(x + 2, yy, &clip_text(&a.task, w - 3), colors.muted, None);
                 yy += 1;
             }
             if !a.done {
                 let (line, col) = if a.action.is_empty() {
-                    ("starting…".to_string(), FAINT)
+                    ("starting…".to_string(), colors.faint)
                 } else {
-                    (format!("▸ {}", a.action), INK2)
+                    (format!("▸ {}", a.action), colors.ink2)
                 };
                 cv.text(x + 2, yy, &clip_text(&line, w - 3), col, None);
                 yy += 1;
@@ -1116,11 +1161,11 @@ fn agent(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 // Its report, wrapped, at most four lines.
                 let report = a.report.trim();
                 let (text, col) = if report.is_empty() {
-                    ("(no report)", FAINT)
+                    ("(no report)", colors.faint)
                 } else if a.ok {
-                    (report, INK2)
+                    (report, colors.ink2)
                 } else {
-                    (report, RED)
+                    (report, colors.red)
                 };
                 let chars: Vec<char> = text.chars().collect();
                 let lines = wrap_ranges(text, w - 3);

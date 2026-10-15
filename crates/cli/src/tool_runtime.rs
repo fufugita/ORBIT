@@ -372,7 +372,43 @@ pub fn execute_call(
     // is only asked when BOTH layers say ask.
     let args_preview =
         crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
-    let pattern_verdict = pattern_layer_verdict(home, scope, &call.name, &args_preview);
+    let mcp_plan = call
+        .name
+        .starts_with("mcp__")
+        .then(|| capture_mcp_dispatch_plan(home, &call.name, tool_cx));
+    let mut pattern_verdict = match &mcp_plan {
+        Some(Ok(plan)) => pattern_layer_verdict_with_plan(
+            home,
+            scope,
+            &call.name,
+            &args_preview,
+            &tool_cx.working_dir,
+            Some(plan),
+        ),
+        Some(Err(error)) => {
+            let (safe, redactions) = scan_mcp_text(error);
+            PatternOutcome::McpError(safe, redactions)
+        }
+        None => {
+            pattern_layer_verdict_in(home, scope, &call.name, &args_preview, &tool_cx.working_dir)
+        }
+    };
+    if call.name.starts_with("mcp__")
+        && tool_cx
+            .ext::<McpToolSelection>()
+            .is_some_and(|selection| !selection.0.contains(&call.name))
+    {
+        pattern_verdict =
+            PatternOutcome::Deny("MCP tool is outside the agent's tool selection".into());
+    }
+    if call.name == "LspDiagnostics"
+        && tool_cx
+            .ext::<LspToolSelection>()
+            .is_some_and(|allowed| !allowed.0)
+    {
+        pattern_verdict =
+            PatternOutcome::Deny("diagnostics are outside the agent's tool selection".into());
+    }
 
     // Determine the verdict:
     // 1. Unknown tool → always deny (fail-closed, even with --auto-tools / R).
@@ -391,11 +427,12 @@ pub fn execute_call(
     // and everything else — deny rules are a durable fail-closed, allow
     // rules a durable consent. A malformed rules file degrades to ask
     // (never silently allow).
-    let rules = crate::permissions::PermissionRules::load(home).unwrap_or_else(|e| {
-        eprintln!("warning: permissions.toml: {e} (falling back to ask)");
-        crate::permissions::PermissionRules::default()
-    });
-    let rule_verdict = rules.verdict(&call.name);
+    let rule_verdict = match &mcp_plan {
+        Some(Ok(plan)) => plan.legacy_verdict(&call.name),
+        _ => crate::permissions::PermissionRules::load(home)
+            .unwrap_or_default()
+            .verdict(&call.name),
+    };
     // The call's permission key, for rules granted this session.
     // Task/Agent are intercepted below (not registry tools), but their
     // pattern rules and session grants key on Agent(<agent-type>) —
@@ -412,19 +449,23 @@ pub fn execute_call(
         .as_ref()
         .is_some_and(|k| grants.rule_granted(&k.tool, &k.pattern));
     let mut offer: Option<GrantOffer> = None;
-    let verdict = if !known || rule_verdict == crate::permissions::RuleVerdict::Deny {
+    let mut verdict = if !known || rule_verdict == crate::permissions::RuleVerdict::Deny {
         ApprovalVerdict::Deny
-    } else if matches!(pattern_verdict, PatternOutcome::Deny(_)) {
+    } else if matches!(
+        pattern_verdict,
+        PatternOutcome::Deny(_) | PatternOutcome::McpError(_, _)
+    ) {
         // A pattern deny rule (or plan mode refusing a write) is final.
         ApprovalVerdict::Deny
-    } else if rule_verdict == crate::permissions::RuleVerdict::Allow
+    } else if pattern_verdict != PatternOutcome::ExplicitAsk
+        && (rule_verdict == crate::permissions::RuleVerdict::Allow
         || auto_tools
         || grants.is_granted(&call.name)
         || rule_granted
         // B4: the mode/pattern layer allows it outright (read-only in
         // default mode, edits in acceptEdits, an allow rule from
         // --allowedTools or settings.toml).
-        || pattern_verdict == PatternOutcome::Allow
+        || pattern_verdict == PatternOutcome::Allow)
     {
         ApprovalVerdict::AllowOnce
     } else {
@@ -448,9 +489,19 @@ pub fn execute_call(
                 preview: crate::tools::approval_preview(&call.name, &args_preview),
                 grant: offer.clone(),
             },
-            auto_tools,
+            auto_tools && pattern_verdict != PatternOutcome::ExplicitAsk,
         )
     };
+    // Consent names the captured server/configuration/policy, never a fresh
+    // decode of an alias. Refuse changes before recording an allowed verdict.
+    let mcp_changed = verdict != ApprovalVerdict::Deny
+        && mcp_plan
+            .as_ref()
+            .and_then(|plan| plan.as_ref().ok())
+            .is_some_and(|plan| !mcp_plan_is_current(home, &call.name, tool_cx, plan));
+    if mcp_changed {
+        verdict = ApprovalVerdict::Deny;
+    }
 
     // Apply the grant's side effects. `s` and `a` remember the rule the
     // card offered (nothing, if none was: the key did not mean anything);
@@ -486,7 +537,9 @@ pub fn execute_call(
         approval.take_note().filter(|n| !n.trim().is_empty())
     };
 
-    let reason = if !known {
+    let reason = if mcp_changed {
+        "MCP configuration or policy changed after approval; request confirmation again"
+    } else if !known {
         "unknown tool (deny-by-default)"
     } else if rule_verdict == crate::permissions::RuleVerdict::Deny {
         "denied by persistent rule (permissions.toml)"
@@ -494,6 +547,16 @@ pub fn execute_call(
         // B4: the mode/pattern layer denied (a deny rule, or plan mode
         // refusing a write) — its reason is the honest one.
         r
+    } else if let PatternOutcome::McpError(error, _) = &pattern_verdict {
+        error
+    } else if pattern_verdict == PatternOutcome::ExplicitAsk {
+        if allowed {
+            "operator approved configured explicit confirmation"
+        } else if !interactive {
+            "configured explicit confirmation requires an interactive approval"
+        } else {
+            "operator declined configured explicit confirmation"
+        }
     } else if rule_verdict == crate::permissions::RuleVerdict::Allow {
         "allowed by persistent rule (permissions.toml)"
     } else if auto_tools {
@@ -564,10 +627,15 @@ pub fn execute_call(
     drop(writer);
 
     if !allowed {
-        let output = match &note {
+        let mut output = match &note {
             Some(n) => tool_denial(&format!("denied by the operator: {n}")),
             None => tool_denial(reason),
         };
+        if let PatternOutcome::McpError(_, redactions) = &pattern_verdict {
+            let mut envelope: serde_json::Value = serde_json::from_str(&output).unwrap_or_default();
+            envelope["redactions"] = (*redactions).into();
+            output = envelope.to_string();
+        }
         // D9: a denial is not an error — audits must be able to tell an
         // operator refusal apart from a tool that ran and failed.
         record_result(
@@ -627,49 +695,119 @@ pub fn execute_call(
         return Ok((output, None));
     }
 
+    // Agent controls share the normal ledger and permission path above.
+    if call.name == "ListAgents" || call.name == "AgentSendMessage" {
+        let result = agent_store_for_context(home, session_id, tool_cx).and_then(|store| {
+            if call.name == "ListAgents" {
+                let offset = args
+                    .get("offset")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .ok_or("ListAgents 'offset' must be a non-negative integer")
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                let limit = args
+                    .get("limit")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .filter(|n| (1..=64).contains(n))
+                            .ok_or("ListAgents 'limit' must be between 1 and 64")
+                    })
+                    .transpose()?
+                    .unwrap_or(20) as usize;
+                store.list().map(|agents| {
+                    let total = agents.len();
+                    let mut agents: Vec<_> = agents.into_iter().skip(offset).take(limit).collect();
+                    // The store bounds agent counts and fields; the wire also
+                    // respects the common tool-result bound for large metadata.
+                    while serde_json::to_vec(&agents)
+                        .map_or(true, |body| body.len() > MAX_RESULT_BYTES - 1024)
+                    {
+                        if agents.pop().is_none() {
+                            break;
+                        }
+                    }
+                    let next = offset.saturating_add(agents.len());
+                    serde_json::json!({
+                        "total": total, "offset": offset,
+                        "next_offset": (next < total).then_some(next), "agents": agents,
+                    })
+                })
+            } else {
+                let id = args
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("AgentSendMessage requires 'agent_id'")?;
+                let text = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .ok_or("AgentSendMessage requires 'message'")?;
+                let identity = agent_session_context(tool_cx, session_id);
+                store
+                    .enqueue(id, text, identity.current_agent_id.as_deref())
+                    .map(|message| {
+                        serde_json::json!({
+                            "agent_id": id,
+                            "message_id": message.message_id,
+                            "status": "queued",
+                            "delivery": "next explicit Task resume"
+                        })
+                    })
+            }
+        });
+        let output = match result {
+            Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
+            Err(e) => tool_error(&e),
+        };
+        let status = if orbit_tools::result_is_error(&output) {
+            "error"
+        } else {
+            "ok"
+        };
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            status,
+            &output,
+            tool_cx,
+        )?;
+        return Ok((output, None));
+    }
+
     // The Task tool (phase 5) and its Agent alias: spawn a subagent.
     // The subagent needs the session's TurnConfig — derived from the
     // same environment the front-ends use, so provider/gate/model
     // match the parent. `Agent` is the current Claude Code name; both
     // shapes route to the one runner.
     if call.name == "Task" || call.name == "Agent" {
-        let agent = args
-            .get("agent")
-            .or_else(|| args.get("agent_type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("general");
-        let prompt = args
-            .get("prompt")
-            .or_else(|| args.get("description"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if prompt.is_empty() {
-            let output = tool_error("Task/Agent requires a 'prompt'");
-            record_result(
-                home,
-                session_id,
-                decision_id,
-                call,
-                "error",
-                &output,
-                tool_cx,
-            )?;
-            return Ok((output, None));
-        }
-        let turn_config = subagent_config_for(tool_cx, home, agent);
         let observer = tool_cx.ext::<SubagentObserver>();
-        let output = match crate::tools::execute_task(
+        let response = match crate::tools::execute_task_in_session(
             home,
-            agent,
-            prompt,
-            &turn_config,
+            session_id,
+            &args,
+            tool_cx,
+            scope,
             approval,
-            tool_cx.cancel_check(),
             observer.as_deref().map(|o| &*o.0),
         ) {
-            Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
-            Err(e) => tool_error(&e),
+            Ok(v) if v.get("ok").and_then(|ok| ok.as_bool()) == Some(false) => serde_json::json!({
+                "ok": false,
+                "agent_id": v.get("agent_id"),
+                "error": if v.get("status").and_then(|s| s.as_str()) == Some("cancelled") {
+                    "agent cancelled"
+                } else { "agent stopped before completing" },
+                "result": v,
+            }),
+            Ok(v) => serde_json::json!({ "ok": true, "result": v }),
+            Err(e) => e.into_value(),
         };
+        let output = bounded_task_output(response);
         let status = if orbit_tools::result_is_denial(&output) {
             "denied"
         } else if orbit_tools::result_is_error(&output) {
@@ -691,7 +829,10 @@ pub fn execute_call(
 
     // MCP tools (phase 5): mcp__<server>__<tool> — spawn, call, scan.
     if call.name.starts_with("mcp__") {
-        let output = execute_mcp(home, call, &args);
+        let output = match &mcp_plan {
+            Some(Ok(plan)) => execute_mcp(home, call, &args, tool_cx, plan),
+            _ => tool_denial("MCP dispatch has no validated captured plan"),
+        };
         let status = if orbit_tools::result_is_denial(&output) {
             "denied"
         } else if orbit_tools::result_is_error(&output) {
@@ -699,6 +840,23 @@ pub fn execute_call(
         } else {
             "ok"
         };
+        record_result(
+            home,
+            session_id,
+            decision_id,
+            call,
+            status,
+            &output,
+            tool_cx,
+        )?;
+        return Ok((output, None));
+    }
+
+    if call.name == "LspDiagnostics" {
+        let result = serde_json::from_value::<crate::lsp::LspDiagnosticsArgs>(args.clone())
+            .map_err(|error| crate::lsp::LspError::Configuration(error.to_string()))
+            .and_then(|arguments| crate::lsp::diagnostics(home, tool_cx, scope, &arguments));
+        let (output, status) = lsp_result_output(result);
         record_result(
             home,
             session_id,
@@ -781,10 +939,180 @@ pub fn execute_call(
         &output,
         tool_cx,
     )?;
-    // Legacy tools (Bash/Glob/...) don't snapshot, so no diff — only
-    // checkpointed writes (Write/Edit through execute_wave1) carry a
-    // FileChange.
     Ok((output, None))
+}
+
+fn lsp_result_output(
+    result: Result<crate::lsp::DiagnosticReport, crate::lsp::LspError>,
+) -> (String, &'static str) {
+    let (output, status) = match result {
+        Ok(report) => (
+            serde_json::json!({"ok":true,"result":report}).to_string(),
+            "ok",
+        ),
+        Err(error) => {
+            let denied = matches!(error, crate::lsp::LspError::Denied(_));
+            let (safe, _) = scan_mcp_text(&error.to_string());
+            (
+                serde_json::json!({"ok":false,"error":safe,"denied":denied}).to_string(),
+                if denied { "denied" } else { "error" },
+            )
+        }
+    };
+    if output.len() > MAX_RESULT_BYTES {
+        (tool_error("diagnostic result exceeds 64 KiB"), "error")
+    } else {
+        (output, status)
+    }
+}
+
+#[cfg(test)]
+mod lsp_output_tests {
+    use super::*;
+
+    #[test]
+    fn lsp_outer_envelope_overflow_records_exact_error_hash_and_bytes() {
+        let mut report = crate::lsp::DiagnosticReport {
+            server: "fixture".into(),
+            uri: "file:///workspace/file.rs".into(),
+            document_version: 1,
+            position_encoding: "utf-16".into(),
+            status: crate::lsp::DiagnosticStatus::Received,
+            freshness: crate::lsp::Freshness::Confirmed,
+            reason: None,
+            diagnostics: vec![crate::lsp::Diagnostic {
+                range: crate::lsp::Range {
+                    start: crate::lsp::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: crate::lsp::Position {
+                        line: 0,
+                        character: 1,
+                    },
+                },
+                severity: Some(1),
+                message: "x".repeat(60_000),
+                code: None,
+                source: None,
+                tags: vec![],
+            }],
+            truncated: false,
+            redactions: vec![],
+        };
+        let bytes = serde_json::to_vec(&report).unwrap().len();
+        report
+            .uri
+            .push_str(&"x".repeat(MAX_RESULT_BYTES - 4 - bytes));
+        assert_eq!(
+            serde_json::to_vec(&report).unwrap().len(),
+            MAX_RESULT_BYTES - 4
+        );
+        let (output, status) = lsp_result_output(Ok(report));
+        assert!(output.len() < MAX_RESULT_BYTES);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap()["ok"],
+            false
+        );
+        assert_eq!(status, "error");
+        let home = std::env::temp_dir().join(format!("orbit-lsp-output-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&home).unwrap();
+        let cx = orbit_tools::ToolContext::new(home.clone(), "owner".into(), home.clone());
+        let call = crate::PendingToolCall {
+            index: 0,
+            id: "boundary".into(),
+            name: "LspDiagnostics".into(),
+            arguments: b"{}".to_vec(),
+        };
+        record_result(&home, "owner", "decision", &call, status, &output, &cx).unwrap();
+        let (records, _) = orbit_ledger::verify_ledger(&home.join("ledger")).unwrap();
+        let result = records
+            .iter()
+            .find_map(|record| match &record.record.event {
+                orbit_ledger::LedgerEvent::ToolResult(result) if result.call_id == "boundary" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(result.status, "error");
+        assert_eq!(result.output_bytes, output.len() as u64);
+        assert_eq!(
+            result.output_sha256,
+            hex::encode(Sha256::digest(output.as_bytes()))
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
+/// Only the wire response is shortened; the engine's full report has already
+/// been persisted. AgentStore bounds all metadata fields, so report/error text
+/// are the only fields capable of exceeding the common result limit.
+fn bounded_task_output(mut response: serde_json::Value) -> String {
+    let encoded = response.to_string();
+    if encoded.len() <= MAX_RESULT_BYTES {
+        return encoded;
+    }
+    for (pointer, flag) in [
+        ("/result/report", "/result/report_truncated"),
+        ("/error", "/error_truncated"),
+    ] {
+        if response.to_string().len() <= MAX_RESULT_BYTES {
+            break;
+        }
+        let Some(field) = response
+            .pointer_mut(pointer)
+            .filter(|value| value.is_string())
+        else {
+            continue;
+        };
+        let serde_json::Value::String(full_text) = field.take() else {
+            unreachable!()
+        };
+        *field = serde_json::Value::String(String::new());
+        // These paths are fixed properties of Task's owned response envelope.
+        if flag == "/result/report_truncated" {
+            response["result"]["report_truncated"] = true.into();
+        } else {
+            response["error_truncated"] = true.into();
+        }
+        let budget = MAX_RESULT_BYTES.saturating_sub(response.to_string().len());
+        let mut upper = full_text.len().min(budget);
+        while !full_text.is_char_boundary(upper) {
+            upper -= 1;
+        }
+        // A UTF-8 prefix cannot serialize to fewer bytes than its source. Bound
+        // the search before collecting character boundaries, even for huge reports.
+        let mut boundaries: Vec<usize> = full_text[..upper]
+            .char_indices()
+            .map(|(index, _)| index)
+            .collect();
+        boundaries.push(upper);
+        let (mut low, mut high) = (0, boundaries.len() - 1);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            *response
+                .pointer_mut(pointer)
+                .expect("fixed Task text field") =
+                full_text[..boundaries[middle]].to_string().into();
+            // Measure the complete encoded envelope: escaped control characters
+            // and the truncation flag consume space too.
+            if response.to_string().len() <= MAX_RESULT_BYTES {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        *response
+            .pointer_mut(pointer)
+            .expect("fixed Task text field") = full_text[..boundaries[low]].to_string().into();
+    }
+    let encoded = response.to_string();
+    debug_assert!(
+        encoded.len() <= MAX_RESULT_BYTES,
+        "bounded Task metadata exceeded the result limit"
+    );
+    encoded
 }
 
 /// The rule `s` and `a` would remember for this call, or None when there
@@ -852,18 +1180,56 @@ fn save_rule(project: &Path, rule: &str) -> Result<(), String> {
 enum PatternOutcome {
     Allow,
     Ask,
+    ExplicitAsk,
     Deny(String),
+    McpError(String, usize),
 }
 
+#[cfg(test)]
 fn pattern_layer_verdict(
     home: &Path,
     scope: &PermissionScope,
     tool_name: &str,
     args: &serde_json::Value,
 ) -> PatternOutcome {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    pattern_layer_verdict_in(home, scope, tool_name, args, &cwd)
+}
+
+fn pattern_layer_verdict_in(
+    home: &Path,
+    scope: &PermissionScope,
+    tool_name: &str,
+    args: &serde_json::Value,
+    working_dir: &Path,
+) -> PatternOutcome {
+    pattern_layer_verdict_with_plan(home, scope, tool_name, args, working_dir, None)
+}
+
+fn pattern_layer_verdict_with_plan(
+    home: &Path,
+    scope: &PermissionScope,
+    tool_name: &str,
+    args: &serde_json::Value,
+    working_dir: &Path,
+    plan: Option<&McpDispatchPlan>,
+) -> PatternOutcome {
     use orbit_tools::permissions::{evaluate, parse_rule, RuleEffectSerde, Verdict};
 
-    let mut rules = orbit_tools::executor::load_rules(home);
+    let entries = match plan
+        .map(|plan| Ok(plan.rules.clone()))
+        .unwrap_or_else(|| orbit_tools::executor::load_sourced_rules_in(home, working_dir))
+    {
+        Ok(entries) => entries,
+        Err(error) => return PatternOutcome::Deny(error),
+    };
+    let mut rules = orbit_tools::permissions::RuleSet {
+        rules: entries
+            .into_iter()
+            .filter(|entry| !entry.shadowed)
+            .map(|entry| entry.rule)
+            .collect(),
+    };
     // An explicit operator allowlist (--allowedTools / settings) is a
     // SCOPE statement: only what it names may run. The flag is tracked
     // separately so the pure-built-in bypass below cannot punch
@@ -871,12 +1237,18 @@ fn pattern_layer_verdict(
     // calculator with exit 2, not let the built-in run).
     if let Some(list) = &scope.allowlist {
         for entry in list {
+            if let Err(error) = validate_scope_selector(entry) {
+                return PatternOutcome::Deny(error);
+            }
             if let Some(r) = parse_rule(entry, RuleEffectSerde::Allow) {
                 rules.rules.push(r);
             }
         }
     }
     for entry in &scope.disallowlist {
+        if let Err(error) = validate_scope_selector(entry) {
+            return PatternOutcome::Deny(error);
+        }
         if let Some(r) = parse_rule(entry, RuleEffectSerde::Deny) {
             rules.rules.push(r);
         }
@@ -885,6 +1257,31 @@ fn pattern_layer_verdict(
         .into_iter()
         .find(|t| t.name() == tool_name)
     else {
+        if tool_name == "LspDiagnostics" {
+            let pattern = args
+                .get("file_path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            // The diagnostics backend preserves read/file deny barriers in
+            // every mode; reflect that same boundary before convenience grants.
+            if rules.evaluate(tool_name, pattern)
+                == Some(orbit_tools::permissions::RuleEffect::Deny)
+                || rules.evaluate("Read", pattern)
+                    == Some(orbit_tools::permissions::RuleEffect::Deny)
+            {
+                return PatternOutcome::Deny("diagnostics or document is denied by rule".into());
+            }
+            if let Some(allowlist) = &scope.allowlist {
+                if !allowlist.iter().any(|entry| entry == tool_name) {
+                    return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
+                }
+            }
+            return match evaluate(scope.mode, &rules, tool_name, pattern, true, false) {
+                Verdict::Allow => PatternOutcome::Allow,
+                Verdict::Ask => PatternOutcome::ExplicitAsk,
+                Verdict::Deny(reason) => PatternOutcome::Deny(reason),
+            };
+        }
         // Not a registry tool. Pure built-ins (calculator, session
         // lookups) are safe by construction — UNLESS the operator
         // pinned an explicit allowlist, which names the whole scope
@@ -893,8 +1290,32 @@ fn pattern_layer_verdict(
             .iter()
             .any(|t| t.name == tool_name)
         {
-            if scope.allowlist.is_some() {
-                return PatternOutcome::Ask;
+            if let Some(allowlist) = &scope.allowlist {
+                let covered = allowlist.iter().any(|entry| {
+                    parse_rule(entry, RuleEffectSerde::Allow).is_some_and(|rule| {
+                        rule.tool == tool_name && orbit_tools::permissions::rule_matches(&rule, "")
+                    })
+                });
+                if !covered {
+                    return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
+                }
+            }
+            if scope.mode != orbit_tools::permissions::PermissionMode::Bypass {
+                match rules.evaluate(tool_name, "") {
+                    Some(orbit_tools::permissions::RuleEffect::Deny) => {
+                        return PatternOutcome::Deny("denied by rule".into());
+                    }
+                    Some(orbit_tools::permissions::RuleEffect::Ask) => {
+                        return if scope.mode == orbit_tools::permissions::PermissionMode::DontAsk {
+                            PatternOutcome::Deny(
+                                "configured confirmation is unavailable (dontAsk)".into(),
+                            )
+                        } else {
+                            PatternOutcome::ExplicitAsk
+                        };
+                    }
+                    Some(orbit_tools::permissions::RuleEffect::Allow) | None => {}
+                }
             }
             return PatternOutcome::Allow;
         }
@@ -907,6 +1328,84 @@ fn pattern_layer_verdict(
             let key = orbit_tools::agent_permission_key(args);
             return match evaluate(scope.mode, &rules, &key.tool, &key.pattern, false, false) {
                 Verdict::Allow => PatternOutcome::Allow,
+                Verdict::Ask => PatternOutcome::Ask,
+                Verdict::Deny(reason) => PatternOutcome::Deny(reason),
+            };
+        }
+        if tool_name == "ListAgents" || tool_name == "AgentSendMessage" {
+            let pattern = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            if tool_name == "AgentSendMessage"
+                && scope.mode == orbit_tools::permissions::PermissionMode::Plan
+            {
+                return PatternOutcome::Deny("plan mode: agent messages are queue writes".into());
+            }
+            if let Some(allowlist) = &scope.allowlist {
+                let covered = allowlist.iter().any(|entry| {
+                    parse_rule(entry, RuleEffectSerde::Allow).is_some_and(|rule| {
+                        rule.tool == tool_name
+                            && orbit_tools::permissions::rule_matches(&rule, pattern)
+                    })
+                });
+                if !covered {
+                    return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
+                }
+            }
+            return match evaluate(
+                scope.mode,
+                &rules,
+                tool_name,
+                pattern,
+                tool_name == "ListAgents",
+                false,
+            ) {
+                Verdict::Allow => PatternOutcome::Allow,
+                Verdict::Ask => PatternOutcome::Ask,
+                Verdict::Deny(reason) => PatternOutcome::Deny(reason),
+            };
+        }
+        if tool_name.starts_with("mcp__") {
+            // Server descriptions cannot establish whether a call reads or
+            // writes. Plan mode therefore refuses every opaque MCP operation,
+            // including calls covered by durable or automatic grants.
+            if scope.mode == orbit_tools::permissions::PermissionMode::Plan {
+                return PatternOutcome::Deny("plan mode: MCP effects are unknown".into());
+            }
+            let (server, _) = match plan
+                .map(|plan| Ok((plan.server.clone(), plan.tool.clone())))
+                .unwrap_or_else(|| resolve_mcp_target(home, working_dir, tool_name))
+            {
+                Ok(target) => target,
+                Err(error) => {
+                    let (safe, redactions) = scan_mcp_text(&error);
+                    return PatternOutcome::McpError(safe, redactions);
+                }
+            };
+            if let Some(allowlist) = &scope.allowlist {
+                if !allowlist.iter().any(|entry| {
+                    parse_rule(entry, RuleEffectSerde::Allow).is_some_and(|rule| {
+                        orbit_tools::permissions::rule_tool_matches(&rule, tool_name, Some(&server))
+                            && orbit_tools::permissions::rule_matches(&rule, "")
+                    })
+                }) {
+                    return PatternOutcome::Deny("tool is outside the operator's allowlist".into());
+                }
+            }
+            return match orbit_tools::permissions::evaluate_with_server(
+                scope.mode,
+                &rules,
+                tool_name,
+                "",
+                false,
+                false,
+                Some(&server),
+            ) {
+                Verdict::Allow => PatternOutcome::Allow,
+                Verdict::Ask
+                    if rules.evaluate_with_server(tool_name, "", Some(&server))
+                        == Some(orbit_tools::permissions::RuleEffect::Ask) =>
+                {
+                    PatternOutcome::ExplicitAsk
+                }
                 Verdict::Ask => PatternOutcome::Ask,
                 Verdict::Deny(reason) => PatternOutcome::Deny(reason),
             };
@@ -930,6 +1429,483 @@ fn pattern_layer_verdict(
         Verdict::Ask => PatternOutcome::Ask,
         Verdict::Deny(reason) => PatternOutcome::Deny(reason),
     }
+}
+
+fn validate_scope_selector(entry: &str) -> Result<(), String> {
+    if !entry.trim().starts_with("mcp__") {
+        return Ok(());
+    }
+    let rule =
+        orbit_tools::permissions::parse_rule(entry, orbit_tools::permissions::RuleEffectSerde::Ask)
+            .ok_or_else(|| "malformed MCP selector".to_string())?;
+    orbit_tools::permissions::validate_mcp_selector(&rule.tool)?;
+    if !rule.pattern.is_empty() || entry.contains(['(', ')']) {
+        return Err("MCP selectors do not accept argument patterns".into());
+    }
+    Ok(())
+}
+
+/// A bounded effective view; sources identify scopes without disclosing paths.
+#[derive(Debug, Clone)]
+pub struct PermissionPolicyReport {
+    pub selector: String,
+    pub effect: orbit_tools::permissions::RuleEffectSerde,
+    pub sources: Vec<String>,
+    pub matching_rules: Vec<PermissionPolicyMatch>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionPolicyMatch {
+    pub selector: String,
+    pub effect: orbit_tools::permissions::RuleEffectSerde,
+    pub source: String,
+    pub shadowed: bool,
+}
+
+/// Query an exact tool or an actual-server policy, including independent layers.
+pub fn effective_permission_policy(
+    home: &Path,
+    scope: &PermissionScope,
+    working_dir: &Path,
+    selector: &str,
+) -> Result<PermissionPolicyReport, String> {
+    use orbit_tools::permissions::{parse_rule, rule_tool_matches, RuleEffectSerde};
+    validate_policy_selector(selector)?;
+    let server_selector = selector
+        .strip_prefix("mcp__")
+        .and_then(|value| value.strip_suffix("__*"));
+    let target = if selector.starts_with("mcp__") && server_selector.is_none() {
+        Some(
+            resolve_mcp_target(home, working_dir, selector)
+                .map_err(|error| scan_mcp_text(&error).0)?,
+        )
+    } else {
+        None
+    };
+    let server = server_selector.or_else(|| target.as_ref().map(|target| target.0.as_str()));
+    let pure_builtin = crate::tools::builtin_tools()
+        .iter()
+        .any(|tool| tool.name == selector);
+    // Pure built-ins have an empty permission argument for every call, so
+    // universal patterns have a definite meaning even in a whole-tool query.
+    let pattern_covers = |rule: &orbit_tools::permissions::PermissionRule| {
+        rule.pattern.is_empty()
+            || ((pure_builtin || selector == "LspDiagnostics")
+                && orbit_tools::permissions::rule_matches(rule, ""))
+    };
+    let rule_selector = |rule: &orbit_tools::permissions::PermissionRule| {
+        if rule.pattern.is_empty() {
+            rule.tool.clone()
+        } else {
+            format!("{}({})", rule.tool, rule.pattern)
+        }
+    };
+    let mut matches = Vec::new();
+    for entry in orbit_tools::executor::load_sourced_rules_in(home, working_dir)? {
+        let inherited_read_deny = selector == "LspDiagnostics"
+            && entry.rule.effect == RuleEffectSerde::Deny
+            && (entry.rule.pattern.is_empty()
+                || orbit_tools::permissions::rule_matches(&entry.rule, ""))
+            && entry.rule.tool == "Read";
+        if (pattern_covers(&entry.rule) && rule_tool_matches(&entry.rule, selector, server))
+            || inherited_read_deny
+        {
+            matches.push(PermissionPolicyMatch {
+                selector: rule_selector(&entry.rule),
+                effect: entry.rule.effect,
+                source: entry.source.into(),
+                shadowed: entry.shadowed,
+            });
+        }
+    }
+    for (entries, effect, source) in [
+        (
+            scope.disallowlist.as_slice(),
+            RuleEffectSerde::Deny,
+            "operator-disallowlist",
+        ),
+        (
+            scope.allowlist.as_deref().unwrap_or_default(),
+            RuleEffectSerde::Allow,
+            "operator-allowlist",
+        ),
+    ] {
+        for raw in entries {
+            validate_scope_selector(raw)?;
+            if let Some(rule) = parse_rule(raw, effect) {
+                let inherited_read_deny = selector == "LspDiagnostics"
+                    && effect == RuleEffectSerde::Deny
+                    && (rule.pattern.is_empty()
+                        || orbit_tools::permissions::rule_matches(&rule, ""))
+                    && rule.tool == "Read";
+                if (pattern_covers(&rule) && rule_tool_matches(&rule, selector, server))
+                    || inherited_read_deny
+                {
+                    matches.push(PermissionPolicyMatch {
+                        selector: rule_selector(&rule),
+                        effect,
+                        source: source.into(),
+                        shadowed: false,
+                    });
+                }
+            }
+        }
+    }
+    if selector.starts_with("mcp__") && scope.mode == orbit_tools::permissions::PermissionMode::Plan
+    {
+        matches.push(PermissionPolicyMatch {
+            selector: selector.into(),
+            effect: RuleEffectSerde::Deny,
+            source: "plan-mode".into(),
+            shadowed: false,
+        });
+    } else if scope.allowlist.is_some()
+        && !matches
+            .iter()
+            .any(|entry| entry.source == "operator-allowlist")
+    {
+        matches.push(PermissionPolicyMatch {
+            selector: selector.into(),
+            effect: RuleEffectSerde::Deny,
+            source: "operator-scope-exclusion".into(),
+            shadowed: false,
+        });
+    }
+    let winning = [
+        RuleEffectSerde::Deny,
+        RuleEffectSerde::Ask,
+        RuleEffectSerde::Allow,
+    ]
+    .into_iter()
+    .find(|effect| {
+        matches
+            .iter()
+            .any(|entry| !entry.shadowed && entry.effect == *effect)
+    });
+    let mut effect = winning.unwrap_or_else(|| {
+        if selector.starts_with("mcp__") {
+            RuleEffectSerde::Ask
+        } else if crate::tools::builtin_tools()
+            .iter()
+            .any(|tool| tool.name == selector)
+        {
+            RuleEffectSerde::Allow
+        } else {
+            use orbit_tools::permissions::{evaluate, RuleSet, Verdict};
+            match evaluate(
+                scope.mode,
+                &RuleSet::default(),
+                selector,
+                "",
+                crate::tools::is_read_only(selector),
+                false,
+            ) {
+                Verdict::Allow => RuleEffectSerde::Allow,
+                Verdict::Ask => RuleEffectSerde::Ask,
+                Verdict::Deny(_) => RuleEffectSerde::Deny,
+            }
+        }
+    });
+    let mut sources: Vec<_> = matches
+        .iter()
+        .filter(|entry| !entry.shadowed && entry.effect == effect)
+        .map(|entry| entry.source.clone())
+        .collect();
+    sources.sort();
+    sources.dedup();
+    if sources.is_empty() {
+        use orbit_tools::permissions::PermissionMode;
+        sources.push(
+            if crate::tools::builtin_tools()
+                .iter()
+                .any(|tool| tool.name == selector)
+            {
+                "pure-builtin"
+            } else {
+                match scope.mode {
+                    PermissionMode::Default => "uncovered-default",
+                    PermissionMode::AcceptEdits => "accept-edits-mode",
+                    PermissionMode::Plan => "plan-mode",
+                    PermissionMode::DontAsk => "dont-ask-mode",
+                    PermissionMode::Bypass => "bypass-mode",
+                }
+            }
+            .into(),
+        );
+    }
+    if scope.mode == orbit_tools::permissions::PermissionMode::Bypass
+        && !matches.iter().any(|entry| {
+            entry.effect == RuleEffectSerde::Deny
+                && !entry.shadowed
+                && (selector == "LspDiagnostics"
+                    || matches!(entry.source.as_str(), "legacy" | "operator-scope-exclusion"))
+        })
+    {
+        effect = RuleEffectSerde::Allow;
+        sources = vec!["bypass-mode".into()];
+    } else if scope.mode == orbit_tools::permissions::PermissionMode::DontAsk
+        && effect == RuleEffectSerde::Ask
+    {
+        effect = RuleEffectSerde::Deny;
+        sources = vec!["dont-ask-mode".into()];
+    }
+    let truncated = matches.len() > 64;
+    matches.truncate(64);
+    Ok(PermissionPolicyReport {
+        selector: selector.into(),
+        effect,
+        sources,
+        matching_rules: matches,
+        truncated,
+    })
+}
+
+fn validate_policy_selector(selector: &str) -> Result<(), String> {
+    if selector.is_empty()
+        || selector.len() > 256
+        || selector
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        || selector.contains(['(', ')'])
+        || (!selector.starts_with("mcp__") && selector.contains('*'))
+    {
+        return Err("policy requires an exact tool or mcp__<server>__* selector".into());
+    }
+    orbit_tools::permissions::validate_mcp_selector(selector)
+}
+
+/// Save a replacement in the operator layer before publishing its effective view.
+/// None resets that layer only, so other user/project/legacy denies survive.
+pub fn set_permission_override(
+    home: &Path,
+    scope: &PermissionScope,
+    working_dir: &Path,
+    selector: &str,
+    effect: Option<orbit_tools::permissions::RuleEffectSerde>,
+) -> Result<PermissionPolicyReport, String> {
+    effective_permission_policy(home, scope, working_dir, selector)?;
+    orbit_tools::executor::write_operator_override(home, selector, effect)?;
+    effective_permission_policy(home, scope, working_dir, selector)
+}
+
+/// Text for /permissions; bounded and restricted to rule identities/scope labels.
+pub fn permission_command(
+    home: &Path,
+    scope: &PermissionScope,
+    working_dir: &Path,
+    argument: &str,
+) -> Result<String, String> {
+    use orbit_tools::permissions::RuleEffectSerde;
+    let words: Vec<_> = argument.split_whitespace().collect();
+    match words.as_slice() {
+        [] => permission_policy_status(home, scope, working_dir, None),
+        [selector] if !matches!(*selector, "allow" | "ask" | "deny" | "reset") => {
+            permission_policy_status(home, scope, working_dir, Some(selector))
+        }
+        [action, selector] if matches!(*action, "allow" | "ask" | "deny" | "reset") => {
+            let effect = match *action {
+                "allow" => Some(RuleEffectSerde::Allow),
+                "ask" => Some(RuleEffectSerde::Ask),
+                "deny" => Some(RuleEffectSerde::Deny),
+                _ => None,
+            };
+            let report = set_permission_override(home, scope, working_dir, selector, effect)?;
+            Ok(format_permission_report(&report))
+        }
+        _ => Err("usage: /permissions [<tool>|allow|ask|deny|reset <tool>]".into()),
+    }
+}
+
+fn format_permission_report(report: &PermissionPolicyReport) -> String {
+    let shadowed = report
+        .matching_rules
+        .iter()
+        .filter(|entry| entry.shadowed)
+        .map(|entry| entry.source.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}: {:?} ({}{}){}",
+        report.selector,
+        report.effect,
+        report.sources.join(", "),
+        if report.truncated {
+            "; more matching rules omitted"
+        } else {
+            ""
+        },
+        if shadowed.is_empty() {
+            String::new()
+        } else {
+            format!("; replaces same-selector {shadowed}")
+        }
+    )
+}
+
+/// Text for /permissions; bounded and restricted to rule identities/scope labels.
+pub fn permission_policy_status(
+    home: &Path,
+    scope: &PermissionScope,
+    working_dir: &Path,
+    selector: Option<&str>,
+) -> Result<String, String> {
+    let selectors = if let Some(selector) = selector {
+        vec![selector.to_string()]
+    } else {
+        let mut selectors: Vec<_> =
+            orbit_tools::executor::load_sourced_rules_in(home, working_dir)?
+                .into_iter()
+                .filter(|entry| entry.rule.pattern.is_empty())
+                .map(|entry| entry.rule.tool)
+                .collect();
+        selectors.extend(
+            scope
+                .allowlist
+                .iter()
+                .flatten()
+                .chain(scope.disallowlist.iter())
+                .filter_map(|raw| {
+                    orbit_tools::permissions::parse_rule(
+                        raw,
+                        orbit_tools::permissions::RuleEffectSerde::Ask,
+                    )
+                    .filter(|rule| rule.pattern.is_empty())
+                    .map(|rule| rule.tool)
+                }),
+        );
+        selectors.sort();
+        selectors.dedup();
+        selectors.truncate(64);
+        selectors
+    };
+    if selectors.is_empty() {
+        return Ok(
+            "No exact tool or MCP server rules. Uncovered MCP calls ask for approval.".into(),
+        );
+    }
+    let mut lines = Vec::new();
+    for selector in selectors {
+        let report = effective_permission_policy(home, scope, working_dir, &selector)?;
+        lines.push(format_permission_report(&report));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Resolve from configured identities and exposure, never the first separator.
+/// If two enabled/exposed server-tool pairs have the same wire name, refuse.
+pub fn resolve_mcp_target(
+    home: &Path,
+    working_dir: &Path,
+    wire: &str,
+) -> Result<(String, String), String> {
+    let trusted = orbit_tools::permissions::FolderTrust::new(home.into()).is_trusted(working_dir);
+    let cfg = orbit_mcp::McpConfig::try_load_at(home, working_dir, trusted)?;
+    resolve_mcp_target_in(&cfg, wire)
+}
+
+pub(crate) fn resolve_mcp_target_in(
+    cfg: &orbit_mcp::McpConfig,
+    wire: &str,
+) -> Result<(String, String), String> {
+    let candidates: Vec<_> = cfg
+        .servers
+        .iter()
+        .filter_map(|(server, config)| {
+            let tool = wire.strip_prefix(&format!("mcp__{server}__"))?;
+            (!tool.is_empty() && config.tool_enabled(tool))
+                .then(|| (server.clone(), tool.to_string()))
+        })
+        .collect();
+    match candidates.as_slice() {
+        [target] => Ok(target.clone()),
+        [] => Err("MCP server or tool is not configured or enabled".into()),
+        _ => Err("ambiguous MCP wire name; configure exact tool exposure for each server".into()),
+    }
+}
+
+/// Configuration and rule values stay private. A bounded snapshot binds
+/// consent to the actual server/tool and launch vector, including environment.
+struct McpDispatchPlan {
+    server: String,
+    tool: String,
+    configuration: orbit_mcp::McpConfig,
+    rules: Vec<orbit_tools::executor::SourcedPermissionRule>,
+    profile: Option<Vec<String>>,
+}
+
+impl McpDispatchPlan {
+    fn legacy_verdict(&self, wire: &str) -> crate::permissions::RuleVerdict {
+        use orbit_tools::permissions::{RuleEffect, RuleSet};
+        let legacy = RuleSet {
+            rules: self
+                .rules
+                .iter()
+                .filter(|entry| entry.source == "legacy" && !entry.shadowed)
+                .map(|entry| entry.rule.clone())
+                .collect(),
+        };
+        match legacy.evaluate_with_server(wire, "", Some(&self.server)) {
+            Some(RuleEffect::Deny) => crate::permissions::RuleVerdict::Deny,
+            Some(RuleEffect::Allow) => crate::permissions::RuleVerdict::Allow,
+            _ => crate::permissions::RuleVerdict::Ask,
+        }
+    }
+}
+
+fn capture_mcp_dispatch_plan(
+    home: &Path,
+    wire: &str,
+    cx: &orbit_tools::ToolContext,
+) -> Result<McpDispatchPlan, String> {
+    let trusted =
+        orbit_tools::permissions::FolderTrust::new(home.into()).is_trusted(&cx.working_dir);
+    let configuration = orbit_mcp::McpConfig::try_load_at(home, &cx.working_dir, trusted)?;
+    if serde_json::to_vec(&configuration)
+        .map_err(|_| "invalid MCP configuration".to_string())?
+        .len()
+        > orbit_mcp::MAX_FRAME_BYTES
+    {
+        return Err("MCP configuration exceeds dispatch snapshot bound".into());
+    }
+    let (server, tool) = resolve_mcp_target_in(&configuration, wire)?;
+    let rules = orbit_tools::executor::load_sourced_rules_in(home, &cx.working_dir)?;
+    let rule_values: Vec<_> = rules
+        .iter()
+        .map(|entry| (&entry.rule, entry.source, entry.shadowed))
+        .collect();
+    if serde_json::to_vec(&rule_values)
+        .map_err(|_| "invalid permission rules".to_string())?
+        .len()
+        > orbit_mcp::MAX_FRAME_BYTES
+    {
+        return Err("permission rules exceed dispatch snapshot bound".into());
+    }
+    let profile = cx
+        .ext::<McpToolSelection>()
+        .map(|selection| selection.0.clone());
+    Ok(McpDispatchPlan {
+        server,
+        tool,
+        configuration,
+        rules,
+        profile,
+    })
+}
+
+fn mcp_plan_is_current(
+    home: &Path,
+    wire: &str,
+    cx: &orbit_tools::ToolContext,
+    approved: &McpDispatchPlan,
+) -> bool {
+    capture_mcp_dispatch_plan(home, wire, cx).is_ok_and(|current| {
+        current.server == approved.server
+            && current.tool == approved.tool
+            && current.configuration.servers == approved.configuration.servers
+            && current.rules == approved.rules
+            && current.profile == approved.profile
+    })
 }
 
 /// Display-safe summary of a tool call (name + argument keys only).
@@ -1440,56 +2416,730 @@ fn project_trusted_home(home: &Path) -> bool {
 
 /// Execute one MCP call: resolve the server from the config, spawn,
 /// call, scan the result (never trust external output).
-fn execute_mcp(home: &Path, call: &crate::PendingToolCall, args: &serde_json::Value) -> String {
-    let Some((server, tool)) = orbit_mcp::split_wire_name(&call.name) else {
-        return tool_error("malformed mcp tool name");
-    };
-    let trusted = project_trusted_home(home);
-    let cfg = orbit_mcp::McpConfig::load(home, trusted);
-    let Some(server_cfg) = cfg.servers.get(&server) else {
-        return tool_error(&format!("mcp server not configured: {server}"));
-    };
+fn execute_mcp(
+    home: &Path,
+    call: &crate::PendingToolCall,
+    args: &serde_json::Value,
+    cx: &orbit_tools::ToolContext,
+    plan: &McpDispatchPlan,
+) -> String {
+    if !mcp_plan_is_current(home, &call.name, cx, plan) {
+        return tool_denial(
+            "MCP configuration or policy changed before dispatch; request confirmation again",
+        );
+    }
+    if cx
+        .ext::<McpToolSelection>()
+        .is_some_and(|selection| !selection.0.contains(&call.name))
+    {
+        return mcp_error("MCP tool is outside the agent's tool selection");
+    }
+    let server_cfg = &plan.configuration.servers[&plan.server];
     // The process-lifetime pool: the server was spawned once (at
     // definition build) and is reused across every call (phase 5 —
     // no re-spawn, no re-handshake per tool call).
-    let mut call_args = args.clone();
-    if let Some(obj) = call_args.as_object_mut() {
-        obj.remove("server");
-        obj.remove("tool");
-    }
-    let params = serde_json::json!({
-        "name": tool,
-        "arguments": call_args,
-    });
-    match orbit_mcp::POOL.request(&server, server_cfg, "tools/call", params) {
+    let mut options =
+        orbit_mcp::McpCallOptions::new(std::time::Duration::from_millis(server_cfg.timeout_ms));
+    options.cancel = cx.cancel_check();
+    options.working_dir = Some(cx.working_dir.clone());
+    match orbit_mcp::POOL.call_tool_with_options(
+        &plan.server,
+        server_cfg,
+        &plan.tool,
+        args.clone(),
+        &options,
+    ) {
         Ok(result) => {
-            // MCP content blocks → text.
-            let text = mcp_result_text(&result);
-            let scanned = orbit_tools::scan::scan_result(&text);
-            serde_json::json!({
-                "ok": true,
-                "result": scanned.text,
-                "redactions": scanned.redactions.len(),
-            })
-            .to_string()
+            let ok = !result
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Scan decoded strings throughout the complete bounded frame,
+            // including structured data and content that is not plain text.
+            let mut safe_result = result;
+            let mut redactions = 0;
+            scan_mcp_value(&mut safe_result, &mut redactions);
+            bounded_mcp_output(
+                serde_json::json!({
+                    "ok": ok,
+                    "result_error": !ok,
+                    "result": mcp_result_text(&safe_result),
+                    "redactions": redactions,
+                }),
+                "result",
+            )
         }
-        Err(e) => tool_error(&format!("mcp call failed: {e}")),
+        Err(e) => mcp_error(&format!("mcp call failed: {e}")),
     }
 }
 
-/// Pull the text out of an MCP tools/call result (content blocks).
-fn mcp_result_text(result: &serde_json::Value) -> String {
-    result
-        .get("content")
-        .and_then(|c| c.as_array())
-        .map(|blocks| {
-            blocks
+/// The profile selection is trusted runtime state, never a tool argument.
+#[derive(Clone)]
+struct McpToolSelection(Vec<String>);
+
+/// Inherited profile authority for the configured diagnostics integration.
+#[derive(Clone)]
+pub struct LspToolSelection(pub bool);
+
+/// A child profile can narrow its parent's diagnostics authority, never widen it.
+pub fn set_lsp_tool_selection(
+    child: &orbit_tools::ToolContext,
+    parent: &orbit_tools::ToolContext,
+    tools: &[String],
+) {
+    let parent_allowed = parent
+        .ext::<LspToolSelection>()
+        .is_none_or(|allowed| allowed.0);
+    let profile_allowed = tools.is_empty() || tools.iter().any(|name| name == "LspDiagnostics");
+    child.set_ext(LspToolSelection(parent_allowed && profile_allowed));
+}
+
+pub(crate) fn effective_mcp_tool_selection(
+    cx: &orbit_tools::ToolContext,
+    requested: Option<&[String]>,
+) -> Option<Vec<String>> {
+    let requested = requested.filter(|names| !names.is_empty());
+    match (cx.ext::<McpToolSelection>(), requested) {
+        (Some(parent), Some(names)) => Some(
+            names
                 .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_else(|| result.to_string())
+                .filter(|name| parent.0.contains(name))
+                .cloned()
+                .collect(),
+        ),
+        (Some(parent), None) => Some(parent.0.clone()),
+        (None, Some(names)) => Some(names.to_vec()),
+        (None, None) => None,
+    }
+}
+
+pub(crate) fn set_mcp_tool_selection(
+    child: &orbit_tools::ToolContext,
+    parent: &orbit_tools::ToolContext,
+    tools: &[String],
+) {
+    if let Some(selection) = effective_mcp_tool_selection(parent, Some(tools)) {
+        child.set_ext(McpToolSelection(selection));
+    }
+}
+
+fn scan_mcp_text(text: &str) -> (String, usize) {
+    // First scan whole lines for assignments and multiline private-key blocks.
+    let scanned = orbit_tools::scan::scan_result(text);
+    let mut count = scanned.redactions.len();
+    let mut safe = String::with_capacity(scanned.text.len());
+    // The common scanner handles one token of each family per line. Scan the
+    // remaining token spans independently without repeatedly copying a large
+    // frame; this also catches a short prefix preceding a real token.
+    for span in scanned
+        .text
+        .split_inclusive(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    {
+        let scanned = orbit_tools::scan::scan_result(span);
+        count += scanned.redactions.len();
+        safe.push_str(&scanned.text);
+    }
+    (safe, count)
+}
+
+fn scan_mcp_value(value: &mut serde_json::Value, redactions: &mut usize) {
+    scan_mcp_value_with_key(value, redactions, false);
+}
+
+fn scan_mcp_value_with_key(
+    value: &mut serde_json::Value,
+    redactions: &mut usize,
+    sensitive_key: bool,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            // Structured JSON separates a secret's label from its value. Keep
+            // that association for the common high-entropy assignment rule.
+            if sensitive_key {
+                let assignment = orbit_tools::scan::scan_result(&format!("TOKEN = {text}"));
+                if assignment
+                    .redactions
+                    .iter()
+                    .any(|kind| kind == "secret assignment")
+                {
+                    *text = "[redacted:secret]".into();
+                    *redactions += 1;
+                    return;
+                }
+            }
+            let (safe, count) = scan_mcp_text(text);
+            *text = safe;
+            *redactions += count;
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                scan_mcp_value_with_key(value, redactions, sensitive_key);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let original = std::mem::take(values);
+            for (child_key, mut value) in original {
+                // Classify each raw key once. Carry a boolean through its
+                // descendants so a huge key plus many leaves stays linear.
+                let assignment = orbit_tools::scan::scan_result(&format!(
+                    "{child_key} = AbCDef1234567890gHiJKLmN7890xyzPQ"
+                ));
+                let child_sensitive = sensitive_key
+                    || assignment
+                        .redactions
+                        .iter()
+                        .any(|kind| kind == "secret assignment");
+                let (safe_key, count) = scan_mcp_text(&child_key);
+                *redactions += count;
+                scan_mcp_value_with_key(&mut value, redactions, child_sensitive);
+                values.insert(safe_key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mcp_error(error: &str) -> String {
+    const SERVER_ERROR_PREFIX: &str = "mcp call failed: mcp server error: ";
+    if let Some(body) = error.strip_prefix(SERVER_ERROR_PREFIX) {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) {
+            let mut redactions = 0;
+            scan_mcp_value(&mut value, &mut redactions);
+            return bounded_mcp_output(
+                serde_json::json!({ "ok":false, "result_error":true,
+                    "error":format!("{SERVER_ERROR_PREFIX}{value}"), "redactions":redactions }),
+                "error",
+            );
+        }
+    }
+    let (safe, redactions) = scan_mcp_text(error);
+    bounded_mcp_output(
+        serde_json::json!({ "ok": false, "result_error": true, "error": safe,
+            "redactions": redactions }),
+        "error",
+    )
+}
+
+/// Measure the complete serialized envelope, including escaping and flags.
+fn bounded_mcp_output(mut response: serde_json::Value, field: &str) -> String {
+    let encoded = response.to_string();
+    if encoded.len() <= MAX_RESULT_BYTES {
+        return encoded;
+    }
+    let full = response[field].take().as_str().unwrap_or("").to_string();
+    response[field] = "".into();
+    response["truncated"] = true.into();
+    let budget = MAX_RESULT_BYTES.saturating_sub(response.to_string().len());
+    let mut upper = full.len().min(budget);
+    while !full.is_char_boundary(upper) {
+        upper -= 1;
+    }
+    let mut boundaries: Vec<usize> = full[..upper].char_indices().map(|(i, _)| i).collect();
+    boundaries.push(upper);
+    let (mut low, mut high) = (0, boundaries.len() - 1);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        response[field] = full[..boundaries[middle]].into();
+        if response.to_string().len() <= MAX_RESULT_BYTES {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    response[field] = full[..boundaries[low]].into();
+    response.to_string()
+}
+
+/// Text blocks remain readable; structured-only and non-text results remain visible.
+fn mcp_result_text(result: &serde_json::Value) -> String {
+    let blocks = result.get("content").and_then(|c| c.as_array());
+    let mut parts = Vec::new();
+    if let Some(blocks) = blocks {
+        for block in blocks {
+            parts.push(
+                block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| block.to_string()),
+            );
+        }
+    }
+    if let Some(structured) = result.get("structuredContent") {
+        parts.push(structured.to_string());
+    }
+    if parts.is_empty() {
+        result.to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
+#[cfg(all(test, unix))]
+mod mcp_runtime_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::path::PathBuf;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    struct Fixture {
+        home: PathBuf,
+        work: PathBuf,
+        server: String,
+        cx: orbit_tools::ToolContext,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let server = format!("fixture{}", ulid::Ulid::new());
+            let home = std::env::temp_dir().join(format!("orbit-mcp-cli-{server}"));
+            let work = home.join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            std::fs::write(home.join("server.py"), r#"
+import json, os, sys, time
+with open(sys.argv[1], 'a') as log:
+    log.write('spawn\n')
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get('method', '')
+    with open(sys.argv[1], 'a') as log:
+        log.write(method + '\n')
+    if 'id' not in request:
+        continue
+    reply = {'jsonrpc': '2.0', 'id': request['id']}
+    if method == 'initialize':
+        reply['result'] = {'protocolVersion': '2025-06-18', 'capabilities': {}, 'serverInfo': {'name': 'fixture', 'version': '1'}}
+    elif method == 'tools/list':
+        reply['result'] = {'tools': [{'name': n, 'description': 'test', 'inputSchema': {'type':'object'}} for n in ['action', 'structured', 'error', 'large', 'silent', 'server_error']]}
+    elif method == 'tools/call':
+        name = request['params']['name']
+        if name == 'silent':
+            time.sleep(10)
+            continue
+        if name == 'server_error':
+            reply['error'] = {'code': -32603, 'message': 'ghp_abcdefghijklmnopqrstuvwxyz123456 sk-abcdefghijklmnopqrstuvwxyz654321', 'data': {'api_key': 'AbCDef1234567890gHiJKLmN7890xyzPQ', 'nested': [{'password': ['AbCDef1234567890gHiJKLmN7890xyzPQ']}]}}
+        elif name == 'echo':
+            reply['result'] = {'content': [{'type': 'text', 'text': json.dumps(request['params']['arguments'])}]}
+        elif name == 'structured':
+            reply['result'] = {'content': [], 'structuredContent': {'answer': 42, 'token': 'ghp_abcdefghijklmnopqrstuvwxyz123456', 'api_key': 'AbCDef1234567890gHiJKLmN7890xyzPQ', 'nested': [{'password': ['AbCDef1234567890gHiJKLmN7890xyzPQ']}]}}
+        elif name == 'error':
+            reply['result'] = {'isError': True, 'content': [{'type': 'text', 'text': 'failed ghp_abcdefghijklmnopqrstuvwxyz123456 ghp_abcdefghijklmnopqrstuvwxyz654321'}]}
+        elif name == 'large':
+            reply['result'] = {'content': [{'type': 'text', 'text': 'ghp_abcdefghijklmnopqrstuvwxyz123456 ghp_abcdefghijklmnopqrstuvwxyz654321\n' + '\x00\n\t"\\é' * 40000 + '\nlate sk-abcdefghijklmnopqrstuvwxyz123456'}]}
+        else:
+            reply['result'] = {'content': [{'type': 'text', 'text': os.getcwd()}]}
+    else:
+        reply['error'] = {'code': -32601, 'message': 'unknown method'}
+    print(json.dumps(reply, ensure_ascii=False), flush=True)
+    if method == 'tools/call':
+        break
+"#).unwrap();
+            let cx = orbit_tools::ToolContext::new(home.clone(), "mcp-owner".into(), work.clone());
+            let fixture = Self {
+                home,
+                work,
+                server,
+                cx,
+            };
+            fixture.config(json!({}));
+            fixture
+        }
+        fn config_value(&self, extra: Value) -> Value {
+            let mut server = json!({"command":"python3", "args":[self.home.join("server.py"), self.home.join("calls.log")], "timeout_ms":500, "initialize_timeout_ms":300});
+            for (key, value) in extra.as_object().unwrap() {
+                server[key] = value.clone();
+            }
+            json!({"servers":{(self.server.clone()):server}})
+        }
+        fn config(&self, extra: Value) {
+            std::fs::write(
+                self.home.join("mcp.json"),
+                self.config_value(extra).to_string(),
+            )
+            .unwrap();
+        }
+        fn wire(&self, tool: &str) -> String {
+            orbit_mcp::wire_name(&self.server, tool)
+        }
+        fn call(&self, tool: &str, scope: &PermissionScope) -> Value {
+            self.call_with_args(tool, json!({}), scope)
+        }
+        fn call_with_args(&self, tool: &str, args: Value, scope: &PermissionScope) -> Value {
+            let call = crate::PendingToolCall {
+                index: 0,
+                id: format!("call-{}", ulid::Ulid::new()),
+                name: self.wire(tool),
+                arguments: serde_json::to_vec(&args).unwrap(),
+            };
+            let (output, _) = execute_call(
+                &self.home,
+                "mcp-owner",
+                "decision",
+                &call,
+                true,
+                false,
+                &mut StdApprovalChannel::new(false),
+                &mut AutoGrants::new(),
+                scope,
+                &self.cx,
+            )
+            .unwrap();
+            assert!(output.len() <= MAX_RESULT_BYTES);
+            serde_json::from_str(&output).unwrap()
+        }
+        fn log(&self) -> String {
+            std::fs::read_to_string(self.home.join("calls.log")).unwrap_or_default()
+        }
+        fn status(&self) -> String {
+            let (records, _) =
+                orbit_ledger::reader::verify_ledger(&self.home.join("ledger")).unwrap();
+            records
+                .iter()
+                .rev()
+                .find_map(|record| match &record.record.event {
+                    LedgerEvent::ToolResult(result) => Some(result.status.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    #[test]
+    fn dispatcher_preserves_server_errors_and_ledger_status() {
+        let fixture = Fixture::new();
+        let out = fixture.call("error", &PermissionScope::default());
+        assert_eq!(out["ok"], false);
+        assert_eq!(out["result_error"], true);
+        assert_eq!(fixture.status(), "error");
+        assert!(out["result"].as_str().unwrap().contains("failed"));
+        assert!(out["redactions"].as_u64().unwrap() >= 2);
+        assert!(!out.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
+        assert_eq!(fixture.log().matches("tools/call").count(), 1);
+    }
+
+    #[test]
+    fn structured_only_content_is_visible_and_scanned() {
+        let fixture = Fixture::new();
+        let out = fixture.call("structured", &PermissionScope::default());
+        assert_eq!(out["ok"], true);
+        assert!(out["result"].as_str().unwrap().contains("42"));
+        assert!(!out.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!out
+            .to_string()
+            .contains("AbCDef1234567890gHiJKLmN7890xyzPQ"));
+        assert!(out["redactions"].as_u64().unwrap() >= 3);
+        assert_eq!(fixture.status(), "ok");
+    }
+
+    #[test]
+    fn advertised_server_and_tool_arguments_are_preserved() {
+        let fixture = Fixture::new();
+        let args = json!({"server":"destination","tool":"operation","other":42});
+        let out = fixture.call_with_args("echo", args.clone(), &PermissionScope::default());
+        assert_eq!(out["ok"], true, "{out}");
+        let returned: Value = serde_json::from_str(out["result"].as_str().unwrap()).unwrap();
+        assert_eq!(returned, args);
+    }
+
+    #[test]
+    fn complete_result_is_scanned_before_encoded_truncation() {
+        let fixture = Fixture::new();
+        let out = fixture.call("large", &PermissionScope::default());
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["truncated"], true);
+        assert!(
+            out["redactions"].as_u64().unwrap() >= 3,
+            "late token must be scanned too"
+        );
+        assert!(!out.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(out.to_string().len() <= MAX_RESULT_BYTES);
+        assert!(out["result"].as_str().unwrap().contains('é'));
+    }
+
+    #[test]
+    fn dense_secret_payload_is_scanned_in_bounded_time() {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let mut result = json!({"content":[{"type":"text","text":format!("ghp_short {}", format!("{secret} ").repeat(20000))}]});
+        let started = Instant::now();
+        let mut redactions = 0;
+        scan_mcp_value(&mut result, &mut redactions);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(redactions >= 20000);
+        assert!(!result.to_string().contains(secret));
+        let output = bounded_mcp_output(
+            json!({"ok":true,"result":mcp_result_text(&result),"redactions":redactions}),
+            "result",
+        );
+        assert!(output.len() <= MAX_RESULT_BYTES);
+        assert!(!output.contains(secret));
+    }
+
+    #[test]
+    fn huge_structured_key_and_many_leaves_do_not_amplify_scanning() {
+        let key = "k".repeat(500000);
+        let mut result = json!({(key): vec!["v"; 100000]});
+        assert!(result.to_string().len() <= orbit_mcp::MAX_FRAME_BYTES);
+        let started = Instant::now();
+        let mut redactions = 0;
+        scan_mcp_value(&mut result, &mut redactions);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(redactions, 0);
+    }
+
+    #[test]
+    fn protocol_and_config_errors_are_scanned() {
+        let fixture = Fixture::new();
+        let out = fixture.call("server_error", &PermissionScope::default());
+        assert_eq!(out["ok"], false);
+        assert!(!out.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!out
+            .to_string()
+            .contains("AbCDef1234567890gHiJKLmN7890xyzPQ"));
+        assert!(out["redactions"].as_u64().unwrap() >= 4);
+        let invalid_name = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        std::fs::write(
+            fixture.home.join("mcp.json"),
+            json!({"servers":{(invalid_name):{"command":"", "timeout_ms":0}}}).to_string(),
+        )
+        .unwrap();
+        let out = fixture.call("action", &PermissionScope::default());
+        assert_eq!(out["ok"], false);
+        assert!(!out.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(out["redactions"].as_u64().unwrap() >= 1);
+        assert_eq!(fixture.log().matches("spawn").count(), 1);
+    }
+
+    #[test]
+    fn disabled_hidden_and_profile_excluded_names_never_spawn() {
+        for extra in [
+            json!({"enabled":false}),
+            json!({"tools":[]}),
+            json!({"tools":["structured"]}),
+        ] {
+            let fixture = Fixture::new();
+            fixture.config(extra);
+            let out = fixture.call("invented", &PermissionScope::default());
+            assert_eq!(out["ok"], false);
+            assert!(fixture.log().is_empty());
+        }
+        let fixture = Fixture::new();
+        fixture
+            .cx
+            .set_ext(McpToolSelection(vec![fixture.wire("structured")]));
+        let out = fixture.call("invented", &PermissionScope::default());
+        assert_eq!(out["ok"], false);
+        assert!(fixture.log().is_empty());
+    }
+
+    #[test]
+    fn discovery_selects_profiles_and_config_before_spawning() {
+        let fixture = Fixture::new();
+        let read_only = vec!["Read".into()];
+        let defs = crate::tools::session_tool_definitions_with_context(
+            &fixture.home,
+            &fixture.cx,
+            Some(&read_only),
+        );
+        assert!(!defs.iter().any(|tool| tool.name.starts_with("mcp__")));
+        assert!(fixture.log().is_empty());
+        fixture.config(json!({"tools":["structured"]}));
+        let hidden = vec![fixture.wire("action")];
+        let defs = crate::tools::session_tool_definitions_with_context(
+            &fixture.home,
+            &fixture.cx,
+            Some(&hidden),
+        );
+        assert!(!defs.iter().any(|tool| tool.name.starts_with("mcp__")));
+        assert!(fixture.log().is_empty());
+        let selected = vec![fixture.wire("structured")];
+        let defs = crate::tools::session_tool_definitions_with_context(
+            &fixture.home,
+            &fixture.cx,
+            Some(&selected),
+        );
+        assert_eq!(
+            defs.iter()
+                .filter(|tool| tool.name.starts_with("mcp__"))
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            selected
+        );
+        assert_eq!(fixture.log().matches("spawn").count(), 1);
+        assert_eq!(
+            fixture.call("structured", &PermissionScope::default())["ok"],
+            true
+        );
+        assert_eq!(
+            fixture.log().matches("spawn").count(),
+            1,
+            "discovery session must be reused"
+        );
+    }
+
+    #[test]
+    fn nested_profile_cannot_widen_parent_selection() {
+        let fixture = Fixture::new();
+        let allowed = fixture.wire("structured");
+        fixture.cx.set_ext(McpToolSelection(vec![allowed.clone()]));
+        let child = child_agent_context(&fixture.home, "mcp-owner", "child", &fixture.cx);
+        set_mcp_tool_selection(&child, &fixture.cx, &[]);
+        assert_eq!(
+            child.ext::<McpToolSelection>().unwrap().0,
+            vec![allowed.clone()]
+        );
+        let wider = vec![allowed.clone(), fixture.wire("action")];
+        assert_eq!(
+            effective_mcp_tool_selection(&child, Some(&wider)),
+            Some(vec![allowed.clone()])
+        );
+        let excluded = vec![fixture.wire("action")];
+        assert_eq!(
+            effective_mcp_tool_selection(&child, Some(&excluded)),
+            Some(vec![])
+        );
+        assert_eq!(
+            fixture.cx.ext::<McpToolSelection>().unwrap().0,
+            vec![allowed]
+        );
+    }
+
+    #[test]
+    fn plan_and_operator_deny_outrank_durable_and_auto_grants() {
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.home.join("permissions.toml"),
+            format!("[allow]\ntools = [\"{}\"]\n", fixture.wire("action")),
+        )
+        .unwrap();
+        let scopes = [
+            PermissionScope::from_flags(Some("plan"), Some(&fixture.wire("action")), None),
+            PermissionScope::from_flags(None, None, Some(&fixture.wire("action"))),
+            PermissionScope::from_flags(None, Some("Read"), None),
+        ];
+        for scope in scopes {
+            let out = fixture.call("action", &scope);
+            assert_eq!(out["denied"], true, "{out}");
+            assert_eq!(fixture.status(), "denied");
+        }
+        assert!(fixture.log().is_empty());
+        let allowed =
+            PermissionScope::from_flags(Some("dontAsk"), Some(&fixture.wire("action")), None);
+        assert_eq!(fixture.call("action", &allowed)["ok"], true);
+    }
+
+    #[test]
+    fn actual_context_cwd_selects_trusted_project_configuration() {
+        let fixture = Fixture::new();
+        std::fs::remove_file(fixture.home.join("mcp.json")).unwrap();
+        std::fs::create_dir_all(fixture.work.join(".orbit")).unwrap();
+        std::fs::write(
+            fixture.work.join(".orbit/mcp.json"),
+            fixture.config_value(json!({})).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.call("action", &PermissionScope::default())["ok"],
+            false
+        );
+        assert!(fixture.log().is_empty());
+        orbit_tools::permissions::FolderTrust::new(fixture.home.clone())
+            .trust(&fixture.work)
+            .unwrap();
+        let out = fixture.call("action", &PermissionScope::default());
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["result"], fixture.work.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn trusted_context_project_deny_outranks_auto_and_durable_allow() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.work.join(".orbit")).unwrap();
+        std::fs::write(
+            fixture.work.join(".orbit/settings.local.toml"),
+            format!("[permissions]\ndeny = [\"{}\"]\n", fixture.wire("action")),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.home.join("permissions.toml"),
+            format!("[allow]\ntools = [\"{}\"]\n", fixture.wire("action")),
+        )
+        .unwrap();
+        orbit_tools::permissions::FolderTrust::new(fixture.home.clone())
+            .trust(&fixture.work)
+            .unwrap();
+        let out = fixture.call("action", &PermissionScope::default());
+        assert_eq!(out["denied"], true, "{out}");
+        assert_eq!(fixture.status(), "denied");
+        assert!(fixture.log().is_empty());
+    }
+
+    #[test]
+    fn dispatch_forwards_cancellation_and_does_not_replay() {
+        let fixture = Fixture::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let check = cancel.clone();
+        fixture
+            .cx
+            .push_cancel_check(Arc::new(move || check.load(Ordering::SeqCst)));
+        let log = fixture.home.join("calls.log");
+        let watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .contains("tools/call")
+                {
+                    cancel.store(true, Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        let out = fixture.call("silent", &PermissionScope::default());
+        watcher.join().unwrap();
+        assert_eq!(out["ok"], false);
+        assert!(
+            out["error"].as_str().unwrap().contains("cancelled"),
+            "{out}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fixture.log().matches("tools/call").count(), 1);
+        fixture.cx.pop_cancel_check();
+        assert_eq!(
+            fixture.call("action", &PermissionScope::default())["ok"],
+            true
+        );
+        assert_eq!(fixture.log().matches("spawn").count(), 2);
+        assert_eq!(fixture.log().matches("tools/call").count(), 2);
+    }
+
+    #[test]
+    fn precancelled_call_does_not_spawn_and_timeout_is_bounded() {
+        let fixture = Fixture::new();
+        fixture.cx.push_cancel_check(Arc::new(|| true));
+        assert_eq!(
+            fixture.call("action", &PermissionScope::default())["ok"],
+            false
+        );
+        assert!(fixture.log().is_empty());
+        fixture.cx.pop_cancel_check();
+        fixture.config(json!({"timeout_ms":150, "initialize_timeout_ms":100}));
+        let started = Instant::now();
+        let out = fixture.call("silent", &PermissionScope::default());
+        assert_eq!(out["ok"], false);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fixture.status(), "error");
+    }
 }
 
 /// The subagent's tool executor: every call goes through execute_call
@@ -1512,10 +3162,12 @@ pub struct SubagentExecutor<'a> {
 impl<'a> SubagentExecutor<'a> {
     /// The subagent's id: also the session id of its ledger records, so
     /// what a front-end shows can be matched to the chain.
+    #[allow(dead_code)] // retained for callers of the legacy constructor
     pub fn id(&self) -> &str {
         &self.session_id
     }
 
+    #[allow(dead_code)] // retained for callers without a session context
     pub fn new(home: std::path::PathBuf, approval: &'a mut dyn ApprovalChannel) -> Self {
         let session_id = format!("subagent-{}", ulid::Ulid::new());
         let working_dir =
@@ -1530,6 +3182,87 @@ impl<'a> SubagentExecutor<'a> {
             tool_cx,
         }
     }
+
+    pub(crate) fn with_context(
+        home: std::path::PathBuf,
+        session_id: String,
+        tool_cx: orbit_tools::ToolContext,
+        scope: PermissionScope,
+        approval: &'a mut dyn ApprovalChannel,
+    ) -> Self {
+        Self {
+            home,
+            session_id,
+            approval,
+            grants: AutoGrants::new(),
+            scope,
+            tool_cx,
+        }
+    }
+}
+
+/// Trusted runtime identity, never taken from tool arguments or a caller's
+/// arbitrary ToolContext.session_id. Children keep the root owner namespace.
+#[derive(Clone)]
+struct AgentSessionContext {
+    owner_session_id: String,
+    current_agent_id: Option<String>,
+    depth: usize,
+}
+
+fn agent_session_context(cx: &orbit_tools::ToolContext, session_id: &str) -> AgentSessionContext {
+    cx.ext::<AgentSessionContext>()
+        .map(|context| (*context).clone())
+        .unwrap_or_else(|| AgentSessionContext {
+            owner_session_id: session_id.into(),
+            current_agent_id: None,
+            depth: 0,
+        })
+}
+
+pub(crate) fn agent_store_for_context(
+    home: &Path,
+    session_id: &str,
+    cx: &orbit_tools::ToolContext,
+) -> Result<orbit_engine::agent_store::AgentStore, String> {
+    orbit_engine::agent_store::AgentStore::new(
+        home,
+        &agent_session_context(cx, session_id).owner_session_id,
+    )
+}
+
+pub(crate) fn agent_parent_and_depth(
+    cx: &orbit_tools::ToolContext,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let identity = agent_session_context(cx, session_id);
+    if identity.depth >= 3 {
+        return Err("agent nesting limit of 3 reached".into());
+    }
+    Ok(identity.current_agent_id)
+}
+
+pub(crate) fn child_agent_context(
+    home: &Path,
+    session_id: &str,
+    agent_id: &str,
+    parent: &orbit_tools::ToolContext,
+) -> orbit_tools::ToolContext {
+    let identity = agent_session_context(parent, session_id);
+    // Clone would share extensions, cancellation and read-before-edit state.
+    // Constructing a fresh context preserves authority without sharing grants.
+    let mut child =
+        orbit_tools::ToolContext::new(home.into(), agent_id.into(), parent.working_dir.clone());
+    child.working_dirs = parent.working_dirs.clone();
+    child.set_ext(AgentSessionContext {
+        owner_session_id: identity.owner_session_id,
+        current_agent_id: Some(agent_id.into()),
+        depth: identity.depth + 1,
+    });
+    if let Some(observer) = parent.ext::<SubagentObserver>() {
+        child.set_ext((*observer).clone());
+    }
+    child
 }
 
 impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
@@ -1584,6 +3317,17 @@ impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
 /// subagent runs on THIS, not on whatever the environment names.
 pub struct SessionTurnConfig(pub orbit_engine::TurnConfig);
 
+#[derive(Clone)]
+pub struct SessionEffortSetting(pub Option<orbit_adapter::types::EffortSetting>);
+
+/// Selection provenance is independent from the resolved provider request value.
+pub fn remember_effort_setting(
+    cx: &orbit_tools::ToolContext,
+    setting: &Option<orbit_adapter::types::EffortSetting>,
+) {
+    cx.set_ext(SessionEffortSetting(setting.clone()));
+}
+
 /// Keep the running turn's provider configuration where its tools can
 /// reach it. Every front-end's executor does this when the engine starts a
 /// turn (`ToolExecutor::begin_turn`).
@@ -1597,6 +3341,7 @@ pub enum SubagentUpdate {
     Started {
         id: String,
         name: String,
+        model: String,
         task: String,
     },
     /// The subagent started a tool call (or a new round): what it is doing.
@@ -1619,7 +3364,10 @@ pub struct SubagentObserver(pub std::sync::Arc<dyn Fn(&SubagentUpdate) + Send + 
 /// model, credential and pricing as the turn that called it), without
 /// sampling overrides (E8: subagents inherit none). Only a context that
 /// was never told (a test, a bare executor) falls back to the environment.
-fn session_subagent_config(cx: &orbit_tools::ToolContext, home: &Path) -> orbit_engine::TurnConfig {
+pub(crate) fn session_subagent_config(
+    cx: &orbit_tools::ToolContext,
+    home: &Path,
+) -> orbit_engine::TurnConfig {
     match cx.ext::<SessionTurnConfig>() {
         Some(session) => {
             let mut config = session.0.clone();
@@ -1640,15 +3388,14 @@ fn subagent_config_for(
     cx: &orbit_tools::ToolContext,
     home: &Path,
     agent: &str,
-) -> orbit_engine::TurnConfig {
+) -> Result<orbit_engine::TurnConfig, String> {
     let base = session_subagent_config(cx, home);
 
     // Look the agent up for its own model override. Unknown names keep
     // the role path (execute_task will report the unknown agent).
     let agents = {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let trusted =
-            orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cwd);
+        let trusted = orbit_tools::permissions::FolderTrust::new(home.to_path_buf())
+            .is_trusted(&cx.working_dir);
         orbit_engine::skills::load_agents(home, trusted)
     };
     let agent_model = agents
@@ -1661,31 +3408,12 @@ fn subagent_config_for(
     if let Some(spec) = agent_model {
         // An agent-declared model resolves like a role spec: bare id
         // across providers, provider/model explicit.
-        let cfg = crate::config::ProvidersConfig::load(home).ok();
-        let provider = cfg.as_ref().and_then(|c| c.provider_for_role_spec(&spec));
-        if let Some(provider) = provider {
-            let model = spec.rsplit('/').next().unwrap_or(&spec).to_string();
-            let mut out = base.clone();
-            out.provider_id = provider.name.clone();
-            out.gate = provider.url.clone();
-            out.model = model.clone();
-            out.kind = orbit_engine::dispatch::ProviderKind::from_config(&provider.kind);
-            out.credential_env = provider.env.clone().filter(|s| !s.trim().is_empty());
-            out.pricing = provider
-                .models
-                .iter()
-                .find(|m| m.id == model)
-                .map(|m| std::convert::From::from(m.pricing));
-            out.max_output_tokens = cfg
-                .as_ref()
-                .and_then(|c| c.max_output_tokens_for(&model))
-                .unwrap_or(32_000) as u64;
-            out.sampling = None; // E8: subagents inherit no sampling
-            return out;
-        }
-        // A declared model that matches no provider: keep the base and
-        // let the request fail loudly rather than silently rerouting.
-        return base;
+        let cfg = crate::config::ProvidersConfig::load(home)?;
+        let selected = crate::phase_routing::resolve_model(&cfg, &spec, None)
+            .map_err(|e| format!("configured agent profile model: {e}"))?;
+        let mut out = selected.turn_config(None)?;
+        out.sampling = None; // E8: subagents inherit no sampling.
+        return Ok(out);
     }
 
     // Read-only explorers prefer the cheap role; everything else the
@@ -1695,9 +3423,40 @@ fn subagent_config_for(
     } else {
         "subagent"
     };
-    let mut out = crate::role_turn_config(home, &base, role);
+    let mut out = crate::try_role_turn_config(home, &base, role)?;
     out.sampling = None; // E8: subagents inherit no sampling
-    out
+    Ok(out)
+}
+
+/// Explicit selections must resolve to configured models. Persisted selections
+/// may reuse an ephemeral parent's exact provider/model after a reload.
+pub(crate) fn task_config_for(
+    cx: &orbit_tools::ToolContext,
+    home: &Path,
+    agent: &str,
+    explicit: Option<&str>,
+    saved: Option<&str>,
+) -> Result<orbit_engine::TurnConfig, String> {
+    // Malformed capability declarations must not silently become an unconfigured model.
+    crate::config::ProvidersConfig::load(home)?;
+    let Some(spec) = explicit.or(saved) else {
+        return subagent_config_for(cx, home, agent);
+    };
+    let base = session_subagent_config(cx, home);
+    let configured = crate::config::ProvidersConfig::load(home)
+        .map_err(|e| format!("load configured agent model: {e}"))?;
+    if let Ok(selected) = crate::phase_routing::resolve_model(&configured, spec, None) {
+        let mut out = selected.turn_config(None)?;
+        out.sampling = None;
+        return Ok(out);
+    }
+    if configured.provider.is_empty()
+        && explicit.is_none()
+        && spec == format!("{}/{}", base.provider_id, base.model)
+    {
+        return Ok(base);
+    }
+    Err(format!("unknown configured agent model: {spec}"))
 }
 
 /// Derive a TurnConfig for a subagent from the environment alone
@@ -1705,12 +3464,14 @@ fn subagent_config_for(
 /// configuration (`SessionTurnConfig`) is what a subagent normally runs on.
 pub fn subagent_turn_config(_home: &Path) -> orbit_engine::TurnConfig {
     let gate = std::env::var("ORBIT_GATE_URL").unwrap_or_else(|_| "http://127.0.0.1:4001".into());
-    let model = std::env::var("ORBIT_MODEL").unwrap_or_else(|_| "glm-5.2".into());
+    let model = std::env::var("ORBIT_MODEL").unwrap_or_else(|_| "default".into());
     orbit_engine::dispatch::TurnConfig {
         provider_id: std::env::var("ORBIT_PROVIDER").unwrap_or_else(|_| "local".into()),
         gate,
         model,
         sampling: None, // E8: subagents inherit no sampling
+        effort: None,
+        supported_efforts: None,
         kind: orbit_engine::dispatch::ProviderKind::OpenAiCompatible,
         credential_env: std::env::var("ORBIT_CREDENTIAL_ENV").ok(),
         pricing: None,
@@ -1843,6 +3604,8 @@ mod tests {
             pricing: None,
             max_output_tokens: 4096,
             sampling: Some((Some(0.2), None)),
+            effort: None,
+            supported_efforts: None,
         }
     }
 
@@ -1879,6 +3642,10 @@ mod tests {
         assert_eq!(
             c.gate,
             subagent_turn_config(std::path::Path::new("/h")).gate
+        );
+        assert_eq!(
+            c.model,
+            std::env::var("ORBIT_MODEL").unwrap_or_else(|_| "default".into())
         );
     }
 
@@ -3325,5 +5092,905 @@ mod agent_key_tests {
         assert_eq!(orbit_tools::agent_permission_key(&bare).pattern, "general");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod agent_lifecycle_tests {
+    use super::*;
+    use orbit_engine::agent_store::{AgentStatus, AgentStore};
+    use serde_json::{json, Value};
+    use std::sync::atomic::Ordering;
+
+    struct Mock {
+        gate: String,
+        state: orbit_mock_provider::server::ServerState,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Mock {
+        fn new() -> Self {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let (addr, state, handle) = orbit_mock_provider::server::spawn().await.unwrap();
+                    ready_tx.send((addr, state)).unwrap();
+                    let _ = stopped.await;
+                    handle.abort();
+                    let _ = handle.await;
+                });
+            });
+            let (addr, state) = ready_rx.recv().unwrap();
+            Self {
+                gate: format!("http://{addr}"),
+                state,
+                stop: Some(stop),
+                thread: Some(thread),
+            }
+        }
+
+        fn requests(&self) -> u64 {
+            self.state.requests.load(Ordering::SeqCst)
+        }
+        fn body(&self) -> Value {
+            self.state.last_body.lock().unwrap().clone().unwrap()
+        }
+        fn config(&self, model: &str) -> orbit_engine::TurnConfig {
+            orbit_engine::TurnConfig {
+                provider_id: "mock".into(),
+                gate: self.gate.clone(),
+                model: model.into(),
+                kind: orbit_engine::ProviderKind::OpenAiCompatible,
+                credential_env: None,
+                pricing: None,
+                max_output_tokens: 32_000,
+                sampling: None,
+                effort: None,
+                supported_efforts: None,
+            }
+        }
+        fn configure(&self, home: &Path) {
+            std::fs::write(home.join("providers.toml"), format!(
+                "[[provider]]\nname='mock'\nurl='{}'\n[[provider.models]]\nid='mock-notools'\n[[provider.models]]\nid='override-notools'\n[[provider.models]]\nid='role-notools'\n[[provider.models]]\nid='mock-bash'\n", self.gate
+            )).unwrap();
+        }
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    struct Approve;
+    impl ApprovalChannel for Approve {
+        fn ask(&mut self, _: &ApprovalRequest, _: bool) -> ApprovalVerdict {
+            ApprovalVerdict::AllowOnce
+        }
+    }
+
+    struct Fixture {
+        home: std::path::PathBuf,
+        cx: orbit_tools::ToolContext,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let home =
+                std::env::temp_dir().join(format!("orbit-agent-runtime-{}", ulid::Ulid::new()));
+            let work = home.join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            // The public context ID is deliberately different: only the trusted
+            // execute_call session ID may establish the owner namespace.
+            let cx =
+                orbit_tools::ToolContext::new(home.clone(), "untrusted-context-id".into(), work);
+            Self { home, cx }
+        }
+        fn call(&self, owner: &str, name: &str, args: Value, scope: &PermissionScope) -> Value {
+            let call = crate::PendingToolCall {
+                index: 0,
+                id: ulid::Ulid::new().to_string(),
+                name: name.into(),
+                arguments: serde_json::to_vec(&args).unwrap(),
+            };
+            let (result, _) = execute_call(
+                &self.home,
+                owner,
+                "decision",
+                &call,
+                true,
+                false,
+                &mut Approve,
+                &mut AutoGrants::new(),
+                scope,
+                &self.cx,
+            )
+            .unwrap();
+            serde_json::from_str(&result).unwrap()
+        }
+        fn task(&self, args: Value) -> Value {
+            self.call("owner", "Task", args, &PermissionScope::default())
+        }
+        fn store(&self) -> AgentStore {
+            AgentStore::new(&self.home, "owner").unwrap()
+        }
+        fn ledger(&self) -> String {
+            std::fs::read_dir(self.home.join("ledger/segments"))
+                .unwrap()
+                .flatten()
+                .map(|entry| {
+                    String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap()).into_owned()
+                })
+                .collect()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+    fn id(result: &Value) -> &str {
+        result["result"]["agent_id"].as_str().unwrap()
+    }
+
+    #[test]
+    fn actual_read_only_agent_does_not_discover_irrelevant_mcp_servers() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        let marker = fixture.home.join("unexpected-spawn");
+        std::fs::write(fixture.home.join("mcp.json"), json!({"servers":{"irrelevant":{
+            "command":"python3", "args":["-c", format!("from pathlib import Path; Path({:?}).touch()", marker.to_string_lossy())],
+            "timeout_ms":100, "initialize_timeout_ms":100
+        }}}).to_string()).unwrap();
+        remember_turn_config(&fixture.cx, &mock.config("mock-notools"));
+        let result = fixture.task(json!({"agent":"Explore","prompt":"inspect without MCP"}));
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(!marker.exists());
+        let body = mock.body();
+        assert!(!body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("mcp__")));
+    }
+
+    #[test]
+    fn bounded_task_response_preserves_normal_success_and_cancellation() {
+        for ok in [true, false] {
+            let response = json!({
+                "ok": ok,
+                "result": { "ok":ok,"agent_id":"01K00000000000000000000000",
+                    "name":"researcher","model":"mock/mock-notools",
+                    "status":if ok {"completed"} else {"cancelled"},
+                    "turns":1,"rounds":1,"agent":"Explore","report":"hello 世界\n" }
+            });
+            assert_eq!(bounded_task_output(response.clone()), response.to_string());
+        }
+    }
+
+    #[test]
+    fn bounded_task_response_keeps_metadata_for_large_escaped_unicode_reports() {
+        let full_report = "世界🛰\"\\\n\r\t\u{0000}\u{001f}".repeat(MAX_RESULT_BYTES);
+        let response = json!({
+            "ok":true,
+            "result": { "ok":true,"agent_id":"01K00000000000000000000000",
+                "name":"researcher","model":"mock/mock-notools","status":"completed",
+                "turns":3,"rounds":2,"agent":"Explore","report":full_report }
+        });
+        let expected_metadata = response["result"].as_object().unwrap().clone();
+        let output = bounded_task_output(response);
+        assert!(
+            output.len() <= MAX_RESULT_BYTES,
+            "encoded length {}",
+            output.len()
+        );
+        let decoded: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(decoded["ok"], true);
+        assert_eq!(decoded["result"]["report_truncated"], true);
+        for (key, value) in expected_metadata
+            .iter()
+            .filter(|(key, _)| key.as_str() != "report")
+        {
+            assert_eq!(&decoded["result"][key], value, "metadata field {key}");
+        }
+        let shortened = decoded["result"]["report"].as_str().unwrap();
+        assert!(!shortened.is_empty() && full_report.starts_with(shortened));
+        assert!(shortened.len() < full_report.len());
+        // The formatter never alters the saved source report.
+        assert_eq!(expected_metadata["report"].as_str().unwrap(), full_report);
+    }
+
+    #[test]
+    fn bounded_task_error_retains_agent_id_under_large_escaped_failure_text() {
+        let output = bounded_task_output(json!({
+            "ok":false,"agent_id":"01K00000000000000000000000",
+            "error":"failed\u{0000}🛰\n".repeat(MAX_RESULT_BYTES)
+        }));
+        assert!(output.len() <= MAX_RESULT_BYTES);
+        let decoded: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(decoded["ok"], false);
+        assert_eq!(decoded["agent_id"], "01K00000000000000000000000");
+        assert_eq!(decoded["error_truncated"], true);
+        assert!(!decoded["error"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_resume_keeps_identity_history_and_sticky_model() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        mock.configure(&fixture.home);
+        remember_turn_config(&fixture.cx, &mock.config("mock-notools"));
+        let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = updates.clone();
+        fixture
+            .cx
+            .set_ext(SubagentObserver(std::sync::Arc::new(move |update| {
+                seen.lock().unwrap().push(update.clone());
+            })));
+        let first =
+            fixture.task(json!({"agent":"Explore","name":"researcher","prompt":"first task"}));
+        assert_eq!(first["ok"], true, "{first}");
+        let agent_id = id(&first).to_string();
+        remember_turn_config(&fixture.cx, &mock.config("override-notools"));
+        let second = fixture.call(
+            "owner",
+            "Agent",
+            json!({
+                "agent_type":"Explore", "resume":agent_id, "description":"second task"
+            }),
+            &PermissionScope::default(),
+        );
+        assert_eq!(second["ok"], true, "{second}");
+        assert_eq!(id(&second), agent_id);
+        assert_eq!(second["result"]["model"], "mock/mock-notools");
+        assert_eq!(second["result"]["name"], "researcher");
+        assert_eq!(mock.body()["model"], "mock-notools");
+        let messages = mock.body()["messages"].to_string();
+        assert!(messages.contains("first task") && messages.contains("second task"));
+        let saved = fixture.store().load(&agent_id).unwrap();
+        assert_eq!(saved.turns, 2);
+        assert_eq!(saved.status, AgentStatus::Completed);
+        assert_eq!(
+            saved
+                .transcript
+                .iter()
+                .filter(|m| m.role == orbit_adapter::types::ChatRole::User)
+                .count(),
+            2
+        );
+        assert!(AgentStore::new(&fixture.home, "untrusted-context-id")
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty());
+        let started: Vec<_> = updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|update| match update {
+                SubagentUpdate::Started {
+                    id, name, model, ..
+                } => Some((id.clone(), name.clone(), model.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started,
+            vec![(agent_id.clone(), "Explore".into(), "mock-notools".into()); 2]
+        );
+        assert!(
+            fixture.ledger().contains(&agent_id),
+            "engine ledger must use the agent ID"
+        );
+    }
+
+    #[test]
+    fn explicit_model_overrides_routing_and_unknown_models_do_not_run() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        mock.configure(&fixture.home);
+        let mut configured = std::fs::read_to_string(fixture.home.join("providers.toml")).unwrap();
+        configured.push_str("[roles]\nexplore='mock/role-notools'\n");
+        std::fs::write(fixture.home.join("providers.toml"), configured).unwrap();
+        remember_turn_config(&fixture.cx, &mock.config("mock-notools"));
+        let role = fixture.task(json!({"agent":"Explore","prompt":"use role"}));
+        assert_eq!(role["result"]["model"], "mock/role-notools", "{role}");
+        let first = fixture.task(
+            json!({"subagent_type":"Explore","prompt":"override role","model":"override-notools"}),
+        );
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["result"]["model"], "mock/override-notools");
+        let resumed = fixture.task(json!({"agent":"Explore","prompt":"change saved model","resume":id(&first),"model":"mock/mock-notools"}));
+        assert_eq!(resumed["result"]["model"], "mock/mock-notools");
+        assert_eq!(mock.body()["model"], "mock-notools");
+        let requests = mock.requests();
+        let count = fixture.store().list().unwrap().len();
+        for spec in ["missing", "missing/mock-notools", "mock/missing", ""] {
+            let error =
+                fixture.task(json!({"agent":"Explore","prompt":"invalid override","model":spec}));
+            assert_eq!(error["ok"], false, "{error}");
+        }
+        assert_eq!(mock.requests(), requests);
+        assert_eq!(fixture.store().list().unwrap().len(), count);
+        // Frontmatter remains the default, but explicit selection takes precedence.
+        std::fs::create_dir_all(fixture.home.join("agents")).unwrap();
+        std::fs::write(
+            fixture.home.join("agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: review\nmodel: role-notools\ntools: [Read]\n---\n",
+        )
+        .unwrap();
+        let declared = fixture.task(json!({"agent":"reviewer","prompt":"default declared model"}));
+        assert_eq!(declared["result"]["model"], "mock/role-notools");
+        let explicit = fixture.task(json!({"agent":"reviewer","prompt":"explicit declared override","model":"mock/override-notools"}));
+        assert_eq!(explicit["result"]["model"], "mock/override-notools");
+    }
+
+    #[test]
+    fn queued_messages_wait_for_explicit_resume_and_listing_is_metadata_only() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        remember_turn_config(&fixture.cx, &mock.config("mock-notools"));
+        let first = fixture.task(json!({"agent":"Explore","prompt":"initial"}));
+        let agent_id = id(&first);
+        let before = mock.requests();
+        let receipt = fixture.call("owner", "AgentSendMessage", json!({
+            "agent_id":agent_id,"message":"private queued instruction","sender_agent_id":"spoofed"
+        }), &PermissionScope::default());
+        assert_eq!(receipt["ok"], true, "{receipt}");
+        assert_eq!(receipt["result"]["status"], "queued");
+        assert_eq!(mock.requests(), before);
+        let message_id = receipt["result"]["message_id"].as_str().unwrap();
+        let saved = fixture.store().load(agent_id).unwrap();
+        assert_eq!(saved.inbox[0].message_id, message_id);
+        assert_eq!(saved.inbox[0].sender_agent_id, None);
+        let listing = fixture.call(
+            "owner",
+            "ListAgents",
+            json!({}),
+            &PermissionScope::default(),
+        );
+        assert_eq!(listing["result"]["agents"][0]["pending_messages"], 1);
+        assert!(!listing.to_string().contains("private queued instruction"));
+        assert!(!listing.to_string().contains("transcript"));
+        assert_eq!(mock.requests(), before);
+        let resumed =
+            fixture.task(json!({"agent":"Explore","resume":agent_id,"prompt":"process inbox"}));
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        let messages = mock.body()["messages"].to_string();
+        assert!(messages.contains("private queued instruction"));
+        assert!(messages.contains(message_id) && messages.contains("owning session"));
+        assert!(fixture.store().load(agent_id).unwrap().inbox.is_empty());
+    }
+
+    #[test]
+    fn agent_listing_pages_all_agents_with_bounded_metadata() {
+        let fixture = Fixture::new();
+        let owner = "o".repeat(256);
+        let store = AgentStore::new(&fixture.home, &owner).unwrap();
+        for index in 0..64 {
+            let name = format!("{}{:02}", "界".repeat(62), index);
+            store
+                .create(&"a".repeat(256), Some(&name), &"m".repeat(256), None)
+                .unwrap();
+        }
+        let mut offset = 0;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let listing = fixture.call(
+                &owner,
+                "ListAgents",
+                json!({"offset":offset,"limit":64}),
+                &PermissionScope::default(),
+            );
+            assert_eq!(listing["ok"], true, "{listing}");
+            assert!(listing.to_string().len() <= MAX_RESULT_BYTES);
+            assert_eq!(listing["result"]["total"], 64);
+            let page = listing["result"]["agents"].as_array().unwrap();
+            assert!(!page.is_empty());
+            for agent in page {
+                assert!(seen.insert(agent["agent_id"].as_str().unwrap().to_string()));
+            }
+            match listing["result"]["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 64);
+        let default_page =
+            fixture.call(&owner, "ListAgents", json!({}), &PermissionScope::default());
+        assert_eq!(
+            default_page["result"]["agents"].as_array().unwrap().len(),
+            20
+        );
+        for args in [
+            json!({"offset":-1}),
+            json!({"limit":0}),
+            json!({"limit":65}),
+        ] {
+            let invalid = fixture.call(&owner, "ListAgents", args, &PermissionScope::default());
+            assert_eq!(invalid["ok"], false);
+        }
+    }
+
+    #[test]
+    fn failures_keep_agent_id_and_persist_the_actual_transcript() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        let mut config = mock.config("mock-notools");
+        config.gate = "not-a-provider-url".into();
+        remember_turn_config(&fixture.cx, &config);
+        let error = fixture.task(json!({"agent":"Explore","prompt":"persist failed turn"}));
+        assert_eq!(error["ok"], false, "{error}");
+        let agent_id = error["agent_id"].as_str().unwrap();
+        let saved = fixture.store().load(agent_id).unwrap();
+        assert_eq!(saved.status, AgentStatus::Failed);
+        assert_eq!(saved.turns, 1);
+        assert!(saved
+            .transcript
+            .iter()
+            .any(|message| message.content == "persist failed turn"));
+        assert!(!saved.report.is_empty());
+        assert_eq!(mock.requests(), 0);
+        let serialized = serde_json::to_string(&saved).unwrap();
+        assert!(!serialized.contains(&mock.gate));
+        assert!(!serialized.contains("credential_env"));
+    }
+
+    #[test]
+    fn owner_profile_and_path_mismatches_never_call_provider() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        remember_turn_config(&fixture.cx, &mock.config("mock-notools"));
+        let first = fixture.task(json!({"agent":"Explore","prompt":"owned"}));
+        let agent_id = id(&first);
+        let before = mock.requests();
+        let wrong_profile =
+            fixture.task(json!({"agent":"Plan","resume":agent_id,"prompt":"change authority"}));
+        assert_eq!(wrong_profile["ok"], false, "{wrong_profile}");
+        assert!(wrong_profile["error"]
+            .as_str()
+            .unwrap()
+            .contains("type mismatch"));
+        let wrong_owner = fixture.call(
+            "other-owner",
+            "Task",
+            json!({"agent":"Explore","resume":agent_id,"prompt":"foreign"}),
+            &PermissionScope::default(),
+        );
+        assert_eq!(wrong_owner["ok"], false);
+        for target in ["../outside", "not-an-id"] {
+            let invalid =
+                fixture.task(json!({"agent":"Explore","resume":target,"prompt":"invalid"}));
+            assert_eq!(invalid["ok"], false);
+            let send = fixture.call(
+                "owner",
+                "AgentSendMessage",
+                json!({"agent_id":target,"message":"invalid"}),
+                &PermissionScope::default(),
+            );
+            assert_eq!(send["ok"], false);
+        }
+        let foreign_send = fixture.call(
+            "other-owner",
+            "AgentSendMessage",
+            json!({"agent_id":agent_id,"message":"foreign"}),
+            &PermissionScope::default(),
+        );
+        assert_eq!(foreign_send["ok"], false);
+        assert_eq!(mock.requests(), before);
+    }
+
+    #[test]
+    fn child_inherits_scope_and_stable_id_for_real_tool_ledger_records() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        remember_turn_config(&fixture.cx, &mock.config("mock-bash"));
+        let scope = PermissionScope::from_flags(None, Some("Agent(general-purpose)"), Some("Bash"));
+        let result = fixture.call(
+            "owner",
+            "Task",
+            json!({"agent":"general-purpose","prompt":"a denied shell call"}),
+            &scope,
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        let agent_id = id(&result);
+        let saved = fixture.store().load(agent_id).unwrap();
+        let tool = saved
+            .transcript
+            .iter()
+            .find(|m| m.role == orbit_adapter::types::ChatRole::Tool)
+            .unwrap();
+        assert!(
+            orbit_tools::result_is_denial(&tool.content),
+            "{}",
+            tool.content
+        );
+        let ledger = fixture.ledger();
+        assert!(ledger.contains(agent_id) && ledger.contains("Bash"));
+        assert!(ledger.contains("\"allowed\":false"));
+        assert_eq!(mock.requests(), 2);
+    }
+
+    #[test]
+    fn depth_is_checked_before_model_or_agent_creation_and_context_is_fresh() {
+        let fixture = Fixture::new();
+        fixture.cx.set_ext(AgentSessionContext {
+            owner_session_id: "owner".into(),
+            current_agent_id: None,
+            depth: 3,
+        });
+        let error =
+            fixture.task(json!({"agent":"general-purpose","prompt":"too deep","model":"invalid"}));
+        assert!(error["error"].as_str().unwrap().contains("nesting limit"));
+        assert!(fixture.store().list().unwrap().is_empty());
+        fixture.cx.set_ext(AgentSessionContext {
+            owner_session_id: "owner".into(),
+            current_agent_id: None,
+            depth: 0,
+        });
+        let path = fixture.cx.working_dir.join("read.txt");
+        std::fs::write(&path, b"parent").unwrap();
+        fixture
+            .cx
+            .record_read(path.clone(), hex::encode(Sha256::digest(b"parent")));
+        assert!(fixture.cx.was_read(&path));
+        fixture.cx.push_cancel_check(std::sync::Arc::new(|| true));
+        let child = child_agent_context(&fixture.home, "owner", "child", &fixture.cx);
+        assert_eq!(child.working_dir, fixture.cx.working_dir);
+        assert_eq!(child.working_dirs, fixture.cx.working_dirs);
+        assert!(!child.was_read(&path));
+        assert!(!child.is_cancelled());
+        child.push_cancel_check(std::sync::Arc::new(|| false));
+        assert!(fixture.cx.is_cancelled());
+        let identity = agent_session_context(&child, "ignored");
+        assert_eq!(identity.owner_session_id, "owner");
+        assert_eq!(identity.current_agent_id.as_deref(), Some("child"));
+        assert_eq!(identity.depth, 1);
+    }
+
+    #[test]
+    fn plan_denies_queue_writes_and_task_aliases_use_identical_keys() {
+        let fixture = Fixture::new();
+        let agent = fixture
+            .store()
+            .create("Explore", None, "mock/mock-notools", None)
+            .unwrap();
+        let plan = PermissionScope::from_flags(Some("plan"), None, None);
+        let send = fixture.call(
+            "owner",
+            "AgentSendMessage",
+            json!({"agent_id":agent.agent_id,"message":"blocked"}),
+            &plan,
+        );
+        assert!(orbit_tools::result_is_denial(&send.to_string()));
+        assert!(fixture
+            .store()
+            .load(&agent.agent_id)
+            .unwrap()
+            .inbox
+            .is_empty());
+        let explicit_allow =
+            PermissionScope::from_flags(Some("plan"), Some("AgentSendMessage"), None);
+        let still_denied = fixture.call(
+            "owner",
+            "AgentSendMessage",
+            json!({"agent_id":agent.agent_id,"message":"still blocked"}),
+            &explicit_allow,
+        );
+        assert!(orbit_tools::result_is_denial(&still_denied.to_string()));
+        let listing = fixture.call("owner", "ListAgents", json!({}), &plan);
+        assert_eq!(listing["ok"], true, "{listing}");
+        let denied = PermissionScope::from_flags(None, None, Some("Agent(Explore)"));
+        for alias in ["agent", "agent_type", "subagent_type"] {
+            let args = json!({(alias):"Explore","description":"old aliases"});
+            for tool in ["Task", "Agent"] {
+                let result = fixture.call("owner", tool, args.clone(), &denied);
+                assert!(
+                    orbit_tools::result_is_denial(&result.to_string()),
+                    "{alias} {result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_and_stale_runs_resume_from_saved_transcript() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        remember_turn_config(&fixture.cx, &mock.config("mock-notools"));
+        fixture.cx.push_cancel_check(std::sync::Arc::new(|| true));
+        let cancelled = fixture.task(json!({"agent":"Explore","prompt":"cancelled task"}));
+        assert_eq!(cancelled["ok"], false, "{cancelled}");
+        let agent_id = cancelled["agent_id"].as_str().unwrap();
+        let saved = fixture.store().load(agent_id).unwrap();
+        assert_eq!(saved.status, AgentStatus::Cancelled);
+        assert_eq!(saved.turns, 1);
+        assert_eq!(mock.requests(), 0);
+        fixture.cx.pop_cancel_check();
+        drop(fixture.store().begin(agent_id, None).unwrap());
+        assert_eq!(
+            fixture.store().load(agent_id).unwrap().status,
+            AgentStatus::Interrupted
+        );
+        let resumed = fixture.task(
+            json!({"agent":"Explore","resume":agent_id,"prompt":"continue after inspection"}),
+        );
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        let body = mock.body();
+        let last = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(last.contains("previous run was interrupted"));
+        assert!(last.contains("Inspect the actual work"));
+        assert!(!last.contains("cancelled task"));
+        assert_eq!(fixture.store().load(agent_id).unwrap().turns, 2);
+    }
+    fn configure_effort(mock: &Mock, fixture: &Fixture) {
+        mock.configure(&fixture.home);
+        let mut cfg = crate::config::ProvidersConfig::load(&fixture.home).unwrap();
+        for model in &mut cfg.provider[0].models {
+            use orbit_adapter::types::EffortValue;
+            let (choices, default) = if model.id == "role-notools" {
+                (vec![EffortValue::Level("medium".into())], "medium")
+            } else {
+                (
+                    vec![
+                        EffortValue::Level("low".into()),
+                        EffortValue::Level("high".into()),
+                    ],
+                    "low",
+                )
+            };
+            model.supported_efforts = Some(choices);
+            model.default_effort = Some(EffortValue::Level(default.into()));
+        }
+        cfg.save_atomic(&fixture.home).unwrap();
+        let config = crate::try_engine_turn_config(
+            &fixture.home,
+            "mock",
+            &mock.gate,
+            "mock-notools",
+            None,
+            None,
+        )
+        .unwrap();
+        remember_turn_config(&fixture.cx, &config);
+    }
+
+    #[test]
+    fn agent_effort_override_inheritance_and_sticky_reset_reach_requests() {
+        use orbit_adapter::types::{EffortSetting, EffortValue};
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        configure_effort(&mock, &fixture);
+        let mut config = crate::try_engine_turn_config(
+            &fixture.home,
+            "mock",
+            &mock.gate,
+            "mock-notools",
+            None,
+            None,
+        )
+        .unwrap();
+        let high = Some(EffortSetting::Value(EffortValue::Level("high".into())));
+        crate::apply_effort_setting(&fixture.home, &mut config, high.as_ref().unwrap()).unwrap();
+        remember_turn_config(&fixture.cx, &config);
+        remember_effort_setting(&fixture.cx, &high);
+        let before = mock.requests();
+        let first = fixture.task(json!({"agent":"Explore","prompt":"inherit parent"}));
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(mock.body()["reasoning_effort"], "high");
+        assert_eq!(mock.requests(), before + 1);
+        let agent_id = id(&first);
+        remember_effort_setting(&fixture.cx, &Some(EffortSetting::Default));
+        let resumed =
+            fixture.task(json!({"agent":"Explore","prompt":"keep saved choice","resume":agent_id}));
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(mock.body()["reasoning_effort"], "high");
+        let low = fixture.task(
+            json!({"agent":"Explore","prompt":"explicit lower","resume":agent_id,"effort":"low"}),
+        );
+        assert_eq!(low["ok"], true, "{low}");
+        assert_eq!(mock.body()["reasoning_effort"], "low");
+        let reset = fixture
+            .task(json!({"agent":"Explore","prompt":"reset","resume":agent_id,"effort":null}));
+        assert_eq!(reset["ok"], true, "{reset}");
+        assert_eq!(
+            fixture.store().load(agent_id).unwrap().effort,
+            Some(EffortSetting::Default)
+        );
+        remember_effort_setting(&fixture.cx, &high);
+        let saved_reset =
+            fixture.task(json!({"agent":"Explore","prompt":"keep reset","resume":agent_id}));
+        assert_eq!(saved_reset["ok"], true, "{saved_reset}");
+        assert_eq!(mock.body()["reasoning_effort"], "low");
+        let list = fixture.call(
+            "owner",
+            "ListAgents",
+            json!({}),
+            &PermissionScope::default(),
+        );
+        assert!(list.to_string().contains("\"mode\":\"default\""), "{list}");
+    }
+
+    #[test]
+    fn saved_default_outranks_a_nondefault_profile_and_model_changes_drop_overrides() {
+        use orbit_adapter::types::{EffortSetting, EffortValue};
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        configure_effort(&mock, &fixture);
+        std::fs::create_dir_all(fixture.home.join("agents")).unwrap();
+        std::fs::write(fixture.home.join("agents/profile.md"),"---\nname: custom\ndescription: configured profile\ntools: [Read]\neffort: high\n---\n").unwrap();
+        let profile = fixture.task(json!({"agent":"custom","prompt":"profile choice"}));
+        assert_eq!(profile["ok"], true, "{profile}");
+        assert_eq!(mock.body()["reasoning_effort"], "high");
+        let first =
+            fixture.task(json!({"agent":"custom","prompt":"reset profile","effort":"default"}));
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(mock.body()["reasoning_effort"], "low");
+        let resumed =
+            fixture.task(json!({"agent":"custom","prompt":"saved reset","resume":id(&first)}));
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(mock.body()["reasoning_effort"], "low");
+        assert_eq!(
+            fixture.store().load(id(&first)).unwrap().effort,
+            Some(EffortSetting::Default)
+        );
+        let selected =
+            fixture.task(json!({"agent":"Explore","prompt":"selected high","effort":"high"}));
+        assert_eq!(selected["ok"], true, "{selected}");
+        remember_effort_setting(
+            &fixture.cx,
+            &Some(EffortSetting::Value(EffortValue::Level("high".into()))),
+        );
+        let changed = fixture.task(json!({"agent":"Explore","prompt":"new model default","resume":id(&selected),"model":"mock/override-notools"}));
+        assert_eq!(changed["ok"], true, "{changed}");
+        assert_eq!(mock.body()["reasoning_effort"], "low");
+        assert_eq!(
+            fixture.store().load(id(&selected)).unwrap().effort,
+            Some(EffortSetting::Default)
+        );
+        let mut cfg = crate::config::ProvidersConfig::load(&fixture.home).unwrap();
+        cfg.roles.explore = "mock/role-notools".into();
+        cfg.save_atomic(&fixture.home).unwrap();
+        let routed = fixture.task(json!({"agent":"Explore","prompt":"different model default"}));
+        assert_eq!(routed["ok"], true, "{routed}");
+        assert_eq!(mock.body()["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn invalid_agent_effort_has_no_request_start_or_mailbox_ack() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        configure_effort(&mock, &fixture);
+        let before = mock.requests();
+        for effort in [json!("xhigh"), json!(true), json!(3), json!(" high")] {
+            let response =
+                fixture.task(json!({"agent":"Explore","prompt":"invalid choice","effort":effort}));
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(mock.requests(), before);
+            assert!(fixture.store().list().unwrap().is_empty());
+        }
+        std::fs::write(
+            fixture.home.join("agents/unknown-target.md"),
+            "---\nname: unknown-target\nmodel: mock/missing\neffort: high\n---\n",
+        )
+        .unwrap();
+        let missing_target =
+            fixture.task(json!({"agent":"unknown-target","prompt":"invalid profile target"}));
+        assert_eq!(missing_target["ok"], false, "{missing_target}");
+        assert_eq!(mock.requests(), before);
+        assert!(fixture.store().list().unwrap().is_empty());
+        let first = fixture.task(json!({"agent":"Explore","prompt":"valid","effort":"high"}));
+        assert_eq!(first["ok"], true, "{first}");
+        let agent_id = id(&first);
+        let before = mock.requests();
+        fixture
+            .store()
+            .enqueue(agent_id, "do not acknowledge", None)
+            .unwrap();
+        let response = fixture.task(
+            json!({"agent":"Explore","prompt":"invalid resume","resume":agent_id,"effort":false}),
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(mock.requests(), before);
+        let snapshot = fixture.store().load(agent_id).unwrap();
+        assert_eq!(snapshot.status, AgentStatus::Completed);
+        assert!(snapshot.active_run_id.is_none());
+        assert_eq!(snapshot.inbox.len(), 1);
+        let mut cfg = crate::config::ProvidersConfig::load(&fixture.home).unwrap();
+        cfg.provider[0].models[0].default_effort =
+            Some(orbit_adapter::types::EffortValue::Level("invalid".into()));
+        std::fs::write(
+            fixture.home.join("providers.toml"),
+            toml::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+        let invalid_cfg =
+            fixture.task(json!({"agent":"Explore","prompt":"bad config resume","resume":agent_id}));
+        assert_eq!(invalid_cfg["ok"], false, "{invalid_cfg}");
+        assert_eq!(mock.requests(), before);
+        assert_eq!(fixture.store().load(agent_id).unwrap().inbox.len(), 1);
+    }
+
+    #[test]
+    fn typed_boolean_and_named_false_are_distinct_agent_requests() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.home.join("providers.toml"),format!("[[provider]]\nname='mock'\nkind='ollama'\nurl='{}'\n[[provider.models]]\nid='mock-notools'\nsupported_efforts=[false,'false']\n",mock.gate)).unwrap();
+        let config = crate::try_engine_turn_config(
+            &fixture.home,
+            "mock",
+            &mock.gate,
+            "mock-notools",
+            None,
+            None,
+        )
+        .unwrap();
+        remember_turn_config(&fixture.cx, &config);
+        for (value, expected) in [
+            (json!(false), json!(false)),
+            (json!("false"), json!("false")),
+        ] {
+            let before = mock.requests();
+            let result =
+                fixture.task(json!({"agent":"Explore","prompt":"typed choice","effort":value}));
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(mock.requests(), before + 1);
+            assert_eq!(mock.body()["think"], expected);
+        }
+    }
+    #[test]
+    fn slash_model_ids_keep_their_default_and_explicit_effort_on_role_and_profile_paths() {
+        let mock = Mock::new();
+        let fixture = Fixture::new();
+        configure_effort(&mock, &fixture);
+        let mut cfg = crate::config::ProvidersConfig::load(&fixture.home).unwrap();
+        let mut entry = cfg.provider[0].models[2].clone();
+        entry.id = "vendor/reasoner".into();
+        cfg.provider[0].models.push(entry);
+        cfg.roles.explore = "mock/vendor/reasoner".into();
+        cfg.save_atomic(&fixture.home).unwrap();
+        let role = fixture.task(json!({"agent":"Explore","prompt":"slash role default"}));
+        assert_eq!(role["ok"], true, "{role}");
+        assert_eq!(role["result"]["model"], "mock/vendor/reasoner");
+        assert_eq!(mock.body()["model"], "vendor/reasoner");
+        assert_eq!(mock.body()["reasoning_effort"], "medium");
+        std::fs::create_dir_all(fixture.home.join("agents")).unwrap();
+        std::fs::write(
+            fixture.home.join("agents/slash.md"),
+            "---\nname: slash\nmodel: vendor/reasoner\neffort: medium\n---\n",
+        )
+        .unwrap();
+        let profile = fixture
+            .task(json!({"agent":"slash","prompt":"slash explicit effort","effort":"medium"}));
+        assert_eq!(profile["ok"], true, "{profile}");
+        assert_eq!(mock.body()["model"], "vendor/reasoner");
+        assert_eq!(mock.body()["reasoning_effort"], "medium");
+        let explicit = fixture.task(json!({"agent":"Explore","prompt":"bare slash target","model":"vendor/reasoner","effort":"medium"}));
+        assert_eq!(explicit["ok"], true, "{explicit}");
+        assert_eq!(mock.body()["model"], "vendor/reasoner");
+        assert_eq!(mock.body()["reasoning_effort"], "medium");
+        let before = mock.requests();
+        let invalid = fixture
+            .task(json!({"agent":"slash","prompt":"reject other model choice","effort":"high"}));
+        assert_eq!(invalid["ok"], false, "{invalid}");
+        assert_eq!(mock.requests(), before);
     }
 }

@@ -25,6 +25,10 @@ pub enum Msg {
     /// A one-line status message (model changed, session loaded, etc.).
     /// Rendered in the status bar / toast, NOT in the transcript.
     Status(String),
+    /// Display-safe decision facts from the shared routing engine; no raw prompt/config.
+    Routing(Vec<String>),
+    /// Configured request effort and choices, wrapped in the transcript on resize.
+    EffortStatus(String),
     /// The session's permission mode changed at runtime (S5:
     /// Shift+Tab or /mode). Payload: the mode name (default,
     /// acceptEdits, plan, dontAsk, bypass).
@@ -154,11 +158,13 @@ pub enum Msg {
         /// "before" to diff against.
         hunks: Option<Vec<orbit_frontend_protocol::DiffHunk>>,
     },
-    /// A subagent started (id, name, task).
+    /// A subagent started (id, profile name, task, actual model).
     SubagentStarted {
         id: String,
         name: String,
         task: String,
+        /// Empty when the caller did not supply model information.
+        model: String,
     },
     /// A subagent's current action.
     SubagentProgress { id: String, action: String },

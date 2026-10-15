@@ -1,0 +1,50 @@
+# Reference template; ORBIT does not directly load this TOML file.
+# Replace the executable with an already installed stdio browser-MCP server.
+# Choose arguments for your existing browser and isolated profile explicitly.
+# Do not use package runners that download an executable at launch.
+# Browser origin/file options configure that server; ORBIT policy still applies.
+
+[mcp_json.servers.browser]
+command = "/path/to/existing/browser-mcp-server"
+args = ["--headless"]
+enabled = true
+tools = ["browser_navigate", "browser_snapshot", "browser_click", "browser_close"]
+timeout_ms = 30000
+initialize_timeout_ms = 5000
+
+[settings_toml.permissions]
+ask = ["mcp__browser__*"]
+
+# Translate the two sections into the actual home-scoped configuration files:
+# python3 - <<'PY'
+# import json, os, pathlib, tomllib
+# template = tomllib.loads(pathlib.Path("examples/browser-mcp.toml").read_text())
+# home = pathlib.Path(os.environ["ORBIT_HOME"])
+# mcp = home / "mcp.json"
+# current = json.loads(mcp.read_text()) if mcp.exists() else {"servers": {}}
+# if "browser" in current.setdefault("servers", {}):
+#     raise SystemExit("browser server already configured; merge deliberately")
+# current["servers"].update(template["mcp_json"]["servers"])
+# mcp.write_text(json.dumps(current, indent=2) + "\n")
+# print('Add ask = ["mcp__browser__*"] to [permissions] in home/settings.toml.')
+# PY
+# The conversion preserves other server entries and refuses an existing browser
+# entry. Edit the executable/argv before conversion. Merge the permission rule
+# with your current settings; retain any independent deny rules.
+# Home configuration authorizes executable launch. Project MCP configuration
+# additionally requires ORBIT's existing folder trust.
+#
+# In an interactive chat, inspect /permissions mcp__browser__browser_navigate.
+# Confirm individual Ask requests, or deliberately change a specific selector
+# with /permissions allow <selector>. Reset restores the configured Ask rule.
+# Headless --auto-tools cannot approve this explicit Ask. For a deliberate
+# unattended workflow, configure exact allows yourself and retain deny rules.
+#
+# Local synthetic acceptance (no native browser):
+# scripts/in-jail.sh python3 scripts/verify_priority_checks.py script \
+#   --min-checks 6 -- python3 scripts/browser_mcp_test.py --binary target/debug/orbit
+# Optional real compatibility uses an existing executable and browser, never an
+# automatic install. Supply an mcp.json with one server and these exact tools:
+# scripts/in-jail.sh python3 scripts/browser_mcp_test.py \
+#   --binary target/debug/orbit --real-config /path/to/real-browser-mcp.json
+# The supplied argv must already support opening the local file fixture.

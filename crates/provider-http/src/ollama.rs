@@ -69,6 +69,11 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
         cancel: &CancelToken,
     ) -> Result<AsyncProviderEventStream, AdapterError> {
         self.validate_route(&request.route)?;
+        if let Some(effort) = &request.effort {
+            effort
+                .validate_for_ollama()
+                .map_err(AdapterError::ProviderConfigurationInvalid)?;
+        }
         // Ollama serves at the bare host by default; a configured gate
         // path (a nonstandard reverse-proxy layout) is honored verbatim.
         let base_path = if request.route.endpoint_path.is_empty() {
@@ -148,6 +153,9 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
             }
         });
         // E8: sampling opt-in per model; zero means unset — omitted.
+        if let Some(effort) = &request.effort {
+            body["think"] = serde_json::json!(effort);
+        }
         if request.sampling.temperature_milliunits > 0 {
             body["options"]["temperature"] =
                 serde_json::json!(request.sampling.temperature_milliunits as f64 / 1000.0);
@@ -156,18 +164,36 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
             body["options"]["top_p"] =
                 serde_json::json!(request.sampling.top_p_millionths as f64 / 1_000_000.0);
         }
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_millis(request.connect_timeout_ms),
-            self.client.post(url).json(&body).send(),
-        )
-        .await
-        .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
-        .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
+        let Some(response) = cancel
+            .until_cancelled(tokio::time::timeout(
+                std::time::Duration::from_millis(request.connect_timeout_ms),
+                self.client.post(url).json(&body).send(),
+            ))
+            .await
+        else {
+            return Ok(crate::cancel::cancelled_stream());
+        };
+        let resp = response
+            .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
+            .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
         if !resp.status().is_success() {
             // E1: the body carries the provider's own message; E2:
             // 529/5xx classify retryable.
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let Some(body) = cancel
+                .until_cancelled(tokio::time::timeout(
+                    std::time::Duration::from_millis(request.idle_timeout_ms),
+                    resp.text(),
+                ))
+                .await
+            else {
+                return Ok(crate::cancel::cancelled_stream());
+            };
+            let body = body
+                .map_err(|_| {
+                    AdapterError::ProviderTimeout("error response body stalled (E0409)".into())
+                })?
+                .unwrap_or_default();
             return Err(crate::error::status_error(status, body).await);
         }
         Ok(ollama_stream(
@@ -202,9 +228,10 @@ fn ollama_stream(
             } else {
                 idle_timeout_ms
             });
-            match tokio::time::timeout(budget, bytes.next()).await {
-                Ok(item) => item,
-                Err(_) => {
+            match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
+                None => None,
+                Some(Ok(item)) => item,
+                Some(Err(_)) => {
                     yield Err(AdapterError::ProviderTimeout(
                         "stream stalled: no bytes within the idle timeout (E0409)".into(),
                     ));
@@ -229,6 +256,7 @@ fn ollama_stream(
                 }
             }
         }
-        yield Ok(ProviderStreamEvent{sequence:seq,event:ProviderEventKind::Finished{finish_reason:Some("stop".into()),final_usage:Some(usage)}});
+        let reason = if cancel.is_cancelled() { "cancelled" } else { "stop" };
+        yield Ok(ProviderStreamEvent{sequence:seq,event:ProviderEventKind::Finished{finish_reason:Some(reason.into()),final_usage:Some(usage)}});
     })
 }

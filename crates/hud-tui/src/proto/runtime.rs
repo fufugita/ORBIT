@@ -3,6 +3,7 @@
 //! (presets, arrange mode, saved to `tui.toml`); the screen is a pure
 //! function of that tree, the scenario and the tick.
 
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -53,11 +54,14 @@ pub struct Toast {
 /// The runtime's own state (the App replacement): focus, the star
 /// clock, the brand tier.
 pub struct Tui {
+    pub profile: orbit_frontend_protocol::customization::Profile,
+    pub customization: Option<crate::customization::CustomizationSession>,
     pub focus: Focus,
     pub star: super::anim::StarClock,
     pub reduced: bool,
     pub tick_ms: u64,
     pub brand_tier: super::welcome::BrandTier,
+    pub brand_preference: super::welcome::BrandTier,
     /// The layout tree, focus and arrange mode (the screen's panels).
     pub app: super::app::App,
     /// Timestamps of interface changes, for the motion between states.
@@ -71,6 +75,10 @@ pub struct Tui {
     pub selection: Option<super::shell::Selection>,
     /// The highlighted row of the `/` command list.
     pub completion_sel: usize,
+    /// Workspace file suggestions; accepting one changes only the draft.
+    pub file_completion: super::composer::FileCompletion,
+    /// An active reverse search, including the draft to restore on Escape.
+    pub history_search: Option<super::composer::HistorySearch>,
     /// What the last frame drew as clickable, in drawing order. The mouse
     /// is answered from this and nothing else, so a click can only reach
     /// what is on screen.
@@ -86,17 +94,22 @@ impl Default for Tui {
 impl Tui {
     pub fn new() -> Self {
         Tui {
+            profile: Default::default(),
+            customization: None,
             focus: Focus::Conversation,
             star: super::anim::StarClock::new(),
             reduced: false,
             tick_ms: 0,
             brand_tier: super::welcome::BrandTier::Static,
+            brand_preference: super::welcome::BrandTier::Static,
             app: super::app::App::new(std::path::PathBuf::new(), false),
             fx: super::shell::Fx::default(),
             tier: super::core::Tier::TrueColor,
             scrolls: Vec::new(),
             selection: None,
             completion_sel: 0,
+            file_completion: super::composer::FileCompletion::default(),
+            history_search: None,
             hits: Vec::new(),
         }
     }
@@ -138,35 +151,69 @@ impl Tui {
 
 /// `orbit chat` → the prototype screen (the MD's target front-end).
 pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) -> i32 {
-    let _ = args;
+    run_proto_inner(args, worker_spawner, None)
+}
+
+/// The caller owns storage/policy. This frontend only consumes the checked host interface.
+pub fn run_proto_with_customization(
+    args: &[String],
+    worker_spawner: crate::worker::WorkerSpawner,
+    host: std::sync::Arc<dyn orbit_frontend_protocol::customization::ProfileHost>,
+) -> i32 {
+    match crate::customization::CustomizationSession::open(host) {
+        Ok(session) => run_proto_inner(args, worker_spawner, Some(session)),
+        Err(error) => {
+            eprintln!("orbit-tui: {error}");
+            1
+        }
+    }
+}
+
+fn run_proto_inner(
+    args: &[String],
+    worker_spawner: crate::worker::WorkerSpawner,
+    customization: Option<crate::customization::CustomizationSession>,
+) -> i32 {
     let home = std::env::var("ORBIT_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(".orbit"));
 
     // tui.toml (Appendix C): colour mode, glyphs, motion, brand,
     // notify, colours, layout.
-    let raw: crate::tokens::Theme = {
-        let path = home.join("tui.toml");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| toml::from_str(&raw).ok())
-            .unwrap_or_default()
+    let safe_session = args.iter().any(|arg| arg == "--safe-customization")
+        || customization
+            .as_ref()
+            .is_some_and(|session| session.resolved.revision == "session-defaults");
+    let raw = match load_legacy_theme(&home, safe_session) {
+        Ok(theme) => theme,
+        Err(error) => {
+            eprintln!("orbit-tui: {error}");
+            return 1;
+        }
     };
-    let reduced = raw.capabilities.reduced;
+    let profile = select_profile(&raw, customization.as_ref().map(|c| &c.resolved.profile));
+    if let Err(error) = profile.validate() {
+        eprintln!("orbit-tui: {error}");
+        return 1;
+    }
+    let reduced = profile.reduced_motion;
     // Brand tier (Appendix C): `off` by default; reduced motion caps
     // at `static`.
-    let brand_tier = {
+    let brand_preference = {
         use super::welcome::BrandTier;
-        let t = match raw.capabilities.brand.as_str() {
+        match raw.capabilities.brand.as_str() {
             "anim" => BrandTier::Anim,
             "text" => BrandTier::Text,
             "static" => BrandTier::Static,
             _ => BrandTier::Off,
-        };
-        if reduced && t == BrandTier::Anim {
+        }
+    };
+    let brand_tier = {
+        use super::welcome::BrandTier;
+        if reduced && brand_preference == BrandTier::Anim {
             BrandTier::Static
         } else {
-            t
+            brand_preference
         }
     };
 
@@ -179,7 +226,6 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
             return 1;
         }
     };
-
     let (bus, sender) = Bus::new();
     let approvals = ApprovalRegistry::new();
     let mut scenario = Scenario::new();
@@ -193,29 +239,42 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     scenario.model = std::env::var("ORBIT_ACTIVE_MODEL").unwrap_or_default();
 
     let mut tui = Tui {
+        profile,
+        customization,
         focus: Focus::Conversation,
         star: super::anim::StarClock::new(),
         reduced,
         tick_ms: 0,
         brand_tier,
+        brand_preference,
         app: super::app::App::new(home.clone(), reduced),
         fx: super::shell::Fx::default(),
-        tier: match raw.capabilities.mode.as_str() {
-            "truecolor" => super::core::Tier::TrueColor,
-            "256" => super::core::Tier::T256,
-            "16" => super::core::Tier::T16,
-            "mono" => super::core::Tier::None,
-            _ => super::core::Tier::detect(
-                std::env::var_os("NO_COLOR").is_some(),
-                std::env::var("COLORTERM").ok().as_deref(),
-                std::env::var("TERM").ok().as_deref(),
-            ),
-        },
+        tier: super::core::Tier::detect(
+            std::env::var_os("NO_COLOR").is_some(),
+            std::env::var("COLORTERM").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+        ),
         scrolls: Vec::new(),
         selection: None,
         completion_sel: 0,
+        file_completion: super::composer::FileCompletion::default(),
+        history_search: None,
         hits: Vec::new(),
     };
+    if let Some(session) = tui.customization.as_mut() {
+        match crate::customization::profile_tree(&session.resolved.profile) {
+            Ok(tree) => {
+                tui.app.tree = tree;
+                crate::customization::focus_conversation(&mut tui.app);
+            }
+            Err(error) => {
+                eprintln!("orbit-tui: {error}");
+                return 1;
+            }
+        }
+        session.refresh_all();
+        scenario.custom_panes = session.outputs.clone();
+    }
     tui.sync_focus();
 
     // The composer: text lives here (the event loop owns it).
@@ -229,7 +288,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     // queued row until their TurnStarted.
     let mut queued: Vec<String> = Vec::new();
     // Composer history (§11.3), newest first. Persisted per session
-    // (`sessions/<id>.history`, one prompt per line): the CLI names
+    // (`sessions/<id>.history`): the CLI names
     // the session (ORBIT_SESSION_ID — the same id the worker saves
     // under), so a resumed session's ↑/↓ memory loads before the
     // first key.
@@ -239,14 +298,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     let mut history: Vec<String> = history_path
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|raw| {
-            raw.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .take(HISTORY_MAX)
-                .map(str::to_string)
-                .collect()
-        })
+        .map(|raw| read_history(&raw))
         .unwrap_or_default();
     let mut history_idx: Option<usize> = None;
     // The history length as of the last key: a change means a send
@@ -279,7 +331,6 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         std::io::stdout(),
         crossterm::cursor::SetCursorStyle::SteadyBar
     );
-    let guard = &mut guard;
     let mut last_tick = Instant::now();
     let boot_ms = Instant::now();
     let mut last_drawn = String::new();
@@ -290,6 +341,7 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     // The last frame drawn: a selection copies its text from here.
     let mut last_buf: Option<ratatui::buffer::Buffer> = None;
 
+    let mut exit_code = 0;
     loop {
         let timeout = UI_TICK
             .checked_sub(last_tick.elapsed())
@@ -305,7 +357,11 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
             None => match event::poll(timeout) {
                 Ok(true) => event::read().ok(),
                 Ok(false) => None,
-                Err(_) => break,
+                Err(_) => {
+                    exit_code = crate::terminal::take_pending_signal()
+                        .map_or(1, crate::terminal::ShutdownSignal::exit_code);
+                    break;
+                }
             },
         };
         if let Some(ev) = ev {
@@ -314,29 +370,43 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                     overlay_dirty = true;
                     let snap_before =
                         super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
-                    let quit = handle_key(
+                    let handled_custom = handle_custom_key(
                         k,
                         &mut tui,
                         &mut scenario,
                         &mut composer,
                         cancel_handle.as_ref(),
-                        &command_sink,
-                        &sender,
-                        &approvals,
-                        now_ms,
-                        &mut overlay,
-                        &mut palette_query,
-                        &mut palette_sel,
-                        &mut completion_sel,
                         &mut toast,
-                        &mut queued,
-                        &mut history,
-                        &mut history_idx,
-                        &mut pending_leader,
-                        &mut want_copy_mode,
-                        &mut sessions_pushed,
-                        &mut last_prompt,
+                        now_ms,
+                        overlay.is_some(),
                     );
+                    let quit = if handled_custom {
+                        false
+                    } else {
+                        handle_key(
+                            k,
+                            &mut tui,
+                            &mut scenario,
+                            &mut composer,
+                            cancel_handle.as_ref(),
+                            &command_sink,
+                            &sender,
+                            &approvals,
+                            now_ms,
+                            &mut overlay,
+                            &mut palette_query,
+                            &mut palette_sel,
+                            &mut completion_sel,
+                            &mut toast,
+                            &mut queued,
+                            &mut history,
+                            &mut history_idx,
+                            &mut pending_leader,
+                            &mut want_copy_mode,
+                            &mut sessions_pushed,
+                            &mut last_prompt,
+                        )
+                    };
                     let snap_after =
                         super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
                     tui.fx.observe(&snap_before, &snap_after, now_ms);
@@ -388,6 +458,25 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                                 crossterm::event::KeyModifiers::NONE,
                             )));
                         }
+                        MouseOutcome::Completion(i) => {
+                            tui.file_completion.selected = i;
+                            injected = Some(Event::Key(crossterm::event::KeyEvent::new(
+                                KeyCode::Tab,
+                                KeyModifiers::NONE,
+                            )));
+                        }
+                        MouseOutcome::CustomAction { panel, action } => {
+                            run_pane_action(
+                                panel,
+                                action,
+                                &mut tui,
+                                &mut scenario,
+                                &mut composer,
+                                cancel_handle.as_ref(),
+                                &mut toast,
+                                now_ms,
+                            );
+                        }
                         MouseOutcome::Tape(i) => {
                             scenario.pick_tape(i);
                             tui.scroll_follow(); // the other command is read from its end
@@ -419,20 +508,20 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         }
         if want_copy_mode {
             want_copy_mode = false;
-            copy_mode(guard, &scenario);
+            copy_mode(&mut guard, &scenario);
         }
         if last_tick.elapsed() >= UI_TICK {
             last_tick = Instant::now();
             // Signals (SIGHUP/SIGTERM/SIGINT): exit at once — a
             // closed terminal must not leak the process.
             if let Some(sig) = crate::terminal::take_pending_signal() {
-                let _ = sig;
+                exit_code = sig.exit_code();
                 break;
             }
             // Drain the bus into the scenario.
             let msgs_before = scenario.state_version();
             while let Some(msg) = bus.try_recv() {
-                if let Some(text) = apply_msg(msg, &mut scenario, now_ms) {
+                if let Some(text) = reduce_frontend_message(msg, &mut tui, &mut scenario, now_ms) {
                     // The agent-done toast (§9.13): replaces any current
                     // toast — the newest event wins.
                     toast = Some(Toast {
@@ -517,6 +606,8 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
                 let Some(done) = done else {
                     // The terminal is gone (closed window, dead PTY): leave the
                     // loop and let the normal shutdown run — never panic here.
+                    exit_code = crate::terminal::take_pending_signal()
+                        .map_or(1, crate::terminal::ShutdownSignal::exit_code);
                     break;
                 };
                 last_buf = Some(done.buffer.clone());
@@ -531,7 +622,12 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
         }
     }
 
-    let _ = guard;
+    drop(guard);
+    if let Some(sig) = crate::terminal::take_pending_signal() {
+        if matches!(exit_code, 0 | 1) {
+            exit_code = sig.exit_code();
+        }
+    }
     // The composer history outlives the run: one last save (the sends
     // saved as they happened; this catches nothing on a clean exit,
     // and everything on a signal).
@@ -554,11 +650,14 @@ pub fn run_proto(args: &[String], worker_spawner: crate::worker::WorkerSpawner) 
     } else {
         "n/a".into()
     };
-    println!(
+    let _ = writeln!(
+        std::io::stdout(),
         "✦ ORBIT  session saved · {} turns · {} in · {} out · {cost}{session}",
-        scenario.turns, scenario.input_tokens, scenario.output_tokens
+        scenario.turns,
+        scenario.input_tokens,
+        scenario.output_tokens
     );
-    0
+    exit_code
 }
 
 /// The keyboard (§11). Returns true to quit.
@@ -690,9 +789,22 @@ fn handle_key(
     // each running tool's process group". Outside a turn Esc keeps its
     // per-context meaning (close completion, defocus…).
     if k.code == KeyCode::Esc && scenario.is_turning() {
+        if let Some(search) = tui.history_search.take() {
+            search.restore(composer);
+        }
+        tui.file_completion.sync(composer);
+        tui.file_completion.dismiss();
         if let Some(cancel) = &cancel_handle {
             cancel();
         }
+        return false;
+    }
+
+    if tui.focus == Focus::Conversation
+        && !tui.app.arranging
+        && tui.app.picker.is_none()
+        && composer_key(k, tui, composer, history, history_idx)
+    {
         return false;
     }
 
@@ -705,7 +817,7 @@ fn handle_key(
             KeyCode::Char(ch @ '1'..='8') => {
                 let i = ch as usize - '1' as usize;
                 if tui.app.pick(super::shell::PICKER_VIEWS[i]) {
-                    tui.app.save_yours();
+                    save_layout(tui, toast, now_ms);
                 }
             }
             _ => {}
@@ -730,7 +842,7 @@ fn handle_key(
         };
         if let Some(key) = key {
             if tui.app.key(key) {
-                tui.app.save_yours();
+                save_layout(tui, toast, now_ms);
             }
         }
         tui.sync_focus();
@@ -842,8 +954,11 @@ fn handle_key(
                 *completion_sel = 0;
                 return false;
             }
-            KeyCode::Enter if k.modifiers.contains(KeyModifiers::ALT) => {
-                // §11.3: Alt+⏎ inserts a newline.
+            KeyCode::Enter
+                if k.modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                // §11.3: Alt+⏎ (and terminals reporting Shift+⏎) inserts a newline.
                 composer.push('\n');
             }
             KeyCode::Enter => {
@@ -1005,6 +1120,7 @@ fn handle_key(
                 *completion_sel = 0;
             }
         }
+        tui.file_completion.sync(composer);
         return false;
     }
 
@@ -1097,6 +1213,83 @@ fn handle_key(
             tui.app.arranging = true;
         }
         _ => {}
+    }
+    false
+}
+
+/// Draft modes own their keys before send, history navigation or panel focus.
+/// Approval cards and overlays are handled before this function is called.
+fn composer_key(
+    k: crossterm::event::KeyEvent,
+    tui: &mut Tui,
+    draft: &mut String,
+    history: &[String],
+    history_idx: &mut Option<usize>,
+) -> bool {
+    let reverse = k.code == KeyCode::Char('r') && k.modifiers.contains(KeyModifiers::CONTROL);
+    if reverse && tui.history_search.is_none() {
+        tui.file_completion.dismiss();
+        let search = super::composer::HistorySearch::new(draft, history);
+        search.preview(history, draft);
+        tui.history_search = Some(search);
+        *history_idx = None;
+        return true;
+    }
+    if let Some(search) = tui.history_search.as_mut() {
+        match k.code {
+            KeyCode::Esc => {
+                tui.history_search.take().unwrap().restore(draft);
+                tui.file_completion.sync(draft);
+                return true;
+            }
+            KeyCode::Enter => {
+                tui.history_search = None;
+                tui.file_completion.sync(draft);
+                return true;
+            }
+            _ if reverse => search.older(history),
+            KeyCode::Backspace => {
+                search.query.pop();
+                search.update(history);
+            }
+            KeyCode::Char(c)
+                if !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                search.query.push(c);
+                search.update(history);
+            }
+            _ => {}
+        }
+        search.preview(history, draft);
+        return true;
+    }
+
+    tui.file_completion.sync(draft);
+    if tui.file_completion.is_open() {
+        let picker = &mut tui.file_completion;
+        match k.code {
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => {
+                picker.selected = (picker.selected + 1).min(picker.candidates.len() - 1)
+            }
+            KeyCode::Tab => {
+                picker.accept(draft);
+                *history_idx = None;
+            }
+            KeyCode::Enter
+                if !k
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                picker.accept(draft);
+                *history_idx = None;
+            }
+            KeyCode::Esc => picker.dismiss(),
+            _ => return false,
+        }
+        return true;
     }
     false
 }
@@ -1235,6 +1428,10 @@ fn run_command(
         });
     };
     let open: Option<Overlay> = match cmd {
+        "/route" => {
+            let _ = command_sink.send(WorkerCommand::Route(arg.to_string()));
+            None
+        }
         "/help" => Some(Overlay::Help),
         "/sessions" => {
             // List the saved sessions in the transcript and open the
@@ -1272,6 +1469,10 @@ fn run_command(
             } else {
                 let _ = command_sink.send(WorkerCommand::SetModel(arg.to_string()));
             }
+            None
+        }
+        "/effort" => {
+            let _ = command_sink.send(WorkerCommand::Effort(arg.to_string()));
             None
         }
         "/resume" => {
@@ -1386,11 +1587,135 @@ fn set_plan(scenario: &mut Scenario, rows: Vec<super::panels::TaskRow>, now_ms: 
 
 /// FrontendEvent-shaped Msgs → the scenario reducer. Returns a toast
 /// to show (the agent-done note, §9.13) — the event loop owns toasts.
+fn restored_transcript_line(line: crate::model::TranscriptLine) -> TranscriptLine {
+    use crate::model::TranscriptLine as Saved;
+    let clean = |text: &str| crate::bridge::safe_text(&crate::bridge::terminal_safe(text));
+    match line {
+        Saved::User { text, time } => TranscriptLine {
+            kind: LineKind::User,
+            text: clean(&text),
+            time,
+            ..Default::default()
+        },
+        Saved::Assistant { text, time } => TranscriptLine {
+            kind: LineKind::Model,
+            text: clean(&text),
+            time,
+            ..Default::default()
+        },
+        Saved::System(text) => TranscriptLine {
+            kind: LineKind::System,
+            text: clean(&text),
+            ..Default::default()
+        },
+        Saved::Stripped {
+            tool_name,
+            summary,
+            outcome,
+            meta,
+            ..
+        } => TranscriptLine {
+            kind: LineKind::Tool,
+            tool_name: clean(&tool_name),
+            text: clean(&summary),
+            meta: clean(&meta),
+            tool_state: match outcome {
+                Some(crate::model::ToolOutcome::Failed) => ToolState::Failed,
+                Some(crate::model::ToolOutcome::Denied) => ToolState::Denied,
+                Some(crate::model::ToolOutcome::Blocked) => ToolState::Blocked,
+                Some(crate::model::ToolOutcome::Cancelled) => ToolState::Cancelled,
+                _ => ToolState::Done,
+            },
+            ..Default::default()
+        },
+        Saved::Evidence { checks, note, rows } => TranscriptLine {
+            kind: LineKind::System,
+            text: clean(&format!(
+                "{checks} · {note}\n{}",
+                rows.into_iter()
+                    .map(|(a, b)| format!("{a}: {b}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+            ..Default::default()
+        },
+        Saved::Sources(rows) => TranscriptLine {
+            kind: LineKind::System,
+            text: clean(
+                &rows
+                    .into_iter()
+                    .map(|(a, b)| format!("{a}: {b}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            ..Default::default()
+        },
+        Saved::Redacted(kind) => TranscriptLine {
+            kind: LineKind::System,
+            text: format!("[blocked: {kind:?}]"),
+            ..Default::default()
+        },
+    }
+}
+
 fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Option<String> {
     use crate::msg::Msg;
     // Every message may start a motion: keep redrawing for a second.
     scenario.motion_until_ms = now_ms + 1000;
     match msg {
+        Msg::Routing(lines) => {
+            scenario.routing_lines = lines
+                .into_iter()
+                .take(32)
+                .map(|line| {
+                    let clean = crate::bridge::safe_text(&crate::bridge::terminal_safe(&line));
+                    let mut end = clean.len().min(256);
+                    while !clean.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    clean[..end].to_string()
+                })
+                .collect();
+        }
+        Msg::TranscriptLoaded {
+            lines,
+            input_tokens,
+            output_tokens,
+            cost_microcents,
+            turns,
+        } => {
+            scenario.routing_lines.clear();
+            scenario.transcript = lines.into_iter().map(restored_transcript_line).collect();
+            scenario.input_tokens = input_tokens;
+            scenario.output_tokens = output_tokens;
+            scenario.cost_microcents = cost_microcents;
+            scenario.turns = turns;
+            scenario.turn_live = false;
+            scenario.visible_output = false;
+            scenario.last_failed = false;
+            scenario.compacting = false;
+            scenario.running.clear();
+            scenario.approval_pending = None;
+            scenario.approval_call_id = None;
+            scenario.approval_queue.clear();
+            scenario.approval_summary = None;
+            scenario.approval_grant = None;
+            scenario.approval_note = None;
+            scenario.agents.clear();
+            scenario.agents_running = 0;
+            scenario.tasks.clear();
+            scenario.file_changes.clear();
+            scenario.tapes.clear();
+            scenario.tape_sel = None;
+            scenario.activity.clear();
+            scenario.turn_report = None;
+            scenario.turn_tools = 0;
+            scenario.backoff_until_ms = None;
+            for pane in scenario.custom_panes.values_mut() {
+                pane.state = orbit_frontend_protocol::customization::PaneState::Stale;
+                pane.text = "Session changed; refresh this pane".into();
+            }
+        }
         Msg::TextDelta(text) => {
             scenario.apply("text_delta", 0);
             scenario.last_data_ms = now_ms;
@@ -1672,6 +1997,14 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.turn_ended_ms = Some(now_ms);
             scenario.apply("turn_ended", 0);
         }
+        Msg::EffortStatus(text) => {
+            scenario.transcript.push(TranscriptLine {
+                kind: LineKind::System,
+                text,
+                wrap: true,
+                ..Default::default()
+            });
+        }
         Msg::SystemMessage(text) => {
             // §11.6: one notice per line (`/models` rows, session
             // lists), `muted`, at the content column.
@@ -1781,11 +2114,17 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 .resize(scenario.file_changes.len(), 0);
             scenario.file_changed_ms[idx] = now_ms;
         }
-        Msg::SubagentStarted { id, name, task } => {
+        Msg::SubagentStarted {
+            id,
+            name,
+            task,
+            model,
+        } => {
             scenario.agents.insert(
                 id.clone(),
                 super::scenario::Agent {
                     name,
+                    model,
                     task,
                     action: String::new(),
                     report: String::new(),
@@ -1952,14 +2291,25 @@ pub fn draw_with_hits(
     let area = f.area();
     // The size notice (§9.23): below 40 × 10 it is the whole screen.
     if area.width < 40 || area.height < 10 {
-        let lines = super::chrome::size_notice_lines(area.width, area.height);
+        let lines = super::chrome::size_notice_lines_themed(
+            super::shell::pal::Palette::from_profile(&tui.profile),
+            area.width,
+            area.height,
+        );
         let star = Line::from(Span::styled(
             "✦",
-            Style::default().fg(comps::colour(Token::Magenta)),
+            Style::default().fg(comps::colour_themed(
+                super::shell::pal::Palette::from_profile(&tui.profile),
+                Token::Magenta,
+            )),
         ));
         let mut out = vec![star];
         out.extend(lines);
         f.render_widget(Paragraph::new(out), area);
+        super::shell::tier::apply(
+            f.buffer_mut(),
+            super::shell::effective_tier(tui.tier, tui.profile.color_mode, false),
+        );
         return Vec::new();
     }
     use super::shell::overlays::Overlay as Ov;
@@ -1993,7 +2343,7 @@ pub fn draw_with_hits(
         }
         None => None,
     };
-    super::shell::draw_with_hits(
+    super::shell::draw_with_profile(
         f,
         &super::shell::DrawIn {
             app: &tui.app,
@@ -2001,6 +2351,8 @@ pub fn draw_with_hits(
             scenario,
             composer,
             completion_sel: tui.completion_sel,
+            file_completion: Some(&tui.file_completion),
+            history_search: tui.history_search.as_ref(),
             now_ms: tui.tick_ms,
             // Colour-effect gating (the spec): shimmer, fades and flashes
             // are COLOUR motion — they switch off under 16 colours or no
@@ -2015,13 +2367,25 @@ pub fn draw_with_hits(
             selection: tui.selection,
             scroll_offset,
             brand: tui.brand_tier,
-            toast: toast.map(|t| super::shell::ToastIn {
-                text: t.text.as_str(),
-                ok: t.ok,
-                shown_ms: t.shown_ms,
-            }),
+            toast: toast
+                .map(|t| super::shell::ToastIn {
+                    text: t.text.as_str(),
+                    ok: t.ok,
+                    shown_ms: t.shown_ms,
+                })
+                .or_else(|| {
+                    tui.app
+                        .layout_error
+                        .as_ref()
+                        .map(|text| super::shell::ToastIn {
+                            text,
+                            ok: false,
+                            shown_ms: tui.tick_ms,
+                        })
+                }),
             overlay: ov,
         },
+        &tui.profile,
     )
 }
 
@@ -2047,6 +2411,10 @@ fn card_just_appeared(scenario: &Scenario, now_ms: u64) -> bool {
 /// What a mouse event asks the event loop to do beyond updating `Tui`.
 #[derive(Debug, PartialEq)]
 enum MouseOutcome {
+    CustomAction {
+        panel: usize,
+        action: usize,
+    },
     None,
     /// Text was copied: say so.
     Toast(String),
@@ -2056,6 +2424,8 @@ enum MouseOutcome {
     File(usize),
     /// A click on row `i` of the `/` command list.
     Slash(usize),
+    /// A click on row `i` of the file completion picker.
+    Completion(usize),
     /// A click on row `i` of the command palette.
     Palette(usize),
     /// A click on the tab of the Terminal's tape `i`.
@@ -2113,6 +2483,10 @@ fn handle_mouse(
                 }
             };
             match click {
+                Some(Click::CustomAction { panel, action }) => {
+                    focus_under(tui);
+                    return MouseOutcome::CustomAction { panel, action };
+                }
                 Some(Click::Key(code, mods)) => {
                     focus_under(tui);
                     return MouseOutcome::Key(KeyEvent::new(code, mods));
@@ -2124,6 +2498,10 @@ fn handle_mouse(
                 Some(Click::Slash(i)) => {
                     focus_under(tui);
                     return MouseOutcome::Slash(i);
+                }
+                Some(Click::Completion(i)) => {
+                    focus_under(tui);
+                    return MouseOutcome::Completion(i);
                 }
                 Some(Click::Tape(i)) => {
                     focus_under(tui);
@@ -2146,7 +2524,15 @@ fn handle_mouse(
                     ];
                     if let Some(p) = presets.get(i) {
                         tui.app.apply_preset(*p);
-                        tui.app.save_yours();
+                        if let Some(session) = tui.customization.as_mut() {
+                            tui.app.tree = super::layout::Node::profile_preset(*p);
+                            crate::customization::focus_conversation(&mut tui.app);
+                            if let Err(error) = session.persist_tree(&tui.app.tree) {
+                                tui.app.layout_error = Some(error.to_string());
+                            }
+                        } else {
+                            let _ = tui.app.save_yours();
+                        }
                         tui.sync_focus();
                     }
                     return MouseOutcome::None;
@@ -2401,20 +2787,45 @@ fn overlay_code(o: Option<Overlay>) -> u8 {
     }
 }
 
+const HISTORY_FILE_SCHEMA: &str = "orbit.composer-history/v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposerHistoryFile {
+    schema: String,
+    entries: Vec<String>,
+}
+
+/// Accept legacy line-based history while keeping new multiline entries exact.
+/// A version tag distinguishes saved entries from a literal JSON-array prompt.
+fn read_history(raw: &str) -> Vec<String> {
+    let entries = serde_json::from_str::<ComposerHistoryFile>(raw)
+        .ok()
+        .filter(|file| file.schema == HISTORY_FILE_SCHEMA)
+        .map(|file| file.entries)
+        .unwrap_or_else(|| raw.lines().map(str::to_string).collect());
+    entries
+        .into_iter()
+        .filter(|entry| !entry.trim().is_empty())
+        .take(HISTORY_MAX)
+        .collect()
+}
+
 /// Persist the composer history (§11.3): newest first, bounded at
-/// [`HISTORY_MAX`], one JSON array per session. Best-effort by design
+/// [`HISTORY_MAX`], one versioned JSON file per session. Best-effort by design
 /// — losing the history is a comfort, not a correctness, failure.
 fn save_history(path: &Option<std::path::PathBuf>, history: &[String]) {
     let Some(p) = path else { return };
     if history.is_empty() {
         return;
     }
-    let raw: String = history
-        .iter()
-        .take(HISTORY_MAX)
-        .map(|l| l.replace('\n', " ").trim().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let file = ComposerHistoryFile {
+        schema: HISTORY_FILE_SCHEMA.into(),
+        entries: history[..history.len().min(HISTORY_MAX)].to_vec(),
+    };
+    let Ok(raw) = serde_json::to_string(&file) else {
+        return;
+    };
     // Security posture (matches the ledger writer, DR-06 §1.2): dir 0700,
     // file 0600. The history can carry pasted credentials and engagement
     // text, so it must not leak to local users via the default umask
@@ -2904,6 +3315,11 @@ mod click_tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut tui = Tui::new();
         tui.app = super::super::app::App::new(home, true);
         tui.sync_focus();
@@ -3617,6 +4033,7 @@ mod subagent_tests {
                 id: "a1".into(),
                 name: "Explore".into(),
                 task: "find where add() is defined".into(),
+                model: "test-explore-model".into(),
             },
             s,
             now,
@@ -3631,6 +4048,8 @@ mod subagent_tests {
         let mut s = Scenario::new();
         start(&mut s, 1_000);
         let a = &s.agents["a1"];
+        assert_eq!(a.name, "Explore");
+        assert_eq!(a.model, "test-explore-model");
         assert_eq!(a.task, "find where add() is defined");
         assert!(a.action.is_empty(), "nothing started yet");
         assert!(!a.done && a.ok);
@@ -3685,6 +4104,62 @@ mod subagent_tests {
         let a = &s.agents["a1"];
         assert!(a.done && !a.ok);
         assert_eq!(a.report, "ORBIT-E0403 credential_rejected");
+    }
+
+    #[test]
+    fn a_resumed_subagent_replaces_its_model_and_stale_run_state() {
+        let mut s = Scenario::new();
+        start(&mut s, 1_000);
+        apply_msg(
+            Msg::SubagentProgress {
+                id: "a1".into(),
+                action: "Read calc.py".into(),
+            },
+            &mut s,
+            2_000,
+        );
+        apply_msg(
+            Msg::SubagentFinished {
+                id: "a1".into(),
+                report: "stopped".into(),
+                ok: false,
+            },
+            &mut s,
+            3_000,
+        );
+        apply_msg(
+            Msg::SubagentStarted {
+                id: "a1".into(),
+                name: "Explore".into(),
+                task: "check callers of add()".into(),
+                model: "test-resumed-model".into(),
+            },
+            &mut s,
+            4_000,
+        );
+
+        let a = &s.agents["a1"];
+        assert_eq!(s.agents.len(), 1, "the same agent is resumed");
+        assert_eq!(s.agents_running, 1);
+        assert_eq!(a.name, "Explore");
+        assert_eq!(a.model, "test-resumed-model");
+        assert_eq!(a.task, "check callers of add()");
+        assert!(a.action.is_empty() && a.report.is_empty());
+        assert!(!a.done && a.ok);
+        assert_eq!(a.started_ms, 4_000);
+        assert_eq!(a.done_ms, None);
+
+        apply_msg(
+            Msg::SubagentProgress {
+                id: "a1".into(),
+                action: "Read caller.py".into(),
+            },
+            &mut s,
+            5_000,
+        );
+        let a = &s.agents["a1"];
+        assert_eq!(a.action, "Read caller.py");
+        assert_eq!(a.model, "test-resumed-model");
     }
 }
 
@@ -3941,10 +4416,334 @@ mod activity_panel_tests {
 }
 
 #[cfg(test)]
+mod composer_key_tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Keyboard {
+        tui: Tui,
+        scenario: Scenario,
+        draft: String,
+        history: Vec<String>,
+        history_idx: Option<usize>,
+        overlay: Option<Overlay>,
+        tx: CommandSink,
+        rx: std::sync::mpsc::Receiver<WorkerCommand>,
+        approvals: ApprovalRegistry,
+        cancel_count: std::sync::Arc<AtomicUsize>,
+        root: std::path::PathBuf,
+    }
+
+    impl Keyboard {
+        fn new() -> Self {
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "orbit-keys-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut tui = Tui::new();
+            tui.app = super::super::app::App::new(root.clone(), true);
+            tui.file_completion = super::super::composer::FileCompletion::new(root.clone());
+            Self {
+                tui,
+                scenario: Scenario::new(),
+                draft: String::new(),
+                history: Vec::new(),
+                history_idx: None,
+                overlay: None,
+                tx,
+                rx,
+                approvals: ApprovalRegistry::new(),
+                cancel_count: std::sync::Arc::new(AtomicUsize::new(0)),
+                root,
+            }
+        }
+
+        fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+            let (_, sender) = Bus::new();
+            let count = self.cancel_count.clone();
+            let cancel: crate::worker::CancelHandle = std::sync::Arc::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+            assert!(!handle_key(
+                KeyEvent::new(code, modifiers),
+                &mut self.tui,
+                &mut self.scenario,
+                &mut self.draft,
+                Some(&cancel),
+                &self.tx,
+                &sender,
+                &self.approvals,
+                10_000,
+                &mut self.overlay,
+                &mut String::new(),
+                &mut 0,
+                &mut 0,
+                &mut None,
+                &mut Vec::new(),
+                &mut self.history,
+                &mut self.history_idx,
+                &mut None,
+                &mut false,
+                &mut false,
+                &mut None
+            ));
+        }
+
+        fn plain(&mut self, code: KeyCode) {
+            self.key(code, KeyModifiers::NONE);
+        }
+        fn reverse(&mut self) {
+            self.key(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        }
+        fn type_text(&mut self, text: &str) {
+            for c in text.chars() {
+                self.plain(KeyCode::Char(c));
+            }
+        }
+        fn no_send(&self) {
+            assert!(self.rx.try_recv().is_err());
+        }
+
+        fn frame(&mut self, width: u16, height: u16) -> String {
+            self.tui.reduced = true;
+            self.tui.tick_ms = 5_000;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let frame = terminal
+                .draw(|f| {
+                    self.tui.hits = draw_with_hits(
+                        f,
+                        &self.tui,
+                        &self.scenario,
+                        &self.draft,
+                        self.overlay,
+                        "",
+                        0,
+                        None,
+                        false,
+                        0,
+                    );
+                })
+                .unwrap();
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| frame.buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    impl Drop for Keyboard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn file_enter_and_tab_complete_the_draft_without_sending() {
+        let mut k = Keyboard::new();
+        std::fs::create_dir(k.root.join("docs")).unwrap();
+        std::fs::write(k.root.join("docs/a b\"c.rs"), "content").unwrap();
+        k.type_text("Read @do");
+        assert!(k.frame(100, 30).contains("Files"));
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.draft, "Read @\"docs/");
+        assert!(k.tui.file_completion.is_open());
+        k.no_send();
+        k.plain(KeyCode::Tab);
+        assert_eq!(k.draft, "Read @\"docs/a b\\\"c.rs\" ");
+        assert!(!k.tui.file_completion.is_open());
+        k.no_send();
+        k.plain(KeyCode::Enter);
+        assert!(
+            matches!(k.rx.try_recv().unwrap(), WorkerCommand::Prompt(text) if text == "Read @\"docs/a b\\\"c.rs\"")
+        );
+    }
+
+    #[test]
+    fn file_picker_navigation_and_escape_preserve_the_draft() {
+        let mut k = Keyboard::new();
+        for path in ["alpha.rs", "beta.rs"] {
+            std::fs::write(k.root.join(path), "content").unwrap();
+        }
+        k.type_text("@");
+        k.plain(KeyCode::Down);
+        assert_eq!(k.tui.file_completion.selected, 1);
+        k.plain(KeyCode::Up);
+        assert_eq!(k.tui.file_completion.selected, 0);
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.draft, "@");
+        assert!(!k.tui.file_completion.is_open());
+        k.plain(KeyCode::Down);
+        assert!(
+            !k.tui.file_completion.is_open(),
+            "dismissed picker stays closed until draft changes"
+        );
+        k.type_text("b");
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.draft, "@\"beta.rs\" ");
+        k.no_send();
+    }
+
+    #[test]
+    fn reverse_history_queries_cycle_and_accept_only_the_draft() {
+        let mut k = Keyboard::new();
+        k.history = vec![
+            "recent build".into(),
+            "unrelated".into(),
+            "old build\nnext".into(),
+        ];
+        k.draft = "unfinished\n日本語".into();
+        k.reverse();
+        k.type_text("build");
+        assert_eq!(k.draft, "recent build");
+        assert!(k.frame(100, 30).contains("History search: build"));
+        k.reverse();
+        assert_eq!(k.draft, "old build\nnext");
+        k.plain(KeyCode::Enter);
+        assert!(k.tui.history_search.is_none());
+        k.no_send();
+        k.plain(KeyCode::Enter);
+        assert!(
+            matches!(k.rx.try_recv().unwrap(), WorkerCommand::Prompt(text) if text == "old build\nnext")
+        );
+    }
+
+    #[test]
+    fn reverse_history_no_match_and_escape_restore_exact_multiline_input() {
+        let mut k = Keyboard::new();
+        k.history = vec!["日本語 build".into()];
+        k.draft = "unfinished\n日本語".into();
+        k.reverse();
+        k.type_text("日本");
+        k.plain(KeyCode::Backspace);
+        assert_eq!(k.tui.history_search.as_ref().unwrap().query, "日");
+        k.type_text("missing");
+        assert_eq!(k.draft, "unfinished\n日本語");
+        assert!(k.frame(100, 30).contains("no match"));
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.draft, "unfinished\n日本語");
+        assert!(k.tui.history_search.is_none());
+        k.no_send();
+        k.history.clear();
+        k.reverse();
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.draft, "unfinished\n日本語");
+        k.no_send();
+    }
+
+    #[test]
+    fn slash_completion_and_multiline_input_keep_their_existing_behavior() {
+        let mut k = Keyboard::new();
+        k.type_text("/he");
+        k.plain(KeyCode::Tab);
+        assert_eq!(k.draft, "/help ");
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.overlay, Some(Overlay::Help));
+        k.plain(KeyCode::Esc);
+        k.type_text("first");
+        k.key(KeyCode::Enter, KeyModifiers::ALT);
+        k.type_text("second");
+        assert_eq!(k.draft, "first\nsecond");
+        k.no_send();
+    }
+
+    #[test]
+    fn modified_enter_in_an_open_file_picker_adds_a_newline() {
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            let mut k = Keyboard::new();
+            std::fs::write(k.root.join("alpha.rs"), "content").unwrap();
+            k.type_text("@a");
+            k.key(KeyCode::Enter, modifiers);
+            assert_eq!(k.draft, "@a\n");
+            assert!(!k.tui.file_completion.is_open());
+            k.no_send();
+        }
+    }
+
+    #[test]
+    fn a_live_escape_stops_the_turn_even_with_a_picker_or_history_search() {
+        let mut k = Keyboard::new();
+        std::fs::write(k.root.join("alpha.rs"), "content").unwrap();
+        k.type_text("@a");
+        k.scenario.turn_live = true;
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.cancel_count.load(Ordering::SeqCst), 1);
+        assert!(!k.tui.file_completion.is_open());
+        k.history = vec!["older prompt".into()];
+        k.reverse();
+        assert_eq!(k.draft, "older prompt");
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.cancel_count.load(Ordering::SeqCst), 2);
+        assert_eq!(k.draft, "@a");
+        assert!(k.tui.history_search.is_none());
+        k.no_send();
+    }
+
+    #[test]
+    fn approval_keyboard_priority_prevents_completion_or_history_entry() {
+        let mut k = Keyboard::new();
+        std::fs::write(k.root.join("alpha.rs"), "content").unwrap();
+        k.type_text("@a");
+        k.scenario.approval_call_id = Some("read-1".into());
+        k.scenario.approval_pending = Some("Read(alpha.rs)".into());
+        k.scenario.approval_queue = vec!["Read".into()];
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.draft, "@a");
+        k.reverse();
+        assert!(k.tui.history_search.is_none());
+        assert!(!k.frame(100, 30).contains("Files"));
+        k.no_send();
+    }
+
+    #[test]
+    fn file_rows_are_clickable_and_history_hints_press_their_named_key() {
+        let mut k = Keyboard::new();
+        std::fs::write(k.root.join("alpha.rs"), "content").unwrap();
+        k.type_text("@a");
+        k.frame(100, 30);
+        let hit = k
+            .tui
+            .hits
+            .iter()
+            .find(|hit| hit.click == super::super::shell::hits::Click::Completion(0))
+            .unwrap();
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: hit.rect.x + 2,
+            row: hit.rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            handle_mouse(event, &mut k.tui, Rect::new(0, 0, 100, 30), None, false),
+            MouseOutcome::Completion(0)
+        );
+        assert_eq!(
+            super::super::shell::hits::parse_key("⌃r"),
+            Some((KeyCode::Char('r'), KeyModifiers::CONTROL))
+        );
+        k.no_send();
+    }
+}
+
+#[cfg(test)]
 mod history_persistence_tests {
     use super::*;
 
-    /// The history file is one prompt per line, newest first, bounded:
+    /// The history file has exact prompt entries, newest first, bounded:
     /// what save_history writes, the boot loader reads back.
     #[test]
     fn history_round_trips_through_the_file() {
@@ -3957,30 +4756,25 @@ mod history_persistence_tests {
         ];
         save_history(&path, &history);
         let raw = std::fs::read_to_string(path.as_ref().unwrap()).unwrap();
-        assert_eq!(raw, "third prompt\nsecond prompt\nfirst prompt");
+        assert_eq!(read_history(&raw), history);
         // And the boot loader's shape reads it back, newest first.
         let loaded: Vec<String> = std::fs::read_to_string(path.as_ref().unwrap())
-            .map(|raw| {
-                raw.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .take(HISTORY_MAX)
-                    .map(str::to_string)
-                    .collect()
-            })
+            .map(|raw| read_history(&raw))
             .unwrap_or_default();
         assert_eq!(loaded, history);
     }
 
-    /// A prompt with newlines is one history line: the file is one
-    /// entry per line, so a newline inside a prompt becomes a space.
+    /// Newlines and literal escape sequences survive a session resume.
     #[test]
-    fn a_multiline_prompt_is_one_history_line() {
+    fn a_multiline_prompt_round_trips_as_one_exact_entry() {
         let dir = tempfile_dir();
         let path = Some(dir.join("sessions").join("s2.history"));
-        save_history(&path, &["line one\nline two".to_string()]);
+        save_history(
+            &path,
+            &["line one\nline two".to_string(), r"literal \n".to_string()],
+        );
         let raw = std::fs::read_to_string(path.as_ref().unwrap()).unwrap();
-        assert_eq!(raw, "line one line two");
+        assert_eq!(read_history(&raw), ["line one\nline two", r"literal \n"]);
         assert_eq!(raw.lines().count(), 1);
     }
 
@@ -4044,8 +4838,49 @@ mod history_persistence_tests {
             .collect();
         save_history(&path, &history);
         let raw = std::fs::read_to_string(path.as_ref().unwrap()).unwrap();
-        assert_eq!(raw.lines().count(), HISTORY_MAX);
-        assert!(raw.starts_with("prompt 0"), "newest first");
+        let loaded = read_history(&raw);
+        assert_eq!(loaded.len(), HISTORY_MAX);
+        assert_eq!(loaded[0], "prompt 0", "newest first");
+        assert_eq!(
+            loaded.last().unwrap(),
+            &format!("prompt {}", HISTORY_MAX - 1)
+        );
+    }
+
+    #[test]
+    fn legacy_history_loads_without_rewriting_literal_escapes() {
+        assert_eq!(
+            read_history("recent\n\nold \\n prompt\n"),
+            ["recent", r"old \n prompt"]
+        );
+        let overlong = (0..HISTORY_MAX + 5)
+            .map(|i| format!("prompt {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(read_history(&overlong).len(), HISTORY_MAX);
+    }
+
+    #[test]
+    fn legacy_json_array_prompts_stay_literal() {
+        for prompt in [r#"["first","second"]"#, "[]", "[1, 2]"] {
+            assert_eq!(read_history(prompt), vec![prompt.to_string()]);
+        }
+    }
+
+    #[test]
+    fn saved_history_requires_the_version_tag() {
+        let raw = serde_json::to_string(&ComposerHistoryFile {
+            schema: "unknown-version".into(),
+            entries: vec!["a prompt".into()],
+        })
+        .unwrap();
+        assert_eq!(read_history(&raw), vec![raw.clone()]);
+        let tagged = serde_json::to_string(&ComposerHistoryFile {
+            schema: HISTORY_FILE_SCHEMA.into(),
+            entries: vec!["first\nsecond".into(), r"literal \n".into()],
+        })
+        .unwrap();
+        assert_eq!(read_history(&tagged), ["first\nsecond", r"literal \n"]);
     }
 
     fn tempfile_dir() -> std::path::PathBuf {
@@ -4060,5 +4895,843 @@ mod history_persistence_tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+}
+
+fn pane_context(
+    s: &Scenario,
+    controller: bool,
+) -> orbit_frontend_protocol::customization::PaneContext {
+    use orbit_frontend_protocol::customization::{PaneAgent, PaneContext};
+    PaneContext {
+        permission_mode: s.permission_mode.clone(),
+        routing: s.routing_lines.clone(),
+        input_tokens: s.input_tokens,
+        output_tokens: s.output_tokens,
+        cost_microcents: s.cost_microcents,
+        agents: s
+            .agents
+            .iter()
+            .take(32)
+            .map(|(id, a)| PaneAgent {
+                id: id.clone(),
+                name: a.name.clone(),
+                state: if a.done {
+                    if a.ok {
+                        "done"
+                    } else {
+                        "failed"
+                    }
+                } else {
+                    "running"
+                }
+                .into(),
+            })
+            .collect(),
+        controller,
+    }
+}
+
+fn load_legacy_theme(
+    home: &std::path::Path,
+    safe_session: bool,
+) -> Result<crate::tokens::Theme, String> {
+    if safe_session {
+        return Ok(crate::tokens::Theme::default());
+    }
+    let snapshot = super::layout::LayoutFile::load_checked(home).map_err(|e| e.to_string())?;
+    match snapshot.legacy_bytes {
+        None => Ok(Default::default()),
+        Some(bytes) => std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| toml::from_str(text).ok())
+            .ok_or_else(|| {
+                "invalid tui.toml; choose an explicit safe-default session or repair the file"
+                    .into()
+            }),
+    }
+}
+
+fn select_profile(
+    legacy: &crate::tokens::Theme,
+    canonical: Option<&orbit_frontend_protocol::customization::Profile>,
+) -> orbit_frontend_protocol::customization::Profile {
+    canonical.cloned().unwrap_or_else(|| legacy.profile())
+}
+fn apply_profile_preferences(
+    tui: &mut Tui,
+    profile: orbit_frontend_protocol::customization::Profile,
+) {
+    tui.reduced = profile.reduced_motion;
+    tui.app.reduced = tui.reduced;
+    tui.brand_tier = if tui.reduced && tui.brand_preference == super::welcome::BrandTier::Anim {
+        super::welcome::BrandTier::Static
+    } else {
+        tui.brand_preference
+    };
+    tui.profile = profile;
+}
+fn reduce_frontend_message(
+    msg: crate::msg::Msg,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    now: u64,
+) -> Option<String> {
+    let restored = matches!(&msg, crate::msg::Msg::TranscriptLoaded { .. });
+    let result = apply_msg(msg, s, now);
+    if restored {
+        if let Some(session) = tui.customization.as_mut() {
+            session.invalidate_session(pane_context(s, session.context.controller));
+            s.custom_panes = session.outputs.clone();
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pane_action(
+    panel: usize,
+    action: usize,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    composer: &mut String,
+    cancel: Option<&crate::worker::CancelHandle>,
+    toast: &mut Option<Toast>,
+    now: u64,
+) {
+    let Some(id) = tui.app.tree.custom_id_at(panel) else {
+        return;
+    };
+    let Some(session) = tui.customization.as_mut() else {
+        return;
+    };
+    session.context = pane_context(s, cancel.is_some());
+    let result = session.action(&id, action);
+    s.custom_panes = session.outputs.clone();
+    match result {
+        Ok(crate::customization::ActionEffect::InsertDraft(text)) => {
+            *composer = text;
+            crate::customization::focus_conversation(&mut tui.app);
+            tui.sync_focus();
+        }
+        Ok(crate::customization::ActionEffect::FocusConversation) => {
+            crate::customization::focus_conversation(&mut tui.app);
+            tui.sync_focus();
+        }
+        Ok(crate::customization::ActionEffect::OwnerCancel) => {
+            if let Some(cancel) = cancel {
+                cancel();
+            }
+        }
+        Ok(crate::customization::ActionEffect::Refreshed) => {}
+        Err(error) => {
+            *toast = Some(Toast {
+                text: crate::bridge::terminal_safe(&crate::bridge::safe_text(&error.to_string())),
+                ok: false,
+                shown_ms: now,
+            })
+        }
+    }
+}
+
+fn apply_profile_command(
+    tui: &mut Tui,
+    s: &mut Scenario,
+    command: orbit_frontend_protocol::customization::ProfileCommand,
+) -> Result<String, orbit_frontend_protocol::customization::CustomizationError> {
+    let Some(session) = tui.customization.as_mut() else {
+        return Err(
+            orbit_frontend_protocol::customization::CustomizationError::Invalid(
+                "customization host unavailable".into(),
+            ),
+        );
+    };
+    let reply = session.host.command(command)?;
+    if let Some(profile) = reply.profile {
+        let tree = crate::customization::profile_tree(&profile.profile)?;
+        let focused = tui.app.tree.custom_id_at(tui.app.focus);
+        session.accept(profile)?;
+        session.refresh_all();
+        let profile = session.resolved.profile.clone();
+        tui.app.tree = tree;
+        if let Some(id) = focused {
+            tui.app.focus = (0..tui.app.tree.panel_count())
+                .find(|i| tui.app.tree.custom_id_at(*i).as_deref() == Some(&id))
+                .unwrap_or_else(|| {
+                    tui.app
+                        .tree
+                        .leaves()
+                        .iter()
+                        .position(|(_, v)| *v == super::layout::View::Conversation)
+                        .unwrap_or(0)
+                });
+        }
+        apply_profile_preferences(tui, profile);
+        s.brand_tier = tui.brand_tier;
+        tui.sync_focus();
+        s.custom_panes = tui.customization.as_ref().unwrap().outputs.clone();
+    }
+    Ok(crate::bridge::terminal_safe(&crate::bridge::safe_text(
+        &reply.message,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn handle_custom_key(
+    k: crossterm::event::KeyEvent,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    composer: &mut String,
+    cancel: Option<&crate::worker::CancelHandle>,
+    toast: &mut Option<Toast>,
+    now: u64,
+    modal: bool,
+) -> bool {
+    if modal || tui.app.arranging {
+        return false;
+    }
+    if k.code == KeyCode::Enter
+        && (composer.starts_with("/theme") || composer.starts_with("/customize"))
+    {
+        let result = parse_profile_command(composer)
+            .and_then(|command| apply_profile_command(tui, s, command));
+        let (text, ok) = match result {
+            Ok(text) => (text, true),
+            Err(error) => (error.to_string(), false),
+        };
+        *toast = Some(Toast {
+            text,
+            ok,
+            shown_ms: now,
+        });
+        composer.clear();
+        return true;
+    }
+    if tui.app.focused_view() == super::layout::View::Custom {
+        match k.code {
+            KeyCode::Char('r') => {
+                if let Some(id) = tui.app.tree.custom_id_at(tui.app.focus) {
+                    if let Some(session) = tui.customization.as_mut() {
+                        session.context = pane_context(s, cancel.is_some());
+                        let result = session.refresh(&id);
+                        s.custom_panes = session.outputs.clone();
+                        if let Err(error) = result {
+                            *toast = Some(Toast {
+                                text: error.to_string(),
+                                ok: false,
+                                shown_ms: now,
+                            });
+                        }
+                    }
+                }
+                return true;
+            }
+            KeyCode::Char(c @ '1'..='8') => {
+                run_pane_action(
+                    tui.app.focus,
+                    c as usize - '1' as usize,
+                    tui,
+                    s,
+                    composer,
+                    cancel,
+                    toast,
+                    now,
+                );
+                return true;
+            }
+            KeyCode::Tab => {
+                tui.app.cycle_focus(true);
+                tui.sync_focus();
+                return true;
+            }
+            KeyCode::BackTab => {
+                tui.app.cycle_focus(false);
+                tui.sync_focus();
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+pub fn parse_profile_command(
+    input: &str,
+) -> Result<
+    orbit_frontend_protocol::customization::ProfileCommand,
+    orbit_frontend_protocol::customization::CustomizationError,
+> {
+    use orbit_frontend_protocol::customization::{CustomizationError as E, ProfileCommand as C};
+    if input.len() > 8192 {
+        return Err(E::Invalid("customization command exceeds bounds".into()));
+    }
+    let (verb, rest) = input.trim().split_once(' ').unwrap_or((input.trim(), ""));
+    let rest = rest.trim();
+    if verb == "/theme" {
+        return if rest.is_empty() {
+            Ok(C::Show)
+        } else {
+            Ok(C::Theme { name: rest.into() })
+        };
+    }
+    if verb != "/customize" {
+        return Err(E::Invalid("unknown customization command".into()));
+    }
+    let (op, args) = rest.split_once(' ').unwrap_or((rest, ""));
+    let args = args.trim();
+    match op {
+        "" | "show" if args.is_empty() => Ok(C::Show),
+        "capabilities" if args.is_empty() => Ok(C::Capabilities),
+        "reload" if args.is_empty() => Ok(C::Reload),
+        "validate" | "import" | "export" if !args.is_empty() => Ok(match op {
+            "validate" => C::Validate { path: args.into() },
+            "import" => C::Import { path: args.into() },
+            _ => C::Export { path: args.into() },
+        }),
+        "reset" => Ok(C::Reset {
+            key: if args.is_empty() {
+                None
+            } else {
+                Some(args.into())
+            },
+        }),
+        "set" => {
+            let (key, value) = args
+                .split_once(' ')
+                .ok_or_else(|| E::Invalid("set requires KEY VALUE".into()))?;
+            Ok(C::Set {
+                key: key.into(),
+                value: value.trim().into(),
+            })
+        }
+        _ => Err(E::Invalid(
+            "usage: /customize show|capabilities|validate|import|export|set|reset|reload".into(),
+        )),
+    }
+}
+
+fn save_layout(tui: &mut Tui, toast: &mut Option<Toast>, now: u64) {
+    if tui.customization.is_some() {
+        tui.app.tree = tui.app.tree.clone().with_conversation();
+        tui.sync_focus();
+    }
+    let result = if let Some(session) = tui.customization.as_mut() {
+        session
+            .persist_tree(&tui.app.tree)
+            .map_err(|e| e.to_string())
+    } else {
+        tui.app.save_yours()
+    };
+    if let Err(error) = result {
+        *toast = Some(Toast {
+            text: format!("Layout not saved: {error}"),
+            ok: false,
+            shown_ms: now,
+        });
+    }
+}
+
+#[cfg(test)]
+mod routing_projection_tests {
+    use super::*;
+    #[test]
+    fn pane_context_tracks_authoritative_mode_changes_without_caching_startup_mode() {
+        let mut scenario = Scenario::new();
+        for mode in ["default", "dontAsk", "acceptEdits", "plan", "bypass"] {
+            apply_msg(
+                crate::msg::Msg::ModeChanged(mode.into()),
+                &mut scenario,
+                5000,
+            );
+            assert_eq!(
+                pane_context(&scenario, true).permission_mode.as_deref(),
+                Some(mode)
+            );
+        }
+    }
+    #[test]
+    fn routing_projection_is_bounded_scanned_and_available_to_pane_context() {
+        let mut scenario = Scenario::new();
+        apply_msg(
+            crate::msg::Msg::Routing(vec![
+                "phase: coding".into(),
+                "difficulty: easy".into(),
+                "\u{1b}[31mprovider/model\u{1b}[0m".into(),
+                "界".repeat(200),
+            ]),
+            &mut scenario,
+            5000,
+        );
+        let context = pane_context(&scenario, true);
+        assert_eq!(context.routing[0], "phase: coding");
+        assert_eq!(context.routing[2], "provider/model");
+        assert!(context.routing[3].len() <= 256);
+        assert!(context.controller);
+        assert!(scenario.transcript.is_empty());
+    }
+    #[test]
+    fn resumed_transcript_replaces_old_chat_and_clears_route_and_working_state() {
+        let mut scenario = Scenario::new();
+        scenario.model = "preserved model".into();
+        scenario.routing_lines = vec!["old route".into()];
+        scenario.transcript.push(TranscriptLine {
+            text: "old chat".into(),
+            ..Default::default()
+        });
+        scenario.turn_live = true;
+        scenario.running.insert("stale-call".into(), "Read".into());
+        apply_msg(
+            crate::msg::Msg::TranscriptLoaded {
+                lines: vec![
+                    crate::model::TranscriptLine::User {
+                        text: "saved prompt".into(),
+                        time: None,
+                    },
+                    crate::model::TranscriptLine::Assistant {
+                        text: "saved answer".into(),
+                        time: None,
+                    },
+                ],
+                input_tokens: 55,
+                output_tokens: 21,
+                cost_microcents: 100,
+                turns: 4,
+            },
+            &mut scenario,
+            5000,
+        );
+        assert_eq!(
+            scenario
+                .transcript
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["saved prompt", "saved answer"]
+        );
+        assert_eq!(scenario.model, "preserved model");
+        assert!(scenario.routing_lines.is_empty());
+        assert!(scenario.running.is_empty());
+        assert!(!scenario.turn_live);
+        assert_eq!(
+            (
+                scenario.input_tokens,
+                scenario.output_tokens,
+                scenario.cost_microcents,
+                scenario.turns
+            ),
+            (55, 21, 100, 4)
+        );
+    }
+}
+
+#[cfg(test)]
+mod customization_review_tests {
+    use super::*;
+    use orbit_frontend_protocol::customization::*;
+    use ratatui::{backend::TestBackend, style::Color, Terminal};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+
+    struct Host(Mutex<ResolvedProfile>);
+    impl ProfileHost for Host {
+        fn load(&self) -> Result<ResolvedProfile, CustomizationError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn replace(
+            &self,
+            profile: Profile,
+            expected: &str,
+        ) -> Result<ResolvedProfile, CustomizationError> {
+            profile.validate()?;
+            let mut current = self.0.lock().unwrap();
+            if current.revision != expected {
+                return Err(CustomizationError::Busy);
+            }
+            current.profile = profile;
+            current.revision.push('x');
+            Ok(current.clone())
+        }
+        fn reset(&self, _: &str) -> Result<ResolvedProfile, CustomizationError> {
+            unreachable!()
+        }
+        fn command(&self, _: ProfileCommand) -> Result<ProfileCommandResult, CustomizationError> {
+            Ok(ProfileCommandResult {
+                message: "loaded".into(),
+                profile: Some(self.load()?),
+            })
+        }
+        fn read_pane(
+            &self,
+            id: &str,
+            context: &PaneContext,
+        ) -> Result<PaneOutput, CustomizationError> {
+            let resolved = self.load()?;
+            let def = resolved.profile.panes.iter().find(|p| p.id == id).unwrap();
+            let text = match id {
+                "routing" => context.routing.join("\n"),
+                "usage" => format!("input {}", context.input_tokens),
+                "agents" => context
+                    .agents
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => unreachable!(),
+            };
+            Ok(PaneOutput {
+                id: id.into(),
+                title: def.title.clone(),
+                state: PaneState::Ready,
+                text,
+                truncated: false,
+                actions: def.actions.clone(),
+            })
+        }
+    }
+    fn host(profile: Profile) -> Arc<Host> {
+        Arc::new(Host(Mutex::new(ResolvedProfile {
+            profile,
+            revision: "review-1".into(),
+            sources: BTreeMap::new(),
+            capabilities: CustomizationCapabilities::default(),
+        })))
+    }
+    fn buffer(tui: &Tui) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    tui,
+                    &Scenario::new(),
+                    "local draft",
+                    None,
+                    "",
+                    0,
+                    None,
+                    false,
+                    0,
+                )
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+    #[test]
+    fn host_backed_review_preset_mouse_and_keyboard_keep_and_persist_conversation() {
+        use crate::proto::layout::{Node, Preset, View as LayoutView};
+        use crate::proto::shell::hits::Click;
+        use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+        let source = host(Profile::default());
+        let mut tui = Tui::new();
+        tui.reduced = true;
+        tui.tick_ms = 5000;
+        tui.customization =
+            Some(crate::customization::CustomizationSession::open(source.clone()).unwrap());
+        let mut scenario = Scenario::new();
+        let mut terminal = Terminal::new(TestBackend::new(164, 48)).unwrap();
+        terminal
+            .draw(|f| {
+                tui.hits = draw_with_hits(f, &tui, &scenario, "", None, "", 0, None, false, 0);
+            })
+            .unwrap();
+        let hit = tui
+            .hits
+            .iter()
+            .find(|hit| hit.click == Click::Preset(3))
+            .unwrap()
+            .rect;
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut tui,
+            Rect::new(0, 0, 164, 48),
+            None,
+            false,
+        );
+        assert_eq!(tui.app.current_preset(), Some(Preset::Review));
+        assert_eq!(tui.app.tree, Node::profile_preset(Preset::Review));
+        assert_eq!(
+            tui.app
+                .tree
+                .leaves()
+                .iter()
+                .filter(|(_, view)| *view == LayoutView::Conversation)
+                .count(),
+            1
+        );
+        source.load().unwrap().profile.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&tui.app.tree).unwrap(),
+            serde_json::to_value(&source.load().unwrap().profile.layout.tree).unwrap()
+        );
+        let (commands, received) = std::sync::mpsc::channel();
+        let (_bus, sender) = Bus::new();
+        let approvals = ApprovalRegistry::new();
+        tui.app.arranging = true;
+        for ch in [']', '['] {
+            handle_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut tui,
+                &mut scenario,
+                &mut String::new(),
+                None,
+                &commands,
+                &sender,
+                &approvals,
+                5000,
+                &mut None,
+                &mut String::new(),
+                &mut 0,
+                &mut 0,
+                &mut None,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut None,
+                &mut None,
+                &mut false,
+                &mut false,
+                &mut None,
+            );
+        }
+        assert_eq!(tui.app.tree, Node::profile_preset(Preset::Review));
+        assert_eq!(tui.app.current_preset(), Some(Preset::Review));
+        assert_eq!(
+            serde_json::to_value(&tui.app.tree).unwrap(),
+            serde_json::to_value(&source.load().unwrap().profile.layout.tree).unwrap()
+        );
+        assert!(received.try_recv().is_err());
+        assert!(tui.app.layout_error.is_none());
+    }
+    #[test]
+    fn canonical_startup_profile_overrules_conflicting_real_legacy_capabilities() {
+        let legacy: crate::tokens::Theme =
+            toml::from_str("[color]\nmode='mono'\nreduced=true\nbrand='anim'\n").unwrap();
+        assert!(legacy.profile().reduced_motion);
+        assert_eq!(legacy.profile().color_mode, ColorMode::Mono);
+        let canonical = Profile {
+            reduced_motion: false,
+            color_mode: ColorMode::Truecolor,
+            ..Profile::default()
+        };
+        let mut tui = Tui::new();
+        tui.tier =
+            super::super::core::Tier::detect(false, Some("truecolor"), Some("xterm-256color"));
+        tui.brand_preference = super::super::welcome::BrandTier::Anim;
+        apply_profile_preferences(&mut tui, select_profile(&legacy, Some(&canonical)));
+        tui.tick_ms = 5000;
+        assert!(!tui.reduced && !tui.app.reduced);
+        assert_eq!(tui.brand_tier, super::super::welcome::BrandTier::Anim);
+        assert!(buffer(&tui)
+            .content
+            .iter()
+            .any(|c| matches!(c.fg, Color::Rgb(..))));
+        assert!(select_profile(&legacy, None).reduced_motion);
+    }
+    #[test]
+    fn hot_profile_reload_releases_mono_and_reduced_motion_without_caching_legacy() {
+        let mut tui = Tui::new();
+        tui.tick_ms = 5000;
+        tui.brand_preference = super::super::welcome::BrandTier::Anim;
+        apply_profile_preferences(
+            &mut tui,
+            Profile {
+                color_mode: ColorMode::Mono,
+                reduced_motion: true,
+                ..Profile::default()
+            },
+        );
+        let first = buffer(&tui);
+        assert!(first
+            .content
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        assert_eq!(tui.brand_tier, super::super::welcome::BrandTier::Static);
+        let source = host(Profile::default());
+        tui.customization = Some(crate::customization::CustomizationSession::open(source).unwrap());
+        let mut scenario = Scenario::new();
+        apply_profile_command(&mut tui, &mut scenario, ProfileCommand::Reload).unwrap();
+        assert!(!tui.reduced && !tui.app.reduced);
+        assert_eq!(scenario.brand_tier, super::super::welcome::BrandTier::Anim);
+        assert_eq!(tui.tier, super::super::core::Tier::TrueColor);
+        assert!(buffer(&tui)
+            .content
+            .iter()
+            .any(|c| matches!(c.fg, Color::Rgb(..))));
+    }
+    #[test]
+    fn canonical_truecolor_cannot_upgrade_no_color_or_sixteen_color_hardware() {
+        let mut tui = Tui::new();
+        tui.tick_ms = 5000;
+        for (no_color, expected) in [
+            (true, super::super::core::Tier::None),
+            (false, super::super::core::Tier::T16),
+        ] {
+            tui.tier = super::super::core::Tier::detect(no_color, None, Some("xterm"));
+            apply_profile_preferences(
+                &mut tui,
+                Profile {
+                    color_mode: ColorMode::Truecolor,
+                    ..Profile::default()
+                },
+            );
+            assert_eq!(tui.tier, expected);
+            let actual = buffer(&tui);
+            assert!(!actual
+                .content
+                .iter()
+                .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..))));
+            if no_color {
+                assert!(actual
+                    .content
+                    .iter()
+                    .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+            }
+        }
+    }
+    #[test]
+    fn transcript_replacement_keeps_all_snapshot_caches_stale_through_actions() {
+        let mut profile = Profile::default();
+        for (id, snapshot) in [
+            ("routing", SnapshotKind::Routing),
+            ("usage", SnapshotKind::Usage),
+            ("agents", SnapshotKind::Agents),
+        ] {
+            profile.panes.push(PaneDef {
+                id: id.into(),
+                title: id.into(),
+                surfaces: vec![Surface::Terminal],
+                source: PaneSource::Snapshot { snapshot },
+                actions: vec![
+                    PaneAction::Refresh,
+                    PaneAction::FocusConversation,
+                    PaneAction::InsertPrompt {
+                        text: "local draft".into(),
+                    },
+                ],
+            });
+        }
+        profile.layout.tree = LayoutNode::Split {
+            direction: Direction::Right,
+            shares: vec![1, 1, 1, 1],
+            children: vec![
+                LayoutNode::panel(View::Conversation),
+                LayoutNode::Custom {
+                    pane_id: "routing".into(),
+                },
+                LayoutNode::Custom {
+                    pane_id: "usage".into(),
+                },
+                LayoutNode::Custom {
+                    pane_id: "agents".into(),
+                },
+            ],
+        };
+        let source = host(profile);
+        let mut tui = Tui::new();
+        let mut session = crate::customization::CustomizationSession::open(source).unwrap();
+        session.context = PaneContext {
+            routing: vec!["OLD ROUTE".into()],
+            input_tokens: 999,
+            agents: vec![PaneAgent {
+                id: "old".into(),
+                name: "OLD AGENT".into(),
+                state: "done".into(),
+            }],
+            ..PaneContext::default()
+        };
+        session.refresh_all();
+        assert!(session.outputs["routing"].text.contains("OLD ROUTE"));
+        tui.app.tree = crate::customization::profile_tree(&session.resolved.profile).unwrap();
+        let mut scenario = Scenario::new();
+        scenario.custom_panes = session.outputs.clone();
+        tui.customization = Some(session);
+        reduce_frontend_message(
+            crate::msg::Msg::TranscriptLoaded {
+                lines: vec![],
+                input_tokens: 55,
+                output_tokens: 21,
+                cost_microcents: 100,
+                turns: 4,
+            },
+            &mut tui,
+            &mut scenario,
+            5000,
+        );
+        let mut composer = String::new();
+        let mut toast = None;
+        for action in [1, 2] {
+            run_pane_action(
+                1,
+                action,
+                &mut tui,
+                &mut scenario,
+                &mut composer,
+                None,
+                &mut toast,
+                5000,
+            );
+            for id in ["routing", "usage", "agents"] {
+                assert_eq!(scenario.custom_panes[id].state, PaneState::Stale);
+                assert_eq!(
+                    tui.customization.as_ref().unwrap().outputs[id].state,
+                    PaneState::Stale
+                );
+                assert!(!scenario.custom_panes[id].text.contains("OLD"));
+            }
+        }
+        assert_eq!(composer, "local draft");
+        assert!(toast.is_none());
+        run_pane_action(
+            2,
+            0,
+            &mut tui,
+            &mut scenario,
+            &mut composer,
+            None,
+            &mut toast,
+            5000,
+        );
+        assert_eq!(scenario.custom_panes["usage"].text, "input 55");
+        assert_eq!(scenario.custom_panes["usage"].state, PaneState::Ready);
+        for id in ["routing", "agents"] {
+            assert_eq!(scenario.custom_panes[id].state, PaneState::Stale);
+        }
+        let context = &tui.customization.as_ref().unwrap().context;
+        assert!(context.routing.is_empty() && context.agents.is_empty());
+        assert_eq!(context.input_tokens, 55);
+    }
+    #[test]
+    fn explicit_safe_session_bypasses_malformed_legacy_and_profile_without_rewrite() {
+        let home =
+            std::env::temp_dir().join(format!("orbit-safe-customization-{}", std::process::id()));
+        std::fs::create_dir(&home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let legacy = b"[layout\nthis cannot parse\n";
+        let canonical = b"{invalid profile";
+        std::fs::write(home.join("tui.toml"), legacy).unwrap();
+        std::fs::write(home.join("customization.json"), canonical).unwrap();
+        assert!(load_legacy_theme(&home, false).is_err());
+        let safe = load_legacy_theme(&home, true).unwrap();
+        assert_eq!(
+            select_profile(&safe, None),
+            crate::tokens::Theme::default().profile()
+        );
+        assert_eq!(std::fs::read(home.join("tui.toml")).unwrap(), legacy);
+        assert_eq!(
+            std::fs::read(home.join("customization.json")).unwrap(),
+            canonical
+        );
+        assert!(!home.join(".customization.lock").exists());
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

@@ -25,6 +25,7 @@ use std::path::Path;
 
 /// The persisted rule set.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionRules {
     /// Tool names always allowed (durable R-grant).
     #[serde(default)]
@@ -35,6 +36,7 @@ pub struct PermissionRules {
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleSet {
     #[serde(default)]
     pub tools: BTreeSet<String>,
@@ -56,59 +58,22 @@ impl PermissionRules {
     /// rules (everything asks). Malformed file → empty rules + Err so the
     /// caller can warn (never crash chat over a config typo).
     pub fn load(home: &Path) -> Result<Self, String> {
-        let path = home.join("permissions.toml");
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(r) => r,
-            Err(_) => return Ok(Self::default()),
-        };
-        // Minimal line parser (same posture as mods.rs): `tools = ["a", "b"]`
-        // under [allow] / [deny] headers. Strict enough to fail loudly on
-        // garbage, small enough to avoid a toml dependency in this path.
+        let parsed = orbit_tools::executor::load_legacy_permission_rules(home)?;
         let mut rules = Self::default();
-        let mut section = String::new();
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                section = line[1..line.len() - 1].to_string();
-                continue;
-            }
-            let Some(rest) = line.strip_prefix("tools") else {
-                // Any other `key = value` line is a typo (e.g. `tool = ...`
-                // or a rule outside [allow]/[deny]) — fail loudly, not
-                // silently. Bare words (no `=`) are ignored for future
-                // header formats.
-                if line.contains('=') {
-                    return Err(format!(
-                        "permissions.toml: unexpected line (section [{section}]): {line}"
-                    ));
-                }
-                continue;
+        for rule in parsed.rules {
+            let selector = if rule.pattern.is_empty() {
+                rule.tool
+            } else {
+                format!("{}({})", rule.tool, rule.pattern)
             };
-            let rest = rest.trim_start().strip_prefix('=').ok_or_else(|| {
-                format!("permissions.toml: expected `tools = [...]`, got: {line}")
-            })?;
-            let rest = rest.trim();
-            let list = rest
-                .strip_prefix('[')
-                .and_then(|r| r.strip_suffix(']'))
-                .ok_or_else(|| format!("permissions.toml: expected a [...] list, got: {rest}"))?;
-            for item in list.split(',') {
-                let item = item.trim().trim_matches('"').trim();
-                if item.is_empty() {
-                    continue;
+            match rule.effect {
+                orbit_tools::permissions::RuleEffectSerde::Allow => {
+                    rules.allow.tools.insert(selector);
                 }
-                match section.as_str() {
-                    "allow" => rules.allow.tools.insert(item.to_string()),
-                    "deny" => rules.deny.tools.insert(item.to_string()),
-                    _ => {
-                        return Err(format!(
-                            "permissions.toml: `tools` outside [allow]/[deny] (section [{section}])"
-                        ))
-                    }
-                };
+                orbit_tools::permissions::RuleEffectSerde::Deny => {
+                    rules.deny.tools.insert(selector);
+                }
+                orbit_tools::permissions::RuleEffectSerde::Ask => {}
             }
         }
         Ok(rules)
@@ -147,9 +112,24 @@ impl PermissionRules {
     /// The effective verdict for a tool. Deny wins; unknown tools are the
     /// caller's concern (execute_call denies them before consulting rules).
     pub fn verdict(&self, tool: &str) -> RuleVerdict {
-        if self.deny.tools.contains(tool) {
+        self.verdict_with_server(tool, None)
+    }
+
+    /// MCP selectors use a configuration-resolved server, never a string prefix.
+    pub fn verdict_with_server(&self, tool: &str, server: Option<&str>) -> RuleVerdict {
+        let matches = |selector: &String| {
+            orbit_tools::permissions::parse_rule(
+                selector,
+                orbit_tools::permissions::RuleEffectSerde::Ask,
+            )
+            .is_some_and(|rule| {
+                rule.pattern.is_empty()
+                    && orbit_tools::permissions::rule_tool_matches(&rule, tool, server)
+            })
+        };
+        if self.deny.tools.iter().any(matches) {
             RuleVerdict::Deny
-        } else if self.allow.tools.contains(tool) {
+        } else if self.allow.tools.iter().any(matches) {
             RuleVerdict::Allow
         } else {
             RuleVerdict::Ask

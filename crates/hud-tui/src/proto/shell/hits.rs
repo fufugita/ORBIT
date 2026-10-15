@@ -17,12 +17,18 @@ use ratatui::layout::Rect;
 /// What clicking a region does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Click {
+    CustomAction {
+        panel: usize,
+        action: usize,
+    },
     /// Press this key (the region is a key hint).
     Key(KeyCode, KeyModifiers),
     /// Select row `index` of the changed-files list (Changes and Review).
     File(usize),
     /// Pick row `index` of the `/` command list.
     Slash(usize),
+    /// Complete row `index` of the workspace file picker into the draft.
+    Completion(usize),
     /// Run row `index` of the command palette.
     Palette(usize),
     /// Show tape `index` in the Terminal panel (a command's tab).
@@ -91,6 +97,7 @@ pub fn parse_key(token: &str) -> Option<(KeyCode, KeyModifiers)> {
         "⇥" | "tab" => (KeyCode::Tab, none),
         "⇧tab" => (KeyCode::BackTab, none),
         "⇧⏎" => (KeyCode::Enter, KeyModifiers::ALT),
+        "⌃r" => (KeyCode::Char('r'), KeyModifiers::CONTROL),
         t => {
             let mut chars = t.chars();
             let c = chars.next()?;

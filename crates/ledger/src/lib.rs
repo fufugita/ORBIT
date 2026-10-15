@@ -18,7 +18,8 @@ pub mod writer;
 pub use error::LedgerError;
 pub use event::{
     AuthorityGrant, AuthorityRevoke, EgressDestination, EgressIntent, GrantSignature, LedgerEvent,
-    LedgerRecord, Phase, SessionId, TerminalOutcome, ToolIntent, ToolResult, ToolVerdict,
+    LedgerRecord, Phase, PluginInstall, SessionId, TerminalOutcome, ToolIntent, ToolResult,
+    ToolVerdict,
 };
 pub use reader::{count_records, validate_record, verify_ledger};
 pub use writer::{LedgerWriter, ReadRecord};

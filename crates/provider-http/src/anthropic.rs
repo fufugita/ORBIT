@@ -233,6 +233,11 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
         cancel: &CancelToken,
     ) -> Result<AsyncProviderEventStream, AdapterError> {
         self.validate_route(&request.route)?;
+        if let Some(effort) = &request.effort {
+            effort
+                .validate_for_anthropic()
+                .map_err(AdapterError::ProviderConfigurationInvalid)?;
+        }
         // https for the real API; http only for loopback (local gateways,
         // the mock provider). The scheme comes from the route binding,
         // which the egress gate already pinned.
@@ -280,6 +285,9 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
             // with thinking, and adaptive thinking owns sampling (B7).
             "thinking": { "type": "adaptive" },
         });
+        if let Some(effort) = &request.effort {
+            body["output_config"] = serde_json::json!({ "effort": effort });
+        }
 
         // One explicit cache breakpoint at the end of the system prompt:
         // the stable prefix caches, the growing tail re-caches per round.
@@ -310,18 +318,36 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
                 String::from_utf8_lossy(secret.expose()).into_owned(),
             );
         }
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_millis(request.connect_timeout_ms),
-            req.send(),
-        )
-        .await
-        .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
-        .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
+        let Some(response) = cancel
+            .until_cancelled(tokio::time::timeout(
+                std::time::Duration::from_millis(request.connect_timeout_ms),
+                req.send(),
+            ))
+            .await
+        else {
+            return Ok(crate::cancel::cancelled_stream());
+        };
+        let resp = response
+            .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
+            .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
         if !resp.status().is_success() {
             // E1: the body carries the provider's own message; E2:
             // 529/5xx classify retryable.
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let Some(body) = cancel
+                .until_cancelled(tokio::time::timeout(
+                    std::time::Duration::from_millis(request.idle_timeout_ms),
+                    resp.text(),
+                ))
+                .await
+            else {
+                return Ok(crate::cancel::cancelled_stream());
+            };
+            let body = body
+                .map_err(|_| {
+                    AdapterError::ProviderTimeout("error response body stalled (E0409)".into())
+                })?
+                .unwrap_or_default();
             return Err(crate::error::status_error(status, body).await);
         }
         Ok(anthropic_stream(
@@ -366,9 +392,10 @@ fn anthropic_stream(
             } else {
                 idle_timeout_ms
             });
-            match tokio::time::timeout(budget, bytes.next()).await {
-                Ok(item) => item,
-                Err(_) => {
+            match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
+                None => None,
+                Some(Ok(item)) => item,
+                Some(Err(_)) => {
                     yield Err(AdapterError::ProviderTimeout(
                         "stream stalled: no bytes within the idle timeout (E0409)".into(),
                     ));
@@ -475,7 +502,11 @@ fn anthropic_stream(
             seq += 1;
         }
 
-        let reason = finish_reason.unwrap_or_else(|| "end_turn".into());
+        let reason = if cancel.is_cancelled() {
+            "cancelled".into()
+        } else {
+            finish_reason.unwrap_or_else(|| "end_turn".into())
+        };
         yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some(reason), final_usage: Some(usage) } });
     })
 }
@@ -494,6 +525,7 @@ mod tool_result_image_tests {
             tool_result: Some(content.into()),
             blocks,
             origin_model: None,
+            origin_provider: None,
         }
     }
 

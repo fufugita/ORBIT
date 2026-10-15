@@ -3,7 +3,7 @@
 //! egress allowlist, ledger write, stream assembly. The CLI keeps
 //! thin re-exports so existing callers do not churn.
 
-use orbit_adapter::types::ChatMessage;
+use orbit_adapter::types::{ChatMessage, EffortValue};
 use sha2::Digest;
 use std::path::Path;
 
@@ -53,6 +53,14 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    pub fn validate_effort_value(self, effort: &EffortValue) -> Result<(), String> {
+        match self {
+            Self::OpenAiCompatible => effort.validate_for_openai(),
+            Self::Anthropic => effort.validate_for_anthropic(),
+            Self::Ollama => effort.validate_for_ollama(),
+        }
+    }
+
     /// From the providers.toml `kind` string (unknown → OpenAI-compatible,
     /// the backwards-compatible default).
     pub fn from_config(s: &str) -> Self {
@@ -83,6 +91,37 @@ pub struct TurnConfig {
     /// providers apply their own defaults, and several current
     /// model families REJECT explicit sampling parameters.
     pub sampling: Option<(Option<f64>, Option<f64>)>,
+    /// Resolved request control; selection provenance belongs to the caller.
+    pub effort: Option<EffortValue>,
+    /// None is unknown, an empty list is unsupported, otherwise exact choices.
+    pub supported_efforts: Option<Vec<EffortValue>>,
+}
+
+impl TurnConfig {
+    pub fn validate_effort(&self) -> Result<(), String> {
+        if let Some(choices) = &self.supported_efforts {
+            let mut seen = std::collections::HashSet::new();
+            for choice in choices {
+                self.kind.validate_effort_value(choice)?;
+                if !seen.insert(choice) {
+                    return Err(format!(
+                        "duplicate effort choice {choice} for model {}",
+                        self.model
+                    ));
+                }
+            }
+        }
+        let Some(effort) = &self.effort else {
+            return Ok(());
+        };
+        self.kind.validate_effort_value(effort)?;
+        match &self.supported_efforts {
+            None => Err(format!("effort support is unknown for model {}; declare supported_efforts before selecting {effort}", self.model)),
+            Some(choices) if choices.is_empty() => Err(format!("model {} declares effort controls unsupported", self.model)),
+            Some(choices) if !choices.contains(effort) => Err(format!("effort {effort} is not supported by model {}", self.model)),
+            Some(_) => Ok(()),
+        }
+    }
 }
 
 /// Run one provider round through the four-gate async dispatch
@@ -106,6 +145,17 @@ pub fn run_dispatch(
     request_stem: &str,
     session_id: &str,
 ) -> Result<TurnOutcome, (&'static str, String)> {
+    config.validate_effort().map_err(|e| ("ORBIT-E0401", e))?;
+    // Own only the outgoing copy. Saved transcripts keep their original opaque
+    // blocks; every frontend and direct dispatch uses this exact pair guard.
+    let messages = messages.map(|mut wire| {
+        crate::routing::strip_foreign_opaque_blocks_for(
+            &mut wire,
+            &config.provider_id,
+            &config.model,
+        );
+        wire
+    });
     // Parse the gate URL; only http loopback or https is acceptable.
     let url =
         url::Url::parse(&config.gate).map_err(|e| ("ORBIT-E0401", format!("bad gate url: {e}")))?;
@@ -271,6 +321,7 @@ pub fn run_dispatch(
         route: route.clone(),
         input,
         messages,
+        effort: config.effort.clone(),
         // E8: sampling is opt-in per model. Zero means "not set" —
         // the wire adapters omit a zero temperature/top_p (B7/E8).
         sampling: orbit_adapter::types::SamplingParameters {

@@ -93,22 +93,38 @@ impl RuleSet {
     /// Evaluate deny → ask → allow across every scope's rules; first
     /// match wins; a deny anywhere beats an allow anywhere.
     pub fn evaluate(&self, tool: &str, argument: &str) -> Option<RuleEffect> {
+        self.evaluate_with_server(tool, argument, None)
+    }
+
+    /// Evaluate an MCP server selector only against a resolved server identity.
+    pub fn evaluate_with_server(
+        &self,
+        tool: &str,
+        argument: &str,
+        server: Option<&str>,
+    ) -> Option<RuleEffect> {
         // Deny anywhere beats everything.
         if self.rules.iter().any(|r| {
-            r.tool == tool && r.effect == RuleEffectSerde::Deny && rule_matches(r, argument)
+            rule_tool_matches(r, tool, server)
+                && r.effect == RuleEffectSerde::Deny
+                && rule_matches(r, argument)
         }) {
             return Some(RuleEffect::Deny);
         }
         // Then ask.
         if let Some(r) = self.rules.iter().find(|r| {
-            r.tool == tool && r.effect == RuleEffectSerde::Ask && rule_matches(r, argument)
+            rule_tool_matches(r, tool, server)
+                && r.effect == RuleEffectSerde::Ask
+                && rule_matches(r, argument)
         }) {
             let _ = r;
             return Some(RuleEffect::Ask);
         }
         // Then allow.
         if self.rules.iter().any(|r| {
-            r.tool == tool && r.effect == RuleEffectSerde::Allow && rule_matches(r, argument)
+            rule_tool_matches(r, tool, server)
+                && r.effect == RuleEffectSerde::Allow
+                && rule_matches(r, argument)
         }) {
             return Some(RuleEffect::Allow);
         }
@@ -122,6 +138,47 @@ impl RuleSet {
         rules.extend(other.rules.clone());
         RuleSet { rules }
     }
+}
+
+/// Exact tools remain exact. The only tool-name wildcard is an MCP server selector.
+pub fn rule_tool_matches(rule: &PermissionRule, tool: &str, server: Option<&str>) -> bool {
+    if rule.tool == tool {
+        return true;
+    }
+    rule.tool
+        .strip_prefix("mcp__")
+        .and_then(|name| name.strip_suffix("__*"))
+        .is_some_and(|selected| server == Some(selected))
+}
+
+/// Validate the narrow MCP selector syntax without adding generic wildcards.
+pub fn validate_mcp_selector(selector: &str) -> Result<(), String> {
+    if !selector.starts_with("mcp__") {
+        return Ok(());
+    }
+    if selector.len() > 256
+        || selector
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("MCP selector must be at most 256 bytes without whitespace or controls".into());
+    }
+    let name = selector.strip_prefix("mcp__").unwrap();
+    if let Some(server) = name.strip_suffix("__*") {
+        if server.is_empty() || server.contains('*') {
+            return Err(
+                "MCP server selector requires an exact server name: mcp__<server>__*".into(),
+            );
+        }
+    } else {
+        let Some((server, tool)) = name.split_once("__") else {
+            return Err("MCP exact selector requires server and tool names".into());
+        };
+        if server.is_empty() || tool.is_empty() || name.contains('*') {
+            return Err("only mcp__<server>__* is a supported MCP wildcard".into());
+        }
+    }
+    Ok(())
 }
 
 /// Does a rule's pattern match the call's argument?
@@ -263,6 +320,27 @@ pub fn evaluate(
     is_read_only_tool: bool,
     is_readonly_command: bool,
 ) -> Verdict {
+    evaluate_with_server(
+        mode,
+        rules,
+        tool,
+        argument,
+        is_read_only_tool,
+        is_readonly_command,
+        None,
+    )
+}
+
+/// Permission evaluation with a configuration-resolved MCP server identity.
+pub fn evaluate_with_server(
+    mode: PermissionMode,
+    rules: &RuleSet,
+    tool: &str,
+    argument: &str,
+    is_read_only_tool: bool,
+    is_readonly_command: bool,
+    server: Option<&str>,
+) -> Verdict {
     // Bypass: everything runs (refused at startup as root — the CLI
     // checks that separately).
     if mode == PermissionMode::Bypass {
@@ -270,7 +348,7 @@ pub fn evaluate(
     }
 
     // Explicit rules first — they override the mode.
-    if let Some(effect) = rules.evaluate(tool, argument) {
+    if let Some(effect) = rules.evaluate_with_server(tool, argument, server) {
         return match effect {
             RuleEffect::Allow => Verdict::Allow,
             RuleEffect::Ask => {

@@ -78,26 +78,109 @@ pub fn scan_result(text: &str) -> ScanOutcome {
 /// KEY = value / KEY: value where the key looks secret and the value
 /// is long and high-entropy.
 fn scan_assignment(line: &str) -> Option<String> {
-    let sep = line.find('=').or_else(|| line.find(':'))?;
-    let (k, _) = line.split_at(sep);
-    let key_up = k.trim().to_uppercase();
-    let looks_secret = key_up.contains("SECRET")
-        || key_up.contains("TOKEN")
-        || key_up.contains("PASSWORD")
-        || key_up.contains("API_KEY")
-        || key_up.contains("PRIVATE");
-    if !looks_secret {
-        return None;
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut copied = 0;
+    let mut out = String::new();
+    // Quoted lookahead can overlap in hostile nested text. Charge it and
+    // entropy work to a fixed linear budget, failing closed on exhaustion.
+    let mut budget = line.len().saturating_mul(4).saturating_add(1);
+    while index < bytes.len() {
+        if !(bytes[index].is_ascii_alphabetic() || bytes[index] == b'_') {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'-'))
+        {
+            index += 1;
+        }
+        let key = line[start..index].to_ascii_uppercase();
+        if !["SECRET", "TOKEN", "PASSWORD", "API_KEY", "PRIVATE"]
+            .iter()
+            .any(|part| key.contains(part))
+        {
+            continue;
+        }
+        let mut sep = index;
+        while bytes.get(sep) == Some(&b'\\') {
+            sep += 1;
+        }
+        if bytes.get(sep).is_some_and(|b| matches!(b, b'\'' | b'"')) {
+            sep += 1;
+        }
+        while bytes.get(sep).is_some_and(u8::is_ascii_whitespace) {
+            sep += 1;
+        }
+        if !bytes.get(sep).is_some_and(|b| matches!(b, b'=' | b':')) {
+            continue;
+        }
+        let mut value = sep + 1;
+        while bytes.get(value).is_some_and(u8::is_ascii_whitespace) {
+            value += 1;
+        }
+        // Diagnostic JSON may itself contain an escaped quoted assignment.
+        // Recognize its opening quote; conservative closing lookahead can
+        // redact more surrounding data, never expose the embedded value.
+        let mut quoted_start = value;
+        while bytes.get(quoted_start) == Some(&b'\\') {
+            quoted_start += 1;
+        }
+        if bytes
+            .get(quoted_start)
+            .is_some_and(|b| matches!(b, b'\'' | b'"'))
+        {
+            value = quoted_start;
+        }
+        let quote = bytes
+            .get(value)
+            .copied()
+            .filter(|b| matches!(b, b'\'' | b'"'));
+        if quote.is_some() {
+            value += 1;
+        }
+        let mut end = value;
+        let mut escaped = false;
+        while let Some(&b) = bytes.get(end) {
+            if budget == 0 {
+                out.push_str(&line[copied..value]);
+                out.push_str("[redacted:secret context exceeds scan budget]");
+                return Some(out);
+            }
+            budget -= 1;
+            if let Some(quote) = quote {
+                if b == quote && !escaped {
+                    break;
+                }
+                escaped = b == b'\\' && !escaped;
+            } else if b.is_ascii_whitespace()
+                || matches!(b, b',' | b';' | b'}' | b']' | b'\'' | b'"' | b'=')
+            {
+                break;
+            }
+            end += 1;
+        }
+        let candidate = &line[value..end];
+        if candidate.len() > budget {
+            out.push_str(&line[copied..value]);
+            out.push_str("[redacted:secret context exceeds scan budget]");
+            return Some(out);
+        }
+        budget -= candidate.len();
+        if candidate.chars().count() >= 32 && entropy_bits(candidate) > 3.5 {
+            out.push_str(&line[copied..value]);
+            out.push_str("[redacted:secret]");
+            copied = end;
+            index = end;
+        }
     }
-    let value = line[sep + 1..].trim();
-    let value = value.trim_matches('"').trim_matches('\'');
-    if value.chars().count() < 32 {
-        return None;
-    }
-    if entropy_bits(value) > 3.5 {
-        Some(format!("{}= [redacted:secret]\n", k.trim()))
-    } else {
+    if copied == 0 {
         None
+    } else {
+        out.push_str(&line[copied..]);
+        Some(out)
     }
 }
 
@@ -171,5 +254,47 @@ mod tests {
         let input = "fetch https://example.com/path?query=1";
         let out = scan_result(input);
         assert_eq!(out.text, input);
+    }
+    #[test]
+    fn assignment_after_harmless_first_separator_is_redacted() {
+        let secret = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+        let out = scan_result(&format!("status=ok API_KEY={secret} tail=kept"));
+        assert!(!out.text.contains(secret));
+        assert!(out.text.contains("status=ok"));
+        assert!(out.text.contains("tail=kept"));
+    }
+    #[test]
+    fn every_assignment_on_a_line_is_scanned_with_quotes_and_json_keys() {
+        let a = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+        let b = "9876543210ZyXwVuTsRqPoNmLkJiHgFeDcBa";
+        let out = scan_result(&format!(
+            "{{\"status\":\"ok\",\"API_KEY\":\"{a}\",\"TOKEN\":'{b}'}}"
+        ));
+        assert!(!out.text.contains(a));
+        assert!(!out.text.contains(b));
+        assert!(out.text.contains("\"status\":\"ok\""));
+        assert!(out.text.contains("[redacted:secret]"));
+    }
+    #[test]
+    fn prefixed_assignment_preserves_unicode_and_line_endings() {
+        let text =
+            "observed café status=ok password = \"AbCdEfGhIjKlMnOpQrStUvWxYz0123456789\"\r\n";
+        let out = scan_result(text);
+        assert!(out.text.starts_with("observed café status=ok"));
+        assert!(out.text.ends_with("\r\n"));
+        assert!(!out.text.contains("AbCdEfGh"));
+    }
+    #[test]
+    fn harmless_first_secret_assignment_does_not_hide_later_secret() {
+        let out = scan_result("TOKEN=short API_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789");
+        assert!(out.text.contains("TOKEN=short"));
+        assert!(!out.text.contains("AbCdEfGh"));
+    }
+    #[test]
+    fn escaped_json_assignment_context_does_not_expose_the_value() {
+        let secret = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+        let out = scan_result(&format!(r#"wrapper="{{\"API_KEY\":\"{secret}\"}}""#));
+        assert!(!out.text.contains(secret));
+        assert!(out.text.contains("[redacted:secret]"));
     }
 }

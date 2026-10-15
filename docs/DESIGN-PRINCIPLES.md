@@ -1,7 +1,6 @@
 # ORBIT — Shared Design Law
 
-> The nine principles both design-review submissions converged on
-> independently. They bind every front-end — ratatui TUI, Go Bubble Tea,
+> These nine principles bind every front-end — ratatui TUI, Go Bubble Tea,
 > future Tauri desktop, browser projection. When a surface's spec conflicts
 > with a principle, the principle wins.
 
@@ -54,6 +53,5 @@
 
 ---
 
-Provenance: two independent model submissions (a terminal-native spec and a
-desktop visual system), compared 2026-09-26. DR-20 architecture locks remain
+DR-20 architecture locks remain
 authoritative for process model, approval pipeline, and display-safety seams.

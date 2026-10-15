@@ -51,12 +51,23 @@ impl Transcript {
     /// Open (or create) the transcript for a session.
     pub fn open(home: &Path, session_id: &str) -> std::io::Result<Self> {
         let dir = home.join("projects");
-        std::fs::create_dir_all(&dir)?;
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(&dir)?;
         let path = dir.join(format!("{session_id}.jsonl"));
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let f = options.open(&path)?;
         f.sync_all()?;
         Ok(Transcript { path })
     }
@@ -243,6 +254,7 @@ fn msg(role: orbit_adapter::types::ChatRole, text: String) -> ChatMessage {
         tool_result: None,
         blocks: None,
         origin_model: None,
+        origin_provider: None,
     }
 }
 

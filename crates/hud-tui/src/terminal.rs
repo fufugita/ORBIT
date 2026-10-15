@@ -37,8 +37,9 @@
 //! file is written per-turn — the most that is lost is the in-flight turn.
 //!
 //! `Drop` restores the terminal unconditionally — even on panic — so the
-//! operator's terminal is never left in a broken state. Write failures on an
-//! already-dead PTY are swallowed (`.ok()`): there is nothing left to restore.
+//! operator's terminal is never left in a broken state. The backend consumes
+//! output after terminal loss, including Ratatui's cursor restoration on drop,
+//! so cleanup does not try to report the failure through an already-dead stderr.
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
@@ -48,12 +49,67 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io::Stdout;
+use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-pub type Term = Terminal<CrosstermBackend<Stdout>>;
+pub type Term = Terminal<CrosstermBackend<TerminalWriter<Stdout>>>;
+
+/// Terminal output that stops touching a disconnected display surface.
+///
+/// Only terminal-loss errors are consumed. Other I/O errors still reach the
+/// caller. Ratatui also uses this writer when restoring a hidden cursor in Drop.
+pub struct TerminalWriter<W> {
+    inner: W,
+    disconnected: bool,
+}
+
+impl<W> TerminalWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            disconnected: false,
+        }
+    }
+
+    fn terminal_lost(&mut self, error: &io::Error) -> bool {
+        let broken_pipe = error.kind() == io::ErrorKind::BrokenPipe;
+        #[cfg(unix)]
+        let dead_pty = error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error());
+        #[cfg(not(unix))]
+        let dead_pty = false;
+        if broken_pipe || dead_pty {
+            self.disconnected = true;
+            SIGHUP_FLAG.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<W: Write> Write for TerminalWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.disconnected {
+            return Ok(buf.len());
+        }
+        match self.inner.write(buf) {
+            Err(error) if self.terminal_lost(&error) => Ok(buf.len()),
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.disconnected {
+            return Ok(());
+        }
+        match self.inner.flush() {
+            Err(error) if self.terminal_lost(&error) => Ok(()),
+            result => result,
+        }
+    }
+}
 
 /// Signal flags set by the signal handler and checked by the event loop.
 /// `Arc<AtomicBool>` is required by `signal_hook::flag::register`.
@@ -269,7 +325,7 @@ impl TerminalGuard {
             )
             .map_err(|e| format!("enter alt screen: {e}"))?;
         }
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(TerminalWriter::new(stdout));
         let terminal = Terminal::new(backend).map_err(|e| format!("create terminal: {e}"))?;
         // The watchdog watches the same fd crossterm reads (stdin — we are
         // only here when stdin is a TTY). Spawned AFTER raw mode + alt
@@ -285,9 +341,10 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let stdout = self.terminal.backend_mut();
         if self.mouse_capture {
             execute!(
-                std::io::stdout(),
+                stdout,
                 Show,
                 DisableMouseCapture,
                 crossterm::event::DisableBracketedPaste,
@@ -296,7 +353,7 @@ impl Drop for TerminalGuard {
             .ok();
         } else {
             execute!(
-                std::io::stdout(),
+                stdout,
                 Show,
                 crossterm::event::DisableBracketedPaste,
                 LeaveAlternateScreen
@@ -310,6 +367,58 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct WriterState {
+        write_error: Option<io::Error>,
+        flush_error: Option<io::Error>,
+        write_calls: usize,
+        flush_calls: usize,
+    }
+
+    struct FakeWriter(Rc<RefCell<WriterState>>);
+
+    fn copy_error(error: &io::Error) -> io::Error {
+        error
+            .raw_os_error()
+            .map(io::Error::from_raw_os_error)
+            .unwrap_or_else(|| io::Error::from(error.kind()))
+    }
+
+    impl Write for FakeWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut state = self.0.borrow_mut();
+            state.write_calls += 1;
+            match &state.write_error {
+                Some(error) => Err(copy_error(error)),
+                None => Ok(buf.len()),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut state = self.0.borrow_mut();
+            state.flush_calls += 1;
+            match &state.flush_error {
+                Some(error) => Err(copy_error(error)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn loss_errors() -> Vec<io::Error> {
+        let errors = vec![io::Error::from(io::ErrorKind::BrokenPipe)];
+        #[cfg(unix)]
+        let errors = {
+            let mut errors = errors;
+            errors.push(io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            ));
+            errors
+        };
+        errors
+    }
 
     #[test]
     fn shutdown_signal_exit_codes_follow_128_plus_signum() {
@@ -321,6 +430,96 @@ mod tests {
     /// The signal flags are process-global; tests that mutate them must not
     /// interleave (cargo runs tests in parallel threads).
     static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn terminal_writer_forwards_healthy_output() {
+        let mut writer = TerminalWriter::new(Vec::new());
+        writer.write_all(b"cursor and frame output").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.inner, b"cursor and frame output");
+        assert!(!writer.disconnected);
+    }
+
+    #[test]
+    fn terminal_writer_latches_output_loss_and_requests_hangup_once() {
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for error in loss_errors() {
+            let state = Rc::new(RefCell::new(WriterState {
+                write_error: Some(error),
+                ..WriterState::default()
+            }));
+            let mut writer = TerminalWriter::new(FakeWriter(state.clone()));
+            assert_eq!(writer.write(b"frame").unwrap(), 5);
+            assert_eq!(take_pending_signal(), Some(ShutdownSignal::Hangup));
+            assert_eq!(writer.write(b"cleanup").unwrap(), 7);
+            writer.flush().unwrap();
+            assert_eq!(take_pending_signal(), None);
+            assert_eq!(state.borrow().write_calls, 1);
+            assert_eq!(state.borrow().flush_calls, 0);
+        }
+    }
+
+    #[test]
+    fn terminal_writer_latches_flush_loss() {
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for error in loss_errors() {
+            let state = Rc::new(RefCell::new(WriterState {
+                flush_error: Some(error),
+                ..WriterState::default()
+            }));
+            let mut writer = TerminalWriter::new(FakeWriter(state.clone()));
+            writer.flush().unwrap();
+            assert_eq!(take_pending_signal(), Some(ShutdownSignal::Hangup));
+            writer.write_all(b"cleanup").unwrap();
+            writer.flush().unwrap();
+            assert_eq!(state.borrow().write_calls, 0);
+            assert_eq!(state.borrow().flush_calls, 1);
+            assert_eq!(take_pending_signal(), None);
+        }
+    }
+
+    #[test]
+    fn terminal_writer_preserves_unrelated_errors() {
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = Rc::new(RefCell::new(WriterState {
+            write_error: Some(io::Error::from(io::ErrorKind::PermissionDenied)),
+            flush_error: Some(io::Error::from(io::ErrorKind::Other)),
+            ..WriterState::default()
+        }));
+        let mut writer = TerminalWriter::new(FakeWriter(state.clone()));
+        assert_eq!(
+            writer.write(b"frame").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::Other);
+        assert!(!writer.disconnected);
+        assert_eq!(take_pending_signal(), None);
+        state.borrow_mut().write_error = None;
+        assert_eq!(writer.write(b"retry").unwrap(), 5);
+    }
+
+    #[test]
+    fn hidden_cursor_terminal_drop_tolerates_output_disconnect() {
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for error in loss_errors() {
+            let state = Rc::new(RefCell::new(WriterState::default()));
+            let backend = CrosstermBackend::new(TerminalWriter::new(FakeWriter(state.clone())));
+            let mut terminal = Terminal::with_options(
+                backend,
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 2, 1)),
+                },
+            )
+            .unwrap();
+            terminal.hide_cursor().unwrap();
+            let writes_before_drop = state.borrow().write_calls;
+            state.borrow_mut().write_error = Some(error);
+            drop(terminal);
+            assert_eq!(state.borrow().write_calls, writes_before_drop + 1);
+            assert_eq!(take_pending_signal(), Some(ShutdownSignal::Hangup));
+            assert_eq!(take_pending_signal(), None);
+        }
+    }
 
     #[test]
     fn take_pending_signal_drains_flag_exactly_once() {

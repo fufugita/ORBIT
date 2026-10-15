@@ -20,14 +20,13 @@ ratatui.workspace = true
 crossterm.workspace = true
 toml.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 signal-hook.workspace = true
 unicode-width.workspace = true
+ignore.workspace = true
 # The terminal watchdog polls the input fd for POLLHUP/POLLERR without
 # unsafe (the crate forbids it) — rustix::event::poll is safe Rust.
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 
 [lib]
 name = "orbit_hud_tui"
-
-[dev-dependencies]
-serde_json.workspace = true

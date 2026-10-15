@@ -30,8 +30,8 @@ fn render(tui: &Tui, scenario: &Scenario, w: u16, h: u16) -> String {
 
 fn base_scenario() -> Scenario {
     let mut s = Scenario::new();
-    s.model = "glm-5.2".into();
-    s.model_id = "glm-5.2".into();
+    s.model = "fixture-model".into();
+    s.model_id = "fixture-model".into();
     s.provider = "local".into();
     s.session_id = "session-01J8ZK4QX2M7C9RT5VWEHN3B6D".into();
     s.session_prefix = "01J8ZK4Q".into();
@@ -58,7 +58,7 @@ fn columns_layout_matches_the_prototype() {
     let mut s = base_scenario();
     s.welcome_chips = vec![
         (true, "trust root".into()),
-        (true, "local · glm-5.2".into()),
+        (true, "local · fixture-model".into()),
     ];
     let out = render(&tui, &s, 164, 48);
     let rows: Vec<&str> = out.lines().collect();
@@ -67,7 +67,7 @@ fn columns_layout_matches_the_prototype() {
         rows[0].contains("ORBIT") && rows[0].contains("columns"),
         "{out}"
     );
-    assert!(rows[0].contains("glm-5.2"), "{out}");
+    assert!(rows[0].contains("fixture-model"), "{out}");
     // Row 1: three panels — thin, heavy (focused), thin.
     assert!(
         rows[1].starts_with(" ╭") && rows[1].contains("┏") && rows[1].ends_with("╮"),
@@ -188,7 +188,7 @@ fn approval_card_needs_you_with_risk_facts_and_keys() {
     s.approval_queue = vec!["shell".into()];
     s.approval_summary = Some("shell(scripts/e2e-clean-machine.sh --keep-home)".into());
     s.approval_risk = 2;
-    s.approval_dir = "/home/hanu/src/orbit".into();
+    s.approval_dir = "/workspace/project".into();
     let out = render(&tui, &s, 164, 48);
     assert!(out.contains("◆ NEEDS YOU"), "{out}");
     assert!(out.contains("Allow shell?"), "{out}");
@@ -197,7 +197,7 @@ fn approval_card_needs_you_with_risk_facts_and_keys() {
         out.contains("$ scripts/e2e-clean-machine.sh --keep-home"),
         "{out}"
     );
-    assert!(out.contains("/home/hanu/src/orbit"), "{out}");
+    assert!(out.contains("/workspace/project"), "{out}");
     // No whole-tool grant on the card: `y` is the only allow, and the
     // card says there is no rule to remember for this call.
     assert!(out.contains("allow once"), "{out}");
@@ -318,16 +318,19 @@ fn the_waiting_row_appears_only_while_the_model_is_awaited() {
     });
     s.turn_live = true;
     let waiting = render(&tui, &s, 164, 48);
-    assert!(waiting.contains("waiting for glm-5.2"), "{waiting}");
+    assert!(waiting.contains("waiting for fixture-model"), "{waiting}");
 
     s.approval_pending = Some("Edit".into());
     let approval = render(&tui, &s, 164, 48);
-    assert!(!approval.contains("waiting for glm-5.2"), "{approval}");
+    assert!(
+        !approval.contains("waiting for fixture-model"),
+        "{approval}"
+    );
 
     s.approval_pending = None;
     s.running.insert("c1".into(), "Bash".into());
     let running = render(&tui, &s, 164, 48);
-    assert!(!running.contains("waiting for glm-5.2"), "{running}");
+    assert!(!running.contains("waiting for fixture-model"), "{running}");
 }
 
 #[test]

@@ -24,6 +24,8 @@ pub enum View {
     Review,
     /// A named agent's panel.
     Agent,
+    /// A named declarative pane; its stable ID lives in Node::Custom.
+    Custom,
 }
 
 impl View {
@@ -39,7 +41,7 @@ impl View {
             Self::Activity => Token::Cyan,
             Self::Context => Token::Blue,
             Self::Review => Token::Red,
-            Self::Agent => Token::Cyan,
+            Self::Agent | Self::Custom => Token::Cyan,
         }
     }
 
@@ -53,14 +55,18 @@ impl View {
             Self::Context => "Context",
             Self::Review => "Review",
             Self::Agent => "Agent",
+            Self::Custom => "Custom pane",
         }
     }
 }
 
 /// A node of the layout tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Node {
+    Custom {
+        pane_id: String,
+    },
     /// A leaf: one panel showing one view.
     Panel {
         view: View,
@@ -114,7 +120,7 @@ impl Node {
     /// Count leaves (panels) in reading order.
     pub fn panel_count(&self) -> usize {
         match self {
-            Node::Panel { .. } => 1,
+            Node::Panel { .. } | Node::Custom { .. } => 1,
             Node::Split { children, .. } => children.iter().map(Node::panel_count).sum(),
         }
     }
@@ -130,6 +136,7 @@ impl Node {
     fn walk(&self, path: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, View)>) {
         match self {
             Node::Panel { view, .. } => out.push((path.clone(), *view)),
+            Node::Custom { .. } => out.push((path.clone(), View::Custom)),
             Node::Split { children, .. } => {
                 for (i, c) in children.iter().enumerate() {
                     path.push(i);
@@ -155,7 +162,23 @@ impl Node {
         let Some(path) = self.path_of(index) else {
             return false;
         };
+        if self.view_at(index) == Some(View::Conversation) && view != View::Conversation {
+            return false;
+        }
+        if view == View::Conversation
+            && self.leaves().iter().any(|(_, v)| *v == View::Conversation)
+            && self.view_at(index) != Some(View::Conversation)
+        {
+            return false;
+        }
         match self.at_mut(&path) {
+            Some(Node::Custom { .. }) => {
+                *self.at_mut(&path).unwrap() = Node::Panel {
+                    view,
+                    agent: String::new(),
+                };
+                true
+            }
             Some(Node::Panel { view: v, .. }) => {
                 *v = view;
                 true
@@ -167,7 +190,7 @@ impl Node {
     /// `x` — close the panel; its share goes to its neighbours.
     /// The last panel cannot close.
     pub fn close(&mut self, index: usize) -> bool {
-        if self.panel_count() <= 1 {
+        if self.panel_count() <= 1 || self.view_at(index) == Some(View::Conversation) {
             return false;
         }
         let Some(path) = self.path_of(index) else {
@@ -204,6 +227,9 @@ impl Node {
         let Some(path) = self.path_of(index) else {
             return false;
         };
+        if self.panel_count() >= 24 || view == View::Conversation {
+            return false;
+        }
         // If the parent split has the same direction, insert a sibling.
         if !path.is_empty() {
             let parent_path = path[..path.len() - 1].to_vec();
@@ -214,7 +240,7 @@ impl Node {
                 children,
             }) = self.at_mut(&parent_path)
             {
-                if *d == direction && children.len() < 9 {
+                if *d == direction && children.len() < 8 {
                     children.insert(
                         child_i + 1,
                         Node::Panel {
@@ -232,12 +258,13 @@ impl Node {
         let Some(node) = self.at_mut(&path) else {
             return false;
         };
-        if let Node::Panel { view: old, agent } = node.clone() {
+        if matches!(node, Node::Panel { .. } | Node::Custom { .. }) {
+            let old = node.clone();
             *node = Node::Split {
                 direction,
                 shares: vec![50, 50],
                 children: vec![
-                    Node::Panel { view: old, agent },
+                    old,
                     Node::Panel {
                         view,
                         agent: String::new(),
@@ -337,7 +364,7 @@ impl Node {
     /// `=` — even out every split.
     pub fn even(&mut self) {
         match self {
-            Node::Panel { .. } => {}
+            Node::Panel { .. } | Node::Custom { .. } => {}
             Node::Split {
                 shares, children, ..
             } => {
@@ -353,7 +380,7 @@ impl Node {
         let mut node = self;
         for i in path {
             match node {
-                Node::Panel { .. } => return None,
+                Node::Panel { .. } | Node::Custom { .. } => return None,
                 Node::Split { children, .. } => node = children.get(*i)?,
             }
         }
@@ -364,7 +391,7 @@ impl Node {
         let mut node = self;
         for i in path {
             match node {
-                Node::Panel { .. } => return None,
+                Node::Panel { .. } | Node::Custom { .. } => return None,
                 Node::Split { children, .. } => node = children.get_mut(*i)?,
             }
         }
@@ -436,6 +463,39 @@ impl Node {
         }
     }
 
+    /// Portable layouts always retain a reachable composer, including review.
+    pub fn profile_preset(which: Preset) -> Self {
+        Self::preset(which).with_conversation()
+    }
+
+    pub fn with_conversation(self) -> Self {
+        if self
+            .leaves()
+            .iter()
+            .any(|(_, view)| *view == View::Conversation)
+        {
+            return self;
+        }
+        Self::Split {
+            direction: Direction::Right,
+            shares: vec![40, 60],
+            children: vec![
+                Self::Panel {
+                    view: View::Conversation,
+                    agent: String::new(),
+                },
+                self,
+            ],
+        }
+    }
+
+    pub fn custom_id_at(&self, index: usize) -> Option<String> {
+        let path = self.path_of(index)?;
+        match self.at(&path)? {
+            Self::Custom { pane_id } => Some(pane_id.clone()),
+            _ => None,
+        }
+    }
     /// The agent name of the leaf at panel index (empty when none).
     pub fn agent_at(&self, index: usize) -> String {
         let Some(path) = self.path_of(index) else {
@@ -448,7 +508,7 @@ impl Node {
                     Some(c) => node = c,
                     None => return String::new(),
                 },
-                Node::Panel { .. } => break,
+                Node::Panel { .. } | Node::Custom { .. } => break,
             }
         }
         match node {
@@ -536,57 +596,315 @@ pub struct LayoutFile {
     pub from_preset: String,
 }
 
+/// The exact bytes read form a revision; publication compares them under the stable lock.
+pub struct LayoutSnapshot {
+    pub layout: LayoutFile,
+    pub revision: Option<Vec<u8>>,
+    pub legacy_bytes: Option<Vec<u8>>,
+}
+
 impl LayoutFile {
-    /// Load from `$ORBIT_HOME/tui.toml` (a `[layout.tree]` table).
-    /// Malformed or missing → the default tree.
+    /// Compatibility accessor. Live startup uses load_checked and presents errors explicitly.
     pub fn load(home: &std::path::Path) -> Self {
-        let path = home.join("tui.toml");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return Self::default_tree_file();
+        Self::load_checked(home)
+            .map(|s| s.layout)
+            .unwrap_or_else(|_| Self::default_tree_file())
+    }
+    pub fn load_checked(home: &std::path::Path) -> Result<LayoutSnapshot, String> {
+        let dir = match layout_dir(home) {
+            Ok(d) => d,
+            Err(_error) if !home.exists() => {
+                return Ok(LayoutSnapshot {
+                    layout: Self::default_tree_file(),
+                    revision: None,
+                    legacy_bytes: None,
+                })
+            }
+            Err(error) => return Err(error),
         };
+        let legacy_bytes = layout_read(&dir)?;
+        let profile_bytes = layout_read_named(&dir, "customization.json")?;
+        let revision = layout_revision(&legacy_bytes, &profile_bytes);
+        let layout = match &legacy_bytes {
+            None => Self::default_tree_file(),
+            Some(raw) => Self::parse(raw)?,
+        };
+        Ok(LayoutSnapshot {
+            layout,
+            revision,
+            legacy_bytes,
+        })
+    }
+    fn parse(raw: &[u8]) -> Result<Self, String> {
         #[derive(Deserialize)]
         struct Wrapper {
             #[serde(default)]
             layout: LayoutFile,
         }
-        toml::from_str::<Wrapper>(&raw)
-            .map(|w| w.layout)
-            .unwrap_or_else(|_| Self::default_tree_file())
+        let text = std::str::from_utf8(raw).map_err(|_| "tui.toml is not UTF-8")?;
+        let wrapper: Wrapper = toml::from_str(text).map_err(|e| format!("tui.toml: {e}"))?;
+        if let Some(tree) = &wrapper.layout.tree {
+            validate_legacy_tree(tree)?;
+        }
+        Ok(wrapper.layout)
     }
-
     fn default_tree_file() -> Self {
         Self {
             tree: Some(Node::default_tree()),
             from_preset: "columns".into(),
         }
     }
-
-    /// Save as "yours": write the tree into tui.toml (merging into an
-    /// existing file by re-serializing the `[layout.tree]` table).
     pub fn save(&self, home: &std::path::Path) -> Result<(), String> {
-        let path = home.join("tui.toml");
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        // Parse as a raw table, replace [layout.tree], keep the rest.
-        let mut root: toml::Value =
-            toml::from_str(&existing).unwrap_or_else(|_| toml::Value::Table(Default::default()));
-        if let Some(table) = root.as_table_mut() {
-            let layout = table
-                .entry("layout".to_string())
-                .or_insert_with(|| toml::Value::Table(Default::default()));
-            if let Some(lt) = layout.as_table_mut() {
-                if let Some(tree) = &self.tree {
-                    let v = toml::Value::try_from(tree).map_err(|e| e.to_string())?;
-                    lt.insert("tree".into(), v);
+        let snapshot = Self::load_checked(home)?;
+        self.save_checked(home, snapshot.revision.as_deref())
+            .map(|_| ())
+    }
+    pub fn save_checked(
+        &self,
+        home: &std::path::Path,
+        expected: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+        use std::io::Write;
+        if let Some(tree) = &self.tree {
+            validate_legacy_tree(tree)?;
+        }
+        let dir = layout_dir(home)?;
+        let lockfd = openat(
+            &dir,
+            ".customization.lock",
+            OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| format!("layout lock: {e}"))?;
+        let lock = std::fs::File::from(lockfd);
+        layout_regular(&lock, &dir)?;
+        lock.try_lock().map_err(|e| format!("layout busy: {e}"))?;
+        let current = layout_read(&dir)?;
+        let profile_bytes = layout_read_named(&dir, "customization.json")?;
+        if layout_revision(&current, &profile_bytes).as_deref() != expected {
+            return Err("layout revision changed; reload before saving".into());
+        }
+        let mut root: toml::Value = match &current {
+            Some(bytes) => {
+                Self::parse(bytes)?;
+                toml::from_str(std::str::from_utf8(bytes).map_err(|_| "tui.toml is not UTF-8")?)
+                    .map_err(|e| format!("tui.toml: {e}"))?
+            }
+            None => toml::Value::Table(Default::default()),
+        };
+        let table = root.as_table_mut().ok_or("tui.toml root must be a table")?;
+        let layout = table
+            .entry("layout")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .ok_or("layout must be a table")?;
+        if let Some(tree) = &self.tree {
+            layout.insert(
+                "tree".into(),
+                toml::Value::try_from(tree).map_err(|e| e.to_string())?,
+            );
+        }
+        layout.insert(
+            "from_preset".into(),
+            toml::Value::String(self.from_preset.clone()),
+        );
+        let bytes = toml::to_string_pretty(&root)
+            .map_err(|e| e.to_string())?
+            .into_bytes();
+        if bytes.len() > 128 * 1024 {
+            return Err("tui.toml exceeds 128 KiB".into());
+        }
+        let mut temp = None;
+        for counter in 0..64 {
+            let name = format!(".tui-layout-{}-{counter}.tmp", std::process::id());
+            match openat(
+                &dir,
+                &name,
+                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(fd) => {
+                    temp = Some((name, std::fs::File::from(fd)));
+                    break;
                 }
-                lt.insert(
-                    "from_preset".into(),
-                    toml::Value::String(self.from_preset.clone()),
-                );
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(format!("layout stage: {e}")),
             }
         }
-        std::fs::write(&path, toml::to_string_pretty(&root).unwrap_or_default())
-            .map_err(|e| e.to_string())
+        let (name, mut staged) = temp.ok_or("layout staging busy")?;
+        let result = (|| {
+            staged.write_all(&bytes).map_err(|e| e.to_string())?;
+            staged.sync_all().map_err(|e| e.to_string())?;
+            if layout_read(&dir)? != current
+                || layout_read_named(&dir, "customization.json")? != profile_bytes
+            {
+                return Err("layout changed during publication".into());
+            }
+            layout_same_directory(home, &dir)?;
+            renameat(&dir, &name, &dir, "tui.toml").map_err(|e| e.to_string())?;
+            dir.sync_all()
+                .map_err(|e| format!("layout publication uncertain: {e}"))?;
+            layout_same_directory(home, &dir)
+                .map_err(|e| format!("layout publication uncertain: {e}"))?;
+            Ok(layout_revision(&Some(bytes), &profile_bytes))
+        })();
+        let _ = unlinkat(&dir, &name, AtFlags::empty());
+        result
     }
+}
+
+fn validate_legacy_tree(tree: &Node) -> Result<(), String> {
+    fn walk(
+        node: &Node,
+        depth: usize,
+        leaves: &mut usize,
+        conversation: &mut usize,
+    ) -> Result<(), String> {
+        if depth > 8 {
+            return Err("layout depth exceeds 8".into());
+        }
+        match node {
+            Node::Panel { view, agent } => {
+                *leaves += 1;
+                if *view == View::Conversation {
+                    *conversation += 1;
+                }
+                if *view == View::Custom || agent.len() > 128 || agent.chars().any(char::is_control)
+                {
+                    return Err("invalid layout view/agent".into());
+                }
+            }
+            Node::Custom { pane_id } => {
+                *leaves += 1;
+                if !orbit_frontend_protocol::customization::valid_id(pane_id) {
+                    return Err("invalid custom pane identity".into());
+                }
+            }
+            Node::Split {
+                shares, children, ..
+            } => {
+                if children.is_empty()
+                    || children.len() > 8
+                    || shares.len() != children.len()
+                    || shares.iter().any(|v| !(1..=1000).contains(v))
+                {
+                    return Err("invalid layout split/shares".into());
+                }
+                for child in children {
+                    walk(child, depth + 1, leaves, conversation)?;
+                }
+            }
+        }
+        if *leaves > 24 {
+            return Err("layout leaves exceed 24".into());
+        }
+        Ok(())
+    }
+    let (mut leaves, mut conversation) = (0, 0);
+    walk(tree, 1, &mut leaves, &mut conversation)?;
+    if conversation != 1 {
+        return Err("layout must retain exactly one conversation".into());
+    }
+    Ok(())
+}
+
+fn layout_dir(home: &std::path::Path) -> Result<std::fs::File, String> {
+    use rustix::fs::{open, Mode, OFlags};
+    let fd = open(
+        home,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("layout directory: {e}"))?;
+    let dir = std::fs::File::from(fd);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = dir.metadata().map_err(|e| e.to_string())?;
+        let uid = std::fs::metadata("/proc/self")
+            .map_err(|e| e.to_string())?
+            .uid();
+        if m.uid() != uid || m.mode() & 0o022 != 0 {
+            return Err("unsafe layout directory owner/permissions".into());
+        }
+    }
+    Ok(dir)
+}
+fn layout_regular(file: &std::fs::File, dir: &std::fs::File) -> Result<(), String> {
+    let m = file.metadata().map_err(|e| e.to_string())?;
+    if !m.is_file() || m.len() > 128 * 1024 {
+        return Err("layout requires a bounded regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = dir.metadata().map_err(|e| e.to_string())?.uid();
+        if m.uid() != owner || m.nlink() != 1 || m.mode() & 0o022 != 0 {
+            return Err("unsafe layout file owner/links/permissions".into());
+        }
+    }
+    Ok(())
+}
+fn layout_read(dir: &std::fs::File) -> Result<Option<Vec<u8>>, String> {
+    layout_read_named(dir, "tui.toml")
+}
+fn layout_read_named(dir: &std::fs::File, name: &str) -> Result<Option<Vec<u8>>, String> {
+    use rustix::fs::{openat, Mode, OFlags};
+    use std::io::Read;
+    let fd = match openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(format!("layout read: {e}")),
+    };
+    let mut file = std::fs::File::from(fd);
+    layout_regular(&file, dir)?;
+    let mut raw = Vec::new();
+    file.by_ref()
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| e.to_string())?;
+    if raw.len() > 128 * 1024 {
+        return Err("tui.toml exceeds 128 KiB".into());
+    }
+    Ok(Some(raw))
+}
+
+fn layout_same_directory(home: &std::path::Path, held: &std::fs::File) -> Result<(), String> {
+    let current = layout_dir(home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = held.metadata().map_err(|e| e.to_string())?;
+        let b = current.metadata().map_err(|e| e.to_string())?;
+        if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+            return Err("layout directory identity changed".into());
+        }
+    }
+    Ok(())
+}
+
+fn layout_revision(legacy: &Option<Vec<u8>>, profile: &Option<Vec<u8>>) -> Option<Vec<u8>> {
+    if legacy.is_none() && profile.is_none() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for part in [legacy, profile] {
+        match part {
+            None => bytes.push(0),
+            Some(value) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(value);
+            }
+        }
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -744,6 +1062,11 @@ mod tests {
         let home = std::env::temp_dir().join(format!("orbit-layout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
 
         let mut t = Node::preset(Preset::Agents);
         assert!(t.split(0, Direction::Down, View::Context));

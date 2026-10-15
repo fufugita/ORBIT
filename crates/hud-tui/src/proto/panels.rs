@@ -75,6 +75,7 @@ pub fn render_panel(
         View::Context => context(scenario, tick_ms, reduced, inner.width),
         View::Review => review(scenario),
         View::Agent => agent(scenario, tick_ms, reduced),
+        View::Custom => vec![Line::raw("Custom pane requires its checked host")],
     };
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -398,7 +399,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let tree = super::super::layout::Node::default_tree();
         let mut s = Scenario::new();
-        s.model = "glm-5.2".into();
+        s.model = "fixture-model".into();
         // A turn live with an empty transcript is the welcome's
         // waiting state (§9.22); give the session one prior turn so
         // the conversation shows the live activity instead.
@@ -438,7 +439,7 @@ mod tests {
                 text.lines().take(2).collect::<Vec<_>>().join("\n")
             );
         }
-        assert!(text.contains("waiting for glm-5.2"));
+        assert!(text.contains("waiting for fixture-model"));
     }
 
     #[test]
@@ -521,6 +522,7 @@ fn areas_rec(area: Rect, node: &super::layout::Node, out: &mut Vec<(Rect, View)>
     use super::layout::{Direction, Node};
     match node {
         Node::Panel { view, .. } => out.push((area, *view)),
+        Node::Custom { .. } => out.push((area, View::Custom)),
         Node::Split {
             direction,
             shares,

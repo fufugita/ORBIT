@@ -180,6 +180,8 @@ pub fn preset_model(preset: &ProviderPreset, model_id: &str) -> Option<&'static 
 pub fn preset_model_entry(preset: &ProviderPreset, model_id: &str) -> ModelEntry {
     let fact = preset_model(preset, model_id);
     ModelEntry {
+        supported_efforts: None,
+        default_effort: None,
         id: model_id.to_string(),
         label: fact.map(|f| f.label.to_string()),
         sampling: None,

@@ -7,7 +7,7 @@
 
 use super::canvas::{mix, tint, Cv, Rgb};
 use super::motion::star_at;
-use super::pal::*;
+use super::pal::MAGENTA_HI;
 use ratatui::style::Modifier;
 use unicode_width::UnicodeWidthStr;
 
@@ -87,6 +87,7 @@ impl MarkOpts {
 
 /// Paint the mark with its top-left at (x, y).
 pub fn draw_mark(cv: &mut Cv, x: i32, y: i32, o: &MarkOpts) {
+    let colors = cv.palette;
     let ring_n = (o.ring * RING_ORDER.len() as f32).round() as usize;
     let ring_on = &RING_ORDER[..ring_n.min(RING_ORDER.len())];
     for (r, row) in MARK.iter().enumerate() {
@@ -101,11 +102,17 @@ pub fn draw_mark(cv: &mut Cv, x: i32, y: i32, o: &MarkOpts) {
                 if !ring_on.contains(&(c, r)) {
                     continue;
                 }
-                cv.text(x + c, y + r, &ch.to_string(), MAGENTA_DIM, Some(o.bg));
+                cv.text(
+                    x + c,
+                    y + r,
+                    &ch.to_string(),
+                    colors.magenta_dim,
+                    Some(o.bg),
+                );
                 continue;
             }
             // Letter strokes: the O is columns 3..=7, R B I T follow.
-            let mut col = super::pal::brand_at(c as f32 / 32.0);
+            let mut col = colors.brand_at(c as f32 / 32.0);
             if (3..=7).contains(&c) {
                 if o.o_alpha <= 0.0 {
                     continue;
@@ -123,7 +130,7 @@ pub fn draw_mark(cv: &mut Cv, x: i32, y: i32, o: &MarkOpts) {
             }
             if let Some(shine) = o.shine {
                 let d = (c as f32 - shine).abs();
-                col = mix(col, WHITE, (1.0 - d / 3.0).max(0.0) * 0.85);
+                col = mix(col, colors.white, (1.0 - d / 3.0).max(0.0) * 0.85);
             }
             cv.put(
                 x + c,
@@ -166,16 +173,23 @@ pub fn hero_height(waiting: bool) -> i32 {
 /// Draw the welcome hero in the panel interior `(x, y, w, h)`; returns
 /// the rows it used.
 pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i32 {
+    let colors = cv.palette;
     let waiting = hero.waiting_for.is_some();
     let hh = hero_height(waiting);
     let (hx, hw) = (x + 4, w - 8);
     if hw < 36 || h < hh + 1 {
         return 0;
     }
-    let glow = tint(MAGENTA, PANEL, 0.07);
+    let glow = tint(colors.magenta, colors.panel, 0.07);
     cv.fill(hx, y + 1, hw, hh, glow);
     for yy in y + 1..y + 1 + hh {
-        cv.text(hx, yy, "▏", tint(MAGENTA, PANEL, 0.35), Some(glow));
+        cv.text(
+            hx,
+            yy,
+            "▏",
+            tint(colors.magenta, colors.panel, 0.35),
+            Some(glow),
+        );
     }
     let t = hero.since_start;
     let red = hero.reduced;
@@ -199,7 +213,7 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
         ((t - 0.8) / 0.45).clamp(0.0, 1.0)
     };
     let mut star_k = Some(0);
-    let mut star_col = MAGENTA_HI;
+    let mut star_col = colors.magenta_hi;
     if !red && t < 1.1 {
         star_k = if t < 0.7 {
             None
@@ -208,7 +222,7 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
         };
     }
     if let Some(wt) = hero.waiting_for {
-        star_col = CYAN;
+        star_col = colors.cyan;
         if !red {
             star_k = Some(((wt / 0.25) as usize) % 12);
         }
@@ -246,7 +260,7 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
                 x + (w - tag.width() as i32) / 2,
                 my + 4,
                 tag,
-                mix(glow, INK2, ta),
+                mix(glow, colors.ink2, ta),
                 Some(glow),
             );
         },
@@ -259,7 +273,7 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
     if hero.checks.is_empty() || yy + 4 > y + h {
         return hh + 1;
     }
-    cv.bold(x + 6, yy, "READY", FAINT, None);
+    cv.bold(x + 6, yy, "READY", colors.faint, None);
     yy += 2;
     for (i, (ok, label)) in hero.checks.iter().enumerate() {
         // Each check lands 120 ms after the last, from 1.3 s.
@@ -271,18 +285,22 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
             0.0
         };
         if done {
-            let (g, col) = if *ok { ("✓", GREEN) } else { ("✕", RED) };
-            cv.bold(x + 7, yy, g, mix(col, WHITE, fl), None);
+            let (g, col) = if *ok {
+                ("✓", colors.green)
+            } else {
+                ("✕", colors.red)
+            };
+            cv.bold(x + 7, yy, g, mix(col, colors.white, fl), None);
             cv.bold(
                 x + 9,
                 yy,
                 &super::canvas::clip_text(label, w - 12),
-                INK,
+                colors.ink,
                 None,
             );
         } else {
-            cv.bold(x + 7, yy, star_at(t, 4.0, false), CYAN, None);
-            cv.bold(x + 9, yy, "checking", MUTED, None);
+            cv.bold(x + 7, yy, star_at(t, 4.0, false), colors.cyan, None);
+            cv.bold(x + 9, yy, "checking", colors.muted, None);
         }
         yy += 1;
     }
@@ -290,13 +308,13 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
     if yy + 7 > y + h {
         return hh + 1;
     }
-    cv.bold(x + 6, yy, "START WITH", FAINT, None);
+    cv.bold(x + 6, yy, "START WITH", colors.faint, None);
     yy += 2;
     let cards: [(&str, Rgb, &str); 4] = [
-        ("/models", VIOLET, "list models from providers"),
-        ("/sessions", MAGENTA, "browse and resume work"),
-        ("/help", BLUE, "keys and commands"),
-        ("?", INK2, "keys and commands"),
+        ("/models", colors.violet, "list models from providers"),
+        ("/sessions", colors.magenta, "browse and resume work"),
+        ("/help", colors.blue, "keys and commands"),
+        ("?", colors.ink2, "keys and commands"),
     ];
     let cw = ((w - 14) / 2).max(10);
     for (i, (cmd, col, desc)) in cards.iter().enumerate() {
@@ -310,13 +328,13 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
         if a <= 0.0 {
             continue;
         }
-        let bg = mix(PANEL, RAISE, a);
+        let bg = mix(colors.panel, colors.raise, a);
         cv.fill(cx, cy, cw, 2, bg);
-        cv.text(cx, cy, "▌", mix(PANEL, *col, a), Some(bg));
-        let (fg, chip) = if *col == INK2 {
-            (INK, RULE_HI)
+        cv.text(cx, cy, "▌", mix(colors.panel, *col, a), Some(bg));
+        let (fg, chip) = if *col == colors.ink2 {
+            (colors.ink, colors.rule_hi)
         } else {
-            (ON_ACCENT, *col)
+            (colors.on_accent, *col)
         };
         cv.put(
             cx + 2,
@@ -330,7 +348,7 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
             cx + 2,
             cy + 1,
             &super::canvas::clip_text(desc, cw - 3),
-            mix(RAISE, INK2, a),
+            mix(colors.raise, colors.ink2, a),
             Some(bg),
         );
     }

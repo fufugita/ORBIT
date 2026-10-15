@@ -30,6 +30,11 @@ pub struct TurnOptions {
     /// Tools advertised to the model this turn. `/compact` passes an
     /// EMPTY list: a summarization request must not advertise tools.
     pub tools: Vec<orbit_adapter::types::ToolDefinition>,
+    /// Optional structured content for the user message that starts this
+    /// turn. Callers supply the prompt's Text block alongside attachments;
+    /// the flattened message content remains `prompt` for text consumers.
+    /// None keeps the ordinary text-only message behavior.
+    pub user_blocks: Option<Vec<orbit_adapter::types::ContentBlock>>,
     /// The frozen system prompt (phase 4: built once per session by
     /// the context builder — base instructions, tools, environment,
     /// memory files, mods). Sent as the System message; never
@@ -129,6 +134,7 @@ impl Default for TurnOptions {
             // explicitly (every front-end resolves its own today).
             // Phase 3 moves the tool runtime into the engine.
             tools: Vec::new(),
+            user_blocks: None,
             system_directive: None,
             memory_bytes: 0,
             session_id: format!("s-{}", ulid::Ulid::new()),
@@ -191,6 +197,8 @@ pub fn run_turn(
     cancel: &orbit_provider_http::CancelToken,
     events: EventSink<'_>,
 ) -> Result<TurnReport, String> {
+    // Reject invalid selections before hooks, transcript mutation or tools.
+    config.validate_effort()?;
     // E9: hooks — the prompt enters the session before the turn runs.
     let hooks = crate::hooks::Hooks::load(home, crate::hooks::project_trusted(home));
     let _ = hooks.fire(
@@ -199,7 +207,11 @@ pub fn run_turn(
     );
 
     executor.begin_turn(config);
-    transcript.push(user_message(prompt));
+    let mut user = user_message(prompt);
+    if let Some(blocks) = &options.user_blocks {
+        user.blocks = Some(blocks.clone());
+    }
+    transcript.push(user);
 
     let mut report = TurnReport::default();
     let mut round: u32 = 0;
@@ -260,6 +272,7 @@ pub fn run_turn(
                 // transcript, so it is untouched here.
                 let keep_from = transcript.len().saturating_sub(COMPACT_KEEP_TAIL);
                 let tail: Vec<ChatMessage> = transcript.split_off(keep_from);
+                transcript.clear();
                 transcript.push(user_message(format!(
                     "[context compacted from {keep_from} older messages]\n\n{summary}"
                 )));
@@ -316,6 +329,19 @@ pub fn run_turn(
             });
         }
 
+        if cancel.is_cancelled() || o.finish_reason.as_deref() == Some("cancelled") {
+            if !o.output.is_empty() {
+                let mut partial = user_message(o.output.clone());
+                partial.role = ChatRole::Assistant;
+                transcript.push(partial);
+            }
+            report.final_text = o.output;
+            report.interrupted = true;
+            report.ok = false;
+            emit_turn_ended(events, &report, report.rounds);
+            return Ok(report);
+        }
+
         if o.tool_calls.is_empty() {
             // Terminal text round. A `length` stop means the reply was
             // cut off by the output-token limit — end the turn with a
@@ -347,6 +373,7 @@ pub fn run_turn(
             // them so a later switched-model dispatch can strip them.
             if m.blocks.is_some() {
                 m.origin_model = Some(config.model.clone());
+                m.origin_provider = Some(config.provider_id.clone());
             }
             transcript.push(m);
             report.final_text = o.output.clone();
@@ -387,6 +414,7 @@ pub fn run_turn(
         // Routing: same origin tag on the tool-call message's thinking.
         if m.blocks.is_some() {
             m.origin_model = Some(config.model.clone());
+            m.origin_provider = Some(config.provider_id.clone());
         }
         transcript.push(m);
 
@@ -462,6 +490,7 @@ pub fn run_turn(
                 tool_result: Some(r.content),
                 blocks,
                 origin_model: None,
+                origin_provider: None,
             });
         }
 
@@ -522,6 +551,9 @@ fn dispatch_with_retry(
 ) -> Result<crate::dispatch::TurnOutcome, String> {
     let mut attempt: u32 = 1;
     loop {
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
         // Mods directive: a System message at the FRONT of the provider
         // transcript (never persisted to the session file — it's rebuilt
         // from the enabled set every turn).
@@ -538,6 +570,7 @@ fn dispatch_with_retry(
                         tool_result: None,
                         blocks: None,
                         origin_model: None,
+                        origin_provider: None,
                     },
                 );
             }
@@ -563,6 +596,9 @@ fn dispatch_with_retry(
             &options.request_stem,
             &options.session_id,
         );
+        if cancel.is_cancelled() && result.is_err() {
+            return Err("cancelled".into());
+        }
         match result {
             Ok(o) => {
                 // The egress record was durable BEFORE the request left
@@ -678,6 +714,7 @@ pub(crate) fn assistant_with_calls_and_thinking(
         tool_result: None,
         blocks: None,
         origin_model: None,
+        origin_provider: None,
     };
     if let Some(t) = thinking.filter(|t| !t.is_empty()) {
         m.blocks = Some(vec![orbit_adapter::types::ContentBlock::Opaque {
@@ -769,7 +806,12 @@ fn compact_transcript(
     // Private sink (B6): the summary turn is housekeeping, not a turn
     // the front-end should see. Its deltas, usage and turn_ended would
     // land mid-turn on the real stream — swallow everything.
-    let mut private_sink = |_ev: FrontendEvent| {};
+    let mut truncated = false;
+    let mut private_sink = |ev: FrontendEvent| {
+        if matches!(ev, FrontendEvent::OutputTruncated { .. }) {
+            truncated = true;
+        }
+    };
     let report = run_turn(
         home,
         &summary_config,
@@ -781,7 +823,8 @@ fn compact_transcript(
         &mut private_sink,
     )
     .ok()?;
-    (!report.final_text.is_empty()).then_some(report.final_text)
+    (report.ok && !report.interrupted && !truncated && !report.final_text.is_empty())
+        .then_some(report.final_text)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -927,6 +970,79 @@ mod tests {
 #[cfg(test)]
 mod image_block_tests {
     use super::*;
+
+    fn cancelled_transcript(
+        prompt: &str,
+        user_blocks: Option<Vec<orbit_adapter::types::ContentBlock>>,
+    ) -> Vec<ChatMessage> {
+        let home = std::env::temp_dir().join(format!("orbit-user-blocks-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        let config = TurnConfig {
+            provider_id: "test".into(),
+            gate: "http://127.0.0.1:1".into(),
+            model: "test".into(),
+            kind: crate::dispatch::ProviderKind::OpenAiCompatible,
+            credential_env: None,
+            pricing: None,
+            max_output_tokens: 32,
+            sampling: None,
+            effort: None,
+            supported_efforts: None,
+        };
+        let options = TurnOptions {
+            user_blocks,
+            ..Default::default()
+        };
+        let cancel = orbit_provider_http::CancelToken::new();
+        cancel.cancel();
+        let mut transcript = vec![user_message("earlier turn")];
+        let mut executor = NoopExecutor;
+        let report = run_turn(
+            &home,
+            &config,
+            &options,
+            prompt,
+            &mut transcript,
+            &mut executor,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(report.interrupted);
+        std::fs::remove_dir_all(home).unwrap();
+        transcript
+    }
+
+    #[test]
+    fn initial_user_images_survive_the_engine_and_transcript_round_trip() {
+        use orbit_adapter::types::ContentBlock;
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "inspect this image".into(),
+            },
+            ContentBlock::Image {
+                data: "aGVsbG8=".into(),
+                media_type: "image/png".into(),
+            },
+        ];
+        let transcript = cancelled_transcript("inspect this image", Some(blocks.clone()));
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].content, "earlier turn");
+        assert!(transcript[0].blocks.is_none());
+        assert_eq!(transcript[1].role, ChatRole::User);
+        assert_eq!(transcript[1].content, "inspect this image");
+        assert_eq!(transcript[1].blocks, Some(blocks));
+        let saved = serde_json::to_string(&transcript).unwrap();
+        let restored: Vec<ChatMessage> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored[1].blocks, transcript[1].blocks);
+    }
+
+    #[test]
+    fn ordinary_user_turns_keep_the_text_only_contract() {
+        let transcript = cancelled_transcript("plain prompt", None);
+        assert_eq!(transcript[1].content, "plain prompt");
+        assert!(transcript[1].blocks.is_none());
+    }
 
     /// A Read result carrying image data yields one Image block; the
     /// text-only result yields none.

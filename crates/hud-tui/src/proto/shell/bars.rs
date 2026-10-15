@@ -3,7 +3,7 @@
 use super::canvas::{mix, segs_width, text_width, tint, Cv, Rgb, Seg};
 use super::frame::{keyhints, pill, pill_width};
 use super::motion::{ease_in_out, flash, prog, secs, shimmer, star_at};
-use super::pal::*;
+use super::pal::Palette;
 use crate::proto::scenario::{Activity, Scenario};
 use ratatui::style::Modifier;
 
@@ -90,23 +90,24 @@ pub struct TopBar<'a> {
 }
 
 pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
+    let colors = cv.palette;
     // Gradient strip: deep violet fading into the bar colour.
     let strip = (w as f32 * 0.42).max(20.0);
     for x in 0..w {
         let t = (x as f32 / strip).min(1.0).powf(0.8);
-        cv.fill(x, 0, 1, 1, mix(GRAD0, TOPBAR, t));
+        cv.fill(x, 0, 1, 1, mix(colors.grad0, colors.topbar, t));
     }
     let bg_at = |x: i32| -> Rgb {
         let t = (x as f32 / strip).min(1.0).powf(0.8);
-        mix(GRAD0, TOPBAR, t)
+        mix(colors.grad0, colors.topbar, t)
     };
-    cv.bold(2, 0, "✦", MAGENTA_HI, Some(bg_at(2)));
+    cv.bold(2, 0, "✦", colors.magenta_hi, Some(bg_at(2)));
     for (i, ch) in "ORBIT".chars().enumerate() {
         cv.bold(
             4 + i as i32,
             0,
             &ch.to_string(),
-            brand_at(i as f32 / 4.0),
+            colors.brand_at(i as f32 / 4.0),
             Some(bg_at(4 + i as i32)),
         );
     }
@@ -139,27 +140,34 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                     x,
                     0,
                     &format!(" {num} {title} "),
-                    ON_ACCENT,
-                    Some(MAGENTA),
+                    colors.on_accent,
+                    Some(colors.magenta),
                     Modifier::BOLD,
                 );
                 if *attn {
-                    x = cv.put(x, 0, "◆ ", ON_ACCENT, Some(MAGENTA), Modifier::BOLD);
+                    x = cv.put(
+                        x,
+                        0,
+                        "◆ ",
+                        colors.on_accent,
+                        Some(colors.magenta),
+                        Modifier::BOLD,
+                    );
                 }
             } else {
                 x = cv.put(
                     x,
                     0,
                     &format!(" {num} "),
-                    FAINT,
+                    colors.faint,
                     Some(bg_at(x)),
                     Modifier::BOLD,
                 );
                 if !short {
-                    x = cv.text(x, 0, &format!("{title} "), MUTED, Some(bg_at(x)));
+                    x = cv.text(x, 0, &format!("{title} "), colors.muted, Some(bg_at(x)));
                 }
                 if *attn {
-                    x = cv.put(x, 0, "◆ ", MAGENTA, Some(bg_at(x)), Modifier::BOLD);
+                    x = cv.put(x, 0, "◆ ", colors.magenta, Some(bg_at(x)), Modifier::BOLD);
                 }
             }
             cv.hit(from, 0, x - from, 1, super::hits::Click::Panel(*num - 1));
@@ -170,22 +178,29 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             let label = format!(" {name} ");
             let from = x;
             if tb.preset == Some(i) {
-                let pb = tint(MAGENTA, TOPBAR, 1.0);
-                x = cv.put(x, 0, &label, ON_ACCENT, Some(pb), Modifier::BOLD);
+                let pb = tint(colors.magenta, colors.topbar, 1.0);
+                x = cv.put(x, 0, &label, colors.on_accent, Some(pb), Modifier::BOLD);
                 if tb.approval_pending {
-                    x = cv.put(x, 0, "◆ ", ON_ACCENT, Some(pb), Modifier::BOLD);
+                    x = cv.put(x, 0, "◆ ", colors.on_accent, Some(pb), Modifier::BOLD);
                 }
             } else {
-                x = cv.text(x, 0, &label, MUTED, Some(bg_at(x)));
+                x = cv.text(x, 0, &label, colors.muted, Some(bg_at(x)));
             }
             cv.hit(from, 0, x - from, 1, super::hits::Click::Preset(i));
             x += 1;
         }
         if tb.preset.is_none() {
-            x = cv.put(x, 0, " yours ", INK2, Some(bg_at(x)), Modifier::BOLD) + 1;
+            x = cv.put(x, 0, " yours ", colors.ink2, Some(bg_at(x)), Modifier::BOLD) + 1;
         }
         if tb.zoom {
-            x = cv.put(x + 1, 0, " ZOOM ", ON_ACCENT, Some(AMBER), Modifier::BOLD);
+            x = cv.put(
+                x + 1,
+                0,
+                " ZOOM ",
+                colors.on_accent,
+                Some(colors.amber),
+                Modifier::BOLD,
+            );
         }
         // M30: `✓ saved` for 1.2 s, then it fades.
         if let Some(t) = tb.saved_ms {
@@ -200,7 +215,7 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                     x + 1,
                     0,
                     "✓ saved",
-                    mix(bg_at(x + 1), GREEN, a),
+                    mix(bg_at(x + 1), colors.green, a),
                     Some(bg_at(x + 1)),
                 );
             }
@@ -211,17 +226,28 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     let s = tb.scenario;
     let mut chips: Vec<(Vec<Seg>, Option<Rgb>, u8)> = Vec::new();
     if !tb.cwd.is_empty() {
-        chips.push((vec![Seg::new(tb.cwd.clone(), INK2)], Some(INK2), 1));
+        chips.push((
+            vec![Seg::new(tb.cwd.clone(), colors.ink2)],
+            Some(colors.ink2),
+            1,
+        ));
     }
     if let Some(b) = &tb.branch {
         chips.push((
-            vec![Seg::new("⎇ ", GREEN), Seg::bold(b.clone(), GREEN)],
-            Some(GREEN),
+            vec![
+                Seg::new("⎇ ", colors.green),
+                Seg::bold(b.clone(), colors.green),
+            ],
+            Some(colors.green),
             3,
         ));
     }
     if !s.model_id.is_empty() {
-        chips.push((vec![Seg::bold(s.model_id.clone(), VIOLET)], Some(VIOLET), 2));
+        chips.push((
+            vec![Seg::bold(s.model_id.clone(), colors.violet)],
+            Some(colors.violet),
+            2,
+        ));
     }
     if s.window_tokens > 0 {
         // M18: the meter eases to the new fraction in 300 ms.
@@ -231,25 +257,29 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             s.ctx_eased(tb.now_ms)
         };
         let k = (ctx * 10.0).round() as usize;
-        let mut meter = vec![Seg::new("ctx ", FAINT)];
+        let mut meter = vec![Seg::new("ctx ", colors.faint)];
         for i in 0..10 {
             let col = if i < k {
                 let u = i as f32 / 9.0;
                 if u < 0.5 {
-                    CYAN
+                    colors.cyan
                 } else if u < 0.8 {
-                    AMBER
+                    colors.amber
                 } else {
-                    RED
+                    colors.red
                 }
             } else {
-                RULE_HI
+                colors.rule_hi
             };
             meter.push(Seg::new(if i < k { "▰" } else { "▱" }, col));
         }
         meter.push(Seg::new(
             format!(" {}%", (ctx * 100.0).round() as u32),
-            if ctx > 0.85 { AMBER } else { INK2 },
+            if ctx > 0.85 {
+                colors.amber
+            } else {
+                colors.ink2
+            },
         ));
         chips.push((meter, None, 9));
     }
@@ -260,8 +290,8 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                 Seg::bold(
                     "● ",
                     mix(
-                        GREEN,
-                        WHITE,
+                        colors.green,
+                        colors.white,
                         flash(
                             secs(tb.now_ms),
                             s.ledger_ms.map(secs),
@@ -270,7 +300,7 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
                         ),
                     ),
                 ),
-                Seg::new(group_thousands(n), INK2),
+                Seg::new(group_thousands(n), colors.ink2),
             ],
             None,
             4,
@@ -280,9 +310,9 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
         chips.push((
             vec![Seg::bold(
                 format!("${:.3}", s.cost_microcents as f64 / 1_000_000.0),
-                AMBER,
+                colors.amber,
             )],
-            Some(AMBER),
+            Some(colors.amber),
             10,
         ));
     }
@@ -303,8 +333,8 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     let mut rx = w - 1 - total;
     for (parts, col, _) in &chips {
         match col {
-            Some(c) => rx = pill(cv, rx, 0, parts, *c, TOPBAR, 0.22) + 1,
-            None => rx = cv.spans(rx, 0, parts, Some(TOPBAR)) + 1,
+            Some(c) => rx = pill(cv, rx, 0, parts, *c, colors.topbar, 0.22) + 1,
+            None => rx = cv.spans(rx, 0, parts, Some(colors.topbar)) + 1,
         }
     }
     let _ = pill_width;
@@ -323,12 +353,14 @@ fn group_thousands(n: u64) -> String {
 }
 
 /// The permission-mode pill: label + (fg, bg).
-pub fn mode_pill_spec(mode: Option<&str>) -> (&'static str, Rgb, Rgb) {
+pub fn mode_pill_spec_themed(colors: Palette, mode: Option<&str>) -> (&'static str, Rgb, Rgb) {
     match mode.unwrap_or("default") {
-        "acceptEdits" | "accept_edits" | "accept-edits" => ("ACCEPT EDITS", ON_ACCENT, VIOLET),
-        "plan" => ("PLAN", ON_ACCENT, CYAN),
-        "bypass" | "bypassPermissions" | "dontAsk" => ("BYPASS", WHITE, RED),
-        _ => ("DEFAULT", INK, MODE_DEFAULT_BG),
+        "acceptEdits" | "accept_edits" | "accept-edits" => {
+            ("ACCEPT EDITS", colors.on_accent, colors.violet)
+        }
+        "plan" => ("PLAN", colors.on_accent, colors.cyan),
+        "bypass" | "bypassPermissions" | "dontAsk" => ("BYPASS", colors.white, colors.red),
+        _ => ("DEFAULT", colors.ink, colors.mode_default_bg),
     }
 }
 
@@ -346,9 +378,17 @@ pub fn status_line(
     focus_is_diff: bool,
     arranging: bool,
 ) {
-    cv.fill(0, y, w, 1, APP);
+    let colors = cv.palette;
+    cv.fill(0, y, w, 1, colors.app);
     if arranging {
-        let mut x = cv.put(1, y, " NAVIGATE ", ON_ACCENT, Some(CYAN), Modifier::BOLD) + 2;
+        let mut x = cv.put(
+            1,
+            y,
+            " NAVIGATE ",
+            colors.on_accent,
+            Some(colors.cyan),
+            Modifier::BOLD,
+        ) + 2;
         let all: [(&str, &str); 10] = [
             ("h j k l", "move"),
             ("H J K L", "swap"),
@@ -369,16 +409,18 @@ pub fn status_line(
             }
             fit.push(h);
         }
-        keyhints(cv, x, y, &fit, Some(APP));
+        keyhints(cv, x, y, &fit, Some(colors.app));
         x = 0;
         let _ = x;
         return;
     }
     // M14: the new colour wipes across the pill in 240 ms; the label
     // swaps at the midpoint.
-    let (n_label, n_fg, n_bg) = mode_pill_spec(s.permission_mode.as_deref());
-    let (o_label, o_fg, o_bg) =
-        mode_pill_spec(s.mode_prev.as_deref().or(s.permission_mode.as_deref()));
+    let (n_label, n_fg, n_bg) = mode_pill_spec_themed(colors, s.permission_mode.as_deref());
+    let (o_label, o_fg, o_bg) = mode_pill_spec_themed(
+        colors,
+        s.mode_prev.as_deref().or(s.permission_mode.as_deref()),
+    );
     let p = ease_in_out(prog(
         secs(now_ms),
         s.mode_changed_ms.map(secs),
@@ -404,12 +446,17 @@ pub fn status_line(
     let el = |t: u64| {
         let n = secs(t);
         if n >= 1 {
-            vec![Seg::new(format!(" · {n}s"), MUTED)]
+            vec![Seg::new(format!(" · {n}s"), colors.muted)]
         } else {
             vec![]
         }
     };
-    let head = |g: &str, col: Rgb| vec![Seg::bold(g.to_string(), col), Seg::bold(" ORBIT  ", INK2)];
+    let head = |g: &str, col: Rgb| {
+        vec![
+            Seg::bold(g.to_string(), col),
+            Seg::bold(" ORBIT  ", colors.ink2),
+        ]
+    };
     // M27: rate-limit backoff — a still amber star and a draining bar.
     let backoff = s.backoff_until_ms.filter(|u| *u > now_ms);
     let (seg_col, parts): (Option<Rgb>, Vec<Seg>) = if let Some(until) = backoff {
@@ -418,16 +465,16 @@ pub fn status_line(
         let k =
             ((n as f32 * left as f32 / s.backoff_total_ms.max(1) as f32).round() as usize).min(n);
         (
-            Some(AMBER),
+            Some(colors.amber),
             [
-                head("✦", AMBER),
+                head("✦", colors.amber),
                 vec![
                     Seg::bold(
                         format!("rate limited · retrying in {}s ", left.div_ceil(1000)),
-                        AMBER,
+                        colors.amber,
                     ),
-                    Seg::new("▰".repeat(k), AMBER),
-                    Seg::new("▱".repeat(n - k), RULE_HI),
+                    Seg::new("▰".repeat(k), colors.amber),
+                    Seg::new("▱".repeat(n - k), colors.rule_hi),
                 ],
             ]
             .concat(),
@@ -435,71 +482,92 @@ pub fn status_line(
     } else {
         match s.activity() {
             Activity::Approval(t) => (
-                Some(MAGENTA),
+                Some(colors.magenta),
                 [
-                    head("✦", MAGENTA),
-                    vec![Seg::bold(format!("◆ approval needed · {t}"), MAGENTA)],
+                    head("✦", colors.magenta),
+                    vec![Seg::bold(
+                        format!("◆ approval needed · {t}"),
+                        colors.magenta,
+                    )],
                 ]
                 .concat(),
             ),
             Activity::RunningMany(n) => (
-                Some(CYAN),
+                Some(colors.cyan),
                 [
-                    head(star, CYAN),
-                    sh(&format!("running {n} tools"), CYAN),
+                    head(star, colors.cyan),
+                    sh(&format!("running {n} tools"), colors.cyan),
                     el(s.turn_started_ms),
                 ]
                 .concat(),
             ),
             Activity::Running(t) => (
-                Some(CYAN),
+                Some(colors.cyan),
                 [
-                    head(star, CYAN),
-                    sh(&format!("running {t}"), CYAN),
+                    head(star, colors.cyan),
+                    sh(&format!("running {t}"), colors.cyan),
                     el(s.turn_started_ms),
                 ]
                 .concat(),
             ),
             Activity::Streaming => (
-                Some(CYAN),
+                Some(colors.cyan),
                 [
-                    head(star, CYAN),
-                    sh("streaming", CYAN),
+                    head(star, colors.cyan),
+                    sh("streaming", colors.cyan),
                     el(s.turn_started_ms),
                 ]
                 .concat(),
             ),
             Activity::WaitingModel(m) => (
-                Some(CYAN),
+                Some(colors.cyan),
                 [
-                    head(star, CYAN),
-                    sh(&format!("waiting for {m}"), CYAN),
+                    head(star, colors.cyan),
+                    sh(&format!("waiting for {m}"), colors.cyan),
                     el(s.turn_started_ms),
                 ]
                 .concat(),
             ),
             Activity::Compacting => (
-                Some(AMBER),
-                [head(star, AMBER), sh("compacting context", AMBER)].concat(),
+                Some(colors.amber),
+                [
+                    head(star, colors.amber),
+                    sh("compacting context", colors.amber),
+                ]
+                .concat(),
             ),
             Activity::Done => (
-                Some(GREEN),
-                [head("✦", MAGENTA), vec![Seg::bold("✓ done", GREEN)]].concat(),
+                Some(colors.green),
+                [
+                    head("✦", colors.magenta),
+                    vec![Seg::bold("✓ done", colors.green)],
+                ]
+                .concat(),
             ),
             Activity::Failed => (
-                Some(RED),
-                [head("✦", MAGENTA), vec![Seg::bold("✕ failed", RED)]].concat(),
+                Some(colors.red),
+                [
+                    head("✦", colors.magenta),
+                    vec![Seg::bold("✕ failed", colors.red)],
+                ]
+                .concat(),
             ),
             Activity::Ready => (
                 None,
-                [head("✦", MAGENTA), vec![Seg::new("ready", MUTED)]].concat(),
+                [
+                    head("✦", colors.magenta),
+                    vec![Seg::new("ready", colors.muted)],
+                ]
+                .concat(),
             ),
         }
     };
-    let bg = seg_col.map(|c| tint(c, APP, 0.16)).unwrap_or(APP);
-    x = cv.text(x, y, " ", INK, Some(bg));
+    let bg = seg_col
+        .map(|c| tint(c, colors.app, 0.16))
+        .unwrap_or(colors.app);
+    x = cv.text(x, y, " ", colors.ink, Some(bg));
     x = cv.spans(x, y, &parts, Some(bg));
-    cv.text(x, y, " ", INK, Some(bg));
+    cv.text(x, y, " ", colors.ink, Some(bg));
 
     // Esc stops a running turn wherever focus is; only when none runs does
     // it start arranging.
@@ -535,6 +603,10 @@ pub fn status_line(
     let hw = super::frame::hints_width(&hints);
     let used = x + 2 + segs_width(&parts);
     if used + hw + 2 < w {
-        keyhints(cv, w - 1 - hw, y, &hints, Some(APP));
+        keyhints(cv, w - 1 - hw, y, &hints, Some(colors.app));
     }
+}
+
+pub fn mode_pill_spec(mode: Option<&str>) -> (&'static str, Rgb, Rgb) {
+    mode_pill_spec_themed(Palette::default(), mode)
 }

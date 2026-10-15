@@ -85,6 +85,8 @@ fn gate2_anthropic_tool_round_and_replay() {
 
     let config = orbit_engine::TurnConfig {
         sampling: None,
+        effort: None,
+        supported_efforts: None,
         provider_id: "mock-anthropic".into(),
         // The adapter builds https://host:port/v1/messages from the
         // route; the mock listens on plain http loopback. The adapter

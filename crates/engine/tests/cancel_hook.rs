@@ -101,6 +101,8 @@ fn the_engine_scopes_the_turn_token_around_each_rounds_tools() {
     std::fs::create_dir_all(dir.join("ledger")).expect("mkdir ledger");
     let config = orbit_engine::TurnConfig {
         sampling: None,
+        effort: None,
+        supported_efforts: None,
         provider_id: "mock".into(),
         gate: format!("http://127.0.0.1:{}", addr.port()),
         model: "test-model".into(),

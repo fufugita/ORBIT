@@ -31,7 +31,8 @@ pub struct Mod {
 }
 
 /// The persisted enabled-set (mods/enabled.json).
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnabledSet {
     /// Mod names currently enabled. Absent file = all mods with
     /// `default = true` in their mod.toml (or, if none declare a default,
@@ -39,124 +40,364 @@ pub struct EnabledSet {
     pub enabled: Vec<String>,
 }
 
-/// Scan `$ORBIT_HOME/mods/` and load every well-formed mod directory.
-/// Malformed entries are skipped (a broken mod must never break chat).
-pub fn load_all(home: &Path) -> Vec<Mod> {
-    let root = home.join("mods");
-    let entries = match std::fs::read_dir(&root) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut mods = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        if let Some(m) = load_one(&entry.path()) {
-            mods.push(m);
-        }
-    }
-    mods.sort_by(|a, b| a.name.cmp(&b.name));
-    mods
-}
+const MAX_BYTES: usize = 128 * 1024;
+const MAX_MODS: usize = 128;
+const MAX_COMMANDS: usize = 64;
 
-/// Load a single mod directory. Returns None when mod.toml or
-/// instructions.md is missing/unreadable (skip silently — the operator
-/// sees the gap in `/mods`).
-fn load_one(dir: &Path) -> Option<Mod> {
-    let meta_raw = std::fs::read_to_string(dir.join("mod.toml")).ok()?;
-    let name = dir.file_name()?.to_str()?.to_string();
-    // Minimal TOML parse: `key = "value"` lines only. Full serde_toml for
-    // two string fields would pull a dependency into the hot path; the
-    // format is ours, so a strict line parser is enough and fails loudly
-    // on malformed input (mod skipped).
-    let mut description = String::new();
-    let mut default_on = false;
-    for line in meta_raw.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("description") {
-            let rest = rest.trim_start().strip_prefix('=')?.trim();
-            description = rest.trim_matches('"').to_string();
-        } else if let Some(rest) = line.strip_prefix("default") {
-            let rest = rest.trim_start().strip_prefix('=')?.trim();
-            default_on = rest == "true";
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.chars().any(char::is_control)
+}
+fn checked_dir(path: &Path) -> Result<crate::customization::Directory, String> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = crate::customization::Directory::open(path, false).map_err(|e| e.to_string())?;
+    let metadata = std::fs::metadata(dir.io().map_err(|e| e.to_string())?)
+        .map_err(|_| "instruction directory is unreadable")?;
+    let uid = std::fs::metadata("/proc/self")
+        .map_err(|_| "cannot determine local owner")?
+        .uid();
+    if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        return Err("instruction directory has unsafe ownership or permissions".into());
+    }
+    Ok(dir)
+}
+fn root(home: &Path, create: bool) -> Result<Option<crate::customization::Directory>, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let path = mods_dir(home);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => checked_dir(&path).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = if home.exists() {
+                checked_dir(home)?
+            } else {
+                crate::customization::Directory::create(home).map_err(|e| e.to_string())?
+            };
+            match std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(parent.io().map_err(|e| e.to_string())?.join("mods"))
+            {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err("cannot create instruction directory".into()),
+            }
+            parent.sync().map_err(|e| e.to_string())?;
+            checked_dir(&path).map(Some)
+        }
+        Err(_) => Err("cannot inspect instruction directory".into()),
+    }
+}
+fn read_file(dir: &crate::customization::Directory, name: &str) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = dir.io().map_err(|e| e.to_string())?.join(name);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| "instruction file is missing or unreadable")?;
+    if metadata.mode() & 0o022 != 0 {
+        return Err("instruction file has unsafe permissions".into());
+    }
+    let bytes = crate::customization::read_regular(&path, MAX_BYTES, false)
+        .map_err(|_| "instruction file must be bounded, owned, regular and unlinked")?;
+    dir.check().map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+#[derive(Default)]
+struct Metadata {
+    description: String,
+    default_on: bool,
+}
+fn metadata(dir: &crate::customization::Directory) -> Result<Metadata, String> {
+    let raw = read_file(dir, "mod.toml")?;
+    let table: toml::Value =
+        toml::from_str(std::str::from_utf8(&raw).map_err(|_| "instruction metadata is not UTF-8")?)
+            .map_err(|_| "instruction metadata is malformed TOML")?;
+    let table = table
+        .as_table()
+        .ok_or("instruction metadata must be a table")?;
+    if let Some(name) = table.get("name") {
+        if !name.as_str().is_some_and(valid_name) {
+            return Err("instruction metadata name is invalid".into());
         }
     }
-    let instructions = std::fs::read_to_string(dir.join("instructions.md")).ok()?;
+    let description = match table.get("description") {
+        None => String::new(),
+        Some(value) => value
+            .as_str()
+            .filter(|s| {
+                s.len() <= 1024 && !s.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+            })
+            .ok_or("instruction description is invalid")?
+            .to_string(),
+    };
+    let default_on = match table.get("default") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or("instruction default must be boolean")?,
+    };
+    Ok(Metadata {
+        description,
+        default_on,
+    })
+}
+fn load_one_checked(path: &Path) -> Result<Mod, String> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| valid_name(n))
+        .ok_or("instruction bundle name is invalid")?
+        .to_string();
+    let dir = checked_dir(path)?;
+    let meta = metadata(&dir)?;
+    let instructions = String::from_utf8(read_file(&dir, "instructions.md")?)
+        .map_err(|_| "instruction text is not UTF-8")?;
     if instructions.trim().is_empty() {
-        return None;
+        return Err("instruction text is empty".into());
     }
-    // Optional commands: commands/<cmd>.md → /<name>:<cmd>
+    let mut total = instructions.len();
     let mut commands = BTreeMap::new();
-    if let Ok(entries) = std::fs::read_dir(dir.join("commands")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let cmd = path.file_stem()?.to_str()?.to_string();
-            if let Ok(body) = std::fs::read_to_string(&path) {
+    let command_path = path.join("commands");
+    match std::fs::symlink_metadata(&command_path) {
+        Ok(_) => {
+            let directory = checked_dir(&command_path)?;
+            for (index, entry) in std::fs::read_dir(directory.io().map_err(|e| e.to_string())?)
+                .map_err(|_| "instruction commands are unreadable")?
+                .enumerate()
+            {
+                if index >= MAX_COMMANDS {
+                    return Err("instruction command count exceeds 64".into());
+                }
+                let entry = entry.map_err(|_| "instruction command entry is unreadable")?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or("instruction command name is invalid")?;
+                if !name.ends_with(".md") {
+                    continue;
+                }
+                let command = name
+                    .strip_suffix(".md")
+                    .filter(|n| valid_name(n))
+                    .ok_or("instruction command name is invalid")?;
+                let body = String::from_utf8(read_file(&directory, name)?)
+                    .map_err(|_| "instruction command is not UTF-8")?;
+                total += body.len();
+                if total > 1024 * 1024 {
+                    return Err("instruction bundle exceeds 1 MiB".into());
+                }
                 if !body.trim().is_empty() {
-                    commands.insert(cmd, body);
+                    commands.insert(command.to_string(), body);
                 }
             }
+            directory.check().map_err(|e| e.to_string())?;
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("instruction commands are unsafe".into()),
     }
-    let _ = default_on; // used by initial_enabled(); kept for clarity
-    Some(Mod {
+    dir.check().map_err(|e| e.to_string())?;
+    Ok(Mod {
         name,
-        description,
+        description: meta.description,
         instructions,
         commands,
     })
 }
-
+fn bundle_paths(home: &Path) -> Result<Vec<PathBuf>, String> {
+    let Some(directory) = root(home, false)? else {
+        return Ok(Vec::new());
+    };
+    let mut paths = Vec::new();
+    for (index, entry) in std::fs::read_dir(directory.io().map_err(|e| e.to_string())?)
+        .map_err(|_| "instruction bundles are unreadable")?
+        .enumerate()
+    {
+        if index >= 256 {
+            return Err("instruction root entry count exceeds 256".into());
+        }
+        let entry = entry.map_err(|_| "instruction bundle entry is unreadable")?;
+        let kind = entry
+            .file_type()
+            .map_err(|_| "instruction bundle type is unreadable")?;
+        if kind.is_symlink() {
+            return Err("instruction bundle symlink is refused".into());
+        }
+        if kind.is_dir() {
+            if paths.len() >= MAX_MODS {
+                return Err("instruction bundle count exceeds 128".into());
+            }
+            paths.push(mods_dir(home).join(entry.file_name()));
+        }
+    }
+    directory.check().map_err(|e| e.to_string())?;
+    paths.sort();
+    Ok(paths)
+}
+/// Load valid instruction bundles. Invalid bundles never execute or become active.
+/// Explicit diagnostics are available through validation_status/doctor.
+pub fn load_all(home: &Path) -> Vec<Mod> {
+    bundle_paths(home)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| load_one_checked(p).ok())
+        .collect()
+}
 /// The mods root directory.
 pub fn mods_dir(home: &Path) -> PathBuf {
     home.join("mods")
 }
-
-/// Read the persisted enabled set. Missing file → None (caller computes
-/// defaults from mod.toml `default = true` flags).
+fn enabled_bytes(directory: &crate::customization::Directory) -> Result<Option<Vec<u8>>, String> {
+    let path = directory
+        .io()
+        .map_err(|e| e.to_string())?
+        .join("enabled.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => read_file(directory, "enabled.json").map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("enabled metadata is unreadable".into()),
+    }
+}
+fn validate_enabled(set: &EnabledSet) -> Result<(), String> {
+    if set.enabled.len() > MAX_MODS {
+        return Err("enabled instruction count exceeds 128".into());
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    if set
+        .enabled
+        .iter()
+        .any(|name| !valid_name(name) || !unique.insert(name))
+    {
+        return Err("enabled instruction names are invalid or duplicated".into());
+    }
+    Ok(())
+}
+fn parse_enabled(bytes: Option<&[u8]>) -> Result<Option<EnabledSet>, String> {
+    bytes
+        .map(|raw| {
+            let set: EnabledSet = serde_json::from_slice(raw)
+                .map_err(|_| "enabled instruction metadata is malformed")?;
+            validate_enabled(&set)?;
+            Ok(set)
+        })
+        .transpose()
+}
+/// Missing and invalid enabled metadata are distinct. Invalid data is never rewritten.
+pub fn read_enabled_checked(home: &Path) -> Result<Option<EnabledSet>, String> {
+    let Some(directory) = root(home, false)? else {
+        return Ok(None);
+    };
+    parse_enabled(enabled_bytes(&directory)?.as_deref())
+}
+/// Compatibility reader fails closed on malformed metadata, rather than enabling defaults.
 pub fn read_enabled(home: &Path) -> Option<EnabledSet> {
-    let path = mods_dir(home).join("enabled.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    match read_enabled_checked(home) {
+        Ok(set) => set,
+        Err(_) => Some(EnabledSet::default()),
+    }
 }
-
-/// Persist the enabled set.
+fn publish_enabled(
+    directory: &crate::customization::Directory,
+    expected: Option<Vec<u8>>,
+    set: &EnabledSet,
+) -> Result<(), String> {
+    use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(set).map_err(|_| "cannot encode enabled metadata")?;
+    if bytes.len() > MAX_BYTES {
+        return Err("enabled metadata exceeds 128 KiB".into());
+    }
+    let parent = std::fs::File::open(directory.io().map_err(|e| e.to_string())?)
+        .map_err(|_| "cannot hold instruction directory")?;
+    let name = format!(".enabled-{}.tmp", ulid::Ulid::new());
+    let fd = openat(
+        &parent,
+        &name,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| "cannot stage enabled metadata")?;
+    let mut staged = std::fs::File::from(fd);
+    let result = (|| {
+        staged
+            .write_all(&bytes)
+            .map_err(|_| "cannot write enabled metadata")?;
+        staged
+            .sync_all()
+            .map_err(|_| "cannot sync enabled metadata")?;
+        if enabled_bytes(directory)? != expected {
+            return Err("enabled metadata changed during publication".into());
+        }
+        directory.check().map_err(|e| e.to_string())?;
+        renameat(&parent, &name, &parent, "enabled.json")
+            .map_err(|_| "cannot publish enabled metadata")?;
+        directory.sync().map_err(|_| {
+            "enabled metadata publication uncertain; reload before retry".to_string()
+        })?;
+        Ok(())
+    })();
+    let _ = unlinkat(&parent, &name, AtFlags::empty());
+    result
+}
+fn mutate_enabled(
+    home: &Path,
+    operation: impl FnOnce(Option<EnabledSet>) -> Result<EnabledSet, String>,
+) -> Result<(), String> {
+    // Validate existing data before creating even the stable mutation lock.
+    read_enabled_checked(home)?;
+    let directory = root(home, true)?.ok_or("instruction root is missing")?;
+    let _lock = crate::customization::Lock::acquire(&directory, ".enabled.lock")
+        .map_err(|e| e.to_string())?;
+    let before = enabled_bytes(&directory)?;
+    let set = operation(parse_enabled(before.as_deref())?)?;
+    validate_enabled(&set)?;
+    publish_enabled(&directory, before, &set)
+}
+/// Publish a private durable enabled set under a stable lock; retain malformed bytes.
 pub fn write_enabled(home: &Path, set: &EnabledSet) -> Result<(), String> {
-    let dir = mods_dir(home);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {dir:?}: {e}"))?;
-    let json = serde_json::to_string_pretty(set).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("enabled.json"), json).map_err(|e| format!("write: {e}"))
+    validate_enabled(set)?;
+    mutate_enabled(home, |_| Ok(set.clone()))
 }
-
-/// Compute the initial enabled set: persisted file wins; otherwise mods
-/// declaring `default = true`. (Re-reads mod.toml `default` flags — the
-/// Mod struct doesn't carry them to keep its surface small.)
+fn defaults(home: &Path, mods: &[Mod]) -> Vec<String> {
+    mods.iter()
+        .filter(|m| {
+            checked_dir(&mods_dir(home).join(&m.name))
+                .ok()
+                .and_then(|d| metadata(&d).ok())
+                .is_some_and(|m| m.default_on)
+        })
+        .map(|m| m.name.clone())
+        .collect()
+}
+/// Explicit saved settings win. Malformed metadata disables defaults and is reported by doctor.
 pub fn initial_enabled(home: &Path, mods: &[Mod]) -> Vec<String> {
-    if let Some(set) = read_enabled(home) {
-        // Drop names that no longer exist on disk.
-        return set
+    match read_enabled_checked(home) {
+        Ok(Some(set)) => set
             .enabled
             .into_iter()
             .filter(|n| mods.iter().any(|m| &m.name == n))
-            .collect();
+            .collect(),
+        Ok(None) => defaults(home, mods),
+        Err(_) => Vec::new(),
     }
-    let mut defaults = Vec::new();
-    for m in mods {
-        let meta = std::fs::read_to_string(mods_dir(home).join(&m.name).join("mod.toml"));
-        if let Ok(raw) = meta {
-            if raw.lines().any(|l| {
-                let l = l.trim();
-                l.starts_with("default") && l.ends_with("true")
-            }) {
-                defaults.push(m.name.clone());
-            }
-        }
-    }
-    defaults
+}
+#[derive(Debug, serde::Serialize)]
+pub struct ModValidation {
+    pub bundles: usize,
+    pub commands: usize,
+    pub enabled: Vec<String>,
+}
+/// Inspect actual instruction and enabled metadata without executing extension code.
+pub fn validation_status(home: &Path) -> Result<ModValidation, String> {
+    let mods = bundle_paths(home)?
+        .iter()
+        .map(|p| load_one_checked(p))
+        .collect::<Result<Vec<_>, _>>()?;
+    read_enabled_checked(home)?;
+    Ok(ModValidation {
+        bundles: mods.len(),
+        commands: mods.iter().map(|m| m.commands.len()).sum(),
+        enabled: initial_enabled(home, &mods),
+    })
 }
 
 /// Build the system message that carries all enabled mods' instructions.
@@ -186,40 +427,65 @@ always take precedence.\n",
 /// Toggle a mod in the enabled set. Returns the new state (true = now
 /// enabled). Persists immediately.
 pub fn toggle(home: &Path, mods: &[Mod], name: &str) -> Result<bool, String> {
-    if !mods.iter().any(|m| m.name == name) {
-        return Err(format!("no such mod: {name} (see /mods)"));
+    if !valid_name(name) || !mods.iter().any(|m| m.name == name) {
+        return Err("no such instruction bundle (see /mods)".into());
     }
-    let mut set = read_enabled(home).unwrap_or_default();
-    let currently = set.enabled.iter().any(|n| n == name);
-    if currently {
-        set.enabled.retain(|n| n != name);
-    } else {
-        set.enabled.push(name.to_string());
-    }
-    write_enabled(home, &set)?;
-    Ok(!currently)
+    let mut next = false;
+    mutate_enabled(home, |saved| {
+        let mut set = saved.unwrap_or_else(|| EnabledSet {
+            enabled: defaults(home, mods),
+        });
+        let currently = set.enabled.iter().any(|n| n == name);
+        if currently {
+            set.enabled.retain(|n| n != name);
+        } else {
+            set.enabled.push(name.to_string());
+        }
+        next = !currently;
+        Ok(set)
+    })?;
+    Ok(next)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    fn fixture_dir(path: &Path) {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .unwrap();
+    }
+
+    fn fixture_file(path: &Path, contents: &str) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+    }
 
     fn tmp_home(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("orbit-mods-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!("orbit-mods-test-{tag}-{}", ulid::Ulid::new()));
+        fixture_dir(&dir);
         dir
     }
 
     fn make_mod(home: &Path, name: &str, instructions: &str, default: bool) {
         let dir = mods_dir(home).join(name);
-        std::fs::create_dir_all(dir.join("commands")).unwrap();
-        std::fs::write(
-            dir.join("mod.toml"),
-            format!("description = \"test mod {name}\"\ndefault = {default}\n"),
-        )
-        .unwrap();
-        std::fs::write(dir.join("instructions.md"), instructions).unwrap();
+        fixture_dir(&dir.join("commands"));
+        fixture_file(
+            &dir.join("mod.toml"),
+            &format!("description = \"test mod {name}\"\ndefault = {default}\n"),
+        );
+        fixture_file(&dir.join("instructions.md"), instructions);
     }
 
     #[test]
@@ -262,9 +528,9 @@ mod tests {
     fn broken_mod_is_skipped() {
         let home = tmp_home("broken");
         let dir = mods_dir(&home).join("broken");
-        std::fs::create_dir_all(&dir).unwrap();
+        fixture_dir(&dir);
         // mod.toml exists but instructions.md doesn't → skipped.
-        std::fs::write(dir.join("mod.toml"), "description = \"x\"\n").unwrap();
+        fixture_file(&dir.join("mod.toml"), "description = \"x\"\n");
         assert!(load_all(&home).is_empty());
     }
 
@@ -272,10 +538,10 @@ mod tests {
     fn mod_commands_load() {
         let home = tmp_home("cmds");
         let dir = mods_dir(&home).join("alpha");
-        std::fs::create_dir_all(dir.join("commands")).unwrap();
-        std::fs::write(dir.join("mod.toml"), "description = \"d\"\n").unwrap();
-        std::fs::write(dir.join("instructions.md"), "guide").unwrap();
-        std::fs::write(dir.join("commands").join("review.md"), "Review the diff.").unwrap();
+        fixture_dir(&dir.join("commands"));
+        fixture_file(&dir.join("mod.toml"), "description = \"d\"\n");
+        fixture_file(&dir.join("instructions.md"), "guide");
+        fixture_file(&dir.join("commands").join("review.md"), "Review the diff.");
         let mods = load_all(&home);
         assert_eq!(mods[0].commands.len(), 1);
         assert_eq!(mods[0].commands["review"], "Review the diff.");

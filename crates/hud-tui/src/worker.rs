@@ -24,6 +24,10 @@ pub enum WorkerCommand {
     PlanPrompt(String),
     /// `/model <M>` — switch the active model for subsequent turns.
     SetModel(String),
+    /// `/effort [VALUE]` — query or select a subsequent-request effort control.
+    Effort(String),
+    /// `/route` — inspect routing or explicitly restore automatic selection.
+    Route(String),
     /// `/models` — list provider/model entries (formatted by the worker).
     ListModels,
     /// `/sessions` — list saved sessions (formatted by the worker).

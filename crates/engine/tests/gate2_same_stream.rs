@@ -80,6 +80,8 @@ fn run_session(
 ) -> (Vec<String>, orbit_engine::TurnReport) {
     let config = TurnConfig {
         sampling: None,
+        effort: None,
+        supported_efforts: None,
         provider_id: "mock".into(),
         gate: format!("http://127.0.0.1:{}", addr.port()),
         model: "test-model".into(),

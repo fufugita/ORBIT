@@ -14,24 +14,28 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 /// A keycap chip (§6.15 style): surface2 fill, ink bold letters.
 /// Mono tier brackets it — handled by the caller's tier.
-fn keycap(key: &str) -> Span<'static> {
+fn keycap_themed(colors: crate::proto::shell::pal::Palette, key: &str) -> Span<'static> {
     Span::styled(
         format!(" {key} "),
         Style::default()
-            .fg(comps::colour(Token::Ink))
-            .bg(comps::colour(Token::Panel))
+            .fg(comps::colour_themed(colors, Token::Ink))
+            .bg(comps::colour_themed(colors, Token::Panel))
             .add_modifier(Modifier::BOLD),
     )
 }
 
 /// One hint: keycap + label.
-fn hint(key: &str, label: &str) -> Vec<Span<'static>> {
+fn hint_themed(
+    colors: crate::proto::shell::pal::Palette,
+    key: &str,
+    label: &str,
+) -> Vec<Span<'static>> {
     vec![
-        keycap(key),
+        keycap_themed(colors, key),
         Span::raw(" "),
         Span::styled(
             label.to_string(),
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         ),
         Span::raw("   "),
     ]
@@ -39,7 +43,8 @@ fn hint(key: &str, label: &str) -> Vec<Span<'static>> {
 
 /// The hint row (§9.13): keycaps + one context hint, toast at the
 /// right end.
-pub fn hint_row(
+pub fn hint_row_themed(
+    colors: crate::proto::shell::pal::Palette,
     turn_live: bool,
     transcript_tall: bool,
     toast: Option<&str>,
@@ -47,18 +52,18 @@ pub fn hint_row(
 ) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     if turn_live {
-        spans.extend(hint("⏎", "queue"));
-        spans.extend(hint("⇧⏎", "newline"));
+        spans.extend(hint_themed(colors, "⏎", "queue"));
+        spans.extend(hint_themed(colors, "⇧⏎", "newline"));
     } else {
-        spans.extend(hint("⏎", "send"));
-        spans.extend(hint("⇧⏎", "newline"));
-        spans.extend(hint("/", "commands"));
+        spans.extend(hint_themed(colors, "⏎", "send"));
+        spans.extend(hint_themed(colors, "⇧⏎", "newline"));
+        spans.extend(hint_themed(colors, "/", "commands"));
     }
     // One context hint, first that applies. (Single-view layouts
     // show `tab views`; we always have multiple panes, so history /
     // scroll.)
     if transcript_tall {
-        spans.extend(hint("pgup", "scroll"));
+        spans.extend(hint_themed(colors, "pgup", "scroll"));
     }
     let mut line = Line::from(spans);
     // The toast rides the right end, ending at the last column.
@@ -70,7 +75,7 @@ pub fn hint_row(
             spans.push(Span::raw(" ".repeat((width - used - tw) as usize)));
             spans.push(Span::styled(
                 format!("✓ {t}"),
-                Style::default().fg(comps::colour(Token::Green)),
+                Style::default().fg(comps::colour_themed(colors, Token::Green)),
             ));
             line = Line::from(spans);
         }
@@ -78,8 +83,8 @@ pub fn hint_row(
     line
 }
 
-/// The completion list's commands (§9.13), alphabetical.
-pub const COMMANDS: [(&str, &str); 12] = [
+/// The completion list's stable built-in order, extended with customization and routing.
+pub const COMMANDS: [(&str, &str); 16] = [
     (
         "/clear",
         "forget earlier turns (the model stops seeing them)",
@@ -87,6 +92,10 @@ pub const COMMANDS: [(&str, &str); 12] = [
     (
         "/compact",
         "summarize the conversation into one summary message",
+    ),
+    (
+        "/effort",
+        "show or set configured request effort; default restores the model default",
     ),
     ("/help", "keys and commands"),
     (
@@ -97,7 +106,7 @@ pub const COMMANDS: [(&str, &str); 12] = [
     ("/models", "list models from configured providers"),
     (
         "/permissions",
-        "allow/deny rules in force, and their source",
+        "effective rules and sources; allow, ask, deny or reset a tool/server rule",
     ),
     ("/resume", "continue a saved session by id"),
     (
@@ -107,6 +116,15 @@ pub const COMMANDS: [(&str, &str); 12] = [
     ("/sessions", "browse and resume earlier sessions"),
     ("/undo", "drop the last exchange from the context"),
     ("/usage", "turns, tokens and cost for this session"),
+    (
+        "/customize",
+        "show, validate, import, export, set, reset or reload customization",
+    ),
+    (
+        "/route",
+        "show routing; auto restores automatic model selection",
+    ),
+    ("/theme", "show or choose orbit, midnight or paper"),
 ];
 
 /// The commands the inline list offers for what is typed: every one
@@ -135,7 +153,11 @@ pub fn slash_list(composer: &str) -> Vec<(&'static str, &'static str)> {
 }
 
 /// The inline completion list above the composer (§9.13).
-pub fn completion_list(typed: &str, selected: usize) -> (Rect, Vec<Line<'static>>) {
+pub fn completion_list_themed(
+    colors: crate::proto::shell::pal::Palette,
+    typed: &str,
+    selected: usize,
+) -> (Rect, Vec<Line<'static>>) {
     let prefix = typed.trim_start_matches('/');
     let matches: Vec<&(&str, &str)> = COMMANDS
         .iter()
@@ -144,7 +166,7 @@ pub fn completion_list(typed: &str, selected: usize) -> (Rect, Vec<Line<'static>
         .collect();
     let lines: Vec<Line> = std::iter::once(Line::from(Span::styled(
         "Commands",
-        Style::default().fg(comps::colour(Token::Muted)),
+        Style::default().fg(comps::colour_themed(colors, Token::Muted)),
     )))
     .chain(matches.iter().enumerate().map(|(i, (cmd, desc))| {
         let is_sel = i == selected;
@@ -152,18 +174,21 @@ pub fn completion_list(typed: &str, selected: usize) -> (Rect, Vec<Line<'static>
             Span::styled(
                 cmd.to_string(),
                 Style::default()
-                    .fg(comps::colour(Token::Ink))
+                    .fg(comps::colour_themed(colors, Token::Ink))
                     .add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(
                 cmd.to_string(),
-                Style::default().fg(comps::colour(Token::Muted)),
+                Style::default().fg(comps::colour_themed(colors, Token::Muted)),
             )
         };
         Line::from(vec![
             if is_sel {
-                Span::styled("▌ ", Style::default().fg(comps::colour(Token::Magenta)))
+                Span::styled(
+                    "▌ ",
+                    Style::default().fg(comps::colour_themed(colors, Token::Magenta)),
+                )
             } else {
                 Span::raw("  ")
             },
@@ -171,7 +196,7 @@ pub fn completion_list(typed: &str, selected: usize) -> (Rect, Vec<Line<'static>
             Span::raw("  "),
             Span::styled(
                 desc.to_string(),
-                Style::default().fg(comps::colour(Token::Muted)),
+                Style::default().fg(comps::colour_themed(colors, Token::Muted)),
             ),
         ])
     }))
@@ -201,27 +226,31 @@ pub fn palette_area(screen: Rect) -> Rect {
 }
 
 /// The palette: query row, COMMANDS section, fuzzy-matched rows.
-pub fn palette_lines(query: &str, selected: usize) -> Vec<Line<'static>> {
+pub fn palette_lines_themed(
+    colors: crate::proto::shell::pal::Palette,
+    query: &str,
+    selected: usize,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 "› ",
                 Style::default()
-                    .fg(comps::colour(Token::Magenta))
+                    .fg(comps::colour_themed(colors, Token::Magenta))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 query.to_string(),
-                Style::default().fg(comps::colour(Token::Ink)),
+                Style::default().fg(comps::colour_themed(colors, Token::Ink)),
             ),
         ]),
         Line::from(Span::styled(
             "─".repeat(74),
-            Style::default().fg(comps::colour(Token::Rule)),
+            Style::default().fg(comps::colour_themed(colors, Token::Rule)),
         )),
         Line::from(Span::styled(
             "COMMANDS",
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         )),
     ];
     let matched: Vec<&(&str, &str)> = COMMANDS
@@ -231,12 +260,12 @@ pub fn palette_lines(query: &str, selected: usize) -> Vec<Line<'static>> {
     if matched.is_empty() {
         lines.push(Line::from(Span::styled(
             "no matches",
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         )));
     } else {
         for (i, (cmd, desc)) in matched.iter().enumerate() {
             let is_sel = i == selected % matched.len().max(1);
-            lines.push(palette_row(cmd, desc, is_sel));
+            lines.push(palette_row_themed(colors, cmd, desc, is_sel));
         }
     }
     lines
@@ -270,17 +299,25 @@ pub fn subsequence(query: &str, target: &str) -> bool {
     }
 }
 
-fn palette_row(cmd: &str, desc: &str, selected: bool) -> Line<'static> {
+fn palette_row_themed(
+    colors: crate::proto::shell::pal::Palette,
+    cmd: &str,
+    desc: &str,
+    selected: bool,
+) -> Line<'static> {
     let cmd_style = if selected {
         Style::default()
-            .fg(comps::colour(Token::Ink))
+            .fg(comps::colour_themed(colors, Token::Ink))
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(comps::colour(Token::Muted))
+        Style::default().fg(comps::colour_themed(colors, Token::Muted))
     };
     Line::from(vec![
         if selected {
-            Span::styled("▌", Style::default().fg(comps::colour(Token::Magenta)))
+            Span::styled(
+                "▌",
+                Style::default().fg(comps::colour_themed(colors, Token::Magenta)),
+            )
         } else {
             Span::raw(" ")
         },
@@ -289,27 +326,27 @@ fn palette_row(cmd: &str, desc: &str, selected: bool) -> Line<'static> {
         Span::raw(" ".repeat(22usize.saturating_sub(cmd.chars().count()))),
         Span::styled(
             desc.to_string(),
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         ),
     ])
 }
 
 /// The help overlay's content (§9.20): two columns of groups.
-pub fn help_lines() -> Vec<Line<'static>> {
+pub fn help_lines_themed(colors: crate::proto::shell::pal::Palette) -> Vec<Line<'static>> {
     // The help overlay (§9.20), per the golden: two columns of
     // groups — ANYWHERE, OUTSIDE THE COMPOSER, APPROVAL left;
     // IN THE COMPOSER right.
     let label = |t: &str| {
         Span::styled(
             t.to_string(),
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         )
     };
     let key = |k: &str| {
         Span::styled(
             format!("{k:<11}"),
             Style::default()
-                .fg(comps::colour(Token::Ink))
+                .fg(comps::colour_themed(colors, Token::Ink))
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )
     };
@@ -317,14 +354,14 @@ pub fn help_lines() -> Vec<Line<'static>> {
         Span::styled(
             format!("{k:<11}"),
             Style::default()
-                .fg(comps::colour(Token::Ink))
+                .fg(comps::colour_themed(colors, Token::Ink))
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )
     };
     let desc = |d: &str| {
         Span::styled(
             d.to_string(),
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         )
     };
     let left: Vec<(&str, &str)> = vec![
@@ -351,6 +388,11 @@ pub fn help_lines() -> Vec<Line<'static>> {
         ("⏎", "send; queues while busy"),
         ("⇧⏎  alt+⏎", "new line"),
         ("↑  ↓", "history"),
+        ("ctrl-r", "search history; older match"),
+        ("@", "workspace file picker"),
+        ("tab", "accept a file suggestion"),
+        ("⏎", "accept picker/search draft"),
+        ("esc", "close files; restore search"),
         ("pgup  pgdn", "scroll the transcript"),
         ("end", "newest line (if empty)"),
     ];
@@ -381,9 +423,9 @@ pub fn help_lines() -> Vec<Line<'static>> {
 }
 
 /// The help overlay's frame.
-pub fn help_area(screen: Rect) -> Rect {
+pub fn help_area_themed(colors: crate::proto::shell::pal::Palette, screen: Rect) -> Rect {
     let w = 78.min(screen.width.saturating_sub(8));
-    let h = (help_lines().len() as u16 + 2).min(screen.height.saturating_sub(4));
+    let h = (help_lines_themed(colors).len() as u16 + 2).min(screen.height.saturating_sub(4));
     Rect {
         x: screen.x + (screen.width - w) / 2,
         y: screen.y + 3,
@@ -393,19 +435,23 @@ pub fn help_area(screen: Rect) -> Rect {
 }
 
 /// The quit card (§9.21).
-pub fn quit_card(turn_running: bool, screen: Rect) -> (Rect, Vec<Line<'static>>) {
+pub fn quit_card_themed(
+    colors: crate::proto::shell::pal::Palette,
+    turn_running: bool,
+    screen: Rect,
+) -> (Rect, Vec<Line<'static>>) {
     let lines = if turn_running {
         vec![
             Line::from(""),
             Line::from(Span::styled(
                 "A turn is running. Quitting stops it.",
-                Style::default().fg(comps::colour(Token::Amber)),
+                Style::default().fg(comps::colour_themed(colors, Token::Amber)),
             )),
             Line::from(""),
-            quit_keys(),
+            quit_keys_themed(colors),
         ]
     } else {
-        vec![Line::from(""), quit_keys()]
+        vec![Line::from(""), quit_keys_themed(colors)]
     };
     let h = lines.len() as u16 + 2;
     let w = 46u16.min(screen.width.saturating_sub(4));
@@ -420,45 +466,56 @@ pub fn quit_card(turn_running: bool, screen: Rect) -> (Rect, Vec<Line<'static>>)
     )
 }
 
-fn quit_keys() -> Line<'static> {
+fn quit_keys_themed(colors: crate::proto::shell::pal::Palette) -> Line<'static> {
     Line::from(vec![
-        keycap("y"),
+        keycap_themed(colors, "y"),
         Span::raw(" "),
-        Span::styled("quit", Style::default().fg(comps::colour(Token::Muted))),
+        Span::styled(
+            "quit",
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
+        ),
         Span::raw("    "),
-        keycap("n"),
+        keycap_themed(colors, "n"),
         Span::raw(" "),
-        Span::styled("stay", Style::default().fg(comps::colour(Token::Muted))),
+        Span::styled(
+            "stay",
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
+        ),
     ])
 }
 
 /// The size notice (§9.23): below 40 × 10 this is the whole screen.
-pub fn size_notice_lines(w: u16, h: u16) -> Vec<Line<'static>> {
+pub fn size_notice_lines_themed(
+    colors: crate::proto::shell::pal::Palette,
+    w: u16,
+    h: u16,
+) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(
             "ORBIT needs at least 40 × 10",
             Style::default()
-                .fg(comps::colour(Token::Ink))
+                .fg(comps::colour_themed(colors, Token::Ink))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!("this terminal is {w} × {h}"),
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "enlarge the window or run",
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         )),
         Line::from(Span::styled(
             "orbit chat --no-tui",
-            Style::default().fg(comps::colour(Token::Ink)),
+            Style::default().fg(comps::colour_themed(colors, Token::Ink)),
         )),
     ]
 }
 
 /// Render an overlay frame (palette / help / quit) with its title.
-pub fn overlay(
+pub fn overlay_themed(
+    colors: crate::proto::shell::pal::Palette,
     f: &mut ratatui::Frame,
     area: Rect,
     title: &str,
@@ -469,22 +526,82 @@ pub fn overlay(
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(comps::colour(Token::Rule)))
+        .border_style(Style::default().fg(comps::colour_themed(colors, Token::Rule)))
         .title(Span::styled(
             format!(" {title} "),
             Style::default()
-                .fg(comps::colour(Token::Ink))
+                .fg(comps::colour_themed(colors, Token::Ink))
                 .add_modifier(Modifier::BOLD),
         ));
     if let Some(ft) = footer {
         block = block.title_bottom(Span::styled(
             format!(" {ft} "),
-            Style::default().fg(comps::colour(Token::Muted)),
+            Style::default().fg(comps::colour_themed(colors, Token::Muted)),
         ));
     }
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+pub fn hint_row(
+    turn_live: bool,
+    transcript_tall: bool,
+    toast: Option<&str>,
+    width: u16,
+) -> Line<'static> {
+    hint_row_themed(
+        crate::proto::shell::pal::Palette::default(),
+        turn_live,
+        transcript_tall,
+        toast,
+        width,
+    )
+}
+pub fn completion_list(typed: &str, selected: usize) -> (Rect, Vec<Line<'static>>) {
+    completion_list_themed(
+        crate::proto::shell::pal::Palette::default(),
+        typed,
+        selected,
+    )
+}
+pub fn palette_lines(query: &str, selected: usize) -> Vec<Line<'static>> {
+    palette_lines_themed(
+        crate::proto::shell::pal::Palette::default(),
+        query,
+        selected,
+    )
+}
+pub fn help_lines() -> Vec<Line<'static>> {
+    help_lines_themed(crate::proto::shell::pal::Palette::default())
+}
+pub fn help_area(screen: Rect) -> Rect {
+    help_area_themed(crate::proto::shell::pal::Palette::default(), screen)
+}
+pub fn quit_card(turn_running: bool, screen: Rect) -> (Rect, Vec<Line<'static>>) {
+    quit_card_themed(
+        crate::proto::shell::pal::Palette::default(),
+        turn_running,
+        screen,
+    )
+}
+pub fn size_notice_lines(w: u16, h: u16) -> Vec<Line<'static>> {
+    size_notice_lines_themed(crate::proto::shell::pal::Palette::default(), w, h)
+}
+pub fn overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+    footer: Option<&str>,
+) {
+    overlay_themed(
+        crate::proto::shell::pal::Palette::default(),
+        f,
+        area,
+        title,
+        lines,
+        footer,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +649,17 @@ mod tests {
         assert!(txt.contains("/model"));
         assert!(txt.contains("/models"));
         assert!(!txt.contains("/clear"));
+    }
+
+    #[test]
+    fn effort_is_available_in_completion_and_palette() {
+        assert_eq!(completion_matches("/eff"), vec![("/effort", COMMANDS[2].1)]);
+        let text = palette_lines("effort", 0)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|s| s.content.into_owned()))
+            .collect::<String>();
+        assert!(text.contains("/effort"));
+        assert!(text.contains("request effort"));
     }
 
     #[test]
