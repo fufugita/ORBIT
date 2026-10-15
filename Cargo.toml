@@ -26,6 +26,7 @@ members = [
   "crates/memory",
   "crates/export",
   "crates/plugin",
+  "crates/plugin-compat",
   "crates/egress",
   "crates/hud",
   "crates/hud-tui",
@@ -56,6 +57,8 @@ description = "ORBIT — the harness that orbits around you. User-authority orch
 # Phase-A baseline — permissive-only (DR-13 §5): MIT/Apache-2.0/BSD-3/ISC.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+yaml_serde = "=0.10.7"
+libyaml-rs = "=0.3.0"
 sha2 = "0.10"
 # Image reads → vision blocks: standard base64 (MIT/Apache, DR-13 §5).
 base64 = "0.22"

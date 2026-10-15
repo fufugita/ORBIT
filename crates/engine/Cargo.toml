@@ -13,6 +13,7 @@ orbit-gateway = { path = "../gateway" }
 orbit-egress = { path = "../egress" }
 orbit-ledger = { path = "../ledger" }
 orbit-frontend-protocol = { path = "../frontend-protocol" }
+orbit-plugin-compat = { path = "../plugin-compat" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

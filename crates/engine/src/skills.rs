@@ -23,28 +23,79 @@ pub struct Skill {
     pub body: String,
 }
 
-/// Parse a SKILL.md: `---` frontmatter (name, description) + body.
+/// Parse a skill definition, retaining the legacy optional interface.
 pub fn parse_skill_md(text: &str) -> Option<Skill> {
-    let text = text.trim_start_matches('\u{feff}');
-    let rest = text.strip_prefix("---")?;
-    let (front, body) = rest.split_once("---")?;
-    let mut name = String::new();
-    let mut description = String::new();
-    for line in front.lines() {
-        if let Some(v) = line.strip_prefix("name:") {
-            name = v.trim().to_string();
-        } else if let Some(v) = line.strip_prefix("description:") {
-            description = v.trim().to_string();
-        }
-    }
-    if name.is_empty() {
-        return None;
-    }
-    Some(Skill {
-        name,
-        description,
-        body: body.trim().to_string(),
+    parse_skill_md_checked(text).ok()
+}
+
+/// Parse a skill while reporting malformed frontmatter explicitly.
+pub fn parse_skill_md_checked(text: &str) -> Result<Skill, orbit_plugin_compat::CompatError> {
+    let document = orbit_plugin_compat::parse_frontmatter(text)?;
+    Ok(Skill {
+        name: required_name(&document.frontmatter)?,
+        description: optional_string(&document.frontmatter, "description")?.unwrap_or_default(),
+        body: document.body.trim().to_owned(),
     })
+}
+
+fn field_error(field: &str) -> orbit_plugin_compat::CompatError {
+    orbit_plugin_compat::CompatError::new(
+        "invalid_frontmatter_field",
+        format!("invalid {field} in definition frontmatter"),
+    )
+}
+
+fn optional_string(
+    frontmatter: &serde_json::Value,
+    field: &str,
+) -> Result<Option<String>, orbit_plugin_compat::CompatError> {
+    match frontmatter.get(field) {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(field_error(field)),
+    }
+}
+
+fn required_name(
+    frontmatter: &serde_json::Value,
+) -> Result<String, orbit_plugin_compat::CompatError> {
+    let name = optional_string(frontmatter, "name")?.ok_or_else(|| field_error("name"))?;
+    if name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+        return Err(field_error("name"));
+    }
+    Ok(name)
+}
+
+fn optional_tools(
+    frontmatter: &serde_json::Value,
+) -> Result<Vec<String>, orbit_plugin_compat::CompatError> {
+    let tools: Vec<String> = match frontmatter.get("tools") {
+        None => return Ok(Vec::new()),
+        Some(serde_json::Value::String(value)) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| field_error("tools"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(field_error("tools")),
+    };
+    if tools.len() > 256
+        || tools.iter().any(|tool| {
+            tool.trim().is_empty() || tool.len() > 256 || tool.chars().any(char::is_control)
+        })
+    {
+        return Err(field_error("tools"));
+    }
+    Ok(tools)
 }
 
 /// Load every skill from the scopes: user ($ORBIT_HOME/skills) and
@@ -109,60 +160,48 @@ fn default_max_turns() -> u32 {
     25
 }
 
-/// Parse an agent definition .md (same frontmatter shape).
+/// Parse an agent definition, retaining the legacy optional interface.
 pub fn parse_agent_md(text: &str) -> Option<AgentDef> {
-    let rest = text.trim().strip_prefix("---")?;
-    let (front, body) = rest.split_once("---")?;
-    let mut name = String::new();
-    let mut description = String::new();
-    let mut tools = Vec::new();
-    let mut model = String::new();
-    let mut effort = None;
-    let mut max_turns = default_max_turns();
-    for line in front.lines() {
-        if let Some(v) = line.strip_prefix("name:") {
-            name = v.trim().to_string();
-        } else if let Some(v) = line.strip_prefix("description:") {
-            description = v.trim().to_string();
-        } else if let Some(v) = line.strip_prefix("tools:") {
-            tools = v
-                .trim()
-                .trim_matches('[')
-                .trim_matches(']')
-                .split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect();
-        } else if let Some(v) = line.strip_prefix("model:") {
-            model = v.trim().to_string();
-        } else if let Some(v) = line.strip_prefix("effort:") {
-            use orbit_adapter::types::{EffortSetting, EffortValue};
-            let raw = v.trim();
-            let quoted = raw.starts_with(['\'', '"']);
-            let value = raw.trim_matches(['\'', '"']);
-            effort = Some(match value {
-                "default" => EffortSetting::Default,
-                "true" if !quoted => EffortSetting::Value(EffortValue::Bool(true)),
-                "false" if !quoted => EffortSetting::Value(EffortValue::Bool(false)),
-                value => {
-                    let value = EffortValue::Level(value.into());
-                    value.validate().ok()?;
-                    EffortSetting::Value(value)
-                }
-            });
-        } else if let Some(v) = line.strip_prefix("maxTurns:") {
-            max_turns = v.trim().parse().unwrap_or(default_max_turns());
+    parse_agent_md_checked(text).ok()
+}
+
+/// Parse an agent with typed, bounded frontmatter and explicit errors.
+pub fn parse_agent_md_checked(text: &str) -> Result<AgentDef, orbit_plugin_compat::CompatError> {
+    use orbit_adapter::types::{EffortSetting, EffortValue};
+    let document = orbit_plugin_compat::parse_frontmatter(text)?;
+    let front = &document.frontmatter;
+    let effort = match front.get("effort") {
+        None => None,
+        Some(serde_json::Value::Bool(value)) => {
+            Some(EffortSetting::Value(EffortValue::Bool(*value)))
         }
+        Some(serde_json::Value::String(value)) if value == "default" => {
+            Some(EffortSetting::Default)
+        }
+        Some(serde_json::Value::String(value)) => {
+            let effort = EffortValue::Level(value.clone());
+            effort.validate().map_err(|_| field_error("effort"))?;
+            Some(EffortSetting::Value(effort))
+        }
+        Some(_) => return Err(field_error("effort")),
+    };
+    if front.get("maxTurns").is_some() && front.get("max_turns").is_some() {
+        return Err(field_error("maxTurns"));
     }
-    if name.is_empty() {
-        return None;
-    }
-    Some(AgentDef {
-        name,
-        description,
-        instructions: body.trim().to_string(),
-        tools,
-        model,
+    let max_turns = match front.get("maxTurns").or_else(|| front.get("max_turns")) {
+        None => default_max_turns(),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| field_error("maxTurns"))?,
+    };
+    Ok(AgentDef {
+        name: required_name(front)?,
+        description: optional_string(front, "description")?.unwrap_or_default(),
+        instructions: document.body.trim().to_owned(),
+        tools: optional_tools(front)?,
+        model: optional_string(front, "model")?.unwrap_or_default(),
         effort,
         max_turns,
     })
@@ -256,6 +295,87 @@ description: SQL injection hunting methodology
         assert_eq!(skill.name, "hunt-sqli");
         assert_eq!(skill.description, "SQL injection hunting methodology");
         assert!(skill.body.contains("Enumerate inputs"));
+    }
+
+    #[test]
+    fn complete_yaml_metadata_reaches_native_skill_and_agent_loaders() {
+        let text = "\u{feff}---\r\nname: evidence-reviewer\r\ndescription: >-\r\n  Review evidence\r\n  before reporting.\r\ntools:\r\n  - Read\r\n  - Grep\r\neffort: 'false'\r\nmaxTurns: 7\r\n---\r\n\r\nKeep --- inside this paragraph.\r\n\r\n  Preserve λ.\r\n";
+        let agent = parse_agent_md_checked(text).unwrap();
+        assert_eq!(agent.description, "Review evidence before reporting.");
+        assert_eq!(agent.tools, ["Read", "Grep"]);
+        assert_eq!(agent.max_turns, 7);
+        assert_eq!(
+            agent.instructions,
+            "Keep --- inside this paragraph.\r\n\r\n  Preserve λ."
+        );
+        assert_eq!(
+            parse_skill_md_checked(text).unwrap().description,
+            agent.description
+        );
+        assert!(
+            matches!(agent.effort, Some(orbit_adapter::types::EffortSetting::Value(orbit_adapter::types::EffortValue::Level(ref value))) if value == "false")
+        );
+    }
+
+    #[test]
+    fn pinned_hookify_agent_loads_unchanged() {
+        use sha2::{Digest, Sha256};
+        // Apache-2.0 fixture from anthropics/claude-plugins-official, commit
+        // 054417d0fc687dd7d639331f21522d0e06c09cf9, plugins/hookify/agents/conversation-analyzer.md.
+        let text = include_str!("../tests/fixtures/hookify-agent.txt");
+        assert_eq!(
+            hex::encode(Sha256::digest(text.as_bytes())),
+            "96267342d2d0788763b392b26a322ca44d1b62ee4d65be31c0aaa8031ad85db7"
+        );
+        let agent = parse_agent_md_checked(text).unwrap();
+        assert_eq!(agent.name, "conversation-analyzer");
+        assert_eq!(agent.tools, ["Read", "Grep"]);
+        assert_eq!(agent.model, "inherit");
+        assert!(
+            agent
+                .description
+                .starts_with("Use this agent when analyzing conversation transcripts")
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(agent.instructions.as_bytes())),
+            "ece522c5496e4c6de8339370913da6d0dcb22f75e601c6e4cd0a858c4c40b796"
+        );
+    }
+
+    #[test]
+    fn invalid_typed_authority_fields_are_not_silently_defaulted() {
+        for field in [
+            "tools: [Read, false]",
+            "tools: false",
+            "model: false",
+            "effort: [high]",
+            "maxTurns: invalid",
+            "maxTurns: 0",
+            "maxTurns: 4294967296",
+            "maxTurns: 2\nmax_turns: 3",
+            "name: [reviewer]",
+            "description: false",
+        ] {
+            let text = if field.starts_with("name:") {
+                format!("---\n{field}\n---\nbody")
+            } else {
+                format!("---\nname: reviewer\n{field}\n---\nbody")
+            };
+            assert!(parse_agent_md_checked(&text).is_err(), "{field}");
+            assert!(parse_agent_md(&text).is_none(), "{field}");
+        }
+    }
+
+    #[test]
+    fn literal_yaml_descriptions_and_body_delimiters_remain_distinct() {
+        let text = "---\nname: reviewer\ndescription: |-\n  First line.\n  Second line.\n---\nBody\n---\nMore body.";
+        let agent = parse_agent_md_checked(text).unwrap();
+        assert_eq!(agent.description, "First line.\nSecond line.");
+        assert_eq!(agent.instructions, "Body\n---\nMore body.");
+        assert_eq!(
+            parse_skill_md_checked(text).unwrap().body,
+            agent.instructions
+        );
     }
 
     #[test]
