@@ -1,11 +1,11 @@
 //! The top bar (row 0) and the status line (last row).
 
-use super::canvas::{Cv, Rgb, Seg, mix, segs_width, text_width, tint};
+use super::canvas::{Cv, Rgb, Seg, clip_text, mix, segs_width, text_width, tint};
 use super::frame::{keyhints, pill, pill_width};
 use super::motion::{ease_in_out, flash, prog, secs, shimmer, star_at};
 use super::pal::Palette;
 use crate::proto::scenario::{Activity, Scenario};
-use ratatui::style::Modifier;
+use ratatui::{layout::Rect, style::Modifier};
 
 /// The layout tabs the top bar offers.
 pub const PRESET_TABS: [&str; 4] = ["columns", "build", "agents", "review"];
@@ -89,6 +89,84 @@ pub struct TopBar<'a> {
     pub branch: Option<String>,
 }
 
+/// Keep a contiguous window of tabs around the selected panel. Its title gets
+/// space before neighboring numbers, so a late or long-named panel stays visible.
+fn overflow_switcher(
+    cv: &mut Cv,
+    panels: &[(usize, String, bool)],
+    focus_idx: usize,
+    start: i32,
+    room: i32,
+    bg_at: impl Fn(i32) -> Rgb,
+) -> i32 {
+    if panels.is_empty() || room <= 0 {
+        return start;
+    }
+    let colors = cv.palette;
+    let selected = panels
+        .iter()
+        .position(|(number, _, _)| number.checked_sub(1) == Some(focus_idx))
+        .unwrap_or(0);
+    let (number, title, attention) = &panels[selected];
+    // Leave a cell on each side for omitted-tab markers. Bound the title to
+    // eighteen cells so compact neighbors remain useful on wider terminals.
+    let base = text_width(&format!(" {number}  ")) + if *attention { 2 } else { 0 };
+    let title = clip_text(title, (room - base - 3).clamp(0, 18));
+    let label = format!(" {number} {title} {}", if *attention { "◆ " } else { "" });
+    let compact_width = |index: usize| {
+        let (number, _, attention) = &panels[index];
+        text_width(&format!(" {number} ")) + if *attention { 2 } else { 0 } + 1
+    };
+    let (mut first, mut last) = (selected, selected);
+    let mut used = text_width(&label) + 1;
+    loop {
+        if first > 0 && used + compact_width(first - 1) <= room - 2 {
+            first -= 1;
+            used += compact_width(first);
+        } else if last + 1 < panels.len() && used + compact_width(last + 1) <= room - 2 {
+            last += 1;
+            used += compact_width(last);
+        } else {
+            break;
+        }
+    }
+    cv.clipped(Rect::new(start as u16, 0, room as u16, 1), |cv| {
+        let mut x = start;
+        if first > 0 {
+            x = cv.text(x, 0, "‹", colors.faint, Some(bg_at(x)));
+        }
+        for (index, (number, _, attention)) in panels.iter().enumerate().take(last + 1).skip(first)
+        {
+            let from = x;
+            if index == selected {
+                x = cv.put(
+                    x,
+                    0,
+                    &label,
+                    colors.on_accent,
+                    Some(colors.magenta),
+                    Modifier::BOLD,
+                );
+            } else {
+                x = cv.put(
+                    x,
+                    0,
+                    &format!(" {number} {}", if *attention { "◆ " } else { "" }),
+                    colors.faint,
+                    Some(bg_at(x)),
+                    Modifier::BOLD,
+                );
+            }
+            cv.hit(from, 0, x - from, 1, super::hits::Click::Panel(*number - 1));
+            x += 1;
+        }
+        if last + 1 < panels.len() {
+            x = cv.text(x, 0, "›", colors.faint, Some(bg_at(x)));
+        }
+        x.min(start + room)
+    })
+}
+
 pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     let colors = cv.palette;
     // Gradient strip: deep violet fading into the bar colour.
@@ -132,46 +210,61 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             .sum();
         const COST_CHIP: i32 = 10;
         let short = x + full > w - 2 - COST_CHIP;
-        for (num, title, attn) in panels {
-            let on = *num - 1 == tb.focus_idx;
-            let from = x;
-            if on {
-                x = cv.put(
-                    x,
-                    0,
-                    &format!(" {num} {title} "),
-                    colors.on_accent,
-                    Some(colors.magenta),
-                    Modifier::BOLD,
-                );
-                if *attn {
+        let compact: i32 = panels
+            .iter()
+            .map(|(n, t, a)| tab_w(n, t, *a, *n - 1 == tb.focus_idx, true) + 1)
+            .sum();
+        if short && x + compact > w - 2 {
+            x = overflow_switcher(
+                cv,
+                panels,
+                tb.focus_idx,
+                x,
+                (w - 2 - COST_CHIP - x).max(0),
+                bg_at,
+            );
+        } else {
+            for (num, title, attn) in panels {
+                let on = *num - 1 == tb.focus_idx;
+                let from = x;
+                if on {
                     x = cv.put(
                         x,
                         0,
-                        "◆ ",
+                        &format!(" {num} {title} "),
                         colors.on_accent,
                         Some(colors.magenta),
                         Modifier::BOLD,
                     );
+                    if *attn {
+                        x = cv.put(
+                            x,
+                            0,
+                            "◆ ",
+                            colors.on_accent,
+                            Some(colors.magenta),
+                            Modifier::BOLD,
+                        );
+                    }
+                } else {
+                    x = cv.put(
+                        x,
+                        0,
+                        &format!(" {num} "),
+                        colors.faint,
+                        Some(bg_at(x)),
+                        Modifier::BOLD,
+                    );
+                    if !short {
+                        x = cv.text(x, 0, &format!("{title} "), colors.muted, Some(bg_at(x)));
+                    }
+                    if *attn {
+                        x = cv.put(x, 0, "◆ ", colors.magenta, Some(bg_at(x)), Modifier::BOLD);
+                    }
                 }
-            } else {
-                x = cv.put(
-                    x,
-                    0,
-                    &format!(" {num} "),
-                    colors.faint,
-                    Some(bg_at(x)),
-                    Modifier::BOLD,
-                );
-                if !short {
-                    x = cv.text(x, 0, &format!("{title} "), colors.muted, Some(bg_at(x)));
-                }
-                if *attn {
-                    x = cv.put(x, 0, "◆ ", colors.magenta, Some(bg_at(x)), Modifier::BOLD);
-                }
+                cv.hit(from, 0, x - from, 1, super::hits::Click::Panel(*num - 1));
+                x += 1;
             }
-            cv.hit(from, 0, x - from, 1, super::hits::Click::Panel(*num - 1));
-            x += 1;
         }
     } else {
         for (i, name) in PRESET_TABS.iter().enumerate() {
@@ -609,4 +702,130 @@ pub fn status_line(
 
 pub fn mode_pill_spec(mode: Option<&str>) -> (&'static str, Rgb, Rgb) {
     mode_pill_spec_themed(Palette::default(), mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::hits::{self, Click, Hit};
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    fn render_switcher(
+        width: u16,
+        panels: Vec<(usize, String, bool)>,
+        focus_idx: usize,
+    ) -> (Buffer, Vec<Hit>) {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 2));
+        let mut scenario = Scenario::new();
+        scenario.priced = true;
+        scenario.cost_microcents = 1_234_000;
+        let mut cv = Cv::new(&mut buffer);
+        top_bar(
+            &mut cv,
+            i32::from(width),
+            &TopBar {
+                scenario: &scenario,
+                preset: None,
+                approval_pending: false,
+                now_ms: 5000,
+                reduced: true,
+                mono: false,
+                saved_ms: None,
+                zoom: false,
+                switcher: Some(panels),
+                focus_idx,
+                cwd: String::new(),
+                branch: None,
+            },
+        );
+        let hits = cv.take_hits();
+        (buffer, hits)
+    }
+
+    fn cells(buffer: &Buffer, from: u16, to: u16) -> String {
+        (from..to).map(|x| buffer[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn overflowing_switcher_keeps_selected_panel_visible_and_clickable() {
+        for width in [40, 60, 80, 100, 119, 120, 164] {
+            for focus in [0, 11, 23] {
+                for title in [
+                    "Named pane with a very long description that cannot fit on the bar",
+                    "证据界面标题非常长并且需要按终端单元格截断",
+                ] {
+                    let panels = (1..=24)
+                        .map(|number| {
+                            (number, title.into(), number % 3 == 0 || number == focus + 1)
+                        })
+                        .collect();
+                    let (buffer, hits) = render_switcher(width, panels, focus);
+                    let selected = hits
+                        .iter()
+                        .find(|hit| hit.click == Click::Panel(focus))
+                        .expect("the focused tab must remain on screen");
+                    let label = cells(&buffer, selected.rect.x, selected.rect.right());
+                    assert!(
+                        label.starts_with(&format!(" {} ", focus + 1)),
+                        "{width}: {label}"
+                    );
+                    assert!(
+                        label.contains(if title.is_ascii() { "Named" } else { "证" }),
+                        "{width}: {label}"
+                    );
+                    assert!(
+                        label.contains('◆'),
+                        "the selected tab retains its attention badge"
+                    );
+                    assert_eq!(
+                        hits::at(&hits, selected.rect.x + 1, 0),
+                        Some(Click::Panel(focus)),
+                    );
+                    let row = cells(&buffer, 0, width);
+                    assert!(
+                        row.contains("$1.234"),
+                        "the actual tab end leaves space for cost: {row}"
+                    );
+                    for hit in &hits {
+                        assert_eq!(hit.rect.y, 0);
+                        assert!(hit.rect.x >= 12 && hit.rect.right() <= width - 12);
+                        for x in hit.rect.x..hit.rect.right() {
+                            assert_eq!(hits::at(&hits, x, 0), Some(hit.click));
+                        }
+                    }
+                    let visible: Vec<_> = hits
+                        .iter()
+                        .filter_map(|hit| match hit.click {
+                            Click::Panel(index) => Some(index),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(visible.windows(2).all(|pair| pair[1] == pair[0] + 1));
+                    assert!(visible.contains(&focus));
+                    assert!(visible.len() < 24);
+                    for x in width - 11..width {
+                        assert_eq!(hits::at(&hits, x, 0), None, "facts have no hidden tab hit");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitting_switcher_retains_full_labels_positions_and_hits() {
+        for width in [100, 120, 164] {
+            let (buffer, hits) = render_switcher(
+                width,
+                vec![(1, "Chat".into(), false), (2, "Notes".into(), false)],
+                1,
+            );
+            assert_eq!(cells(&buffer, 12, 31), " 1 Chat   2 Notes  ");
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0].rect, Rect::new(12, 0, 8, 1));
+            assert_eq!(hits[0].click, Click::Panel(0));
+            assert_eq!(hits[1].rect, Rect::new(21, 0, 9, 1));
+            assert_eq!(hits[1].click, Click::Panel(1));
+            assert!(cells(&buffer, 31, width).contains("$1.234"));
+        }
+    }
 }

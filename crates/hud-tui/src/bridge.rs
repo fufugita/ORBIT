@@ -436,7 +436,18 @@ pub fn emit_tool_output(sender: &BusSender, call_id: &str, line: &str) {
 /// Unlike [`safe_text`] it does not reject chat-shaped markers such as
 /// `prompt:` — a build log may legitimately say anything.
 pub fn terminal_safe(line: &str) -> String {
-    let redacted = orbit_hud::redact_secret_values(line);
+    terminal_safe_with_newlines(line, false)
+}
+
+/// Display-safe terminal text that retains line feeds for a multiline pane.
+/// Escape sequences are consumed from the whole stream, including any line
+/// feeds inside an OSC. Callers that require the content gate still apply it.
+pub(crate) fn terminal_safe_multiline(text: &str) -> String {
+    terminal_safe_with_newlines(text, true)
+}
+
+fn terminal_safe_with_newlines(text: &str, keep_newlines: bool) -> String {
+    let redacted = orbit_hud::redact_secret_values(text);
     let mut out = String::with_capacity(redacted.len());
     let mut chars = redacted.chars();
     while let Some(c) = chars.next() {
@@ -467,6 +478,7 @@ pub fn terminal_safe(line: &str) -> String {
                 _ => {}
             },
             '\t' => out.push_str("    "),
+            '\n' if keep_newlines => out.push('\n'),
             c if c.is_control() => {}
             c => out.push(c),
         }
@@ -810,6 +822,38 @@ mod tests {
         let out = terminal_safe("token=ghp_0123456789abcdef0123456789abcdef0123 done");
         assert!(!out.contains("ghp_0123"), "{out}");
         assert!(out.contains("done"), "{out}");
+    }
+
+    #[test]
+    fn terminal_safe_multiline_preserves_only_line_feeds() {
+        let input = "first\n\nsecond\tcell\r\u{7}\u{85}\u{9f}\n";
+        assert_eq!(terminal_safe_multiline(input), "first\n\nsecond    cell\n");
+        assert_eq!(terminal_safe(input), "firstsecond    cell");
+    }
+
+    #[test]
+    fn terminal_safe_multiline_consumes_escapes_across_line_feeds() {
+        let input = concat!(
+            "first\n\u{1b}]0;hidden\nOSC title\u{7}",
+            "\u{1b}[31\nmred\u{1b}[0m\n",
+            "\u{1b}]8;;https://example.com/hidden\npath\u{1b}\\last\n"
+        );
+        assert_eq!(terminal_safe_multiline(input), "first\nred\nlast\n");
+        assert_eq!(terminal_safe(input), "firstredlast");
+        assert_eq!(
+            terminal_safe_multiline("kept\n\u{1b}]unterminated\nsecret"),
+            "kept\n"
+        );
+    }
+
+    #[test]
+    fn terminal_safe_multiline_redacts_secrets_without_joining_rows() {
+        let out = terminal_safe_multiline(
+            "first\ntoken=ghp_0123456789abcdef0123456789abcdef0123 done\nlast\n",
+        );
+        assert!(!out.contains("ghp_0123"), "{out}");
+        assert!(out.starts_with("first\n"), "{out}");
+        assert!(out.ends_with(" done\nlast\n"), "{out}");
     }
 
     #[test]

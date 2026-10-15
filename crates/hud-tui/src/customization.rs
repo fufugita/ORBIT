@@ -96,7 +96,7 @@ impl CustomizationSession {
                     ));
                 }
                 output.title = def.title.clone();
-                output.text = crate::bridge::terminal_safe(&crate::bridge::safe_text(&output.text));
+                output.text = safe_pane_text(&output.text)?;
                 if output.text.is_empty() && output.state == PaneState::Ready {
                     output.state = PaneState::Empty;
                 }
@@ -210,6 +210,28 @@ pub fn pane_title<'a>(
     outputs.get(&id).map(|p| p.title.as_str())
 }
 
+fn safe_pane_text(text: &str) -> Result<String, CustomizationError> {
+    if text.len() > MAX_PANE_OUTPUT_BYTES || text.lines().count() > MAX_PANE_LINES {
+        return Err(CustomizationError::Invalid(
+            "pane output exceeds display bounds".into(),
+        ));
+    }
+    // Keep refusals on the original input, even when a forbidden marker is
+    // hidden inside an escape sequence. Parse escapes before display_safe
+    // removes ESC, then gate the visible result as well.
+    let text = if !crate::bridge::safe_text_probe(text) {
+        crate::bridge::safe_text(text)
+    } else {
+        crate::bridge::safe_text(&crate::bridge::terminal_safe_multiline(text))
+    };
+    if text.len() > MAX_PANE_OUTPUT_BYTES || text.lines().count() > MAX_PANE_LINES {
+        return Err(CustomizationError::Invalid(
+            "pane output exceeds display bounds".into(),
+        ));
+    }
+    Ok(text)
+}
+
 /// The custom view shares the same production frame, hit map and clipping engine.
 pub fn draw_pane(
     cv: &mut Cv,
@@ -249,7 +271,14 @@ pub fn draw_pane(
         cv.text(x, y, "loading · refresh with r", palette.muted, None);
         return;
     };
-    let state = match output.state {
+    let (state, mut text) = match safe_pane_text(&output.text) {
+        Ok(text) => (output.state.clone(), text),
+        Err(error) => (
+            PaneState::Error,
+            crate::bridge::safe_text(&error.to_string()),
+        ),
+    };
+    let state = match state {
         PaneState::Ready => "",
         PaneState::Empty => "empty",
         PaneState::Missing => "missing",
@@ -257,7 +286,6 @@ pub fn draw_pane(
         PaneState::Stale => "stale · refresh",
         PaneState::Error => "error",
     };
-    let mut text = crate::bridge::terminal_safe(&crate::bridge::safe_text(&output.text));
     if !state.is_empty() {
         text = format!("{state}\n{text}");
     }
@@ -323,7 +351,12 @@ mod tests {
     use orbit_frontend_protocol::customization::{
         CustomizationCapabilities, LayoutNode, PaneDef, PaneSource, Surface,
     };
-    struct Host;
+    struct Host(String);
+    impl Host {
+        fn new(text: impl Into<String>) -> Self {
+            Self(text.into())
+        }
+    }
     impl ProfileHost for Host {
         fn load(&self) -> Result<ResolvedProfile, CustomizationError> {
             let mut p = Profile::default();
@@ -364,7 +397,7 @@ mod tests {
                 id: id.into(),
                 title: "untrusted host title".into(),
                 state: PaneState::Ready,
-                text: "fixture proof".into(),
+                text: self.0.clone(),
                 truncated: false,
                 actions: vec![PaneAction::Refresh],
             })
@@ -372,7 +405,7 @@ mod tests {
     }
     #[test]
     fn custom_pane_tracer_renders_named_host_data_alongside_conversation() {
-        let mut session = CustomizationSession::open(Arc::new(Host)).unwrap();
+        let mut session = CustomizationSession::open(Arc::new(Host::new("fixture proof"))).unwrap();
         session.refresh_all();
         let tree = profile_tree(&session.resolved.profile).unwrap();
         assert!(tree.leaves().iter().any(|(_, v)| *v == View::Conversation));
@@ -390,5 +423,207 @@ mod tests {
         let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Local notes"));
         assert!(text.contains("fixture proof"));
+    }
+
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        (1..buffer.area.width - 1)
+            .map(|col| buffer[(col, row)].symbol())
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn refresh_keeps_blank_and_trailing_lines_and_renders_separate_rows() {
+        let mut session =
+            CustomizationSession::open(Arc::new(Host::new("alpha\n\nomega\n"))).unwrap();
+        session.refresh("notes").unwrap();
+        let output = session.outputs.get("notes").unwrap();
+        assert_eq!(output.text, "alpha\n\nomega\n");
+        assert_eq!(output.state, PaneState::Ready);
+        assert_eq!(output.title, "Local notes");
+
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut cv = Cv::new(&mut buffer);
+        draw_pane(&mut cv, area, "notes", Some(output), 2, true, 0);
+        let hits = cv.take_hits();
+        assert_eq!(buffer_row(&buffer, 2), "alpha");
+        assert_eq!(buffer_row(&buffer, 3), "");
+        assert_eq!(buffer_row(&buffer, 4), "omega");
+        assert_eq!(buffer_row(&buffer, 5), "");
+        let action = hits
+            .iter()
+            .find(|hit| matches!(hit.click, Click::CustomAction { .. }))
+            .unwrap();
+        assert_eq!(
+            action.click,
+            Click::CustomAction {
+                panel: 1,
+                action: 0
+            }
+        );
+        assert_eq!(buffer_row(&buffer, action.rect.y), "1 refresh");
+
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut cv = Cv::new(&mut buffer);
+        draw_pane(&mut cv, area, "notes", Some(output), 2, true, 2);
+        assert_eq!(buffer_row(&buffer, 2), "omega");
+        assert_eq!(buffer_row(&buffer, action.rect.y), "1 refresh");
+        assert_eq!(session.action("notes", 0).unwrap(), ActionEffect::Refreshed);
+        assert_eq!(session.outputs["notes"].text, "alpha\n\nomega\n");
+    }
+
+    #[test]
+    fn refresh_sanitizes_raw_multiline_escapes_controls_and_secrets() {
+        let mut session = CustomizationSession::open(Arc::new(Host::new(concat!(
+            "first\n\u{1b}]0;hidden\nOSC title\u{7}\u{1b}[31\nmred\u{1b}[0m\n",
+            "token=ghp_0123456789abcdef0123456789abcdef0123 done\r\u{7}\u{85}\n",
+            "last\tcell\n"
+        ))))
+        .unwrap();
+        session.refresh("notes").unwrap();
+        let text = &session.outputs["notes"].text;
+        assert!(text.starts_with("first\nred\ntoken="), "{text}");
+        assert!(text.ends_with(" done\nlast    cell\n"), "{text}");
+        assert!(!text.contains("ghp_0123"), "{text}");
+        assert!(!text.contains("hidden"), "{text}");
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+    }
+
+    #[test]
+    fn refresh_preserves_raw_and_visible_content_gate_refusals() {
+        for text in [
+            "first\nprompt: hidden\nlast",
+            "first\nuser_message\nlast",
+            "first\nchain_of_thought\nlast",
+            "first\n\u{1b}]0;prompt: hidden\u{7}last",
+            "first\npro\u{1b}[31mmpt: hidden\nlast",
+        ] {
+            let mut session = CustomizationSession::open(Arc::new(Host::new(text))).unwrap();
+            session.refresh("notes").unwrap();
+            assert_eq!(session.outputs["notes"].text, "[redacted]", "{text:?}");
+        }
+    }
+
+    #[test]
+    fn refresh_rejects_in_bound_text_that_expands_beyond_display_bounds() {
+        let raw = "\t".repeat(MAX_PANE_OUTPUT_BYTES);
+        assert_eq!(raw.len(), MAX_PANE_OUTPUT_BYTES);
+        assert!(raw.lines().count() <= MAX_PANE_LINES);
+        let mut session = CustomizationSession::open(Arc::new(Host::new(raw))).unwrap();
+        assert!(matches!(
+            session.refresh("notes"),
+            Err(CustomizationError::Invalid(_))
+        ));
+        let output = &session.outputs["notes"];
+        assert_eq!(output.state, PaneState::Error);
+        assert!(output.text.contains("exceeds display bounds"));
+        assert!(output.text.len() <= MAX_PANE_OUTPUT_BYTES);
+        assert_eq!(output.actions, vec![PaneAction::Refresh]);
+    }
+
+    #[test]
+    fn refresh_accepts_tab_expansion_at_exact_display_limit() {
+        let raw = "\t".repeat(MAX_PANE_OUTPUT_BYTES / 4);
+        let mut session = CustomizationSession::open(Arc::new(Host::new(raw))).unwrap();
+        session.refresh("notes").unwrap();
+        let output = &session.outputs["notes"];
+        assert_eq!(output.state, PaneState::Ready);
+        assert_eq!(output.text.len(), MAX_PANE_OUTPUT_BYTES);
+        assert!(output.text.chars().all(|c| c == ' '));
+    }
+
+    #[test]
+    fn direct_pane_render_sanitizes_multiline_input_without_refresh() {
+        let output = PaneOutput {
+            id: "notes".into(),
+            title: "Local notes".into(),
+            state: PaneState::Ready,
+            text: "\u{1b}[31malpha\u{1b}[0m\n\u{1b}]0;hidden\ntext\u{7}omega\n".into(),
+            truncated: false,
+            actions: Vec::new(),
+        };
+        let area = Rect::new(0, 0, 40, 9);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut cv = Cv::new(&mut buffer);
+        draw_pane(&mut cv, area, "notes", Some(&output), 2, true, 0);
+        assert_eq!(buffer_row(&buffer, 2), "alpha");
+        assert_eq!(buffer_row(&buffer, 3), "omega");
+        assert_eq!(buffer_row(&buffer, 4), "");
+        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(!text.contains("hidden"));
+        assert!(!text.contains("[31m"));
+    }
+
+    #[test]
+    fn direct_pane_render_keeps_secret_redaction_and_content_refusals() {
+        for (text, expected) in [
+            ("alpha\nchain_of_thought hidden\nlast", "[redacted]"),
+            (
+                "token=ghp_0123456789abcdef0123456789abcdef0123\nlast",
+                "[redacted:github token]",
+            ),
+        ] {
+            let output = PaneOutput {
+                id: "notes".into(),
+                title: "Local notes".into(),
+                state: PaneState::Ready,
+                text: text.into(),
+                truncated: false,
+                actions: Vec::new(),
+            };
+            let area = Rect::new(0, 0, 60, 9);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            draw_pane(
+                &mut Cv::new(&mut buffer),
+                area,
+                "notes",
+                Some(&output),
+                2,
+                true,
+                0,
+            );
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("ghp_0123"), "{text}");
+            assert!(!text.contains("chain_of_thought"), "{text}");
+        }
+    }
+
+    #[test]
+    fn direct_pane_render_rejects_raw_and_expanded_over_bound_text() {
+        for text in [
+            "x".repeat(MAX_PANE_OUTPUT_BYTES + 1),
+            "\t".repeat(MAX_PANE_OUTPUT_BYTES),
+            "row\n".repeat(MAX_PANE_LINES + 1),
+        ] {
+            let output = PaneOutput {
+                id: "notes".into(),
+                title: "Local notes".into(),
+                state: PaneState::Ready,
+                text,
+                truncated: false,
+                actions: vec![PaneAction::Refresh],
+            };
+            let area = Rect::new(0, 0, 80, 9);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let mut cv = Cv::new(&mut buffer);
+            draw_pane(&mut cv, area, "notes", Some(&output), 2, true, 0);
+            let hits = cv.take_hits();
+            assert_eq!(buffer_row(&buffer, 2), "error");
+            assert_eq!(
+                buffer_row(&buffer, 3),
+                "invalid customization: pane output exceeds display bounds"
+            );
+            assert!(hits.iter().any(|hit| hit.click
+                == Click::CustomAction {
+                    panel: 1,
+                    action: 0
+                }));
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(!text.contains("row"), "{text}");
+            assert!(!text.contains("xxx"), "{text}");
+        }
     }
 }

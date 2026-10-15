@@ -3,670 +3,227 @@
 </p>
 
 <p align="center">
-  <strong>An AI coding harness where you stay the authority.</strong><br>
-  Typed grants instead of blanket trust. A hash-chained ledger of everything
-  the agent did. Providers you route deliberately.
+  <strong>A configurable workspace for coding and pentest work.</strong><br>
+  Your terminal or browser. Your models, tools, and layout.
 </p>
 
 <p align="center">
-  <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/rust-1.99-orange"></a>
-  <a href="https://github.com/fufugita/ORBIT/releases"><img alt="Release" src="https://img.shields.io/badge/release-v0.2.0-blue"></a>
-  <a href="https://github.com/fufugita/ORBIT/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/fufugita/ORBIT/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="#license"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <a href="#install">Install</a> · <a href="#get-started">Get started</a> ·
+  <a href="docs/customization.md">Customize</a> ·
+  <a href="#documentation">Documentation</a>
 </p>
 
----
+ORBIT brings conversation, file changes, command output, and delegated work into
+one open-source workspace. Connect cloud providers or local models, configure task
+routing and permissions, then work in your terminal, browser, or a headless command.
 
 <p align="center">
-  <img src="docs/tui/media/orbit-demo.gif" alt="A full session in the ORBIT terminal UI: the welcome screen, a question about a failing test, an edit and a test run that each wait for approval, the command's output streaming in, and the review layout" width="800">
+  <img src="docs/tui/media/orbit-demo.gif" alt="ORBIT reading a project, proposing an edit, requesting approval, running tests, and opening the review layout" width="960">
 </p>
 
-<p align="center"><sub>One session in the terminal UI, captured from the real binary against a scripted
-provider: a question about a failing test, an edit and a test run that wait for your approval, the
-command's output streaming into the Terminal panel, and the review layout with the ledger's record
-of it all. The project is a throwaway fixture.</sub></p>
+<p align="center"><sub>Captured from the real terminal interface with a scripted provider and a disposable project.</sub></p>
 
-## Why
-
-Most agent harnesses ask you to trust them. ORBIT is built so you don't have to:
+## What you can do
 
 | | |
 |---|---|
-| **Prove** | Every turn is a hash-chained ledger event. `orbit verify-ledger` checks the chain; `orbit replay --dry` re-plans the same work without dispatching a single request. |
-| **Protect** | A non-overridable kernel: credentials, keys, hashes and internal identifiers never leave your machine. Prompt bytes never enter the ledger, exports, logs, or the UI. Untrusted quoted, tool, or provider content can never become user authority. |
-| **Route** | Declare providers in `providers.toml`; the gateway resolves the right one at dispatch time, with four-gate admission and bounded retry. Credentials are referenced by environment-variable *name*, never stored. |
-
-## The terminal UI
-
-The default front-end is a ratatui interface built from panels. Each panel is
-a closed box with its own scroll and selection, and keys go only to the
-focused one. Every panel is fed by engine events, so nothing on screen is
-placeholder data. Replies type in at 240 characters per second and markdown
-arrives as style (headings, emphasis, lists, quotes, links, code), not as
-markup.
-
-<p align="center">
-  <img src="docs/tui/shots/idle.png" alt="The columns layout after a turn: Changes, Conversation and Terminal, all filled in" width="860">
-</p>
-
-<p align="center"><sub>The <code>columns</code> layout after a turn. <b>Changes</b> lists the files ORBIT
-edited with their real +/− counts. <b>Conversation</b> holds the prompts, one card per tool call and the
-reply. <b>Terminal</b> keeps a tape per command, with its output and outcome.</sub></p>
-
-Reads run freely; edits and commands ask first. The approval card says what
-you are approving (an Edit's diff, or the command with its directory, the
-permission mode, whether the sandbox confines it and where it may write) and
-the rule that remembering the choice would add:
-
-<p align="center">
-  <img src="docs/tui/shots/approval.png" alt="An approval card for a shell command, with directory, mode, sandbox, writes and the rule that s would grant" width="860">
-</p>
-
-<p align="center"><sub>Approving a shell command. <code>y</code> allows it once. <code>s</code> allows the calls the
-named rule matches (here the exact command) for the rest of the session; in a trusted folder <code>a</code>
-also saves the rule in <code>.orbit/settings.local.toml</code>. <code>n</code> denies and asks for a word on why, which goes back
-to the model; <code>Esc</code> denies without one. An Edit's card shows its diff in the same place.</sub></p>
-
-<p align="center">
-  <img src="docs/tui/shots/streaming.png" alt="A command still running: its output streams into the Terminal panel" width="860">
-</p>
-
-<p align="center"><sub>Mid-turn. The command is still running, its output streams into the Terminal as it is
-produced, and the status line names the tool. <code>Esc</code> stops it.</sub></p>
-
-Four layout presets sit in the top bar: `columns`, `build`, `agents` and
-`review`. The `review` layout puts the selected file's hunks beside the Plan
-and the Activity panel, which lists what the ledger recorded for each call
-(its intent, the decision, the result, the request that left) with the
-record's short hash:
-
-<p align="center">
-  <img src="docs/tui/shots/review.png" alt="The review layout: a diff, the plan, and the activity feed of ledger records" width="860">
-</p>
-
-<p align="center"><sub>The <code>review</code> layout. Every row in Activity is a ledger record; the short hash on
-the right is its place in the chain.</sub></p>
-
-`Esc` enters arrange mode: `h j k l` move focus, `H J K L` swap panels, `v`
-and `s` split, `p` changes what a panel shows (Conversation, Changes,
-Terminal, Plan, Activity, Context, Review or an Agent), `x` closes one,
-`< >` and `- +` resize, `z` zooms, `[` and `]` switch presets, and `i` or `⏎`
-returns to typing. The layout is saved in `tui.toml` and survives restarts.
-The mouse works on what you can see: click a panel to focus it, a layout tab
-to switch, a file to select it, an approval chip to answer; the wheel scrolls
-the panel under the pointer. Dragging inside a panel selects what is
-displayed (a turn's words, without its gutter marks or timestamp) and copies
-it on release through OSC 52, so your terminal has to allow that. `?` lists every key, `/` lists the slash
-commands, `:` opens the command palette, and a line that starts with `!` runs
-a command of your own.
-
-Type `@` in the composer to browse files in the current workspace. `↑` and `↓`
-choose a path; `Tab` or `Enter` inserts it into the draft. Selecting a directory
-continues browsing. Ignored files and sensitive paths are hidden from suggestions.
-Use `@"docs/design note.md"` for paths with spaces. When you send the prompt,
-mentions pass through the Read tool's permission and scanning checks; image
-mentions such as `@screenshot.png` attach the image for providers that support it.
-
-`Ctrl-R` searches saved input history. Type a substring, repeat `Ctrl-R` to
-find an older match, and press `Enter` to accept it into the draft. `Esc` restores
-the draft you started with. A second `Enter` sends the accepted draft. History
-preserves multiline prompts across restarts; older history files still load.
-
-Colour is negotiated with the terminal rather than assumed: true colour, 256,
-16 and no colour (`NO_COLOR` is honoured) each have their own palette, and
-colour effects such as fades switch off at the low end while glyph motion
-keeps running. On a narrow terminal the UI shows one panel at a time behind
-numbered tabs, and below 40×10 it shows a single notice that the window is
-too small.
-
-> **Try it without building anything.** [`docs/tui/prototype.html`](docs/tui/prototype.html)
-> is the interactive design prototype the terminal UI was built from: a
-> self-contained canvas simulation you can open in any browser, with a motion
-> gallery where every animation loops side by side. What the binary renders
-> today is in [`docs/tui/shots`](docs/tui/shots).
+| **Build and investigate** | Read files, edit code, run commands, inspect diffs, and follow streamed tool output. |
+| **Choose your models** | Use Anthropic, OpenAI-compatible, and Ollama adapters; configure models and roles explicitly. |
+| **Route by task** | Map task phases and difficulty to different models, preview a decision, or pin your own selection. |
+| **Delegate and return** | Name agents, resume their saved conversations, and inspect the model and effort each one uses. |
+| **Make it yours** | Change themes, colors, layouts, tabs, and panes; set browser fonts and share portable profiles. |
+| **Connect your tools** | Configure local MCP servers, language diagnostics, skills, hooks, and instruction mods. |
+| **Organize pentests** | Start with scope, notes, evidence, findings, report templates, and an engagement layout. |
 
 ## Install
 
-On Linux, Homebrew can build the current main branch with both executables:
+### Homebrew on Linux
+
+Build the current main branch and install both `orbit` and `orbit-web`:
 
 ```sh
 brew tap fufugita/orbit https://github.com/fufugita/ORBIT.git
 brew install --HEAD fufugita/orbit/orbit
 ```
 
-The npm distribution is `@fufugita/orbit`, with prebuilt Linux x64 and arm64
-glibc 2.35+ packages. It needs Node.js 22.15+ (or 23.11+), and no Rust compiler or
-installation script. Once the package has been published:
+The formula uses Homebrew's Rust build dependency. `--HEAD` tracks main.
+
+### npm on Linux
+
+The `next` preview packages are prepared; registry publication is pending. After publication:
 
 ```sh
-npm install --global @fufugita/orbit@next
+npm install --global --include=optional @fufugita/orbit@next
 ```
 
-The initial npm release requires registry authentication; the package source and
-native build workflow do not imply that a version is already published. See
-[package distribution](docs/setup.md#package-distribution) for local package
-installation and publishing prerequisites.
+Requires **Node.js 22.15+ (22.x), or 23.11+**, Linux **x64 or arm64**, and **glibc 2.35+**.
+The optional platform package contains both executables. Installation needs no
+Rust compiler or lifecycle download script. See [package distribution](docs/setup.md#package-distribution)
+for availability, local package installation, and uninstall instructions.
 
-Install the command-line and browser executables as one verified bundle. Release
-mode needs Bash, Python 3.11+, curl, and a SHA-256 utility; Rust is needed only for
-a source build. Use a version with published native Linux assets:
+### From source
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/fufugita/ORBIT/main/install.sh -o /tmp/orbit-install.sh
-bash /tmp/orbit-install.sh --method release --version 0.2.0 --dir "$HOME/.local/bin"
-```
-
-The installer requires the archive checksum and both executable hashes. Managed
-upgrades switch both binaries together and preserve your configuration. It refuses
-unmanaged executables in the destination; choose a fresh `--dir` in that case.
-A missing release asset fails visibly. To build explicitly from a checkout with
-the pinned Rust 1.99 toolchain and locked dependencies:
+Install Rust through [rustup](https://rustup.rs/), then build with the pinned Rust 1.99 toolchain:
 
 ```sh
-git clone https://github.com/fufugita/ORBIT
+git clone https://github.com/fufugita/ORBIT.git
 cd ORBIT
 bash install.sh --method source --source . --version 0.2.0 --dir "$HOME/.local/bin"
 ```
 
-See [setup and installation](docs/setup.md) for the bundle layout and platform
-limits. Checksums establish integrity against the published checksum; current
-bundles are unsigned.
+Add the installation directory to `PATH`. The managed installer switches both
+executables together and preserves your configuration. See [setup](docs/setup.md)
+for bundle installation, upgrades, prerequisites, and platform limits.
 
-## Quickstart
+## Get started
+
+Guided setup initializes ORBIT and asks for your endpoint, model IDs, and credential variable **name**:
 
 ```sh
-# Offline setup; repeating this preserves your identity and ledger
-orbit setup
-orbit doctor
-
-# Manual guided provider setup; credentials stay in your environment
 orbit setup --guided
-
-# Open the terminal harness
-orbit
-
-# Or send one prompt headless
-orbit -p "read README.md and summarize it" --output-format text
 ```
 
-Provider configuration lives in `$ORBIT_HOME/providers.toml` (default
-`~/.orbit/`). Declare exact endpoint/model pairs and credential environment-variable
-names. A legacy direct-gateway session requires an explicit `ORBIT_GATE_URL` or
-`--gate`; malformed or ambiguous declared configuration is refused.
-
-Built-in phase and difficulty routing is configured without another model call:
+Export the credential in your shell, then check your configuration and open ORBIT:
 
 ```sh
-orbit route setup --easy first/small --hard second/strong
-orbit route test "Implement a comprehensive parser"
+orbit doctor
+orbit
 ```
 
-Use declared provider/model names in place of the examples. Explicit model choices
-pin a session; `/route auto` enables automatic selection for it. See
-[setup](docs/setup.md) for individual phase targets and saved-session controls.
+Setup stores credential variable names. Model requests send conversation and tool
+context to your configured provider. Doctor checks local readiness without contacting
+providers or starting integration servers. See [setup](docs/setup.md) for configuration paths.
 
-Appearance and named panes share a portable profile:
+For a browser session, start from the project you want to work in:
+
+```sh
+orbit web
+```
+
+For a headless task, use `orbit -p "Summarize this project" --output-format text`.
+JSON and streaming JSON are also supported. Calls needing unanswered approval are denied.
+
+## Work in the terminal or browser
+
+Arrange Conversation, Changes, Terminal, Plan, Context, Activity, Review, and Agent
+panels. Choose `columns`, `build`, `agents`, or `review`, or split and resize your
+own layout. On narrow terminals, tabs select the focused pane.
+
+Use `@` to complete workspace files, attach images for capable models, and
+`Ctrl-R` to search saved prompt history. With an empty composer while idle,
+press `Esc` for arrange controls, `?` for help, or `:` for the command palette.
+During a live turn, `Esc` cancels it. Approval cards show the proposed edit
+or command before you decide; tool permissions and remembered rules control
+which calls need confirmation.
+
+<p align="center">
+  <img src="docs/images/terminal-customization.png" alt="ORBIT in the Midnight theme with custom Engagement and Notes panes beside the terminal conversation" width="960">
+</p>
+
+<p align="center"><sub>A real terminal capture: Midnight theme, custom layout, and workspace file panes. The local demo has an unsent draft and makes no provider requests.</sub></p>
+
+The browser shares providers, permissions, and saved conversation formats. It streams
+responses and tool activity, presents approvals, and exposes model, effort, session,
+and appearance controls. Use `orbit web --resume SESSION_ID` to return to saved work;
+close its previous owner first. See the [browser guide](docs/browser-harness.md).
+
+## Route models without another model call
+
+Configure easy and hard targets using your declared provider/model IDs:
+
+```sh
+orbit route setup --easy first/small --hard first/strong
+orbit route test "Implement a comprehensive parser"
+orbit route status
+```
+
+Routing classifies phase and difficulty separately using deterministic rules; individual phase targets are configurable.
+An explicit model choice pins the session; `/route auto` restores automatic routing.
+Roles select separate defaults for delegation, exploration, and compaction.
+
+Use `--effort high` or `/effort high` only when that model declares the choice.
+`/effort default` restores its configured default. String levels and Ollama boolean
+thinking controls remain distinct. See [provider setup](docs/setup.md#declare-providers-and-routing).
+
+## Make the workspace yours
 
 ```sh
 orbit customize theme midnight
 orbit customize set colors.accent '#8A91FF'
 orbit customize set layout.preset review
-orbit customize capabilities
+orbit customize set browser.font_family 'Fira Code, monospace'
+orbit customize set browser.font_size_px 15
 ```
 
-See [customization](docs/customization.md) for fonts, layouts, colors, custom panes,
-reload, and import/export. For engagement templates, scope and evidence panes,
-start with [pentest workspaces](docs/pentest.md). Follow the
-[first real-provider trial](docs/provider-acceptance.md) before relying on a new
-provider configuration.
+Choose `orbit`, `midnight`, or `paper`; adjust spacing, symbols, motion, and color mode.
+Add panes for notes, workspace Markdown, routing, usage, agents, scope, evidence, or
+findings. Portable profiles share preferences across frontends and support validation/import/export.
 
-## Providers
+Browser fonts use families already installed on your system. Terminal font family
+and size are controlled by your terminal application. Custom panes are declarative;
+they do not execute JavaScript or shell commands. See [customization](docs/customization.md)
+for profile examples, pane actions, supported settings, and recovery controls.
 
-`orbit provider add` walks a preset through setup — the well-known
-providers' endpoints, credential conventions and public model facts are
-built in, and the models are discovered live from the endpoint:
+<p align="center">
+  <img src="docs/images/browser-customization.png" alt="ORBIT in the browser with the Paper theme, custom Engagement and Notes panes, and appearance controls for fonts, colors, and layouts" width="960">
+</p>
 
-```console
-$ orbit provider add
-Providers:
-  1. anthropic    Anthropic — Claude models over the native Messages API
-  2. openai       OpenAI — GPT models over the chat completions API
-  3. openrouter   OpenRouter — one key, many providers' models
-  4. qwen         Qwen (DashScope international endpoint)
-  5. zai          Z.ai — GLM models (OpenAI-compatible surface)
-  ...
-Discovered models:
-  1. claude-opus-5-5 — Opus 5.5 — the main brain
-  2. claude-sonnet-5-5 — Sonnet 5.5 — fast main agent / coding subagent
-  3. claude-haiku-4-5 — Haiku 4.5 — explore, extraction, summaries
-```
+<p align="center"><sub>The same local demo in the browser, with Paper and custom font settings. Captured from the running interface with no provider requests.</sub></p>
 
-Credentials are stored as **env-var names, never values**: the preset
-suggests the convention (`ANTHROPIC_API_KEY`, `DASHSCOPE_API_KEY`, …),
-you `export` the key yourself, and ORBIT reads it at request time.
-Scripted form for dotfiles:
+## Agents and persistent sessions
+
+The `Task` tool supports named agents with stable IDs, saved reports, model and
+effort selection, and explicit resume. `ListAgents` lists them; `AgentSendMessage`
+queues a message for the next resume. Agents inherit their parent's tool scope
+and permissions. A task call runs synchronously; saved agents can be continued later.
+
+To leave a session running while an attached terminal disconnects, start a
+foreground owner and attach from another terminal:
 
 ```sh
-orbit provider add anthropic --model claude-opus-5-5,claude-haiku-4-5
-orbit provider add qwen --url https://dashscope.aliyuncs.com/compatible-mode/v1 \
-  --model qwen3.8-max --credential-env DASHSCOPE_API_KEY
-orbit provider add ollama --model qwen3.5:9b          # local, no key
-orbit provider list && orbit provider remove qwen
+orbit serve --socket "$HOME/.orbit-run/owner.sock" --session work --model first/small
+orbit attach --socket "$HOME/.orbit-run/owner.sock"
 ```
 
-Gate URLs keep their path: DashScope's `/compatible-mode/v1` and Z.ai's
-`/api/paas/v4` reach the adapters verbatim.
+Use separate terminals and a declared model. `/detach` leaves the owner running;
+`/cancel` interrupts a turn; `/stop` ends it. Resume an owner with `serve --resume SESSION_ID`.
+See [serve and attach](docs/integrations.md#keep-a-session-running-with-serve-and-attach).
 
-### Model roles
+## Tools, extensions, and pentest workspaces
 
-`providers.toml` carries a `[roles]` table — ORBIT's task-based router.
-The main conversation keeps one model (switching mid-thread drops cached
-context and replayed thinking); delegated work picks its own:
-
-```toml
-[roles]
-main       = "claude-opus-5-5"             # the conversation's model
-subagent   = "claude-sonnet-5-5"           # Task-tool children
-explore    = "anthropic/claude-haiku-4-5"  # read-only Explore/Plan
-compaction = "claude-haiku-4-5"            # auto-compact summaries
-```
-
-A bare id resolves across providers; `provider/model` disambiguates when
-the same id is declared twice. A subagent's own `model:` frontmatter
-overrides its role. `orbit provider role <name> [model]` sets and
-queries roles; interactive `provider add` offers to fill unset ones,
-preferring cheap models for explore and compaction.
-
-### Named and resumable agents
-
-`Task` (also accepted as `Agent`) returns a stable `agent_id`, status and
-report. Give a new agent a display `name`, then pass its ID as `resume`
-to continue its saved conversation with the same agent profile:
-
-```json
-{"agent":"Explore","prompt":"Map the parser","name":"parser research"}
-{"agent":"Explore","prompt":"Check its error paths","resume":"<agent_id>"}
-```
-
-Names are labels; IDs address agents. Saved agents belong to the parent
-conversation and remain available when that conversation is resumed.
-Each call runs synchronously. An optional `model` selects a configured
-model, including `provider/model`, ahead of profile frontmatter and role
-routing. Resume keeps the saved model unless the call supplies another
-one. The agent panel displays the model actually used.
-
-An optional `effort` selects one of that model's declared effort choices.
-Use a level string, or a boolean for an Ollama model that supports it.
-Resume keeps the saved selection; `"effort":"default"` or `"effort":null`
-restores the model default. An explicit model change resolves the new
-model's settings. Profile frontmatter can also set `effort`; a parent's
-choice is inherited only for the same provider and model. Effort changes
-apply to subsequent requests and newly started agents.
-
-`ListAgents` returns IDs, names, profiles, models, saved effort selections,
-status and pending
-message counts. Its optional `offset` and `limit` page through the list;
-follow `next_offset` until it is null. `AgentSendMessage` takes an
-`agent_id` and `message` and returns a queued receipt. Messages are
-delivered on the next explicit `Task` resume. Messages arriving during
-a run wait for a later resume.
-
-Child calls inherit the parent's permission rules, working directories
-and cancellation. Nesting is limited to three agent levels, with at
-most 64 saved agents per parent conversation. Long tool-response reports
-are shortened with `report_truncated`; the full report remains saved.
-After an interrupted run, the next resume asks the agent to inspect existing effects before
-continuing; external effects are not automatically replayed.
-
-### Difficulty routing
-
-Roles route *tasks*; routing also reads the *prompt*. A small keyword
-classifier — deterministic, no second model call — sends hard-sounding
-prompts ("refactor", "root cause", "trace", "security review", …) to a
-strong model and easy-sounding ones ("summarize", "what is", "typo",
-…) to a cheap one. Unset or unmatched prompts keep the session's own
-model. Hard always wins when both fire:
+Connect **native Unix stdio MCP** servers with tool selection and permission rules.
+Enable **LSP diagnostics** for installed servers, and add skills, hooks, instruction
+mods, or verified signed content. Browser automation uses a separately configured
+browser MCP server. See [integrations](docs/integrations.md) for setup and limits.
 
 ```sh
-orbit route hard claude-opus-5-5     # arm the tiers (models must be configured)
-orbit route easy claude-haiku-4-5
-orbit route test "refactor the parser"   # preview: phase, model, the keyword that fired
-orbit route status                       # the whole table
-orbit route keywords add hard wasm      # extend the vocabulary
-orbit route off                           # disarm
+orbit pentest init ./engagement --profile standard
+orbit pentest status ./engagement --json
 ```
 
-Every routed turn writes a decision record under the session's
-`routing/` directory and the status line says what happened
-(`routed hard → <model> (refactor)`). An explicit `--model` or `/model`
-choice always wins over the table — routing never overrides you.
-Switching models drops foreign thinking blocks from the wire copy
-(providers reject another model's signatures); the session file keeps
-them. `orbit provider add` offers to arm routing when a second model
-exists.
+The scaffold creates scope, notes, evidence/findings directories, report and
+workflow templates, a triage agent, and a portable engagement profile. It preserves
+existing work and starts no scans or external tools. Edit the scope and templates,
+then import the generated layout as described in [pentest workspaces](docs/pentest.md).
 
-## Features
+## Documentation
 
-- **Tool calling with approval** — reads run freely, edits and commands ask.
-  The card shows an Edit's diff, a command's directory, the permission mode,
-  the sandbox state and the rule a grant would add. `y` allows once. `s`
-  allows the calls that rule matches for the session, and `a` also saves it
-  in the folder's `.orbit/settings.local.toml` (offered only in a trusted
-  folder). `n` denies and takes a word on why, which goes back to the model.
-  Every decision is a ledger record, and a grant never outranks a deny rule.
-- **Sandboxed shell** — on Linux, Bash runs under bubblewrap with no network
-  and writes limited to the project and a session temp directory. Where the
-  sandbox is unavailable, Bash is refused (read-only commands excepted)
-  unless `ORBIT_ALLOW_UNSANDBOXED_BASH=1` is set.
-- **Headless and CI** — `orbit -p PROMPT` runs one turn with tools under
-  `dontAsk` (anything no allow rule covers is denied and reported, never
-  asked). `--output-format` is `text`, `json` or `stream-json`; `--bare`
-  skips hooks, skills, mods and MCP discovery; `--json-schema` validates the
-  final answer. Exit codes: 0 done, 1 failed, 2 stopped by a permission
-  denial, 3 hit `--max-turns`, 130 interrupted.
-- **Sessions and context** — transcripts are JSONL you can `--continue` or
-  `--resume`; a checkpoint is taken before every prompt; and the engine
-  compacts the context by itself when it crosses 90% of a model's
-  `context_window`. The Context panel shows what fills the window.
-- **Extensions** — an MCP client, hooks on 13 events, skills (`SKILL.md`),
-  subagents through the Task tool, and signed mods installed with
-  `orbit mod install`.
-- **Usage and cost accounting** — per-turn and cumulative token counts and
-  microdollar costs, surfaced in the top bar, in `/usage` and in session
-  files.
-- **Trace, replay, export, restore** — verify the ledger hash chain, emit a
-  no-dispatch replay plan, encrypt an age bundle, restore into a fresh
-  namespace.
-- **WASI plugin runtime** — wasmtime 47 with an import allowlist, bounded
-  instance pool, and WASI-kill lifecycle.
-- **SDKs** — TypeScript (lead) and Python (parity) expose the IR types and
-  workflow descriptors for cross-language conformance.
-
-## CLI reference
-
-```
-orbit [chat]           start the interactive harness (TUI or REPL)
-orbit ask PROMPT       send one prompt through a configured gateway
-orbit -p PROMPT        headless one-shot with tools (text, json or stream-json)
-orbit init             initialize trust root + identity + ledger
-orbit models           list models from all configured providers
-orbit run              run the example phase chain
-orbit cancel           cancel the session (terminal: cancelled)
-orbit verify-ledger    verify the ledger hash chain
-orbit replay --dry     verify + emit a no-dispatch replay plan
-orbit export --to      encrypt an age bundle
-orbit restore          restore into a fresh namespace
-orbit mod install|list|allow-issuer   signed mods
-orbit folder trust|untrust|status     let a folder's own settings loosen permissions
-orbit provider add|list|remove|presets|role   manage providers and roles
-orbit route status|hard|easy|off|keywords|test   difficulty routing: arm tiers, preview a prompt
-orbit version          build + evidence facts (computed, no fixed claims)
-orbit web              start the browser harness
-```
-
-Common flags: `--model <M>`, `--effort <VALUE|default>`, `--gate <URL>`, `--provider <name>`,
-`--home <DIR>`, `--continue`, `--resume <ID>`, `--fork-session`, `--no-tui`,
-`--auto-tools`, `--permission-mode <default|acceptEdits|plan|dontAsk|bypass>`.
-For `-p`: `--output-format <text|json|stream-json>`, `--allowedTools`,
-`--disallowedTools`, `--max-turns`, `--max-cost`, `--bare`,
-`--json-schema <file>` and `--worktree <name>`.
-
-## Architecture
-
-```
-crates/
-  engine           the agent loop every front-end shares
-  frontend-protocol  the typed events and actions every front-end speaks
-  tools            the tool set, permission modes and rules, secret scanner, shell sandbox
-  mcp              MCP client
-  reactor          five-phase FSM (init|plan|execute|verify|checkpoint)
-  sandbox          Landlock/seccomp profiles, deny-by-default
-  context          segmented context, token-window ceiling, eviction
-  gateway          four-gate admission, retry policy, cost checking
-  ledger           append-only hash-chained event log, single-writer
-  trust            trust root, issuer allowlist, policy snapshot
-  session          session FSM, restricted ACL, cost tracking
-  pib              PibId identity, cross-machine allowlist
-  memory           layered global<project<path-local resolution
-  export           age-encrypted bundle, immutable restore
-  plugin           wasmtime 47 WASI runtime, import allowlist, pool
-  egress           EgressIntent digest, allowlist, route-pin
-  hud              display gate, output mode, brand, event renderer
-  hud-tui          ratatui + crossterm terminal UI front-end
-  cli              command dispatch, REPL, TUI gate, headless -p
-  web              browser harness: axum SSE/WS projection of the core
-  desktop          Tauri shell (outside the default build; needs GTK)
-  orbit-core       authority kernel, six primitives
-  orbit-api        request/response envelopes, route table
-  orbit-ledger     primitive-specific ledger events
-  orbit-ir         deterministic CBOR encoder, cross-language IR
-  adapter          provider-neutral message types, content blocks, cost rates
-  provider-http    async HTTP adapters (OpenAI-compatible, Anthropic, Ollama), TLS pinning
-  mock-provider    conformance target
-  release          version evidence, SBOM, provenance
-sdk/
-  typescript       TypeScript SDK (lead)
-  python           Python SDK (parity)
-  wit              WIT boundary shims
-tests/             gate and scenario tests that drive the real binary
-conformance/       cross-language IR conformance corpus
-migrator/          legacy-workflow → ORBIT migration
-spec/              machine-readable error registry + traceability
-evidence/          release evidence bundle
-```
-
-## Configuration
-
-### `$ORBIT_HOME`
-
-Defaults to `~/.orbit`. Holds the trust root, identity, ledger, sessions, and
-provider config.
-
-### `providers.toml`
-
-```toml
-[[provider]]
-name = "local"
-kind = "openai-compatible"   # or "anthropic", "ollama"
-url = "http://127.0.0.1:8080"
-env = "ORBIT_GATE_TOKEN"     # env-var NAME, never the value
-
-[[provider.models]]
-id = "model-a"
-context_window = 200000      # enables auto-compaction as the window fills
-max_output_tokens = 32000    # the default when omitted
-# Optional: declare only choices this provider/model accepts.
-# supported_efforts = ["low", "medium", "high"]
-# default_effort = "high"
-
-[provider.models.pricing]
-input_per_million_microdollars = 200000   # $0.20 per million input tokens
-output_per_million_microdollars = 600000   # $0.60 per million output tokens
-```
-
-The pricing unit is microdollars per million tokens. Sampling
-(`temperature`, `top_p`) is sent only when a model sets it.
-
-### Reasoning effort
-
-Declare `supported_efforts` in the model's table to enable explicit effort
-selection. Values are exact strings, or booleans for Ollama's thinking
-control. An omitted list means support is unknown; an empty list declares
-no supported choices. `default_effort`, when set, must be in that list.
-Existing configurations without these fields keep their provider defaults.
-
-Use `--effort high` at startup, or `/effort high` during chat. `/effort`
-shows the configured request value and choices; `/effort default` clears
-the session override and restores `default_effort`, or leaves the provider
-field omitted when there is no configured default. `ORBIT_EFFORT` supplies
-a startup choice when the flag is absent. An explicit startup selection
-or reset takes precedence over a saved choice.
-
-JSON quotes distinguish a named string from a boolean: `/effort "false"`
-or `--effort '"false"'` selects the string, while plain `false` selects
-the boolean. Each must be declared separately when both are supported.
-
-Selections persist with chats and named agents. Changing a model validates
-an explicit choice against the target model; an incompatible change leaves
-the current settings intact. Implicit defaults follow the newly selected
-model. Separate role models use their own configured settings.
-
-OpenAI-compatible Chat Completions uses `reasoning_effort`, Anthropic uses
-`output_config.effort` while retaining its existing adaptive thinking, and
-Ollama uses `think`. Boolean values are not converted into effort levels.
-The setting describes the request ORBIT sends; it does not measure internal
-reasoning or confirm a gateway's acceptance. Declare capabilities from the
-chosen model's documentation or metadata. ORBIT refuses unverified or
-unsupported selections before sending a request.
-
-### MCP servers
-
-On Unix, ORBIT runs configured MCP servers over stdio using protocol
-`2025-06-18`. Put user-wide servers in `$ORBIT_HOME/mcp.json`, or project
-servers in `.orbit/mcp.json`
-after trusting that folder:
-
-```json
-{
-  "servers": {
-    "docs": {
-      "command": "node",
-      "args": ["/path/to/server.js"],
-      "enabled": true,
-      "tools": ["search", "read_document"],
-      "timeout_ms": 30000,
-      "initialize_timeout_ms": 5000
-    }
-  }
-}
-```
-
-Omit `tools` to expose all server tools, or use an empty list to expose
-none. Names are exact and case-sensitive. `enabled: false` skips discovery
-and refuses calls. Agent tool restrictions also apply before discovery
-and at execution; exposing a tool never grants approval.
-
-The defaults are 30 seconds per operation and 5 seconds for initialization.
-Timeout values must be between 1 and 600,000 milliseconds. One deadline
-covers waiting for the server, initialization, writes and responses;
-progress messages do not extend it. Each server has its own connection
-lock. A failed connection is retired and a later explicit call can
-reconnect. A cancelled or timed-out call is never automatically replayed;
-when request data was sent, its external outcome may be unknown.
-
-Discovery follows bounded pages, and protocol frames and accumulated tool
-metadata are limited to 1 MiB. Model-facing results are scanned and limited
-to 64 KiB of encoded JSON, with truncation marked. Server error flags and
-structured results remain visible. MCP calls respect the caller's tool
-rules and working directory; Plan mode refuses opaque MCP calls because
-their read/write behavior is unknown.
-
-See [integrations](docs/integrations.md) for native MCP policy and catalog
-overrides, session owner/attach workflows, LSP diagnostics, and signed package
-usage. The [browser guide](docs/browser-harness.md) covers browser access,
-recovery and workspace customization.
-
-### Permission rules
-
-`[permissions]` tables in `$ORBIT_HOME/settings.toml` and in a project's
-`.orbit/settings.toml` and `.orbit/settings.local.toml` take lists of
-`allow`, `ask` and `deny` rules, such as `Bash(cargo test *)`,
-`Edit(/src/**)` or `WebFetch(domain:docs.rs)`. A deny anywhere wins over an
-allow anywhere.
-
-A Bash rule is read against the whole command line. `cargo test *` means
-the words `cargo test` and anything after them; an allow rule never covers
-a line that chains, pipes or redirects (`;`, `&&`, `|`, `>`, `$(…)`), and a
-deny rule fires on any part of such a line. A project's own settings can
-only make ORBIT stricter: their allow rules apply once you have trusted the
-folder with `orbit folder trust`. The `a` key on the approval card adds an
-allow rule to `.orbit/settings.local.toml`, only in a trusted folder. If
-`.orbit/` has no `.gitignore` it gets one naming that file, so a grant meant
-for one machine is not committed by accident.
-
-### `tui.toml`
-
-Lives in `$ORBIT_HOME`. Holds the saved layout (`[layout.tree]`, rewritten
-whenever you rearrange the panels) and colour and motion settings such as
-`reduced = true`. Missing or malformed values fall back to defaults.
-
-### Environment
-
-| Variable | Purpose |
-|---|---|
-| `ORBIT_HOME` | Config directory (default `~/.orbit`) |
-| `ORBIT_GATE_URL` | Gateway base URL (fallback) |
-| `ORBIT_MODEL` | Default model id (fallback) |
-| `ORBIT_EFFORT` | Startup effort selection when `--effort` is absent; `default` resets it |
-| `ORBIT_GATE_TOKEN` | Bearer token (referenced by `providers.toml`) |
-| `ORBIT_ALLOW_UNSANDBOXED_BASH` | Set to `1` to let Bash run unsandboxed where no sandbox is available |
-| `ORBIT_ASCII_EMOJI` | Set to `0` to disable ASCII emoji fallback |
-
-## Status
-
-ORBIT is in active, early development. **v0.2.0** is the first code-capable
-release: the agent loop, the tool set with approvals and the sandbox, the
-terminal UI, sessions and compaction, and the ledger all work against real
-providers, and the roadmap's gates have run against both a scripted provider
-and a live model. What is not done yet — narrow-screen polish, the desktop
-shell, SDK parity — is tracked in
-[`docs/roadmap/orbit-roadmap.md`](docs/roadmap/orbit-roadmap.md), whose
-"Where this stands" section carries the detailed, commit-level state.
+[Setup and installation](docs/setup.md) · [Customization](docs/customization.md) ·
+[Integrations](docs/integrations.md) · [Browser harness](docs/browser-harness.md) ·
+[Pentest workspaces](docs/pentest.md) · [First provider trial](docs/provider-acceptance.md)
 
 ## Development
 
-The workspace uses Rust 1.99 with edition 2024. An edition selects language
-semantics; its year is separate from the compiler release. The exact compiler
-is pinned in `rust-toolchain.toml` for consistent builds.
+Built with **Rust 1.99** and **edition 2024**, with locked dependencies and a shared engine/frontend protocol.
 
 ```sh
-# Rust 1.99 compiler and 2024 language edition; dependencies stay locked
-cargo build
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-
-# Dependency policy (permissive-only, default deny)
-cargo deny check
+cargo fmt --all --check
+CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --locked -- -D warnings
+CARGO_BUILD_JOBS=1 scripts/in-jail.sh cargo test --workspace --locked -- --test-threads=1
 ```
 
-Tests that stop process groups on purpose (the tools crate, the PTY suite)
-run inside a throwaway PID namespace, so a signal can never reach the rest
-of your session:
-
-```sh
-scripts/in-jail.sh cargo test --workspace
-scripts/in-jail.sh env ORBIT_PTY_ALLOW_KILL_TESTS=1 \
-  python3 scripts/pty_tui_test.py --binary target/debug/orbit \
-  --mock target/debug/orbit-mock-provider
-```
-
-`unsafe` is limited to seven small call sites in four crates (the sandbox
-probes, the ledger's file lock, a uid lookup and a child-process signal), each
-marked with `#[allow(unsafe_code)]`; the rest of the code has none. The
-dependency policy (`deny.toml`) allows MIT, Apache-2.0, BSD-2/3, ISC, 0BSD,
-Unlicense, and CC0-1.0; anything else fails the check.
-
-## Project layout
-
-```
-.
-├── crates/            Rust workspace (28 crates, plus the desktop shell)
-├── tests/             gate and scenario tests that drive the real binary
-├── sdk/               TypeScript + Python SDKs, WIT shims
-├── conformance/       cross-language IR conformance corpus
-├── migrator/          legacy-workflow → ORBIT migration
-├── spec/              error registry + traceability
-├── evidence/          release evidence bundle
-├── deploy/            mock provider deployment
-├── scripts/           build, e2e, fuzz, packaging, PTY and jail scripts
-├── fuzz/              coverage-guided fuzzing
-├── docs/              roadmap, TUI prototype and screenshots
-├── .github/           CI and the headless-run workflow
-├── Cargo.toml         workspace manifest
-├── deny.toml          cargo-deny policy
-└── rust-toolchain.toml
-```
+Process-control tests use the provided Linux PID jail. Use `orbit --help` for the command surface.
 
 ## License
 
-Core: **Apache-2.0**. WIT/SDK shims: dual-licensed `(MIT OR Apache-2.0)`.
+[Apache-2.0](LICENSE).
