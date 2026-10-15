@@ -36,9 +36,9 @@ jobs:
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: build gate binaries
-        run: cargo build -p orbit-cli -p orbit-mock-provider
+        run: cargo build --locked -p orbit-cli -p orbit-mock-provider
       - name: disk before test
         run: df -h /
       - name: allow user namespaces
@@ -52,7 +52,7 @@ jobs:
         # used to be fenced off because the job kept dying when they ran;
         # that was the test process signalling its whole user session via
         # `kill -TERM -<pgid>`, not the runner — fixed in the code.)
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -63,6 +63,5 @@ jobs:
         run: df -h /
       - name: deny
         run: |
-          cargo install --locked cargo-deny >/dev/null 2>&1
-          cargo deny check
-        continue-on-error: true
+          cargo install --locked --version 0.20.2 cargo-deny >/dev/null 2>&1
+          cargo deny --locked check

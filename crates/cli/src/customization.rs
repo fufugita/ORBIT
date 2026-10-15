@@ -46,7 +46,7 @@ impl Directory {
             let mut checked = PathBuf::from("/");
             let mut file = OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open("/")
                 .map_err(io_error)?;
             for component in path.components() {
@@ -66,13 +66,16 @@ impl Directory {
                     ));
                 }
                 if let Component::Normal(part) = component {
-                    // Every ancestor is opened relative to the held parent, so a
-                    // rename/symlink swap cannot redirect a later component.
+                    // Traversal needs search permission, not permission to list
+                    // each ancestor. Held descriptors still prevent a rename or
+                    // symlink swap from redirecting a later component.
                     let next =
                         PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())).join(part);
                     file = OpenOptions::new()
                         .read(true)
-                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .custom_flags(
+                            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
                         .open(next)
                         .map_err(io_error)?;
                     if !same(&m, &file.metadata().map_err(io_error)?) {
@@ -81,6 +84,19 @@ impl Directory {
                 }
             }
             let m = file.metadata().map_err(io_error)?;
+            // Only the final directory needs a readable descriptor for fsync.
+            // Reopen the held directory itself, including when the path is `/`.
+            let readable = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())).join("."))
+                .map_err(io_error)?;
+            let opened = readable.metadata().map_err(io_error)?;
+            if !same(&m, &opened) {
+                return Err(Error::UnsafePath("directory identity changed".into()));
+            }
+            file = readable;
+            let m = opened;
             if private
                 && (m.uid() != unsafe { libc::geteuid() } || m.permissions().mode() & 0o077 != 0)
             {
@@ -1000,4 +1016,85 @@ pub fn count_workspace(
     }
     walk(home, workspace, &root, scope, 0, &mut visited, &mut result)?;
     Ok(result)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod directory_tests {
+    use super::{Directory, Error};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+
+    struct Tree {
+        root: PathBuf,
+        ancestor: PathBuf,
+        target: PathBuf,
+    }
+
+    impl Tree {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("orbit-directory-{}", ulid::Ulid::new()));
+            let ancestor = root.join("search-only");
+            let target = ancestor.join("private");
+            for path in [&root, &ancestor, &target] {
+                std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+            }
+            std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+            Self {
+                root,
+                ancestor,
+                target,
+            }
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ =
+                std::fs::set_permissions(&self.ancestor, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn directory_open_traverses_search_only_ancestors_and_syncs_final_directory() {
+        let tree = Tree::new();
+        let directory = Directory::open(&tree.target, true).unwrap();
+        directory.sync().unwrap();
+        let child = directory.child("created", true).unwrap();
+        child.sync().unwrap();
+        assert!(tree.target.join("created").is_dir());
+        assert!(
+            !rustix::fs::fcntl_getfl(&directory.file)
+                .unwrap()
+                .contains(rustix::fs::OFlags::PATH)
+        );
+    }
+
+    #[test]
+    fn directory_open_keeps_symlink_and_private_mode_checks() {
+        let tree = Tree::new();
+        let alias = tree.root.join("alias");
+        symlink(&tree.ancestor, &alias).unwrap();
+        assert!(matches!(
+            Directory::open(&alias.join("private"), true),
+            Err(Error::UnsafePath(_))
+        ));
+
+        std::fs::set_permissions(&tree.target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            Directory::open(&tree.target, true),
+            Err(Error::UnsafePath(_))
+        ));
+    }
+
+    #[test]
+    fn directory_open_root_returns_readable_final_descriptor() {
+        let directory = Directory::open(Path::new("/"), false).unwrap();
+        assert!(
+            !rustix::fs::fcntl_getfl(&directory.file)
+                .unwrap()
+                .contains(rustix::fs::OFlags::PATH)
+        );
+        directory.check().unwrap();
+    }
 }
