@@ -219,11 +219,14 @@ fn redact_line(line: &str) -> String {
             || key_up.contains("PRIVATE");
         let val = v[1..].trim().trim_matches('"').trim_matches('\'');
         if looks_secret && val.chars().count() >= 32 && entropy_bits(val) > 3.5 {
-            return format!(
-                "{}= [redacted:secret]{}",
-                k,
-                v[1 + v[1..].len() - val.len()..].trim_start_matches(val)
-            );
+            let newline = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            return format!("{k}= [redacted:secret]{newline}");
         }
     }
     line
@@ -306,6 +309,24 @@ mod tests {
         assert!(out.contains("[redacted:private key]"));
         // CoT markers remain hard rejects (prompt-confusion payloads).
         assert!(display_safe("chain_of_thought: ...").is_err());
+    }
+
+    #[test]
+    fn unicode_assignment_redaction_preserves_line_boundaries() {
+        for (suffix, newline) in [("", ""), ("\n", "\n"), ("\r\n", "\r\n")] {
+            let text = format!("secret note = \"éAbCdEfGhIjKlMnOpQrStUvWxYz0123456789\"{suffix}");
+            assert_eq!(
+                redact_secret_values(&text),
+                format!("secret note = [redacted:secret]{newline}")
+            );
+            assert_eq!(
+                display_safe(&text).unwrap(),
+                format!(
+                    "secret note = [redacted:secret]{}",
+                    newline.replace('\r', "")
+                )
+            );
+        }
     }
 
     #[test]
