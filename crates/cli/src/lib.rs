@@ -425,6 +425,7 @@ pub mod profile_commands;
 #[allow(unsafe_code)]
 pub mod lsp;
 pub mod mods;
+pub mod onboarding;
 #[allow(unsafe_code)]
 pub mod pentest;
 pub mod permissions;
@@ -432,6 +433,7 @@ pub mod phase_routing;
 pub mod plugin_commands;
 pub mod plugin_content;
 pub mod presets;
+pub mod provider_discovery;
 pub mod sessions;
 #[allow(unsafe_code)]
 pub mod setup;
@@ -739,13 +741,24 @@ fn engine_turn_config_from(
         gate: gate.to_string(),
         model: model.to_string(),
         kind,
-        credential_env: credential_env.map(str::to_string),
+        credential_env: credential_env.map(str::to_string).or_else(|| {
+            cfg.provider
+                .is_empty()
+                .then(legacy_gate_credential_env)
+                .flatten()
+        }),
         pricing: pricing.map(std::convert::From::from),
         max_output_tokens,
         sampling,
         effort: entry.and_then(|m| m.default_effort.clone()),
         supported_efforts: entry.and_then(|m| m.supported_efforts.clone()),
     }
+}
+
+pub(crate) fn legacy_gate_credential_env() -> Option<String> {
+    let value = std::env::var_os("ORBIT_GATE_TOKEN")?;
+    let secret = orbit_adapter::SecretBytes::new(value.into_encoded_bytes());
+    (!secret.is_empty()).then(|| "ORBIT_GATE_TOKEN".to_owned())
 }
 
 /// Checked construction used at every runtime selection boundary. The old

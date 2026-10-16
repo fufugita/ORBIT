@@ -178,7 +178,7 @@ fn config(fixture: &Fixture) -> TurnConfig {
         gate: fixture.url.clone(),
         model: "local-model".into(),
         kind: orbit_engine::ProviderKind::OpenAiCompatible,
-        credential_env: Some("ORBIT_COMPLETION_FIXTURE_UNUSED_TOKEN".into()),
+        credential_env: None,
         pricing: None,
         max_output_tokens: 2048,
     }

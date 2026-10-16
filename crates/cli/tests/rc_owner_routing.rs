@@ -135,16 +135,11 @@ impl Fixture {
         private_directory(&workspace);
         let a = CapturedProvider::new(root.join("provider-a"));
         let b = CapturedProvider::new(root.join("provider-b"));
-        // An exact, fresh, unset credential reference prevents ambient legacy
-        // ORBIT_GATE_TOKEN from being sent to either local captured provider.
-        let credential = format!("ORBIT_RC_NO_REAL_CREDENTIAL_{}", ulid::Ulid::new());
-        assert!(std::env::var_os(&credential).is_none());
         let providers = format!(
             r#"
 [[provider]]
 name='provider_a'
 url={gate_a:?}
-env={credential:?}
 [[provider.models]]
 id='model-a'
 max_output_tokens=1111
@@ -153,7 +148,6 @@ default_effort='low'
 [[provider]]
 name='provider_b'
 url={gate_b:?}
-env={credential:?}
 [[provider.models]]
 id='vendor/model-b'
 max_output_tokens=733

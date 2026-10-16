@@ -29,6 +29,8 @@ pub struct SetupPlan {
     #[serde(skip)]
     request: SetupRequest,
     #[serde(skip)]
+    main: Option<String>,
+    #[serde(skip)]
     config: Vec<u8>,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -303,7 +305,111 @@ fn revision(home: &Path) -> Result<String, Error> {
     }
     Ok(hex::encode(h.finalize()))
 }
-fn candidate(home: &Path, request: &SetupRequest) -> Result<Vec<u8>, Error> {
+fn validate_main_patch(main: Option<&str>) -> Result<(), Error> {
+    if let Some(main) = main
+        && (main.is_empty()
+            || main.len() > 641
+            || main.trim() != main
+            || main.chars().any(char::is_control)
+            || !main
+                .split_once('/')
+                .is_some_and(|(provider, raw)| !provider.is_empty() && !raw.is_empty()))
+    {
+        return Err(Error::Invalid(
+            "main default requires an exact qualified provider/model identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn merge_model_metadata(old: &toml::Value, new: &mut toml::Value) -> Result<(), Error> {
+    let old = old
+        .as_table()
+        .ok_or_else(|| Error::Invalid("model entry must be a table".into()))?;
+    let new = new
+        .as_table_mut()
+        .ok_or_else(|| Error::Invalid("model serialization must be a table".into()))?;
+    let mut merged = old.clone();
+    for key in [
+        "id",
+        "label",
+        "pricing",
+        "max_output_tokens",
+        "context_window",
+        "sampling",
+        "supported_efforts",
+        "default_effort",
+    ] {
+        merged.remove(key);
+    }
+    let mut pricing = old
+        .get("pricing")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    for key in [
+        "input_per_million_microdollars",
+        "output_per_million_microdollars",
+        "cache_read_per_million_microdollars",
+        "cache_write_per_million_microdollars",
+        "reasoning_per_million_microdollars",
+        "request_flat_microdollars",
+        "input_per_million_microcents",
+        "output_per_million_microcents",
+        "cache_read_per_million_microcents",
+        "cache_write_per_million_microcents",
+        "reasoning_per_million_microcents",
+        "request_flat_microcents",
+    ] {
+        pricing.remove(key);
+    }
+    if let Some(incoming) = new.get("pricing").and_then(toml::Value::as_table) {
+        pricing.extend(incoming.clone());
+    }
+    if !pricing.is_empty() {
+        new.insert("pricing".into(), toml::Value::Table(pricing));
+    }
+    if let Some(incoming) = new.get("sampling").and_then(toml::Value::as_table) {
+        let mut sampling = old
+            .get("sampling")
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        sampling.remove("temperature");
+        sampling.remove("top_p");
+        sampling.extend(incoming.clone());
+        new.insert("sampling".into(), toml::Value::Table(sampling));
+    }
+    merged.extend(new.clone());
+    *new = merged;
+    Ok(())
+}
+
+fn merge_provider_models(old: &toml::Value, new: &mut toml::Value) -> Result<(), Error> {
+    let Some(old_models) = old.get("models").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    let new_models = new
+        .get_mut("models")
+        .and_then(toml::Value::as_array_mut)
+        .ok_or_else(|| Error::Invalid("provider models must serialize as an array".into()))?;
+    for model in new_models {
+        let raw_id = model
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| Error::Invalid("model serialization requires an ID".into()))?;
+        if let Some(existing) = old_models
+            .iter()
+            .find(|old| old.get("id").and_then(toml::Value::as_str) == Some(raw_id))
+        {
+            merge_model_metadata(existing, model)?;
+        }
+    }
+    Ok(())
+}
+
+fn candidate(home: &Path, request: &SetupRequest, main: Option<&str>) -> Result<Vec<u8>, Error> {
+    validate_main_patch(main)?;
     if let Some(p) = &request.provider {
         validate_provider(p)?;
     }
@@ -321,12 +427,13 @@ fn candidate(home: &Path, request: &SetupRequest) -> Result<Vec<u8>, Error> {
             .or_insert_with(|| toml::Value::Array(Vec::new()))
             .as_array_mut()
             .ok_or_else(|| Error::Invalid("provider config must be an array".into()))?;
-        let new = toml::Value::try_from(provider)
+        let mut new = toml::Value::try_from(provider)
             .map_err(|_| Error::Invalid("provider serialization failed".into()))?;
         if let Some(old) = list
             .iter_mut()
             .find(|p| p.get("name").and_then(toml::Value::as_str) == Some(provider.name.as_str()))
         {
+            merge_provider_models(old, &mut new)?;
             let old = old
                 .as_table_mut()
                 .ok_or_else(|| Error::Invalid("provider entry must be a table".into()))?;
@@ -360,7 +467,17 @@ fn candidate(home: &Path, request: &SetupRequest) -> Result<Vec<u8>, Error> {
             routing.insert(key.clone(), toml::Value::String(target.clone()));
         }
     }
-    let output = if request.provider.is_none() && request.routing.is_empty() {
+    if let Some(main) = main {
+        let roles = value
+            .as_table_mut()
+            .ok_or_else(|| Error::Invalid("config must be a table".into()))?
+            .entry("roles")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .ok_or_else(|| Error::Invalid("roles must be a table".into()))?;
+        roles.insert("main".into(), toml::Value::String(main.to_owned()));
+    }
+    let output = if request.provider.is_none() && request.routing.is_empty() && main.is_none() {
         text.to_string()
     } else {
         toml::to_string_pretty(&value)
@@ -373,6 +490,16 @@ fn candidate(home: &Path, request: &SetupRequest) -> Result<Vec<u8>, Error> {
         .map_err(|_| Error::Invalid("complete provider configuration is invalid".into()))?;
     for p in &cfg.provider {
         validate_provider(p)?;
+    }
+    if let Some(main) = main {
+        let resolved = crate::phase_routing::resolve_model(&cfg, main, None).map_err(|_| {
+            Error::Invalid("main default must select an exact declared provider/model".into())
+        })?;
+        if resolved.qualified() != main {
+            return Err(Error::Invalid(
+                "main default must select an exact declared provider/model".into(),
+            ));
+        }
     }
     let mut names = BTreeSet::new();
     for p in &cfg.provider {
@@ -388,14 +515,24 @@ fn candidate(home: &Path, request: &SetupRequest) -> Result<Vec<u8>, Error> {
     Ok(output.into_bytes())
 }
 pub fn plan_setup(home: &Path, request: &SetupRequest) -> Result<SetupPlan, Error> {
+    plan_setup_with_main(home, request, None)
+}
+
+/// Plan one provider/routing update and optional exact main-role patch together.
+pub fn plan_setup_with_main(
+    home: &Path,
+    request: &SetupRequest,
+    main: Option<&str>,
+) -> Result<SetupPlan, Error> {
     // Request validation occurs before inspecting or creating storage.
+    validate_main_patch(main)?;
     if let Some(p) = &request.provider {
         validate_provider(p)?;
     }
     if home.as_os_str().len() > 4096 {
         return Err(Error::UnsafePath("home path is too long".into()));
     }
-    let config = candidate(home, request)?;
+    let config = candidate(home, request, main)?;
     let initialize = !identity_state(home)?;
     let old = optional_file(home, "providers.toml", 128 * 1024)?.unwrap_or_default();
     let config_changed = old != config;
@@ -415,6 +552,7 @@ pub fn plan_setup(home: &Path, request: &SetupRequest) -> Result<SetupPlan, Erro
         revision: revision(home)?,
         home: home.to_path_buf(),
         request: request.clone(),
+        main: main.map(str::to_owned),
         config,
     })
 }
@@ -593,7 +731,7 @@ fn private_tree(path: &Path, depth: usize) -> Result<(), Error> {
 }
 pub fn apply_setup(plan: &SetupPlan) -> Result<SetupReceipt, Error> {
     // Plan fields are not mutation authority: revalidate all captured input and state.
-    let current = plan_setup(&plan.home, &plan.request)?;
+    let current = plan_setup_with_main(&plan.home, &plan.request, plan.main.as_deref())?;
     if current.revision != plan.revision || current.config != plan.config {
         return Err(Error::Busy);
     }
@@ -617,36 +755,52 @@ pub fn apply_setup(plan: &SetupPlan) -> Result<SetupReceipt, Error> {
     // Route/model/config writers share this lock; setup always takes setup
     // before config, while ordinary config changes take only config.
     let _config_lock = Lock::acquire(&home, ".config.lock")?;
-    let current = plan_setup(&plan.home, &plan.request)?;
-    if current.revision != plan.revision {
+    let current = plan_setup_with_main(&plan.home, &plan.request, plan.main.as_deref())?;
+    if current.revision != plan.revision || current.config != plan.config {
         return Err(Error::Busy);
     }
     let initialized = current.initialize;
-    let id = if initialized {
-        initialize(&home)?
-    } else {
-        verify_identity(&plan.home)?.pib_id
-    };
-    if current.config_changed {
-        publish(&home, "providers.toml", &current.config, false).map_err(|error|if initialized{Error::PublicationUncertain(format!("identity initialized; provider configuration publication did not finish: {error}"))}else{error})?;
-    }
-    let pib = verify_identity(&plan.home)?;
-    if pib.pib_id != id {
-        return Err(Error::PublicationUncertain(
-            "identity changed after setup".into(),
-        ));
-    }
-    Ok(SetupReceipt {
-        initialized,
-        reused: !initialized,
-        config_changed: current.config_changed,
-        pib_id: id,
-        providers_configured: plan
-            .request
-            .provider
-            .as_ref()
-            .map(|p| vec![p.name.clone()])
-            .unwrap_or_default(),
-        trust_root_verified: true,
+    let mut published = false;
+    let result = (|| {
+        let id = if initialized {
+            let id = initialize(&home)?;
+            published = true;
+            id
+        } else {
+            verify_identity(&plan.home)?.pib_id
+        };
+        if current.config_changed {
+            // publish already reports uncertainty after its own rename point.
+            publish(&home, "providers.toml", &current.config, false)?;
+            published = true;
+        }
+        home.check()?;
+        let pib = verify_identity(&plan.home)?;
+        home.check()?;
+        if pib.pib_id != id {
+            return Err(Error::Invalid("identity changed after setup".into()));
+        }
+        Ok(SetupReceipt {
+            initialized,
+            reused: !initialized,
+            config_changed: current.config_changed,
+            pib_id: id,
+            providers_configured: plan
+                .request
+                .provider
+                .as_ref()
+                .map(|p| vec![p.name.clone()])
+                .unwrap_or_default(),
+            trust_root_verified: true,
+        })
+    })();
+    result.map_err(|error| {
+        if published && !matches!(error, Error::PublicationUncertain(_)) {
+            Error::PublicationUncertain(format!(
+                "setup publication may have committed; inspect before retrying: {error}"
+            ))
+        } else {
+            error
+        }
     })
 }

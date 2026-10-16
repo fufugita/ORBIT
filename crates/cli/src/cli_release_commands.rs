@@ -29,7 +29,7 @@ pub struct SetupArguments {
     pub request: identity::SetupRequest,
     pub dry_run: bool,
     pub guided: bool,
-    /// Main owns the existing discovery wizard. This module never launches it.
+    /// The terminal frontend owns the provider wizard. This module never launches it.
     pub interactive_provider: bool,
     pub repair: bool,
 }
@@ -96,6 +96,9 @@ pub fn parse_setup(args: &[String]) -> Result<SetupArguments, (&'static str, Str
         return Err(invalid(
             "choose one of manual provider flags, --guided, --interactive-provider or --no-provider",
         ));
+    }
+    if seen.contains("--json") && (parsed.guided || parsed.interactive_provider) {
+        return Err(invalid("interactive setup cannot use JSON output"));
     }
     if parsed.dry_run && (parsed.guided || parsed.interactive_provider) {
         return Err(invalid(
@@ -215,9 +218,9 @@ fn setup_as(home: &Path, args: &[String], command: &str) -> CommandResult {
         );
     }
     if parsed.guided {
-        if !std::io::stdin().is_terminal() {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             return Err(invalid(
-                "--guided requires a terminal; use explicit provider flags for automation",
+                "--guided requires terminal input and output; use explicit provider flags for automation",
             ));
         }
         parsed.request.provider =
@@ -509,7 +512,17 @@ pub fn human_report(value: &Value) -> String {
                 "Existing local identity preserved.\n"
             },
         );
-        out.push_str("Offline setup complete. Add explicit provider models with setup --provider NAME --gate URL --model ID --credential-env ENV_NAME. Run doctor to inspect readiness.\n");
+        if let Some(provider) = value.get("provider").and_then(Value::as_str) {
+            out.push_str(&format!("Saved provider {provider}. "));
+            if value.get("credential_ready").and_then(Value::as_bool) == Some(false) {
+                out.push_str("Set its declared credential ENV before making requests. ");
+            }
+            out.push_str(
+                "Provider connectivity remains untested. Run orbit doctor, then orbit to start.\n",
+            );
+        } else {
+            out.push_str("Offline setup complete. Add explicit provider models with setup --provider NAME --gate URL --model ID --credential-env ENV_NAME. Run doctor to inspect readiness.\n");
+        }
     } else {
         out.push_str(&serde_json::to_string_pretty(value).unwrap_or_default());
         out.push('\n');

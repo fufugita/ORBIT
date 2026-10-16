@@ -11,8 +11,15 @@ mod doctor;
 #[allow(dead_code)]
 mod setup;
 use doctor::*;
+use orbit_adapter::SecretBytes;
+use orbit_adapter::provider_credentials::{
+    ExpectedRevision, ProviderAuthIdentity, ProviderCredentialRevision, ProviderCredentialStore,
+};
 pub use orbit_cli::{config, lsp, phase_routing, tool_runtime};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::ffi::OsString;
+use std::net::TcpListener;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 struct Fixture {
     root: PathBuf,
@@ -133,14 +140,19 @@ fn fabricated_credential_value_never_appears() {
     const ENV: &str = "ORBIT_DOCTOR_CREDENTIAL_VALUE";
     const SECRET: &str = "fabricated-private-value-9837142";
     if std::env::var(CHILD).as_deref() != Ok("1") {
+        let environment = CredentialEnvironment::new();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "fabricated_credential_value_never_appears",
                 "--nocapture",
             ])
+            .env_clear()
+            .env("HOME", &environment.0)
+            .env("TMPDIR", &environment.0)
             .env(CHILD, "1")
             .env(ENV, SECRET)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -349,4 +361,603 @@ fn matching_bundle_hashes_and_version_are_verified_without_execution() {
     std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(web, b"tampered executable bytes").unwrap();
     assert_eq!(browser_check(&cli).status, CheckStatus::Invalid);
+}
+
+const CREDENTIAL_ENV: &str = "ORBIT_DOCTOR_EXACT_CREDENTIAL";
+const SAVED_CREDENTIAL: &str = "synthetic-doctor-private-key-714b8960";
+const ENV_CREDENTIAL: &str = "synthetic-doctor-env-key-947ba510";
+const AMBIENT_CREDENTIAL: &str = "synthetic-doctor-ambient-key-12d87b91";
+const CREDENTIAL_CHILD: &str = "ORBIT_DOCTOR_STATUS_CHILD";
+
+struct CredentialEnvironment(PathBuf);
+impl CredentialEnvironment {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("orbit-doctor-env-{}", ulid::Ulid::new()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        Self(path)
+    }
+}
+impl Drop for CredentialEnvironment {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn isolated_credential_status(name: &str, environment: &[(&str, OsString)], check: impl FnOnce()) {
+    if std::env::var(CREDENTIAL_CHILD).as_deref() == Ok(name) {
+        check();
+        return;
+    }
+    let private_environment = CredentialEnvironment::new();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", name, "--nocapture"])
+        .env_clear()
+        .env(CREDENTIAL_CHILD, name)
+        .env("HOME", &private_environment.0)
+        .env("TMPDIR", &private_environment.0)
+        .env("XDG_CONFIG_HOME", private_environment.0.join("xdg-config"))
+        .env("XDG_CACHE_HOME", private_environment.0.join("xdg-cache"))
+        .env("XDG_DATA_HOME", private_environment.0.join("xdg-data"))
+        .env("CODEX_HOME", private_environment.0.join("codex"))
+        .env("CLAUDE_CONFIG_DIR", private_environment.0.join("claude"))
+        .env("HERMES_HOME", private_environment.0.join("hermes"))
+        .current_dir(&private_environment.0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("isolated doctor status exceeded its deadline: {name}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    let mut diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in [SAVED_CREDENTIAL, ENV_CREDENTIAL, AMBIENT_CREDENTIAL] {
+        diagnostics = diagnostics.replace(secret, "[redacted fixture key]");
+    }
+    assert!(
+        output.status.success(),
+        "isolated doctor status failed: {name}\n{diagnostics}"
+    );
+}
+
+#[derive(PartialEq, Eq)]
+struct CredentialFileSnapshot {
+    path: PathBuf,
+    mode: u32,
+    uid: u32,
+    links: u64,
+    inode: u64,
+    bytes: Vec<u8>,
+    target: Option<PathBuf>,
+}
+
+fn credential_files(root: &Path) -> Vec<CredentialFileSnapshot> {
+    fn visit(root: &Path, path: &Path, result: &mut Vec<CredentialFileSnapshot>) {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        let is_link = metadata.file_type().is_symlink();
+        result.push(CredentialFileSnapshot {
+            path: path.strip_prefix(root).unwrap().to_path_buf(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            links: metadata.nlink(),
+            inode: metadata.ino(),
+            bytes: if metadata.is_file() && !is_link {
+                std::fs::read(path).unwrap()
+            } else {
+                Vec::new()
+            },
+            target: is_link.then(|| std::fs::read_link(path).unwrap()),
+        });
+        if metadata.is_dir() && !is_link {
+            for child in std::fs::read_dir(path).unwrap() {
+                visit(root, &child.unwrap().path(), result);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    visit(root, root, &mut result);
+    result.sort_by(|left, right| left.path.cmp(&right.path));
+    result
+}
+
+fn configured_credential(fixture: &Fixture) -> TcpListener {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut providers = config::ProvidersConfig::load(&fixture.home).unwrap();
+    providers.provider[0].url = format!("http://{}/v1", listener.local_addr().unwrap());
+    providers.provider[0].env = Some(CREDENTIAL_ENV.into());
+    fixture.write("providers.toml", toml::to_string(&providers).unwrap());
+    listener
+}
+
+fn selected_credential(fixture: &Fixture) -> ProviderAuthIdentity {
+    let providers = config::ProvidersConfig::load(&fixture.home).unwrap();
+    let provider = &providers.provider[0];
+    let endpoint = config::validate_provider_endpoint(&provider.url).unwrap();
+    ProviderAuthIdentity::new(
+        &provider.name,
+        &provider.kind,
+        endpoint.as_str(),
+        provider.env.as_deref(),
+    )
+    .unwrap()
+}
+
+fn save_credential(fixture: &Fixture) -> (PathBuf, ProviderCredentialRevision) {
+    let identity = selected_credential(fixture);
+    let saved = ProviderCredentialStore::new(&fixture.home)
+        .unwrap()
+        .save(
+            &identity,
+            SecretBytes::new(SAVED_CREDENTIAL.as_bytes().to_vec()),
+            ExpectedRevision::Absent,
+        )
+        .unwrap();
+    (
+        fixture
+            .home
+            .join("auth/providers")
+            .join(format!("{}.credential", identity.binding_id())),
+        saved.revision,
+    )
+}
+
+fn readonly_credential_report(
+    fixture: &Fixture,
+    listener: &TcpListener,
+    home: &Path,
+) -> DoctorReport {
+    let before = credential_files(&fixture.root);
+    let report = doctor(home, &fixture.workspace);
+    assert!(
+        credential_files(&fixture.root) == before,
+        "doctor changed fixture files, modes, links or inodes"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "offline doctor contacted a provider"
+    );
+    let bytes = serde_json::to_vec(&report).unwrap();
+    for secret in [SAVED_CREDENTIAL, ENV_CREDENTIAL, AMBIENT_CREDENTIAL] {
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|part| part == secret.as_bytes()),
+            "doctor serialized a credential value"
+        );
+    }
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == "provider.connectivity")
+            .unwrap()
+            .status,
+        CheckStatus::NotTested
+    );
+    report
+}
+
+fn credential_check(report: &DoctorReport) -> &DoctorCheck {
+    report
+        .checks
+        .iter()
+        .find(|check| check.id == "credential.0")
+        .unwrap()
+}
+
+#[test]
+fn saved_private_credential_is_ready_without_environment_or_file_changes() {
+    isolated_credential_status(
+        "saved_private_credential_is_ready_without_environment_or_file_changes",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            save_credential(&fixture);
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert!(report.ready);
+            assert_eq!(credential_check(&report).status, CheckStatus::Ready);
+            assert!(
+                credential_check(&report)
+                    .detail
+                    .contains("saved private key")
+            );
+        },
+    );
+}
+
+#[test]
+fn relative_home_uses_the_same_exact_saved_credential() {
+    isolated_credential_status(
+        "relative_home_uses_the_same_exact_saved_credential",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            save_credential(&fixture);
+            let current = std::env::current_dir().unwrap();
+            let relative = fixture.home.strip_prefix(&current).unwrap();
+            assert!(!relative.is_absolute());
+            let report = readonly_credential_report(&fixture, &listener, relative);
+            assert_eq!(credential_check(&report).status, CheckStatus::Ready);
+            assert!(
+                credential_check(&report)
+                    .detail
+                    .contains("saved private key")
+            );
+        },
+    );
+}
+
+#[test]
+fn environment_override_is_ready_even_when_unused_saved_record_is_corrupt() {
+    isolated_credential_status(
+        "environment_override_is_ready_even_when_unused_saved_record_is_corrupt",
+        &[(CREDENTIAL_ENV, ENV_CREDENTIAL.into())],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            let (record, _) = save_credential(&fixture);
+            std::fs::write(record, b"invalid-unused-saved-record").unwrap();
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert!(report.ready);
+            assert_eq!(credential_check(&report).status, CheckStatus::Ready);
+            assert!(
+                credential_check(&report)
+                    .detail
+                    .contains("environment override")
+            );
+        },
+    );
+}
+
+#[test]
+fn empty_environment_uses_saved_key_then_reports_removed_binding_missing() {
+    isolated_credential_status(
+        "empty_environment_uses_saved_key_then_reports_removed_binding_missing",
+        &[(CREDENTIAL_ENV, OsString::new())],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            let (_, revision) = save_credential(&fixture);
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Ready);
+            assert!(
+                credential_check(&report)
+                    .detail
+                    .contains("saved private key")
+            );
+            ProviderCredentialStore::new(&fixture.home)
+                .unwrap()
+                .remove(
+                    &selected_credential(&fixture),
+                    ExpectedRevision::Exact(revision),
+                )
+                .unwrap();
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Missing);
+            assert!(!report.ready);
+        },
+    );
+}
+
+#[test]
+fn invalid_nonempty_environment_does_not_fall_back_to_saved_key() {
+    isolated_credential_status(
+        "invalid_nonempty_environment_does_not_fall_back_to_saved_key",
+        &[(CREDENTIAL_ENV, "invalid\r\nheader".into())],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            save_credential(&fixture);
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Invalid);
+            assert!(!report.ready);
+        },
+    );
+}
+
+#[test]
+fn non_utf8_environment_is_invalid_without_saved_fallback() {
+    isolated_credential_status(
+        "non_utf8_environment_is_invalid_without_saved_fallback",
+        &[(CREDENTIAL_ENV, OsString::from_vec(vec![0xff, b'x']))],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            save_credential(&fixture);
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Invalid);
+            assert!(!report.ready);
+        },
+    );
+}
+
+#[test]
+fn corrupted_saved_record_is_invalid_without_repair() {
+    isolated_credential_status(
+        "corrupted_saved_record_is_invalid_without_repair",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            let (record, _) = save_credential(&fixture);
+            std::fs::write(record, b"truncated-private-record").unwrap();
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Invalid);
+            assert!(credential_check(&report).detail.contains("storage"));
+            assert!(!report.ready);
+        },
+    );
+}
+
+#[test]
+fn missing_store_lock_is_invalid_and_never_created_by_doctor() {
+    isolated_credential_status(
+        "missing_store_lock_is_invalid_and_never_created_by_doctor",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            save_credential(&fixture);
+            let lock = fixture.home.join("auth/providers/store.lock");
+            std::fs::remove_file(&lock).unwrap();
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Invalid);
+            assert!(!report.ready);
+            assert!(!lock.exists());
+        },
+    );
+}
+
+#[test]
+fn symlinked_saved_record_is_invalid_without_following_or_replacing_it() {
+    isolated_credential_status(
+        "symlinked_saved_record_is_invalid_without_following_or_replacing_it",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            let (record, _) = save_credential(&fixture);
+            let target = fixture.root.join("owned-record-target");
+            std::fs::rename(&record, &target).unwrap();
+            symlink(&target, &record).unwrap();
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Invalid);
+            assert!(!report.ready);
+        },
+    );
+}
+
+#[test]
+fn benign_query_is_part_of_the_exact_saved_binding() {
+    isolated_credential_status(
+        "benign_query_is_part_of_the_exact_saved_binding",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            let mut providers = config::ProvidersConfig::load(&fixture.home).unwrap();
+            providers.provider[0].url.push_str("?tenant=first");
+            fixture.write("providers.toml", toml::to_string(&providers).unwrap());
+            let (record, _) = save_credential(&fixture);
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Ready);
+            providers.provider[0].url = providers.provider[0]
+                .url
+                .replace("tenant=first", "tenant=second");
+            fixture.write("providers.toml", toml::to_string(&providers).unwrap());
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Missing);
+            assert!(!report.ready);
+            let misplaced = fixture.home.join("auth/providers").join(format!(
+                "{}.credential",
+                selected_credential(&fixture).binding_id()
+            ));
+            std::fs::copy(record, &misplaced).unwrap();
+            std::fs::set_permissions(&misplaced, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(credential_check(&report).status, CheckStatus::Invalid);
+            assert!(!report.ready);
+        },
+    );
+}
+
+#[test]
+fn no_auth_ignores_saved_storage_and_all_ambient_credential_values() {
+    isolated_credential_status(
+        "no_auth_ignores_saved_storage_and_all_ambient_credential_values",
+        &[
+            (CREDENTIAL_ENV, ENV_CREDENTIAL.into()),
+            ("ORBIT_GATE_TOKEN", AMBIENT_CREDENTIAL.into()),
+        ],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            let (record, _) = save_credential(&fixture);
+            std::fs::write(record, b"unused-invalid-private-record").unwrap();
+            let mut providers = config::ProvidersConfig::load(&fixture.home).unwrap();
+            providers.provider[0].env = None;
+            fixture.write("providers.toml", toml::to_string(&providers).unwrap());
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert!(report.ready);
+            assert_eq!(credential_check(&report).status, CheckStatus::Configured);
+            assert!(
+                credential_check(&report)
+                    .detail
+                    .contains("no authentication")
+            );
+        },
+    );
+}
+
+#[test]
+fn credential_query_is_invalid_and_never_echoed_by_doctor() {
+    isolated_credential_status(
+        "credential_query_is_invalid_and_never_echoed_by_doctor",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            let mut providers = config::ProvidersConfig::load(&fixture.home).unwrap();
+            providers.provider[0]
+                .url
+                .push_str(&format!("?api_key={SAVED_CREDENTIAL}"));
+            fixture.write("providers.toml", toml::to_string(&providers).unwrap());
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            assert_eq!(
+                report
+                    .checks
+                    .iter()
+                    .find(|check| check.id == "provider.0")
+                    .unwrap()
+                    .status,
+                CheckStatus::Invalid
+            );
+            assert!(!report.checks.iter().any(|check| check.id == "credential.0"));
+            assert!(!report.ready);
+        },
+    );
+}
+
+#[test]
+fn streamable_http_mcp_is_configured_without_executable_or_requests() {
+    isolated_credential_status(
+        "streamable_http_mcp_is_configured_without_executable_or_requests",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            fixture.write(
+                "mcp.json",
+                serde_json::to_vec(&serde_json::json!({"servers":{"docs":{
+                    "transport":"streamable-http",
+                    "url":format!("http://{}/mcp", listener.local_addr().unwrap()),
+                    "headers":{"Authorization":format!("Bearer {ENV_CREDENTIAL}")}
+                }}}))
+                .unwrap(),
+            );
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            let check = report
+                .checks
+                .iter()
+                .find(|check| check.id == "mcp.0")
+                .unwrap();
+            assert_eq!(check.status, CheckStatus::Configured);
+            assert!(check.detail.contains("connectivity not tested"));
+            assert_eq!(
+                report
+                    .checks
+                    .iter()
+                    .find(|check| check.id == "mcp.connectivity")
+                    .unwrap()
+                    .status,
+                CheckStatus::NotTested
+            );
+        },
+    );
+}
+
+#[test]
+fn sse_mcp_is_configured_without_executable_or_requests() {
+    isolated_credential_status(
+        "sse_mcp_is_configured_without_executable_or_requests",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            fixture.write(
+                "mcp.json",
+                serde_json::to_vec(&serde_json::json!({"servers":{"docs":{
+                    "transport":"sse",
+                    "url":format!("http://{}/events", listener.local_addr().unwrap())
+                }}}))
+                .unwrap(),
+            );
+            let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+            let check = report
+                .checks
+                .iter()
+                .find(|check| check.id == "mcp.0")
+                .unwrap();
+            assert_eq!(check.status, CheckStatus::Configured);
+            assert!(check.detail.contains("connectivity not tested"));
+            assert_eq!(
+                report
+                    .checks
+                    .iter()
+                    .find(|check| check.id == "mcp.connectivity")
+                    .unwrap()
+                    .status,
+                CheckStatus::NotTested
+            );
+        },
+    );
+}
+
+#[test]
+fn malformed_remote_mcp_urls_are_invalid_without_requests_or_file_changes() {
+    isolated_credential_status(
+        "malformed_remote_mcp_urls_are_invalid_without_requests_or_file_changes",
+        &[],
+        || {
+            let fixture = Fixture::new();
+            let listener = configured_credential(&fixture);
+            let address = listener.local_addr().unwrap();
+            for transport in ["streamable-http", "sse"] {
+                for endpoint in [
+                    "not-a-url".to_owned(),
+                    format!("http://user:{SAVED_CREDENTIAL}@{address}/mcp"),
+                    format!("http://{address}/mcp#fragment"),
+                    "http://remote.example/mcp".to_owned(),
+                ] {
+                    fixture.write(
+                        "mcp.json",
+                        serde_json::to_vec(&serde_json::json!({"servers":{"docs":{
+                            "transport":transport,
+                            "url":endpoint
+                        }}}))
+                        .unwrap(),
+                    );
+                    let report = readonly_credential_report(&fixture, &listener, &fixture.home);
+                    assert_eq!(
+                        report
+                            .checks
+                            .iter()
+                            .find(|check| check.id == "mcp.0")
+                            .unwrap()
+                            .status,
+                        CheckStatus::Invalid
+                    );
+                    assert_eq!(
+                        report
+                            .checks
+                            .iter()
+                            .find(|check| check.id == "mcp.connectivity")
+                            .unwrap()
+                            .status,
+                        CheckStatus::NotTested
+                    );
+                }
+            }
+        },
+    );
 }

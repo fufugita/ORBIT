@@ -368,19 +368,39 @@ pub fn run_dispatch(
             .unwrap_or(90_000),
     };
 
-    // Gate authentication (never printed/persisted). A provider may require a
-    // Bearer token for /v1 chat calls; read it from the provider's declared
-    // env var (config `env = "..."`) or, for the legacy single-gate path,
-    // `ORBIT_GATE_TOKEN`. No other env vars are consulted — e.g.
-    // ANTHROPIC_AUTH_TOKEN is an upstream agent's auth, not this gate's key,
-    // so it is deliberately NOT a fallback.
-    let credential = config
-        .credential_env
-        .clone()
-        .or_else(|| Some("ORBIT_GATE_TOKEN".to_string()))
-        .and_then(|var| std::env::var(var).ok())
-        .filter(|t| !t.is_empty())
-        .map(|t| orbit_adapter::credential::SecretBytes::new(t.into_bytes()));
+    // Authentication follows the exact selected provider binding. No declaration
+    // means no auth; legacy gate authentication is made explicit by its caller.
+    use orbit_adapter::provider_credentials::{ProviderAuthIdentity, ProviderCredentialStore};
+    let credential_error = |error: orbit_adapter::provider_credentials::ProviderCredentialError| {
+        ("ORBIT-E0401", error.to_string())
+    };
+    let kind = match config.kind {
+        ProviderKind::OpenAiCompatible => "openai-compatible",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Ollama => "ollama",
+    };
+    let identity = ProviderAuthIdentity::new(
+        &config.provider_id,
+        kind,
+        url.as_str(),
+        config.credential_env.as_deref(),
+    )
+    .map_err(credential_error)?;
+    // Absolute lexical paths retain no-follow checks, including for --home .orbit.
+    let credential_home = std::path::absolute(home).map_err(|_| {
+        (
+            "ORBIT-E0401",
+            "provider credential home could not be resolved".into(),
+        )
+    })?;
+    let credential = ProviderCredentialStore::new(&credential_home)
+        .map_err(credential_error)?
+        .resolve_with(&identity, |name| {
+            Ok(std::env::var_os(name)
+                .map(|value| orbit_adapter::SecretBytes::new(value.into_encoded_bytes())))
+        })
+        .map_err(credential_error)?
+        .into_secret();
 
     // E7: the session id comes from the front-end (one per chat
     // session, stable across rounds and turns) — not minted per

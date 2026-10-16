@@ -151,8 +151,8 @@ fn print_human_help() {
     for (name, desc) in [
         ("chat", "start the interactive harness (default when bare)"),
         (
-            "setup [--guided]",
-            "offline setup; preserves existing identity and history",
+            "setup",
+            "terminal provider wizard; manual/JSON modes remain offline",
         ),
         ("init", "initialize once (setup compatibility alias)"),
         (
@@ -206,6 +206,24 @@ fn print_human_help() {
     ] {
         println!("    {name:<28} {desc}");
     }
+    println!();
+    println!("SETUP:");
+    println!(
+        "    orbit setup                                 choose a provider, hidden key or ENV, models and default"
+    );
+    println!(
+        "    orbit provider add                          add another provider with the same wizard"
+    );
+    println!(
+        "    orbit setup --no-provider [--json]           offline identity setup for automation"
+    );
+    println!("    orbit setup --provider NAME --gate URL --model ID [--credential-env ENV_NAME]");
+    println!(
+        "    orbit setup --guided                        older offline ENV-name prompts (terminal only)"
+    );
+    println!(
+        "    orbit setup repair --dry-run [--json]        inspect recovery without replacing identity"
+    );
     println!();
     println!("CHAT FLAGS:");
     for (name, desc) in [
@@ -339,7 +357,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
             "commands": [
                 "(bare)        start the interactive harness",
                 "chat          start the interactive harness (explicit alias)",
-                "setup [--guided] offline setup without rotating existing identity",
+                "setup         terminal provider wizard; explicit manual/JSON/offline flags supported",
                 "init          setup compatibility alias",
                 "doctor [--json] offline readiness without server startup",
                 "pentest init|status|templates|readiness local engagement workflows",
@@ -423,20 +441,46 @@ fn cmd_setup(
 ) -> Result<serde_json::Value, (&'static str, String)> {
     let tail = command_tail(args)?;
     let parsed = orbit_cli::cli_release_commands::parse_setup(&tail)?;
-    if parsed.interactive_provider && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(("ORBIT-E1101","--interactive-provider requires a terminal; use manual provider flags for offline setup".into()));
+    let terminal = std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let interactive = parsed.interactive_provider || (!initialize && tail.is_empty() && terminal);
+    if interactive {
+        if tail.iter().any(|arg| arg == "--json") || !parsed.request.routing.is_empty() {
+            return Err((
+                "ORBIT-E1101",
+                "interactive setup cannot use JSON or manual routing flags".into(),
+            ));
+        }
+        if !terminal {
+            return Err(("ORBIT-E1101", "interactive setup requires terminal input and output; use manual flags for automation".into()));
+        }
+        return run_onboarding_command(home, None, if initialize { "init" } else { "setup" });
     }
-    let mut result = if initialize {
-        orbit_cli::cli_release_commands::init(home, &tail)?
+    if initialize {
+        orbit_cli::cli_release_commands::init(home, &tail)
     } else {
-        orbit_cli::cli_release_commands::setup(home, &tail)?
-    };
-    if parsed.interactive_provider {
-        result["providers_configured"] = serde_json::json!(interactive_provider_setup(home)?);
-        result["offline"] = serde_json::json!(false);
+        orbit_cli::cli_release_commands::setup(home, &tail)
     }
+}
+
+fn run_onboarding_command(
+    home: &Path,
+    preset: Option<&str>,
+    command: &str,
+) -> Result<serde_json::Value, (&'static str, String)> {
+    let mut terminal = orbit_cli::onboarding::StdSetupTerminal::new()
+        .map_err(|error| (error.code(), error.to_string()))?;
+    let receipt = orbit_cli::onboarding::run_onboarding(home, preset, &mut terminal)
+        .map_err(|error| (error.code(), error.to_string()))?;
+    let mut result = serde_json::to_value(receipt)
+        .map_err(|_| ("ORBIT-E1101", "setup result could not be encoded".into()))?;
+    result["schema"] = serde_json::json!("orbit.cli/v1");
+    result["command"] = serde_json::json!(command);
+    result["status"] = serde_json::json!("ok");
+    result["offline"] = serde_json::json!(true);
     Ok(result)
 }
+
 fn cmd_init(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     cmd_setup(home, args, true)
 }
@@ -444,6 +488,7 @@ fn cmd_init(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static
 /// Add one provider to providers.toml (scripted init path). Pricing defaults to
 /// zero unless supplied by the interactive setup. Token values are never
 /// accepted here — only the credential env-var name.
+#[cfg(test)]
 fn add_configured_provider(
     home: &Path,
     name: &str,
@@ -605,6 +650,7 @@ fn validate_provider_url(gate: &str) -> Result<(), (&'static str, String)> {
         _ => Err(("ORBIT-E0301", "provider URL must use http(s)".into())),
     }
 }
+#[cfg(test)]
 fn validate_discovery_input(
     name: &str,
     gate: &str,
@@ -630,6 +676,7 @@ fn validate_discovery_input(
     })
     .map_err(|e| ("ORBIT-E1101", e.to_string()))
 }
+#[cfg(test)]
 fn provider_models_url(gate: &str, kind: &str, model: Option<&str>) -> Result<url::Url, String> {
     validate_discovery_input("discovery", gate, None, kind).map_err(|(_, e)| e)?;
     let mut endpoint = url::Url::parse(gate).map_err(|_| "bad provider URL")?;
@@ -655,7 +702,9 @@ fn provider_models_url(gate: &str, kind: &str, model: Option<&str>) -> Result<ur
     }
     Ok(endpoint)
 }
+#[cfg(test)]
 const PROVIDER_RESPONSE_LIMIT: usize = 128 * 1024;
+#[cfg(test)]
 async fn bounded_provider_body(mut response: reqwest::Response) -> Result<String, String> {
     if response
         .content_length()
@@ -676,6 +725,7 @@ async fn bounded_provider_body(mut response: reqwest::Response) -> Result<String
     }
     String::from_utf8(bytes).map_err(|_| "provider response must be UTF-8".into())
 }
+#[cfg(test)]
 fn parse_discovered_models(raw: &str, kind: &str) -> Result<Vec<String>, String> {
     let ids = if kind == "ollama" {
         config::OllamaTagsResponse::parse(raw).map_err(|_| "provider model response is invalid")?
@@ -697,6 +747,7 @@ fn parse_discovered_models(raw: &str, kind: &str) -> Result<Vec<String>, String>
     Ok(ids)
 }
 /// Explicit discovery only; redirects cannot forward a credential to a second endpoint.
+#[cfg(test)]
 fn discover_models(
     gate: &str,
     credential_env: Option<&str>,
@@ -745,6 +796,7 @@ fn discover_models(
         })
 }
 /// Best effort, sharing the same bounded endpoint/request policy as discovery.
+#[cfg(test)]
 fn anthropic_model_limits(
     gate: &str,
     credential_env: Option<&str>,
@@ -782,82 +834,7 @@ fn anthropic_model_limits(
     result.unwrap_or_default()
 }
 
-/// Guided provider setup for `orbit init` in a real terminal.
-fn interactive_provider_setup(home: &Path) -> Result<Vec<String>, (&'static str, String)> {
-    use std::io::Write;
-    let mut configured = Vec::new();
-    if !prompt_yes_no("Configure a model provider now?", true)? {
-        return Ok(configured);
-    }
-    loop {
-        let name = prompt_line("Provider name", Some("local"))?;
-        let gate = prompt_line("Base URL", Some("http://127.0.0.1:4001"))?;
-        validate_provider_url(&gate)?;
-        let credential_env = prompt_line(
-            "Credential env-var name (blank = none)",
-            Some("ORBIT_GATE_TOKEN"),
-        )?;
-        let credential_env = if credential_env.trim().is_empty() {
-            None
-        } else {
-            Some(credential_env)
-        };
-
-        validate_discovery_input(&name, &gate, credential_env.as_deref(), "openai-compatible")?;
-        let discovered =
-            match discover_models(&gate, credential_env.as_deref(), "openai-compatible") {
-                Ok(ids) => {
-                    println!("Discovered models:");
-                    for (i, id) in ids.iter().enumerate() {
-                        println!("  {}. {id}", i + 1);
-                    }
-                    ids
-                }
-                Err(e) => {
-                    eprintln!("Could not discover models: {e}");
-                    Vec::new()
-                }
-            };
-        let model_ids = if discovered.is_empty() {
-            parse_provider_models(&prompt_line("Enter model ids (comma-separated)", None)?)?
-        } else {
-            let sel = prompt_line(
-                "Select models (all or comma-separated numbers)",
-                Some("all"),
-            )?;
-            select_provider_models(&sel, &discovered)?
-        };
-        if model_ids.is_empty() {
-            return Err(("ORBIT-E1101", "no models selected".into()));
-        }
-
-        let mut pricing = Vec::new();
-        for id in &model_ids {
-            println!("Pricing for {id} (microdollars per million tokens; blank = 0):");
-            let input = prompt_line("  input", Some("0"))?
-                .parse::<u64>()
-                .map_err(|_| ("ORBIT-E1101", "pricing must be an unsigned integer".into()))?;
-            let output = prompt_line("  output", Some("0"))?
-                .parse::<u64>()
-                .map_err(|_| ("ORBIT-E1101", "pricing must be an unsigned integer".into()))?;
-            pricing.push(orbit_cli::config::Pricing {
-                input_per_million_microdollars: input,
-                output_per_million_microdollars: output,
-                ..Default::default()
-            });
-        }
-        add_configured_provider(home, &name, &gate, credential_env, model_ids, Some(pricing))?;
-        configured.push(name);
-        let _ = std::io::stdout().flush();
-        if !prompt_yes_no("Add another provider?", false)? {
-            break;
-        }
-    }
-    // Roundtrip validate the final config.
-    config::ProvidersConfig::load(home).map_err(|e| ("ORBIT-E1106", e))?;
-    Ok(configured)
-}
-
+#[cfg(test)]
 fn read_provider_line(
     reader: &mut impl std::io::BufRead,
     default: Option<&str>,
@@ -908,6 +885,7 @@ fn parse_provider_models(raw: &str) -> Result<Vec<String>, (&'static str, String
     }
     Ok(ids)
 }
+#[cfg(test)]
 fn select_provider_models(
     selection: &str,
     offered: &[String],
@@ -934,29 +912,6 @@ fn select_provider_models(
     }
     Ok(selected)
 }
-fn prompt_line(label: &str, default: Option<&str>) -> Result<String, (&'static str, String)> {
-    use std::io::Write;
-    match default {
-        Some(d) => print!("{label} [{d}]: "),
-        None => print!("{label}: "),
-    }
-    std::io::stdout().flush().map_err(ioe)?;
-    read_provider_line(&mut std::io::stdin().lock(), default)
-}
-
-fn prompt_yes_no(label: &str, default_yes: bool) -> Result<bool, (&'static str, String)> {
-    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    let answer = prompt_line(&format!("{label} {suffix}"), None)?;
-    if answer.trim().is_empty() {
-        return Ok(default_yes);
-    }
-    match answer.to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        _ => Err(("ORBIT-E1101", "answer yes or no".into())),
-    }
-}
-
 /// `orbit run example`: phase chain Init→Plan→Execute (example runs locally).
 fn cmd_run(home: &Path, _args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     ensure_initialized(home)?;
@@ -1195,7 +1150,7 @@ fn cmd_restore(_home: &Path, args: &[String]) -> Result<serde_json::Value, (&'st
 /// a local OpenAI-compatible gateway via the four-gate async dispatch pipeline.
 ///
 /// Configuration (no internal defaults committed):
-/// - `--gate` / `ORBIT_GATE_URL` — default `http://127.0.0.1:4001`
+/// - a configured provider endpoint, or explicit `--gate` / `ORBIT_GATE_URL`
 /// - `--model` / `ORBIT_MODEL` — REQUIRED; no default model is invented
 /// - `ORBIT_GATE_TOKEN` — optional bearer token (never printed/persisted)
 fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
@@ -3741,50 +3696,34 @@ fn cmd_provider_add(
     home: &Path,
     args: &[String],
 ) -> Result<serde_json::Value, (&'static str, String)> {
-    // Scripted form: explicit --model skips every prompt.
     let scripted_models = value_after(args, "--model");
-    let preset_id = positionals(args)
-        .get(2)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if scripted_models.is_some() {
-                "custom".into()
-            } else {
-                String::new()
-            }
-        });
-    if preset_id.is_empty() {
-        // Interactive: pick a preset from the list.
-        let all = orbit_cli::presets::presets();
-        println!("Providers:");
-        for (i, p) in all.iter().enumerate() {
-            println!("  {}. {:<12} {}", i + 1, p.id, p.blurb);
-        }
-        let sel = prompt_line("Provider (name or number)", None)?;
-        let preset = select_provider_preset(&sel)?;
-        run_provider_add_interactive(home, &preset)
-    } else {
-        let Some(preset) = orbit_cli::presets::preset_by_id(&preset_id) else {
-            return Err((
-                "ORBIT-E1101",
-                format!(
-                    "unknown preset '{preset_id}'; run: orbit provider presets\n  (custom gateways: leave the preset name out and pass --url)"
-                ),
-            ));
-        };
-        if let Some(models) = scripted_models {
-            run_provider_add_scripted(home, &preset, &models, args)
-        } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            run_provider_add_interactive(home, &preset)
-        } else {
-            Err((
-                "ORBIT-E1101",
-                "non-interactive add needs --model M[,M..] (and --url for custom)".into(),
-            ))
-        }
+    let preset_id = positionals(args).get(2).map(|value| value.to_string());
+    if let Some(models) = scripted_models {
+        let id = preset_id.as_deref().unwrap_or("custom");
+        let preset = orbit_cli::presets::preset_by_id(id)
+            .ok_or(("ORBIT-E1101", "unknown provider preset".into()))?;
+        return run_provider_add_scripted(home, &preset, &models, args);
     }
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--json" | "--url" | "--credential-env" | "--kind" | "--name"
+        )
+    }) {
+        return Err(("ORBIT-E1101", "scripted provider options require --model; enter provider details in the interactive wizard".into()));
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        return Err((
+            "ORBIT-E1101",
+            "non-interactive add needs --model M[,M..] (and --url for custom)".into(),
+        ));
+    }
+    run_onboarding_command(home, preset_id.as_deref(), "provider add")
 }
 
+#[cfg(test)]
 fn select_provider_preset(
     selection: &str,
 ) -> Result<orbit_cli::presets::ProviderPreset, (&'static str, String)> {
@@ -3801,183 +3740,7 @@ fn select_provider_preset(
     ))
 }
 
-fn run_provider_add_interactive(
-    home: &Path,
-    preset: &orbit_cli::presets::ProviderPreset,
-) -> Result<serde_json::Value, (&'static str, String)> {
-    // Name: the preset id by default.
-    let name = prompt_line("Name for providers.toml", Some(preset.id))?;
-
-    // Base URL: preset default, alternates offered.
-    let gate = if preset.alt_urls.is_empty() {
-        prompt_line("Base URL", Some(preset.url))?
-    } else {
-        println!("Endpoints:");
-        println!("  1. {} (default)", preset.url);
-        for (i, (label, url)) in preset.alt_urls.iter().enumerate() {
-            println!("  {}. {url} ({label})", i + 2);
-        }
-        let sel = prompt_line("Endpoint (number)", Some("1"))?;
-        let n = sel
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| ("ORBIT-E1101", "choose an offered endpoint number".into()))?;
-        if n == 1 {
-            preset.url.to_string()
-        } else {
-            preset
-                .alt_urls
-                .get(
-                    n.checked_sub(2)
-                        .ok_or(("ORBIT-E1101", "choose an offered endpoint number".into()))?,
-                )
-                .map(|(_, u)| u.to_string())
-                .ok_or(("ORBIT-E1101", "choose an offered endpoint number".into()))?
-        }
-    };
-    validate_provider_url(&gate)?;
-
-    // Credential: env-var NAME only. Tell the user what to export.
-    // Ollama (empty preset env) defaults to none — it needs no key.
-    let credential_env = if preset.env.is_empty() {
-        let v = prompt_line("Credential env-var name (blank = none)", None)?;
-        if v.trim().is_empty() { None } else { Some(v) }
-    } else {
-        let v = prompt_line("Credential env-var name", Some(preset.env))?;
-        if v.trim().is_empty() { None } else { Some(v) }
-    };
-    validate_discovery_input(&name, &gate, credential_env.as_deref(), preset.kind)?;
-    if let Some(var) = credential_env.as_deref().filter(|v| !v.trim().is_empty())
-        && std::env::var(var).is_err()
-    {
-        println!("note: export {var}=<your key> before orbit needs it");
-    }
-
-    // Discovery against the real endpoint.
-    let kind = preset.kind;
-    println!("Discovering models using the selected endpoint ({kind})…");
-    let discovered = match discover_models(&gate, credential_env.as_deref(), kind) {
-        Ok(ids) => {
-            println!("Discovered models:");
-            for (i, id) in ids.iter().enumerate() {
-                let fact = orbit_cli::presets::preset_model(preset, id)
-                    .map(|f| format!(" — {}", f.label))
-                    .unwrap_or_default();
-                println!("  {}. {id}{fact}", i + 1);
-            }
-            ids
-        }
-        Err(e) => {
-            eprintln!("Could not discover models: {e}");
-            Vec::new()
-        }
-    };
-
-    // Selection: known preset facts join the discovered list when the
-    // endpoint did not already list them.
-    let mut offered: Vec<String> = discovered.clone();
-    for m in preset.models {
-        if !offered.iter().any(|id| id == m.id) {
-            offered.push(m.id.to_string());
-        }
-    }
-    if offered.is_empty() {
-        return Err((
-            "ORBIT-E1101",
-            "no models discovered and this preset lists none; enter them with --model".into(),
-        ));
-    }
-    let sel = prompt_line(
-        "Select models (all or comma-separated numbers)",
-        Some("all"),
-    )?;
-    let chosen = select_provider_models(&sel, &offered)?;
-    if chosen.is_empty() {
-        return Err(("ORBIT-E1101", "no models selected".into()));
-    }
-
-    // Model entries: preset facts + (Anthropic) live per-model limits.
-    let mut entries: Vec<orbit_cli::config::ModelEntry> = chosen
-        .iter()
-        .map(|id| orbit_cli::presets::preset_model_entry(preset, id))
-        .collect();
-    orbit_cli::setup::validate_provider(&config::ProviderConfig {
-        name: name.clone(),
-        kind: kind.into(),
-        url: gate.clone(),
-        env: credential_env.clone(),
-        models: entries.clone(),
-    })
-    .map_err(|e| ("ORBIT-E1101", e.to_string()))?;
-    if kind == "anthropic"
-        && let Some(idx) = entries
-            .iter()
-            .position(|e| e.context_window.is_none() || e.max_output_tokens.is_none())
-    {
-        let id = entries[idx].id.clone();
-        let limits = anthropic_model_limits(&gate, credential_env.as_deref(), &id);
-        if let Some(w) = limits.context_window {
-            entries[idx].context_window = Some(w);
-        }
-        if let Some(o) = limits.max_output_tokens {
-            entries[idx].max_output_tokens = Some(o);
-        }
-    }
-
-    let model_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
-    add_configured_provider_kind(
-        home,
-        &name,
-        &gate,
-        kind,
-        credential_env,
-        model_ids.clone(),
-        None,
-        Some(entries),
-    )?;
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-
-    let roles_set = if prompt_yes_no("Fill unset task roles from these models?", true)? {
-        let roles = fill_unset_provider_roles(home, &name, &model_ids, preset)?;
-        for (role, model) in &roles {
-            println!("  {role:<11} {model}");
-        }
-        roles
-    } else {
-        Vec::new()
-    };
-    let mut routing_set = Vec::new();
-    if config::ProvidersConfig::load(home)
-        .map_err(|e| ("ORBIT-E1106", e))?
-        .all_models()
-        .len()
-        >= 2
-        && prompt_yes_no(
-            "Fill unset difficulty routes? (hard prompts → the strong model, easy → the cheap one)",
-            false,
-        )?
-    {
-        routing_set = fill_unset_provider_routes(home, &name, &model_ids, preset)?;
-        for (difficulty, model) in &routing_set {
-            println!("  {difficulty:<5} {model}");
-        }
-        println!("  preview with: orbit route test \"<prompt>\"");
-    }
-
-    Ok(serde_json::json!({
-        "schema": "orbit.cli/v1",
-        "command": "provider add",
-        "status": "ok",
-        "provider": name,
-        "kind": kind,
-        "url": gate,
-        "models": model_ids,
-        "roles_set": roles_set,
-        "routing_set": routing_set,
-    }))
-}
-
+#[cfg(test)]
 fn ranked_provider_models(
     name: &str,
     models: &[String],
@@ -3994,6 +3757,7 @@ fn ranked_provider_models(
         .map(|id| format!("{name}/{id}"))
         .collect()
 }
+#[cfg(test)]
 fn fill_unset_provider_roles(
     home: &Path,
     name: &str,
@@ -4024,6 +3788,7 @@ fn fill_unset_provider_roles(
     .map_err(|e| ("ORBIT-E1106", e))?;
     Ok(applied)
 }
+#[cfg(test)]
 fn fill_unset_provider_routes(
     home: &Path,
     name: &str,

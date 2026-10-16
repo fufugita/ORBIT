@@ -646,6 +646,183 @@ fn bound_tuple() -> EgressTuple {
     }
 }
 
+fn dispatch_endpoint_path(
+    path: &str,
+    allowed_path: &str,
+) -> (Result<DispatchOutcome, crate::DispatchError>, bool) {
+    dispatch_endpoint_request(path, allowed_path, |_| {})
+}
+
+fn dispatch_endpoint_request(
+    path: &str,
+    allowed_path: &str,
+    alter: fn(&mut ProviderRouteBinding),
+) -> (Result<DispatchOutcome, crate::DispatchError>, bool) {
+    use orbit_adapter::adapters::{MockHttpV1, MockScript};
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("orbit-gateway-path-{}", new_decision_id().0));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let adapter = MockHttpV1::with_credential_probe(
+        identity(AdapterKind::MockHttpV1, &"i".repeat(64), &"p".repeat(64)),
+        text_capabilities(),
+        MockScript::Success(canonical_success_result()),
+        probe.clone(),
+    );
+    let mut binding = test_binding();
+    binding.adapter_kind = AdapterKind::MockHttpV1;
+    binding.endpoint_path = path.into();
+    let mut tuple = bound_tuple();
+    tuple.path_prefix = allowed_path.into();
+    let mut registry = ProviderRegistry::new();
+    registry.register_model(crate::ModelRef("test-model".into()), binding.clone());
+    registry.register_adapter(AdapterKind::MockHttpV1, Arc::new(adapter));
+    let engine = DispatchEngine::new(
+        registry,
+        dir.clone(),
+        EgressAllowlist::new(vec![tuple.clone()]),
+        vec![tuple],
+        vec![spki_pin()],
+    );
+    let mut writer = LedgerWriter::open(&dir, "path-writer".into(), "0.1.0").unwrap();
+    let mut request = canonical_request(&binding, b"hello");
+    alter(&mut request.route);
+    let secret = SecretBytes::new(b"synthetic-path-bound-key".to_vec());
+    let session = new_session_id();
+    let decision = new_decision_id();
+    let result = engine
+        .dispatch(
+            "test-model",
+            &session,
+            &decision.0,
+            &request,
+            Some(&secret),
+            &mut writer,
+        )
+        .map(|(outcome, _)| outcome);
+    if result.is_err() {
+        assert!(matches!(
+            engine.recovery_state(&session, &decision.0).unwrap(),
+            DispatchState::Reserved
+        ));
+    }
+    writer.close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    (result, probe.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[test]
+fn gateway_endpoint_path_custom_base_delivers_only_when_admitted() {
+    let (result, received) = dispatch_endpoint_path("/owned/v1", "/owned/v1");
+    assert!(
+        matches!(result, Ok(DispatchOutcome::Completed(_))),
+        "{result:?}"
+    );
+    assert!(received);
+}
+
+#[test]
+fn gateway_endpoint_path_default_allowlist_cannot_admit_another_base() {
+    let (result, received) = dispatch_endpoint_path("/owned/v1", "/v1");
+    assert_eq!(result.unwrap_err().code, "E0307");
+    assert!(!received);
+}
+
+#[test]
+fn gateway_endpoint_path_prefix_confusion_refuses_before_credential_delivery() {
+    let (result, received) = dispatch_endpoint_path("/v1admin", "/v1");
+    assert_eq!(result.unwrap_err().code, "E0307");
+    assert!(!received);
+}
+
+#[test]
+fn gateway_endpoint_path_noncanonical_paths_refuse_before_credential_delivery() {
+    for path in [
+        "/v1/../outside",
+        "/v1/%2e%2e/outside",
+        "/v1?tenant=fixture",
+        "/v1#fragment",
+        "v1",
+        "/v1\\outside",
+        "/v1\n",
+    ] {
+        let (result, received) = dispatch_endpoint_path(path, "/v1");
+        assert!(result.is_err(), "ambiguous route path was admitted");
+        assert!(!received, "ambiguous route received credentials");
+    }
+}
+
+fn route_changes() -> [fn(&mut ProviderRouteBinding); 3] {
+    [
+        |route| route.endpoint_path = "/outside".into(),
+        |route| route.endpoint_host = "another.invalid".into(),
+        |route| route.endpoint_port = 8443,
+    ]
+}
+
+#[test]
+fn gateway_endpoint_path_sync_request_cannot_change_the_admitted_route() {
+    for alter in route_changes() {
+        let (result, received) = dispatch_endpoint_request("/v1", "/v1", alter);
+        assert_eq!(result.unwrap_err().phase, "capability");
+        assert!(!received);
+    }
+}
+
+#[tokio::test]
+async fn gateway_endpoint_path_async_request_cannot_change_the_admitted_route() {
+    use std::os::unix::fs::DirBuilderExt;
+    for alter in route_changes() {
+        let dir = std::env::temp_dir().join(format!("orbit-gateway-route-{}", new_decision_id().0));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = Arc::new(UsageScript {
+            events: usage_events(&[], None),
+            calls: calls.clone(),
+            capabilities: text_capabilities(),
+        });
+        let binding = test_binding();
+        let mut request = canonical_request(&binding, b"hello");
+        alter(&mut request.route);
+        let mut registry = ProviderRegistry::new();
+        registry.register_model(crate::ModelRef("test-model".into()), binding.clone());
+        registry.register_async_adapter(binding.adapter_kind, adapter);
+        let engine = DispatchEngine::new(
+            registry,
+            dir.clone(),
+            EgressAllowlist::new(vec![bound_tuple()]),
+            vec![bound_tuple()],
+            vec![spki_pin()],
+        );
+        let mut writer = LedgerWriter::open(&dir, "route-writer".into(), "0.1.0").unwrap();
+        let secret = SecretBytes::new(b"synthetic-path-bound-key".to_vec());
+        let session = new_session_id();
+        let decision = new_decision_id();
+        let mut observed = Vec::new();
+        let result = engine
+            .dispatch_async(
+                "test-model",
+                &session,
+                &decision.0,
+                &request,
+                Some(&secret),
+                &mut writer,
+                &CancelToken::new(),
+                Some(&mut |event| observed.push(event.clone())),
+            )
+            .await;
+        assert_eq!(result.unwrap_err().phase, "capability");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(observed.is_empty());
+        assert!(matches!(
+            engine.recovery_state(&session, &decision.0).unwrap(),
+            DispatchState::Reserved
+        ));
+        writer.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 /// Build an engine whose egress allowlist CONTAINS the bound tuple (admitted)
 /// plus a writer already open on the ledger dir (P0-5: injected, not competing).
 fn engine(tag: &str) -> (DispatchEngine, PathBuf, LedgerWriter) {

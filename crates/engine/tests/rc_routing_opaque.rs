@@ -105,7 +105,7 @@ impl Provider {
             gate: self.url.clone(),
             model: model.into(),
             kind: orbit_engine::ProviderKind::Anthropic,
-            credential_env: Some(format!("ORBIT_OPAQUE_UNUSED_{}", ulid::Ulid::new())),
+            credential_env: None,
             pricing: None,
             max_output_tokens: 2048,
             sampling: None,

@@ -20,6 +20,7 @@ pub mod conformance;
 pub mod credential;
 pub mod error;
 pub mod provider_adapter;
+pub mod provider_credentials;
 pub mod redaction;
 pub mod stream;
 pub mod types;

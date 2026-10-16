@@ -9,61 +9,36 @@
 
 <p align="center">
   <a href="#install">Install</a> · <a href="#get-started">Get started</a> ·
-  <a href="docs/customization.md">Customize</a> ·
+  <a href="#connect-mcp-tools">MCP</a> · <a href="#plugins-skills-and-agents">Plugins</a> ·
   <a href="#documentation">Documentation</a>
 </p>
 
 ORBIT brings conversation, file changes, command output, and delegated work into
-one open-source workspace. Connect cloud providers or local models, configure task
-routing and permissions, then work in your terminal, browser, or a headless command.
+one open-source workspace. Connect a provider or local model, choose the tools it
+can use, and work in the terminal, browser, or a headless command.
 
 <p align="center">
   <img src="docs/tui/media/orbit-demo.gif" alt="ORBIT reading a project, proposing an edit, requesting approval, running tests, and opening the review layout" width="960">
 </p>
 
-<p align="center"><sub>Captured from the real terminal interface with a scripted provider and a disposable project.</sub></p>
-
-## What you can do
-
-| | |
-|---|---|
-| **Build and investigate** | Read files, edit code, run commands, inspect diffs, and follow streamed tool output. |
-| **Choose your models** | Use Anthropic, OpenAI-compatible, and Ollama adapters; configure models and roles explicitly. |
-| **Route by task** | Map task phases and difficulty to different models, preview a decision, or pin your own selection. |
-| **Delegate and return** | Name agents, resume their saved conversations, and inspect the model and effort each one uses. |
-| **Make it yours** | Change themes, colors, layouts, tabs, and panes; set browser fonts and share portable profiles. |
-| **Connect your tools** | Configure local MCP servers, language diagnostics, skills, hooks, and instruction mods. |
-| **Organize pentests** | Start with scope, notes, evidence, findings, report templates, and an engagement layout. |
+<p align="center"><sub>Real terminal capture with a scripted provider and a disposable project.</sub></p>
 
 ## Install
 
-### Homebrew on Linux
+ORBIT currently targets Linux. Both `orbit` and `orbit-web` are installed together.
 
-Build the current main branch and install both `orbit` and `orbit-web`:
+### Homebrew on Linux
 
 ```sh
 brew tap fufugita/orbit https://github.com/fufugita/ORBIT.git
 brew install --HEAD fufugita/orbit/orbit
 ```
 
-The formula uses Homebrew's Rust build dependency. `--HEAD` tracks main.
-
-### npm on Linux
-
-The `next` preview packages are prepared; registry publication is pending. After publication:
-
-```sh
-npm install --global --include=optional @fufugita/orbit@next
-```
-
-Requires **Node.js 22.15+ (22.x), or 23.11+**, Linux **x64 or arm64**, and **glibc 2.35+**.
-The optional platform package contains both executables. Installation needs no
-Rust compiler or lifecycle download script. See [package distribution](docs/setup.md#package-distribution)
-for availability, local package installation, and uninstall instructions.
+This builds the current main branch, using Homebrew's Rust build dependency.
 
 ### From source
 
-Install Rust through [rustup](https://rustup.rs/), then build with the pinned Rust 1.99 toolchain:
+Install Rust through [rustup](https://rustup.rs/), then use the pinned Rust 1.99 toolchain:
 
 ```sh
 git clone https://github.com/fufugita/ORBIT.git
@@ -72,78 +47,226 @@ bash install.sh --method source --source . --version 0.2.0 --dir "$HOME/.local/b
 ```
 
 Add the installation directory to `PATH`. The managed installer switches both
-executables together and preserves your configuration. See [setup](docs/setup.md)
-for bundle installation, upgrades, prerequisites, and platform limits.
+executables together and preserves your configuration. See [installation details](docs/setup.md)
+for bundle installation, upgrades, prerequisites, and uninstall instructions.
+
+### npm preview
+
+The native Linux packages are available, but publication of the
+`@fufugita/orbit` launcher is still pending. The following command becomes usable
+once that launcher is published:
+
+```sh
+npm install --global --include=optional @fufugita/orbit@next
+```
+
+The npm distribution requires Node.js **22.15+ (22.x), or 23.11+**, Linux
+**x64 or arm64**, and **glibc 2.35+**. It includes both executables and needs no
+Rust compiler or lifecycle download script. See [package distribution](docs/setup.md#package-distribution)
+for availability and local archive installation.
 
 ## Get started
 
-Guided setup initializes ORBIT and asks for your endpoint, model IDs, and credential variable **name**:
+Open a terminal in the project you want to work on:
 
 ```sh
-orbit setup --guided
-```
-
-Export the credential in your shell, then check your configuration and open ORBIT:
-
-```sh
+cd your-project
+orbit setup
 orbit doctor
 orbit
 ```
 
-Setup stores credential variable names. Model requests send conversation and tool
-context to your configured provider. Doctor checks local readiness without contacting
-providers or starting integration servers. See [setup](docs/setup.md) for configuration paths.
+Plain `orbit setup` opens the provider wizard when both input and output are
+terminals. It walks you through:
 
-For a browser session, start from the project you want to work in:
+1. **Provider and endpoint:** choose a preset, or choose `custom` and enter a name,
+   adapter kind, and your provider's base URL.
+2. **Authentication:** enter an API key in the hidden prompt to save it privately,
+   name an environment variable, or choose explicit no-auth for a custom/local provider.
+3. **Models:** enter exact raw model IDs manually, including any slashes in the ID.
+4. **Default and save:** optionally select the main model, review the complete
+   summary, and type `yes` to save.
+
+A privately saved key needs no shell export. With an ENV reference, set that exact
+variable before making requests. Replacing an existing provider or main default
+requires a separate confirmation. Canceling, declining, or reaching EOF before
+commit leaves existing configuration and credentials intact.
+
+`orbit doctor` checks local readiness without contacting providers or starting
+integration servers. Setup reports credential presence and leaves connectivity
+untested; your first prompt makes the provider request. Conversation and tool
+context are sent to the provider you select.
+
+To add another provider, use the same wizard:
 
 ```sh
-orbit web
+orbit provider add
+orbit provider list
+orbit models
 ```
 
-For a headless task, use `orbit -p "Summarize this project" --output-format text`.
-JSON and streaming JSON are also supported. Calls needing unanswered approval are denied.
+Manual model entry and API-key/ENV/no-auth setup are available now. Online catalog
+selection, model refresh, and browser login are not part of this setup flow yet.
 
-## Work in the terminal or browser
+### Where configuration lives
 
-Arrange Conversation, Changes, Terminal, Plan, Context, Activity, Review, and Agent
-panels. Choose `columns`, `build`, `agents`, or `review`, or split and resize your
-own layout. On narrow terminals, tabs select the focused pane.
+The default home is `~/.orbit`; `--home DIR` and `ORBIT_HOME` select another home.
+See [home selection](docs/setup.md#initialize-once) for the retained workspace-home behavior.
+Providers and model defaults live in `providers.toml`. For example, an ENV-backed
+configuration has this shape:
 
-Use `@` to complete workspace files, attach images for capable models, and
-`Ctrl-R` to search saved prompt history. With an empty composer while idle,
-press `Esc` for arrange controls, `?` for help, or `:` for the command palette.
-During a live turn, `Esc` cancels it. Approval cards show the proposed edit
-or command before you decide; tool permissions and remembered rules control
-which calls need confirmation.
+```toml
+[[provider]]
+name = "work"
+kind = "openai-compatible"
+url = "https://provider.example/v1"
+env = "WORK_API_KEY"
 
-<p align="center">
-  <img src="docs/images/terminal-customization.png" alt="ORBIT in the Midnight theme with custom Engagement and Notes panes beside the terminal conversation" width="960">
-</p>
+[[provider.models]]
+id = "family/model"
 
-<p align="center"><sub>A real terminal capture: Midnight theme, custom layout, and workspace file panes. The local demo has an unsent draft and makes no provider requests.</sub></p>
+[roles]
+main = "work/family/model"
+```
 
-The browser shares providers, permissions, and saved conversation formats. It streams
-responses and tool activity, presents approvals, and exposes model, effort, session,
-and appearance controls. Use `orbit web --resume SESSION_ID` to return to saved work;
-close its previous owner first. See the [browser guide](docs/browser-harness.md).
+Replace the example URL and model with your provider's actual values. The public
+configuration contains credential **references**, never key values. Hidden-key
+setup generates its own reference and stores the key privately, bound to that
+provider and endpoint. A nonempty ENV value for the same reference takes precedence.
 
-## Route models without another model call
-
-Configure easy and hard targets using your declared provider/model IDs:
+For automation, use explicit manual flags:
 
 ```sh
-orbit route setup --easy first/small --hard first/strong
+orbit setup --provider work --kind openai-compatible \
+  --gate https://provider.example/v1 --model family/model \
+  --credential-env WORK_API_KEY
+```
+
+`setup --json`, redirected plain setup, `setup --no-provider`, and
+`setup --dry-run` keep their offline, prompt-free behavior. `setup --guided`
+is the older offline ENV-name prompt flow and requires terminal input and output;
+interactive flags cannot be combined with JSON. `setup repair --dry-run` inspects
+missing identity artifacts without replacing the identity.
+
+## Choose how to work
+
+| Use case | Start with |
+|---|---|
+| Understand or change a project | Run `orbit` in its directory; ask it to inspect files, propose edits, and run checks. |
+| Use the browser interface | Run `orbit web` from the project directory. |
+| Run one task from a script | `orbit -p "Summarize this project" --output-format text` |
+| Reopen work | `orbit --resume SESSION_ID`, or use `--continue` for the latest session in the directory. |
+| Keep a session owned by another terminal | Use `orbit serve` and `orbit attach`; see [owned sessions](docs/integrations.md#keep-a-session-running-with-serve-and-attach). |
+| Prepare an engagement workspace | Use `orbit pentest init`; see the example below. |
+
+Headless output also supports JSON and streaming JSON. A call requiring an
+unanswered approval is denied. Browser sessions use the saved provider
+configuration, permissions, and conversations; see the [browser guide](docs/browser-harness.md)
+for session ownership and access controls.
+
+In the terminal, use `@` to complete workspace files and `Ctrl-R` to search prompt
+history. With an empty composer while idle, `Esc` opens arrange controls, `?`
+shows help, and `:` opens the command palette. During a live turn, `Esc` cancels it.
+Approval cards show proposed edits and commands before you decide.
+
+<p align="center">
+  <img src="docs/images/terminal-customization.png" alt="ORBIT terminal conversation beside custom Engagement and Notes panes in the Midnight theme" width="960">
+</p>
+
+<p align="center"><sub>Real terminal capture with workspace notes and an unsent draft; no provider request.</sub></p>
+
+## Connect MCP tools
+
+Put server configuration in `~/.orbit/mcp.json`, or in the home selected by
+`ORBIT_HOME`/`--home`. ORBIT supports **Unix stdio**, **Streamable HTTP**, and
+**legacy SSE** MCP servers. For example:
+
+```json
+{
+  "servers": {
+    "browser": {
+      "transport": "stdio",
+      "command": "/path/to/installed/browser-mcp-server",
+      "args": [],
+      "tools": ["browser_navigate", "browser_snapshot"]
+    },
+    "docs": {
+      "transport": "streamable-http",
+      "url": "https://mcp.example/mcp"
+    }
+  }
+}
+```
+
+Replace the executable, URL, and tool names with your server's values. Stdio
+servers must already be installed; remote servers use their configured URL and
+optional literal headers. Remote MCP authentication does not provide an automatic
+OAuth/login flow. An omitted `tools` exposes discovered tools; `[]` exposes none.
+
+In ordinary terminal chat, inspect or change policy with:
+
+```text
+/permissions
+/permissions ask mcp__browser__*
+/permissions allow mcp__browser__browser_snapshot
+```
+
+An exact Allow does not remove a surviving server-wide Ask or Deny. Review the
+effective result. Enabled servers may initialize during tool discovery, before a
+tool-call approval; permission rules govern subsequent calls. A workspace's
+`.orbit/mcp.json` is used only after an explicit `orbit folder trust` decision.
+See [MCP configuration and permissions](docs/integrations.md#configure-mcp-servers)
+for transport details, credentials, server selection, and policy limits.
+
+## Plugins, skills, and agents
+
+Inspect a local package before importing it, then list what is installed:
+
+```sh
+orbit plugin inspect ./review-kit
+orbit plugin import ./review-kit --scope user
+orbit plugin list
+orbit plugin status PLUGIN_ID
+```
+
+Use the ID returned by import/list in place of `PLUGIN_ID`. Imports create managed
+local snapshots and are enabled by default; add `--no-enable` to keep one inactive.
+Use `plugin enable`, `disable`, `upgrade`, or `remove` to manage that index.
+Importing does not run package code. Enabled index state and runtime readiness
+are reported separately; removal retains stored versions and user data.
+
+Supported installed **skills and agents** enter the shared catalog when their
+requirements are met. Ask ORBIT to use the exact `PLUGIN:SKILL` or `PLUGIN:AGENT`
+identity from the package inspection. Skills use the `Skill` tool; agent delegation
+uses `Task`. Agents inherit the parent's tool scope and permissions. Named agents
+have saved reports and explicit resume; a task call runs synchronously.
+
+Inspection recognizes `portable`, `claude`, `codex`, and `hermes` formats, with
+explicit model/tool mapping options. Recognition is not full runtime portability:
+components marked as requiring migration, with relevant errors, or with unmet
+requirements are withheld. Project plugins require folder trust, and `--bare`
+skips skills and agents. Foreign runtime hooks, authentication, dependencies, and
+registration behavior may still need manual migration. Use `orbit plugin --help`
+for exact formats, mappings, scopes, and revision options.
+
+## Route models by task
+
+With two declared models, choose easy and hard targets and preview a decision:
+
+```sh
+orbit route setup --easy work/small --hard work/strong
 orbit route test "Implement a comprehensive parser"
 orbit route status
 ```
 
-Routing classifies phase and difficulty separately using deterministic rules; individual phase targets are configurable.
-An explicit model choice pins the session; `/route auto` restores automatic routing.
-Roles select separate defaults for delegation, exploration, and compaction.
+The names must exist in your configuration. Routing uses deterministic phase and
+difficulty rules; individual phase targets are configurable. An explicit model
+choice pins the session, while `/route auto` restores automatic routing. Roles
+provide separate model choices for delegated work and other supported tasks.
 
-Use `--effort high` or `/effort high` only when that model declares the choice.
-`/effort default` restores its configured default. String levels and Ollama boolean
-thinking controls remain distinct. See [provider setup](docs/setup.md#declare-providers-and-routing).
+Use `--effort high` or `/effort high` only when the selected model declares that
+choice; `/effort default` restores its configured default. See [provider configuration](docs/setup.md#declare-providers-and-routing)
+for exact identities, roles, and routing commands.
 
 ## Make the workspace yours
 
@@ -155,56 +278,37 @@ orbit customize set browser.font_family 'Fira Code, monospace'
 orbit customize set browser.font_size_px 15
 ```
 
-Choose `orbit`, `midnight`, or `paper`; adjust spacing, symbols, motion, and color mode.
-Add panes for notes, workspace Markdown, routing, usage, agents, scope, evidence, or
-findings. Portable profiles share preferences across frontends and support validation/import/export.
+Choose `orbit`, `midnight`, or `paper`. Arrange Conversation, Changes, Terminal,
+Plan, Context, Activity, Review, and Agent panels using presets or your own splits.
+Add named panes for notes, workspace Markdown, routing, usage, agents, scope,
+evidence, or findings. Validate, import, and export portable appearance profiles.
 
-Browser fonts use families already installed on your system. Terminal font family
-and size are controlled by your terminal application. Custom panes are declarative;
-they do not execute JavaScript or shell commands. See [customization](docs/customization.md)
-for profile examples, pane actions, supported settings, and recovery controls.
+Browser fonts use installed system families. Your terminal application controls
+its font family and size. Custom panes display declared content and actions;
+they do not execute JavaScript or shell commands. See [customization](docs/customization.md).
 
 <p align="center">
-  <img src="docs/images/browser-customization.png" alt="ORBIT in the browser with the Paper theme, custom Engagement and Notes panes, and appearance controls for fonts, colors, and layouts" width="960">
+  <img src="docs/images/browser-customization.png" alt="ORBIT browser interface in the Paper theme with Engagement and Notes panes and appearance controls" width="960">
 </p>
 
-<p align="center"><sub>The same local demo in the browser, with Paper and custom font settings. Captured from the running interface with no provider requests.</sub></p>
+<p align="center"><sub>Real browser capture of the same local workspace, with Paper and custom font settings; no provider request.</sub></p>
 
-## Agents and persistent sessions
-
-The `Task` tool supports named agents with stable IDs, saved reports, model and
-effort selection, and explicit resume. `ListAgents` lists them; `AgentSendMessage`
-queues a message for the next resume. Agents inherit their parent's tool scope
-and permissions. A task call runs synchronously; saved agents can be continued later.
-
-To leave a session running while an attached terminal disconnects, start a
-foreground owner and attach from another terminal:
-
-```sh
-orbit serve --socket "$HOME/.orbit-run/owner.sock" --session work --model first/small
-orbit attach --socket "$HOME/.orbit-run/owner.sock"
-```
-
-Use separate terminals and a declared model. `/detach` leaves the owner running;
-`/cancel` interrupts a turn; `/stop` ends it. Resume an owner with `serve --resume SESSION_ID`.
-See [serve and attach](docs/integrations.md#keep-a-session-running-with-serve-and-attach).
-
-## Tools, extensions, and pentest workspaces
-
-Connect **native Unix stdio MCP** servers with tool selection and permission rules.
-Enable **LSP diagnostics** for installed servers, and add skills, hooks, instruction
-mods, or verified signed content. Browser automation uses a separately configured
-browser MCP server. See [integrations](docs/integrations.md) for setup and limits.
+## Pentest workspaces
 
 ```sh
 orbit pentest init ./engagement --profile standard
 orbit pentest status ./engagement --json
+cd engagement
+orbit customize validate pentest-profile.json
+orbit customize import pentest-profile.json
+orbit
 ```
 
-The scaffold creates scope, notes, evidence/findings directories, report and
-workflow templates, a triage agent, and a portable engagement profile. It preserves
-existing work and starts no scans or external tools. Edit the scope and templates,
-then import the generated layout as described in [pentest workspaces](docs/pentest.md).
+The scaffold creates scope, notes, evidence/findings directories, report templates,
+workflow skills, a triage agent, and an engagement layout. It preserves existing
+work and starts no scans or external tools. Fill in the scope and adapt the
+provided templates to your engagement. See [pentest workspaces](docs/pentest.md)
+for readiness checks and evidence handling.
 
 ## Documentation
 
@@ -214,7 +318,8 @@ then import the generated layout as described in [pentest workspaces](docs/pente
 
 ## Development
 
-Built with **Rust 1.99** and **edition 2024**, with locked dependencies and a shared engine/frontend protocol.
+Built with **Rust 1.99** and **edition 2024**, with locked dependencies and a shared
+engine/frontend protocol.
 
 ```sh
 cargo fmt --all --check
@@ -222,7 +327,8 @@ CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --locked -- -D warning
 CARGO_BUILD_JOBS=1 scripts/in-jail.sh cargo test --workspace --locked -- --test-threads=1
 ```
 
-Process-control tests use the provided Linux PID jail. Use `orbit --help` for the command surface.
+Process-control tests use the provided Linux PID jail. Use `orbit --help` for the
+command surface.
 
 ## License
 

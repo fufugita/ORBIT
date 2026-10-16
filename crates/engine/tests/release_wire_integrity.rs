@@ -176,7 +176,7 @@ fn config(provider: &Provider, kind: ProviderKind) -> TurnConfig {
         gate: provider.url.clone(),
         model: "fixture-model".into(),
         kind,
-        credential_env: Some("ORBIT_WIRE_FIXTURE_UNUSED_TOKEN".into()),
+        credential_env: None,
         pricing: None,
         max_output_tokens: 2048,
         sampling: None,

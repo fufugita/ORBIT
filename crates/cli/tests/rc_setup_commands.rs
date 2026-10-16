@@ -517,3 +517,47 @@ fn command_engagement_real_project_loaders_require_explicit_folder_trust() {
     assert_eq!(agent.tools, vec!["Read", "Glob", "Grep"]);
     assert!(!f.home.join("customization.json").exists());
 }
+
+#[test]
+fn command_interactive_json_is_rejected_before_home_creation() {
+    for flag in ["--guided", "--interactive-provider"] {
+        let fixture = Fixture::new();
+        let error = commands::setup(&fixture.home, &args(&[flag, "--json"])).unwrap_err();
+        assert_eq!(error.0, "ORBIT-E1101");
+        assert!(!fixture.home.exists());
+    }
+}
+
+#[test]
+fn command_guided_requires_terminal_input_and_output_before_writes() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let fixture = Fixture::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_orbit"))
+        .args([
+            "--home",
+            fixture.home.to_str().unwrap(),
+            "setup",
+            "--guided",
+        ])
+        .env_clear()
+        .env("HOME", &fixture.root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("nonterminal guided setup did not refuse before its deadline");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("terminal input and output"));
+    assert!(!fixture.home.exists());
+}

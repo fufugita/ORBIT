@@ -46,16 +46,34 @@ orbit setup
 orbit doctor
 ```
 
-Setup is offline by default. It creates the trust root, signed manifest, identity,
-and ledger once. Repeating setup or `orbit init` preserves the existing identity
-and history. Partial or inconsistent identity files produce a diagnosis rather
-than a new signing key. Use `orbit setup repair --dry-run` to inspect missing
-artifacts before deciding how to recover them.
+Plain `orbit setup` opens a provider wizard when both input and output are
+terminals. Choose a preset or custom provider name, adapter and base URL, then
+choose a hidden API key, a credential ENV reference, or explicit no-auth for a
+custom/local provider. Enter exact raw model IDs, optionally choose the main
+default, review the summary and type `yes` to save. `orbit provider add` opens the
+same wizard for another provider. Manual model entry sends no provider requests.
+Online catalog selection, refresh and browser login are not wired into this flow
+yet.
 
-Use `orbit setup --guided` for manual terminal prompts. Enter provider metadata,
-model IDs, and a credential environment-variable name; enter the credential value
-in your shell separately. Manual setup does not discover models or start servers.
-An explicitly selected provider-discovery workflow can contact the endpoint.
+Hidden keys are stored in owned private files under the selected home's
+`auth/providers` directory. Public provider configuration contains a generated
+credential reference, not the key. The saved binding includes provider name,
+adapter kind, canonical endpoint and credential reference. A nonempty ENV value
+for that exact reference takes precedence; invalid nonempty values are refused.
+Changing the endpoint or reference requires a matching credential. Set an ENV
+reference in your shell before making requests, or use a privately saved key
+without a shell export.
+
+Identity setup creates the trust root, signed manifest, identity and ledger once.
+Repeating setup or `orbit init` preserves the existing identity and history.
+Partial or inconsistent identity files produce a diagnosis rather than a new
+signing key. Use `orbit setup repair --dry-run` to inspect missing artifacts.
+Canceling before confirmation preserves existing configuration and credentials.
+
+For prompt-free automation, use explicit provider flags below, `setup --json`,
+`setup --no-provider`, or `setup --dry-run`. Redirected plain setup also stays
+offline. `orbit setup --guided` retains the older offline ENV-name prompt flow
+and requires terminal input and output. Interactive flags cannot use JSON.
 
 The configuration directory is selected by `--home`, then nonempty `ORBIT_HOME`.
 Otherwise ORBIT uses an existing `~/.orbit`, then an existing workspace `.orbit`,
@@ -67,8 +85,9 @@ profile.
 ## Declare providers and routing
 
 A provider needs a unique name, an absolute HTTP(S) endpoint, its adapter kind,
-and exact model IDs. Credential configuration references an environment-variable
-name. Embedded credentials in URLs are refused.
+and exact model IDs. Edit `providers.toml` directly or use setup. Credentials are
+ENV references or exact-bound privately saved keys; key values do not belong in
+`providers.toml`. Embedded credentials in URL userinfo are refused.
 
 ```sh
 orbit setup --provider first --kind openai-compatible \
@@ -103,6 +122,9 @@ executable availability, and the installed browser bundle. It never starts a
 configured MCP/LSP process or contacts a provider. `configured` and `not_tested`
 are deliberately different from a successful connection test. Required invalid
 checks make readiness fail; optional unavailable integrations remain visible.
+Credential checks distinguish an active ENV override, exact saved binding,
+explicit no-auth, missing credentials and invalid storage. They do not create
+credential files or establish that a provider accepts the key.
 
 See [customization](customization.md), [pentest workspaces](pentest.md), and the
 [first real-provider trial](provider-acceptance.md) for the next steps.
@@ -162,4 +184,5 @@ bootstrap before trusted publishing can be configured.
 
 Normal uninstall removes package-manager files and preserves ORBIT's home,
 identity, sessions and configuration. Run `orbit setup` and `orbit doctor` after
-installation; provider credentials remain environment-variable names in settings.
+installation. Provider settings retain credential references; private key records
+remain separate and are preserved during upgrades and normal uninstall.

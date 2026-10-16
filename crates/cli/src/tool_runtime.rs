@@ -3676,7 +3676,9 @@ pub(crate) fn task_config_for(
 /// (ORBIT_GATE_URL, ORBIT_MODEL, …). Only the fallback: a session's own
 /// configuration (`SessionTurnConfig`) is what a subagent normally runs on.
 pub fn subagent_turn_config(_home: &Path) -> orbit_engine::TurnConfig {
-    let gate = std::env::var("ORBIT_GATE_URL").unwrap_or_else(|_| "http://127.0.0.1:4001".into());
+    // No implicit local service receives a credential when configuration is absent.
+    // An empty endpoint is rejected by the ordinary dispatch validation before IO.
+    let gate = std::env::var("ORBIT_GATE_URL").unwrap_or_default();
     let model = std::env::var("ORBIT_MODEL").unwrap_or_else(|_| "default".into());
     orbit_engine::dispatch::TurnConfig {
         provider_id: std::env::var("ORBIT_PROVIDER").unwrap_or_else(|_| "local".into()),
@@ -3686,7 +3688,9 @@ pub fn subagent_turn_config(_home: &Path) -> orbit_engine::TurnConfig {
         effort: None,
         supported_efforts: None,
         kind: orbit_engine::dispatch::ProviderKind::OpenAiCompatible,
-        credential_env: std::env::var("ORBIT_CREDENTIAL_ENV").ok(),
+        credential_env: std::env::var("ORBIT_CREDENTIAL_ENV")
+            .ok()
+            .or_else(crate::legacy_gate_credential_env),
         pricing: None,
         max_output_tokens: 0,
     }

@@ -20,3 +20,4 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }

@@ -187,6 +187,9 @@ impl DispatchEngine {
         }
 
         let (adapter, binding) = self.resolve(model, session_id, decision_id)?;
+        if request.route != binding {
+            return Err(DispatchError::admission("capability", model, "E0405"));
+        }
 
         // Build the egress destination tuple from the binding's REAL endpoint.
         // NEW P1 #3: an empty endpoint_host is a config error — refused, never
@@ -319,6 +322,9 @@ impl DispatchEngine {
             .registry
             .route_for_model(model)
             .ok_or_else(|| DispatchError::admission("capability", model, "E0405"))?;
+        if request.route != binding {
+            return Err(DispatchError::admission("capability", model, "E0405"));
+        }
         // Gate 3: egress — endpoint pinned.
         if binding.endpoint_digest.as_str().is_empty() {
             return Err(DispatchError::admission("egress", model, "E0405"));
@@ -535,11 +541,25 @@ fn egress_tuple_from_binding(binding: &ProviderRouteBinding) -> Result<EgressTup
         orbit_adapter::types::EndpointScheme::HttpLoopback => "http",
         _ => "https",
     };
+    let path = if binding.endpoint_path.is_empty() {
+        "/v1"
+    } else {
+        binding.endpoint_path.as_str()
+    };
+    let invalid_path = || "route endpoint_path must be a canonical absolute URL path".to_owned();
+    if !path.starts_with('/') {
+        return Err(invalid_path());
+    }
+    let parsed =
+        url::Url::parse(&format!("https://path.invalid{path}")).map_err(|_| invalid_path())?;
+    if parsed.path() != path || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(invalid_path());
+    }
     Ok(EgressTuple {
         scheme: scheme.into(),
         host: binding.endpoint_host.clone(),
         port: binding.endpoint_port,
-        path_prefix: "/v1".into(),
+        path_prefix: path.into(),
         provider_id: binding.provider_id.0.clone(),
         region_id: binding.region_id.0.clone(),
     })

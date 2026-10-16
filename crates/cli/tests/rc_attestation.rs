@@ -93,12 +93,10 @@ impl Fixture {
         );
         let output = fixture.run(&["setup", "--no-provider", "--json"]);
         assert_success(&output);
-        let credential = format!("ORBIT_ATTESTATION_UNSET_{}", ulid::Ulid::new());
-        assert!(std::env::var_os(&credential).is_none());
         write_private(
             &fixture.home.join("providers.toml"),
             format!(
-                "[[provider]]\nname='fixture'\nurl={gate:?}\nenv={credential:?}\n[[provider.models]]\nid='attestation'\n[roles]\nmain='fixture/attestation'\n"
+                "[[provider]]\nname='fixture'\nurl={gate:?}\n[[provider.models]]\nid='attestation'\n[roles]\nmain='fixture/attestation'\n"
             ),
         );
         fixture

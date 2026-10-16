@@ -1,6 +1,11 @@
 //! Bounded offline readiness. No check launches a program or contacts a provider.
 use crate::customization::{Directory, Error, read_regular};
 use crate::setup::{optional_file, validate_provider, verify_bounded_ledger, verify_identity};
+use orbit_adapter::SecretBytes;
+use orbit_adapter::provider_credentials::{
+    ProviderAuthIdentity, ProviderCredentialError, ProviderCredentialSource,
+    ProviderCredentialStatus, ProviderCredentialStore,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -156,6 +161,13 @@ fn inspect_integration_bytes(bytes: &[u8], label: &str, report: &mut DoctorRepor
                     "Server is disabled; not launched",
                     false,
                 );
+            } else if server.transport != orbit_mcp::McpTransport::Stdio {
+                report.add(
+                    &id,
+                    CheckStatus::Configured,
+                    "Remote MCP endpoint is configured; connectivity not tested and no request sent",
+                    false,
+                );
             } else if find_executable(&server.command, path_env.as_deref()).is_none() {
                 report.add(
                     &id,
@@ -176,6 +188,12 @@ fn inspect_integration_bytes(bytes: &[u8], label: &str, report: &mut DoctorRepor
             "mcp.configuration",
             CheckStatus::Configured,
             "Configuration inspected without server launch or handshake",
+            false,
+        );
+        report.add(
+            "mcp.connectivity",
+            CheckStatus::NotTested,
+            "No MCP server was contacted; connectivity and handshake were not tested",
             false,
         );
     } else {
@@ -491,6 +509,73 @@ pub fn native_target() -> &'static str {
         "unverified-platform"
     }
 }
+fn provider_credential_status(
+    home: &Path,
+    provider: &crate::config::ProviderConfig,
+) -> (CheckStatus, &'static str) {
+    let selected = (|| {
+        let endpoint = crate::config::validate_provider_endpoint(&provider.url)
+            .map_err(|_| ProviderCredentialError::InvalidIdentity)?;
+        let identity = ProviderAuthIdentity::new(
+            &provider.name,
+            &provider.kind,
+            endpoint.as_str(),
+            provider.env.as_deref(),
+        )?;
+        let home =
+            std::path::absolute(home).map_err(|_| ProviderCredentialError::UnsafeDirectory)?;
+        let store = ProviderCredentialStore::new(&home)?;
+        Ok(store.status_read_only_with(&identity, |name| {
+            Ok(std::env::var_os(name).map(|value| SecretBytes::new(value.into_encoded_bytes())))
+        }))
+    })();
+    let status = selected.unwrap_or_else(ProviderCredentialStatus::Invalid);
+    match status {
+        ProviderCredentialStatus::NoAuth => (
+            CheckStatus::Configured,
+            "Credential source: no authentication; no credential lookup or provider request",
+        ),
+        ProviderCredentialStatus::Available {
+            source: ProviderCredentialSource::Environment,
+            ..
+        } => (
+            CheckStatus::Ready,
+            "Credential source: environment override; key format valid, connectivity not tested",
+        ),
+        ProviderCredentialStatus::Available {
+            source: ProviderCredentialSource::Saved,
+            ..
+        } => (
+            CheckStatus::Ready,
+            "Credential source: saved private key; exact binding verified, connectivity not tested",
+        ),
+        ProviderCredentialStatus::Missing => (
+            CheckStatus::Missing,
+            "Credential source missing; set the declared ENV or save a matching private key",
+        ),
+        ProviderCredentialStatus::Invalid(ProviderCredentialError::InvalidKey) => (
+            CheckStatus::Invalid,
+            "Credential value is invalid; check the declared ENV or saved key without displaying it",
+        ),
+        ProviderCredentialStatus::Invalid(ProviderCredentialError::EnvironmentUnavailable) => (
+            CheckStatus::Invalid,
+            "Credential environment is unavailable; no saved fallback or provider request was attempted",
+        ),
+        ProviderCredentialStatus::Invalid(ProviderCredentialError::Busy) => (
+            CheckStatus::Unavailable,
+            "Credential storage is busy; retry after the current operation, connectivity not tested",
+        ),
+        ProviderCredentialStatus::Invalid(_) => (
+            CheckStatus::Invalid,
+            "Credential storage or binding is invalid or unsafe; no files changed or provider request sent",
+        ),
+        ProviderCredentialStatus::Available { .. } => (
+            CheckStatus::Invalid,
+            "Credential source could not be verified; no provider request sent",
+        ),
+    }
+}
+
 pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
     let mut report = DoctorReport::new();
     if !home.exists() {
@@ -578,9 +663,8 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
                         "Explicit provider models and adapter are configured; no request sent",
                         true,
                     );
-                    if let Some(name) = &provider.env {
-                        report.add(&format!("credential.{index}"),if std::env::var_os(name).is_some(){CheckStatus::Ready}else{CheckStatus::Missing},"Credential environment variable presence only; its value is never read or displayed",true);
-                    }
+                    let (status, detail) = provider_credential_status(home, provider);
+                    report.add(&format!("credential.{index}"), status, detail, true);
                 }
                 let routing_valid = std::str::from_utf8(&bytes)
                     .ok()

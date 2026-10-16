@@ -1,9 +1,9 @@
-# Local tools, owned sessions and signed packages
+# MCP tools, owned sessions and signed packages
 
-ORBIT connects configured local programs through its shared tool runtime. This
-guide covers native Unix stdio MCP, on-demand language-server diagnostics, a
-foreground session owner, and a durable local signed-package catalog. Configure
-your provider first using [setup](setup.md).
+ORBIT connects local programs and remote MCP servers through its shared tool
+runtime. This guide covers Unix stdio, Streamable HTTP and legacy SSE MCP,
+on-demand language-server diagnostics, a foreground session owner, and a durable
+local signed-package catalog. Configure your provider first using [setup](setup.md).
 
 ## Configure MCP servers
 
@@ -19,6 +19,7 @@ For an already installed browser MCP executable, a configuration has this shape:
 {
   "servers": {
     "browser": {
+      "transport": "stdio",
       "command": "/path/to/existing/browser-mcp-server",
       "args": [],
       "enabled": true,
@@ -31,11 +32,35 @@ For an already installed browser MCP executable, a configuration has this shape:
 ```
 
 Replace the executable, argument vector and exact tool names with those supported
-by your server. ORBIT does not install the executable. It launches enabled servers
-to initialize them and discover tools, then reuses their stdio connections. This
-launch may happen before a tool-call approval is shown. Servers inherit the
+by your server. ORBIT does not install the executable. It launches enabled stdio
+servers to initialize them and discover tools, then reuses their connections. This
+launch may happen before a tool-call approval is shown. Stdio servers inherit the
 launching environment; export required credential variables there. The optional
 `env` map supplies literal process environment values.
+
+For a remote server, use its actual endpoint and select its transport:
+
+```json
+{
+  "servers": {
+    "docs": {
+      "transport": "streamable-http",
+      "url": "https://mcp.example/mcp",
+      "enabled": true,
+      "timeout_ms": 30000,
+      "initialize_timeout_ms": 5000
+    }
+  }
+}
+```
+
+Use `"transport": "sse"` for a legacy SSE endpoint. Remote entries accept optional
+literal `headers`, including authentication headers when required by that server;
+they reject stdio-only `command`, `args` and `env`. Stdio entries reject remote
+URL/header fields. Remote URLs require HTTPS or loopback HTTP, without URL
+userinfo or fragments, and redirects are disabled. Automatic MCP OAuth, browser
+login and token refresh are not provided by this configuration. Provider API-key
+storage is a separate feature and does not supply remote MCP authentication.
 
 `tools` contains the server's original tool names: omitting it exposes all of that
 server's discovered tools, while `[]` exposes none. `"enabled": false` disables the
@@ -50,7 +75,7 @@ uses `mcp__browser__*`, matched against the configured server identity. It does 
 match a neighboring server merely because its name shares a prefix. Ambiguous
 server/tool identities are refused. MCP rules support exact tools and this one
 server-wide selector; argument-specific grants and arbitrary name wildcards are
-not supported. The current transport is native Unix stdio, without HTTP MCP.
+not supported. Transport selection does not bypass these tool-permission rules.
 
 ## Inspect and change tool permissions
 
