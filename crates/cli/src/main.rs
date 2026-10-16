@@ -52,7 +52,7 @@ fn main() {
     // C1: `--help`/`-h` print HUMAN help (exit 0); `--version` prints the
     // version line. The machine-readable forms stay on the verbs:
     // `orbit help --json` and `orbit version` (JSON).
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if first_word != Some("plugin") && args.iter().any(|a| a == "--help" || a == "-h") {
         if args.iter().any(|a| a == "--json") {
             let value = dispatch(&["help".into(), "--json".into()]).expect("static help command");
             println!("{}", serde_json::to_string(&value).unwrap_or_default());
@@ -99,7 +99,9 @@ fn main() {
             let command = positionals(&args).first().copied().unwrap_or("");
             let human = ["setup", "doctor", "pentest"].contains(&command)
                 && !args.iter().any(|arg| arg == "--json");
-            if human {
+            if command == "plugin" && !args.iter().any(|arg| arg == "--json") {
+                print!("{}", orbit_cli::plugin_commands::human_report(&v));
+            } else if human {
                 print!("{}", orbit_cli::cli_release_commands::human_report(&v));
             } else {
                 println!(
@@ -116,7 +118,19 @@ fn main() {
         }
         Err((code, msg)) => {
             eprintln!("{code}: {msg}");
-            std::process::exit(2);
+            let exit_code = if first_word == Some("plugin") {
+                match code {
+                    "ORBIT-E1101" => 64,
+                    "ORBIT-E1106" => 78,
+                    "ORBIT-E1109" | "ORBIT-E1911" => 93,
+                    "ORBIT-E110B" => 96,
+                    "ORBIT-E110C" => 97,
+                    _ => 2,
+                }
+            } else {
+                2
+            };
+            std::process::exit(exit_code);
         }
     }
 }
@@ -180,6 +194,10 @@ fn print_human_help() {
             "durable signed package catalog",
         ),
         ("mod issuers/allow-issuer", "trusted package issuers"),
+        (
+            "plugin inspect PATH",
+            "inspect a portable or foreign plugin",
+        ),
         (
             "folder trust/untrust/status",
             "let a folder's own settings loosen permissions",
@@ -292,6 +310,19 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
         "ask" => cmd_ask(&home, args),
         "models" | "list-models" => cmd_models(&home, args),
         "mod" => cmd_mod(&home, args),
+        "plugin" => orbit_cli::plugin_commands::command(
+            &home,
+            &std::env::current_dir().map_err(ioe)?,
+            &command_tail(args)?,
+        )
+        .map_err(|error| match error {
+            orbit_cli::CliError::Usage(message) => ("ORBIT-E1101", message),
+            orbit_cli::CliError::ConfigInvalid(message) => ("ORBIT-E1106", message),
+            orbit_cli::CliError::Policy(message) => ("ORBIT-E1109", message),
+            orbit_cli::CliError::TelemetryDenied(message) => ("ORBIT-E110B", message),
+            orbit_cli::CliError::V02Only(message) => ("ORBIT-E110C", message),
+            orbit_cli::CliError::ConfirmRequired(message) => ("ORBIT-E1911", message),
+        }),
         "folder" => cmd_folder(&home, args),
         "provider" => cmd_provider(&home, args),
         "route" => cmd_route(&home, args),
@@ -329,6 +360,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "mod list|search|status           verified installed package catalog",
                 "mod issuers                     trusted package issuers",
                 "mod allow-issuer <hex-key>       trust a mod issuer",
+                "plugin inspect PATH [--format FORMAT]  inspect local plugin components",
                 "folder trust|untrust|status [DIR]  trust a folder's own settings",
                 "provider add|list|remove|presets    manage model providers",
                 "web           start the browser harness (orbit-web bridge)"

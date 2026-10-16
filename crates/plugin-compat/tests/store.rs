@@ -180,6 +180,510 @@ fn staging_is_disabled_and_identical_import_is_byte_for_byte_idempotent() {
 }
 
 #[test]
+fn lifecycle_enable_disable_remove_reloads_and_retains_owned_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let staged = store
+        .import(&source, &InspectOptions::default(), StoreScope::User, false)
+        .unwrap();
+    let enabled = store
+        .enable(&id(StoreScope::User), &staged.snapshot.revision)
+        .unwrap();
+    assert!(enabled.entries[0].enabled);
+    assert_ne!(enabled.revision, staged.snapshot.revision);
+    let reopened = PluginStore::open(&home, &project, true).unwrap();
+    let active = reopened.active().unwrap();
+    assert_eq!(active.revision, enabled.revision);
+    let managed = active.plugins[0].root.clone();
+    let data = active.plugins[0].data_root.clone();
+    write(&data, "user-state.json", b"preserve user state\n");
+    let managed_before = files(&managed);
+    let source_before = files(&source);
+    let unchanged = files(&home);
+    assert_eq!(
+        reopened
+            .enable(&id(StoreScope::User), &enabled.revision)
+            .unwrap(),
+        enabled
+    );
+    assert_eq!(unchanged, files(&home));
+    let disabled = reopened
+        .disable(&id(StoreScope::User), &enabled.revision)
+        .unwrap();
+    assert!(!disabled.entries[0].enabled);
+    assert!(
+        PluginStore::open(&home, &project, true)
+            .unwrap()
+            .active()
+            .unwrap()
+            .plugins
+            .is_empty()
+    );
+    let removed = reopened
+        .remove(&id(StoreScope::User), &disabled.revision)
+        .unwrap();
+    assert!(removed.entries.is_empty());
+    assert!(
+        PluginStore::open(&home, &project, true)
+            .unwrap()
+            .status(&id(StoreScope::User))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(managed_before, files(&managed));
+    assert_eq!(
+        fs::read(data.join("user-state.json")).unwrap(),
+        b"preserve user state\n"
+    );
+    assert_eq!(source_before, files(&source));
+    assert!(!managed.join("execution-marker").exists());
+}
+
+#[test]
+fn lifecycle_upgrade_is_explicit_preserves_enabled_state_and_previous_tree() {
+    for enabled in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, project, source) = roots(temp.path());
+        let store = PluginStore::open(&home, &project, true).unwrap();
+        let initial = store
+            .import(
+                &source,
+                &InspectOptions::default(),
+                StoreScope::User,
+                enabled,
+            )
+            .unwrap();
+        let previous_index = fs::read(index(&home)).unwrap();
+        let previous_root = home
+            .join("plugins/portable/packages/sample")
+            .join(&initial.plugin.digest);
+        let previous_bytes = files(&previous_root);
+        write(&source, "LICENSE", b"Updated preserved license\n");
+        assert_eq!(
+            store
+                .import(
+                    &source,
+                    &InspectOptions::default(),
+                    StoreScope::User,
+                    enabled
+                )
+                .unwrap_err()
+                .code,
+            "store_upgrade_required"
+        );
+        let receipt = store
+            .upgrade(
+                &id(StoreScope::User),
+                &source,
+                &InspectOptions::default(),
+                &initial.snapshot.revision,
+            )
+            .unwrap();
+        assert!(!receipt.reused);
+        assert_eq!(receipt.plugin.enabled, enabled);
+        assert_ne!(receipt.plugin.digest, initial.plugin.digest);
+        assert_ne!(receipt.snapshot.revision, initial.snapshot.revision);
+        assert_eq!(previous_bytes, files(&previous_root));
+        assert_eq!(
+            previous_index,
+            fs::read(home.join("plugins/portable/index.previous.json")).unwrap()
+        );
+        let reopened = PluginStore::open(&home, &project, true).unwrap();
+        assert_eq!(
+            reopened.status(&id(StoreScope::User)).unwrap().unwrap(),
+            receipt.plugin
+        );
+        assert_eq!(
+            reopened.active().unwrap().plugins.len(),
+            usize::from(enabled)
+        );
+        let before = files(&home);
+        let repeated = reopened
+            .upgrade(
+                &id(StoreScope::User),
+                &source,
+                &InspectOptions::default(),
+                &receipt.snapshot.revision,
+            )
+            .unwrap();
+        assert!(repeated.reused);
+        assert_eq!(repeated.snapshot, receipt.snapshot);
+        assert_eq!(before, files(&home));
+    }
+}
+
+#[test]
+fn lifecycle_stale_revision_rejects_every_mutator_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let initial = store
+        .import(&source, &InspectOptions::default(), StoreScope::User, false)
+        .unwrap();
+    let current = store
+        .enable(&id(StoreScope::User), &initial.snapshot.revision)
+        .unwrap();
+    write(&source, "LICENSE", "Updated source\n");
+    let before = files(&home);
+    for result in [
+        store
+            .enable(&id(StoreScope::User), &initial.snapshot.revision)
+            .map(|_| ()),
+        store
+            .disable(&id(StoreScope::User), &initial.snapshot.revision)
+            .map(|_| ()),
+        store
+            .remove(&id(StoreScope::User), &initial.snapshot.revision)
+            .map(|_| ()),
+        store
+            .upgrade(
+                &id(StoreScope::User),
+                &source,
+                &InspectOptions::default(),
+                &initial.snapshot.revision,
+            )
+            .map(|_| ()),
+    ] {
+        assert_eq!(result.unwrap_err().code, "store_revision_changed");
+    }
+    assert_eq!(before, files(&home));
+    assert_eq!(current, store.list().unwrap());
+}
+
+#[test]
+fn lifecycle_failed_publication_keeps_current_index_package_and_external_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let initial = store
+        .import(&source, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    let active = store.active().unwrap();
+    let previous = home.join("plugins/portable/index.previous.json");
+    fs::remove_file(&previous).unwrap();
+    let outside = temp.path().join("outside-index");
+    fs::write(&outside, b"external sentinel\n").unwrap();
+    symlink(&outside, &previous).unwrap();
+    let index_before = fs::read(index(&home)).unwrap();
+    let package_before = files(&active.plugins[0].root);
+    write(&source, "LICENSE", "Candidate upgrade\n");
+    assert!(
+        store
+            .disable(&id(StoreScope::User), &initial.snapshot.revision)
+            .is_err()
+    );
+    assert!(
+        store
+            .remove(&id(StoreScope::User), &initial.snapshot.revision)
+            .is_err()
+    );
+    assert!(
+        store
+            .upgrade(
+                &id(StoreScope::User),
+                &source,
+                &InspectOptions::default(),
+                &initial.snapshot.revision
+            )
+            .is_err()
+    );
+    assert_eq!(index_before, fs::read(index(&home)).unwrap());
+    assert_eq!(package_before, files(&active.plugins[0].root));
+    assert_eq!(fs::read(outside).unwrap(), b"external sentinel\n");
+    assert_eq!(
+        PluginStore::open(&home, &project, true)
+            .unwrap()
+            .active()
+            .unwrap(),
+        active
+    );
+}
+
+#[test]
+fn lifecycle_refuses_tampered_activation_wrong_upgrade_identity_and_untrusted_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let initial = store
+        .import(
+            &source,
+            &InspectOptions::default(),
+            StoreScope::Project,
+            false,
+        )
+        .unwrap();
+    let managed = project
+        .join(".orbit/plugins/portable/packages/sample")
+        .join(&initial.plugin.digest);
+    fs::set_permissions(managed.join("LICENSE"), fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        store
+            .enable(&id(StoreScope::Project), &initial.snapshot.revision)
+            .unwrap_err()
+            .code,
+        "store_file_unsafe"
+    );
+    fs::set_permissions(managed.join("LICENSE"), fs::Permissions::from_mode(0o400)).unwrap();
+    let wrong = temp.path().join("other-package");
+    package(&wrong, "other");
+    let before = files(temp.path());
+    assert_eq!(
+        store
+            .upgrade(
+                &id(StoreScope::Project),
+                &wrong,
+                &InspectOptions::default(),
+                &initial.snapshot.revision
+            )
+            .unwrap_err()
+            .code,
+        "store_identity_mismatch"
+    );
+    let untrusted = PluginStore::open(&home, &project, false).unwrap();
+    for result in [
+        untrusted.enable(&id(StoreScope::Project), &initial.snapshot.revision),
+        untrusted.disable(&id(StoreScope::Project), &initial.snapshot.revision),
+        untrusted.remove(&id(StoreScope::Project), &initial.snapshot.revision),
+    ] {
+        assert_eq!(result.unwrap_err().code, "store_project_untrusted");
+    }
+    assert_eq!(before, files(temp.path()));
+}
+
+#[test]
+fn lifecycle_concurrent_mutators_accept_only_one_observed_revision() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let initial = store
+        .import(
+            &source,
+            &InspectOptions::default(),
+            StoreScope::Project,
+            false,
+        )
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for remove in [false, true] {
+        let contender = PluginStore::open(&home, &project, true).unwrap();
+        let revision = initial.snapshot.revision.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let result = if remove {
+                contender.remove(&id(StoreScope::Project), &revision)
+            } else {
+                contender.enable(&id(StoreScope::Project), &revision)
+            };
+            (remove, result)
+        }));
+    }
+    barrier.wait();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(
+        results.iter().filter(|(_, result)| result.is_ok()).count(),
+        1
+    );
+    let winner = results
+        .iter()
+        .find_map(|(_, result)| result.as_ref().ok())
+        .unwrap();
+    let (remove, error) = results
+        .iter()
+        .find_map(|(remove, result)| result.as_ref().err().map(|error| (*remove, error)))
+        .unwrap();
+    assert!(["store_busy", "store_revision_changed"].contains(&error.code.as_str()));
+    let retry = if remove {
+        store.remove(&id(StoreScope::Project), &initial.snapshot.revision)
+    } else {
+        store.enable(&id(StoreScope::Project), &initial.snapshot.revision)
+    };
+    assert_eq!(retry.unwrap_err().code, "store_revision_changed");
+    let fresh = PluginStore::open(&home, &project, true)
+        .unwrap()
+        .list()
+        .unwrap();
+    assert_eq!(&fresh, winner);
+}
+
+#[test]
+fn lifecycle_damaged_or_missing_package_can_be_disabled_removed_or_replaced() {
+    for missing in [false, true] {
+        for action in ["disable", "remove", "upgrade"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (home, project, source) = roots(temp.path());
+            let store = PluginStore::open(&home, &project, true).unwrap();
+            let imported = store
+                .import(&source, &InspectOptions::default(), StoreScope::User, true)
+                .unwrap();
+            let active = store.active().unwrap();
+            let original_root = active.plugins[0].root.clone();
+            let data = active.plugins[0].data_root.clone();
+            write(&data, "state.json", "preserve state\n");
+            write(&home, "providers.toml", "preserve settings\n");
+            let retained = if missing {
+                let archived = temp.path().join("retained-old-package");
+                fs::rename(&original_root, &archived).unwrap();
+                archived
+            } else {
+                fs::set_permissions(
+                    original_root.join("LICENSE"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+                fs::write(original_root.join("LICENSE"), b"damaged old content\n").unwrap();
+                fs::set_permissions(
+                    original_root.join("LICENSE"),
+                    fs::Permissions::from_mode(0o400),
+                )
+                .unwrap();
+                original_root.clone()
+            };
+            let retained_before = files(&retained);
+            let damaged = store.list().unwrap();
+            assert!(damaged.entries.is_empty());
+            assert_eq!(damaged.revision, imported.snapshot.revision);
+            assert!(!damaged.diagnostics.is_empty());
+            assert!(
+                store
+                    .enable(&id(StoreScope::User), &damaged.revision)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .upgrade(
+                        &id(StoreScope::User),
+                        &source,
+                        &InspectOptions::default(),
+                        &damaged.revision
+                    )
+                    .is_err()
+            );
+            let old_index = fs::read(index(&home)).unwrap();
+            if action == "upgrade" {
+                write(&source, "LICENSE", "verified replacement\n");
+            }
+            let source_before = files(&source);
+            let snapshot = match action {
+                "disable" => store
+                    .disable(&id(StoreScope::User), &damaged.revision)
+                    .unwrap(),
+                "remove" => store
+                    .remove(&id(StoreScope::User), &damaged.revision)
+                    .unwrap(),
+                _ => {
+                    store
+                        .upgrade(
+                            &id(StoreScope::User),
+                            &source,
+                            &InspectOptions::default(),
+                            &damaged.revision,
+                        )
+                        .unwrap()
+                        .snapshot
+                }
+            };
+            assert_ne!(snapshot.revision, damaged.revision);
+            assert_eq!(
+                old_index,
+                fs::read(home.join("plugins/portable/index.previous.json")).unwrap()
+            );
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&fs::read(index(&home)).unwrap()).unwrap();
+            let reopened = PluginStore::open(&home, &project, true).unwrap();
+            match action {
+                "disable" => {
+                    assert_eq!(persisted["entries"][0]["enabled"], json!(false));
+                    assert!(reopened.active().unwrap().plugins.is_empty());
+                    let before = files(&home);
+                    assert_eq!(
+                        reopened
+                            .disable(&id(StoreScope::User), &snapshot.revision)
+                            .unwrap(),
+                        snapshot
+                    );
+                    assert_eq!(before, files(&home));
+                }
+                "remove" => {
+                    assert_eq!(persisted["entries"], json!([]));
+                    assert!(reopened.status(&id(StoreScope::User)).unwrap().is_none());
+                    assert!(reopened.active().unwrap().plugins.is_empty());
+                }
+                _ => {
+                    let replacement = reopened.active().unwrap();
+                    assert_eq!(replacement.plugins.len(), 1);
+                    assert_ne!(replacement.plugins[0].plugin.digest, imported.plugin.digest);
+                    assert_eq!(
+                        fs::read(replacement.plugins[0].root.join("LICENSE")).unwrap(),
+                        b"verified replacement\n"
+                    );
+                }
+            }
+            assert_eq!(reopened.list().unwrap(), snapshot);
+            assert_eq!(retained_before, files(&retained));
+            assert_eq!(source_before, files(&source));
+            assert_eq!(
+                fs::read(data.join("state.json")).unwrap(),
+                b"preserve state\n"
+            );
+            assert_eq!(
+                fs::read(home.join("providers.toml")).unwrap(),
+                b"preserve settings\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn lifecycle_safe_mutation_ignores_unrelated_damaged_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    store
+        .import(&source, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    let other = temp.path().join("other");
+    package(&other, "other");
+    let imported = store
+        .import(&other, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    let damaged_root = home
+        .join("plugins/portable/packages/other")
+        .join(imported.plugin.digest);
+    fs::remove_file(damaged_root.join("LICENSE")).unwrap();
+    let before = files(&damaged_root);
+    let observed = store.list().unwrap();
+    assert_eq!(observed.entries.len(), 1);
+    assert!(!observed.diagnostics.is_empty());
+    let disabled = store
+        .disable(&id(StoreScope::User), &observed.revision)
+        .unwrap();
+    assert!(!disabled.entries[0].enabled);
+    let enabled = store
+        .enable(&id(StoreScope::User), &disabled.revision)
+        .unwrap();
+    assert!(enabled.entries[0].enabled);
+    let removed = store
+        .remove(&id(StoreScope::User), &enabled.revision)
+        .unwrap();
+    assert!(removed.entries.is_empty());
+    assert!(!removed.diagnostics.is_empty());
+    assert_eq!(
+        PluginStore::open(&home, &project, true)
+            .unwrap()
+            .list()
+            .unwrap(),
+        removed
+    );
+    assert_eq!(before, files(&damaged_root));
+}
+
+#[test]
 fn different_digest_requires_upgrade_and_retains_original_enabled_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let (home, project, source) = roots(temp.path());

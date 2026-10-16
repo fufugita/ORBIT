@@ -429,6 +429,7 @@ pub mod mods;
 pub mod pentest;
 pub mod permissions;
 pub mod phase_routing;
+pub mod plugin_commands;
 pub mod presets;
 pub mod sessions;
 #[allow(unsafe_code)]

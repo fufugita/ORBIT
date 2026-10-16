@@ -36,6 +36,7 @@ orbit-provider-http = { path = "../provider-http" }
 orbit-engine = { path = "../engine" }
 orbit-mcp = { path = "../mcp" }
 orbit-plugin = { path = "../plugin" }
+orbit-plugin-compat = { path = "../plugin-compat" }
 orbit-tools = { path = "../tools" }
 orbit-frontend-protocol = { path = "../frontend-protocol" }
 orbit-gateway = { path = "../gateway" }

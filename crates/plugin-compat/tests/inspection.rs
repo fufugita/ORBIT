@@ -123,6 +123,111 @@ fn inventories_portable_skills_mcp_and_support_files_without_execution() {
 }
 
 #[test]
+fn skill_version_is_descriptive_in_portable_and_claude_packages() {
+    for format in [PluginFormat::Portable, PluginFormat::Claude] {
+        let temp = tempfile::tempdir().unwrap();
+        match format {
+            PluginFormat::Portable => portable(temp.path()),
+            PluginFormat::Claude => claude(temp.path(), json!({})),
+            _ => unreachable!(),
+        }
+        let path = "skills/review/SKILL.md";
+        for version in ["0.1.0".to_owned(), "v".repeat(256)] {
+            let source = format!(
+                "---\nname: review\ndescription: Review changes\nversion: {version}\nallowed-tools: [Read]\nuser-invocable: false\nmetadata: {{revision: 7, archived: false}}\n---\nReview the changes.\n\nKeep --- inside the body.\n"
+            );
+            write(temp.path(), path, &source);
+            let inspected = inspect(temp.path(), &InspectOptions::default()).unwrap();
+            let component = &inspected.components[0];
+            let ComponentKind::Skill(skill) = &component.kind else {
+                panic!("skill component missing")
+            };
+            assert_eq!(
+                component.compatibility,
+                orbit_plugin_compat::Compatibility::Adapted
+            );
+            assert_eq!(component.metadata["version"], version);
+            assert_eq!(
+                component.metadata["metadata"],
+                json!({"revision": 7, "archived": false})
+            );
+            assert_eq!(skill.allowed_tools, Some(vec!["Read".to_owned()]));
+            assert!(!skill.user_invocable);
+            assert_eq!(
+                skill.body,
+                "Review the changes.\n\nKeep --- inside the body."
+            );
+            assert!(
+                !inspected
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "component_field_unmapped")
+            );
+            assert!(
+                inspected
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "inspection_only")
+            );
+            assert_eq!(fs::read(temp.path().join(path)).unwrap(), source.as_bytes());
+
+            write(
+                temp.path(),
+                path,
+                source.replacen("version:", "autoApprove: true\nversion:", 1),
+            );
+            let inspected = inspect(temp.path(), &InspectOptions::default()).unwrap();
+            assert_eq!(
+                inspected.components[0].compatibility,
+                orbit_plugin_compat::Compatibility::RequiresMigration
+            );
+            assert!(
+                inspected
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "component_field_unmapped")
+            );
+        }
+    }
+}
+
+#[test]
+fn skill_version_rejects_invalid_descriptive_values() {
+    for format in [PluginFormat::Portable, PluginFormat::Claude] {
+        let temp = tempfile::tempdir().unwrap();
+        match format {
+            PluginFormat::Portable => portable(temp.path()),
+            PluginFormat::Claude => claude(temp.path(), json!({})),
+            _ => unreachable!(),
+        }
+        for version in [
+            Value::Null,
+            json!(false),
+            json!(1),
+            json!(["0.1.0"]),
+            json!({"label": "0.1.0"}),
+            json!(""),
+            json!("   "),
+            json!("v".repeat(257)),
+            json!("0.1\n.0"),
+        ] {
+            write(
+                temp.path(),
+                "skills/review/SKILL.md",
+                format!(
+                    "---\nname: review\ndescription: Review changes\nversion: {version}\n---\nReview the changes.\n"
+                ),
+            );
+            assert_eq!(
+                error(temp.path()),
+                "component_field_invalid",
+                "{format:?}: {version}"
+            );
+        }
+    }
+}
+
+#[test]
 fn original_deja_portable_manifests_inspect_offline() {
     // Original manifest/MCP bytes: vshulcz/deja-vu, commit
     // c489a992d5eceb3b7b0479f8701746a245552135, MIT.

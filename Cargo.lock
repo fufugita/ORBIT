@@ -2506,6 +2506,7 @@ dependencies = [
  "orbit-mock-provider",
  "orbit-pib",
  "orbit-plugin",
+ "orbit-plugin-compat",
  "orbit-provider-http",
  "orbit-reactor",
  "orbit-release",

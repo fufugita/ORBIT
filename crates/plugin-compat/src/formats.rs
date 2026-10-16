@@ -2675,6 +2675,7 @@ fn normalize_skill(
         if ![
             "name",
             "description",
+            "version",
             "license",
             "compatibility",
             "metadata",
@@ -2701,6 +2702,11 @@ fn normalize_skill(
         }
     }
     let description = required_string(object, "description", "component_field_invalid")?;
+    if optional_string(object, "version", "component_field_invalid")?.is_some_and(|value| {
+        value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+    }) {
+        return Err(failure("component_field_invalid"));
+    }
     let mut allowed_tools = if matches!(
         inspection.source.format,
         PluginFormat::Claude | PluginFormat::Codex

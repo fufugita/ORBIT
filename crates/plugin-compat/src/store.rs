@@ -242,6 +242,270 @@ impl PluginStore {
         })
     }
 
+    /// Enable only the verified package observed by the caller.
+    pub fn enable(
+        &self,
+        id: &PluginId,
+        expected_revision: &str,
+    ) -> Result<StoreSnapshot, CompatError> {
+        self.set_enabled(id, expected_revision, true)
+    }
+
+    pub fn disable(
+        &self,
+        id: &PluginId,
+        expected_revision: &str,
+    ) -> Result<StoreSnapshot, CompatError> {
+        self.set_enabled(id, expected_revision, false)
+    }
+
+    /// Remove the active index entry, retaining immutable versions and user data.
+    pub fn remove(
+        &self,
+        id: &PluginId,
+        expected_revision: &str,
+    ) -> Result<StoreSnapshot, CompatError> {
+        let (locks, user, project) = self.lock_mutation(id, expected_revision)?;
+        let view = scoped_view(id.scope, &user, &project);
+        let position = record_position(view, id)?;
+        let mut index = view.index.clone();
+        index.entries.remove(position);
+        self.publish_index(id.scope, view, expected_revision, &locks, index, None)
+    }
+
+    /// Replace one explicit identity without changing its enabled state.
+    pub fn upgrade(
+        &self,
+        id: &PluginId,
+        source: &Path,
+        options: &InspectOptions,
+        expected_revision: &str,
+    ) -> Result<ImportReceipt, CompatError> {
+        self.check_mutation_scope(id)?;
+        self.assert_revision(expected_revision)?;
+        let tree = SourceTree::read_named(source, None)?;
+        let inspection = crate::formats::normalize(&tree, options)?;
+        if inspection.manifest.id != id.name {
+            return Err(error("store_identity_mismatch"));
+        }
+        let (locks, user, project) = self.lock_mutation(id, expected_revision)?;
+        let view = scoped_view(id.scope, &user, &project);
+        let position = record_position(view, id)?;
+        let previous = &view.index.entries[position];
+        if previous.digest == tree.source_digest && previous.options == *options {
+            let plugin = self.load(view, id.scope, previous)?;
+            locks.check()?;
+            let snapshot = self.list()?;
+            if !snapshot.entries.contains(&plugin) {
+                return Err(error("store_package_tampered"));
+            }
+            return Ok(ImportReceipt {
+                snapshot,
+                plugin,
+                reused: true,
+            });
+        }
+        let total = user
+            .index
+            .entries
+            .iter()
+            .chain(&project.index.entries)
+            .try_fold(0u64, |total, record| total.checked_add(record.source_bytes))
+            .and_then(|total| total.checked_sub(previous.source_bytes))
+            .and_then(|total| total.checked_add(source_bytes(&inspection.source)))
+            .ok_or_else(|| error("store_plugin_limit"))?;
+        if total > MAX_STORE_BYTES {
+            return Err(error("store_plugin_limit"));
+        }
+        let mut index = view.index.clone();
+        index.entries[position] = Record::inspected(&inspection, options, previous.enabled);
+        // Reject an unreadable candidate before retaining any new package files.
+        index_bytes(&next_generation(index.clone())?)?;
+        self.capture_package(&tree, &inspection, options, id.scope)?;
+        let snapshot = self.publish_index(
+            id.scope,
+            view,
+            expected_revision,
+            &locks,
+            index,
+            Some(&id.name),
+        )?;
+        let plugin = snapshot
+            .entries
+            .iter()
+            .find(|plugin| plugin.id == *id)
+            .cloned()
+            .ok_or_else(|| failure("store_publication_uncertain"))?;
+        Ok(ImportReceipt {
+            snapshot,
+            plugin,
+            reused: false,
+        })
+    }
+
+    fn set_enabled(
+        &self,
+        id: &PluginId,
+        expected_revision: &str,
+        enabled: bool,
+    ) -> Result<StoreSnapshot, CompatError> {
+        let (locks, user, project) = self.lock_mutation(id, expected_revision)?;
+        let view = scoped_view(id.scope, &user, &project);
+        let position = record_position(view, id)?;
+        let record = &view.index.entries[position];
+        let verified = enabled
+            .then(|| self.load(view, id.scope, record))
+            .transpose()?;
+        if record.enabled == enabled {
+            locks.check()?;
+            let snapshot = self.list()?;
+            if verified.is_some_and(|plugin| !snapshot.entries.contains(&plugin)) {
+                return Err(error("store_package_tampered"));
+            }
+            return Ok(snapshot);
+        }
+        let mut index = view.index.clone();
+        index.entries[position].enabled = enabled;
+        self.publish_index(
+            id.scope,
+            view,
+            expected_revision,
+            &locks,
+            index,
+            enabled.then_some(id.name.as_str()),
+        )
+    }
+
+    fn check_mutation_scope(&self, id: &PluginId) -> Result<(), CompatError> {
+        validate_id(&id.name)?;
+        if id.scope == StoreScope::Project && !self.project_trusted {
+            return Err(error("store_project_untrusted"));
+        }
+        self.project_anchor.check()
+    }
+
+    fn lock_mutation(
+        &self,
+        id: &PluginId,
+        expected_revision: &str,
+    ) -> Result<(MutationLocks, IndexView, IndexView), CompatError> {
+        self.check_mutation_scope(id)?;
+        let (revision, user, project) = self.stable_indices()?;
+        if revision != expected_revision {
+            return Err(error("store_revision_changed"));
+        }
+        record_position(scoped_view(id.scope, &user, &project), id)?;
+        let mut directories = vec![
+            self.scope_directory(StoreScope::User, true)?
+                .ok_or_else(|| failure("store_write_failed"))?,
+        ];
+        if id.scope == StoreScope::Project {
+            directories.push(
+                self.scope_directory(StoreScope::Project, false)?
+                    .ok_or_else(|| error("store_plugin_missing"))?,
+            );
+        }
+        let locks = MutationLocks::acquire(&directories)?;
+        let (revision, user, project) = self.stable_indices()?;
+        if revision != expected_revision {
+            return Err(error("store_revision_changed"));
+        }
+        record_position(scoped_view(id.scope, &user, &project), id)?;
+        Ok((locks, user, project))
+    }
+
+    fn publish_index(
+        &self,
+        scope: StoreScope,
+        view: &IndexView,
+        expected_revision: &str,
+        locks: &MutationLocks,
+        index: Index,
+        verify_name: Option<&str>,
+    ) -> Result<StoreSnapshot, CompatError> {
+        let index = next_generation(index)?;
+        let bytes = index_bytes(&index)?;
+        let directory = view
+            .directory
+            .as_ref()
+            .ok_or_else(|| error("store_index_corrupt"))?;
+        let previous = view
+            .bytes
+            .as_ref()
+            .ok_or_else(|| error("store_index_corrupt"))?;
+        locks.check()?;
+        self.assert_revision(expected_revision)?;
+        directory.atomic_write("index.previous.json", previous)?;
+        locks.check()?;
+        self.assert_revision(expected_revision)?;
+        directory.atomic_write("index.json", &bytes)?;
+        locks
+            .check()
+            .map_err(|_| failure("store_publication_uncertain"))?;
+        let snapshot = self
+            .list()
+            .map_err(|_| failure("store_publication_uncertain"))?;
+        let published = read_index(self.scope_directory(scope, false)?)
+            .map_err(|_| failure("store_publication_uncertain"))?;
+        if published.bytes.as_deref() != Some(bytes.as_slice()) {
+            return Err(failure("store_publication_uncertain"));
+        }
+        // The exact index bytes confirm disable/remove even when damaged
+        // content is deliberately absent from list. Only newly accepted content
+        // must also survive fresh reinspection before reporting success.
+        if let Some(name) = verify_name {
+            let record = index
+                .entries
+                .iter()
+                .find(|record| record.name == name)
+                .ok_or_else(|| failure("store_publication_uncertain"))?;
+            let verified = snapshot.entries.iter().any(|plugin| {
+                plugin.id.scope == scope
+                    && plugin.id.name == record.name
+                    && plugin.digest == record.digest
+                    && plugin.enabled == record.enabled
+                    && plugin.options == record.options
+            });
+            if !verified {
+                return Err(failure("store_publication_uncertain"));
+            }
+        }
+        self.assert_revision(&snapshot.revision)
+            .map_err(|_| failure("store_publication_uncertain"))?;
+        Ok(snapshot)
+    }
+
+    fn capture_package(
+        &self,
+        tree: &SourceTree,
+        inspection: &Inspection,
+        options: &InspectOptions,
+        scope: StoreScope,
+    ) -> Result<(), CompatError> {
+        let directory = self
+            .scope_directory(scope, true)?
+            .ok_or_else(|| failure("store_write_failed"))?;
+        let packages = directory
+            .child("packages", true)?
+            .ok_or_else(|| failure("store_write_failed"))?;
+        let names = packages
+            .child(&inspection.manifest.id, true)?
+            .ok_or_else(|| failure("store_write_failed"))?;
+        if let Some(existing) = names.child(&tree.source_digest, false)? {
+            verify_tree(&existing, &inspection.source, options)?;
+        } else {
+            let stage_name = temp_name("package");
+            let stage = names
+                .child(&stage_name, true)?
+                .ok_or_else(|| failure("store_write_failed"))?;
+            copy_snapshot(tree, &stage)?;
+            verify_tree(&stage, &inspection.source, options)?;
+            stage.sync()?;
+            names.publish_directory(&stage_name, &tree.source_digest)?;
+        }
+        Ok(())
+    }
+
     /// Import the captured source bytes only; never execute package code.
     pub fn import(
         &self,
@@ -303,24 +567,7 @@ impl PluginStore {
         let directory = self
             .scope_directory(scope, true)?
             .ok_or_else(|| failure("store_write_failed"))?;
-        let packages = directory
-            .child("packages", true)?
-            .ok_or_else(|| failure("store_write_failed"))?;
-        let names = packages
-            .child(&inspection.manifest.id, true)?
-            .ok_or_else(|| failure("store_write_failed"))?;
-        if let Some(existing) = names.child(&tree.source_digest, false)? {
-            verify_tree(&existing, &inspection.source, options)?;
-        } else {
-            let stage_name = temp_name("package");
-            let stage = names
-                .child(&stage_name, true)?
-                .ok_or_else(|| failure("store_write_failed"))?;
-            copy_snapshot(&tree, &stage)?;
-            verify_tree(&stage, &inspection.source, options)?;
-            stage.sync()?;
-            names.publish_directory(&stage_name, &tree.source_digest)?;
-        }
+        self.capture_package(&tree, &inspection, options, scope)?;
         locks.check()?;
         self.assert_revision(&revision)?;
         let previous = view
@@ -504,6 +751,42 @@ impl PluginStore {
 }
 
 /// Pure validation is shared by read-only preflight and locked publication.
+fn scoped_view<'a>(
+    scope: StoreScope,
+    user: &'a IndexView,
+    project: &'a IndexView,
+) -> &'a IndexView {
+    if scope == StoreScope::User {
+        user
+    } else {
+        project
+    }
+}
+
+fn record_position(view: &IndexView, id: &PluginId) -> Result<usize, CompatError> {
+    view.index
+        .entries
+        .iter()
+        .position(|record| record.name == id.name)
+        .ok_or_else(|| error("store_plugin_missing"))
+}
+
+fn next_generation(mut index: Index) -> Result<Index, CompatError> {
+    index.generation = index
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| error("store_index_corrupt"))?;
+    Ok(index)
+}
+
+fn index_bytes(index: &Index) -> Result<Vec<u8>, CompatError> {
+    let bytes = serde_json::to_vec(index).map_err(|_| error("store_index_limit"))?;
+    if decode_index(&bytes).map_err(|_| failure("store_index_limit"))? != *index {
+        return Err(failure("store_index_limit"));
+    }
+    Ok(bytes)
+}
+
 fn prepare_import(
     user: &IndexView,
     project: &IndexView,
@@ -566,10 +849,7 @@ fn prepare_import(
     let record = Record::inspected(inspection, options, enable);
     index.entries.push(record.clone());
     index.entries.sort_by(|a, b| a.name.cmp(&b.name));
-    let bytes = serde_json::to_vec(&index).map_err(|_| error("store_index_limit"))?;
-    if decode_index(&bytes).map_err(|_| failure("store_index_limit"))? != index {
-        return Err(failure("store_index_limit"));
-    }
+    let bytes = index_bytes(&index)?;
     Ok(ImportCandidate::New { record, bytes })
 }
 
@@ -746,6 +1026,10 @@ fn error(code: &'static str) -> CompatError {
                 "The plugin index changed concurrently; read a fresh snapshot before retrying"
             }
             "store_package_missing" => "An indexed immutable plugin package is missing",
+            "store_plugin_missing" => {
+                "No plugin with this exact identity is installed in the selected scope"
+            }
+            "store_identity_mismatch" => "An upgrade must preserve the selected plugin identity",
             "store_package_tampered" => {
                 "Managed plugin content no longer matches its recorded identity and digest"
             }
