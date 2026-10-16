@@ -110,6 +110,7 @@ fn http(status: u16, body: &str) -> String {
 
 fn model(id: &str) -> ModelEntry {
     ModelEntry {
+        context_limits: None,
         id: id.into(),
         label: None,
         pricing: Default::default(),

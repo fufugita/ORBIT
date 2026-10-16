@@ -234,6 +234,7 @@ fn observed(id: &str) -> DiscoveredModel {
 }
 fn declared(id: &str) -> ModelEntry {
     ModelEntry {
+        context_limits: None,
         id: id.into(),
         label: None,
         pricing: Pricing::default(),

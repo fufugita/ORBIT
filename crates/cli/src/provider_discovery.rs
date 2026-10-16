@@ -1652,6 +1652,7 @@ mod metadata_persistence_tests {
             url: "http://127.0.0.1:1/tenant/v1?scope=synthetic".into(),
             env: Some("ORBIT_AUTH_SYNTHETIC".into()),
             models: vec![ModelEntry {
+                context_limits: None,
                 id: "vendor/raw:free".into(),
                 label: None,
                 pricing: Default::default(),

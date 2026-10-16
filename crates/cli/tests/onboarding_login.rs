@@ -60,6 +60,7 @@ impl Fixture {
             url: "http://127.0.0.1:9/v1".into(),
             env: Some(format!("ORBIT_LOGIN_TEST_{}", ulid::Ulid::new())),
             models: vec![ModelEntry {
+                context_limits: None,
                 id: "family/raw".into(),
                 label: None,
                 pricing: Pricing::default(),

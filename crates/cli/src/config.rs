@@ -75,6 +75,87 @@ impl From<Pricing> for orbit_adapter::types::CostRates {
     }
 }
 
+/// Operator-declared context ceilings and policy overrides for one exact model.
+/// Absent members keep their existing policy defaults; these are not discovery facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextLimitOverrides {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_positive_context_limit"
+    )]
+    pub input_tokens: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_positive_context_limit"
+    )]
+    pub combined_tokens: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_positive_context_limit"
+    )]
+    pub fallback_input_tokens: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_positive_context_limit"
+    )]
+    pub fallback_combined_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_policy: Option<ContextUnknownPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_policy: Option<ContextMediaPolicy>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_context_max_age"
+    )]
+    pub max_age_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextUnknownPolicy {
+    Fallback,
+    RequireLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextMediaPolicy {
+    AllowWithWarning,
+    Refuse,
+}
+
+fn deserialize_positive_context_limit<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(serde::de::Error::custom(
+            "context token limits must be positive",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_context_max_age<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|seconds| !(1..=604800).contains(&seconds)) {
+        return Err(serde::de::Error::custom(
+            "context limit max_age_seconds must be within 1..604800",
+        ));
+    }
+    Ok(value)
+}
+
 /// A model declared for a provider (id + optional display label + pricing).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -93,6 +174,9 @@ pub struct ModelEntry {
     /// typed selected budgets take precedence when supplied.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Explicit context policy for this exact provider/model entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limits: Option<ContextLimitOverrides>,
     /// Optional sampling override (E8): temperature and top_p. Omitted
     /// by default — current Anthropic models reject temperature with
     /// thinking, and OpenAI reasoning models reject temperature
@@ -833,6 +917,7 @@ output_per_million_microcents = 600000
             url: "http://127.0.0.1:4001".into(),
             env: Some("ORBIT_GATE_TOKEN".into()),
             models: vec![ModelEntry {
+                context_limits: None,
                 supported_efforts: None,
                 default_effort: None,
                 sampling: None,

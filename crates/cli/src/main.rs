@@ -563,6 +563,7 @@ fn add_configured_provider_kind(
             .into_iter()
             .enumerate()
             .map(|(i, id)| orbit_cli::config::ModelEntry {
+                context_limits: None,
                 sampling: None,
                 supported_efforts: None,
                 default_effort: None,
@@ -698,6 +699,7 @@ fn validate_discovery_input(
         url: gate.into(),
         env: credential_env.map(String::from),
         models: vec![config::ModelEntry {
+            context_limits: None,
             id: "discovery-validation".into(),
             label: None,
             pricing: Default::default(),
@@ -5370,6 +5372,7 @@ mod provider_wizard_tests {
             .into();
         f.seed();
         let model = config::ModelEntry {
+            context_limits: None,
             id: "vendor/raw".into(),
             label: Some("Exact".into()),
             pricing: config::Pricing {

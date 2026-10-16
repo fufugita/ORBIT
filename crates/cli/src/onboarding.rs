@@ -170,6 +170,7 @@ pub fn parse_manual_models(value: &str) -> Result<Vec<ModelEntry>, OnboardingErr
             ));
         }
         models.push(ModelEntry {
+            context_limits: None,
             id: id.to_owned(),
             label: None,
             pricing: Pricing::default(),
@@ -1641,6 +1642,7 @@ fn collect_models<T: SetupTerminal>(
             .find(|model| model.id == observed.id)
             .cloned()
             .unwrap_or(ModelEntry {
+                context_limits: None,
                 id: observed.id.clone(),
                 label: None,
                 pricing: Pricing::default(),

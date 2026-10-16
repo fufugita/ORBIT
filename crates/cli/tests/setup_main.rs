@@ -544,3 +544,161 @@ fn setup_main_wizard_retains_private_key_when_post_config_verification_fails() {
     assert_eq!(resolved.source(), ProviderCredentialSource::Saved);
     assert_eq!(resolved.into_secret().unwrap().expose(), secret.as_bytes());
 }
+
+fn setup_context_limits_fixture() -> Fixture {
+    let f = metadata_fixture();
+    // Canonicalize the existing pricing aliases before isolating limit changes.
+    let incoming = f.config().provider.remove(0);
+    apply_setup(&plan_setup(&f.home, &request(incoming)).unwrap()).unwrap();
+    let mut value = f.value();
+    let model = &mut value["provider"][0]["models"][0];
+    let limits = toml::from_str::<toml::Value>(
+        r#"
+input_tokens = 100000
+combined_tokens = 96000
+fallback_input_tokens = 8000
+fallback_combined_tokens = 16000
+unknown_policy = "fallback"
+media_policy = "allow-with-warning"
+max_age_seconds = 3600
+"#,
+    )
+    .unwrap();
+    model
+        .as_table_mut()
+        .unwrap()
+        .insert("context_limits".into(), limits);
+    model["sampling"].as_table_mut().unwrap().insert(
+        "sampling_note".into(),
+        toml::Value::String("preserved-sampling-extension".into()),
+    );
+    f.write_config(&toml::to_string(&value).unwrap());
+    let reloaded = config::ProvidersConfig::load(&f.home).unwrap();
+    assert_eq!(reloaded.provider[0].name, "fixture");
+    assert_eq!(reloaded.provider[0].models[0].id, "owner/family/raw");
+    assert!(reloaded.provider[0].models[0].context_limits.is_some());
+    f
+}
+
+fn assert_setup_context_limits_metadata_preserved(before: &toml::Value, after: &toml::Value) {
+    let without_limits = |value: &toml::Value| {
+        let mut value = value.clone();
+        value["provider"][0]["models"][0]
+            .as_table_mut()
+            .unwrap()
+            .remove("context_limits");
+        value
+    };
+    assert!(
+        without_limits(before) == without_limits(after),
+        "only the exact selected model's context limits may change"
+    );
+}
+
+#[test]
+fn setup_context_limits_explicit_none_removes_raw_table_after_apply_and_reload() {
+    let f = setup_context_limits_fixture();
+    let before = f.value();
+    let identity = f.identity();
+    let mut incoming = config::ProvidersConfig::load(&f.home)
+        .unwrap()
+        .provider
+        .remove(0);
+    incoming.models[0].context_limits = None;
+    let plan = plan_setup(&f.home, &request(incoming)).unwrap();
+    let receipt = apply_setup(&plan).unwrap();
+    let reloaded = config::ProvidersConfig::load(&f.home).unwrap();
+    let after = f.value();
+    // Observe the actual persisted DTO before checking publication bookkeeping.
+    assert!(
+        reloaded.provider[0].models[0].context_limits.is_none(),
+        "an explicitly removed known field must not reappear from old raw TOML"
+    );
+    assert!(
+        after["provider"][0]["models"][0]
+            .get("context_limits")
+            .is_none()
+    );
+    assert_setup_context_limits_metadata_preserved(&before, &after);
+    assert!(plan.config_changed && receipt.config_changed && receipt.reused);
+    assert!(!receipt.initialized);
+    assert!(
+        f.identity() == identity,
+        "setup must reuse the existing identity"
+    );
+}
+
+#[test]
+fn setup_context_limits_replacement_is_exact_and_preserves_unrelated_metadata() {
+    let f = setup_context_limits_fixture();
+    let before = f.value();
+    let identity = f.identity();
+    let replacement: config::ContextLimitOverrides = toml::from_str(
+        r#"
+combined_tokens = 24000
+unknown_policy = "require-limit"
+media_policy = "refuse"
+max_age_seconds = 1
+"#,
+    )
+    .unwrap();
+    let expected_table = toml::Value::try_from(replacement).unwrap();
+    let mut incoming = config::ProvidersConfig::load(&f.home)
+        .unwrap()
+        .provider
+        .remove(0);
+    incoming.models[0].context_limits = Some(replacement);
+    let plan = plan_setup(&f.home, &request(incoming)).unwrap();
+    let receipt = apply_setup(&plan).unwrap();
+    let reloaded = config::ProvidersConfig::load(&f.home).unwrap();
+    let after = f.value();
+    assert_eq!(
+        reloaded.provider[0].models[0].context_limits,
+        Some(replacement)
+    );
+    assert_eq!(
+        after["provider"][0]["models"][0].get("context_limits"),
+        Some(&expected_table)
+    );
+    assert_setup_context_limits_metadata_preserved(&before, &after);
+    assert!(plan.config_changed && receipt.config_changed && receipt.reused);
+    assert!(!receipt.initialized);
+    assert!(
+        f.identity() == identity,
+        "setup must reuse the existing identity"
+    );
+}
+
+#[test]
+fn setup_context_limits_unchanged_value_is_idempotent_and_preserves_unrelated_metadata() {
+    let f = setup_context_limits_fixture();
+    let before = f.value();
+    let identity = f.identity();
+    let incoming = config::ProvidersConfig::load(&f.home)
+        .unwrap()
+        .provider
+        .remove(0);
+    let expected = incoming.models[0].context_limits;
+    apply_setup(&plan_setup(&f.home, &request(incoming)).unwrap()).unwrap();
+    assert_setup_context_limits_metadata_preserved(&before, &f.value());
+    let stable = f.raw();
+    let incoming = config::ProvidersConfig::load(&f.home)
+        .unwrap()
+        .provider
+        .remove(0);
+    let plan = plan_setup(&f.home, &request(incoming)).unwrap();
+    let receipt = apply_setup(&plan).unwrap();
+    let reloaded = config::ProvidersConfig::load(&f.home).unwrap();
+    assert_eq!(reloaded.provider[0].models[0].context_limits, expected);
+    assert!(!plan.config_changed && !receipt.config_changed && receipt.reused);
+    assert!(!receipt.initialized);
+    assert!(
+        f.raw() == stable,
+        "an unchanged update must preserve published bytes"
+    );
+    assert_setup_context_limits_metadata_preserved(&before, &f.value());
+    assert!(
+        f.identity() == identity,
+        "setup must reuse the existing identity"
+    );
+}
