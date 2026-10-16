@@ -372,6 +372,29 @@ pub fn execute_call(
     // is only asked when BOTH layers say ask.
     let args_preview =
         crate::tools::parse_arguments(&call.arguments).unwrap_or(serde_json::Value::Null);
+    let asset_policy = if call.name == "Read" {
+        args_preview
+            .get("file_path")
+            .and_then(|value| value.as_str())
+            .map(|path| crate::plugin_content::asset_policy_path(tool_cx, path))
+            .transpose()
+    } else {
+        Ok(None)
+    };
+    let asset_args = if let Ok(Some(Some(path))) = &asset_policy {
+        let mut alias = args_preview.clone();
+        alias["file_path"] = path.to_string_lossy().into_owned().into();
+        Some(alias)
+    } else {
+        None
+    };
+    let asset_scope = asset_args
+        .as_ref()
+        .map(|alias| asset_read_scope(scope, &args_preview, alias));
+    let policy_scope = asset_scope
+        .as_ref()
+        .and_then(|scope| scope.as_ref().ok())
+        .unwrap_or(scope);
     let mcp_plan = call
         .name
         .starts_with("mcp__")
@@ -379,7 +402,7 @@ pub fn execute_call(
     let mut pattern_verdict = match &mcp_plan {
         Some(Ok(plan)) => pattern_layer_verdict_with_plan(
             home,
-            scope,
+            policy_scope,
             &call.name,
             &args_preview,
             &tool_cx.working_dir,
@@ -389,10 +412,23 @@ pub fn execute_call(
             let (safe, redactions) = scan_mcp_text(error);
             PatternOutcome::McpError(safe, redactions)
         }
-        None => {
-            pattern_layer_verdict_in(home, scope, &call.name, &args_preview, &tool_cx.working_dir)
-        }
+        None => pattern_layer_verdict_in(
+            home,
+            policy_scope,
+            &call.name,
+            &args_preview,
+            &tool_cx.working_dir,
+        ),
     };
+    if let Some(alias) = &asset_args {
+        pattern_verdict = combine_pattern_outcomes(
+            pattern_verdict,
+            pattern_layer_verdict_in(home, policy_scope, &call.name, alias, &tool_cx.working_dir),
+        );
+    }
+    if let Some(Err(error)) = asset_scope {
+        pattern_verdict = PatternOutcome::Deny(error);
+    }
     if call.name.starts_with("mcp__")
         && tool_cx
             .ext::<McpToolSelection>()
@@ -408,6 +444,26 @@ pub fn execute_call(
     {
         pattern_verdict =
             PatternOutcome::Deny("diagnostics are outside the agent's tool selection".into());
+    }
+    if let Err(error) = asset_policy {
+        pattern_verdict = PatternOutcome::Deny(error);
+    }
+    if !crate::plugin_content::permits_alias(
+        tool_cx,
+        &call.name,
+        &args_preview,
+        asset_args.as_ref(),
+        mcp_plan
+            .as_ref()
+            .and_then(|plan| plan.as_ref().ok())
+            .map(|plan| plan.server.as_str()),
+    ) {
+        pattern_verdict =
+            PatternOutcome::Deny("tool is outside the invocation's inherited tool ceiling".into());
+    }
+    if crate::tools::bare_mode() && matches!(call.name.as_str(), "Skill" | "Task" | "Agent") {
+        pattern_verdict =
+            PatternOutcome::Deny("content invocation is unavailable in bare mode".into());
     }
 
     // Determine the verdict:
@@ -669,13 +725,23 @@ pub fn execute_call(
 
     // The Skill tool (phase 5): load a body on demand.
     if call.name == "Skill" {
-        let output = match args.get("name").and_then(|v| v.as_str()) {
-            Some(name) => match crate::tools::execute_skill(home, name) {
-                Ok(v) => serde_json::json!({ "ok": true, "result": v }).to_string(),
-                Err(e) => tool_error(&e),
+        let response = match args.get("name").and_then(|v| v.as_str()) {
+            Some(name) => match crate::plugin_content::invoke_skill(
+                tool_cx,
+                session_id,
+                name,
+                &args,
+                crate::plugin_content::InvocationOrigin::Model,
+                scope,
+                approval,
+            ) {
+                Ok(v) if v.get("ok").and_then(serde_json::Value::as_bool) == Some(false) => v,
+                Ok(v) => serde_json::json!({ "ok": true, "result": v }),
+                Err(e) => serde_json::json!({"ok":false,"error":e}),
             },
-            None => tool_error("Skill requires 'name'"),
+            None => serde_json::json!({"ok":false,"error":"Skill requires 'name'"}),
         };
+        let output = skill_result_output(response);
         let status = if orbit_tools::result_is_denial(&output) {
             "denied"
         } else if orbit_tools::result_is_error(&output) {
@@ -942,6 +1008,38 @@ pub fn execute_call(
     Ok((output, None))
 }
 
+fn skill_result_output(mut response: serde_json::Value) -> String {
+    fn scan(value: &mut serde_json::Value, text_field: bool) {
+        match value {
+            serde_json::Value::String(value) if text_field => *value = scan_mcp_text(value).0,
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    scan(value, text_field);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    scan(
+                        value,
+                        text_field
+                            || matches!(
+                                key.as_str(),
+                                "body" | "report" | "error" | "message" | "text" | "content"
+                            ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    scan(&mut response, false);
+    let encoded = response.to_string();
+    if encoded.len() <= MAX_RESULT_BYTES {
+        return encoded;
+    }
+    serde_json::json!({"ok":false,"result_error":true,"error":"Skill result exceeds the 64 KiB encoded output limit","truncated":true}).to_string()
+}
+
 fn lsp_result_output(
     result: Result<crate::lsp::DiagnosticReport, crate::lsp::LspError>,
 ) -> (String, &'static str) {
@@ -1185,6 +1283,55 @@ enum PatternOutcome {
     McpError(String, usize),
 }
 
+fn combine_pattern_outcomes(first: PatternOutcome, second: PatternOutcome) -> PatternOutcome {
+    match (first, second) {
+        (outcome @ (PatternOutcome::Deny(_) | PatternOutcome::McpError(_, _)), _) => outcome,
+        (_, outcome @ (PatternOutcome::Deny(_) | PatternOutcome::McpError(_, _))) => outcome,
+        (PatternOutcome::ExplicitAsk, _) | (_, PatternOutcome::ExplicitAsk) => {
+            PatternOutcome::ExplicitAsk
+        }
+        (PatternOutcome::Ask, _) | (_, PatternOutcome::Ask) => PatternOutcome::Ask,
+        _ => PatternOutcome::Allow,
+    }
+}
+
+/// Both names identify this one verified asset. Scope coverage may name either;
+/// all deny and explicit-confirmation rules still evaluate against both.
+fn asset_read_scope(
+    scope: &PermissionScope,
+    original: &serde_json::Value,
+    alias: &serde_json::Value,
+) -> Result<PermissionScope, String> {
+    let mut out = scope.clone();
+    if let Some(selectors) = &scope.allowlist {
+        let original = original
+            .get("file_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let alias = alias
+            .get("file_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let mut covered = false;
+        for selector in selectors {
+            validate_scope_selector(selector)?;
+            if let Some(rule) = orbit_tools::permissions::parse_rule(
+                selector,
+                orbit_tools::permissions::RuleEffectSerde::Allow,
+            ) && rule.tool == "Read"
+                && (orbit_tools::permissions::rule_matches(&rule, original)
+                    || orbit_tools::permissions::rule_matches(&rule, alias))
+            {
+                covered = true;
+            }
+        }
+        if covered {
+            out.allowlist = Some(vec!["Read".into()]);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 fn pattern_layer_verdict(
     home: &Path,
@@ -1426,6 +1573,12 @@ fn pattern_layer_verdict_with_plan(
         is_ro_cmd,
     ) {
         Verdict::Allow => PatternOutcome::Allow,
+        Verdict::Ask
+            if rules.evaluate(&key.tool, &key.pattern)
+                == Some(orbit_tools::permissions::RuleEffect::Ask) =>
+        {
+            PatternOutcome::ExplicitAsk
+        }
         Verdict::Ask => PatternOutcome::Ask,
         Verdict::Deny(reason) => PatternOutcome::Deny(reason),
     }
@@ -2209,7 +2362,25 @@ fn execute_wave1(
     use orbit_tools::permissions::{RuleEffectSerde, evaluate, parse_rule};
 
     // Merged rules: the new pattern scopes + the legacy whole-tool file.
-    let mut rules = orbit_tools::executor::load_rules(home);
+    let mut rules = orbit_tools::executor::load_rules_in(home, &tool_cx.working_dir);
+    let mut read_scope = scope.clone();
+    if call.name == "Read"
+        && let Some(path) = args.get("file_path").and_then(serde_json::Value::as_str)
+    {
+        match crate::plugin_content::asset_policy_path(tool_cx, path) {
+            Ok(Some(path)) => {
+                let mut alias = args.clone();
+                alias["file_path"] = path.to_string_lossy().into_owned().into();
+                match asset_read_scope(scope, args, &alias) {
+                    Ok(scope) => read_scope = scope,
+                    Err(error) => return (tool_denial(&error), None),
+                }
+            }
+            Err(error) => return (tool_denial(&error), None),
+            Ok(None) => {}
+        }
+    }
+    let scope = &read_scope;
     // --allowedTools / --disallowedTools (command-line scope), from the
     // session's PermissionScope (S5) — not process env.
     // An explicit operator allowlist (--allowedTools / settings) is a
@@ -2349,16 +2520,23 @@ fn execute_wave1(
 
     // B1: a tool bug must become a tool error, never a dead worker
     // (a panic here used to take the whole process or the TUI thread).
-    let result =
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.run(args, &cx))) {
-            Ok(result) => result,
-            Err(panic) => {
-                let reason = panic_message(&panic);
-                orbit_tools::ToolResult::err(&format!(
-                    "internal tool error: {reason} (the panic was contained)"
-                ))
-            }
-        };
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if call.name == "Read"
+            && let Some(path) = args.get("file_path").and_then(|value| value.as_str())
+            && path.starts_with("orbit-plugin://")
+        {
+            return crate::plugin_content::asset_result(&cx, args);
+        }
+        tool.run(args, &cx)
+    })) {
+        Ok(result) => result,
+        Err(panic) => {
+            let reason = panic_message(&panic);
+            orbit_tools::ToolResult::err(&format!(
+                "internal tool error: {reason} (the panic was contained)"
+            ))
+        }
+    };
     let result = orbit_tools::finish(result, &cx, &call.id);
 
     // PostToolUse: the hook sees the (scanned) result.
@@ -2501,9 +2679,10 @@ pub(crate) fn effective_mcp_tool_selection(
     let requested = requested.filter(|names| !names.is_empty());
     match (cx.ext::<McpToolSelection>(), requested) {
         (Some(parent), Some(names)) => Some(
-            names
+            parent
+                .0
                 .iter()
-                .filter(|name| parent.0.contains(name))
+                .filter(|name| crate::plugin_content::selected(cx, Some(names), name))
                 .cloned()
                 .collect(),
         ),
@@ -2513,6 +2692,24 @@ pub(crate) fn effective_mcp_tool_selection(
     }
 }
 
+pub(crate) fn set_mcp_tool_selection_exact(
+    child: &orbit_tools::ToolContext,
+    parent: &orbit_tools::ToolContext,
+    wires: &[String],
+) {
+    let selected = wires
+        .iter()
+        .filter(|wire| {
+            parent
+                .ext::<McpToolSelection>()
+                .is_none_or(|parent| parent.0.contains(wire))
+        })
+        .cloned()
+        .collect();
+    child.set_ext(McpToolSelection(selected));
+}
+
+#[cfg(test)]
 pub(crate) fn set_mcp_tool_selection(
     child: &orbit_tools::ToolContext,
     parent: &orbit_tools::ToolContext,
@@ -3264,7 +3461,29 @@ pub(crate) fn child_agent_context(
     if let Some(observer) = parent.ext::<SubagentObserver>() {
         child.set_ext((*observer).clone());
     }
+    crate::plugin_content::inherit_context(parent, &child);
     child
+}
+
+pub(crate) fn invocation_context(
+    parent: &orbit_tools::ToolContext,
+    session_id: &str,
+) -> orbit_tools::ToolContext {
+    let mut invocation = orbit_tools::ToolContext::new(
+        parent.home.clone(),
+        parent.session_id.clone(),
+        parent.working_dir.clone(),
+    );
+    invocation.working_dirs = parent.working_dirs.clone();
+    invocation.set_ext(agent_session_context(parent, session_id));
+    crate::plugin_content::inherit_context(parent, &invocation);
+    if let Some(cancel) = parent.cancel_check() {
+        invocation.push_cancel_check(cancel);
+    }
+    if let Some(observer) = parent.ext::<SubagentObserver>() {
+        invocation.set_ext((*observer).clone());
+    }
+    invocation
 }
 
 impl orbit_engine::ToolExecutor for SubagentExecutor<'_> {
@@ -3390,28 +3609,19 @@ fn subagent_config_for(
     cx: &orbit_tools::ToolContext,
     home: &Path,
     agent: &str,
+    profile_model: Option<&str>,
 ) -> Result<orbit_engine::TurnConfig, String> {
     let base = session_subagent_config(cx, home);
 
     // Look the agent up for its own model override. Unknown names keep
     // the role path (execute_task will report the unknown agent).
-    let agents = {
-        let trusted = orbit_tools::permissions::FolderTrust::new(home.to_path_buf())
-            .is_trusted(&cx.working_dir);
-        orbit_engine::skills::load_agents(home, trusted)
-    };
-    let agent_model = agents
-        .iter()
-        .find(|a| a.name == agent)
-        .map(|a| a.model.trim())
-        .filter(|m| !m.is_empty())
-        .map(str::to_string);
+    let agent_model = profile_model.filter(|model| !model.trim().is_empty());
 
     if let Some(spec) = agent_model {
         // An agent-declared model resolves like a role spec: bare id
         // across providers, provider/model explicit.
         let cfg = crate::config::ProvidersConfig::load(home)?;
-        let selected = crate::phase_routing::resolve_model(&cfg, &spec, None)
+        let selected = crate::phase_routing::resolve_model(&cfg, spec, None)
             .map_err(|e| format!("configured agent profile model: {e}"))?;
         let mut out = selected.turn_config(None)?;
         out.sampling = None; // E8: subagents inherit no sampling.
@@ -3438,11 +3648,12 @@ pub(crate) fn task_config_for(
     agent: &str,
     explicit: Option<&str>,
     saved: Option<&str>,
+    profile_model: Option<&str>,
 ) -> Result<orbit_engine::TurnConfig, String> {
     // Malformed capability declarations must not silently become an unconfigured model.
     crate::config::ProvidersConfig::load(home)?;
     let Some(spec) = explicit.or(saved) else {
-        return subagent_config_for(cx, home, agent);
+        return subagent_config_for(cx, home, agent, profile_model);
     };
     let base = session_subagent_config(cx, home);
     let configured = crate::config::ProvidersConfig::load(home)

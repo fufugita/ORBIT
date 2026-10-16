@@ -15,6 +15,11 @@ pub fn enable_bare_mode() {
     BARE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+pub fn bare_mode() -> bool {
+    BARE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("ORBIT_BARE").is_ok_and(|value| value == "1")
+}
+
 pub(crate) fn config_home_from_env() -> std::path::PathBuf {
     // C8: the ONE home resolver — same precedence as the CLI entry
     // (--home > ORBIT_HOME > ~/.orbit > existing local .orbit). The old
@@ -83,11 +88,7 @@ pub fn session_tool_definitions_with_context(
 ) -> Vec<ToolDefinition> {
     // --bare skips discovering skills, mods, MCP servers and memory
     // files (phase 6: fast start for scripts).
-    if BARE_MODE.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("ORBIT_BARE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    {
+    if bare_mode() {
         return tool_definitions();
     }
     let mut defs = tool_definitions();
@@ -114,23 +115,20 @@ pub fn session_tool_definitions_with_context(
     let trusted =
         orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(&cx.working_dir);
     let Ok(cfg) = orbit_mcp::McpConfig::try_load_at(home, &cx.working_dir, trusted) else {
-        return defs;
+        return defs
+            .into_iter()
+            .filter(|tool| crate::plugin_content::exposed(cx, &tool.name))
+            .collect();
     };
     let selected = crate::tool_runtime::effective_mcp_tool_selection(cx, selection);
     let selection = selected.as_deref();
     let mut emitted_mcp = std::collections::HashSet::new();
     for (name, server) in &cfg.servers {
         if !server.enabled
+            || !crate::plugin_content::server_exposed(cx, &cfg, name)
             || server.tools.as_ref().is_some_and(Vec::is_empty)
-            || selection.is_some_and(|names| {
-                !names.iter().any(|wire| {
-                    crate::tool_runtime::resolve_mcp_target_in(&cfg, wire).is_ok_and(
-                        |(selected_server, tool)| {
-                            selected_server == *name && server.tool_enabled(&tool)
-                        },
-                    )
-                })
-            })
+            || selection
+                .is_some_and(|names| !crate::plugin_content::selects_mcp_server(&cfg, names, name))
         {
             continue;
         }
@@ -144,7 +142,8 @@ pub fn session_tool_definitions_with_context(
             for t in tools {
                 let wire = orbit_mcp::wire_name(name, &t.name);
                 if !server.tool_enabled(&t.name)
-                    || selection.is_some_and(|names| !names.contains(&wire))
+                    || !crate::plugin_content::selected(cx, selection, &wire)
+                    || !crate::plugin_content::exposed(cx, &wire)
                     || !crate::tool_runtime::resolve_mcp_target_in(&cfg, &wire).is_ok_and(
                         |(resolved_server, resolved_tool)| {
                             resolved_server == *name && resolved_tool == t.name
@@ -173,7 +172,9 @@ pub fn session_tool_definitions_with_context(
             }
         }
     }
-    defs
+    defs.into_iter()
+        .filter(|tool| crate::plugin_content::exposed(cx, &tool.name))
+        .collect()
 }
 
 /// The Skill tool definition (phase 5).
@@ -355,7 +356,7 @@ pub fn execute_task(
 }
 
 pub(crate) struct AgentTaskError {
-    message: String,
+    pub(crate) message: String,
     agent_id: Option<String>,
 }
 
@@ -465,6 +466,22 @@ pub(crate) fn execute_task_in_session(
     approval: &mut dyn crate::tool_runtime::ApprovalChannel,
     observe: Option<&(dyn Fn(&crate::tool_runtime::SubagentUpdate) + Send + Sync)>,
 ) -> Result<serde_json::Value, AgentTaskError> {
+    execute_task_resolved(
+        home, session_id, args, parent_cx, scope, approval, observe, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_task_resolved(
+    home: &std::path::Path,
+    session_id: &str,
+    args: &serde_json::Value,
+    parent_cx: &orbit_tools::ToolContext,
+    scope: &crate::tool_runtime::PermissionScope,
+    approval: &mut dyn crate::tool_runtime::ApprovalChannel,
+    observe: Option<&(dyn Fn(&crate::tool_runtime::SubagentUpdate) + Send + Sync)>,
+    resolved: Option<orbit_engine::skills::CatalogAgent>,
+) -> Result<serde_json::Value, AgentTaskError> {
     use crate::tool_runtime::SubagentUpdate;
     use orbit_engine::agent_store::AgentStatus;
 
@@ -488,10 +505,12 @@ pub(crate) fn execute_task_in_session(
     }
     let trusted =
         orbit_tools::permissions::FolderTrust::new(home.into()).is_trusted(&parent_cx.working_dir);
-    let agent = orbit_engine::skills::load_agents(home, trusted)
-        .into_iter()
-        .find(|a| a.name == agent_type)
-        .ok_or_else(|| format!("unknown subagent: {agent_type}"))?;
+    let supplied_profile = resolved.is_some();
+    let profile = match resolved {
+        Some(profile) => profile,
+        None => crate::plugin_content::resolve_agent(parent_cx, &agent_type)?,
+    };
+    let agent = &profile.agent;
     let store = crate::tool_runtime::agent_store_for_context(home, session_id, parent_cx)?;
     let saved = resume.map(|id| store.load(id)).transpose()?;
     if let Some(saved) = &saved
@@ -511,6 +530,7 @@ pub(crate) fn execute_task_in_session(
         &agent_type,
         explicit,
         saved.as_ref().map(|s| s.model.as_str()),
+        (!agent.model.is_empty()).then_some(agent.model.as_str()),
     )?;
     let fresh = saved.is_none();
     if fresh {
@@ -558,6 +578,7 @@ pub(crate) fn execute_task_in_session(
                 &agent_type,
                 explicit,
                 Some(&leased.model),
+                (!agent.model.is_empty()).then_some(agent.model.as_str()),
             )?;
             if !fresh {
                 // Resumed identity is read under its lease and remains an
@@ -605,15 +626,25 @@ pub(crate) fn execute_task_in_session(
     input.push_str(prompt);
     let mut transcript = run.snapshot().transcript.clone();
     let turns = run.snapshot().turns.saturating_add(1);
-    let session_tools = session_tool_definitions_with_context(home, parent_cx, Some(&agent.tools));
-    let sub_tools = if agent.tools.is_empty() {
+    let session_tools =
+        session_tool_definitions_with_context(home, parent_cx, profile.allowed_tools.as_deref());
+    let sub_tools: Vec<_> = if profile.allowed_tools.is_none() {
         session_tools
     } else {
         session_tools
             .into_iter()
-            .filter(|t| agent.tools.contains(&t.name))
+            .filter(|tool| {
+                crate::plugin_content::selected(
+                    parent_cx,
+                    profile.allowed_tools.as_deref(),
+                    &tool.name,
+                )
+            })
             .collect()
-    };
+    }
+    .into_iter()
+    .filter(|tool| crate::plugin_content::exposed(parent_cx, &tool.name))
+    .collect();
     let hooks = orbit_engine::hooks::Hooks::load(home, trusted);
     let _ = hooks.fire(
         orbit_engine::hooks::HookEvent::SubagentStart,
@@ -632,7 +663,15 @@ pub(crate) fn execute_task_in_session(
     );
     if !agent.instructions.is_empty() {
         system_directive.push_str("\n\n");
-        system_directive.push_str(&agent.instructions);
+        if supplied_profile {
+            system_directive.push_str(&agent.instructions);
+        } else {
+            system_directive.push_str(&crate::plugin_content::expand_prompt(
+                &agent.instructions,
+                &[],
+                profile.binding.as_ref(),
+            )?);
+        }
     }
     let options = orbit_engine::TurnOptions {
         session_id: id.clone(),
@@ -643,8 +682,18 @@ pub(crate) fn execute_task_in_session(
         ..Default::default()
     };
     let child_cx = crate::tool_runtime::child_agent_context(home, session_id, &id, parent_cx);
+    crate::plugin_content::restrict_context(&child_cx, profile.allowed_tools.as_deref())?;
     crate::tool_runtime::remember_effort_setting(&child_cx, &run.snapshot().effort);
-    crate::tool_runtime::set_mcp_tool_selection(&child_cx, parent_cx, &agent.tools);
+    crate::tool_runtime::set_mcp_tool_selection_exact(
+        &child_cx,
+        parent_cx,
+        &options
+            .tools
+            .iter()
+            .filter(|tool| tool.name.starts_with("mcp__"))
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>(),
+    );
     crate::tool_runtime::set_lsp_tool_selection(&child_cx, parent_cx, &agent.tools);
     let mut executor = crate::tool_runtime::SubagentExecutor::with_context(
         home.into(),

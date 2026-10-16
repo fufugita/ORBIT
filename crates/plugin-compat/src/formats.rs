@@ -2193,10 +2193,11 @@ fn push_legacy_component(
 
 fn finish_legacy_inspection(mut inspection: Inspection) -> Result<Inspection, CompatError> {
     inspection.components.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut identities = std::collections::BTreeSet::new();
     if inspection
         .components
-        .windows(2)
-        .any(|pair| pair[0].id.eq_ignore_ascii_case(&pair[1].id))
+        .iter()
+        .any(|component| !identities.insert(component.id.to_ascii_lowercase()))
     {
         return Err(failure("component_id_collision"));
     }
@@ -2663,9 +2664,15 @@ fn normalize_skill(
         .frontmatter
         .as_object()
         .ok_or_else(|| failure("component_field_invalid"))?;
-    let source_name = required_string(object, "name", "component_field_invalid")?;
+    let claude = inspection.source.format == PluginFormat::Claude;
+    let source_name = if claude {
+        optional_string(object, "name", "component_field_invalid")?
+            .unwrap_or_else(|| directory_name.to_owned())
+    } else {
+        required_string(object, "name", "component_field_invalid")?
+    };
     if !valid_component_name(&source_name)
-        || (!directory_name.is_empty() && source_name != directory_name)
+        || (!claude && !directory_name.is_empty() && source_name != directory_name)
     {
         return Err(failure("component_id_invalid"));
     }

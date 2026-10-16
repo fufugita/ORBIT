@@ -11,6 +11,7 @@
 //! a plan), general-purpose.
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::path::Path;
 
 /// One skill: frontmatter + body.
@@ -273,6 +274,284 @@ pub fn agents_index(agents: &[AgentDef]) -> String {
         s.push_str(&format!("- {}: {}\n", a.name, a.description));
     }
     s
+}
+
+/// A source-qualified reference names an immutable package revision, never a cwd.
+#[derive(Debug, Clone)]
+pub struct ContentBinding {
+    pub plugin: orbit_plugin_compat::PluginId,
+    pub digest: String,
+    pub component_id: String,
+    pub source_path: Option<String>,
+    pub root: std::path::PathBuf,
+    pub data_root: std::path::PathBuf,
+    pub options: orbit_plugin_compat::InspectOptions,
+}
+
+impl ContentBinding {
+    pub fn asset_prefix(&self) -> String {
+        let scope = match self.plugin.scope {
+            orbit_plugin_compat::StoreScope::User => "user",
+            orbit_plugin_compat::StoreScope::Project => "project",
+        };
+        format!(
+            "orbit-plugin://{scope}/{}/{}/{}",
+            self.plugin.name,
+            self.digest,
+            hex::encode(sha2::Sha256::digest(self.component_id.as_bytes()))
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogSkill {
+    pub skill: Skill,
+    pub policy: Option<orbit_plugin_compat::SkillSpec>,
+    pub binding: Option<ContentBinding>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogAgent {
+    pub agent: AgentDef,
+    /// None inherits the parent; Some([]) denies every tool.
+    pub allowed_tools: Option<Vec<String>>,
+    pub binding: Option<ContentBinding>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContentCatalog {
+    pub skills: Vec<CatalogSkill>,
+    pub agents: Vec<CatalogAgent>,
+    pub diagnostics: Vec<String>,
+}
+
+/// Discover against the caller's actual project. Store admission never implies runtime readiness.
+pub fn load_catalog(
+    home: &Path,
+    project: &Path,
+    portable_enabled: bool,
+) -> Result<ContentCatalog, orbit_plugin_compat::CompatError> {
+    use orbit_plugin_compat::{Compatibility, ComponentKind, DiagnosticSeverity, PluginStore};
+    let trusted =
+        orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(project);
+    let mut catalog = ContentCatalog::default();
+    for agent in builtin_agents() {
+        let allowed_tools = (!agent.tools.is_empty()).then(|| agent.tools.clone());
+        catalog.agents.push(CatalogAgent {
+            agent,
+            allowed_tools,
+            binding: None,
+        });
+    }
+    for (base, needs_trust) in [(home.to_path_buf(), false), (project.join(".orbit"), true)] {
+        if needs_trust && !trusted {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(base.join("skills")) {
+            for entry in entries.flatten() {
+                if let Ok(text) = std::fs::read_to_string(entry.path().join("SKILL.md"))
+                    && let Some(skill) = parse_skill_md(&text)
+                {
+                    catalog.skills.push(CatalogSkill {
+                        skill,
+                        policy: None,
+                        binding: None,
+                    });
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(base.join("agents")) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|value| value.to_str()) == Some("md")
+                    && let Ok(text) = std::fs::read_to_string(entry.path())
+                    && let Some(agent) = parse_agent_md(&text)
+                {
+                    let allowed_tools = (!agent.tools.is_empty()).then(|| agent.tools.clone());
+                    catalog.agents.push(CatalogAgent {
+                        agent,
+                        allowed_tools,
+                        binding: None,
+                    });
+                }
+            }
+        }
+    }
+    if portable_enabled {
+        let active = match PluginStore::open(home, project, trusted)
+            .and_then(|store| store.active())
+        {
+            Ok(active) => Some(active),
+            Err(error) => {
+                let code: String = error
+                    .code
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .take(64)
+                    .collect();
+                catalog.diagnostics.push(format!("Managed plugin content is unavailable ({code}); inspect the private plugin store before activating it"));
+                let count = catalog.skills.len() + catalog.agents.len();
+                catalog
+                    .skills
+                    .retain(|entry| !entry.skill.name.contains(':'));
+                catalog
+                    .agents
+                    .retain(|entry| !entry.agent.name.contains(':'));
+                if catalog.skills.len() + catalog.agents.len() != count {
+                    catalog.diagnostics.push("Namespaced native definitions are withheld while managed plugin identities cannot be verified".into());
+                }
+                None
+            }
+        };
+        if let Some(active) = active {
+            let failed_namespaces: std::collections::BTreeSet<_> = active
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+                .filter_map(|diagnostic| diagnostic.component_id.as_deref())
+                .collect();
+            if !failed_namespaces.is_empty() {
+                let available = |name: &str| {
+                    name.split_once(':').is_none_or(|(namespace, _)| {
+                        !failed_namespaces
+                            .iter()
+                            .any(|failed| namespace.eq_ignore_ascii_case(failed))
+                    })
+                };
+                catalog.skills.retain(|entry| available(&entry.skill.name));
+                catalog.agents.retain(|entry| available(&entry.agent.name));
+                catalog.diagnostics.push("Failed managed package namespaces remain reserved; native aliases cannot replace unavailable plugins".into());
+            }
+            catalog.diagnostics.extend(
+                active
+                    .diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.message),
+            );
+            for active in active.plugins {
+                for component in &active.plugin.components {
+                    if !matches!(
+                        component.kind,
+                        ComponentKind::Skill(_) | ComponentKind::Agent(_)
+                    ) {
+                        continue;
+                    }
+                    let relevant_error = active.plugin.diagnostics.iter().any(|diagnostic| {
+                        diagnostic.severity == DiagnosticSeverity::Error
+                            && diagnostic
+                                .component_id
+                                .as_ref()
+                                .is_none_or(|id| id == &component.id)
+                    });
+                    let unmet = active.plugin.requirements.iter().any(|requirement| {
+                        !requirement.satisfied
+                            && requirement.kind != "model_mapping"
+                            && requirement
+                                .component_id
+                                .as_ref()
+                                .is_none_or(|id| id == &component.id)
+                    });
+                    if component.compatibility == Compatibility::RequiresMigration
+                        || relevant_error
+                        || unmet
+                    {
+                        catalog.diagnostics.push(format!(
+                            "{} requires migration or an unsatisfied runtime prerequisite",
+                            component.id
+                        ));
+                        continue;
+                    }
+                    let binding = Some(ContentBinding {
+                        plugin: active.plugin.id.clone(),
+                        digest: active.plugin.digest.clone(),
+                        component_id: component.id.clone(),
+                        source_path: component.source_path.clone(),
+                        root: active.root.clone(),
+                        data_root: active.data_root.clone(),
+                        options: active.plugin.options.clone(),
+                    });
+                    match &component.kind {
+                        ComponentKind::Skill(spec) => catalog.skills.push(CatalogSkill {
+                            skill: Skill {
+                                name: spec.name.clone(),
+                                description: spec.description.clone(),
+                                body: spec.body.clone(),
+                            },
+                            policy: Some(spec.clone()),
+                            binding,
+                        }),
+                        ComponentKind::Agent(spec) => {
+                            let effort = match spec.effort.as_ref() {
+                                None => None,
+                                Some(serde_json::Value::Bool(value)) => {
+                                    Some(orbit_adapter::types::EffortSetting::Value(
+                                        orbit_adapter::types::EffortValue::Bool(*value),
+                                    ))
+                                }
+                                Some(serde_json::Value::String(value)) if value == "default" => {
+                                    Some(orbit_adapter::types::EffortSetting::Default)
+                                }
+                                Some(serde_json::Value::String(value)) => {
+                                    let value =
+                                        orbit_adapter::types::EffortValue::Level(value.clone());
+                                    if value.validate().is_err() {
+                                        catalog.diagnostics.push(format!(
+                                            "{} has invalid effort metadata and was excluded",
+                                            component.id
+                                        ));
+                                        continue;
+                                    }
+                                    Some(orbit_adapter::types::EffortSetting::Value(value))
+                                }
+                                _ => {
+                                    catalog.diagnostics.push(format!(
+                                        "{} has invalid effort metadata and was excluded",
+                                        component.id
+                                    ));
+                                    continue;
+                                }
+                            };
+                            catalog.agents.push(CatalogAgent {
+                                agent: AgentDef {
+                                    name: spec.name.clone(),
+                                    description: spec.description.clone(),
+                                    instructions: spec.instructions.clone(),
+                                    tools: spec.tools.clone().unwrap_or_default(),
+                                    model: spec.model.clone().unwrap_or_default(),
+                                    effort,
+                                    max_turns: spec.max_turns.unwrap_or(25),
+                                },
+                                allowed_tools: spec.tools.clone(),
+                                binding,
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+    catalog
+        .skills
+        .sort_by(|a, b| a.skill.name.cmp(&b.skill.name));
+    catalog
+        .agents
+        .sort_by(|a, b| a.agent.name.cmp(&b.agent.name));
+    if catalog
+        .skills
+        .windows(2)
+        .any(|pair| pair[0].skill.name == pair[1].skill.name)
+        || catalog
+            .agents
+            .windows(2)
+            .any(|pair| pair[0].agent.name == pair[1].agent.name)
+    {
+        return Err(orbit_plugin_compat::CompatError::new(
+            "content_identity_collision",
+            "native and installed content identities must be unique",
+        ));
+    }
+    catalog.diagnostics.truncate(32);
+    Ok(catalog)
 }
 
 #[cfg(test)]

@@ -140,19 +140,54 @@ pub fn build_system_prompt(
 
     // 2b. Skills (phase 5): the index — names + one-line purposes.
     // Bodies load on demand via the Skill tool.
+    if tool_names
+        .iter()
+        .any(|name| matches!(*name, "Skill" | "Task" | "Agent"))
     {
-        let trusted =
-            orbit_tools::permissions::FolderTrust::new(home.to_path_buf()).is_trusted(working_dir);
-        let skills = crate::skills::load_skills(home, trusted);
-        if !skills.is_empty() {
-            s.push_str("## Skills\n\n");
-            s.push_str("Load a skill with the Skill tool when a task matches.\n\n");
-            for sk in &skills {
-                let first = sk.body.lines().next().unwrap_or("").trim();
-                let purpose = first.trim_start_matches("# ").trim();
-                s.push_str(&format!("- {}: {}\n", sk.name, purpose));
+        match crate::skills::load_catalog(home, working_dir, true) {
+            Ok(catalog) => {
+                let mut index = String::new();
+                if tool_names.contains(&"Skill") {
+                    index.push_str(
+                        "## Skills\n\nLoad a skill with the Skill tool when a task matches.\n\n",
+                    );
+                    for entry in catalog.skills.iter().filter(|entry| {
+                        entry
+                            .policy
+                            .as_ref()
+                            .is_none_or(|policy| !policy.disable_model_invocation)
+                    }) {
+                        index.push_str(&format!(
+                            "- {}: {}\n",
+                            entry.skill.name, entry.skill.description
+                        ));
+                        if index.len() > 16 * 1024 {
+                            break;
+                        }
+                    }
+                }
+                if tool_names
+                    .iter()
+                    .any(|name| matches!(*name, "Task" | "Agent"))
+                {
+                    index.push_str("\n## Subagents (call Task or Agent)\n\n");
+                    for entry in &catalog.agents {
+                        index.push_str(&format!(
+                            "- {}: {}\n",
+                            entry.agent.name, entry.agent.description
+                        ));
+                        if index.len() > 24 * 1024 {
+                            break;
+                        }
+                    }
+                }
+                for diagnostic in catalog.diagnostics.iter().take(8) {
+                    index.push_str(&format!("\nContent availability: {diagnostic}\n"));
+                }
+                s.push_str(&cap_auto_memory(&index));
+                s.push('\n');
             }
-            s.push('\n');
+            Err(error) => s.push_str(&format!("Content unavailable: {error}\n\n")),
         }
     }
 

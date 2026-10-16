@@ -19,6 +19,7 @@ struct Binding {
     name: OsString,
     child: Arc<OwnedFd>,
     private: bool,
+    config_container: bool,
 }
 
 /// Every path component remains bound to the directory inode first opened.
@@ -28,6 +29,7 @@ pub(crate) struct Directory {
     path: PathBuf,
     bindings: Vec<Binding>,
     private: bool,
+    config_container: bool,
 }
 
 pub(crate) fn absolute(path: &Path) -> Result<PathBuf, CompatError> {
@@ -67,6 +69,7 @@ impl Directory {
             path: PathBuf::from("/"),
             bindings: Vec::new(),
             private: false,
+            config_container: false,
         };
         for part in path.components() {
             if let Component::Normal(name) = part {
@@ -79,6 +82,21 @@ impl Directory {
         directory.private = private;
         if let Some(binding) = directory.bindings.last_mut() {
             binding.private = private;
+        }
+        directory.check()?;
+        Ok(Some(directory))
+    }
+
+    pub(crate) fn open_project_container(
+        path: &Path,
+        create: bool,
+    ) -> Result<Option<Self>, CompatError> {
+        let Some(mut directory) = Self::open_optional(path, create, false)? else {
+            return Ok(None);
+        };
+        directory.config_container = true;
+        if let Some(binding) = directory.bindings.last_mut() {
+            binding.config_container = true;
         }
         directory.check()?;
         Ok(Some(directory))
@@ -132,12 +150,14 @@ impl Directory {
             name: name.clone(),
             child: fd.clone(),
             private: private || created,
+            config_container: false,
         });
         let result = Self {
             fd,
             path: self.path.join(name),
             bindings,
             private,
+            config_container: false,
         };
         result.check()?;
         if created {
@@ -169,12 +189,20 @@ impl Directory {
             if binding.private {
                 check_owned(&held, true, false)?;
             }
+            if binding.config_container {
+                check_config_container(&held)?;
+            }
         }
         if self.private {
             check_owned(
                 &fstat(self.fd.as_ref()).map_err(|_| failure("store_read_failed"))?,
                 true,
                 false,
+            )?;
+        }
+        if self.config_container {
+            check_config_container(
+                &fstat(self.fd.as_ref()).map_err(|_| failure("store_read_failed"))?,
             )?;
         }
         Ok(())
@@ -469,6 +497,16 @@ fn same_file(a: &Stat, b: &Stat) -> bool {
         && a.st_ctime_nsec == b.st_ctime_nsec
 }
 
+fn check_config_container(stat: &Stat) -> Result<(), CompatError> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o7022 != 0
+    {
+        return Err(failure("store_container_unsafe"));
+    }
+    Ok(())
+}
+
 fn check_owned(stat: &Stat, directory: bool, single_link: bool) -> Result<(), CompatError> {
     let expected = if directory {
         FileType::Directory
@@ -494,6 +532,9 @@ pub(crate) fn failure(code: &'static str) -> CompatError {
                 "Managed content must be owned, private and free of links or special files"
             }
             "store_path_changed" => "A managed path changed; inspect the store before retrying",
+            "store_container_unsafe" => {
+                "Project configuration directories require owner-controlled writes and ordinary permissions"
+            }
             "store_busy" => "Another plugin mutation holds the store lock; retry after it finishes",
             "store_scope_alias" => {
                 "User and project plugin scopes must have distinct physical storage roots"

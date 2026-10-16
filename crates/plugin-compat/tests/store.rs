@@ -153,6 +153,131 @@ fn import_preserves_source_license_modes_and_unrelated_configuration() {
 }
 
 #[test]
+fn project_container_readable_settings_do_not_disable_user_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    store
+        .import(&source, &InspectOptions::default(), StoreScope::User, true)
+        .unwrap();
+    write(
+        &project,
+        ".orbit/settings.toml",
+        "preserve project settings\n",
+    );
+    fs::set_permissions(project.join(".orbit"), fs::Permissions::from_mode(0o755)).unwrap();
+    let before = files(temp.path());
+    let active = store.active().unwrap();
+    assert_eq!(active.plugins.len(), 1);
+    assert_eq!(active.plugins[0].plugin.id, id(StoreScope::User));
+    assert_eq!(files(temp.path()), before);
+    assert_eq!(
+        fs::metadata(project.join(".orbit")).unwrap().mode() & 0o7777,
+        0o755
+    );
+}
+
+#[test]
+fn project_container_import_preserves_settings_and_keeps_store_private() {
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    write(
+        &project,
+        ".orbit/settings.toml",
+        "preserve project settings\n",
+    );
+    fs::set_permissions(project.join(".orbit"), fs::Permissions::from_mode(0o755)).unwrap();
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    let receipt = store
+        .import(
+            &source,
+            &InspectOptions::default(),
+            StoreScope::Project,
+            true,
+        )
+        .unwrap();
+    assert_eq!(receipt.plugin.id, id(StoreScope::Project));
+    assert_eq!(store.active().unwrap().plugins.len(), 1);
+    // Mutations coordinate both scopes even when only the project changes.
+    assert!(!index(&home).exists());
+    for path in [&home, &home.join("plugins"), &home.join("plugins/portable")] {
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o7777, 0o700);
+    }
+    assert_eq!(
+        fs::read(project.join(".orbit/settings.toml")).unwrap(),
+        b"preserve project settings\n"
+    );
+    assert_eq!(
+        fs::metadata(project.join(".orbit")).unwrap().mode() & 0o7777,
+        0o755
+    );
+    for path in [".orbit/plugins", ".orbit/plugins/portable"] {
+        assert_eq!(
+            fs::metadata(project.join(path)).unwrap().mode() & 0o7777,
+            0o700
+        );
+    }
+    assert_eq!(
+        fs::metadata(project.join(".orbit/plugins/portable/index.json"))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert!(!source.join("execution-marker").exists());
+}
+
+#[test]
+fn project_container_refuses_writable_linked_and_special_mode_roots() {
+    for mode in [0o775, 0o777, 0o1755] {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, project, source) = roots(temp.path());
+        write(
+            &project,
+            ".orbit/settings.toml",
+            "preserve project settings\n",
+        );
+        fs::set_permissions(project.join(".orbit"), fs::Permissions::from_mode(mode)).unwrap();
+        let before = files(temp.path());
+        let store = PluginStore::open(&home, &project, true).unwrap();
+        assert!(
+            store
+                .import(
+                    &source,
+                    &InspectOptions::default(),
+                    StoreScope::Project,
+                    true
+                )
+                .is_err()
+        );
+        assert_eq!(files(temp.path()), before);
+        assert_eq!(
+            fs::metadata(project.join(".orbit")).unwrap().mode() & 0o7777,
+            mode
+        );
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (home, project, source) = roots(temp.path());
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&outside, project.join(".orbit")).unwrap();
+    let store = PluginStore::open(&home, &project, true).unwrap();
+    assert!(
+        store
+            .import(
+                &source,
+                &InspectOptions::default(),
+                StoreScope::Project,
+                true
+            )
+            .is_err()
+    );
+    assert!(fs::read_dir(outside).unwrap().next().is_none());
+    assert!(!home.exists());
+}
+
+#[test]
 fn staging_is_disabled_and_identical_import_is_byte_for_byte_idempotent() {
     let temp = tempfile::tempdir().unwrap();
     let (home, project, source) = roots(temp.path());

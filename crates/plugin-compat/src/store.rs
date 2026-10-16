@@ -242,6 +242,63 @@ impl PluginStore {
         })
     }
 
+    /// Read only captured inventory bytes through a currently verified owned root.
+    pub fn read_asset(
+        &self,
+        id: &PluginId,
+        expected_digest: &str,
+        relative: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, CompatError> {
+        validate_id(&id.name)?;
+        if max_bytes == 0
+            || max_bytes > 8 * 1024 * 1024
+            || relative.is_empty()
+            || relative.len() > 1024
+            || relative
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".." || part.contains('\\'))
+            || Path::new(relative)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(error("store_asset_invalid"));
+        }
+        let (revision, user, project) = self.stable_indices()?;
+        let view = scoped_view(id.scope, &user, &project);
+        let record = &view.index.entries[record_position(view, id)?];
+        if !record.enabled || record.digest != expected_digest {
+            return Err(error("store_asset_stale"));
+        }
+        self.load(view, id.scope, record)?;
+        let root = view
+            .directory
+            .as_ref()
+            .ok_or_else(|| error("store_package_missing"))?
+            .child("packages", false)?
+            .ok_or_else(|| error("store_package_missing"))?
+            .child(&id.name, false)?
+            .ok_or_else(|| error("store_package_missing"))?
+            .child(expected_digest, false)?
+            .ok_or_else(|| error("store_package_missing"))?;
+        let tree = SourceTree::read_named(&root.held_path()?, record.inferred_name.as_deref())?;
+        check_private_tree(&root, &tree)?;
+        if tree.source_digest != expected_digest {
+            return Err(error("store_package_tampered"));
+        }
+        let bytes = tree
+            .bytes
+            .get(relative)
+            .ok_or_else(|| error("store_asset_missing"))?;
+        if bytes.len() > max_bytes {
+            return Err(error("store_asset_limit"));
+        }
+        let bytes = bytes.clone();
+        root.check()?;
+        self.assert_revision(&revision)?;
+        Ok(bytes)
+    }
+
     /// Enable only the verified package observed by the caller.
     pub fn enable(
         &self,
@@ -607,11 +664,11 @@ impl PluginStore {
             return Ok(None);
         }
         let base = if scope == StoreScope::User {
-            self.home.clone()
+            Directory::open_optional(&self.home, create, true)?
         } else {
-            self.project.join(".orbit")
+            Directory::open_project_container(&self.project.join(".orbit"), create)?
         };
-        let Some(base) = Directory::open_optional(&base, create, true)? else {
+        let Some(base) = base else {
             return Ok(None);
         };
         let Some(plugins) = base.child("plugins", create)? else {
@@ -1033,6 +1090,14 @@ fn error(code: &'static str) -> CompatError {
             "store_package_tampered" => {
                 "Managed plugin content no longer matches its recorded identity and digest"
             }
+            "store_asset_invalid" => "Plugin assets require a bounded safe relative inventory path",
+            "store_asset_stale" => {
+                "Plugin assets require an enabled package with the expected digest"
+            }
+            "store_asset_missing" => {
+                "The requested asset is absent from the immutable source inventory"
+            }
+            "store_asset_limit" => "The requested asset exceeds the explicit byte limit",
             _ => {
                 "The managed plugin index is corrupt; no portable content was activated or rewritten"
             }

@@ -192,6 +192,118 @@ fn skill_version_is_descriptive_in_portable_and_claude_packages() {
 }
 
 #[test]
+fn claude_skill_declared_identity_and_directory_default_preserve_source_path() {
+    for declared in [Some("writing-hookify-rules"), None] {
+        let temp = tempfile::tempdir().unwrap();
+        claude(temp.path(), json!({}));
+        let name = declared
+            .map(|name| format!("name: {name}\n"))
+            .unwrap_or_default();
+        let source = format!(
+            "---\n{name}description: Write evidence-based rules\nversion: 0.1.0\nmodel: inherit\neffort: false\nallowed-tools: [Read]\ndisable-model-invocation: true\nuser-invocable: false\n---\nReview the rules and their original relative references.\n"
+        );
+        let path = "skills/writing-rules/SKILL.md";
+        write(temp.path(), path, &source);
+        let inspected = inspect(temp.path(), &InspectOptions::default()).unwrap();
+        let expected = declared.unwrap_or("writing-rules");
+        let component = inspected
+            .components
+            .iter()
+            .find(|component| matches!(component.kind, ComponentKind::Skill(_)))
+            .unwrap();
+        assert_eq!(component.id, format!("sample:skill:{expected}"));
+        assert_eq!(component.source_path.as_deref(), Some(path));
+        let ComponentKind::Skill(skill) = &component.kind else {
+            unreachable!()
+        };
+        assert_eq!(skill.name, format!("sample:{expected}"));
+        assert_eq!(skill.entry, path);
+        assert_eq!(
+            skill.body,
+            "Review the rules and their original relative references."
+        );
+        assert_eq!(skill.model, None);
+        assert_eq!(skill.effort, Some(json!(false)));
+        assert_eq!(skill.allowed_tools, Some(vec!["Read".into()]));
+        assert!(skill.disable_model_invocation);
+        assert!(!skill.user_invocable);
+        assert_eq!(
+            component.metadata.get("name").and_then(Value::as_str),
+            declared
+        );
+        assert_eq!(fs::read(temp.path().join(path)).unwrap(), source.as_bytes());
+    }
+}
+
+#[test]
+fn claude_skill_identity_adaptation_keeps_invalid_names_and_portable_mismatch_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    portable(temp.path());
+    write(
+        temp.path(),
+        "skills/directory-name/SKILL.md",
+        "---\nname: declared-name\ndescription: Keep portable directory identity strict\n---\nReview evidence.\n",
+    );
+    assert_eq!(error(temp.path()), "component_id_invalid");
+    let oversized = "x".repeat(65);
+    for invalid in [
+        "",
+        "../escape",
+        "with/slash",
+        "two words",
+        "bad:name",
+        "-leading",
+        "trailing-",
+        oversized.as_str(),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        claude(temp.path(), json!({}));
+        let source = format!(
+            "---\nname: {}\ndescription: Reject unsafe identity\n---\nReview evidence.\n",
+            serde_json::to_string(invalid).unwrap()
+        );
+        write(temp.path(), "skills/directory-name/SKILL.md", source);
+        assert_eq!(
+            error(temp.path()),
+            "component_id_invalid",
+            "invalid declared identity: {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn claude_skills_in_distinct_directories_cannot_share_declared_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    claude(temp.path(), json!({}));
+    for directory in ["one", "two"] {
+        write(
+            temp.path(),
+            &format!("skills/{directory}/SKILL.md"),
+            "---\nname: same-review\ndescription: Review evidence\n---\nReview evidence.\n",
+        );
+    }
+    assert_eq!(error(temp.path()), "component_id_collision");
+}
+
+#[test]
+fn claude_nonadjacent_case_folded_component_names_are_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    claude(temp.path(), json!({}));
+    for (directory, name) in [
+        ("one", "A-review"),
+        ("two", "B-review"),
+        ("three", "a-review"),
+    ] {
+        write(
+            temp.path(),
+            &format!("skills/{directory}/SKILL.md"),
+            format!("---\nname: {name}\ndescription: Review evidence\n---\nReview evidence.\n"),
+        );
+    }
+    assert_eq!(error(temp.path()), "component_id_collision");
+}
+
+#[test]
 fn skill_version_rejects_invalid_descriptive_values() {
     for format in [PluginFormat::Portable, PluginFormat::Claude] {
         let temp = tempfile::tempdir().unwrap();
