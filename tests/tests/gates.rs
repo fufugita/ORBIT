@@ -347,11 +347,9 @@ fn gate1_env_mention_refused_through_binary() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Gate 4, part 1: auto-compaction through the binary. A tiny
-/// context_window in providers.toml (100 tokens) means the second
-/// round's input count crosses 90% and the engine compacts — the
-/// stream must show `compacting`/`compacted` events and the turn must
-/// still finish ok.
+/// Gate 4, part 1: resume a reducible text history through the real
+/// binary. Explicit independent ordinary/summary input policies must
+/// produce an applied, fitting compaction and a successful continuation.
 #[test]
 fn gate4_auto_compaction_through_the_binary() {
     let (port, _mock_guard) = spawn_mock_guarded();
@@ -359,8 +357,12 @@ fn gate4_auto_compaction_through_the_binary() {
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
 
-    // A tiny window: 100 tokens → threshold = 90. init does not write
-    // providers.toml, so write a complete valid one.
+    const INPUT: u64 = 65_536;
+    const SESSION: &str = "g4-compact-seeded";
+    const PROMPT: &str = "count from 1 to 5";
+    const MODEL: &str = "gate-test-model-notools";
+    let gate = format!("http://127.0.0.1:{port}");
+    // Typed explicit policies: raw legacy metadata is not a capacity fact.
     let providers = home.join("providers.toml");
     write_providers(
         &providers,
@@ -372,18 +374,69 @@ url = "http://127.0.0.1:{port}"
 
 [[provider.models]]
 id = "gate-test-model-notools"
-context_window = 100
+max_output_tokens = 256
+[provider.models.context_limits]
+input_tokens = 65536
+
+[[provider.models]]
+id = "gate-test-model-notools-summary"
+max_output_tokens = 128
+[provider.models.context_limits]
+input_tokens = 262144
+
+[roles]
+compaction = "gate/gate-test-model-notools-summary"
 "#
         ),
     )
     .unwrap();
 
+    let mut history = Vec::new();
+    for index in 0..6 {
+        history.push(orbit_engine::user_message(format!(
+            "old-user-{index}: {}",
+            "u".repeat(32_768)
+        )));
+        history.push(orbit_engine::assistant_message(format!(
+            "old-assistant-{index}: {}",
+            "a".repeat(32_768)
+        )));
+    }
+    for index in 0..3 {
+        history.push(orbit_engine::user_message(format!("recent-user-{index}")));
+        history.push(orbit_engine::assistant_message(format!(
+            "recent-assistant-{index}"
+        )));
+    }
+    assert!(
+        history[..12]
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>()
+            > 4 * INPUT as usize
+    );
+    let saved = orbit_cli::sessions::SessionFile::from_chat(
+        SESSION, MODEL, &gate, "gate", &history, 9, 0, 0, 0,
+    );
+    {
+        let lease = orbit_cli::sessions::SessionLease::acquire(&home, SESSION, "fixture").unwrap();
+        lease.save(&saved).unwrap();
+    } // Release the seed lease before the real binary resumes it.
+
     let (events, code) = run_orbit_p_model(
         port,
         &home,
-        "count from 1 to 5",
-        "gate-test-model-notools",
-        &["--output-format", "stream-json"],
+        PROMPT,
+        MODEL,
+        &[
+            "--output-format",
+            "stream-json",
+            "--resume",
+            SESSION,
+            "--provider",
+            "gate",
+            "--bare",
+        ],
     );
     let types: Vec<&str> = events
         .iter()
@@ -401,16 +454,86 @@ context_window = 100
     assert_eq!(ended.get("ok").and_then(|o| o.as_bool()), Some(true));
     assert_eq!(code, 0);
 
-    // ...and at least one compaction must have fired (window crossed).
-    assert!(
-        types.contains(&"compacting") || types.contains(&"compacted"),
-        "gate4: with a 100-token window the session must compact: {types:?}"
+    // An attempted but rejected summary is insufficient: applied reduction,
+    // ordinary completion and durable retained intent must all be observed.
+    let compacting: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "compacting")
+        .collect();
+    let compacted: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "compacted")
+        .collect();
+    assert_eq!(
+        compacting.len(),
+        1,
+        "gate4: exactly one bounded compaction attempt: {types:?}"
     );
+    assert_eq!(
+        compacted.len(),
+        1,
+        "gate4: the candidate must actually be applied: {types:?}"
+    );
+    let before = compacting[0]["used_tokens"].as_u64().unwrap();
+    let after = compacted[0]["after_tokens"].as_u64().unwrap();
+    assert_eq!(compacting[0]["window_tokens"].as_u64(), Some(INPUT));
+    assert!(before > INPUT && after > 0 && after <= INPUT && after < before);
+    let at = |kind: &str| types.iter().position(|value| *value == kind).unwrap();
+    assert!(at("compacting") < at("compacted") && at("compacted") < at("turn_ended"));
+    assert_eq!(
+        types.iter().filter(|kind| **kind == "turn_ended").count(),
+        1,
+        "summary terminal events stay private"
+    );
+    let visible: String = events
+        .iter()
+        .filter(|event| event["type"] == "text_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect();
+    assert_eq!(
+        visible, "hello world",
+        "only the ordinary reply is streamed; summary deltas stay private"
+    );
+    let usage: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "usage")
+        .collect();
+    assert_eq!(
+        usage.len(),
+        1,
+        "only ordinary occupancy reaches the public stream"
+    );
+    assert_eq!(usage[0]["window_tokens"].as_u64(), Some(INPUT));
+    assert!(usage[0]["used_tokens"].as_u64().unwrap() <= INPUT);
+    assert_eq!(usage[0]["breakdown"]["reserve"].as_u64(), Some(0));
+    assert_eq!(usage[0]["breakdown"]["compact_at"].as_u64(), Some(58_982));
 
-    let _ = Command::new("fuser")
-        .arg("-k")
-        .arg(format!("{port}/tcp"))
-        .status();
+    let resumed = orbit_cli::sessions::load_session(&home, SESSION).unwrap();
+    assert_eq!(resumed.session_id, SESSION);
+    assert_eq!(resumed.provider, "gate");
+    assert_eq!(resumed.model, MODEL);
+    assert_eq!(resumed.turns, 10);
+    assert!(resumed.transcript.len() < history.len() + 2);
+    assert_eq!(resumed.transcript.last().unwrap().content, "hello world");
+    assert!(
+        history[..12]
+            .iter()
+            .any(|message| !resumed.transcript.contains(message)),
+        "an older source prefix was replaced by its applied summary"
+    );
+    let mut required = history[history.len() - 4..].to_vec();
+    required.push(orbit_engine::user_message(PROMPT));
+    let end = resumed.transcript.len() - 1;
+    assert!(end >= required.len());
+    assert_eq!(
+        &resumed.transcript[end - required.len()..end],
+        required.as_slice(),
+        "newest complete text exchanges and current intent survive exactly"
+    );
+    let summary = compacted[0]["summary"].as_str().unwrap();
+    assert!(!summary.trim().is_empty() && resumed.transcript[0].content.contains(summary));
+
+    drop(_mock_guard); // The retained guard already owns/kills/waits for this child.
     let _ = std::fs::remove_dir_all(&home);
 }
 

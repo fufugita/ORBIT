@@ -190,7 +190,7 @@ pub fn apply_turn_budgets(
     Ok(notices)
 }
 
-fn turn_budget_notice(role: &str, notice: &BudgetNotice) -> String {
+pub(crate) fn turn_budget_notice(role: &str, notice: &BudgetNotice) -> String {
     match notice {
         BudgetNotice::FallbackPolicy {
             input_tokens,

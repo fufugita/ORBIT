@@ -37,7 +37,10 @@ pub mod skills;
 pub mod transcript;
 pub mod turn;
 
-pub use dispatch::{PendingToolCall, ProviderKind, TurnConfig, TurnOutcome, run_dispatch};
+pub use dispatch::{
+    BudgetedDispatchFailure, BudgetedTurnOutcome, PendingToolCall, ProviderKind, TurnConfig,
+    TurnOutcome, run_budgeted_dispatch, run_dispatch,
+};
 pub use turn::{DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS, TurnOptions, run_turn};
 
 use orbit_adapter::types::ChatMessage;

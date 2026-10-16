@@ -34,8 +34,8 @@ conversation:
         send response headers, then send NOTHING for this long (a
         stalled stream — the client's idle timeout must fire)
   {"stall_ms": 10000, "stall_bytes": "data: {...}\n\n"}
-        send headers, send stall_bytes once, then go silent
-        retryable from the client's point of view
+        send headers, send stall_bytes as one HTTP chunk, then go silent;
+        an admitted response remains uncertain and must not be replayed
   {"status": 529}
         fail with this status and an empty body
 
@@ -294,14 +294,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if "stall_ms" in step:
             # E5: a stalled stream. Headers (200) go out, optional
-            # stall_bytes, then silence for stall_ms — the client must
-            # time out between chunks and retry.
+            # stall_bytes, then silence for stall_ms. The client must
+            # time out without replaying an admitted response.
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             if step.get("stall_bytes"):
-                self.wfile.write(step["stall_bytes"].encode())
+                self._chunk(step["stall_bytes"].encode())
                 self.wfile.flush()
             time.sleep(step["stall_ms"] / 1000.0)
             return

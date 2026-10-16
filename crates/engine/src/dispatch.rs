@@ -469,6 +469,71 @@ pub fn run_dispatch(
     run_prepared_dispatch(home, config, prepared, observer, cancel, session_id)
 }
 
+/// One admitted provider round and its local approximation over the actual
+/// prepared request. Proposed tool calls remain data in the outcome.
+#[derive(Debug, Clone)]
+pub struct BudgetedTurnOutcome {
+    pub outcome: TurnOutcome,
+    pub estimate: crate::context_budget::RequestEstimate,
+}
+
+/// Preserve a completed local measurement even when policy refuses the request
+/// or the provider fails. An estimate records measurement, not admission or egress.
+#[derive(Debug, Clone)]
+pub struct BudgetedDispatchFailure {
+    pub code: &'static str,
+    pub message: String,
+    pub estimate: Option<Box<crate::context_budget::RequestEstimate>>,
+}
+
+impl From<(&'static str, String)> for BudgetedDispatchFailure {
+    fn from((code, message): (&'static str, String)) -> Self {
+        Self {
+            code,
+            message,
+            estimate: None,
+        }
+    }
+}
+
+/// Admit one immutable request against hard selected ceilings, then dispatch it
+/// once. A soft compaction threshold does not reject a fitting single request.
+/// This path never summarizes history, executes tools or retries a provider.
+#[allow(clippy::too_many_arguments)]
+pub fn run_budgeted_dispatch(
+    home: &Path,
+    config: &TurnConfig,
+    budget: &crate::context_budget::SelectedBudget,
+    prompt: &str,
+    messages: Option<Vec<ChatMessage>>,
+    observer: orbit_provider_http::stream::StreamObserver<'_>,
+    cancel: orbit_provider_http::CancelToken,
+    tools: Vec<orbit_adapter::types::ToolDefinition>,
+    request_stem: &str,
+    session_id: &str,
+) -> Result<BudgetedTurnOutcome, BudgetedDispatchFailure> {
+    let context = request_preparation_context(config, None, &tools)?;
+    let prepared = prepare_provider_request(&context, prompt, messages, request_stem, session_id)?;
+    let estimate = crate::context_budget::estimate_prepared_request(&prepared, budget)
+        .map_err(|error| ("ORBIT-E0413", error.to_string()))?;
+    if !crate::context_budget::fits(&estimate, budget) {
+        return Err(BudgetedDispatchFailure {
+            code: "ORBIT-E0413",
+            message:
+                "context budget refuses this single request; check selected limits or media policy"
+                    .into(),
+            estimate: Some(Box::new(estimate)),
+        });
+    }
+    let outcome = run_prepared_dispatch(home, config, prepared, observer, cancel, session_id)
+        .map_err(|(code, message)| BudgetedDispatchFailure {
+            code,
+            message,
+            estimate: Some(Box::new(estimate.clone())),
+        })?;
+    Ok(BudgetedTurnOutcome { outcome, estimate })
+}
+
 pub(crate) fn run_prepared_dispatch(
     home: &Path,
     config: &TurnConfig,

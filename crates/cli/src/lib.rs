@@ -1027,9 +1027,41 @@ pub fn try_role_turn_config(
         .turn_config(Some(base))
 }
 
+/// An admitted single provider round with its local context approximation and
+/// actionable notices. No returned tool proposal is executed by this API.
+#[derive(Debug, Clone)]
+pub struct DetailedTurnOutcome {
+    pub outcome: TurnOutcome,
+    pub estimate: orbit_engine::context_budget::RequestEstimate,
+    pub context_notices: Vec<String>,
+}
+
+/// Keep policy notices and any completed measurement when local admission or
+/// provider dispatch fails. An estimate does not imply admission or egress.
+#[derive(Debug, Clone)]
+pub struct DetailedTurnFailure {
+    pub code: &'static str,
+    pub message: String,
+    pub context_notices: Vec<String>,
+    pub estimate: Option<Box<orbit_engine::context_budget::RequestEstimate>>,
+}
+
+fn append_unknown_media_notice(
+    notices: &mut Vec<String>,
+    estimate: Option<&orbit_engine::context_budget::RequestEstimate>,
+) {
+    if estimate.is_some_and(|estimate| {
+        estimate.status == orbit_engine::context_budget::EstimateStatus::UnknownMedia
+    }) {
+        notices.push(
+            "Media or opaque request cost is unknown; provider capacity is unverified.".into(),
+        );
+    }
+}
+
 /// Run one prompt through the configured gateway via the four-gate async
-/// dispatch pipeline. Shared by `orbit ask` (single-turn) and the interactive
-/// REPL (multi-turn with a transcript + live observer).
+/// dispatch pipeline. This compatibility API returns one round and its tool
+/// proposals; it never executes them or invokes a summarizer.
 ///
 /// - `gate` / `model`: resolved by the caller (flags → env → defaults).
 /// - `messages`: `Some(transcript)` for multi-turn chat, `None` for the
@@ -1065,9 +1097,8 @@ pub fn run_turn(
     )
 }
 
-/// `run_turn` with an explicit tool set. `/compact` passes an EMPTY list:
-/// a summarization request must not advertise tools (a tool-happy model
-/// would answer with calls instead of the summary text).
+/// `run_turn` with an explicit tool set. Detailed policy notices are available
+/// through `run_turn_with_tools_detailed`; the legacy result remains unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn_with_tools(
     home: &Path,
@@ -1083,11 +1114,106 @@ pub fn run_turn_with_tools(
     tools: Vec<orbit_adapter::types::ToolDefinition>,
     session_id: &str,
 ) -> Result<TurnOutcome, (&'static str, String)> {
+    run_turn_with_tools_detailed(
+        home,
+        provider_id,
+        gate,
+        model,
+        credential_env,
+        pricing,
+        prompt,
+        messages,
+        observer,
+        cancel,
+        tools,
+        session_id,
+    )
+    .map(|result| result.outcome)
+    .map_err(|error| (error.code, error.message))
+}
+
+/// The selected-only detailed form of `run_turn`. Its unused compaction role is
+/// neither resolved nor dispatched.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_detailed(
+    home: &Path,
+    provider_id: &str,
+    gate: &str,
+    model: &str,
+    credential_env: Option<&str>,
+    pricing: Option<crate::config::Pricing>,
+    prompt: &str,
+    messages: Option<Vec<orbit_adapter::types::ChatMessage>>,
+    observer: orbit_provider_http::stream::StreamObserver<'_>,
+    cancel: orbit_provider_http::CancelToken,
+) -> Result<DetailedTurnOutcome, DetailedTurnFailure> {
+    run_turn_with_tools_detailed(
+        home,
+        provider_id,
+        gate,
+        model,
+        credential_env,
+        pricing,
+        prompt,
+        messages,
+        observer,
+        cancel,
+        tools::tool_definitions(),
+        &format!("ask-{}", ulid::Ulid::new()),
+    )
+}
+
+/// Resolve the final selected configuration, admit its exact immutable request,
+/// then make one dispatch. Supplied history and returned tool calls remain data.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_with_tools_detailed(
+    home: &Path,
+    provider_id: &str,
+    gate: &str,
+    model: &str,
+    credential_env: Option<&str>,
+    pricing: Option<crate::config::Pricing>,
+    prompt: &str,
+    messages: Option<Vec<orbit_adapter::types::ChatMessage>>,
+    observer: orbit_provider_http::stream::StreamObserver<'_>,
+    cancel: orbit_provider_http::CancelToken,
+    tools: Vec<orbit_adapter::types::ToolDefinition>,
+    session_id: &str,
+) -> Result<DetailedTurnOutcome, DetailedTurnFailure> {
     let config = try_engine_turn_config(home, provider_id, gate, model, credential_env, pricing)
-        .map_err(|error| ("E1106", error))?;
-    orbit_engine::run_dispatch(
+        .map_err(|message| DetailedTurnFailure {
+            code: "E1106",
+            message,
+            context_notices: Vec::new(),
+            estimate: None,
+        })?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| DetailedTurnFailure {
+            code: "ORBIT-E0413",
+            message: model_limits::BudgetError::ObservationTimeUnavailable.to_string(),
+            context_notices: Vec::new(),
+            estimate: None,
+        })?
+        .as_secs();
+    let report =
+        model_limits::resolve_turn_budget_detailed(home, &config, now_unix).map_err(|error| {
+            DetailedTurnFailure {
+                code: "ORBIT-E0413",
+                message: error.to_string(),
+                context_notices: Vec::new(),
+                estimate: None,
+            }
+        })?;
+    let mut context_notices: Vec<_> = report
+        .notices
+        .iter()
+        .map(|notice| model_limits::turn_budget_notice("Selected", notice))
+        .collect();
+    let result = orbit_engine::run_budgeted_dispatch(
         home,
         &config,
+        &report.budget,
         prompt,
         messages,
         observer,
@@ -1096,6 +1222,22 @@ pub fn run_turn_with_tools(
         "orbit-cli",
         session_id,
     )
+    .map_err(|error| {
+        let mut notices = context_notices.clone();
+        append_unknown_media_notice(&mut notices, error.estimate.as_deref());
+        DetailedTurnFailure {
+            code: error.code,
+            message: error.message,
+            context_notices: notices,
+            estimate: error.estimate,
+        }
+    })?;
+    append_unknown_media_notice(&mut context_notices, Some(&result.estimate));
+    Ok(DetailedTurnOutcome {
+        outcome: result.outcome,
+        estimate: result.estimate,
+        context_notices,
+    })
 }
 #[cfg(test)]
 mod tests {

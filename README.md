@@ -122,6 +122,12 @@ It does not add every model in the catalog. `provider list`, `models`
 and `doctor` stay offline. See [discovery and refresh](docs/setup.md#discover-models-and-refresh-limits)
 for catalog controls and custom provider schemas.
 
+Context budgets follow the selected model across routing, resumed sessions and
+child agents. The context display is an estimate; missing limits use a visible
+64,000-token combined fallback policy. Set `context_limits` in `providers.toml`
+to declare your own input or combined ceiling, or require a known limit before
+sending. See [context limits](docs/setup.md#context-limits-and-automatic-compaction).
+
 For an existing provider, choose how to sign in:
 
 ```sh

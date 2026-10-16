@@ -2086,4 +2086,233 @@ mod context_frontend_tests {
         assert_eq!(saved.to_transcript(), expected);
         drop(lease);
     }
+
+    fn direct_ask(
+        f: &ContextFixture,
+        prompt: &str,
+    ) -> Result<orbit_cli::TurnOutcome, (&'static str, String)> {
+        let config = orbit_cli::checked_model_turn(
+            &f.fixture.home,
+            &format!("provider_b/{RAW}"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        orbit_cli::run_turn_with_tools(
+            &f.fixture.home,
+            &config.provider_id,
+            &config.gate,
+            &config.model,
+            config.credential_env.as_deref(),
+            None,
+            prompt,
+            None,
+            None,
+            orbit_provider_http::CancelToken::new(),
+            vec![],
+            "direct-context-ask",
+        )
+    }
+    #[test]
+    fn context_ask_oldapi_selected_limit_refuses_before_single_dispatch() {
+        let f = ContextFixture::new(
+            Some(json!({"input_tokens":1})),
+            1024,
+            json!({"input_tokens":50_000}),
+        );
+        let result = direct_ask(&f, "preserve the one-shot request contract");
+        f.assert_no_calls();
+        let (_, message) = result.expect_err("direct ask must enforce selected input policy");
+        assert!(message.contains("context budget"));
+    }
+    #[test]
+    fn context_ask_oldapi_requested_output_above_combined_limit_refuses() {
+        let f = ContextFixture::new(
+            Some(json!({"combined_tokens":512})),
+            1024,
+            json!({"input_tokens":50_000}),
+        );
+        let result = direct_ask(&f, "inspect one request");
+        f.assert_no_calls();
+        assert!(result.unwrap_err().1.contains("context budget"));
+    }
+    #[test]
+    fn context_ask_oldapi_strict_missing_limit_refuses_without_dispatch() {
+        let f = ContextFixture::new(
+            Some(json!({"unknown_policy":"require-limit"})),
+            1024,
+            json!({"input_tokens":50_000}),
+        );
+        let result = direct_ask(&f, "inspect one request");
+        f.assert_no_calls();
+        assert!(result.unwrap_err().1.contains("context limit required"));
+    }
+    #[test]
+    fn context_ask_oldapi_fitting_single_dispatch_keeps_exact_request_controls() {
+        let f = ContextFixture::new(
+            Some(json!({"combined_tokens":128_000})),
+            1024,
+            json!({"unknown_policy":"require-limit"}),
+        );
+        let outcome = direct_ask(&f, "inspect one request").unwrap();
+        let (a, b, c) = f.calls();
+        assert!(a.is_empty() && c.is_empty());
+        assert_eq!(
+            b.len(),
+            1,
+            "one-shot ask must not invoke its unused summary role"
+        );
+        f.assert_call(&f.fixture.b, KEY_B, 1024, "high", true);
+        assert_eq!(outcome.output, "owned fixture reply");
+    }
+
+    #[test]
+    fn context_ask_oldapi_returns_tool_call_without_executing_or_followup() {
+        let f = ContextFixture::new(
+            Some(json!({"combined_tokens":128_000})),
+            1024,
+            json!({"unknown_policy":"require-limit"}),
+        );
+        let target = f
+            .fixture
+            .workspace
+            .join("one-shot-tool-must-not-execute.txt");
+        f.fixture.b.mode(
+            json!({"tool":"Write","arguments":{"file_path":target,"content":"unexpected effect"}}),
+        );
+        let config = orbit_cli::checked_model_turn(
+            &f.fixture.home,
+            &format!("provider_b/{RAW}"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let tools = orbit_tools::tool_definitions()
+            .into_iter()
+            .filter(|tool| tool.name == "Write")
+            .collect();
+        let result = orbit_cli::run_turn_with_tools(
+            &f.fixture.home,
+            &config.provider_id,
+            &config.gate,
+            &config.model,
+            config.credential_env.as_deref(),
+            None,
+            "inspect one tool proposal",
+            None,
+            None,
+            orbit_provider_http::CancelToken::new(),
+            tools,
+            "single-dispatch-tools",
+        )
+        .unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "Write");
+        assert_eq!(f.fixture.b.calls().len(), 1);
+        assert!(f.fixture.a.calls().is_empty() && f.summary.calls().is_empty());
+        assert!(
+            !target.exists(),
+            "single-dispatch ask only returns proposed tools"
+        );
+    }
+    #[test]
+    fn context_ask_binary_fallback_notice_is_visible_without_summary_resolution() {
+        let f = ContextFixture::new(None, 1024, json!({"unknown_policy":"require-limit"}));
+        let mut command = f.command(env!("CARGO_BIN_EXE_orbit"));
+        command.args([
+            "ask",
+            "inspect one request",
+            "--model",
+            &format!("provider_b/{RAW}"),
+        ]);
+        let (stdout, stderr) = bounded_process(command, &f.fixture.root, "");
+        let value: Value =
+            serde_json::from_str(&stdout).expect("ask preserves its JSON stdout contract");
+        assert_eq!(value["output"], "owned fixture reply", "{stdout} {stderr}");
+        assert_eq!(f.fixture.b.calls().len(), 1);
+        assert!(f.fixture.a.calls().is_empty() && f.summary.calls().is_empty());
+        let notices = value["context_notices"]
+            .as_array()
+            .expect("actual ask must report fallback policy");
+        assert!(notices.iter().any(|n| {
+            n.as_str()
+                .is_some_and(|s| s.contains("fallback") && s.contains("64000"))
+        }));
+        for secret in [KEY_A, KEY_B, KEY_C, QUERY] {
+            assert!(!stdout.contains(secret) && !stderr.contains(secret));
+        }
+    }
+
+    #[test]
+    fn context_ask_detailed_failed_media_request_retains_unknown_cost_warning() {
+        let f = ContextFixture::new(
+            Some(json!({"input_tokens":128_000})),
+            1024,
+            json!({"unknown_policy":"require-limit"}),
+        );
+        f.fixture.b.mode(json!({"disconnect":true}));
+        let mut message = text(ChatRole::User, "inspect image".into());
+        message.blocks = Some(vec![
+            ContentBlock::Text {
+                text: "inspect image".into(),
+            },
+            ContentBlock::Image {
+                data: IMAGE.into(),
+                media_type: "image/png".into(),
+            },
+        ]);
+        let config = orbit_cli::checked_model_turn(
+            &f.fixture.home,
+            &format!("provider_b/{RAW}"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let failure = orbit_cli::run_turn_with_tools_detailed(
+            &f.fixture.home,
+            &config.provider_id,
+            &config.gate,
+            &config.model,
+            config.credential_env.as_deref(),
+            None,
+            "inspect image",
+            Some(vec![message]),
+            None,
+            orbit_provider_http::CancelToken::new(),
+            vec![],
+            "failed-media-ask",
+        )
+        .unwrap_err();
+        assert_eq!(
+            f.fixture.b.calls().len(),
+            1,
+            "failed ask must not retry an uncertain request"
+        );
+        assert!(f.fixture.a.calls().is_empty() && f.summary.calls().is_empty());
+        assert!(
+            failure.context_notices.iter().any(|notice| {
+                let notice = notice.to_ascii_lowercase();
+                notice.contains("unknown")
+                    && (notice.contains("media") || notice.contains("opaque"))
+            }),
+            "failed request must retain the preflight unknown-media warning"
+        );
+        assert!(
+            std::fs::read_dir(&f.fixture.workspace)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        for secret in [KEY_A, KEY_B, KEY_C, QUERY] {
+            assert!(
+                !failure
+                    .context_notices
+                    .iter()
+                    .any(|notice| notice.contains(secret))
+            );
+        }
+    }
 }

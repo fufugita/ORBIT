@@ -734,7 +734,7 @@ fn credential_query_cannot_enter_resolved_identity_but_benign_query_is_preserved
         f.config.provider[0].url =
             format!("https://example.invalid/v1?{key}=PRIVATE_QUERY_CREDENTIAL");
         let error = resolve_model(&f.config, "local/base", None).unwrap_err();
-        assert!(error.contains("credential query"));
+        assert!(error.contains("query") && error.contains("credential-free"));
         assert!(!error.contains("PRIVATE_QUERY_CREDENTIAL"));
         assert!(validate_settings(&f.config, &f.settings).is_err());
     }

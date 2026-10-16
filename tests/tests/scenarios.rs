@@ -1106,14 +1106,14 @@ fn gate4_rewind_restores_recorded_digests() {
 }
 
 // ── K1: compaction keeps the question and emits one turn_ended ────
-// Fails on main: B6 — the whole transcript including the current
-// prompt is replaced by a summary, and the nested summary turn leaks
-// its own `turn_ended` (and `text_delta`s) onto the shared sink.
+// A reducible saved history triggers real compaction while the full
+// current prompt remains immutable and summary events stay private.
 #[test]
 fn scenario_k1_compaction_keeps_the_question() {
-    // A long prompt (~54 KB of filler ending with a question) over a
-    // 20,000-token window forces compaction before the first dispatch.
-    // The summary request is keyed "Summarize this conversation".
+    const SESSION: &str = "k1-compact-seeded";
+    const INPUT: u64 = 65_536;
+    // Keep the entire long current prompt. Older saved text, rather
+    // than truncating this intent, provides the reducible prefix.
     let filler = "A".repeat(54 * 1024);
     let question = "WHAT IS THE MEANING OF LIFE, THE UNIVERSE AND EVERYTHING?";
     let prompt = format!("{filler}\n\n{question}");
@@ -1127,10 +1127,60 @@ fn scenario_k1_compaction_keeps_the_question() {
         ]
     });
     let mock = Mock::start(&script, "openai");
-    let home = Home::init(&mock, "openai", "context_window = 20000\n");
+    let home = Home::init(
+        &mock,
+        "openai",
+        "max_output_tokens = 256\n[provider.models.context_limits]\ninput_tokens = 65536\n\n[[provider.models]]\nid = 'mock-summary'\nmax_output_tokens = 128\n[provider.models.context_limits]\ninput_tokens = 262144\n\n[roles]\ncompaction = 'mock/mock-summary'\n",
+    );
     let fix = Fixture::failing_test();
 
-    let (events, code) = run_p(&mock, &home, &fix.path, &prompt, &["--auto-tools"]);
+    let mut history = Vec::new();
+    for index in 0..6 {
+        history.push(orbit_engine::user_message(format!(
+            "old-user-{index}: {}",
+            "u".repeat(32_768)
+        )));
+        history.push(orbit_engine::assistant_message(format!(
+            "old-assistant-{index}: {}",
+            "a".repeat(32_768)
+        )));
+    }
+    for index in 0..3 {
+        history.push(orbit_engine::user_message(format!("recent-user-{index}")));
+        history.push(orbit_engine::assistant_message(format!(
+            "recent-assistant-{index}"
+        )));
+    }
+    assert!(
+        history[..12]
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>()
+            > 4 * INPUT as usize
+    );
+    let saved = orbit_cli::sessions::SessionFile::from_chat(
+        SESSION,
+        "mock-model",
+        &format!("http://127.0.0.1:{}", mock.port),
+        "mock",
+        &history,
+        9,
+        0,
+        0,
+        0,
+    );
+    {
+        let lease =
+            orbit_cli::sessions::SessionLease::acquire(&home.path, SESSION, "fixture").unwrap();
+        lease.save(&saved).unwrap();
+    }
+    let (events, code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        &prompt,
+        &["--auto-tools", "--resume", SESSION, "--bare"],
+    );
 
     // 1. Exactly ONE turn_ended: the summary's nested turn must not
     //    leak its own turn_ended onto the stream.
@@ -1143,6 +1193,33 @@ fn scenario_k1_compaction_keeps_the_question() {
     // 2. The question survives compaction VERBATIM: the request the
     //    model answered must contain it, not a 94-char digest.
     let reqs = mock.requests();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "one bounded summary, then one ordinary continuation"
+    );
+    assert_eq!(reqs[0]["body"]["model"], "mock-summary");
+    assert_eq!(reqs[0]["body"]["max_tokens"], 128);
+    assert!(reqs[0]["body"].get("tools").is_none());
+    assert!(
+        !serde_json::to_string(&reqs[0]["body"]["messages"])
+            .unwrap()
+            .contains(question)
+    );
+    assert_eq!(reqs[1]["body"]["model"], "mock-model");
+    assert_eq!(reqs[1]["body"]["max_tokens"], 256);
+    let current = reqs[1]["body"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    assert_eq!(
+        current["content"].as_str(),
+        Some(prompt.as_str()),
+        "the entire current prompt must survive verbatim"
+    );
     let answered = serde_json::to_string(&reqs.last().expect("a request")["body"]["messages"])
         .expect("messages");
     assert!(
@@ -1155,13 +1232,82 @@ fn scenario_k1_compaction_keeps_the_question() {
         .iter()
         .filter_map(|e| e.get("type").and_then(|t| t.as_str()).map(String::from))
         .collect();
-    assert!(
-        types.contains(&"compacting".to_string()) || types.contains(&"compacted".to_string()),
-        "K1: with a 20000-token window and a 54 KB prompt the session must compact: {types:?}"
+    assert_eq!(
+        count(&events, "compacting"),
+        1,
+        "K1: the old prefix must trigger a bounded summary: {types:?}"
+    );
+    assert_eq!(
+        count(&events, "compacted"),
+        1,
+        "K1: the fitting reduction must actually be applied: {types:?}"
+    );
+    let compacting = events
+        .iter()
+        .find(|event| event["type"] == "compacting")
+        .unwrap();
+    let compacted = events
+        .iter()
+        .find(|event| event["type"] == "compacted")
+        .unwrap();
+    let before = compacting["used_tokens"].as_u64().unwrap();
+    let after = compacted["after_tokens"].as_u64().unwrap();
+    assert_eq!(compacting["window_tokens"].as_u64(), Some(INPUT));
+    assert!(before > INPUT && after > 0 && after <= INPUT && after < before);
+    let at = |kind: &str| {
+        types
+            .iter()
+            .position(|value| value.as_str() == kind)
+            .unwrap()
+    };
+    assert!(at("compacting") < at("compacted") && at("compacted") < at("turn_ended"));
+    let visible: String = events
+        .iter()
+        .filter(|event| event["type"] == "text_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect();
+    assert_eq!(
+        visible, "42",
+        "private summary deltas must not reach the ordinary stream"
+    );
+    assert_eq!(
+        count(&events, "usage"),
+        1,
+        "summary occupancy stays private"
     );
 
     // 4. The turn completes normally.
     assert_eq!(code, 0, "the turn completes after compaction");
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event["type"] == "turn_ended")
+            .unwrap()["ok"],
+        true
+    );
+    let resumed = orbit_cli::sessions::load_session(&home.path, SESSION).unwrap();
+    assert_eq!(resumed.provider, "mock");
+    assert_eq!(resumed.model, "mock-model");
+    assert_eq!(resumed.turns, 10);
+    assert!(resumed.transcript.len() < history.len() + 2);
+    assert_eq!(resumed.transcript.last().unwrap().content, "42");
+    assert!(
+        history[..12]
+            .iter()
+            .any(|message| !resumed.transcript.contains(message)),
+        "some old source must be replaced by the applied summary"
+    );
+    let mut required = history[history.len() - 4..].to_vec();
+    required.push(orbit_engine::user_message(prompt));
+    let end = resumed.transcript.len() - 1;
+    assert!(end >= required.len());
+    assert_eq!(
+        &resumed.transcript[end - required.len()..end],
+        required.as_slice(),
+        "the newest complete exchanges and full current intent remain exact"
+    );
+    let summary = compacted["summary"].as_str().unwrap();
+    assert!(!summary.trim().is_empty() && resumed.transcript[0].content.contains(summary));
 }
 
 // ── S5: session state is not process-wide env ─────────────────────
@@ -1274,40 +1420,67 @@ fn scenario_s4_spoken_rules_off_by_default() {
 }
 
 // ── E3: the context meter shows occupancy, not traffic ─────────────
-// used_tokens was the SUM of every round's input — four rounds of
-// ~100 prompt tokens showed "context 460/200000". The meter must show
-// the LAST round's occupancy (input + cache), which is what the
-// window actually holds after the final request.
+// The meter uses the current provider occupancy with a whole-request
+// prepared estimate as its floor; cumulative traffic remains separate.
 #[test]
 fn scenario_e3_context_meter_last_round_not_sum() {
-    // Two rounds: round 1 carries 100 input tokens, round 2 carries
-    // 230 (the transcript grew: prompt + tool result + reply).
+    // Provider counts dominate the real prepared body in this fixture,
+    // so the last occupancy can be distinguished from cumulative traffic.
     let script: serde_json::Value = serde_json::json!({
         "main": [
-            {"ptok": 100,
+            {"ptok": 10000,
              "tools": [{"name": "Glob", "args": {"pattern": "*.py"}}]},
-            {"ptok": 230, "text": "done"}]
+            {"ptok": 23000, "text": "done"}]
     });
     let mock = Mock::start(&script, "anthropic");
-    let home = Home::init(&mock, "anthropic", "context_window = 20000\n");
+    let home = Home::init(
+        &mock,
+        "anthropic",
+        "max_output_tokens = 256\n[provider.models.context_limits]\ninput_tokens = 50000\n",
+    );
     let fix = Fixture::failing_test();
 
-    let (events, code) = run_p(&mock, &home, &fix.path, "use tools", &["--auto-tools"]);
+    let (events, code) = run_p(
+        &mock,
+        &home,
+        &fix.path,
+        "use tools",
+        &["--auto-tools", "--bare"],
+    );
     assert_eq!(code, 0, "the turn completes");
 
-    // The last Usage event must report the LAST round's context
-    // (230), never the sum (330) or round 1 alone (100).
+    // The last Usage is 23000, not first 10000 or cumulative 33000.
     let usage: Vec<_> = events
         .iter()
         .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("usage"))
         .collect();
-    assert!(!usage.is_empty(), "at least one Usage event (E3)");
-    let last = usage.last().unwrap();
-    let used = last["used_tokens"].as_u64().unwrap_or(0);
-    assert!(
-        (230..330).contains(&used),
-        "E3: context meter must show the last round's occupancy ({used} used, expected >=230 and <330 — the sum would be 330):\n{last}"
-    );
+    assert_eq!(usage.len(), 2, "one occupancy event per actual round");
+    assert_eq!(mock.requests().len(), 2);
+    for (event, reported) in usage.iter().zip([10_000, 23_000]) {
+        let prepared: u64 = ["system", "memory", "tools", "messages"]
+            .iter()
+            .map(|key| event["breakdown"][*key].as_u64().unwrap())
+            .sum();
+        assert!(
+            prepared < reported,
+            "provider-count dominance is required by this fixture"
+        );
+        assert_eq!(event["used_tokens"].as_u64(), Some(reported));
+        assert!(
+            event["used_tokens"].as_u64().unwrap() >= prepared,
+            "whole prepared request remains the occupancy floor"
+        );
+        assert_eq!(event["window_tokens"].as_u64(), Some(50_000));
+        assert_eq!(event["breakdown"]["reserve"].as_u64(), Some(0));
+        assert_eq!(event["breakdown"]["compact_at"].as_u64(), Some(45_000));
+    }
+    assert_eq!(count(&events, "compacting"), 0);
+    let visible: String = events
+        .iter()
+        .filter(|event| event["type"] == "text_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect();
+    assert_eq!(visible, "done");
 
     // Cost accounting still sums every round (turn_ended carries the
     // totals — unaffected by the meter fix).
@@ -1315,11 +1488,13 @@ fn scenario_e3_context_meter_last_round_not_sum() {
         .iter()
         .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended"))
         .collect();
-    assert!(!ended.is_empty(), "turn_ended present");
-    assert!(
-        ended[0]["input_tokens"].as_u64().unwrap_or(0) >= 330,
-        "E3: turn_ended input_tokens still sums rounds (>=330):\n{}",
-        ended[0]
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0]["ok"], true);
+    assert_eq!(ended[0]["rounds"].as_u64(), Some(2));
+    assert_eq!(
+        ended[0]["input_tokens"].as_u64(),
+        Some(33_000),
+        "cumulative input still sums both billed rounds"
     );
 }
 
@@ -1386,18 +1561,17 @@ fn scenario_e4_result_verdict_typed_not_substring() {
     );
 }
 
-// ── E5: a stalled stream times out between chunks and retries ─────
-// Once headers arrive, a stream that never sends another byte used to
-// hang the turn forever. Now the first gap gets first_byte_timeout and
-// later gaps idle_timeout, both failing as retryable E0409.
+// ── E5: admitted streams time out without replay; refusals retry ───
+// A response admitted before an idle timeout is uncertain even without
+// visible text. Retry remains available for a refusal before admission.
 #[test]
-fn scenario_e5_stalled_stream_times_out_and_retries() {
+fn scenario_e5_stalled_stream_times_out_without_replay() {
     let script: serde_json::Value = serde_json::json!({
         "main": [
-            // Attempt 1: headers, one chunk of real SSE, then silence
+            // Headers, one valid chunk of SSE, then silence
             // for 30 s — far beyond the test's 2 s idle timeout.
             {"stall_ms": 30000, "stall_bytes": "data: {\"choices\":[{\"index\":0,\"delta\":{}}]}\n\n"},
-            // Attempt 2 (after the retry): a normal reply.
+            // This must not be consumed by an unsafe automatic replay.
             {"text": "recovered after retry"}]
     });
     let mock = Mock::start(&script, "openai");
@@ -1420,40 +1594,90 @@ fn scenario_e5_stalled_stream_times_out_and_retries() {
         .current_dir(&fix.path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let started = std::time::Instant::now();
     let out = cmd.output().expect("run orbit -p");
+    let elapsed = started.elapsed();
     let events: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "the turn completes after the retry"
+        Some(1),
+        "an admitted stalled response fails without automatic replay"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1500)
+            && elapsed < std::time::Duration::from_secs(10),
+        "the configured idle timeout must fire, not an immediate wire error or an unbounded stall: {elapsed:?}"
+    );
+    assert_eq!(count(&events, "turn_ended"), 1);
+    let ended = events
+        .iter()
+        .find(|event| event["type"] == "turn_ended")
+        .unwrap();
+    assert_eq!(ended["ok"], false);
+    assert_eq!(ended["interrupted"], false);
+    assert_eq!(count(&events, "retrying"), 0);
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "an admitted response must never be replayed"
+    );
+    assert!(
+        events.iter().any(|event| {
+            if event["type"] != "error" {
+                return false;
+            }
+            let message = event["message"].as_str().unwrap_or("").to_ascii_lowercase();
+            message.contains("e0409") && (message.contains("stall") || message.contains("timeout"))
+        }),
+        "a real idle timeout must surface as E0409: {events:?}"
+    );
+    assert!(
+        !serde_json::to_string(&events)
+            .unwrap()
+            .contains("recovered after retry")
+    );
+    let failed = orbit_cli::sessions::list_sessions(&home.path).unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].transcript.len(), 1);
+    assert_eq!(
+        failed[0].transcript[0],
+        orbit_engine::user_message("try to answer")
     );
 
-    // Exactly one turn_ended (the stall was retried, not fatal).
-    assert_eq!(
-        count(&events, "turn_ended"),
-        1,
-        "E5: stalled stream retried to completion"
+    // A refusal before a successful stream is admitted can still retry.
+    let retry_mock = Mock::start(
+        &serde_json::json!({"main":[
+            {"status":503}, {"text":"recovered after refusal"}
+        ]}),
+        "openai",
     );
-    // The retry actually happened: two provider requests.
-    assert!(
-        mock.requests().len() >= 2,
-        "E5: the stalled request was retried ({} requests)",
-        mock.requests().len()
+    let retry_home = Home::init(&retry_mock, "openai", "");
+    let (retry_events, retry_code) = run_p(
+        &retry_mock,
+        &retry_home,
+        &fix.path,
+        "try after refusal",
+        &[],
     );
-    // The final text arrived.
-    assert!(
-        events.iter().any(|e| {
-            e.get("type").and_then(|t| t.as_str()) == Some("text_delta")
-                && e.get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .contains("recovered")
-        }),
-        "E5: the recovered reply streamed after the retry"
-    );
+    assert_eq!(retry_code, 0);
+    assert_eq!(retry_mock.requests().len(), 2);
+    assert_eq!(count(&retry_events, "retrying"), 1);
+    assert_eq!(count(&retry_events, "turn_ended"), 1);
+    let retry_ended = retry_events
+        .iter()
+        .find(|event| event["type"] == "turn_ended")
+        .unwrap();
+    assert_eq!(retry_ended["ok"], true);
+    assert_eq!(retry_ended["interrupted"], false);
+    let visible: String = retry_events
+        .iter()
+        .filter(|event| event["type"] == "text_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect();
+    assert_eq!(visible, "recovered after refusal");
 }
 
 // ── E7: the ledger ties every call to one session id ──────────────

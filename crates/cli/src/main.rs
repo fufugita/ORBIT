@@ -1214,7 +1214,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     let credential_env = turn.credential_env.as_deref();
     let pricing = cfg.pricing_for_model(&model);
 
-    let outcome = orbit_cli::run_turn(
+    let detailed = match orbit_cli::run_turn_detailed(
         home,
         provider_id,
         resolved_gate,
@@ -1225,7 +1225,27 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         None,
         None,
         orbit_provider_http::CancelToken::new(),
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            for notice in &error.context_notices {
+                eprintln!("{}", orbit_hud_tui::safe_text(notice));
+            }
+            return Err((error.code, error.message));
+        }
+    };
+    for notice in &detailed.context_notices {
+        eprintln!("{}", orbit_hud_tui::safe_text(notice));
+    }
+    let estimate_status = match detailed.estimate.status {
+        orbit_engine::context_budget::EstimateStatus::Approximate => "approximate",
+        orbit_engine::context_budget::EstimateStatus::UnknownMedia => "unknown_media",
+    };
+    eprintln!(
+        "context estimate: {} text tokens, {} requested output tokens ({estimate_status})",
+        detailed.estimate.estimated_input_tokens, detailed.estimate.requested_output_tokens,
+    );
+    let outcome = detailed.outcome;
     Ok(serde_json::json!({
         "schema": "orbit.cli/v1",
         "command": "ask",
@@ -1233,6 +1253,14 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         "model": model,
         "output": outcome.output,
         "ledger_recorded": true,
+        "context_notices": detailed.context_notices,
+        "context_estimate": {
+            "status":estimate_status,
+            "body_bytes":detailed.estimate.body_bytes,
+            "text_bytes":detailed.estimate.text_bytes,
+            "estimated_input_tokens":detailed.estimate.estimated_input_tokens,
+            "requested_output_tokens":detailed.estimate.requested_output_tokens,
+        },
         "usage": {
             "input_tokens": outcome.input_tokens,
             "output_tokens": outcome.output_tokens,

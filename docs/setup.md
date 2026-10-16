@@ -181,9 +181,9 @@ supports up to 128 distinct models.
 
 A complete catalog and successful completions are separate checks. If the
 catalog is partial, ORBIT asks before using its partial results. An unavailable
-catalog offers manual entry. Context and output limits are used only when the
-provider advertises valid values; names do not imply a context size. Missing
-information stays unknown. Ollama's advertised architectural context is not a
+catalog offers manual entry. Valid catalog limits are recorded; runtime budgets
+use only fresh observations with documented semantics, as described below.
+Names do not imply a context size. Missing information stays unknown. Ollama's advertised architectural context is not a
 measurement of the context configured in a running local model.
 
 Discovery supports OpenAI-compatible lists, OpenRouter catalogs, Anthropic
@@ -220,6 +220,59 @@ Hidden-key setup normally creates a fresh credential reference. The advanced
 privately. A nonempty value in that exact ENV takes precedence over the saved
 key during discovery and later requests. Use ordinary `key` when you do not
 need a deliberate ENV override.
+
+## Context limits and automatic compaction
+
+Each configured model can declare an explicit context policy. Edit its existing
+`[[provider.models]]` entry in `providers.toml`, for example:
+
+```toml
+[[provider.models]]
+id = "family/model"
+max_output_tokens = 8192
+context_limits = { combined_tokens = 128000 }
+```
+
+Use `input_tokens` for an input-only ceiling. Use `combined_tokens` when the
+ceiling includes input and requested output; ORBIT reserves the actual selected
+`max_output_tokens`. You may set both when both constraints apply. These values
+are your policy, so use limits appropriate to your endpoint and account. Model
+names and catalog labels do not establish capacity.
+
+Without an explicit policy, ORBIT uses fresh documented observations for the
+exact provider, endpoint and model when available. Identifiable manual input
+overrides survive refresh. Ambiguous old `context_window` values remain saved
+and produce a migration notice; declare their intended meaning with
+`context_limits.input_tokens` or `context_limits.combined_tokens`.
+
+Observations expire after one hour by default. `max_age_seconds` accepts 1 to
+604800. Refreshing a catalog renews only values actually fetched; reading,
+saving, routing or resuming does not renew them. Unsupported catalog metadata
+and stale observations do not become fresh capacity facts. Requests never
+silently fetch a catalog to resolve a budget.
+
+Unknown text capacity uses a visible 64,000-token **combined fallback policy**.
+It is configurable and does not guarantee provider fit. Choose another fallback
+or refuse locally when no usable limit is available:
+
+```toml
+context_limits = { fallback_combined_tokens = 96000 }
+# Or require an explicit limit or fresh documented observation:
+# context_limits = { unknown_policy = "require-limit" }
+```
+
+The text estimate includes the rendered system instructions, tool schemas,
+messages and request framing. Image and opaque-media costs remain unknown;
+supported media is preserved with a warning by default. Add
+`media_policy = "refuse"` inside `context_limits` for strict local refusal.
+
+Automatic compaction uses the selected conversation model's policy and the
+separate `compaction` role's own policy, credentials, output and effort. An unsuccessful
+automatic summary or local context-budget refusal retains the conversation and
+current prompt. Context
+occupancy, output reserve and compaction threshold are separate from cumulative
+input/output traffic. Estimates are approximate, including when a provider
+advertises a limit.
 
 ## Read readiness accurately
 
