@@ -41,9 +41,11 @@ body {
 #logo svg circle:nth-child(2) { transform-origin: 16px 16px; animation: orbit 6s linear infinite; }
 @keyframes orbit { to { transform: rotate(360deg); } }
 
-#statusbar { display: flex; gap: 14px; flex: 1; overflow: hidden; }
+#statusbar { display: flex; gap: 4px 14px; flex: 1; min-width: 0; flex-wrap: wrap; }
 .st { color: var(--dim); white-space: nowrap; }
 .st::before { content: attr(data-k) ": "; color: var(--faint); }
+#statusbar .st { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+#statusbar #st-context { order: -1; flex: 1 0 100%; white-space: normal; overflow-wrap: anywhere; color: var(--text); }
 
 #conn { display: flex; align-items: center; gap: 6px; color: var(--dim); }
 #conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
@@ -186,6 +188,11 @@ button:hover { color: var(--text); border-color: var(--accent-dim); }
 #effort-provenance, #effort-status { color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; margin: 7px 0 0; }
 button:disabled, select:disabled { opacity: .5; cursor: default; }
 @media (max-width: 900px) { #work-pane { display: flex; max-height: 180px; border-top: 1px solid var(--line); } #work-pane > h2:not(:first-child), #activity-list, #usage { display: none; } #panes { grid-template-rows: 1fr auto; } }
+@media (max-width: 900px) {
+  #topbar { flex-wrap: wrap; gap: 8px 12px; }
+  #conn { margin-left: auto; }
+  #statusbar { order: 1; flex: 1 0 100%; gap: 4px 12px; }
+}
 
 /* Portable profile presentation uses individual bounded properties. */
 body { font-size: var(--font-size, 13.5px); }

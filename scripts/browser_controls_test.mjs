@@ -55,4 +55,100 @@ check('stale_ack_cannot_roll_back_stream_or_identity',(ok)=>{const f=fixture();f
 check('ordered_acceptance_renders_user_once_and_completion_uses_session_totals',(ok)=>{const f=fixture();f.recover(f.snapshot({turns:4,input_tokens:100,output_tokens:50,cost_microcents:1000}));f.current().message({type:'action_ack',snapshot:f.snapshot({cursor:{instance:'fixture-owner',sequence:8}})});f.streams[0].emit('request_accepted',{message:{role:'user',text:'accepted prompt'},_cursor:{instance:'fixture-owner',sequence:2}});f.streams[0].emit('text_delta',{text:'answer',_cursor:{instance:'fixture-owner',sequence:3}});f.streams[0].emit('turn_ended',{input_tokens:3,output_tokens:2,_cursor:{instance:'fixture-owner',sequence:4}});f.streams[0].emit('request_finished',{turns:5,input_tokens:103,output_tokens:52,cost_microcents:1200,_cursor:{instance:'fixture-owner',sequence:5}});ok(f.nodes.get('transcript').textContent.split('accepted prompt').length===2);ok(f.nodes.get('us-in').textContent==='103');ok(f.nodes.get('us-out').textContent==='52');ok(f.nodes.get('st-turns').textContent==='5');});
 check('resume_projects_ordered_transcript_and_typed_settings',(ok)=>{const f=fixture();f.recover(f.snapshot({messages:[{role:'assistant',text:'old session'}]}));const state=f.snapshot({session_id:'new-session',model:'new-model',turns:7,input_tokens:800,output_tokens:90,cost_microcents:123});f.streams[0].emit('transcript',{...state,settings:state,messages:[{role:'user',text:'saved new session'}],_cursor:{instance:'fixture-owner',sequence:2}});f.current().message({type:'action_ack',snapshot:f.snapshot()});ok(f.nodes.get('transcript').textContent.includes('saved new session'));ok(!f.nodes.get('transcript').textContent.includes('old session'));ok(f.nodes.get('st-model').textContent==='new-model');ok(f.nodes.get('us-in').textContent==='800');});
 check('acks_do_not_erase_tool_activity_or_stream_errors',(ok)=>{const f=fixture();f.recover(f.snapshot());f.streams[0].emit('tool_started_full',{call_id:'tool-a',tool_name:'Read',summary:'safe file',_cursor:{instance:'fixture-owner',sequence:2}});f.streams[0].emit('error',{message:'visible failure',_cursor:{instance:'fixture-owner',sequence:3}});f.current().message({type:'action_ack',snapshot:f.snapshot({cursor:{instance:'fixture-owner',sequence:4}})});ok(f.nodes.get('transcript').textContent.includes('safe file'));ok(f.nodes.get('transcript').textContent.includes('visible failure'));});
+const contextDisplay = f => [...f.nodes.entries()]
+  .filter(([id]) => /context|compact|reserve/.test(id) && !id.startsWith('custom-'))
+  .map(([,node]) => node.textContent).join('\n');
+const allVisibleText = f => [...f.nodes.values()].map(node=>node.textContent).join('\n');
+const hasContextNumber = (text,value) => new RegExp(`(^|[^0-9])${String(value)}([^0-9]|$)`).test(text.replaceAll(',',''));
+const contextUsage = (changes={}) => ({used_tokens:4321,window_tokens:64000,
+  breakdown:{system:100,memory:20,tools:200,messages:4001,compact_at:56576,reserve:1024},...changes});
+const emitContext = (f,kind,value,sequence) => f.streams.at(-1).emit(kind,{...value,_cursor:{instance:'fixture-owner',sequence}});
+
+check('context_sse_usage_renders_estimate_and_preserves_cumulative_totals',ok=>{
+  const f=fixture(); f.recover(f.snapshot({turns:7,input_tokens:99,output_tokens:101}));
+  emitContext(f,'usage',contextUsage(),2);
+  const visible=contextDisplay(f);
+  ok(/estimate|approx/i.test(visible),'actual shipped usage surface labels its approximation');
+  for(const value of [4321,64000,56576,1024]) ok(hasContextNumber(visible,value),`visible actual context number ${value}`);
+  ok(f.nodes.get('us-in').textContent==='99'); ok(f.nodes.get('us-out').textContent==='101');
+  ok(f.nodes.get('st-turns').textContent==='7'); ok(f.current().sent.length===0);
+});
+
+check('context_zero_breakdown_and_maximum_safe_integer_remain_exact',ok=>{
+  const f=fixture(); f.recover(f.snapshot({turns:7,input_tokens:99,output_tokens:101}));
+  emitContext(f,'usage',contextUsage({used_tokens:0,breakdown:{system:0,memory:0,tools:0,messages:0,compact_at:0,reserve:0}}),2);
+  let visible=contextDisplay(f);
+  ok(hasContextNumber(visible,64000));
+  ok((visible.match(/(^|[^0-9])0(?=[^0-9]|$)/g)||[]).length>=3,'zero occupancy, trigger and output reserve are visible');
+  emitContext(f,'usage',contextUsage({used_tokens:Number.MAX_SAFE_INTEGER,window_tokens:Number.MAX_SAFE_INTEGER,
+    breakdown:{system:0,memory:0,tools:0,messages:0,compact_at:Number.MAX_SAFE_INTEGER,reserve:0}}),3);
+  visible=contextDisplay(f); ok(hasContextNumber(visible,Number.MAX_SAFE_INTEGER));
+  ok(f.nodes.get('us-in').textContent==='99'); ok(f.current().sent.length===0);
+});
+
+check('context_duplicate_cursor_and_obsolete_generation_cannot_replace_newer_meter',ok=>{
+  const f=fixture(); f.recover(f.snapshot());
+  emitContext(f,'usage',contextUsage(),5); ok(hasContextNumber(contextDisplay(f),4321));
+  for(const sequence of [4,5]) emitContext(f,'usage',contextUsage({used_tokens:8765,window_tokens:123456}),sequence);
+  ok(hasContextNumber(contextDisplay(f),4321)); ok(!hasContextNumber(contextDisplay(f),8765));
+  const old=f.streams.at(-1); f.current().onclose(); f.runReconnect(); f.ready();
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:6}}));
+  emitContext(f,'usage',contextUsage({used_tokens:3333}),7);
+  old.emit('usage',{...contextUsage({used_tokens:8888}),_cursor:{instance:'fixture-owner',sequence:99}});
+  ok(hasContextNumber(contextDisplay(f),3333)); ok(!hasContextNumber(contextDisplay(f),8888));
+  ok(!f.current().sent.some(action=>action.type==='prompt'));
+});
+
+check('context_session_replacement_and_cold_recovery_do_not_reuse_old_occupancy',ok=>{
+  const f=fixture(); f.recover(f.snapshot()); emitContext(f,'usage',contextUsage(),2);
+  ok(hasContextNumber(contextDisplay(f),4321));
+  f.recover(f.snapshot({session_id:'other-context-session',cursor:{instance:'fixture-owner',sequence:3},input_tokens:8000,output_tokens:9000}));
+  let visible=contextDisplay(f); ok(!hasContextNumber(visible,4321));
+  ok(/unavailable|unknown|—/i.test(visible)); ok(!hasContextNumber(visible,8000),'session traffic is not context occupancy');
+  emitContext(f,'usage',contextUsage({used_tokens:2222}),4); ok(hasContextNumber(contextDisplay(f),2222));
+  f.recover(f.snapshot({session_id:'other-context-session',cursor:{instance:'fixture-owner',sequence:5},input_tokens:8001,output_tokens:9001}));
+  visible=contextDisplay(f); ok(!hasContextNumber(visible,2222)); ok(/unavailable|unknown|—/i.test(visible));
+  ok(f.nodes.get('us-in').textContent==='8001'); ok(f.current().sent.length===0);
+});
+
+check('context_invalid_or_unsafe_numbers_are_unavailable_not_rounded_or_zeroed',ok=>{
+  const f=fixture(); f.recover(f.snapshot({input_tokens:99,output_tokens:101}));
+  let sequence=2;
+  for(const invalid of [
+    {used_tokens:-1}, {used_tokens:'64000'}, {window_tokens:Number.MAX_SAFE_INTEGER+1},
+    {window_tokens:null}, {breakdown:{compact_at:0,reserve:-1}}, {breakdown:{compact_at:null,reserve:0}},
+  ]) {
+    emitContext(f,'usage',contextUsage(),sequence++); ok(hasContextNumber(contextDisplay(f),4321));
+    emitContext(f,'usage',contextUsage(invalid),sequence++);
+    const visible=contextDisplay(f); ok(/unavailable|unknown|—/i.test(visible));
+    ok(!hasContextNumber(visible,4321),'invalid current sample cannot retain a stale valid occupancy');
+    ok(!visible.includes(String(Number.MAX_SAFE_INTEGER+1)));
+  }
+  ok(f.nodes.get('us-in').textContent==='99'); ok(f.nodes.get('us-out').textContent==='101');
+});
+
+check('context_media_warning_stays_visible_beside_approximation_without_fit_claim',ok=>{
+  const f=fixture(); f.recover(f.snapshot());
+  emitContext(f,'status',{text:'Media request cost is unknown; text estimate does not verify provider capacity.'},2);
+  emitContext(f,'usage',contextUsage(),3);
+  ok(f.nodes.get('transcript').textContent.includes('Media request cost is unknown'));
+  const visible=contextDisplay(f); ok(/estimate|approx/i.test(visible)); ok(hasContextNumber(visible,64000));
+  ok(!/guaranteed|verified fit|capacity verified/i.test(visible)); ok(f.current().sent.length===0);
+});
+
+check('context_compaction_events_render_numeric_progress_without_summary_or_actions',ok=>{
+  const f=fixture(); f.recover(f.snapshot()); emitContext(f,'usage',contextUsage(),2);
+  emitContext(f,'compacting',{used_tokens:100000,window_tokens:128000},3);
+  ok(/compacting/i.test(allVisibleText(f)),'actual compacting listener reaches visible state');
+  const summary='<img src=x onerror=alert(1)> private-summary-must-not-render';
+  emitContext(f,'compacted',{summary,after_tokens:2234},4);
+  const visible=allVisibleText(f); ok(/compacted/i.test(visible)); ok(hasContextNumber(visible,2234));
+  ok(!visible.includes('private-summary-must-not-render')); ok(!visible.includes('<img src=x'));
+  emitContext(f,'usage',contextUsage({used_tokens:7777}),5);
+  const current=f.nodes.get('st-context').textContent;
+  ok(hasContextNumber(current,7777)&&hasContextNumber(current,64000),'latest usage replaces stale progress in the header');
+  ok(!hasContextNumber(current,2234));
+  ok(f.current().sent.length===0);
+});
+
 console.log(`ORBIT_CHECK_RECEIPT ${JSON.stringify({scenarios})}`);

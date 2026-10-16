@@ -715,3 +715,139 @@ fn unix_attach_truncated_then_delayed_ack_poisons_stream_and_reconnects_without_
     wait_done(&serving.handle());
     assert_eq!(fixture.calls(), 1);
 }
+
+#[cfg(unix)]
+mod context_attach_renderer_tests {
+    use super::*;
+    use daemon::{EventCursor, OwnerEvent, Recovery};
+    use serde_json::{Value, json};
+
+    fn cursor(sequence: u64) -> EventCursor {
+        EventCursor {
+            instance: "attach-context-renderer".into(),
+            sequence,
+        }
+    }
+    fn event(sequence: u64, kind: &str, payload: Value) -> OwnerEvent {
+        OwnerEvent {
+            cursor: cursor(sequence),
+            kind: kind.into(),
+            payload,
+        }
+    }
+    fn render(events: Vec<OwnerEvent>) -> String {
+        let recovery = Recovery {
+            snapshot: None,
+            events,
+            cursor: cursor(99),
+        };
+        let mut visible = Vec::new();
+        attach::render_recovery(&recovery, &mut visible).unwrap();
+        String::from_utf8(visible).unwrap()
+    }
+    fn has_number(text: &str, value: u64) -> bool {
+        let expected = value.to_string();
+        text.replace(',', "")
+            .split(|character: char| !character.is_ascii_digit())
+            .any(|number| number == expected.as_str())
+    }
+
+    #[test]
+    fn attach_actual_owner_recovery_usage_reaches_plain_renderer_with_exact_reserve_and_trigger() {
+        let fixture = Fixture::new();
+        let mut config = orbit_cli::config::ProvidersConfig::load(&fixture.root).unwrap();
+        config.provider[0].models[0].context_window = None;
+        config.provider[0].models[0].max_output_tokens = Some(32_000);
+        config.provider[0].models[0].context_limits =
+            Some(serde_json::from_value(json!({"combined_tokens":128_000})).unwrap());
+        config.save_atomic(&fixture.root).unwrap();
+        let serving = fixture.serve();
+        let mut client = AttachClient::connect(&fixture.socket(), true, None).unwrap();
+        let before = client.recovery.cursor.clone();
+        client.prompt("attached context estimate".into()).unwrap();
+        wait_done(&serving.handle());
+        let recovery = client.logs(Some(&before)).unwrap();
+        let usage: Vec<_> = recovery
+            .events
+            .iter()
+            .filter(|event| event.kind == "usage")
+            .collect();
+        assert_eq!(
+            usage.len(),
+            1,
+            "requires accepted owner typed Usage before testing renderer"
+        );
+        assert_eq!(usage[0].payload["window_tokens"], 128_000);
+        assert_eq!(usage[0].payload["breakdown"]["reserve"], 32_000);
+        assert_eq!(usage[0].payload["breakdown"]["compact_at"], 83_200);
+        let mut output = Vec::new();
+        attach::render_recovery(&recovery, &mut output).unwrap();
+        let visible = String::from_utf8(output).unwrap();
+        assert!(visible.to_ascii_lowercase().contains("estimate"));
+        for value in [128_000, 32_000, 83_200] {
+            assert!(
+                has_number(&visible, value),
+                "missing actual Usage number {value}"
+            );
+        }
+        assert!(visible.contains("owned fixture reply"));
+        assert_eq!(fixture.calls(), 1);
+    }
+
+    #[test]
+    fn attach_actual_recovery_zero_breakdown_and_compaction_render_without_summary_content() {
+        let hidden = "private-summary-must-not-render";
+        let visible = render(vec![
+            event(
+                1,
+                "usage",
+                json!({"used_tokens":0,"window_tokens":64_000,"breakdown":{"system":0,"memory":0,"tools":0,"messages":0,"reserve":0,"compact_at":0}}),
+            ),
+            event(
+                2,
+                "compacting",
+                json!({"used_tokens":100_000,"window_tokens":128_000}),
+            ),
+            event(
+                3,
+                "compacted",
+                json!({"after_tokens":2234,"summary":format!("{hidden} <img src=x onerror=alert(1)>\u{1b}[31m")}),
+            ),
+        ]);
+        let lower = visible.to_ascii_lowercase();
+        assert!(lower.contains("estimate"));
+        assert!(has_number(&visible, 64_000));
+        assert!(
+            visible
+                .split(|character: char| !character.is_ascii_digit())
+                .filter(|number| *number == "0")
+                .count()
+                >= 3,
+            "zero occupancy/reserve/trigger must not be omitted"
+        );
+        assert!(lower.contains("compacting"));
+        assert!(lower.contains("compacted"));
+        assert!(has_number(&visible, 2234));
+        assert!(!visible.contains(hidden));
+        assert!(!visible.contains("<img"));
+        assert!(!visible.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn attach_malformed_optional_usage_cannot_invent_zero_capacity_or_echo_raw_values() {
+        let poison = "fixture-binding-query-should-not-render";
+        let visible = render(vec![
+            event(
+                1,
+                "usage",
+                json!({"used_tokens":"not-numeric","window_tokens":poison,"breakdown":{"reserve":-1,"compact_at":1.5}}),
+            ),
+            event(2, "status", json!({"text":"safe context notice"})),
+        ]);
+        assert!(visible.contains("safe context notice"));
+        assert!(!visible.contains(poison));
+        assert!(!visible.contains("not-numeric"));
+        assert!(!visible.contains("0 / 0"));
+        assert!(!visible.contains("reserve 0"));
+    }
+}

@@ -219,6 +219,7 @@ pub fn render_snapshot(
     )
     .map_err(io_error)?;
     writeln!(output, "{}", display(&snapshot.effort_status)).map_err(io_error)?;
+    writeln!(output, "Context estimate unavailable in this snapshot").map_err(io_error)?;
     for message in &snapshot.messages {
         if let Some(text) = message.get("text").and_then(Value::as_str) {
             writeln!(
@@ -263,6 +264,41 @@ fn render_approval(card: &Value, output: &mut impl Write) -> Result<(), OwnerErr
     .map_err(io_error)
 }
 
+fn render_context_usage(payload: &Value, output: &mut impl Write) -> Result<(), OwnerError> {
+    let used = payload.get("used_tokens").and_then(Value::as_u64);
+    let window = payload
+        .get("window_tokens")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
+    let Some((used, window)) = used.zip(window) else {
+        return writeln!(output, "Context estimate unavailable").map_err(io_error);
+    };
+    let breakdown = payload.get("breakdown").filter(|value| !value.is_null());
+    let details = breakdown.and_then(|value| {
+        value
+            .get("compact_at")
+            .and_then(Value::as_u64)
+            .zip(value.get("reserve").and_then(Value::as_u64))
+    });
+    if breakdown.is_some() && details.is_none() {
+        return writeln!(output, "Context estimate unavailable").map_err(io_error);
+    }
+    write!(output, "Context estimate {used} / {window} tokens").map_err(io_error)?;
+    if let Some((compact_at, reserve)) = details {
+        writeln!(
+            output,
+            "; compact at {compact_at}; output reserve {reserve}"
+        )
+        .map_err(io_error)
+    } else {
+        writeln!(
+            output,
+            "; compaction threshold and output reserve unavailable"
+        )
+        .map_err(io_error)
+    }
+}
+
 pub fn render_recovery(recovery: &Recovery, output: &mut impl Write) -> Result<(), OwnerError> {
     if let Some(snapshot) = &recovery.snapshot {
         render_snapshot(snapshot, output)?;
@@ -296,6 +332,32 @@ pub fn render_recovery(recovery: &Recovery, output: &mut impl Write) -> Result<(
                 )
             )
             .map_err(io_error)?,
+            "usage" => render_context_usage(&event.payload, output)?,
+            "compacting" => {
+                let used = event.payload.get("used_tokens").and_then(Value::as_u64);
+                let window = event
+                    .payload
+                    .get("window_tokens")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0);
+                if let Some((used, window)) = used.zip(window) {
+                    writeln!(
+                        output,
+                        "Compacting context (estimate {used} / {window} tokens)"
+                    )
+                } else {
+                    writeln!(output, "Compacting context; estimate unavailable")
+                }
+                .map_err(io_error)?;
+            }
+            "compacted" => {
+                if let Some(after) = event.payload.get("after_tokens").and_then(Value::as_u64) {
+                    writeln!(output, "Context compacted; estimated input {after} tokens")
+                } else {
+                    writeln!(output, "Context compacted; estimate unavailable")
+                }
+                .map_err(io_error)?;
+            }
             "tool_started_full" | "tool_started" => writeln!(
                 output,
                 "Tool: {}",
