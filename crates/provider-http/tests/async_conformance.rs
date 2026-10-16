@@ -36,6 +36,7 @@ fn route_for(host: &str, port: u16, kind: AdapterKind) -> ProviderRouteBinding {
         endpoint_port: port,
         endpoint_scheme: orbit_adapter::types::EndpointScheme::HttpLoopback,
         endpoint_path: String::new(),
+        endpoint_query: None,
     }
 }
 

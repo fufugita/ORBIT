@@ -74,7 +74,7 @@ impl OpenAiCompatibleHttpV1 {
         // URL from the route: scheme (HttpLoopback → http, else https with
         // SPKI pinning) + host/port + the gate URL's base path (empty =
         // the historical `/v1`).
-        let url = chat_completions_url(&request.route);
+        let url = chat_completions_url(&request.route)?;
 
         // Build the wire body — sampling as provider floats ONLY here.
         // Multi-turn transcript wins when present; otherwise the single
@@ -148,6 +148,11 @@ impl OpenAiCompatibleHttpV1 {
             .map_err(|e| AdapterError::ProviderTransportFailure(format!("send: {e}")))?;
 
         let status = resp.status();
+        if status.is_redirection() {
+            return Err(AdapterError::ProtocolOrStreamViolation(
+                "provider redirects are not permitted (E0411)".into(),
+            ));
+        }
         if !status.is_success() {
             // E1/E2: read the body, classify precisely, retry 5xx.
             let Some(body) = cancel
@@ -454,6 +459,7 @@ impl AsyncProviderAdapter for OpenAiCompatibleHttpV1 {
         if route.adapter_profile_digest.as_str() != self.identity.profile_digest.as_str() {
             return Err(AdapterError::AdapterProfileDigestMismatch("E0422".into()));
         }
+        chat_completions_url(route)?;
         Ok(())
     }
     async fn invoke(
@@ -487,20 +493,8 @@ pub fn openai_capabilities() -> ProviderCapabilities {
 
 /// The chat-completions URL for a route: `{scheme}://{host}:{port}{path}/chat/completions`.
 /// An empty `endpoint_path` keeps the historical `/v1` default.
-pub fn chat_completions_url(route: &ProviderRouteBinding) -> String {
-    let scheme = match route.endpoint_scheme {
-        orbit_adapter::types::EndpointScheme::HttpLoopback => "http",
-        _ => "https",
-    };
-    let path = if route.endpoint_path.is_empty() {
-        "/v1"
-    } else {
-        route.endpoint_path.as_str()
-    };
-    format!(
-        "{scheme}://{}:{}{path}/chat/completions",
-        route.endpoint_host, route.endpoint_port
-    )
+pub fn chat_completions_url(route: &ProviderRouteBinding) -> Result<String, AdapterError> {
+    crate::endpoint::provider_method_url(route, "/v1", "chat/completions")
 }
 
 #[cfg(test)]
@@ -524,13 +518,14 @@ mod url_tests {
             endpoint_port: port,
             endpoint_scheme: EndpointScheme::Https,
             endpoint_path: path.into(),
+            endpoint_query: None,
         }
     }
 
     #[test]
     fn empty_path_keeps_the_v1_default() {
         assert_eq!(
-            chat_completions_url(&route("api.openai.com", 443, "")),
+            chat_completions_url(&route("api.openai.com", 443, "")).unwrap(),
             "https://api.openai.com:443/v1/chat/completions"
         );
     }
@@ -543,12 +538,13 @@ mod url_tests {
                 "dashscope-intl.aliyuncs.com",
                 443,
                 "/compatible-mode/v1"
-            )),
+            ))
+            .unwrap(),
             "https://dashscope-intl.aliyuncs.com:443/compatible-mode/v1/chat/completions"
         );
         // Z.ai (GLM)
         assert_eq!(
-            chat_completions_url(&route("api.z.ai", 443, "/api/paas/v4")),
+            chat_completions_url(&route("api.z.ai", 443, "/api/paas/v4")).unwrap(),
             "https://api.z.ai:443/api/paas/v4/chat/completions"
         );
         // Gemini's OpenAI-compat surface
@@ -557,7 +553,8 @@ mod url_tests {
                 "generativelanguage.googleapis.com",
                 443,
                 "/v1beta/openai"
-            )),
+            ))
+            .unwrap(),
             "https://generativelanguage.googleapis.com:443/v1beta/openai/chat/completions"
         );
     }

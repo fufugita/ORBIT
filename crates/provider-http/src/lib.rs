@@ -14,6 +14,7 @@
 pub mod adapter_trait;
 pub mod anthropic;
 pub mod cancel;
+pub mod endpoint;
 pub mod error;
 pub mod ollama;
 pub mod openai;
@@ -64,6 +65,8 @@ pub fn shared_tls_client(
     let config = tls::client_config(policy)?;
     let config = std::sync::Arc::try_unwrap(config).unwrap_or_else(|arc| (*arc).clone());
     let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .use_preconfigured_tls(config)
         .build()
         .map_err(|e| TransportError::Transport(format!("client build: {e}")))?;
@@ -79,7 +82,13 @@ pub fn shared_plain_client() -> Result<reqwest::Client, TransportError> {
     // used to rely on some other adapter having installed it first.
     tls::ensure_crypto_provider();
     Ok(CLIENT
-        .get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build provider HTTP client")
+        })
         .clone())
 }
 

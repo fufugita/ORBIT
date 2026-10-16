@@ -96,6 +96,7 @@ fn make_route(
         endpoint_port: 443,
         endpoint_scheme: crate::types::EndpointScheme::Https,
         endpoint_path: String::new(),
+        endpoint_query: None,
     }
 }
 

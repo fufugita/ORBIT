@@ -223,6 +223,7 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
         if route.adapter_profile_digest != self.identity.profile_digest {
             return Err(AdapterError::AdapterProfileDigestMismatch("E0422".into()));
         }
+        crate::endpoint::provider_method_url(route, "/v1", "messages")?;
         Ok(())
     }
 
@@ -238,26 +239,7 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
                 .validate_for_anthropic()
                 .map_err(AdapterError::ProviderConfigurationInvalid)?;
         }
-        // https for the real API; http only for loopback (local gateways,
-        // the mock provider). The scheme comes from the route binding,
-        // which the egress gate already pinned.
-        let scheme = match request.route.endpoint_scheme {
-            orbit_adapter::types::EndpointScheme::Https => "https",
-            // Loopback (local gateways, the mock); LocalProcess is not an
-            // HTTP endpoint — the route kind check above excludes it.
-            _ => "http",
-        };
-        // Base path from the gate URL when configured (an Anthropic-compatible
-        // gateway behind a path); empty keeps the API's own `/v1`.
-        let base_path = if request.route.endpoint_path.is_empty() {
-            "/v1"
-        } else {
-            request.route.endpoint_path.as_str()
-        };
-        let url = format!(
-            "{}://{}:{}{}/messages",
-            scheme, request.route.endpoint_host, request.route.endpoint_port, base_path
-        );
+        let url = crate::endpoint::provider_method_url(&request.route, "/v1", "messages")?;
 
         // Messages: the transcript when present, else the single prompt.
         let (system, messages) = match &request.messages {
@@ -330,6 +312,11 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
         let resp = response
             .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
             .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
+        if resp.status().is_redirection() {
+            return Err(AdapterError::ProtocolOrStreamViolation(
+                "provider redirects are not permitted (E0411)".into(),
+            ));
+        }
         if !resp.status().is_success() {
             // E1: the body carries the provider's own message; E2:
             // 529/5xx classify retryable.

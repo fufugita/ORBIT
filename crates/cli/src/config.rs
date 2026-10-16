@@ -14,52 +14,7 @@ use std::path::Path;
 /// Provider credentials belong in an environment reference, never in the URL.
 /// Errors deliberately contain neither the input URL nor any query value.
 pub fn validate_provider_endpoint(raw: &str) -> Result<url::Url, String> {
-    if raw.len() > 2048 || raw.chars().any(char::is_control) {
-        return Err("provider URL must be bounded printable HTTP(S)".into());
-    }
-    let endpoint = url::Url::parse(raw).map_err(|_| "provider URL must be absolute HTTP(S)")?;
-    if !matches!(endpoint.scheme(), "http" | "https")
-        || endpoint.host_str().is_none()
-        || !endpoint.username().is_empty()
-        || endpoint.password().is_some()
-        || endpoint.fragment().is_some()
-    {
-        return Err(
-            "provider URL must be absolute HTTP(S) without credentials or a fragment".into(),
-        );
-    }
-    for (key, _) in endpoint.query_pairs() {
-        let normalized: String = key
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .map(|c| c.to_ascii_lowercase())
-            .collect();
-        if [
-            "apikey",
-            "xapikey",
-            "key",
-            "token",
-            "accesstoken",
-            "refreshtoken",
-            "sessiontoken",
-            "idtoken",
-            "bearertoken",
-            "password",
-            "secret",
-            "clientsecret",
-            "authorization",
-            "auth",
-            "credential",
-            "credentials",
-        ]
-        .contains(&normalized.as_str())
-        {
-            return Err(
-                "provider URL contains a credential query; use a credential ENV reference".into(),
-            );
-        }
-    }
-    Ok(endpoint)
+    orbit_provider_http::endpoint::validate_provider_url(raw).map_err(str::to_owned)
 }
 
 /// Per-million-token pricing in microdollars (DR-09 §8; C5: the unit was

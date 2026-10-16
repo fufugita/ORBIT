@@ -82,6 +82,7 @@ fn test_route(kind: AdapterKind) -> ProviderRouteBinding {
         endpoint_port: 443,
         endpoint_scheme: crate::types::EndpointScheme::Https,
         endpoint_path: String::new(),
+        endpoint_query: None,
     }
 }
 
@@ -304,5 +305,66 @@ fn adapter_error_retry_classification_is_closed() {
     assert_eq!(
         AdapterError::CredentialRejected("x".into()).retry_class(),
         AdapterRetryClass::NotRetryable
+    );
+}
+
+#[test]
+fn endpoint_query_serde_roundtrip_retains_exact_raw_query() {
+    let mut encoded = serde_json::to_value(test_route(AdapterKind::MockHttpV1)).unwrap();
+    encoded["endpoint_query"] =
+        serde_json::json!("scope=synthetic&escaped=a%2Fb%26c%3Dd%2Be&space=a+b");
+    let decoded: ProviderRouteBinding = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+}
+
+#[test]
+fn endpoint_query_absent_serialization_keeps_existing_route_bytes() {
+    let route = test_route(AdapterKind::MockHttpV1);
+    let expected = format!(
+        concat!(
+            "{{\"provider_id\":\"test-provider\",\"deployment_id\":\"test-deploy\",",
+            "\"region_id\":\"test-region\",\"adapter_kind\":\"MockHttpV1\",",
+            "\"adapter_implementation_digest\":\"{}\",\"adapter_profile_digest\":\"{}\",",
+            "\"endpoint_digest\":\"{}\",\"expected_model\":\"test-model\",",
+            "\"pricing_digest\":\"{}\",\"endpoint_host\":\"api.test-provider.example\",",
+            "\"endpoint_port\":443,\"endpoint_scheme\":\"Https\",\"endpoint_path\":\"\"}}"
+        ),
+        "i".repeat(64),
+        "p".repeat(64),
+        "e".repeat(64),
+        "r".repeat(64),
+    );
+    let serialized = serde_json::to_vec(&route).unwrap();
+    assert_eq!(serialized, expected.as_bytes());
+    let decoded: ProviderRouteBinding = serde_json::from_slice(expected.as_bytes()).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), serialized);
+    assert!(
+        !String::from_utf8(serialized)
+            .unwrap()
+            .contains("endpoint_query")
+    );
+}
+
+#[test]
+fn endpoint_query_is_part_of_full_route_equality() {
+    let route = test_route(AdapterKind::MockHttpV1);
+    let mut encoded = serde_json::to_value(&route).unwrap();
+    encoded["endpoint_query"] = serde_json::json!("scope=one");
+    let one: ProviderRouteBinding = serde_json::from_value(encoded.clone()).unwrap();
+    encoded["endpoint_query"] = serde_json::json!("scope=two");
+    let two: ProviderRouteBinding = serde_json::from_value(encoded.clone()).unwrap();
+    assert_ne!(
+        one, two,
+        "changing only query must change the admitted route"
+    );
+    assert_ne!(
+        route, one,
+        "absent query must differ from an explicitly bound query"
+    );
+    encoded["endpoint_query"] = serde_json::json!("");
+    let empty: ProviderRouteBinding = serde_json::from_value(encoded).unwrap();
+    assert_ne!(
+        route, empty,
+        "empty query must not silently collapse to absence"
     );
 }

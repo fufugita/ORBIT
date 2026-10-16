@@ -165,9 +165,10 @@ pub fn run_dispatch(
         );
         wire
     });
-    // Parse the gate URL; only http loopback or https is acceptable.
-    let url =
-        url::Url::parse(&config.gate).map_err(|e| ("ORBIT-E0401", format!("bad gate url: {e}")))?;
+    // Validate the original URL before parsing can discard controls or whitespace.
+    // This shared guard runs before credential-store access and ledger creation.
+    let url = orbit_provider_http::endpoint::validate_provider_url(&config.gate)
+        .map_err(|message| ("ORBIT-E0401", message.to_owned()))?;
     let scheme = match url.scheme() {
         "https" => orbit_adapter::types::EndpointScheme::Https,
         "http" => orbit_adapter::types::EndpointScheme::HttpLoopback,
@@ -182,14 +183,20 @@ pub fn run_dispatch(
     let port = url
         .port()
         .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
-    // The gate URL's path is the endpoint's base path, carried verbatim
-    // (DashScope `/compatible-mode/v1`, Z.ai `/api/paas/v4`, Gemini
-    // `/v1beta/openai`). Empty keeps the historical default: the adapters
-    // treat an empty path as `/v1` — except Ollama, which serves at the
-    // bare host. Normalized: always a single leading `/`, never a
-    // trailing `/` (so `{path}/chat/completions` composes).
+    // The concrete Ollama HTTP route carries its actual API base. Generic
+    // LocalProcess routes retain their own transport and path semantics.
     let endpoint_path = match config.kind {
-        ProviderKind::Ollama => String::new(),
+        ProviderKind::Ollama => {
+            if scheme != orbit_adapter::types::EndpointScheme::HttpLoopback {
+                return Err(("ORBIT-E0401", "Ollama requires loopback HTTP".into()));
+            }
+            let base = normalize_endpoint_path(url.path());
+            if base == "/api" || base.ends_with("/api") {
+                base
+            } else {
+                format!("{base}/api")
+            }
+        }
         _ => normalize_endpoint_path(url.path()),
     };
 
@@ -284,6 +291,7 @@ pub fn run_dispatch(
         endpoint_port: port,
         endpoint_scheme: scheme,
         endpoint_path: endpoint_path.clone(),
+        endpoint_query: url.query().map(str::to_owned),
     };
 
     // Register the model + async adapter in a fresh registry.

@@ -530,6 +530,8 @@ impl DispatchEngine {
 /// NEW P1 #3: an empty endpoint_host is a config error → Err (never
 /// fabricate from the provider id — the host MUST be DNS-routable).
 fn egress_tuple_from_binding(binding: &ProviderRouteBinding) -> Result<EgressTuple, String> {
+    orbit_provider_http::endpoint::validate_endpoint_query(binding.endpoint_query.as_deref())
+        .map_err(str::to_owned)?;
     if binding.endpoint_host.is_empty() {
         return Err(format!(
             "route for {} has no endpoint_host (E0401 provider_configuration_invalid)",

@@ -72,7 +72,12 @@ fn request(adapter: &dyn AsyncProviderAdapter, port: u16) -> ProviderRequest {
         endpoint_host: "127.0.0.1".into(),
         endpoint_port: port,
         endpoint_scheme: EndpointScheme::HttpLoopback,
-        endpoint_path: String::new(),
+        endpoint_path: if identity.kind == AdapterKind::LocalProcessV1 {
+            "/api".into()
+        } else {
+            String::new()
+        },
+        endpoint_query: None,
     };
     let mut request = canonical_request(&route, b"original input");
     request.connect_timeout_ms = 1000;
@@ -99,6 +104,12 @@ fn message(role: ChatRole, content: &str) -> ChatMessage {
 struct Mock {
     port: u16,
     task: tokio::task::JoinHandle<Option<Value>>,
+    head: std::sync::Arc<std::sync::Mutex<Option<CapturedHead>>>,
+}
+
+struct CapturedHead {
+    target: String,
+    headers: Vec<(String, String)>,
 }
 
 impl Mock {
@@ -111,8 +122,36 @@ impl Mock {
     }
 
     async fn scripted(body: String, family: Family, held: Option<Option<String>>) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::scripted_at(body, family, held, "127.0.0.1:0").await
+    }
+
+    async fn scripted_at(
+        body: String,
+        family: Family,
+        held: Option<Option<String>>,
+        address: &str,
+    ) -> Self {
+        Self::respond_at(body, family, held, address, None).await
+    }
+
+    async fn redirect(location: String, family: Family) -> Self {
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        Self::respond_at(String::new(), family, None, "127.0.0.1:0", Some(response)).await
+    }
+
+    async fn respond_at(
+        body: String,
+        family: Family,
+        held: Option<Option<String>>,
+        address: &str,
+        response: Option<String>,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let head = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_head = head.clone();
         let task = tokio::spawn(async move {
             let Ok(Ok((mut socket, _))) =
                 tokio::time::timeout(Duration::from_millis(400), listener.accept()).await
@@ -134,6 +173,17 @@ impl Mock {
                 }
             };
             let headers = std::str::from_utf8(&raw[..header_end]).unwrap();
+            *captured_head.lock().unwrap() = Some(CapturedHead {
+                target: headers.lines().next().unwrap().to_owned(),
+                headers: headers
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        Some((name.to_ascii_lowercase(), value.trim().to_owned()))
+                    })
+                    .collect(),
+            });
             let length = headers
                 .lines()
                 .find_map(|line| {
@@ -158,7 +208,9 @@ impl Mock {
                 Family::Ollama => "application/x-ndjson",
                 _ => "text/event-stream",
             };
-            let headers = if held.is_some() {
+            let headers = if let Some(response) = response {
+                response
+            } else if held.is_some() {
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {media}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
                 )
@@ -194,7 +246,7 @@ impl Mock {
             let _ = socket.shutdown().await;
             Some(captured)
         });
-        Self { port, task }
+        Self { port, task, head }
     }
 
     async fn captured(&mut self) -> Option<Value> {
@@ -1021,4 +1073,261 @@ async fn openai_terminal_malformed_or_unframed_sse_fails() {
         mock.captured().await.unwrap();
         assert_eq!(result.unwrap_err().code(), "E0411");
     }
+}
+
+fn query_route(route: &ProviderRouteBinding, query: Option<&str>) -> ProviderRouteBinding {
+    let mut encoded = serde_json::to_value(route).unwrap();
+    match query {
+        Some(query) => encoded["endpoint_query"] = query.into(),
+        None => {
+            encoded.as_object_mut().unwrap().remove("endpoint_query");
+        }
+    }
+    serde_json::from_value(encoded).unwrap()
+}
+
+fn query_reply(family: Family) -> String {
+    match family {
+        Family::OpenAi => format!(
+            "{}{}data: [DONE]\n\n",
+            openai_delta(json!({"content":"query response"})),
+            openai_reason("stop")
+        ),
+        Family::Anthropic => anthropic_response(
+            Some(json!({"input_tokens":1,"output_tokens":0})),
+            Some(json!({"output_tokens":1})),
+            vec![json!({"type":"text","text":"query response"})],
+        ),
+        Family::Ollama => concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"query response\"},",
+            "\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":1,\"eval_count\":1}\n"
+        )
+        .into(),
+    }
+}
+
+async fn query_drain(
+    adapter: &dyn AsyncProviderAdapter,
+    request: &ProviderRequest,
+    credential: Option<&orbit_adapter::SecretBytes>,
+) -> Result<(), AdapterError> {
+    let cancel = CancelToken::new();
+    let mut stream = adapter.invoke(request, credential, &cancel).await?;
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event?);
+    }
+    orbit_adapter::stream::validate_stream(&events)?;
+    Ok(())
+}
+
+async fn assert_query_target(family: Family, ipv6: bool) {
+    let adapter = adapter(family);
+    let address = if ipv6 { "[::1]:0" } else { "127.0.0.1:0" };
+    let mut mock = Mock::scripted_at(query_reply(family), family, None, address).await;
+    let mut request = request(adapter.as_ref(), mock.port);
+    request.route.endpoint_host = if ipv6 {
+        "::1".into()
+    } else {
+        "127.0.0.1".into()
+    };
+    request.route.endpoint_path = match family {
+        Family::Ollama => "/proxy/api",
+        _ => "/tenant/v1",
+    }
+    .into();
+    let query = "scope=synthetic&escaped=a%2Fb%26c%3Dd%2Be&space=a+b";
+    request.route = query_route(&request.route, Some(query));
+    let secret = orbit_adapter::SecretBytes::new(b"synthetic-query-wire-key".to_vec());
+    let credential = if matches!(family, Family::Ollama) {
+        None
+    } else {
+        Some(&secret)
+    };
+    let result = query_drain(adapter.as_ref(), &request, credential).await;
+    let _body = mock.captured().await.expect("one exact owned HTTP request");
+    assert!(result.is_ok(), "matching query route must complete");
+    let head = mock.head.lock().unwrap();
+    let head = head.as_ref().unwrap();
+    let expected_path = match family {
+        Family::OpenAi => "/tenant/v1/chat/completions",
+        Family::Anthropic => "/tenant/v1/messages",
+        Family::Ollama => "/proxy/api/chat",
+    };
+    assert_eq!(
+        head.target,
+        format!("POST {expected_path}?{query} HTTP/1.1")
+    );
+    let host = if ipv6 {
+        format!("[::1]:{}", mock.port)
+    } else {
+        format!("127.0.0.1:{}", mock.port)
+    };
+    assert!(
+        head.headers
+            .iter()
+            .any(|(name, value)| name == "host" && value == &host)
+    );
+    let bearer = head
+        .headers
+        .iter()
+        .filter(|(name, _)| name == "authorization")
+        .collect::<Vec<_>>();
+    let key = head
+        .headers
+        .iter()
+        .filter(|(name, _)| name == "x-api-key")
+        .collect::<Vec<_>>();
+    match family {
+        Family::OpenAi => {
+            assert!(bearer.len() == 1 && bearer[0].1 == "Bearer synthetic-query-wire-key");
+            assert!(key.is_empty());
+        }
+        Family::Anthropic => {
+            assert!(key.len() == 1 && key[0].1 == "synthetic-query-wire-key");
+            assert!(bearer.is_empty());
+        }
+        Family::Ollama => {
+            assert!(bearer.is_empty());
+            assert!(key.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn endpoint_query_openai_actual_target_and_credential() {
+    assert_query_target(Family::OpenAi, false).await;
+}
+
+#[tokio::test]
+async fn endpoint_query_anthropic_actual_target_and_credential() {
+    assert_query_target(Family::Anthropic, false).await;
+}
+
+#[tokio::test]
+async fn endpoint_query_ollama_actual_api_base_without_duplication() {
+    assert_query_target(Family::Ollama, false).await;
+}
+
+#[tokio::test]
+async fn endpoint_query_invalid_or_sensitive_values_refuse_before_http() {
+    for family in [Family::OpenAi, Family::Anthropic, Family::Ollama] {
+        for query in [
+            "",
+            "?scope=one",
+            "scope=one#fragment",
+            "scope=one\n",
+            "scope=%GG",
+            "scope=one&scope=two",
+            "scope=one&%73cope=two",
+            "api_key=synthetic-query-wire-key",
+        ] {
+            let adapter = adapter(family);
+            let mut mock = Mock::new(query_reply(family), family).await;
+            let mut request = request(adapter.as_ref(), mock.port);
+            request.route.endpoint_path = match family {
+                Family::Ollama => "/api",
+                _ => "/v1",
+            }
+            .into();
+            request.route = query_route(&request.route, Some(query));
+            let secret = orbit_adapter::SecretBytes::new(b"synthetic-query-wire-key".to_vec());
+            let result = query_drain(adapter.as_ref(), &request, Some(&secret)).await;
+            let captured = mock.captured().await;
+            assert!(result.is_err(), "ambiguous query was accepted");
+            assert!(
+                captured.is_none(),
+                "invalid query reached an owned provider"
+            );
+            assert!(mock.head.lock().unwrap().is_none());
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), "E0401");
+            assert!(!error.to_string().contains("synthetic-query-wire-key"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn endpoint_query_hostile_authority_refuses_before_http() {
+    for family in [Family::OpenAi, Family::Anthropic] {
+        for variant in 0..2 {
+            let adapter = adapter(family);
+            let mut mock = Mock::new(query_reply(family), family).await;
+            let mut request = request(adapter.as_ref(), mock.port);
+            // Both old-format interpretations still target this owned listener.
+            request.route.endpoint_host = match variant {
+                0 => "ignored-user@127.0.0.1".into(),
+                _ => format!("127.0.0.1:{}/injected", mock.port),
+            };
+            request.route = query_route(&request.route, Some("scope=synthetic"));
+            let secret = orbit_adapter::SecretBytes::new(b"synthetic-query-wire-key".to_vec());
+            let result = query_drain(adapter.as_ref(), &request, Some(&secret)).await;
+            let captured = mock.captured().await;
+            assert!(result.is_err(), "hostile authority was accepted");
+            assert!(
+                captured.is_none(),
+                "reinterpreted authority reached a provider"
+            );
+            assert!(mock.head.lock().unwrap().is_none());
+            assert_eq!(result.unwrap_err().code(), "E0401");
+        }
+    }
+}
+
+async fn assert_redirect_refused(family: Family) {
+    let adapter = adapter(family);
+    let mut trap = Mock::new(query_reply(family), family).await;
+    let mut source = Mock::redirect(
+        format!("http://127.0.0.1:{}/redirect-trap?scope=other", trap.port),
+        family,
+    )
+    .await;
+    let mut request = request(adapter.as_ref(), source.port);
+    request.route.endpoint_path = match family {
+        Family::Ollama => "/api",
+        _ => "/v1",
+    }
+    .into();
+    request.route = query_route(&request.route, Some("scope=synthetic"));
+    let secret = orbit_adapter::SecretBytes::new(b"synthetic-query-wire-key".to_vec());
+    let credential = if matches!(family, Family::Ollama) {
+        None
+    } else {
+        Some(&secret)
+    };
+    let result = query_drain(adapter.as_ref(), &request, credential).await;
+    assert!(
+        source.captured().await.is_some(),
+        "initial owned endpoint must receive the request"
+    );
+    let redirected = trap.captured().await;
+    assert!(
+        redirected.is_none(),
+        "307 must not cross the registered endpoint authority"
+    );
+    assert!(trap.head.lock().unwrap().is_none());
+    assert!(
+        result.is_err(),
+        "redirect cannot produce a completed provider response"
+    );
+    assert_eq!(
+        result.unwrap_err().code(),
+        "E0411",
+        "redirects must not enter a retry class"
+    );
+}
+
+#[tokio::test]
+async fn endpoint_query_openai_redirect_trap_receives_nothing() {
+    assert_redirect_refused(Family::OpenAi).await;
+}
+
+#[tokio::test]
+async fn endpoint_query_anthropic_redirect_trap_receives_nothing() {
+    assert_redirect_refused(Family::Anthropic).await;
+}
+
+#[tokio::test]
+async fn endpoint_query_ollama_redirect_trap_receives_nothing() {
+    assert_redirect_refused(Family::Ollama).await;
 }

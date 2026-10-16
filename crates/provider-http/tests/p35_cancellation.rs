@@ -233,7 +233,12 @@ fn request(adapter: &dyn AsyncProviderAdapter, port: u16) -> ProviderRequest {
             endpoint_host: "127.0.0.1".into(),
             endpoint_port: port,
             endpoint_scheme: EndpointScheme::HttpLoopback,
-            endpoint_path: String::new(),
+            endpoint_path: if identity.kind == AdapterKind::LocalProcessV1 {
+                "/api".into()
+            } else {
+                String::new()
+            },
+            endpoint_query: None,
         },
         b"cancellation fixture",
     );

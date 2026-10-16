@@ -620,6 +620,7 @@ fn test_binding() -> ProviderRouteBinding {
         endpoint_port: 443,
         endpoint_scheme: orbit_adapter::types::EndpointScheme::Https,
         endpoint_path: String::new(),
+        endpoint_query: None,
     }
 }
 
@@ -1151,4 +1152,251 @@ async fn gateway_async_dispatch_streams_from_mock_provider() {
         other => panic!("async dispatch expected Completed, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn endpoint_query_binding(
+    route: &ProviderRouteBinding,
+    query: Option<&str>,
+) -> ProviderRouteBinding {
+    let mut encoded = serde_json::to_value(route).unwrap();
+    match query {
+        Some(query) => encoded["endpoint_query"] = query.into(),
+        None => {
+            encoded.as_object_mut().unwrap().remove("endpoint_query");
+        }
+    }
+    serde_json::from_value(encoded).unwrap()
+}
+
+fn endpoint_query_sync_fixture(
+    registered: Option<&str>,
+    requested: Option<&str>,
+) -> (Result<DispatchOutcome, crate::DispatchError>, bool) {
+    use orbit_adapter::adapters::{MockHttpV1, MockScript};
+    let dir = crate::tmpdir("query-sync");
+    let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let adapter = MockHttpV1::with_credential_probe(
+        identity(AdapterKind::MockHttpV1, &"i".repeat(64), &"p".repeat(64)),
+        text_capabilities(),
+        MockScript::Success(canonical_success_result()),
+        probe.clone(),
+    );
+    let mut binding = test_binding();
+    binding.adapter_kind = AdapterKind::MockHttpV1;
+    binding.endpoint_path = "/v1".into();
+    let binding = endpoint_query_binding(&binding, registered);
+    let mut request = canonical_request(&binding, b"hello");
+    request.route = endpoint_query_binding(&binding, requested);
+    let mut registry = ProviderRegistry::new();
+    registry.register_model(crate::ModelRef("test-model".into()), binding);
+    registry.register_adapter(AdapterKind::MockHttpV1, Arc::new(adapter));
+    let engine = DispatchEngine::new(
+        registry,
+        dir.clone(),
+        EgressAllowlist::new(vec![bound_tuple()]),
+        vec![bound_tuple()],
+        vec![spki_pin()],
+    );
+    let mut writer = LedgerWriter::open(&dir, "query-writer".into(), "0.1.0").unwrap();
+    let session = new_session_id();
+    let decision = new_decision_id();
+    let secret = SecretBytes::new(b"synthetic-query-bound-key".to_vec());
+    let result = engine
+        .dispatch(
+            "test-model",
+            &session,
+            &decision.0,
+            &request,
+            Some(&secret),
+            &mut writer,
+        )
+        .map(|(outcome, _)| outcome);
+    if result.is_err() {
+        assert_eq!(
+            engine.recovery_state(&session, &decision.0).unwrap(),
+            DispatchState::Reserved
+        );
+    }
+    writer.close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    (result, probe.load(Ordering::SeqCst))
+}
+
+struct QueryCredentialProbe {
+    inner: UsageScript,
+    probe: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl AsyncProviderAdapter for QueryCredentialProbe {
+    fn identity(&self) -> orbit_adapter::types::AdapterIdentity {
+        self.inner.identity()
+    }
+    fn capabilities(&self) -> &orbit_adapter::types::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+    fn validate_route(
+        &self,
+        route: &ProviderRouteBinding,
+    ) -> Result<(), orbit_adapter::error::AdapterError> {
+        self.inner.validate_route(route)
+    }
+    async fn invoke(
+        &self,
+        request: &orbit_adapter::types::ProviderRequest,
+        credential: Option<&SecretBytes>,
+        cancel: &CancelToken,
+    ) -> Result<orbit_provider_http::AsyncProviderEventStream, orbit_adapter::error::AdapterError>
+    {
+        self.probe.store(credential.is_some(), Ordering::SeqCst);
+        self.inner.invoke(request, credential, cancel).await
+    }
+}
+
+async fn endpoint_query_async_fixture(
+    registered: Option<&str>,
+    requested: Option<&str>,
+) -> (Result<DispatchOutcome, crate::DispatchError>, bool, usize) {
+    let dir = crate::tmpdir("query-async");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let adapter = Arc::new(QueryCredentialProbe {
+        inner: UsageScript {
+            events: usage_events(&[], None),
+            calls: calls.clone(),
+            capabilities: text_capabilities(),
+        },
+        probe: probe.clone(),
+    });
+    let mut binding = test_binding();
+    binding.endpoint_path = "/v1".into();
+    let binding = endpoint_query_binding(&binding, registered);
+    let mut request = canonical_request(&binding, b"hello");
+    request.route = endpoint_query_binding(&binding, requested);
+    let mut registry = ProviderRegistry::new();
+    registry.register_model(crate::ModelRef("test-model".into()), binding.clone());
+    registry.register_async_adapter(binding.adapter_kind, adapter);
+    let engine = DispatchEngine::new(
+        registry,
+        dir.clone(),
+        EgressAllowlist::new(vec![bound_tuple()]),
+        vec![bound_tuple()],
+        vec![spki_pin()],
+    );
+    let mut writer = LedgerWriter::open(&dir, "query-writer".into(), "0.1.0").unwrap();
+    let session = new_session_id();
+    let decision = new_decision_id();
+    let secret = SecretBytes::new(b"synthetic-query-bound-key".to_vec());
+    let mut observed = Vec::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        engine.dispatch_async(
+            "test-model",
+            &session,
+            &decision.0,
+            &request,
+            Some(&secret),
+            &mut writer,
+            &CancelToken::new(),
+            Some(&mut |event| observed.push(event.clone())),
+        ),
+    )
+    .await
+    .expect("bounded query fixture")
+    .map(|(outcome, _)| outcome);
+    if result.is_err() {
+        assert_eq!(
+            engine.recovery_state(&session, &decision.0).unwrap(),
+            DispatchState::Reserved
+        );
+        assert!(observed.is_empty());
+    }
+    writer.close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    (
+        result,
+        probe.load(Ordering::SeqCst),
+        calls.load(Ordering::SeqCst),
+    )
+}
+
+fn endpoint_query_changes() -> [(Option<&'static str>, Option<&'static str>); 5] {
+    [
+        (Some("scope=one"), Some("scope=two")),
+        (Some("scope=one"), None),
+        (None, Some("scope=one")),
+        (Some("scope=one&other=two"), Some("other=two&scope=one")),
+        (Some("scope=a%2Fb"), Some("scope=a/b")),
+    ]
+}
+
+#[test]
+fn gateway_endpoint_query_sync_mismatch_refuses_before_credential() {
+    for (registered, requested) in endpoint_query_changes() {
+        let (result, received) = endpoint_query_sync_fixture(registered, requested);
+        assert_eq!(result.unwrap_err().phase, "capability");
+        assert!(!received);
+    }
+}
+
+#[tokio::test]
+async fn gateway_endpoint_query_async_mismatch_refuses_before_credential_and_invoke() {
+    for (registered, requested) in endpoint_query_changes() {
+        let (result, received, calls) = endpoint_query_async_fixture(registered, requested).await;
+        assert_eq!(result.unwrap_err().phase, "capability");
+        assert!(!received);
+        assert_eq!(calls, 0);
+    }
+}
+
+#[test]
+fn gateway_endpoint_query_sync_exact_match_is_admitted() {
+    let (result, received) =
+        endpoint_query_sync_fixture(Some("scope=a%2Fb&other=two"), Some("scope=a%2Fb&other=two"));
+    assert!(matches!(result, Ok(DispatchOutcome::Completed(_))));
+    assert!(received);
+}
+
+#[tokio::test]
+async fn gateway_endpoint_query_async_exact_match_is_admitted() {
+    let (result, received, calls) =
+        endpoint_query_async_fixture(Some("scope=a%2Fb&other=two"), Some("scope=a%2Fb&other=two"))
+            .await;
+    assert!(matches!(result, Ok(DispatchOutcome::Completed(_))));
+    assert!(received);
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn gateway_endpoint_query_sync_ambiguous_values_refuse_before_credential() {
+    for query in [
+        "",
+        "scope=one#fragment",
+        "scope=one\n",
+        "scope=%GG",
+        "scope=one&%73cope=two",
+        "api_key=synthetic-query-bound-key",
+    ] {
+        let (result, received) = endpoint_query_sync_fixture(Some(query), Some(query));
+        assert!(result.is_err(), "ambiguous query passed egress validation");
+        assert!(!received);
+    }
+}
+
+#[tokio::test]
+async fn gateway_endpoint_query_async_ambiguous_values_refuse_before_credential_and_invoke() {
+    for query in [
+        "",
+        "scope=one#fragment",
+        "scope=one\n",
+        "scope=%GG",
+        "scope=one&%73cope=two",
+        "api_key=synthetic-query-bound-key",
+    ] {
+        let (result, received, calls) =
+            endpoint_query_async_fixture(Some(query), Some(query)).await;
+        assert!(result.is_err(), "ambiguous query passed egress validation");
+        assert!(!received);
+        assert_eq!(calls, 0);
+    }
 }

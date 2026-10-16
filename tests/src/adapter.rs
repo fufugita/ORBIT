@@ -48,6 +48,7 @@ fn test_binding() -> ProviderRouteBinding {
         endpoint_port: 443,
         endpoint_scheme: orbit_adapter::types::EndpointScheme::Https,
         endpoint_path: String::new(),
+        endpoint_query: None,
     }
 }
 

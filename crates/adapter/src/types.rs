@@ -201,19 +201,23 @@ pub struct ProviderRouteBinding {
     pub endpoint_host: String,
     #[serde(default = "default_https_port")]
     pub endpoint_port: u16,
-    /// Endpoint scheme (v0.2): HttpLoopback → http, else https. The adapter
-    /// and gateway egress tuple derive the wire scheme from this, so a
-    /// homelab mock (HTTP on a LAN IP) is addressable without host sniffing.
+    /// Endpoint scheme (v0.2). HttpLoopback is restricted to loopback HTTP;
+    /// LocalProcess is not an HTTP transport.
     #[serde(default)]
     pub endpoint_scheme: EndpointScheme,
     /// Base path of the endpoint, from the configured gate URL. Empty means
     /// the historical default: `/v1` for the OpenAI-compatible and Anthropic
-    /// adapters, the bare host for Ollama. A non-empty gate path (DashScope's
+    /// adapters. The concrete Ollama adapter requires an explicit API base.
+    /// A non-empty gate path (DashScope's
     /// `/compatible-mode/v1`, Z.ai's `/api/paas/v4`, Gemini's
     /// `/v1beta/openai`) is carried verbatim — the adapters append their
     /// method segment to it.
     #[serde(default)]
     pub endpoint_path: String,
+    /// Exact canonical raw query, without `?`. Absence retains the serialized
+    /// route payload used before queries were represented explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_query: Option<String>,
 }
 
 fn default_https_port() -> u16 {

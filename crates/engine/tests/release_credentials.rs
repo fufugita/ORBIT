@@ -27,6 +27,7 @@ const SAVED_KEY: &str = "orbit-fixture-saved-f931daa4";
 const ENV_KEY: &str = "orbit-fixture-environment-53f4e755";
 const CHILD_CASE: &str = "ORBIT_CREDENTIAL_FIXTURE_CHILD";
 const CHILD_HOME: &str = "ORBIT_CREDENTIAL_FIXTURE_HOME";
+const WIRE_QUERY: &str = "scope=synthetic&escaped=a%2Fb%26c%3Dd%2Be&space=a+b";
 
 struct Home(PathBuf);
 
@@ -158,6 +159,25 @@ impl Provider {
     }
 
     fn with_reply(body: &'static str) -> Self {
+        Self::with_response(body, "text/event-stream", None)
+    }
+
+    fn ollama() -> Self {
+        Self::with_response(
+            concat!(
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"fixture response\"},",
+                "\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":1,\"eval_count\":1}\n"
+            ),
+            "application/x-ndjson",
+            None,
+        )
+    }
+
+    fn redirect(location: String) -> Self {
+        Self::with_response("", "text/plain", Some(location))
+    }
+
+    fn with_response(body: &'static str, media: &'static str, redirect: Option<String>) -> Self {
         let (watchdog, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             if matches!(
@@ -186,9 +206,16 @@ impl Provider {
                             .set_write_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
                         captured.lock().unwrap().push(read_request(&mut stream));
+                        let (status, location) = match &redirect {
+                            Some(location) => (
+                                "307 Temporary Redirect",
+                                format!("Location: {location}\r\n"),
+                            ),
+                            None => ("200 OK", String::new()),
+                        };
                         let _ = write!(
                             stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 {status}\r\n{location}Content-Type: {media}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
                         let _ = stream.flush();
@@ -238,7 +265,7 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
     let header = String::from_utf8(header).unwrap();
     let mut lines = header.lines();
     let target = lines.next().unwrap().to_owned();
-    assert!(target.starts_with("POST /"));
+    assert!(target.starts_with("POST /") || target.starts_with("POST http://127.0.0.1:"));
     let headers: Vec<(String, String)> = lines
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
@@ -1010,6 +1037,295 @@ fn selected_stale_replacement_preserves_and_dispatches_current_key() {
                 std::fs::read(record).unwrap() == before,
                 "dispatch changed the preserved saved binding"
             );
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_openai_saved_key_exact_target() {
+    isolated(
+        "endpoint_query_engine_openai_saved_key_exact_target",
+        &[],
+        |home| {
+            let provider = Provider::new();
+            let mut config = config(&provider, Some(DECLARED_ENV));
+            config.gate = format!("{}/tenant/v1?{WIRE_QUERY}", provider.url);
+            save_key(home, &config);
+            assert_request(
+                home,
+                &config,
+                &provider,
+                ExpectedAuth::Bearer(SAVED_KEY),
+                &format!("POST /tenant/v1/chat/completions?{WIRE_QUERY} HTTP/1.1"),
+            );
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_anthropic_saved_key_exact_target() {
+    isolated(
+        "endpoint_query_engine_anthropic_saved_key_exact_target",
+        &[],
+        |home| {
+            let provider = Provider::anthropic();
+            let mut config = config(&provider, Some(DECLARED_ENV));
+            config.kind = ProviderKind::Anthropic;
+            config.gate = format!("{}/tenant/v1?{WIRE_QUERY}", provider.url);
+            save_key(home, &config);
+            assert_request(
+                home,
+                &config,
+                &provider,
+                ExpectedAuth::ApiKey(SAVED_KEY),
+                &format!("POST /tenant/v1/messages?{WIRE_QUERY} HTTP/1.1"),
+            );
+        },
+    );
+}
+
+fn query_ollama_case(home: &Path, base: &str, target: &str) {
+    let provider = Provider::ollama();
+    let mut config = config(&provider, None);
+    config.kind = ProviderKind::Ollama;
+    config.gate = format!("{}{base}?{WIRE_QUERY}", provider.url);
+    assert_request(
+        home,
+        &config,
+        &provider,
+        ExpectedAuth::None,
+        &format!("POST {target}?{WIRE_QUERY} HTTP/1.1"),
+    );
+}
+
+#[test]
+fn endpoint_query_engine_ollama_bare_host_no_auth() {
+    isolated(
+        "endpoint_query_engine_ollama_bare_host_no_auth",
+        &[],
+        |home| {
+            query_ollama_case(home, "", "/api/chat");
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_ollama_proxy_base_no_auth() {
+    isolated(
+        "endpoint_query_engine_ollama_proxy_base_no_auth",
+        &[],
+        |home| {
+            query_ollama_case(home, "/proxy", "/proxy/api/chat");
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_ollama_explicit_api_no_duplication() {
+    isolated(
+        "endpoint_query_engine_ollama_explicit_api_no_duplication",
+        &[],
+        |home| {
+            query_ollama_case(home, "/proxy/api", "/proxy/api/chat");
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_changed_query_cannot_reuse_saved_key() {
+    isolated(
+        "endpoint_query_engine_changed_query_cannot_reuse_saved_key",
+        &[],
+        |home| {
+            let provider = Provider::new();
+            let mut config = config(&provider, Some(DECLARED_ENV));
+            config.gate = format!("{}/v1?scope=first", provider.url);
+            save_key(home, &config);
+            config.gate = format!("{}/v1?scope=second", provider.url);
+            assert_preio_refusal(home, &config, &[&provider]);
+        },
+    );
+}
+
+fn invalid_gate_case(home: &Path, suffix: &str) {
+    let provider = Provider::new();
+    let mut config = config(&provider, Some(DECLARED_ENV));
+    config.gate = format!("{}{suffix}", provider.url);
+    let (result, events) = dispatch(home, &config);
+    assert!(result.is_err(), "ambiguous raw URL must fail locally");
+    let (code, message) = result.unwrap_err();
+    assert_eq!(code, "ORBIT-E0401");
+    assert!(!message.contains("scope=") && !message.contains("synthetic-query-token"));
+    assert!(!message.contains(&provider.url));
+    assert!(events.is_empty());
+    assert_eq!(provider.count(), 0);
+    assert_eq!(std::fs::read_dir(home.join("ledger")).unwrap().count(), 0);
+    assert_secret_free(message.as_bytes());
+    assert_ledger_secret_free(&home.join("ledger"));
+}
+
+#[test]
+fn endpoint_query_engine_sensitive_query_refuses_before_http() {
+    isolated(
+        "endpoint_query_engine_sensitive_query_refuses_before_http",
+        &[(DECLARED_ENV, ENV_KEY)],
+        |home| {
+            invalid_gate_case(home, "/v1?api_key=synthetic-query-token");
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_raw_newline_refuses_before_url_parse() {
+    isolated(
+        "endpoint_query_engine_raw_newline_refuses_before_url_parse",
+        &[(DECLARED_ENV, ENV_KEY)],
+        |home| {
+            invalid_gate_case(home, "/v1?scope=syn\nthetic");
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_raw_tab_refuses_before_url_parse() {
+    isolated(
+        "endpoint_query_engine_raw_tab_refuses_before_url_parse",
+        &[(DECLARED_ENV, ENV_KEY)],
+        |home| {
+            invalid_gate_case(home, "/v1?scope=syn\tthetic");
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_raw_backslash_refuses_before_url_parse() {
+    isolated(
+        "endpoint_query_engine_raw_backslash_refuses_before_url_parse",
+        &[(DECLARED_ENV, ENV_KEY)],
+        |home| {
+            invalid_gate_case(home, "/tenant\\v1?scope=synthetic");
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_ambiguous_queries_refuse_before_http() {
+    isolated(
+        "endpoint_query_engine_ambiguous_queries_refuse_before_http",
+        &[(DECLARED_ENV, ENV_KEY)],
+        |home| {
+            for suffix in [
+                "/v1?",
+                "/v1?scope=%GG",
+                "/v1?scope=one&scope=two",
+                "/v1?scope=one&%73cope=two",
+            ] {
+                invalid_gate_case(home, suffix);
+            }
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_all_dialects_refuse_redirect_trap() {
+    isolated(
+        "endpoint_query_engine_all_dialects_refuse_redirect_trap",
+        &[],
+        |home| {
+            for kind in [
+                ProviderKind::OpenAiCompatible,
+                ProviderKind::Anthropic,
+                ProviderKind::Ollama,
+            ] {
+                let trap = match kind {
+                    ProviderKind::Anthropic => Provider::anthropic(),
+                    ProviderKind::Ollama => Provider::ollama(),
+                    _ => Provider::new(),
+                };
+                let provider =
+                    Provider::redirect(format!("{}/redirect-trap?scope=other", trap.url));
+                let mut config = config(
+                    &provider,
+                    if matches!(kind, ProviderKind::Ollama) {
+                        None
+                    } else {
+                        Some(DECLARED_ENV)
+                    },
+                );
+                config.kind = kind;
+                config.gate = format!("{}?scope=synthetic", provider.url);
+                if !matches!(kind, ProviderKind::Ollama) {
+                    save_key(home, &config);
+                }
+                let (result, events) = dispatch(home, &config);
+                assert_eq!(provider.count(), 1);
+                assert_eq!(trap.count(), 0, "redirect escaped the registered authority");
+                assert!(result.is_err(), "redirect cannot complete a turn");
+                assert_public_secret_free(home, &config, &result, &events);
+                assert_eq!(
+                    result.unwrap_err().0,
+                    "E0411",
+                    "redirect refusal must not be retryable"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn endpoint_query_engine_ambient_proxy_cannot_replace_exact_destination() {
+    let proxy = Provider::new();
+    isolated_with_env(
+        "endpoint_query_engine_ambient_proxy_cannot_replace_exact_destination",
+        |child| {
+            child
+                .env("HTTP_PROXY", &proxy.url)
+                .env("http_proxy", &proxy.url)
+                .env("ALL_PROXY", &proxy.url)
+                .env("all_proxy", &proxy.url)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "");
+        },
+        |home| {
+            let provider = Provider::new();
+            let config = config(&provider, Some(DECLARED_ENV));
+            save_key(home, &config);
+            assert_request(
+                home,
+                &config,
+                &provider,
+                ExpectedAuth::Bearer(SAVED_KEY),
+                "POST /v1/chat/completions HTTP/1.1",
+            );
+        },
+    );
+    assert_eq!(
+        proxy.count(),
+        0,
+        "ambient proxy received an admitted request"
+    );
+}
+
+#[test]
+fn endpoint_query_engine_zero_port_refuses_before_credentials_or_ledger() {
+    isolated(
+        "endpoint_query_engine_zero_port_refuses_before_credentials_or_ledger",
+        &[(DECLARED_ENV, ENV_KEY)],
+        |home| {
+            let provider = Provider::new();
+            let mut config = config(&provider, Some(DECLARED_ENV));
+            config.gate = "http://127.0.0.1:0/v1?scope=synthetic".into();
+            let before = credential_snapshot(home);
+            let (result, events) = dispatch(home, &config);
+            let (code, message) = result.unwrap_err();
+            assert_eq!(code, "ORBIT-E0401");
+            assert!(message.starts_with("provider endpoint "));
+            assert!(!message.contains("scope=") && !message.contains("127.0.0.1"));
+            assert_secret_free(message.as_bytes());
+            assert!(events.is_empty());
+            assert_eq!(provider.count(), 0);
+            assert_eq!(std::fs::read_dir(home.join("ledger")).unwrap().count(), 0);
+            assert!(credential_snapshot(home) == before);
         },
     );
 }
