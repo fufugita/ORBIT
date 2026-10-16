@@ -1,21 +1,36 @@
-//! SSE (Server-Sent Events) parser for streaming provider responses (DR-09 §4).
-//!
-//! Parses `data:` frames from an SSE byte stream. Handles multi-line data
-//! frames, `[DONE]`, and JSON payloads. Malformed framing → E0411.
+//! Bounded incremental Server-Sent Events framing.
 
 use crate::error::TransportError;
+use crate::stream::{MAX_FRAME_BYTES, MAX_RESPONSE_BYTES};
 
-/// A parsed SSE event: the raw `data:` payload (multi-line joined) + whether
-/// the stream sent the terminal `[DONE]` marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
     pub data: String,
 }
 
-/// Incremental SSE line parser. Feed it raw bytes; it yields complete events.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseParser {
-    buffer: Vec<u8>,
+    line: Vec<u8>,
+    data: String,
+    has_data: bool,
+    first_line: bool,
+    skip_lf: bool,
+    frame_bytes: usize,
+    total_bytes: usize,
+}
+
+impl Default for SseParser {
+    fn default() -> Self {
+        Self {
+            line: Vec::new(),
+            data: String::new(),
+            has_data: false,
+            first_line: true,
+            skip_lf: false,
+            frame_bytes: 0,
+            total_bytes: 0,
+        }
+    }
 }
 
 impl SseParser {
@@ -23,43 +38,72 @@ impl SseParser {
         Self::default()
     }
 
-    /// Feed bytes; returns the complete `data:` events found (each possibly
-    /// spanning multiple `data:` lines, joined by newline).
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, TransportError> {
-        self.buffer.extend_from_slice(bytes);
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(bytes.len())
+            .filter(|n| *n <= MAX_RESPONSE_BYTES)
+            .ok_or_else(|| TransportError::Protocol("SSE response exceeds byte limit".into()))?;
         let mut events = Vec::new();
-        loop {
-            // Find the next blank line (event terminator).
-            let terminator = self
-                .buffer
-                .windows(2)
-                .position(|w| w == b"\n\n")
-                .or_else(|| self.buffer.windows(2).position(|w| w == b"\r\n\r\n"));
-            let Some(end) = terminator else {
-                break; // incomplete event — wait for more bytes
-            };
-            let event_bytes: Vec<u8> = self.buffer.drain(..=end).collect();
-            let event_text = String::from_utf8_lossy(&event_bytes);
-            // Extract `data:` lines (possibly multiple, joined by \n).
-            let mut data_lines = Vec::new();
-            for line in event_text.lines() {
-                let line = line.trim_end_matches('\r');
-                if let Some(rest) = line.strip_prefix("data:") {
-                    data_lines.push(rest.trim_start().to_string());
+        for &byte in bytes {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
                 }
             }
-            if !data_lines.is_empty() {
-                events.push(SseEvent {
-                    data: data_lines.join("\n"),
-                });
+            self.frame_bytes += 1;
+            if self.frame_bytes > MAX_FRAME_BYTES {
+                return Err(TransportError::Protocol(
+                    "SSE frame exceeds byte limit".into(),
+                ));
+            }
+            if byte == b'\r' || byte == b'\n' {
+                self.finish_line(&mut events)?;
+                self.skip_lf = byte == b'\r';
+            } else {
+                self.line.push(byte);
             }
         }
         Ok(events)
     }
 
-    /// Whether the parser has no leftover bytes (stream ended cleanly).
+    fn finish_line(&mut self, events: &mut Vec<SseEvent>) -> Result<(), TransportError> {
+        let line = std::str::from_utf8(&self.line)
+            .map_err(|_| TransportError::Protocol("invalid SSE UTF-8".into()))?;
+        let line = if self.first_line {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        } else {
+            line
+        };
+        self.first_line = false;
+        if line.is_empty() {
+            if self.has_data {
+                events.push(SseEvent {
+                    data: std::mem::take(&mut self.data),
+                });
+                self.has_data = false;
+            }
+            self.frame_bytes = 0;
+        } else if !line.starts_with(':') {
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            if field == "data" {
+                if self.has_data {
+                    self.data.push('\n');
+                }
+                self.data.push_str(value);
+                self.has_data = true;
+            }
+        }
+        self.line.clear();
+        Ok(())
+    }
+
+    /// EOF never dispatches pending data. A final CR already ended its line;
+    /// skip_lf only suppresses the optional second half of a CRLF delimiter.
     pub fn is_clean(&self) -> bool {
-        self.buffer.is_empty() || self.buffer.iter().all(|b| b.is_ascii_whitespace())
+        self.line.is_empty() && !self.has_data
     }
 }
 

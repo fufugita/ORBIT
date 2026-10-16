@@ -79,43 +79,10 @@ impl OpenAiCompatibleHttpV1 {
         // Build the wire body — sampling as provider floats ONLY here.
         // Multi-turn transcript wins when present; otherwise the single
         // user turn (input bytes are always the newest user prompt).
-        let messages: serde_json::Value = match &request.messages {
-            Some(transcript) => transcript
-                .iter()
-                .map(|m| {
-                    if let Some(tool_calls) = m
-                        .tool_calls
-                        .as_ref()
-                        .filter(|_| m.role == orbit_adapter::types::ChatRole::Assistant)
-                    {
-                        serde_json::json!({
-                            "role": "assistant",
-                            "content": if m.content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(m.content.clone()) },
-                            "tool_calls": tool_calls.iter().map(|tc| serde_json::json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": { "name": tc.name, "arguments": tc.arguments },
-                            })).collect::<Vec<_>>(),
-                        })
-                    } else if m.role == orbit_adapter::types::ChatRole::Tool {
-                        serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": m.tool_call_id,
-                            "content": m.tool_result.as_deref().unwrap_or(&m.content),
-                        })
-                    } else {
-                        serde_json::json!({
-                            "role": m.role.as_str(),
-                            "content": m.content,
-                        })
-                    }
-                })
-                .collect::<Vec<_>>()
-                .into(),
+        let messages = match &request.messages {
+            Some(transcript) => openai_messages(transcript)?,
             None => serde_json::json!([
-                {"role": "user", "content": String::from_utf8_lossy(
-                    request.input.expose()
-                ).into_owned()}
+                {"role": "user", "content": String::from_utf8_lossy(request.input.expose()).into_owned()}
             ]),
         };
         let tools: Vec<serde_json::Value> = request
@@ -210,6 +177,124 @@ impl OpenAiCompatibleHttpV1 {
 }
 
 /// Consume the OpenAI SSE byte stream and emit `ProviderStreamEvent`s.
+fn openai_messages(
+    transcript: &[orbit_adapter::types::ChatMessage],
+) -> Result<serde_json::Value, AdapterError> {
+    use orbit_adapter::types::{ChatRole, ContentBlock};
+    let mut messages = Vec::with_capacity(transcript.len());
+    for message in transcript {
+        let content = match &message.blocks {
+            None => serde_json::Value::String(message.content.clone()),
+            Some(blocks) => {
+                let mut parts = Vec::with_capacity(blocks.len());
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            parts.push(serde_json::json!({"type":"text","text":text}));
+                        }
+                        ContentBlock::Image { data, media_type }
+                            if message.role == ChatRole::User && supported_image(media_type) =>
+                        {
+                            parts.push(serde_json::json!({
+                                "type":"image_url", "image_url":{"url":format!("data:{media_type};base64,{data}")}
+                            }));
+                        }
+                        _ => {
+                            return Err(AdapterError::CapabilityMismatch(
+                                "unsupported structured block or role for OpenAI chat (E0414)"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                serde_json::Value::Array(parts)
+            }
+        };
+        let mut wire = serde_json::json!({"role":message.role.as_str(),"content":content});
+        if message.role == ChatRole::Tool {
+            if message.blocks.is_some() {
+                return Err(AdapterError::CapabilityMismatch(
+                    "structured OpenAI tool results are unsupported (E0414)".into(),
+                ));
+            }
+            let id = message
+                .tool_call_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    AdapterError::RequestInvalidOrTooLarge(
+                        "tool result is missing its call identity (E0412)".into(),
+                    )
+                })?;
+            wire["tool_call_id"] = serde_json::json!(id);
+            wire["content"] =
+                serde_json::json!(message.tool_result.as_deref().unwrap_or(&message.content));
+        } else if let Some(calls) = &message.tool_calls {
+            if message.role != ChatRole::Assistant {
+                return Err(AdapterError::RequestInvalidOrTooLarge(
+                    "tool calls require an assistant message (E0412)".into(),
+                ));
+            }
+            if message.blocks.is_none() && message.content.is_empty() {
+                wire["content"] = serde_json::Value::Null;
+            }
+            wire["tool_calls"] = serde_json::json!(calls.iter().map(|call| serde_json::json!({
+                "id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}
+            })).collect::<Vec<_>>());
+        }
+        messages.push(wire);
+    }
+    Ok(messages.into())
+}
+
+pub(crate) fn supported_image(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
+}
+
+fn openai_usage(value: &serde_json::Value) -> Result<ProviderUsage, AdapterError> {
+    use crate::stream::{optional_counter, protocol, required_counter};
+    if !value.is_object() {
+        return Err(protocol("invalid OpenAI usage object"));
+    }
+    let prompt = required_counter(value, "prompt_tokens")?;
+    let output = required_counter(value, "completion_tokens")?;
+    let details = |field: &str| -> Result<Option<&serde_json::Value>, AdapterError> {
+        match value.get(field).filter(|value| !value.is_null()) {
+            None => Ok(None),
+            Some(value) if value.is_object() => Ok(Some(value)),
+            Some(_) => Err(protocol("invalid OpenAI usage details")),
+        }
+    };
+    let cached = details("prompt_tokens_details")?
+        .map(|value| optional_counter(value, "cached_tokens"))
+        .transpose()?
+        .flatten()
+        .unwrap_or(0);
+    let reasoning = details("completion_tokens_details")?
+        .map(|value| optional_counter(value, "reasoning_tokens"))
+        .transpose()?
+        .flatten()
+        .unwrap_or(0);
+    if cached > prompt || reasoning > output {
+        return Err(protocol("OpenAI usage detail exceeds its total"));
+    }
+    if let Some(total) = optional_counter(value, "total_tokens")?
+        && prompt.checked_add(output) != Some(total)
+    {
+        return Err(protocol("inconsistent OpenAI total usage"));
+    }
+    Ok(ProviderUsage {
+        input_tokens: prompt - cached,
+        output_tokens: output,
+        cache_read_tokens: cached,
+        cache_write_tokens: 0,
+        reasoning_tokens: reasoning,
+    })
+}
+
 fn openai_stream(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
     + Unpin
@@ -219,186 +304,133 @@ fn openai_stream(
     idle_timeout_ms: u64,
     cancel: CancelToken,
 ) -> AsyncProviderEventStream {
+    use crate::stream::{
+        MAX_FRAME_BYTES, MAX_TOOL_CALLS, WireCall, append_bounded, count_bytes, incomplete_reason,
+        protocol, record_reason, validate_calls,
+    };
     Box::pin(async_stream::stream! {
         let mut parser = SseParser::new();
-        let mut seq: u64 = 0;
-        let mut usage = ProviderUsage::default();
+        let mut seq = 0u64;
+        let mut usage = None;
         let mut saw_done = false;
-        let mut finish_reason: Option<String> = None;
-        let mut open_tool_calls: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-
-        // Emit the response-started event.
+        let mut finish_reason = None;
+        let mut calls = std::collections::BTreeMap::<u32, WireCall>::new();
+        let mut total = 0usize;
         yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ResponseStarted { upstream_request_id: None } });
         seq += 1;
-
-        // E5: a stream that stops sending bytes must fail as a
-        // retryable timeout, not hang the turn forever. First gap
-        // gets first_byte_timeout; later gaps get idle_timeout.
-        let mut first_chunk = true;
+        let mut first = true;
+        // One absolute trailer window, so pings cannot keep a completed
+        // reason-only response alive indefinitely while optional usage arrives.
+        let mut trailer_deadline: Option<tokio::time::Instant> = None;
         while let Some(chunk) = {
-            let budget = std::time::Duration::from_millis(if first_chunk {
-                first_byte_timeout_ms
-            } else {
-                idle_timeout_ms
-            });
-            match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
-                None => None,
-                Some(Ok(item)) => item,
-                Some(Err(_)) => {
-                    yield Err(AdapterError::ProviderTimeout(
-                        "stream stalled: no bytes within the idle timeout (E0409)".into(),
-                    ));
-                    return;
+            let idle = std::time::Duration::from_millis(if first { first_byte_timeout_ms } else { idle_timeout_ms });
+            let budget = trailer_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now())).unwrap_or(idle).min(idle);
+            if trailer_deadline.is_some() && budget.is_zero() { None } else {
+                match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
+                    None => None,
+                    Some(Ok(item)) => item,
+                    Some(Err(_)) if finish_reason.is_some() => None,
+                    Some(Err(_)) => { yield Err(AdapterError::ProviderTimeout("stream stalled (E0409)".into())); return; }
                 }
             }
         } {
             if cancel.is_cancelled() { break; }
-            first_chunk = false;
+            first = false;
             let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => { yield Err(AdapterError::ProviderTransportFailure(e.to_string())); return; }
+                Ok(chunk) => chunk,
+                Err(error) if finish_reason.is_some() && parser.is_clean() && error.is_body() => break,
+                Err(error) => { yield Err(AdapterError::ProviderTransportFailure(error.to_string())); return; }
             };
-            let events = match parser.feed(&chunk) {
-                Ok(evs) => evs,
-                Err(e) => { yield Err(e.into()); return; }
-            };
-            for ev in events {
-                if ev.data == "[DONE]" {
-                    saw_done = true;
-                    break;
-                }
-                let json: serde_json::Value = match serde_json::from_str(&ev.data) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        yield Err(AdapterError::ProtocolOrStreamViolation(
-                            "malformed SSE JSON (E0411)".into(),
-                        ));
-                        return;
-                    }
+            if let Err(error) = count_bytes(&mut total, chunk.len()) { yield Err(error); return; }
+            let events = match parser.feed(&chunk) { Ok(events) => events, Err(error) => { yield Err(error.into()); return; } };
+            for event in events {
+                if event.data == "[DONE]" { saw_done = true; continue; }
+                let value: serde_json::Value = match serde_json::from_str(&event.data) {
+                    Ok(value) => value,
+                    Err(_) => { yield Err(protocol("malformed SSE JSON")); return; }
                 };
-                // Delta text.
-                if let Some(delta) = json.pointer("/choices/0/delta/content")
-                    .and_then(|d| d.as_str())
-                {
-                    yield Ok(ProviderStreamEvent {
-                        sequence: seq,
-                        event: ProviderEventKind::TextDelta { bytes: delta.as_bytes().to_vec() },
-                    });
-                    seq += 1;
-                }
-                // Streaming tool calls. OpenAI may fragment name/id/arguments
-                // across arbitrary SSE chunks. We emit Started on first sight,
-                // ArgumentsDelta for every fragment, then Finished when the
-                // choice finish_reason becomes `tool_calls` (or at terminal).
-                if let Some(calls) = json.pointer("/choices/0/delta/tool_calls")
-                    .and_then(|v| v.as_array())
-                {
-                    for call in calls {
-                        let index = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        if !open_tool_calls.contains(&index) {
-                            let id = call.get("id").and_then(|v| v.as_str()).map(str::to_string);
-                            let name = call.pointer("/function/name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            open_tool_calls.insert(index);
-                            yield Ok(ProviderStreamEvent {
-                                sequence: seq,
-                                event: ProviderEventKind::ToolCallStarted {
-                                    call_index: index,
-                                    provider_call_id: id,
-                                    name,
-                                },
-                            });
-                            seq += 1;
+                if value.get("error").is_some() { yield Err(protocol("provider sent an error event")); return; }
+                if saw_done { yield Err(protocol("provider data follows completion sentinel")); return; }
+                if let Some(choices) = value.get("choices") {
+                    let Some(choices) = choices.as_array() else { yield Err(protocol("invalid choices array")); return; };
+                    if choices.len() > 1 { yield Err(protocol("multiple response choices are unsupported")); return; }
+                    if let Some(choice) = choices.first() {
+                        if choice.get("index").and_then(|v| v.as_u64()).is_some_and(|index| index != 0) {
+                            yield Err(protocol("unexpected response choice index")); return;
                         }
-                        if let Some(args) = call.pointer("/function/arguments").and_then(|v| v.as_str())
-                            && !args.is_empty() {
-                                yield Ok(ProviderStreamEvent {
-                                    sequence: seq,
-                                    event: ProviderEventKind::ToolCallArgumentsDelta {
-                                        call_index: index,
-                                        bytes: args.as_bytes().to_vec(),
-                                    },
-                                });
-                                seq += 1;
+                        let delta = &choice["delta"];
+                        if finish_reason.is_some() && (
+                            delta.get("content").is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+                            || delta.get("refusal").is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+                            || delta.get("tool_calls").and_then(|value| value.as_array()).is_some_and(|calls| !calls.is_empty())
+                        ) {
+                            yield Err(protocol("content or tool fragments follow semantic completion")); return;
+                        }
+                        if let Some(text) = delta.get("content").filter(|v| !v.is_null()) {
+                            let Some(text) = text.as_str() else { yield Err(protocol("invalid text delta")); return; };
+                            yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::TextDelta { bytes: text.as_bytes().to_vec() } }); seq += 1;
+                        }
+                        if let Some(refusal) = delta.get("refusal").filter(|v| !v.is_null()) {
+                            let Some(refusal) = refusal.as_str() else { yield Err(protocol("invalid refusal delta")); return; };
+                            if !refusal.is_empty() { finish_reason = Some("content_filter".into()); }
+                        }
+                        if let Some(tool_deltas) = delta.get("tool_calls") {
+                            let Some(tool_deltas) = tool_deltas.as_array() else { yield Err(protocol("invalid tool call array")); return; };
+                            for tool in tool_deltas {
+                                let Some(index) = tool.get("index").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()) else {
+                                    yield Err(protocol("tool delta is missing a valid index")); return;
+                                };
+                                if !calls.contains_key(&index) && calls.len() >= MAX_TOOL_CALLS { yield Err(protocol("too many tool calls")); return; }
+                                let call = calls.entry(index).or_default();
+                                for (field, target, limit) in [
+                                    (tool.get("id"), &mut call.id, 512),
+                                    (tool.pointer("/function/name"), &mut call.name, 256),
+                                    (tool.pointer("/function/arguments"), &mut call.arguments, MAX_FRAME_BYTES),
+                                ] {
+                                    if let Some(field) = field {
+                                        let Some(part) = field.as_str() else { yield Err(protocol("invalid tool delta field")); return; };
+                                        if let Err(error) = append_bounded(target, part, limit) { yield Err(error); return; }
+                                    }
+                                }
                             }
-                    }
-                }
-                if let Some(reason) = json.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) {
-                    finish_reason = Some(reason.to_string());
-                    if reason == "tool_calls" {
-                        let to_finish: Vec<u32> = open_tool_calls.iter().copied().collect();
-                        for index in to_finish {
-                            yield Ok(ProviderStreamEvent {
-                                sequence: seq,
-                                event: ProviderEventKind::ToolCallFinished { call_index: index },
-                            });
-                            seq += 1;
-                            open_tool_calls.remove(&index);
+                        }
+                        if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
+                            let Some(reason) = reason.as_str() else { yield Err(protocol("invalid finish reason")); return; };
+                            if let Err(error) = record_reason(&mut finish_reason, reason, &["stop","tool_calls","length","max_tokens","content_filter"]) { yield Err(error); return; }
                         }
                     }
                 }
-                // Usage update — full five-field extraction (DR-09 §8).
-                // OpenAI nests cache/reasoning under prompt/completion details.
-                if let Some(u) = json.get("usage") {
-                    let prompt_details = u.get("prompt_tokens_details");
-                    let completion_details = u.get("completion_tokens_details");
-                    // OpenAI's prompt_tokens INCLUDES cached tokens;
-                    // the crate's convention (GW-15, and what the cost
-                    // table charges) is input EXCLUDES cache. Subtract
-                    // so input + cache = the request's true context
-                    // size, and cache reads bill at the cache rate
-                    // only, never twice.
-                    let prompt_total =
-                        u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let cached = prompt_details
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                    usage = ProviderUsage {
-                        input_tokens: prompt_total.saturating_sub(cached),
-                        output_tokens: u
-                            .get("completion_tokens")
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0),
-                        cache_read_tokens: cached,
-                        cache_write_tokens: 0,
-                        reasoning_tokens: completion_details
-                            .and_then(|d| d.get("reasoning_tokens"))
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0),
-                    };
-                    yield Ok(ProviderStreamEvent {
-                        sequence: seq,
-                        event: ProviderEventKind::UsageUpdate(usage),
-                    });
-                    seq += 1;
+                if let Some(value) = value.get("usage").filter(|v| !v.is_null()) {
+                    let parsed = match openai_usage(value) { Ok(usage) => usage, Err(error) => { yield Err(error); return; } };
+                    usage = Some(parsed);
+                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::UsageUpdate(parsed) }); seq += 1;
                 }
             }
             if saw_done { break; }
-        }
-
-        // Terminalizer (GW-10): exactly one Finished. Finish any tool calls the
-        // stream left open (belt-and-suspenders — a well-formed stream closes
-        // them at finish_reason=tool_calls).
-        for index in open_tool_calls.iter().copied().collect::<Vec<_>>() {
-            yield Ok(ProviderStreamEvent {
-                sequence: seq,
-                event: ProviderEventKind::ToolCallFinished { call_index: index },
-            });
-            seq += 1;
+            if finish_reason.is_some() && trailer_deadline.is_none() {
+                trailer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(idle_timeout_ms));
+            }
         }
         if cancel.is_cancelled() {
-            finish_reason = Some("cancelled".into());
+            yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some("cancelled".into()), final_usage: None } });
+            return;
         }
-        yield Ok(ProviderStreamEvent {
-            sequence: seq,
-            event: ProviderEventKind::Finished {
-                finish_reason,
-                final_usage: Some(usage),
-            },
-        });
+        if !parser.is_clean() { yield Err(protocol("unfinished SSE frame")); return; }
+        if !saw_done && finish_reason.is_none() { yield Err(protocol("stream ended without completion evidence")); return; }
+        let mut reason = finish_reason.unwrap_or_else(|| "stop".into());
+        if !incomplete_reason(&reason) {
+            if reason == "tool_calls" && calls.is_empty() { yield Err(protocol("tool completion has no calls")); return; }
+            if let Err(error) = validate_calls(&calls) { yield Err(error); return; }
+            if !calls.is_empty() {
+                reason = "tool_calls".into();
+                for (index, call) in calls {
+                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallStarted { call_index: index, provider_call_id: Some(call.id), name: call.name } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallArgumentsDelta { call_index: index, bytes: call.arguments.into_bytes() } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallFinished { call_index: index } }); seq += 1;
+                }
+            }
+        }
+        yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some(reason), final_usage: usage } });
     })
 }
 

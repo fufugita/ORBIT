@@ -18,6 +18,28 @@ pub const DEFAULT_MAX_ROUNDS: u32 = 100;
 /// Retry budget for rate-limit/server refusals (roadmap: 8).
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 8;
 
+fn accumulate_accounting(
+    report: &mut TurnReport,
+    outcome: &crate::dispatch::TurnOutcome,
+) -> Result<(), &'static str> {
+    let input_tokens = report
+        .input_tokens
+        .checked_add(outcome.input_tokens)
+        .ok_or("provider input accounting overflow (ORBIT-E0411)")?;
+    let output_tokens = report
+        .output_tokens
+        .checked_add(outcome.output_tokens)
+        .ok_or("provider output accounting overflow (ORBIT-E0411)")?;
+    let cost_microcents = report
+        .cost_microcents
+        .checked_add(outcome.cost_microcents)
+        .ok_or("provider cost accounting overflow (ORBIT-E0411)")?;
+    report.input_tokens = input_tokens;
+    report.output_tokens = output_tokens;
+    report.cost_microcents = cost_microcents;
+    Ok(())
+}
+
 /// Configuration for one engine turn.
 #[derive(Debug, Clone)]
 pub struct TurnOptions {
@@ -181,6 +203,123 @@ fn call_target(name: &str, arguments: &[u8]) -> String {
     orbit_tools::scan::scan_result(&raw).text
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    CompleteText,
+    CompleteTools,
+    Truncated,
+    Filtered,
+    Cancelled,
+    Incomplete,
+}
+
+impl StopReason {
+    fn classify(outcome: &crate::dispatch::TurnOutcome) -> Self {
+        match outcome.finish_reason.as_deref() {
+            Some("cancelled") => Self::Cancelled,
+            Some("length" | "max_tokens") => Self::Truncated,
+            Some("content_filter" | "filter" | "refusal") => Self::Filtered,
+            Some("stop" | "end_turn" | "stop_sequence") if outcome.tool_calls.is_empty() => {
+                Self::CompleteText
+            }
+            Some("tool_calls" | "tool_use")
+                if !outcome.tool_calls.is_empty() && valid_tool_set(&outcome.tool_calls) =>
+            {
+                Self::CompleteTools
+            }
+            _ => Self::Incomplete,
+        }
+    }
+}
+
+fn valid_tool_set(calls: &[crate::dispatch::PendingToolCall]) -> bool {
+    if calls.len() > 128 {
+        return false;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut indexes = std::collections::BTreeSet::new();
+    calls.iter().all(|call| {
+        !call.id.trim().is_empty()
+            && call.id.len() <= 512
+            && !call.name.trim().is_empty()
+            && call.name.len() <= 256
+            && call.arguments.len() <= 8 * 1024 * 1024
+            && ids.insert(call.id.as_str())
+            && indexes.insert(call.index)
+            && serde_json::from_slice::<serde_json::Value>(&call.arguments)
+                .is_ok_and(|arguments| arguments.is_object())
+    })
+}
+
+struct ObservedCall {
+    id: String,
+    name: String,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct ToolLifecycle {
+    calls: std::collections::BTreeMap<u32, ObservedCall>,
+    invalid: bool,
+}
+
+impl ToolLifecycle {
+    fn observe(&mut self, event: &orbit_adapter::types::ProviderEventKind) {
+        use orbit_adapter::types::ProviderEventKind;
+        match event {
+            ProviderEventKind::ToolCallStarted {
+                call_index,
+                provider_call_id,
+                name,
+            } => {
+                let Some(id) = provider_call_id.as_ref().filter(|id| !id.trim().is_empty()) else {
+                    self.invalid = true;
+                    return;
+                };
+                if self.calls.len() >= 128
+                    || self.calls.contains_key(call_index)
+                    || id.len() > 512
+                    || name.trim().is_empty()
+                    || name.len() > 256
+                {
+                    self.invalid = true;
+                    return;
+                }
+                self.calls.insert(
+                    *call_index,
+                    ObservedCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        finished: false,
+                    },
+                );
+            }
+            ProviderEventKind::ToolCallArgumentsDelta { call_index, .. } => {
+                if self.calls.get(call_index).is_none_or(|call| call.finished) {
+                    self.invalid = true;
+                }
+            }
+            ProviderEventKind::ToolCallFinished { call_index } => {
+                match self.calls.get_mut(call_index) {
+                    Some(call) if !call.finished => call.finished = true,
+                    _ => self.invalid = true,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn matches(&self, calls: &[crate::dispatch::PendingToolCall]) -> bool {
+        !self.invalid
+            && self.calls.len() == calls.len()
+            && calls.iter().all(|call| {
+                self.calls.get(&call.index).is_some_and(|observed| {
+                    observed.finished && observed.id == call.id && observed.name == call.name
+                })
+            })
+    }
+}
+
 /// Run one prompt through the engine loop, updating `transcript` in
 /// place (the caller owns persistence). `cancel` is checked between
 /// rounds and during streaming (the provider layer aborts mid-stream).
@@ -292,14 +431,31 @@ pub fn run_turn(
         }
 
         // One dispatch, with retry on rate-limit-class refusals.
+        let mut partial_text = String::new();
         let outcome = dispatch_with_retry(
-            home, config, options, prompt, transcript, cancel, round, events,
+            home,
+            config,
+            options,
+            prompt,
+            transcript,
+            cancel,
+            round,
+            &mut |event| {
+                if let FrontendEvent::TextDelta { text } = &event {
+                    partial_text.push_str(text);
+                }
+                events(event);
+            },
         );
 
         let o = match outcome {
             Ok(o) => o,
             Err(e) => {
-                if e == "cancelled" {
+                if !partial_text.is_empty() {
+                    transcript.push(assistant_message(partial_text.clone()));
+                    report.final_text = partial_text;
+                }
+                if e == "cancelled" || cancel.is_cancelled() {
                     report.interrupted = true;
                     report.ok = false;
                     emit_turn_ended(events, &report, round);
@@ -312,9 +468,28 @@ pub fn run_turn(
         };
 
         report.rounds = round + 1;
-        report.input_tokens += o.input_tokens;
-        report.output_tokens += o.output_tokens;
-        report.cost_microcents += o.cost_microcents;
+        let stop_reason = StopReason::classify(&o);
+        if cancel.is_cancelled() || stop_reason == StopReason::Cancelled {
+            if !o.output.is_empty() {
+                transcript.push(assistant_message(o.output.clone()));
+            }
+            report.final_text = o.output;
+            report.interrupted = true;
+            report.ok = false;
+            emit_turn_ended(events, &report, report.rounds);
+            return Ok(report);
+        }
+        if let Err(message) = accumulate_accounting(&mut report, &o) {
+            if !o.output.is_empty() {
+                transcript.push(assistant_message(o.output.clone()));
+            }
+            report.final_text = o.output;
+            events(FrontendEvent::Error {
+                message: message.into(),
+            });
+            emit_turn_ended(events, &report, report.rounds);
+            return Err(message.into());
+        }
         events(FrontendEvent::CostUpdated {
             total_microcents: report.cost_microcents,
         });
@@ -329,30 +504,18 @@ pub fn run_turn(
             });
         }
 
-        if cancel.is_cancelled() || o.finish_reason.as_deref() == Some("cancelled") {
+        if matches!(
+            stop_reason,
+            StopReason::Truncated | StopReason::Filtered | StopReason::Incomplete
+        ) {
+            // Preserve useful visible text, never unfinished tool metadata
+            // or signed thinking from a reply that did not complete.
             if !o.output.is_empty() {
-                let mut partial = user_message(o.output.clone());
-                partial.role = ChatRole::Assistant;
-                transcript.push(partial);
+                transcript.push(assistant_message(o.output.clone()));
             }
             report.final_text = o.output;
-            report.interrupted = true;
             report.ok = false;
-            emit_turn_ended(events, &report, report.rounds);
-            return Ok(report);
-        }
-
-        if o.tool_calls.is_empty() {
-            // Terminal text round. A `length` stop means the reply was
-            // cut off by the output-token limit — end the turn with a
-            // visible note instead of silently treating it as done.
-            let truncated = matches!(
-                o.finish_reason.as_deref(),
-                Some("length") | Some("max_tokens")
-            );
-            if truncated {
-                // E9: Notification — a condition the operator should
-                // hear about (the reply was cut off).
+            if stop_reason == StopReason::Truncated {
                 let _ = hooks.fire(
                     crate::hooks::HookEvent::Notification,
                     &serde_json::json!({
@@ -363,7 +526,21 @@ pub fn run_turn(
                 events(FrontendEvent::OutputTruncated {
                     limit: config.max_output_tokens,
                 });
+            } else {
+                let message = if stop_reason == StopReason::Filtered {
+                    "provider filtered or refused the response before completion"
+                } else {
+                    "E0411: provider response has an incomplete terminal state or invalid tool calls"
+                };
+                events(FrontendEvent::Error {
+                    message: message.into(),
+                });
             }
+            emit_turn_ended(events, &report, report.rounds);
+            return Ok(report);
+        }
+
+        if stop_reason == StopReason::CompleteText {
             let mut m = assistant_message_with_thinking(
                 o.output.clone(),
                 o.thinking.clone(),
@@ -578,7 +755,13 @@ fn dispatch_with_retry(
         // Live stream: forward TextDelta bytes to the front-end as
         // protocol events. The observer borrows `events` for the
         // duration of the dispatch call only.
+        let mut observed = false;
+        let mut lifecycle = ToolLifecycle::default();
         let mut observer = |ev: &orbit_adapter::types::ProviderStreamEvent| {
+            // Admission itself makes replay unsafe, even while an adapter
+            // is buffering tool identity and has not delivered text yet.
+            observed = true;
+            lifecycle.observe(&ev.event);
             if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &ev.event {
                 events(FrontendEvent::TextDelta {
                     text: String::from_utf8_lossy(bytes).into_owned(),
@@ -601,6 +784,13 @@ fn dispatch_with_retry(
         }
         match result {
             Ok(o) => {
+                if matches!(
+                    StopReason::classify(&o),
+                    StopReason::CompleteText | StopReason::CompleteTools
+                ) && !lifecycle.matches(&o.tool_calls)
+                {
+                    return Err("E0411: incomplete provider tool-call lifecycle".into());
+                }
                 // The egress record was durable BEFORE the request left
                 // (GW-04); tell the front-end its hash, now that the round
                 // has finished, so the proof surface lists it.
@@ -623,7 +813,9 @@ fn dispatch_with_retry(
                 }
                 return Ok(o);
             }
-            Err((code, msg)) if is_retryable(code) && attempt < options.max_attempts => {
+            Err((code, msg))
+                if !observed && is_retryable(code) && attempt < options.max_attempts =>
+            {
                 // Exponential backoff with jitter: 1s, 2s, 4s, … capped
                 // at 32s; ~8 attempts span about two minutes.
                 let base = 1000u64.saturating_mul(1 << (attempt - 1).min(5));
@@ -843,6 +1035,107 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn pending(
+        index: u32,
+        id: &str,
+        name: &str,
+        arguments: &[u8],
+    ) -> crate::dispatch::PendingToolCall {
+        crate::dispatch::PendingToolCall {
+            index,
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    #[test]
+    fn terminal_gate_independently_validates_the_whole_outcome() {
+        let valid = pending(0, "one", "Effect", b"{}");
+        for invalid in [
+            pending(1, "", "Effect", b"{}"),
+            pending(1, "two", "", b"{}"),
+            pending(1, "two", "Effect", b"{"),
+            pending(1, "two", "Effect", b"[]"),
+            pending(1, "one", "Effect", b"{}"),
+            pending(0, "two", "Effect", b"{}"),
+            pending(1, "two", "Effect", &[0xff]),
+        ] {
+            let outcome = crate::dispatch::TurnOutcome {
+                finish_reason: Some("tool_calls".into()),
+                tool_calls: vec![valid.clone(), invalid],
+                ..Default::default()
+            };
+            assert_eq!(StopReason::classify(&outcome), StopReason::Incomplete);
+        }
+        let mut outcome = crate::dispatch::TurnOutcome {
+            finish_reason: Some("tool_calls".into()),
+            tool_calls: vec![valid],
+            ..Default::default()
+        };
+        assert_eq!(StopReason::classify(&outcome), StopReason::CompleteTools);
+        for (reason, expected) in [
+            ("length", StopReason::Truncated),
+            ("max_tokens", StopReason::Truncated),
+            ("content_filter", StopReason::Filtered),
+            ("cancelled", StopReason::Cancelled),
+            ("stop", StopReason::Incomplete),
+            ("end_turn", StopReason::Incomplete),
+            ("unknown", StopReason::Incomplete),
+        ] {
+            outcome.finish_reason = Some(reason.into());
+            assert_eq!(StopReason::classify(&outcome), expected);
+        }
+        outcome.finish_reason = None;
+        assert_eq!(StopReason::classify(&outcome), StopReason::Incomplete);
+        outcome.tool_calls.clear();
+        outcome.finish_reason = Some("tool_calls".into());
+        assert_eq!(StopReason::classify(&outcome), StopReason::Incomplete);
+    }
+
+    #[test]
+    fn terminal_gate_requires_coherent_tool_lifecycles() {
+        use orbit_adapter::types::ProviderEventKind;
+        let started = ProviderEventKind::ToolCallStarted {
+            call_index: 0,
+            provider_call_id: Some("one".into()),
+            name: "Effect".into(),
+        };
+        let arguments = ProviderEventKind::ToolCallArgumentsDelta {
+            call_index: 0,
+            bytes: b"{}".to_vec(),
+        };
+        let finished = ProviderEventKind::ToolCallFinished { call_index: 0 };
+        let calls = [pending(0, "one", "Effect", b"{}")];
+        let mut lifecycle = ToolLifecycle::default();
+        lifecycle.observe(&started);
+        lifecycle.observe(&arguments);
+        assert!(!lifecycle.matches(&calls));
+        lifecycle.observe(&finished);
+        assert!(lifecycle.matches(&calls));
+        lifecycle.observe(&arguments);
+        assert!(!lifecycle.matches(&calls));
+        for events in [
+            vec![&arguments, &started, &finished],
+            vec![&started, &started, &finished],
+            vec![&started, &finished, &finished],
+        ] {
+            let mut lifecycle = ToolLifecycle::default();
+            for event in events {
+                lifecycle.observe(event);
+            }
+            assert!(!lifecycle.matches(&calls));
+        }
+        let mut lifecycle = ToolLifecycle::default();
+        lifecycle.observe(&ProviderEventKind::ToolCallStarted {
+            call_index: 0,
+            provider_call_id: None,
+            name: "Effect".into(),
+        });
+        lifecycle.observe(&finished);
+        assert!(!lifecycle.matches(&calls));
+    }
+
     #[test]
     fn retryable_codes() {
         assert!(is_retryable("ORBIT-E0407"));
@@ -963,6 +1256,71 @@ mod tests {
         assert_eq!(
             target("Task", serde_json::json!({"prompt": "just do it"})),
             "just do it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    use crate::dispatch::TurnOutcome;
+
+    #[test]
+    fn accounting_overflow_keeps_every_existing_total_unchanged() {
+        for field in ["input", "output", "cost"] {
+            let mut report = TurnReport {
+                input_tokens: 7,
+                output_tokens: 11,
+                cost_microcents: 13,
+                ..Default::default()
+            };
+            let mut outcome = TurnOutcome {
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_microcents: 1,
+                ..Default::default()
+            };
+            match field {
+                "input" => outcome.input_tokens = u64::MAX,
+                "output" => outcome.output_tokens = u64::MAX,
+                "cost" => outcome.cost_microcents = u64::MAX,
+                _ => unreachable!(),
+            }
+            assert!(accumulate_accounting(&mut report, &outcome).is_err());
+            assert_eq!(
+                (
+                    report.input_tokens,
+                    report.output_tokens,
+                    report.cost_microcents
+                ),
+                (7, 11, 13),
+                "failed {field} addition must not partially update other totals"
+            );
+        }
+    }
+
+    #[test]
+    fn accounting_exact_integer_boundary_remains_representable() {
+        let mut report = TurnReport {
+            input_tokens: u64::MAX - 1,
+            output_tokens: u64::MAX - 2,
+            cost_microcents: u64::MAX - 3,
+            ..Default::default()
+        };
+        let outcome = TurnOutcome {
+            input_tokens: 1,
+            output_tokens: 2,
+            cost_microcents: 3,
+            ..Default::default()
+        };
+        accumulate_accounting(&mut report, &outcome).unwrap();
+        assert_eq!(
+            (
+                report.input_tokens,
+                report.output_tokens,
+                report.cost_microcents
+            ),
+            (u64::MAX, u64::MAX, u64::MAX)
         );
     }
 }

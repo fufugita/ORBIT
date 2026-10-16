@@ -87,61 +87,10 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
         );
         // Full conversation when present; else the single prompt. Ollama's
         // chat API takes tool calls/results natively on messages.
-        let messages: serde_json::Value = match &request.messages {
-            Some(transcript) => transcript
-                .iter()
-                .filter_map(|m| {
-                    use orbit_adapter::types::ChatRole;
-                    match m.role {
-                        ChatRole::System => Some(serde_json::json!({
-                            "role": "system",
-                            "content": m.content,
-                        })),
-                        ChatRole::User => Some(serde_json::json!({
-                            "role": "user",
-                            "content": m.content,
-                        })),
-                        ChatRole::Assistant => {
-                            // Ollama carries tool calls natively on the
-                            // assistant message.
-                            let calls: Vec<serde_json::Value> = m
-                                .tool_calls
-                                .as_ref()
-                                .map(|tcs| {
-                                    tcs.iter()
-                                        .map(|tc| serde_json::json!({
-                                            "function": {
-                                                "name": tc.name,
-                                                "arguments": serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                                    .unwrap_or(serde_json::json!({})),
-                                            }
-                                        }))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            if !m.content.is_empty() || !calls.is_empty() {
-                                let mut msg = serde_json::json!({
-                                    "role": "assistant",
-                                    "content": m.content,
-                                });
-                                if !calls.is_empty() {
-                                    msg["tool_calls"] = serde_json::Value::Array(calls);
-                                }
-                                Some(msg)
-                            } else {
-                                None
-                            }
-                        }
-                        ChatRole::Tool => Some(serde_json::json!({
-                            "role": "tool",
-                            "content": m.tool_result.as_deref().unwrap_or(&m.content),
-                        })),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .into(),
+        let messages = match &request.messages {
+            Some(transcript) => ollama_messages(transcript)?,
             None => serde_json::json!([
-                {"role":"user","content": String::from_utf8_lossy(request.input.expose()).into_owned()}
+                {"role":"user","content":String::from_utf8_lossy(request.input.expose()).into_owned()}
             ]),
         };
         let mut body = serde_json::json!({
@@ -152,6 +101,11 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
                 "num_predict": request.sampling.max_output_tokens,
             }
         });
+        if !request.tools.is_empty() {
+            body["tools"] = serde_json::json!(request.tools.iter().map(|tool| serde_json::json!({
+                "type":"function", "function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}
+            })).collect::<Vec<_>>());
+        }
         // E8: sampling opt-in per model; zero means unset — omitted.
         if let Some(effort) = &request.effort {
             body["think"] = serde_json::json!(effort);
@@ -205,6 +159,205 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
     }
 }
 
+fn ollama_messages(
+    transcript: &[orbit_adapter::types::ChatMessage],
+) -> Result<serde_json::Value, AdapterError> {
+    use orbit_adapter::types::{ChatRole, ContentBlock};
+    let mut messages = Vec::with_capacity(transcript.len());
+    let mut pending = std::collections::BTreeMap::<String, String>::new();
+    for message in transcript {
+        let mut content = String::new();
+        let mut images = Vec::new();
+        match &message.blocks {
+            None => content = message.content.clone(),
+            Some(blocks) => {
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text } => content.push_str(text),
+                        ContentBlock::Image { data, media_type }
+                            if message.role == ChatRole::User
+                                && crate::openai::supported_image(media_type) =>
+                        {
+                            images.push(data.clone())
+                        }
+                        _ => {
+                            return Err(AdapterError::CapabilityMismatch(
+                                "unsupported structured block or role for Ollama (E0414)".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let mut wire = serde_json::json!({"role":message.role.as_str(),"content":content});
+        if !images.is_empty() {
+            wire["images"] = serde_json::json!(images);
+        }
+        if message.role == ChatRole::Tool {
+            if message.blocks.is_some() {
+                return Err(AdapterError::CapabilityMismatch(
+                    "structured Ollama tool results are unsupported (E0414)".into(),
+                ));
+            }
+            let id = message
+                .tool_call_id
+                .as_deref()
+                .ok_or_else(|| crate::stream::protocol("tool result has no call identity"))?;
+            let name = pending.remove(id).ok_or_else(|| {
+                crate::stream::protocol("tool result has no matching assistant call")
+            })?;
+            wire["tool_name"] = serde_json::json!(name);
+            wire["content"] =
+                serde_json::json!(message.tool_result.as_deref().unwrap_or(&message.content));
+        } else if let Some(calls) = &message.tool_calls {
+            if message.role != ChatRole::Assistant {
+                return Err(crate::stream::protocol("tool calls require assistant role"));
+            }
+            let mut wire_calls = Vec::with_capacity(calls.len());
+            for call in calls {
+                if call.id.trim().is_empty()
+                    || call.name.trim().is_empty()
+                    || pending.insert(call.id.clone(), call.name.clone()).is_some()
+                {
+                    return Err(crate::stream::protocol(
+                        "invalid outgoing tool call identity",
+                    ));
+                }
+                let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
+                    .map_err(|_| crate::stream::protocol("invalid outgoing tool call arguments"))?;
+                if !arguments.is_object() {
+                    return Err(crate::stream::protocol(
+                        "outgoing arguments must be an object",
+                    ));
+                }
+                wire_calls
+                    .push(serde_json::json!({"function":{"name":call.name,"arguments":arguments}}));
+            }
+            wire["tool_calls"] = wire_calls.into();
+        }
+        messages.push(wire);
+    }
+    Ok(messages.into())
+}
+
+#[derive(Default)]
+struct OllamaState {
+    calls: std::collections::BTreeMap<u32, crate::stream::WireCall>,
+    done: bool,
+    reason: Option<String>,
+    usage: Option<orbit_adapter::types::ProviderUsage>,
+    next_index: u32,
+}
+
+impl OllamaState {
+    fn line(&mut self, line: &[u8]) -> Result<Option<String>, AdapterError> {
+        use crate::stream::{MAX_FRAME_BYTES, MAX_TOOL_CALLS, WireCall, protocol, record_reason};
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        if self.done {
+            return Err(protocol("native data follows done marker"));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(line).map_err(|_| protocol("malformed native JSON"))?;
+        if !value.is_object() {
+            return Err(protocol("native response must be an object"));
+        }
+        if value.get("error").is_some() {
+            return Err(protocol("native provider sent an error"));
+        }
+        let message = value.get("message");
+        if message.is_some_and(|message| !message.is_object()) {
+            return Err(protocol("invalid native message"));
+        }
+        let text = message
+            .and_then(|message| message.get("content"))
+            .map(|text| {
+                text.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| protocol("invalid native content"))
+            })
+            .transpose()?;
+        if let Some(tools) = message.and_then(|message| message.get("tool_calls")) {
+            let tools = tools
+                .as_array()
+                .ok_or_else(|| protocol("invalid native calls"))?;
+            for tool in tools {
+                if self.calls.len() >= MAX_TOOL_CALLS {
+                    return Err(protocol("too many native calls"));
+                }
+                let function = tool
+                    .get("function")
+                    .and_then(|function| function.as_object())
+                    .ok_or_else(|| protocol("native call has no function"))?;
+                let index = match function.get("index") {
+                    Some(index) => index
+                        .as_u64()
+                        .and_then(|index| u32::try_from(index).ok())
+                        .ok_or_else(|| protocol("invalid native call index"))?,
+                    None => {
+                        while self.calls.contains_key(&self.next_index) {
+                            self.next_index = self
+                                .next_index
+                                .checked_add(1)
+                                .ok_or_else(|| protocol("native call index overflow"))?;
+                        }
+                        self.next_index
+                    }
+                };
+                let name = function
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .filter(|name| !name.trim().is_empty() && name.len() <= 256)
+                    .ok_or_else(|| protocol("native call has no valid name"))?;
+                let arguments = function
+                    .get("arguments")
+                    .filter(|arguments| arguments.is_object())
+                    .ok_or_else(|| protocol("native arguments must be an object"))?;
+                let arguments = serde_json::to_string(arguments)
+                    .map_err(|_| protocol("invalid native arguments"))?;
+                if arguments.len() > MAX_FRAME_BYTES {
+                    return Err(protocol("native arguments exceed byte limit"));
+                }
+                let call = WireCall {
+                    id: format!("ollama-{index}"),
+                    name: name.into(),
+                    arguments,
+                };
+                if self.calls.insert(index, call).is_some() {
+                    return Err(protocol("duplicate native call index"));
+                }
+                self.next_index = self.next_index.max(index.saturating_add(1));
+            }
+        }
+        if let Some(reason) = value.get("done_reason").filter(|reason| !reason.is_null()) {
+            let reason = reason
+                .as_str()
+                .ok_or_else(|| protocol("invalid native done reason"))?;
+            record_reason(
+                &mut self.reason,
+                reason,
+                &["stop", "length", "max_tokens", "content_filter", "refusal"],
+            )?;
+        }
+        if let Some(done) = value.get("done") {
+            self.done = done
+                .as_bool()
+                .ok_or_else(|| protocol("invalid native done marker"))?;
+        }
+        if self.done
+            && (value.get("prompt_eval_count").is_some() || value.get("eval_count").is_some())
+        {
+            self.usage = Some(orbit_adapter::types::ProviderUsage {
+                input_tokens: crate::stream::required_counter(&value, "prompt_eval_count")?,
+                output_tokens: crate::stream::required_counter(&value, "eval_count")?,
+                ..Default::default()
+            });
+        }
+        Ok(text)
+    }
+}
+
 fn ollama_stream(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
     + Unpin
@@ -214,48 +367,73 @@ fn ollama_stream(
     idle_timeout_ms: u64,
     cancel: CancelToken,
 ) -> AsyncProviderEventStream {
+    use crate::stream::{
+        MAX_FRAME_BYTES, count_bytes, incomplete_reason, protocol, validate_calls,
+    };
     use futures::StreamExt;
-    use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent, ProviderUsage};
+    use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent};
     Box::pin(async_stream::stream! {
-        let mut buffer = Vec::new(); let mut seq=0u64; let mut usage=ProviderUsage::default();
-        yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ResponseStarted { upstream_request_id: None }}); seq+=1;
-        // E5: a stream that stops sending bytes must fail as a
-        // retryable timeout, not hang the turn forever.
-        let mut first_chunk = true;
+        let mut line = Vec::new();
+        let mut state = OllamaState::default();
+        let mut seq = 0u64;
+        let mut total = 0usize;
+        yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ResponseStarted { upstream_request_id:None } }); seq += 1;
+        let mut first = true;
         while let Some(chunk) = {
-            let budget = std::time::Duration::from_millis(if first_chunk {
-                first_byte_timeout_ms
-            } else {
-                idle_timeout_ms
-            });
+            let budget = std::time::Duration::from_millis(if first { first_byte_timeout_ms } else { idle_timeout_ms });
             match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
                 None => None,
                 Some(Ok(item)) => item,
-                Some(Err(_)) => {
-                    yield Err(AdapterError::ProviderTimeout(
-                        "stream stalled: no bytes within the idle timeout (E0409)".into(),
-                    ));
-                    return;
-                }
+                Some(Err(_)) => { yield Err(AdapterError::ProviderTimeout("native stream stalled (E0409)".into())); return; }
             }
         } {
-            if cancel.is_cancelled(){break;}
-            first_chunk = false;
-            let chunk=match chunk{Ok(c)=>c,Err(e)=>{yield Err(AdapterError::ProviderTransportFailure(e.to_string()));return;}};
-            buffer.extend_from_slice(&chunk);
-            while let Some(pos)=buffer.iter().position(|b|*b==b'\n') {
-                let line:Vec<u8>=buffer.drain(..=pos).collect();
-                let v:serde_json::Value=match serde_json::from_slice(&line){Ok(v)=>v,Err(_)=>continue};
-                if let Some(text)=v.pointer("/message/content").and_then(|x|x.as_str())
-                    && !text.is_empty(){yield Ok(ProviderStreamEvent{sequence:seq,event:ProviderEventKind::TextDelta{bytes:text.as_bytes().to_vec()}});seq+=1;}
-                if v.get("done").and_then(|x|x.as_bool())==Some(true){
-                    usage.input_tokens=v.get("prompt_eval_count").and_then(|x|x.as_u64()).unwrap_or(0);
-                    usage.output_tokens=v.get("eval_count").and_then(|x|x.as_u64()).unwrap_or(0);
-                    break;
+            if cancel.is_cancelled() { break; }
+            first = false;
+            let chunk = match chunk { Ok(chunk) => chunk, Err(error) => { yield Err(AdapterError::ProviderTransportFailure(error.to_string())); return; } };
+            if let Err(error) = count_bytes(&mut total, chunk.len()) { yield Err(error); return; }
+            for byte in chunk {
+                if byte == b'\n' {
+                    match state.line(&line) {
+                        Ok(Some(text)) if !text.is_empty() => {
+                            yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::TextDelta { bytes:text.into_bytes() } }); seq += 1;
+                        }
+                        Ok(_) => {},
+                        Err(error) => { yield Err(error); return; }
+                    }
+                    line.clear();
+                } else {
+                    if line.len() >= MAX_FRAME_BYTES { yield Err(protocol("native JSON line exceeds byte limit")); return; }
+                    line.push(byte);
+                }
+            }
+            if state.done { break; }
+        }
+        if cancel.is_cancelled() {
+            yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::Finished { finish_reason:Some("cancelled".into()), final_usage:None } });
+            return;
+        }
+        if !line.is_empty() {
+            match state.line(&line) {
+                Ok(Some(text)) if !text.is_empty() => {
+                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::TextDelta { bytes:text.into_bytes() } }); seq += 1;
+                }
+                Ok(_) => {},
+                Err(error) => { yield Err(error); return; }
+            }
+        }
+        if !state.done { yield Err(protocol("native stream ended without done marker")); return; }
+        let mut reason = state.reason.unwrap_or_else(|| "stop".into());
+        if !incomplete_reason(&reason) {
+            if let Err(error) = validate_calls(&state.calls) { yield Err(error); return; }
+            if !state.calls.is_empty() {
+                reason = "tool_calls".into();
+                for (index, call) in state.calls {
+                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallStarted { call_index:index, provider_call_id:Some(call.id), name:call.name } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallArgumentsDelta { call_index:index, bytes:call.arguments.into_bytes() } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallFinished { call_index:index } }); seq += 1;
                 }
             }
         }
-        let reason = if cancel.is_cancelled() { "cancelled" } else { "stop" };
-        yield Ok(ProviderStreamEvent{sequence:seq,event:ProviderEventKind::Finished{finish_reason:Some(reason.into()),final_usage:Some(usage)}});
+        yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::Finished { finish_reason:Some(reason), final_usage:state.usage } });
     })
 }

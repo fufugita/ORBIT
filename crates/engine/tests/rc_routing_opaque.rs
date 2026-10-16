@@ -213,6 +213,9 @@ impl Drop for Home {
 fn event(value: Value) -> String {
     format!("data: {value}\n\n")
 }
+fn message_start() -> String {
+    event(json!({"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}))
+}
 fn thinking_prefix(text: &str, signature: &str) -> String {
     [event(json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})),
      event(json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":text}})),
@@ -231,6 +234,7 @@ fn finish(reason: &str) -> String {
 fn response(thinking: Option<(&str, &str)>) -> Response {
     Response {
         body: [
+            message_start(),
             thinking
                 .map(|(text, signature)| thinking_prefix(text, signature))
                 .unwrap_or_default(),
@@ -462,7 +466,7 @@ fn calculator() -> ToolDefinition {
 #[test]
 fn opaque_identity_tool_round_preserves_same_pair_then_strips_on_provider_switch() {
     let home = Home::new();
-    let tool = Response { body:[thinking_prefix("private tool fixture","tool-signature"),
+    let tool = Response { body:[message_start(), thinking_prefix("private tool fixture","tool-signature"),
         event(json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"fixture-call","name":"calculator","input":{}}})),
         event(json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"expression\":\"1+1\"}"}})),
         event(json!({"type":"content_block_stop","index":1})),finish("tool_use")].concat(),pause:false };
@@ -532,6 +536,7 @@ fn opaque_identity_cancelled_partial_has_no_provenance_or_replayable_blocks() {
     let home = Home::new();
     let a = Provider::new(vec![Response {
         body: [
+            message_start(),
             thinking_prefix("incomplete fixture thought", "partial-signature"),
             text_events("visible partial"),
         ]

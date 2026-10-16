@@ -501,6 +501,16 @@ pub fn run_dispatch(
                 _ => None,
             });
             let usage = r.accounting.usage;
+            let context_tokens = usage
+                .input_tokens
+                .checked_add(usage.cache_read_tokens)
+                .and_then(|total| total.checked_add(usage.cache_write_tokens))
+                .ok_or_else(|| {
+                    (
+                        "ORBIT-E0411",
+                        "provider context accounting overflow".to_owned(),
+                    )
+                })?;
             // Cost in microcents from the pricing config (zero if unpriced).
             let cost_microcents = config
                 .pricing
@@ -515,9 +525,7 @@ pub fn run_dispatch(
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_microcents,
-                context_tokens: usage.input_tokens
-                    + usage.cache_read_tokens
-                    + usage.cache_write_tokens,
+                context_tokens,
                 egress_digest,
             })
         }

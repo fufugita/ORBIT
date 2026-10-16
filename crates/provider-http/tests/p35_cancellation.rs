@@ -99,7 +99,7 @@ impl Adapter {
     fn delta(self) -> &'static [u8] {
         match self {
             Self::OpenAi => b"data: {\"choices\":[{\"delta\":{\"content\":\"partial visible\"}}]}\n\n",
-            Self::Anthropic => b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial visible\"}}\n\n",
+            Self::Anthropic => b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial visible\"}}\n\n",
             Self::Ollama => b"{\"message\":{\"content\":\"partial visible\"},\"done\":false}\n",
         }
     }

@@ -22,6 +22,589 @@ use orbit_ledger::LedgerWriter;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent, ProviderUsage, UsageSource};
+use orbit_provider_http::{AsyncProviderAdapter, CancelToken};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+struct UsageScript {
+    events: Vec<ProviderStreamEvent>,
+    calls: Arc<AtomicUsize>,
+    capabilities: orbit_adapter::types::ProviderCapabilities,
+}
+
+#[async_trait::async_trait]
+impl AsyncProviderAdapter for UsageScript {
+    fn identity(&self) -> orbit_adapter::types::AdapterIdentity {
+        identity(
+            AdapterKind::DeterministicTestV1,
+            &"i".repeat(64),
+            &"p".repeat(64),
+        )
+    }
+
+    fn capabilities(&self) -> &orbit_adapter::types::ProviderCapabilities {
+        &self.capabilities
+    }
+
+    fn validate_route(
+        &self,
+        route: &ProviderRouteBinding,
+    ) -> Result<(), orbit_adapter::error::AdapterError> {
+        assert_eq!(route.adapter_kind, self.identity().kind);
+        Ok(())
+    }
+
+    async fn invoke(
+        &self,
+        _request: &orbit_adapter::types::ProviderRequest,
+        _credential: Option<&SecretBytes>,
+        _cancel: &CancelToken,
+    ) -> Result<orbit_provider_http::AsyncProviderEventStream, orbit_adapter::error::AdapterError>
+    {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(futures::stream::iter(
+            self.events.clone().into_iter().map(Ok),
+        )))
+    }
+}
+
+fn usage_snapshot(base: u64) -> ProviderUsage {
+    ProviderUsage {
+        input_tokens: base,
+        output_tokens: base + 1,
+        cache_read_tokens: base + 2,
+        cache_write_tokens: base + 3,
+        reasoning_tokens: base + 4,
+    }
+}
+
+fn usage_events(
+    updates: &[ProviderUsage],
+    final_usage: Option<ProviderUsage>,
+) -> Vec<ProviderStreamEvent> {
+    let mut kinds = vec![
+        ProviderEventKind::ResponseStarted {
+            upstream_request_id: Some("usage-fixture".into()),
+        },
+        ProviderEventKind::TextDelta {
+            bytes: b"exact answer\n".to_vec(),
+        },
+    ];
+    kinds.extend(updates.iter().copied().map(ProviderEventKind::UsageUpdate));
+    kinds.push(ProviderEventKind::Finished {
+        finish_reason: Some("stop".into()),
+        final_usage,
+    });
+    kinds
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, event)| ProviderStreamEvent {
+            sequence: sequence as u64,
+            event,
+        })
+        .collect()
+}
+
+// Exercise registry admission, durable egress, the real collector and completion.
+// The writer is closed and its private directory removed before assertions return.
+async fn dispatch_usage_fixture(
+    adapter: Arc<dyn AsyncProviderAdapter>,
+    binding: ProviderRouteBinding,
+) -> (DispatchOutcome, Vec<ProviderStreamEvent>) {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("orbit-gw-usage-{}", new_decision_id().0));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let tuple = EgressTuple {
+        scheme: if binding.endpoint_scheme == orbit_adapter::types::EndpointScheme::HttpLoopback {
+            "http"
+        } else {
+            "https"
+        }
+        .into(),
+        host: binding.endpoint_host.clone(),
+        port: binding.endpoint_port,
+        path_prefix: "/v1".into(),
+        provider_id: binding.provider_id.0.clone(),
+        region_id: binding.region_id.0.clone(),
+    };
+    let mut registry = ProviderRegistry::new();
+    registry.register_model(crate::ModelRef("test-model".into()), binding.clone());
+    registry.register_async_adapter(binding.adapter_kind, adapter);
+    let engine = DispatchEngine::new(
+        registry,
+        dir.clone(),
+        EgressAllowlist::new(vec![tuple.clone()]),
+        vec![tuple.clone()],
+        vec![],
+    );
+    let mut writer = LedgerWriter::open(&dir, "usage-writer".into(), "0.1.0").unwrap();
+    let session = new_session_id();
+    let decision = new_decision_id();
+    let mut request = canonical_request(&binding, b"hello");
+    request.connect_timeout_ms = 1000;
+    request.first_byte_timeout_ms = 1000;
+    request.idle_timeout_ms = 1000;
+    let cancel = CancelToken::new();
+    let mut observed = Vec::new();
+    let (outcome, reservation) = tokio::time::timeout(
+        Duration::from_secs(4),
+        engine.dispatch_async(
+            "test-model",
+            &session,
+            &decision.0,
+            &request,
+            None,
+            &mut writer,
+            &cancel,
+            Some(&mut |event| observed.push(event.clone())),
+        ),
+    )
+    .await
+    .expect("bounded gateway fixture")
+    .unwrap();
+    writer.close().unwrap();
+    let state = engine.recovery_state(&session, &decision.0).unwrap();
+    let (records, _) = orbit_ledger::verify_ledger(&dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(reservation.decision_id, decision.0);
+    assert_eq!(reservation.session_id, session);
+    assert_eq!(reservation.destination_digest, tuple.digest());
+    assert!(!reservation.intent_digest.is_empty());
+    assert_eq!(state, DispatchState::EgressIntentDurable);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(
+                record.record.event,
+                orbit_ledger::event::LedgerEvent::EgressIntent(_)
+            ))
+            .count(),
+        1
+    );
+    (outcome, observed)
+}
+
+fn assert_usage_result(
+    outcome: DispatchOutcome,
+    usage: ProviderUsage,
+    source: UsageSource,
+    complete: bool,
+) -> Box<orbit_adapter::types::ProviderResult> {
+    let DispatchOutcome::Completed(result) = outcome else {
+        panic!("expected completed response, got {outcome:?}")
+    };
+    assert_eq!(
+        result.status,
+        orbit_adapter::types::ProviderTerminalStatus::Completed
+    );
+    assert_eq!(result.accounting.usage, usage);
+    assert_eq!(result.accounting.usage_source, Some(source));
+    assert_eq!(result.accounting.usage_complete, complete);
+    assert_eq!(result.accounting.cost_microcents, 0);
+    assert_eq!(result.accounting.currency, None);
+    assert_eq!(
+        result.output,
+        orbit_adapter::stream::output_evidence(&result.events).unwrap()
+    );
+    result
+}
+
+async fn scripted_usage_case(
+    updates: &[ProviderUsage],
+    final_usage: Option<ProviderUsage>,
+    usage: ProviderUsage,
+    source: UsageSource,
+    complete: bool,
+) {
+    let events = usage_events(updates, final_usage);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = UsageScript {
+        events: events.clone(),
+        calls: calls.clone(),
+        capabilities: text_capabilities(),
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(adapter), test_binding()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let result = assert_usage_result(outcome, usage, source, complete);
+    assert_eq!(result.events, events);
+    assert_eq!(observed, events);
+    assert_eq!(result.output.observed_bytes, 13);
+    assert_eq!(result.output.delivered_bytes, 13);
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_missing_is_not_final_zero() {
+    scripted_usage_case(
+        &[],
+        None,
+        ProviderUsage::default(),
+        UsageSource::Missing,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_one_incremental_snapshot_is_incomplete() {
+    scripted_usage_case(
+        &[usage_snapshot(2)],
+        None,
+        usage_snapshot(2),
+        UsageSource::Incremental,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_latest_snapshot_is_not_summed() {
+    scripted_usage_case(
+        &[usage_snapshot(2), usage_snapshot(20)],
+        None,
+        usage_snapshot(20),
+        UsageSource::Incremental,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_incremental_zero_is_incomplete() {
+    scripted_usage_case(
+        &[ProviderUsage::default()],
+        None,
+        ProviderUsage::default(),
+        UsageSource::Incremental,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_explicit_final_zero_is_complete() {
+    scripted_usage_case(
+        &[],
+        Some(ProviderUsage::default()),
+        ProviderUsage::default(),
+        UsageSource::Final,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_final_zero_overrides_incremental_snapshot() {
+    scripted_usage_case(
+        &[usage_snapshot(2)],
+        Some(ProviderUsage::default()),
+        ProviderUsage::default(),
+        UsageSource::Final,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_final_snapshot_wins_over_updates() {
+    scripted_usage_case(
+        &[usage_snapshot(2), usage_snapshot(20)],
+        Some(usage_snapshot(40)),
+        usage_snapshot(40),
+        UsageSource::Final,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_incomplete_stream_is_refused() {
+    let mut events = usage_events(&[usage_snapshot(2)], None);
+    events.pop();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = UsageScript {
+        events: events.clone(),
+        calls: calls.clone(),
+        capabilities: text_capabilities(),
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(adapter), test_binding()).await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::AdapterRefused { code: "E0411", .. }
+    ));
+    assert_eq!(observed, events);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+struct UsageWireServer {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl UsageWireServer {
+    async fn new(body: String) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut raw = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 2048];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "complete request headers");
+                raw.extend_from_slice(&chunk[..count]);
+                assert!(raw.len() <= 1024 * 1024, "bounded request capture");
+                if let Some(end) = raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&raw[..header_end]).unwrap();
+            assert!(
+                headers.starts_with("POST /v1/"),
+                "one admitted provider POST"
+            );
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert!(header_end + length <= 1024 * 1024);
+            while raw.len() < header_end + length {
+                let mut chunk = [0u8; 2048];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "complete request body");
+                raw.extend_from_slice(&chunk[..count]);
+                assert!(raw.len() <= 1024 * 1024);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&raw[header_end..header_end + length]).unwrap();
+            assert_eq!(request["model"], "test-model");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err(),
+                "no second provider invocation"
+            );
+        });
+        Self { port, task }
+    }
+
+    async fn finish(&mut self) {
+        tokio::time::timeout(Duration::from_secs(3), &mut self.task)
+            .await
+            .expect("owned server deadline")
+            .expect("owned server completed");
+    }
+}
+
+impl Drop for UsageWireServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn usage_sse(value: serde_json::Value) -> String {
+    format!("data: {value}\n\n")
+}
+
+async fn wire_usage_case(
+    anthropic: bool,
+    body: String,
+) -> (DispatchOutcome, Vec<ProviderStreamEvent>) {
+    let mut server = UsageWireServer::new(body).await;
+    let adapter: Arc<dyn AsyncProviderAdapter> = if anthropic {
+        Arc::new(
+            orbit_provider_http::AnthropicMessagesV1::new(
+                orbit_provider_http::anthropic::anthropic_identity(),
+                orbit_provider_http::anthropic::anthropic_capabilities(),
+            )
+            .unwrap(),
+        )
+    } else {
+        Arc::new(
+            orbit_provider_http::OpenAiCompatibleHttpV1::new(
+                orbit_provider_http::openai::openai_identity(),
+                orbit_provider_http::openai::openai_capabilities(),
+                orbit_adapter::types::TlsPinPolicy {
+                    webpki: false,
+                    spki_sha256: None,
+                },
+            )
+            .unwrap(),
+        )
+    };
+    let identity = adapter.identity();
+    let mut binding = test_binding();
+    binding.adapter_kind = identity.kind;
+    binding.adapter_implementation_digest = identity.implementation_digest;
+    binding.adapter_profile_digest = identity.profile_digest;
+    binding.endpoint_host = "127.0.0.1".into();
+    binding.endpoint_port = server.port;
+    binding.endpoint_scheme = orbit_adapter::types::EndpointScheme::HttpLoopback;
+    let outcome = dispatch_usage_fixture(adapter, binding).await;
+    server.finish().await;
+    outcome
+}
+
+fn openai_usage_body(usage: Option<serde_json::Value>) -> String {
+    let mut body = usage_sse(
+        serde_json::json!({"choices":[{"index":0,"delta":{"content":"wire answer"},"finish_reason":null}]}),
+    );
+    body.push_str(&usage_sse(
+        serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ));
+    if let Some(usage) = usage {
+        body.push_str(&usage_sse(serde_json::json!({"choices":[],"usage":usage})));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn assert_wire_text(
+    result: &orbit_adapter::types::ProviderResult,
+    observed: &[ProviderStreamEvent],
+) {
+    assert_eq!(result.events, observed);
+    let text: Vec<u8> = result
+        .events
+        .iter()
+        .filter_map(|event| match &event.event {
+            ProviderEventKind::TextDelta { bytes } => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(text, b"wire answer");
+}
+
+#[tokio::test]
+async fn gateway_wire_usage_accounting_openai_missing_trailer() {
+    let (outcome, observed) = wire_usage_case(false, openai_usage_body(None)).await;
+    let result = assert_usage_result(
+        outcome,
+        ProviderUsage::default(),
+        UsageSource::Missing,
+        false,
+    );
+    assert_wire_text(&result, &observed);
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event.event, ProviderEventKind::UsageUpdate(_)))
+    );
+}
+
+#[tokio::test]
+async fn gateway_wire_usage_accounting_openai_explicit_final_zero() {
+    let (outcome, observed) = wire_usage_case(
+        false,
+        openai_usage_body(Some(
+            serde_json::json!({"prompt_tokens":0,"completion_tokens":0}),
+        )),
+    )
+    .await;
+    let result = assert_usage_result(outcome, ProviderUsage::default(), UsageSource::Final, true);
+    assert_wire_text(&result, &observed);
+}
+
+#[tokio::test]
+async fn gateway_wire_usage_accounting_openai_final_categories() {
+    let body = openai_usage_body(Some(
+        serde_json::json!({"prompt_tokens":20,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}),
+    ));
+    let (outcome, observed) = wire_usage_case(false, body).await;
+    let usage = ProviderUsage {
+        input_tokens: 17,
+        output_tokens: 9,
+        cache_read_tokens: 3,
+        cache_write_tokens: 0,
+        reasoning_tokens: 2,
+    };
+    let result = assert_usage_result(outcome, usage, UsageSource::Final, true);
+    assert_wire_text(&result, &observed);
+}
+
+fn anthropic_usage_body(final_usage: bool, terminal: bool) -> String {
+    let values = [
+        serde_json::json!({"type":"message_start","message":{"id":"owned-usage","usage":{"input_tokens":17,"output_tokens":0,"cache_read_input_tokens":3,"cache_creation_input_tokens":4}}}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"wire answer"}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+    ];
+    let mut body: String = values.into_iter().map(usage_sse).collect();
+    let mut delta = serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}});
+    if final_usage {
+        delta["usage"] = serde_json::json!({"output_tokens":9});
+    }
+    body.push_str(&usage_sse(delta));
+    if terminal {
+        body.push_str(&usage_sse(serde_json::json!({"type":"message_stop"})));
+    }
+    body
+}
+
+#[tokio::test]
+async fn gateway_wire_usage_accounting_anthropic_initial_only_is_missing() {
+    let (outcome, observed) = wire_usage_case(true, anthropic_usage_body(false, true)).await;
+    let result = assert_usage_result(
+        outcome,
+        ProviderUsage::default(),
+        UsageSource::Missing,
+        false,
+    );
+    assert_wire_text(&result, &observed);
+}
+
+#[tokio::test]
+async fn gateway_wire_usage_accounting_anthropic_final_cache_categories() {
+    let (outcome, observed) = wire_usage_case(true, anthropic_usage_body(true, true)).await;
+    let usage = ProviderUsage {
+        input_tokens: 17,
+        output_tokens: 9,
+        cache_read_tokens: 3,
+        cache_write_tokens: 4,
+        reasoning_tokens: 0,
+    };
+    let result = assert_usage_result(outcome, usage, UsageSource::Final, true);
+    assert_wire_text(&result, &observed);
+}
+
+#[tokio::test]
+async fn gateway_wire_usage_accounting_anthropic_disconnect_is_refused() {
+    let (outcome, _) = wire_usage_case(true, anthropic_usage_body(true, false)).await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::AdapterRefused { code: "E0411", .. }
+    ));
+}
+
+#[tokio::test]
+async fn gateway_wire_usage_accounting_anthropic_malformed_usage_is_refused() {
+    let body = anthropic_usage_body(true, true)
+        .replace("\"output_tokens\":9", "\"output_tokens\":\"invalid\"");
+    let (outcome, _) = wire_usage_case(true, body).await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::AdapterRefused { code: "E0411", .. }
+    ));
+}
+
 fn test_binding() -> ProviderRouteBinding {
     ProviderRouteBinding {
         provider_id: orbit_adapter::types::ProviderId("test-provider".into()),

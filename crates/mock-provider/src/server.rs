@@ -555,11 +555,14 @@ fn anthropic_fat() -> String {
     let para = "The quick brown fox jumps over the lazy dog. ".repeat(40); // ~2k chars
     let body = para.repeat(25); // ~50k chars ≈ 12k+ tokens
     [
-        r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
         &format!(
-            r#"{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{body}"}}}}"#
+            r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{body}"}}}}"#
         ),
-        r#"{"type":"message_stop","usage":{"input_tokens":3,"output_tokens":12000}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12000}}"#,
+        r#"data: {"type":"message_stop"}"#,
         "",
     ]
     .join("\n\n")
@@ -568,8 +571,11 @@ fn anthropic_fat() -> String {
 fn anthropic_success() -> String {
     [
         r#"data: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
-        r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello world"}}"#,
-        r#"data: {"type":"message_stop","usage":{"input_tokens":3,"output_tokens":2}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello world"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+        r#"data: {"type":"message_stop"}"#,
         "",
     ].join("\n\n")
 }

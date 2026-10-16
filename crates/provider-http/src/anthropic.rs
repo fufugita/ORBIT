@@ -359,6 +359,342 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
     }
 }
 
+#[derive(Default)]
+struct AnthropicState {
+    started: bool,
+    done: bool,
+    blocks: std::collections::BTreeMap<u32, (String, bool)>,
+    calls: std::collections::BTreeMap<u32, crate::stream::WireCall>,
+    partial_arguments: std::collections::BTreeSet<u32>,
+    initial_arguments: std::collections::BTreeMap<u32, String>,
+    reason: Option<String>,
+    usage: orbit_adapter::types::ProviderUsage,
+    saw_input_usage: bool,
+    saw_final_usage: bool,
+    saw_thinking: bool,
+}
+
+impl AnthropicState {
+    fn event(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<Vec<orbit_adapter::types::ProviderEventKind>, AdapterError> {
+        use crate::stream::{
+            MAX_FRAME_BYTES, MAX_TOOL_CALLS, WireCall, append_bounded, protocol, record_reason,
+        };
+        use orbit_adapter::types::ProviderEventKind as Event;
+        let kind = value
+            .get("type")
+            .and_then(|kind| kind.as_str())
+            .ok_or_else(|| protocol("Anthropic event has no type"))?;
+        if kind == "error" {
+            return Err(protocol("Anthropic sent a streamed error"));
+        }
+        if self.done {
+            return Err(protocol("Anthropic data follows message_stop"));
+        }
+        let mut events = Vec::new();
+        match kind {
+            "message_start" => {
+                if self.started {
+                    return Err(protocol("duplicate Anthropic message_start"));
+                }
+                if !value
+                    .get("message")
+                    .is_some_and(serde_json::Value::is_object)
+                {
+                    return Err(protocol("invalid Anthropic message_start"));
+                }
+                self.started = true;
+            }
+            "content_block_start" | "content_block_delta" | "content_block_stop" => {
+                if !self.started || self.reason.is_some() {
+                    return Err(protocol("Anthropic content outside active message"));
+                }
+                let index = value
+                    .get("index")
+                    .and_then(|index| index.as_u64())
+                    .and_then(|index| u32::try_from(index).ok())
+                    .ok_or_else(|| protocol("invalid Anthropic block index"))?;
+                match kind {
+                    "content_block_start" => {
+                        if self.blocks.len() >= 4096 || self.blocks.contains_key(&index) {
+                            return Err(protocol("duplicate or excessive Anthropic blocks"));
+                        }
+                        let block = &value["content_block"];
+                        let block_kind = block
+                            .get("type")
+                            .and_then(|kind| kind.as_str())
+                            .ok_or_else(|| protocol("Anthropic block has no type"))?;
+                        self.blocks.insert(index, (block_kind.into(), false));
+                        if block_kind == "redacted_thinking"
+                            || (block_kind == "thinking" && self.saw_thinking)
+                        {
+                            return Err(AdapterError::CapabilityMismatch(
+                                "native redacted or multiple thinking blocks require lossless block replay support (E0414)".into(),
+                            ));
+                        }
+                        if block_kind == "thinking" {
+                            self.saw_thinking = true;
+                        }
+                        match block_kind {
+                            "tool_use" => {
+                                if self.calls.len() >= MAX_TOOL_CALLS {
+                                    return Err(protocol("too many Anthropic tool calls"));
+                                }
+                                let id = block
+                                    .get("id")
+                                    .and_then(|id| id.as_str())
+                                    .filter(|id| !id.trim().is_empty() && id.len() <= 512)
+                                    .ok_or_else(|| {
+                                        protocol("Anthropic tool block has no valid id")
+                                    })?;
+                                let name = block
+                                    .get("name")
+                                    .and_then(|name| name.as_str())
+                                    .filter(|name| !name.trim().is_empty() && name.len() <= 256)
+                                    .ok_or_else(|| {
+                                        protocol("Anthropic tool block has no valid name")
+                                    })?;
+                                let input = block
+                                    .get("input")
+                                    .filter(|input| input.is_object())
+                                    .ok_or_else(|| {
+                                        protocol("Anthropic tool input must be an object")
+                                    })?;
+                                let arguments = serde_json::to_string(input)
+                                    .map_err(|_| protocol("invalid Anthropic input"))?;
+                                self.initial_arguments.insert(index, arguments);
+                                self.calls.insert(
+                                    index,
+                                    WireCall {
+                                        id: id.into(),
+                                        name: name.into(),
+                                        arguments: String::new(),
+                                    },
+                                );
+                            }
+                            "text" => {
+                                if let Some(text) = block.get("text") {
+                                    let text = text.as_str().ok_or_else(|| {
+                                        protocol("invalid initial Anthropic text")
+                                    })?;
+                                    if !text.is_empty() {
+                                        events.push(Event::TextDelta {
+                                            bytes: text.as_bytes().to_vec(),
+                                        });
+                                    }
+                                }
+                            }
+                            "thinking" => {
+                                if let Some(text) = block.get("thinking") {
+                                    let text = text
+                                        .as_str()
+                                        .ok_or_else(|| protocol("invalid initial thinking"))?;
+                                    if !text.is_empty() {
+                                        events.push(Event::ThinkingDelta {
+                                            bytes: text.as_bytes().to_vec(),
+                                        });
+                                    }
+                                }
+                                if let Some(signature) = block.get("signature") {
+                                    let signature = signature
+                                        .as_str()
+                                        .ok_or_else(|| protocol("invalid initial signature"))?;
+                                    if !signature.is_empty() {
+                                        events.push(Event::ThinkingSignatureDelta {
+                                            bytes: signature.as_bytes().to_vec(),
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    "content_block_delta" => {
+                        let (block_kind, closed) = self
+                            .blocks
+                            .get(&index)
+                            .ok_or_else(|| protocol("Anthropic delta has no block start"))?;
+                        if *closed {
+                            return Err(protocol("Anthropic delta follows block stop"));
+                        }
+                        let delta = &value["delta"];
+                        let delta_kind = delta
+                            .get("type")
+                            .and_then(|kind| kind.as_str())
+                            .ok_or_else(|| protocol("Anthropic delta has no type"))?;
+                        match delta_kind {
+                            "text_delta" => {
+                                if block_kind != "text" {
+                                    return Err(protocol("text delta has wrong block kind"));
+                                }
+                                let text = delta
+                                    .get("text")
+                                    .and_then(|text| text.as_str())
+                                    .ok_or_else(|| protocol("invalid text delta"))?;
+                                events.push(Event::TextDelta {
+                                    bytes: text.as_bytes().to_vec(),
+                                });
+                            }
+                            "thinking_delta" => {
+                                if block_kind != "thinking" {
+                                    return Err(protocol("thinking delta has wrong block kind"));
+                                }
+                                let text = delta
+                                    .get("thinking")
+                                    .and_then(|text| text.as_str())
+                                    .ok_or_else(|| protocol("invalid thinking delta"))?;
+                                events.push(Event::ThinkingDelta {
+                                    bytes: text.as_bytes().to_vec(),
+                                });
+                            }
+                            "signature_delta" => {
+                                if block_kind != "thinking" {
+                                    return Err(protocol("signature delta has wrong block kind"));
+                                }
+                                let signature = delta
+                                    .get("signature")
+                                    .and_then(|signature| signature.as_str())
+                                    .ok_or_else(|| protocol("invalid signature delta"))?;
+                                events.push(Event::ThinkingSignatureDelta {
+                                    bytes: signature.as_bytes().to_vec(),
+                                });
+                            }
+                            "input_json_delta" => {
+                                if block_kind != "tool_use" {
+                                    return Err(protocol("input delta has wrong block kind"));
+                                }
+                                let part = delta
+                                    .get("partial_json")
+                                    .and_then(|part| part.as_str())
+                                    .ok_or_else(|| protocol("invalid input JSON delta"))?;
+                                if self
+                                    .initial_arguments
+                                    .get(&index)
+                                    .is_some_and(|arguments| arguments != "{}")
+                                {
+                                    return Err(protocol(
+                                        "conflicting initial and partial tool input",
+                                    ));
+                                }
+                                self.partial_arguments.insert(index);
+                                let call = self
+                                    .calls
+                                    .get_mut(&index)
+                                    .ok_or_else(|| protocol("input delta has no tool call"))?;
+                                append_bounded(&mut call.arguments, part, MAX_FRAME_BYTES)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    "content_block_stop" => {
+                        let (_, closed) = self
+                            .blocks
+                            .get_mut(&index)
+                            .ok_or_else(|| protocol("Anthropic stop has no block start"))?;
+                        if *closed {
+                            return Err(protocol("duplicate Anthropic block stop"));
+                        }
+                        *closed = true;
+                        if !self.partial_arguments.contains(&index)
+                            && let Some(call) = self.calls.get_mut(&index)
+                        {
+                            call.arguments = self
+                                .initial_arguments
+                                .remove(&index)
+                                .unwrap_or_else(|| "{}".into());
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            "message_delta" => {
+                if !self.started {
+                    return Err(protocol("Anthropic message delta has no message start"));
+                }
+                if self.blocks.values().any(|(_, closed)| !closed) {
+                    return Err(protocol("Anthropic message delta precedes block stop"));
+                }
+                let delta = value
+                    .get("delta")
+                    .filter(|delta| delta.is_object())
+                    .ok_or_else(|| protocol("invalid message delta"))?;
+                if let Some(reason) = delta.get("stop_reason").filter(|reason| !reason.is_null()) {
+                    let reason = reason
+                        .as_str()
+                        .ok_or_else(|| protocol("invalid Anthropic stop reason"))?;
+                    record_reason(
+                        &mut self.reason,
+                        reason,
+                        &[
+                            "end_turn",
+                            "stop_sequence",
+                            "tool_use",
+                            "max_tokens",
+                            "refusal",
+                            "content_filter",
+                        ],
+                    )?;
+                }
+            }
+            "message_stop" => {
+                if !self.started
+                    || self.reason.is_none()
+                    || self.blocks.values().any(|(_, closed)| !closed)
+                {
+                    return Err(protocol("incomplete Anthropic message lifecycle"));
+                }
+                self.done = true;
+            }
+            _ => {} // Ping and well-formed future extension events do not complete a message.
+        }
+        if let Some(usage) = value
+            .get("usage")
+            .or_else(|| value.pointer("/message/usage"))
+        {
+            use crate::stream::{optional_counter, required_counter};
+            if !usage.is_object() {
+                return Err(protocol("invalid Anthropic usage"));
+            }
+            match kind {
+                "message_start" => {
+                    self.usage.input_tokens = required_counter(usage, "input_tokens")?;
+                    self.saw_input_usage = true;
+                    if let Some(output) = optional_counter(usage, "output_tokens")? {
+                        self.usage.output_tokens = output;
+                    }
+                }
+                "message_delta" => {
+                    self.usage.output_tokens = required_counter(usage, "output_tokens")?;
+                    if let Some(input) = optional_counter(usage, "input_tokens")? {
+                        self.usage.input_tokens = input;
+                        self.saw_input_usage = true;
+                    }
+                    if !self.saw_input_usage {
+                        return Err(protocol("Anthropic final usage has no input total"));
+                    }
+                    self.saw_final_usage = true;
+                }
+                _ => return Err(protocol("Anthropic usage has no defined accounting phase")),
+            }
+            if let Some(cached) = optional_counter(usage, "cache_read_input_tokens")? {
+                self.usage.cache_read_tokens = cached;
+            }
+            if let Some(written) = optional_counter(usage, "cache_creation_input_tokens")? {
+                self.usage.cache_write_tokens = written;
+            }
+            // Initial input/output snapshots are provisional. The gateway's
+            // UsageUpdate fallback treats updates as authoritative totals, so
+            // emit only a validated final message_delta accounting snapshot.
+            if self.saw_final_usage {
+                events.push(Event::UsageUpdate(self.usage));
+            }
+        }
+        Ok(events)
+    }
+}
+
 fn anthropic_stream(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
     + Unpin
@@ -368,145 +704,58 @@ fn anthropic_stream(
     idle_timeout_ms: u64,
     cancel: CancelToken,
 ) -> AsyncProviderEventStream {
+    use crate::stream::{count_bytes, incomplete_reason, protocol, validate_calls};
     use futures::StreamExt;
-    use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent, ProviderUsage};
+    use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent};
     Box::pin(async_stream::stream! {
         let mut parser = crate::sse::SseParser::new();
         let mut seq = 0u64;
-        let mut usage = ProviderUsage::default();
-        yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ResponseStarted { upstream_request_id: None } });
-        seq += 1;
-
-        // Tool-call assembly: Anthropic streams input_json_delta per block.
-        let mut tool_calls: std::collections::BTreeMap<u32, (String, String, String)> =
-            std::collections::BTreeMap::new(); // index -> (id, name, partial json)
-        let mut finish_reason: Option<String> = None;
-
-        // E5: a stream that stops sending bytes must fail as a
-        // retryable timeout, not hang the turn forever. First gap
-        // gets first_byte_timeout; later gaps get idle_timeout.
-        let mut first_chunk = true;
+        let mut state = AnthropicState::default();
+        let mut total = 0usize;
+        yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ResponseStarted { upstream_request_id:None } }); seq += 1;
+        let mut first = true;
         while let Some(chunk) = {
-            let budget = std::time::Duration::from_millis(if first_chunk {
-                first_byte_timeout_ms
-            } else {
-                idle_timeout_ms
-            });
+            let budget = std::time::Duration::from_millis(if first { first_byte_timeout_ms } else { idle_timeout_ms });
             match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
                 None => None,
                 Some(Ok(item)) => item,
-                Some(Err(_)) => {
-                    yield Err(AdapterError::ProviderTimeout(
-                        "stream stalled: no bytes within the idle timeout (E0409)".into(),
-                    ));
-                    return;
-                }
+                Some(Err(_)) => { yield Err(AdapterError::ProviderTimeout("Anthropic stream stalled (E0409)".into())); return; }
             }
         } {
             if cancel.is_cancelled() { break; }
-            first_chunk = false;
-            let chunk = match chunk { Ok(c) => c, Err(e) => { yield Err(AdapterError::ProviderTransportFailure(e.to_string())); return; } };
-            for ev in parser.feed(&chunk).unwrap_or_default() {
-                let v: serde_json::Value = match serde_json::from_str(&ev.data) { Ok(v) => v, Err(_) => continue };
-                match v.get("type").and_then(|x|x.as_str()) {
-                    Some("content_block_start") => {
-                        let index = v.pointer("/index").and_then(|x|x.as_u64()).unwrap_or(0) as u32;
-                        let block_type = v.pointer("/content_block/type").and_then(|x|x.as_str()).unwrap_or("");
-                        if block_type == "tool_use" {
-                            let id = v.pointer("/content_block/id").and_then(|x|x.as_str()).unwrap_or("").to_string();
-                            let name = v.pointer("/content_block/name").and_then(|x|x.as_str()).unwrap_or("").to_string();
-                            tool_calls.insert(index, (id.clone(), name.clone(), String::new()));
-                            yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallStarted {
-                                call_index: index,
-                                provider_call_id: Some(id),
-                                name,
-                            }});
-                            seq += 1;
-                        }
-                        // thinking blocks: assembled for replay, never
-                        // surfaced as text (CoT defense).
-                    }
-                    Some("content_block_delta") => {
-                        let delta_type = v.pointer("/delta/type").and_then(|x|x.as_str()).unwrap_or("");
-                        let index = v.pointer("/index").and_then(|x|x.as_u64()).unwrap_or(0) as u32;
-                        match delta_type {
-                            "text_delta" => {
-                                if let Some(text) = v.pointer("/delta/text").and_then(|x|x.as_str()) {
-                                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::TextDelta { bytes: text.as_bytes().to_vec() } });
-                                    seq += 1;
-                                }
-                            }
-                            "thinking_delta" => {
-                                // Reasoning: assembled for replay, never
-                                // displayed (CoT defense).
-                                if let Some(text) = v.pointer("/delta/thinking").and_then(|x|x.as_str()) {
-                                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ThinkingDelta { bytes: text.as_bytes().to_vec() } });
-                                    seq += 1;
-                                }
-                            }
-                            "signature_delta" => {
-                                // The thinking block's signature: replayed
-                                // verbatim next round (the API rejects
-                                // unsigned replayed thinking).
-                                if let Some(sig) = v.pointer("/delta/signature").and_then(|x|x.as_str()) {
-                                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ThinkingSignatureDelta { bytes: sig.as_bytes().to_vec() } });
-                                    seq += 1;
-                                }
-                            }
-                            "input_json_delta" => {
-                                if let Some(part) = v.pointer("/delta/partial_json").and_then(|x|x.as_str())
-                                    && let Some((_, _, json)) = tool_calls.get_mut(&index) {
-                                        json.push_str(part);
-                                    }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some("content_block_stop") => {
-                        let index = v.pointer("/index").and_then(|x|x.as_u64()).unwrap_or(0) as u32;
-                        if tool_calls.contains_key(&index) {
-                            yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallFinished { call_index: index } });
-                            seq += 1;
-                        }
-                    }
-                    Some("message_delta") => {
-                        // The real stop reason lives here.
-                        if let Some(reason) = v.pointer("/delta/stop_reason").and_then(|x|x.as_str()) {
-                            finish_reason = Some(reason.to_string());
-                        }
-                        if let Some(u) = v.get("usage") {
-                            usage.output_tokens = u.get("output_tokens").and_then(|x|x.as_u64()).unwrap_or(usage.output_tokens);
-                        }
-                    }
-                    _ => {}
-                }
-                // message_start carries usage nested under /message;
-                // message_delta carries it top-level.
-                let u = v.get("usage").or_else(|| v.pointer("/message/usage"));
-                if let Some(u) = u {
-                    usage.input_tokens = u.get("input_tokens").and_then(|x|x.as_u64()).unwrap_or(usage.input_tokens);
-                    // Cache accounting (roadmap: check cache_read in tests).
-                    usage.cache_read_tokens = u.get("cache_read_input_tokens").and_then(|x|x.as_u64()).unwrap_or(usage.cache_read_tokens);
-                    usage.cache_write_tokens = u.get("cache_creation_input_tokens").and_then(|x|x.as_u64()).unwrap_or(usage.cache_write_tokens);
+            first = false;
+            let chunk = match chunk { Ok(chunk) => chunk, Err(error) => { yield Err(AdapterError::ProviderTransportFailure(error.to_string())); return; } };
+            if let Err(error) = count_bytes(&mut total, chunk.len()) { yield Err(error); return; }
+            let events = match parser.feed(&chunk) { Ok(events) => events, Err(error) => { yield Err(error.into()); return; } };
+            for event in events {
+                let value = match serde_json::from_str(&event.data) { Ok(value) => value, Err(_) => { yield Err(protocol("malformed Anthropic JSON")); return; } };
+                match state.event(&value) {
+                    Ok(events) => for event in events {
+                        yield Ok(ProviderStreamEvent { sequence:seq, event }); seq += 1;
+                    },
+                    Err(error) => { yield Err(error); return; }
                 }
             }
+            if state.done { break; }
         }
-
-        // Emit assembled tool calls (arguments complete after block stop).
-        for (index, (_id, _name, json)) in &tool_calls {
-            yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallArgumentsDelta {
-                call_index: *index,
-                bytes: json.as_bytes().to_vec(),
-            }});
-            seq += 1;
+        if cancel.is_cancelled() {
+            yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::Finished { finish_reason:Some("cancelled".into()), final_usage:None } });
+            return;
         }
-
-        let reason = if cancel.is_cancelled() {
-            "cancelled".into()
-        } else {
-            finish_reason.unwrap_or_else(|| "end_turn".into())
-        };
-        yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some(reason), final_usage: Some(usage) } });
+        if !state.done || !parser.is_clean() { yield Err(protocol("Anthropic stream ended before message_stop")); return; }
+        let reason = state.reason.expect("message_stop validates reason");
+        if !incomplete_reason(&reason) {
+            if reason == "tool_use" {
+                if state.calls.is_empty() { yield Err(protocol("tool_use terminal has no calls")); return; }
+                if let Err(error) = validate_calls(&state.calls) { yield Err(error); return; }
+                for (index, call) in state.calls {
+                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallStarted { call_index:index, provider_call_id:Some(call.id), name:call.name } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallArgumentsDelta { call_index:index, bytes:call.arguments.into_bytes() } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallFinished { call_index:index } }); seq += 1;
+                }
+            } else if !state.calls.is_empty() { yield Err(protocol("Anthropic text terminal contradicts tool calls")); return; }
+        }
+        yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::Finished { finish_reason:Some(reason), final_usage:state.saw_final_usage.then_some(state.usage) } });
     })
 }
 

@@ -2622,6 +2622,8 @@ dependencies = [
 name = "orbit-gateway"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "hex",
  "orbit-adapter",
  "orbit-egress",

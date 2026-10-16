@@ -22,7 +22,8 @@ use crate::registry::ProviderRegistry;
 use orbit_adapter::ProviderAdapter;
 use orbit_adapter::credential::SecretBytes;
 use orbit_adapter::types::{
-    DecisionId, ProviderRequest, ProviderResult, ProviderRouteBinding, RequestId,
+    AccountingResult, DecisionId, ProviderEventKind, ProviderRequest, ProviderResult,
+    ProviderRouteBinding, ProviderTerminalStatus, ProviderUsage, RequestId, UsageSource,
 };
 use orbit_egress::{BrokerVerdict, EgressAllowlist, EgressBroker, EgressTuple, SpkiPin};
 use orbit_ledger::event::{EgressDestination, EgressIntent, LedgerEvent};
@@ -392,24 +393,37 @@ impl DispatchEngine {
         };
         match orbit_provider_http::stream::collect_stream(stream, observer).await {
             Ok((events, evidence)) => {
-                // Surface the final provider usage into ProviderResult.accounting.
-                // Prefer Finished.final_usage; fall back to the last UsageUpdate.
-                let usage = events
+                // Presence establishes finality: zero is a valid snapshot, while
+                // the latest update remains provisional without final usage.
+                let (usage, usage_source, usage_complete) = events
                     .iter()
                     .rev()
                     .find_map(|e| match &e.event {
-                        orbit_adapter::types::ProviderEventKind::Finished {
+                        ProviderEventKind::Finished {
                             final_usage: Some(u),
                             ..
-                        } => Some(*u),
-                        orbit_adapter::types::ProviderEventKind::UsageUpdate(u) => Some(*u),
+                        } => Some((*u, UsageSource::Final, true)),
+                        ProviderEventKind::UsageUpdate(u) => {
+                            Some((*u, UsageSource::Incremental, false))
+                        }
                         _ => None,
                     })
-                    .unwrap_or_default();
-                let result = orbit_adapter::types::ProviderResult::completed(
-                    events, usage, 0, // cost computed by the caller from its pricing config
-                    evidence,
-                );
+                    .unwrap_or((ProviderUsage::default(), UsageSource::Missing, false));
+                let result = ProviderResult {
+                    status: ProviderTerminalStatus::Completed,
+                    binding: Default::default(),
+                    output: evidence,
+                    accounting: AccountingResult {
+                        usage,
+                        usage_source: Some(usage_source),
+                        usage_complete,
+                        // Pricing is owned by the caller; no charge is computed here.
+                        cost_microcents: 0,
+                        currency: None,
+                    },
+                    transport: Default::default(),
+                    events,
+                };
                 Ok((DispatchOutcome::Completed(Box::new(result)), reservation))
             }
             Err(e) => Ok((
