@@ -3,9 +3,8 @@
 //! - Spoken rules: the authority extractor turns operator speech into
 //!   real permission rules ("run the tests but never push" →
 //!   Bash(cargo test *) allowed, Bash(git push *) denied).
-//! - RTA (retest attestation): when the agent claims tests pass, ORBIT
-//!   re-runs the recorded command itself; only an attested pass turns
-//!   green.
+//! - Test claims: report the current turn's captured Bash completion,
+//!   without executing a second command to produce a verdict.
 //! - Cost guard: --max-cost stops a session/job at the budget.
 
 use crate::TurnReport;
@@ -137,15 +136,7 @@ fn phrase_to_rule(phrase: &str, effect: SpokenEffect) -> Option<String> {
     None
 }
 
-// ── RTA: retest attestation ────────────────────────────────────────────────
-
-/// An attested test pass: ORBIT re-ran the command itself.
-#[derive(Debug, Clone)]
-pub struct AttestedPass {
-    pub command: String,
-    pub exit_code: i32,
-    pub attested_at_epoch: u64,
-}
+// ── Captured test-command evidence ────────────────────────────────────────
 
 /// The structured attestation scan (E10): the last test-like Bash
 /// command of a turn, its RECORDED exit status (from the paired tool
@@ -160,97 +151,115 @@ pub struct AttestationScan {
 }
 
 /// Scan a turn's transcript for the attestation facts (E10). Returns
-/// None when no test-like command ran. The exit code comes from the
-/// tool result JSON recorded by the Bash tool itself; the claim check
-/// covers the common phrasings ("tests pass", "the test passes now",
-/// "tests passed", "tests are passing") — the old three-phrase list
-/// missed the singular, and a claim is a claim.
+/// None when the current user turn has no recognized test-like Bash
+/// call. A recognized call with missing, ambiguous or incomplete evidence
+/// returns `exit_code: -1`, retaining the warning contract of existing
+/// frontends. A zero means that exact command's captured completion,
+/// rather than proof that arbitrary shell text ran a real test suite.
 pub fn scan_attestation(
     transcript: &[orbit_adapter::types::ChatMessage],
 ) -> Option<AttestationScan> {
     use orbit_adapter::types::ChatRole;
 
-    // The last test-like Bash tool call, its paired result, and the
-    // final assistant text — one reverse pass.
-    let mut command: Option<String> = None;
-    let mut exit_code: Option<i64> = None;
-    let mut final_text = String::new();
-    for m in transcript.iter().rev() {
-        if m.role == ChatRole::Assistant && final_text.is_empty() && !m.content.is_empty() {
-            final_text = m.content.to_lowercase();
-        }
-        if command.is_none()
-            && let Some(calls) = m.tool_calls.as_ref()
-        {
-            for c in calls.iter().rev() {
-                let Ok(a) = serde_json::from_str::<serde_json::Value>(&c.arguments) else {
-                    continue;
-                };
-                let Some(cmd) = a.get("command").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let is_test = cmd.contains("cargo test")
-                    || cmd.contains("npm test")
-                    || cmd.contains("pytest")
-                    || cmd.contains("go test")
-                    || cmd.contains("python3 test");
-                if is_test {
-                    command = Some(cmd.to_string());
-                    // The paired result: the Tool message with this
-                    // call id carries the recorded exit_code.
-                    let id = c.id.clone();
-                    if let Some(tm) = transcript.iter().rev().find(|t| {
-                        t.role == ChatRole::Tool && t.tool_call_id.as_deref() == Some(id.as_str())
-                    }) && let Some(r) = tm.tool_result.as_deref()
-                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(r)
-                    {
-                        exit_code = v.get("exit_code").and_then(|x| x.as_i64());
-                    }
-                    break;
+    let start = transcript.iter().rposition(|m| m.role == ChatRole::User)? + 1;
+    let current = &transcript[start..];
+    let final_text = current
+        .last()
+        .filter(|m| {
+            m.role == ChatRole::Assistant && m.tool_calls.as_ref().is_none_or(Vec::is_empty)
+        })
+        .map(|m| m.content.to_lowercase())
+        .unwrap_or_default();
+
+    let (call_index, call, command) = current
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, m)| m.role == ChatRole::Assistant)
+        .find_map(|(index, message)| {
+            message.tool_calls.as_ref()?.iter().rev().find_map(|call| {
+                if call.name != "Bash" {
+                    return None;
                 }
-            }
-        }
-        if command.is_some() && !final_text.is_empty() {
-            break;
-        }
-    }
-    let command = command?;
-    let claimed_pass = final_text.contains("test") && (final_text.contains("pass"));
+                let arguments: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+                let command = arguments.get("command")?.as_str()?;
+                test_like_command(command).then(|| (index, call, command.to_owned()))
+            })
+        })?;
+
+    // Count all occurrences, including other tools and results preceding the
+    // call. Choosing only the newest matching ID would hide ambiguity.
+    let call_count = current
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .filter(|candidate| candidate.id == call.id)
+        .count();
+    let mut results = current.iter().enumerate().filter(|(_, message)| {
+        message.role == ChatRole::Tool && message.tool_call_id.as_deref() == Some(call.id.as_str())
+    });
+    let result = results.next();
+    let unique_result = results.next().is_none();
+    let exit_code = if !call.id.trim().is_empty() && call_count == 1 && unique_result {
+        result
+            .filter(|(index, _)| *index > call_index)
+            .and_then(|(_, message)| message.tool_result.as_deref())
+            .and_then(recorded_exit_code)
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+    let claimed_pass = final_text.contains("test") && final_text.contains("pass");
     Some(AttestationScan {
         command,
-        exit_code: exit_code.unwrap_or(-1),
+        exit_code,
         claimed_pass,
     })
 }
 
-/// Re-run a command and attest the result. Only a zero exit code
-/// attests a pass — the agent's claim is never trusted (roadmap:
-/// "when the agent says tests pass, ORBIT re-runs the recorded
-/// command itself").
-pub fn attest_test_pass(command: &str, working_dir: &Path) -> Result<AttestedPass, String> {
-    use std::process::Command;
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .current_dir(working_dir)
-        .output()
-        .map_err(|e| format!("retest spawn failed: {e}"))?;
-    let code = output.status.code().unwrap_or(-1);
-    let attested = AttestedPass {
-        command: command.to_string(),
-        exit_code: code,
-        attested_at_epoch: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    };
-    if code == 0 {
-        Ok(attested)
-    } else {
-        Err(format!(
-            "retest FAILED (exit {code}): the agent's claim of a passing test is not attested"
-        ))
+fn test_like_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    match words.next() {
+        Some("cargo" | "npm" | "go") => words.next() == Some("test"),
+        Some("pytest") => true,
+        Some("python3") => words
+            .next()
+            .is_some_and(|script| script.starts_with("test")),
+        _ => false,
     }
+}
+
+fn recorded_exit_code(raw: &str) -> Option<i64> {
+    let payload: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let payload = payload.as_object()?;
+    let ok = payload.get("ok")?.as_bool()?;
+    let exit_code = payload.get("exit_code")?.as_i64()?;
+    // These fields describe unsupported or unfinished execution states. A
+    // malformed state flag is not permission to treat a command as complete.
+    for flag in [
+        "backgrounded",
+        "pending",
+        "cancelled",
+        "canceled",
+        "interrupted",
+        "timed_out",
+        "denied",
+        "is_error",
+    ] {
+        if payload
+            .get(flag)
+            .is_some_and(|value| value != &serde_json::Value::Bool(false))
+        {
+            return None;
+        }
+    }
+    if ["task_id", "status", "state", "error"]
+        .iter()
+        .any(|field| payload.contains_key(*field))
+    {
+        return None;
+    }
+    (exit_code != 0 || ok).then_some(exit_code)
 }
 
 // ── Cost guard ─────────────────────────────────────────────────────────────
@@ -408,16 +417,311 @@ mod tests {
         assert!(rules.is_empty(), "ambiguity must not produce rules");
     }
 
+    fn call(id: &str, name: &str, command: &str) -> orbit_adapter::types::ChatMessage {
+        let mut message = crate::assistant_message("");
+        message.tool_calls = Some(vec![orbit_adapter::types::ToolCallMessage {
+            id: id.into(),
+            name: name.into(),
+            arguments: serde_json::json!({"command": command}).to_string(),
+        }]);
+        message
+    }
+
+    fn result(id: &str, raw: &str) -> orbit_adapter::types::ChatMessage {
+        let mut message = crate::assistant_message("");
+        message.role = orbit_adapter::types::ChatRole::Tool;
+        message.tool_call_id = Some(id.into());
+        message.tool_result = Some(raw.into());
+        message
+    }
+
+    fn proof_turn(raw: &str) -> Vec<orbit_adapter::types::ChatMessage> {
+        vec![
+            crate::user_message("Run the test command."),
+            call("test-call", "Bash", "cargo test --lib"),
+            result("test-call", raw),
+            crate::assistant_message("The tests pass."),
+        ]
+    }
+
     #[test]
-    fn rta_attests_only_real_passes() {
-        let dir = std::env::temp_dir();
-        // A command that genuinely passes.
-        let pass = attest_test_pass("true", &dir).unwrap();
-        assert_eq!(pass.exit_code, 0);
-        // A failing command is refused — the claim is not attested.
-        let fail = attest_test_pass("false", &dir);
-        assert!(fail.is_err());
-        assert!(fail.unwrap_err().contains("not attested"));
+    fn captured_test_command_has_exact_zero_exit_and_current_claim() {
+        let scan = scan_attestation(&proof_turn(r#"{"ok":true,"exit_code":0}"#)).unwrap();
+        assert_eq!(scan.command, "cargo test --lib");
+        assert_eq!(scan.exit_code, 0);
+        assert!(scan.claimed_pass);
+    }
+
+    #[test]
+    fn captured_failed_test_remains_unverified_despite_claim() {
+        let scan = scan_attestation(&proof_turn(r#"{"ok":false,"exit_code":17}"#)).unwrap();
+        assert_eq!(scan.exit_code, 17);
+        assert!(scan.claimed_pass);
+    }
+
+    #[test]
+    fn captured_zero_requires_a_typed_success_flag() {
+        for payload in [
+            r#"{"ok":false,"exit_code":0}"#,
+            r#"{"exit_code":0}"#,
+            r#"{"ok":"true","exit_code":0}"#,
+            r#"{"ok":null,"exit_code":0}"#,
+        ] {
+            assert_eq!(
+                scan_attestation(&proof_turn(payload)).unwrap().exit_code,
+                -1,
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_exit_requires_an_integer_in_the_completed_payload() {
+        for payload in [
+            r#"{"ok":true}"#,
+            r#"{"ok":true,"exit_code":"0"}"#,
+            r#"{"ok":true,"exit_code":0.0}"#,
+            r#"{"ok":true,"exit_code":null}"#,
+            r#"{"ok":true,"exit_code":true}"#,
+            r#"{"ok":true,"exit_code":18446744073709551615}"#,
+            r#"{"ok":true,"exit_code":0"#,
+            r#"[{"ok":true,"exit_code":0}]"#,
+        ] {
+            assert_eq!(
+                scan_attestation(&proof_turn(payload)).unwrap().exit_code,
+                -1,
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_pending_background_and_cancelled_results_are_unverified() {
+        for flag in [
+            "backgrounded",
+            "pending",
+            "cancelled",
+            "canceled",
+            "interrupted",
+            "timed_out",
+            "denied",
+            "is_error",
+        ] {
+            for value in [
+                serde_json::json!(true),
+                serde_json::json!("false"),
+                serde_json::Value::Null,
+            ] {
+                let mut payload = serde_json::json!({"ok": true, "exit_code": 0});
+                payload[flag] = value;
+                assert_eq!(
+                    scan_attestation(&proof_turn(&payload.to_string()))
+                        .unwrap()
+                        .exit_code,
+                    -1,
+                    "{payload}"
+                );
+            }
+        }
+        for (key, value) in [
+            ("task_id", serde_json::json!("pending-task")),
+            ("status", serde_json::json!("running")),
+            ("status", serde_json::json!("unknown")),
+            ("state", serde_json::json!("cancelled")),
+            ("error", serde_json::json!("execution stopped")),
+        ] {
+            let mut payload = serde_json::json!({"ok": true, "exit_code": 0});
+            payload[key] = value;
+            assert_eq!(
+                scan_attestation(&proof_turn(&payload.to_string()))
+                    .unwrap()
+                    .exit_code,
+                -1,
+                "{payload}"
+            );
+        }
+        let pending = proof_turn(r#"{"ok":true,"backgrounded":true,"task_id":"running"}"#);
+        assert_eq!(scan_attestation(&pending).unwrap().exit_code, -1);
+    }
+
+    #[test]
+    fn captured_explicit_false_state_flags_do_not_hide_real_completion() {
+        let scan = scan_attestation(&proof_turn(
+            r#"{"ok":true,"exit_code":0,"backgrounded":false,"cancelled":false,"sandboxed":true}"#,
+        ))
+        .unwrap();
+        assert_eq!(scan.exit_code, 0);
+    }
+
+    #[test]
+    fn command_shaped_non_bash_calls_cannot_attest() {
+        for name in ["Read", "Task", "plugin:test:Bash", "bash", "Bash "] {
+            let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+            turn[1] = call("test-call", name, "cargo test --lib");
+            assert!(scan_attestation(&turn).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn bash_calls_must_come_from_assistant_messages() {
+        for role in [
+            orbit_adapter::types::ChatRole::Tool,
+            orbit_adapter::types::ChatRole::System,
+        ] {
+            let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+            turn[1].role = role;
+            assert!(scan_attestation(&turn).is_none());
+        }
+    }
+
+    #[test]
+    fn stale_prior_turn_test_does_not_attest_current_claim() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn.push(crate::user_message("Summarize the work."));
+        turn.push(crate::assistant_message("The tests pass."));
+        assert!(scan_attestation(&turn).is_none());
+    }
+
+    #[test]
+    fn current_call_cannot_borrow_a_prior_turn_result() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn.push(crate::user_message("Run tests again."));
+        turn.push(call("test-call", "Bash", "cargo test --lib"));
+        turn.push(crate::assistant_message("The tests pass."));
+        assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+    }
+
+    #[test]
+    fn current_unique_call_can_reuse_a_prior_turn_id_with_its_own_result() {
+        let mut turn = proof_turn(r#"{"ok":false,"exit_code":7}"#);
+        turn.extend(proof_turn(r#"{"ok":true,"exit_code":0}"#));
+        assert_eq!(scan_attestation(&turn).unwrap().exit_code, 0);
+    }
+
+    #[test]
+    fn missing_result_keeps_a_recognized_command_unverified() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn.remove(2);
+        let scan = scan_attestation(&turn).unwrap();
+        assert_eq!(scan.command, "cargo test --lib");
+        assert_eq!(scan.exit_code, -1);
+        assert!(scan.claimed_pass);
+    }
+
+    #[test]
+    fn mismatched_result_id_cannot_attest() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn[2].tool_call_id = Some("different-call".into());
+        assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+    }
+
+    #[test]
+    fn result_must_follow_the_call_in_causal_order() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn.swap(1, 2);
+        assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+    }
+
+    #[test]
+    fn result_requires_the_tool_role_and_structured_payload() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn[2].role = orbit_adapter::types::ChatRole::Assistant;
+        assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+        turn[2].role = orbit_adapter::types::ChatRole::Tool;
+        turn[2].content = turn[2].tool_result.take().unwrap();
+        assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+    }
+
+    #[test]
+    fn duplicate_call_ids_are_ambiguous_even_across_tool_names() {
+        for name in ["Bash", "Read"] {
+            let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+            turn.insert(1, call("test-call", name, "cargo test --lib"));
+            assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+        }
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        let duplicate = turn[1].tool_calls.as_ref().unwrap()[0].clone();
+        turn[1].tool_calls.as_mut().unwrap().push(duplicate);
+        assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+    }
+
+    #[test]
+    fn duplicate_results_are_ambiguous_regardless_of_payload_or_order() {
+        for raw in [
+            r#"{"ok":true,"exit_code":0}"#,
+            r#"{"ok":false,"exit_code":4}"#,
+            "malformed",
+        ] {
+            for index in [1, 3] {
+                let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+                turn.insert(index, result("test-call", raw));
+                assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_call_id_cannot_attest() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn[1].tool_calls.as_mut().unwrap()[0].id.clear();
+        turn[2].tool_call_id = Some(String::new());
+        assert_eq!(scan_attestation(&turn).unwrap().exit_code, -1);
+    }
+
+    #[test]
+    fn latest_recognized_test_call_controls_the_report() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn.pop();
+        turn.push(call("new-test", "Bash", "npm test"));
+        turn.push(result("new-test", r#"{"ok":false,"exit_code":5}"#));
+        turn.push(crate::assistant_message("The tests pass."));
+        let scan = scan_attestation(&turn).unwrap();
+        assert_eq!(scan.command, "npm test");
+        assert_eq!(scan.exit_code, 5);
+    }
+
+    #[test]
+    fn absent_user_boundary_cannot_supply_current_turn_proof() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn.remove(0);
+        assert!(scan_attestation(&turn).is_none());
+    }
+
+    #[test]
+    fn claim_comes_only_from_a_final_plain_assistant_message() {
+        let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+        turn[3].content = "The command has finished.".into();
+        assert!(!scan_attestation(&turn).unwrap().claimed_pass);
+        turn[3].content = "The tests pass.".into();
+        turn.push(call("uncompleted", "Read", "other"));
+        assert!(!scan_attestation(&turn).unwrap().claimed_pass);
+        turn.pop();
+        turn.push(result("extra", r#"{"output":"tests pass"}"#));
+        assert!(!scan_attestation(&turn).unwrap().claimed_pass);
+    }
+
+    #[test]
+    fn literal_test_words_inside_other_commands_are_not_test_calls() {
+        for command in [
+            "echo cargo test",
+            "printf pytest",
+            "notpytest",
+            "cargo testing",
+            "python3 inspect.py",
+        ] {
+            let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+            turn[1] = call("test-call", "Bash", command);
+            assert!(scan_attestation(&turn).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn malformed_or_missing_command_arguments_cannot_qualify() {
+        for raw in ["not-json", "{}", r#"{"command":null}"#, r#"{"command":42}"#] {
+            let mut turn = proof_turn(r#"{"ok":true,"exit_code":0}"#);
+            turn[1].tool_calls.as_mut().unwrap()[0].arguments = raw.into();
+            assert!(scan_attestation(&turn).is_none());
+        }
     }
 
     #[test]

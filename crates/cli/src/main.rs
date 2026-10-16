@@ -1956,31 +1956,19 @@ fn cmd_headless(args: &[String]) -> i32 {
         && let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
         && scan.claimed_pass
     {
-        let cwd = std::env::current_dir().unwrap_or_default();
         let verdict = if scan.exit_code == 0 {
-            // The recorded exit was 0 — re-run to attest (the
-            // re-run is ORBIT's own eyes on the claim).
-            match orbit_engine::automation::attest_test_pass(&scan.command, &cwd) {
-                Ok(p) => serde_json::json!({
-                    "attested": true,
-                    "command": p.command,
-                    "at": p.attested_at_epoch
-                }),
-                Err(e) => serde_json::json!({
-                    "attested": false,
-                    "command": scan.command,
-                    "reason": e
-                }),
-            }
+            serde_json::json!({
+                "attested": true,
+                "command": scan.command,
+                "evidence": "recorded_tool_result",
+                "recorded_exit_code": scan.exit_code
+            })
         } else {
-            // The recorded exit status was already a failure:
-            // no re-run needed — the claim contradicts the
-            // recorded facts.
             serde_json::json!({
                 "attested": false,
                 "command": scan.command,
                 "recorded_exit_code": scan.exit_code,
-                "reason": "the last test-like command exited non-zero; the claim is unverified"
+                "reason": "the current turn lacks a unique completed successful Bash result for this command; the claim is unverified"
             })
         };
         if stream_json {
@@ -1991,10 +1979,15 @@ fn cmd_headless(args: &[String]) -> i32 {
                             text: format!(
                                 "rta: {}",
                                 if attested {
-                                    "tests re-run and PASSED (attested)".to_string()
+                                    "recorded Bash command exited 0 (captured tool result)".to_string()
+                                } else if scan.exit_code == -1 {
+                                    format!(
+                                        "UNVERIFIED CLAIM — {} has no unique completed Bash result",
+                                        scan.command
+                                    )
                                 } else {
                                     format!(
-                                        "UNVERIFIED CLAIM — {} exited {} at turn time; the claim is not attested",
+                                        "UNVERIFIED CLAIM — {} has captured exit code {}; the claim is not attested",
                                         scan.command, scan.exit_code
                                     )
                                 }

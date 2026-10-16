@@ -353,7 +353,7 @@ Parity makes ORBIT usable; these six make it worth choosing. Each one is built f
 | --- | --- | --- |
 | Proof of every action | `orbit-ledger`: tool intent, decision and result, approvals, egress grants, hook runs, subagent calls, checkpoints | `orbit verify-ledger` shows the record of a session was not altered; the Activity panel shows it live |
 | Replay from any checkpoint | Replay planning in the CLI, plus checkpoints and recorded tool outputs | Re-run a session with another model, other rules or a changed prompt, and compare; regression-test agent behaviour on your own work |
-| Claims checked, not trusted | The RTA (retest attestation) and EPB (evidence publish) primitives in `orbit-core` | When the agent says tests pass, ORBIT re-runs the recorded command itself; only an attested pass turns green |
+| Claims checked, not trusted | The RTA (retest attestation) and EPB (evidence publish) primitives in `orbit-core` | When the agent says tests pass, ORBIT checks the current turn’s unique completed Bash result and reports its captured exit status without executing the command again |
 | Spoken rules become real rules | The authority extractor in `orbit-core` (UserAuthorityIntent) | "Run the tests but never push" becomes `Bash(cargo test *)` allowed and `Bash(git push *)` denied, recorded as an AuthorityGrant |
 | Credentials stay home | Deny-read defaults, the secret scanner, the egress broker | Keys and `.env` files never reach a provider, and every outbound host is on a list you approved |
 | Spend under control | Per-turn cost accounting, model routing by subagent | A live cost meter, `--max-cost` per session or job, cheaper models for exploration |
