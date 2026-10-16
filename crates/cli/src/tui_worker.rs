@@ -86,6 +86,64 @@ fn save_controls(
     true
 }
 
+fn retain_local_intent(
+    transcript: &mut Vec<ChatMessage>,
+    prompt: &str,
+    blocks: Option<Vec<ContentBlock>>,
+) {
+    transcript.push(ChatMessage {
+        role: ChatRole::User,
+        content: prompt.to_owned(),
+        tool_calls: None,
+        tool_call_id: None,
+        tool_result: None,
+        blocks,
+        origin_model: None,
+        origin_provider: None,
+    });
+}
+
+fn save_failed_turn(
+    config: &TuiTurnConfig,
+    lease: &crate::sessions::SessionLease,
+    transcript: &[ChatMessage],
+    counters: (u64, u64, u64, u64),
+    origin: crate::phase_routing::SelectionOrigin,
+    sender: &BusSender,
+) {
+    let (turns, input, output, cost) = counters;
+    let saved = crate::sessions::SessionFile::from_chat(
+        &config.session_id,
+        &config.model,
+        &config.gate,
+        &config.provider_id,
+        transcript,
+        turns,
+        input,
+        output,
+        cost,
+    )
+    .with_effort(config.effort.clone())
+    .with_selection_origin(origin);
+    match lease.save(&saved) {
+        Ok(()) => {}
+        Err(error @ crate::sessions::SessionLeaseError::PublicationUncertain(_)) => {
+            orbit_hud_tui::emit_error(
+                sender,
+                &format!(
+                    "current prompt save may have committed; inspect the session before retrying: {error}"
+                ),
+            );
+        }
+        Err(error) => {
+            orbit_hud_tui::emit_error(
+                sender,
+                &format!("current prompt could not be saved: {error}"),
+            );
+        }
+    }
+}
+
 /// Build the worker spawner closure for the TUI. The CLI owns `run_turn`;
 /// this closure captures the turn config and spawns a thread that drives it.
 /// Returns a `CancelHandle` that cancels the turn currently in flight.
@@ -382,7 +440,7 @@ fn worker_main_owned(
                 // Take the scope out of config for the turn (borrow
                 // rules: config is borrowed immutably by run_tui_turn).
                 let mut scope = std::mem::take(&mut config.scope);
-                let (_ok, _input, _output, _cost, plan_text) = match run_tui_turn(
+                let (ok, input, output, cost, plan_text) = match run_tui_turn(
                     &config,
                     &mut transcript,
                     &prompt,
@@ -401,6 +459,16 @@ fn worker_main_owned(
                     Err(e) => {
                         config.scope = scope;
                         orbit_hud_tui::emit_error(&ctx.sender, &e);
+                        // Resolution failed before the engine appended this intent.
+                        retain_local_intent(&mut transcript, &prompt, None);
+                        save_failed_turn(
+                            &config,
+                            &lease,
+                            &transcript,
+                            (turns, cum_input, cum_output, cum_cost),
+                            selection_origin,
+                            &ctx.sender,
+                        );
                         orbit_hud_tui::emit_response_finished(
                             &ctx.sender,
                             "",
@@ -419,6 +487,29 @@ fn worker_main_owned(
                     *guard = None;
                 }
                 turns = turns.saturating_add(1);
+                if !ok {
+                    // The engine already retained this attempt. Preserve its
+                    // history and actual accounting without publishing a plan.
+                    cum_input = cum_input.saturating_add(input);
+                    cum_output = cum_output.saturating_add(output);
+                    cum_cost = cum_cost.saturating_add(cost);
+                    save_failed_turn(
+                        &config,
+                        &lease,
+                        &transcript,
+                        (turns, cum_input, cum_output, cum_cost),
+                        selection_origin,
+                        &ctx.sender,
+                    );
+                    orbit_hud_tui::emit_response_finished(
+                        &ctx.sender,
+                        "",
+                        cum_input,
+                        cum_output,
+                        cum_cost,
+                    );
+                    continue;
+                }
                 // The plan is HELD for approval — no counters commit, no
                 // session save yet (the plan isn't part of the transcript
                 // until approved and executed).
@@ -452,7 +543,7 @@ fn worker_main_owned(
                     &config,
                     &mut transcript,
                     &expanded_prompt,
-                    user_blocks,
+                    user_blocks.clone(),
                     &ctx.sender,
                     &ctx.approvals,
                     &token,
@@ -467,6 +558,17 @@ fn worker_main_owned(
                     Err(e) => {
                         config.scope = scope;
                         orbit_hud_tui::emit_error(&ctx.sender, &e);
+                        // Keep expanded typed media with the same intent the
+                        // engine would have appended after local resolution.
+                        retain_local_intent(&mut transcript, &expanded_prompt, user_blocks);
+                        save_failed_turn(
+                            &config,
+                            &lease,
+                            &transcript,
+                            (turns, cum_input, cum_output, cum_cost),
+                            selection_origin,
+                            &ctx.sender,
+                        );
                         orbit_hud_tui::emit_response_finished(
                             &ctx.sender,
                             "",
@@ -1920,6 +2022,26 @@ pub fn run_tui_turn(
         }
     };
 
+    let mut options = orbit_engine::TurnOptions {
+        user_blocks,
+        tools: crate::tools::session_tool_definitions(&config.home),
+        session_id: config.session_id.clone(),
+        system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
+        memory_bytes: tool_cx.ext::<MemoryBytes>().map_or(0, |m| m.0),
+        request_stem: "orbit-tui".into(),
+        // The compaction role: a cheap model may summarize while the
+        // conversation keeps its own. None = same model summarizes.
+        compaction_config: Some(compaction_config),
+        ..Default::default()
+    };
+    // A local budget error must leave session grants and permission scope in
+    // the caller's slots so the worker can finish the error without losing them.
+    let notices = crate::model_limits::apply_turn_budgets(&config.home, &turn_config, &mut options)
+        .map_err(|error| error.to_string())?;
+    for notice in notices {
+        orbit_hud_tui::emit_status(sender, &notice);
+    }
+
     let mut executor = TuiToolExecutor {
         home: config.home.clone(),
         session_id: config.session_id.clone(),
@@ -1930,22 +2052,6 @@ pub fn run_tui_turn(
         auto_grants: std::mem::take(auto_grants),
         scope: std::mem::take(scope),
         tool_cx: tool_cx.clone(),
-    };
-
-    let options = orbit_engine::TurnOptions {
-        user_blocks,
-        tools: crate::tools::session_tool_definitions(&config.home),
-        session_id: config.session_id.clone(),
-        system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
-        memory_bytes: tool_cx.ext::<MemoryBytes>().map_or(0, |m| m.0),
-        // Resolve the selected provider and raw model's legacy input policy.
-        // The engine measures the prepared request and applies the active budget.
-        window_tokens: crate::context_window_for_turn(&config.home, &turn_config),
-        request_stem: "orbit-tui".into(),
-        // The compaction role: a cheap model may summarize while the
-        // conversation keeps its own. None = same model summarizes.
-        compaction_config: Some(compaction_config),
-        ..Default::default()
     };
 
     let report = orbit_engine::run_turn(

@@ -1599,11 +1599,28 @@ fn owner_loop(
                     .map_err(OwnerError::Invalid)?;
             let compaction = crate::try_role_turn_config(&config.turn.home, &turn, "compaction")
                 .map_err(OwnerError::Invalid)?;
+            let mut options = orbit_engine::TurnOptions {
+                max_attempts: 1,
+                compaction_config: Some(compaction),
+                session_id: config.turn.session_id.clone(),
+                request_stem: format!("orbit-owned-{request_id}"),
+                ..Default::default()
+            };
+            let cancelled = handle
+                .lock()?
+                .cancel
+                .as_ref()
+                .is_some_and(CancelToken::is_cancelled);
+            let notices = if cancelled {
+                Ok(Vec::new())
+            } else {
+                crate::model_limits::apply_turn_budgets(&config.turn.home, &turn, &mut options)
+            };
             store.save(&handle.snapshot()?)?;
             save_live(&lease, &config.turn, &intent, &handle.snapshot()?)?;
-            Ok((base, turn, decision, compaction))
+            Ok((base, turn, decision, options, notices))
         });
-        let (base_turn, turn, decision, compaction) = match accepted {
+        let (base_turn, turn, decision, mut options, notices) = match accepted {
             Ok(turn) => turn,
             Err(error) => {
                 let mut hub = handle.lock()?;
@@ -1619,6 +1636,94 @@ fn owner_loop(
                 drop(hub);
                 let _ = store.save(&handle.snapshot()?);
                 let _ = reply.try_send(Err(error));
+                continue;
+            }
+        };
+        let notices = match notices {
+            Ok(notices) => notices,
+            Err(error) => {
+                // Admission failed locally: no engine/provider attempt occurred.
+                // Retain intent once and publish a known terminal request so a
+                // reconnect cannot replay it or confuse it with uncertain egress.
+                transcript = intent;
+                let interrupted;
+                {
+                    let mut hub = handle.lock()?;
+                    interrupted = hub.cancel.as_ref().is_some_and(CancelToken::is_cancelled);
+                    hub.snapshot.turns = hub.snapshot.turns.saturating_add(1);
+                    hub.snapshot.messages = visible_messages(&transcript, &hub.masks);
+                }
+                let mut terminal = handle.snapshot()?;
+                let saved = save_live(&lease, &config.turn, &transcript, &terminal);
+                if let Some(record) = terminal.requests.get_mut(&request_id) {
+                    record.state = if saved.is_err() {
+                        RequestState::Unknown
+                    } else if interrupted {
+                        RequestState::Interrupted
+                    } else {
+                        RequestState::Failed
+                    };
+                }
+                let saved_request = store.save(&terminal);
+                let publication_error = saved.and(saved_request).err();
+                let state = if publication_error.is_some() {
+                    "unknown"
+                } else if interrupted {
+                    "interrupted"
+                } else {
+                    "failed"
+                };
+                {
+                    let mut hub = handle.lock()?;
+                    if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
+                        record.state = if publication_error.is_some() {
+                            RequestState::Unknown
+                        } else if interrupted {
+                            RequestState::Interrupted
+                        } else {
+                            RequestState::Failed
+                        };
+                    }
+                    hub.snapshot.partial_response.clear();
+                    hub.snapshot.pending_approvals.clear();
+                    hub.approvals.clear();
+                    hub.cancel = None;
+                    hub.snapshot.state = if hub.stopping {
+                        TurnState::Stopping
+                    } else if publication_error.is_some() {
+                        TurnState::Interrupted
+                    } else {
+                        TurnState::Idle
+                    };
+                    hub.emit(
+                        "error",
+                        json!({"type":"error","message":error.to_string(),"request_id":request_id}),
+                    );
+                    hub.emit(
+                        "turn_ended",
+                        json!({"type":"turn_ended","ok":false,"interrupted":interrupted,
+                        "rounds":0,"input_tokens":0,"output_tokens":0,"cost_microcents":0}),
+                    );
+                    if let Some(error) = &publication_error {
+                        hub.emit(
+                            "error",
+                            json!({"message":error.to_string(),"request_id":request_id}),
+                        );
+                    }
+                    let finished = json!({"request_id":request_id,"turns":hub.snapshot.turns,
+                        "input_tokens":hub.snapshot.input_tokens,"output_tokens":hub.snapshot.output_tokens,
+                        "cost_microcents":hub.snapshot.cost_microcents});
+                    hub.emit("request_finished", finished);
+                }
+                let ack = match publication_error {
+                    Some(error) => Err(error),
+                    None => Ok(ActionAck {
+                        request_id: Some(request_id.clone()),
+                        state: state.into(),
+                        duplicate: false,
+                    }),
+                };
+                let _ = reply.try_send(ack);
                 continue;
             }
         };
@@ -1651,6 +1756,12 @@ fn owner_loop(
             state: "accepted".into(),
             duplicate: false,
         }));
+        {
+            let mut hub = handle.lock()?;
+            for text in notices {
+                hub.emit("status", json!({"text":text}));
+            }
+        }
         let cancel = handle
             .lock()?
             .cancel
@@ -1684,15 +1795,7 @@ fn owner_loop(
                     .as_ref()
                     .is_none_or(|allow| allow.contains(&definition.name))
         });
-        let options = orbit_engine::TurnOptions {
-            tools: definitions,
-            max_attempts: 1,
-            window_tokens: crate::context_window_for_turn(&config.turn.home, &turn),
-            compaction_config: Some(compaction),
-            session_id: config.turn.session_id.clone(),
-            request_stem: format!("orbit-owned-{request_id}"),
-            ..Default::default()
-        };
+        options.tools = definitions;
         let mut cot = orbit_hud_tui::CotStripper::new();
         let mut display = DisplayStream::default();
         let mut events = |event: orbit_frontend_protocol::FrontendEvent| {

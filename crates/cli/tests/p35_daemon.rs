@@ -2,9 +2,9 @@
 
 pub use orbit_cli::{
     apply_effort_setting, checked_model_turn, config, context_window_for_turn, effort_status,
-    parse_effort_setting, phase_routing, resolve_selected_model, route_command, sessions,
-    tool_runtime, tools, try_engine_turn_config, try_phase_turn_config, try_role_turn_config,
-    tui_worker,
+    model_limits, parse_effort_setting, phase_routing, resolve_selected_model, route_command,
+    sessions, tool_runtime, tools, try_engine_turn_config, try_phase_turn_config,
+    try_role_turn_config, tui_worker,
 };
 #[path = "../src/attach.rs"]
 pub mod attach;

@@ -17,7 +17,7 @@ use orbit_engine::context_budget::{
     BudgetCeilings, BudgetIdentity, BudgetPolicy, BudgetSource, Freshness, MediaPolicy,
     SelectedBudget, UnknownTextPolicy,
 };
-use orbit_engine::{ProviderKind, TurnConfig};
+use orbit_engine::{ProviderKind, TurnConfig, TurnOptions};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -97,6 +97,7 @@ pub enum BudgetError {
     InvalidMetadata,
     InvalidBinding,
     LimitRequired,
+    ObservationTimeUnavailable,
 }
 
 impl std::fmt::Display for BudgetError {
@@ -108,6 +109,7 @@ impl std::fmt::Display for BudgetError {
             Self::LimitRequired => {
                 "context limit required: configure context_limits.input_tokens or combined_tokens, or choose fallback policy"
             }
+            Self::ObservationTimeUnavailable => "context budget observation time is unavailable",
         })
     }
 }
@@ -155,6 +157,69 @@ pub fn resolve_turn_budgets_detailed(
     let selected = snapshot.resolve(home, selected, now_unix)?;
     let summary = snapshot.resolve(home, summary, now_unix)?;
     Ok(TurnBudgetReports { selected, summary })
+}
+
+/// Apply the pair policy only after all request settings and the actual summary
+/// role are final. A failed resolution leaves every option unchanged.
+pub fn apply_turn_budgets(
+    home: &Path,
+    selected: &TurnConfig,
+    options: &mut TurnOptions,
+) -> Result<Vec<String>, BudgetError> {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| BudgetError::ObservationTimeUnavailable)?
+        .as_secs();
+    let summary = options.compaction_config.as_ref().unwrap_or(selected);
+    let reports = resolve_turn_budgets_detailed(home, selected, summary, now_unix)?;
+    let mut notices = Vec::new();
+    for (role, report) in [
+        ("Selected", &reports.selected),
+        ("Summary", &reports.summary),
+    ] {
+        notices.extend(
+            report
+                .notices
+                .iter()
+                .map(|notice| turn_budget_notice(role, notice)),
+        );
+    }
+    options.selected_budget = Some(reports.selected.budget);
+    options.compaction_budget = Some(reports.summary.budget);
+    options.window_tokens = None;
+    Ok(notices)
+}
+
+fn turn_budget_notice(role: &str, notice: &BudgetNotice) -> String {
+    match notice {
+        BudgetNotice::FallbackPolicy {
+            input_tokens,
+            combined_tokens,
+        } => {
+            let mut limits = Vec::new();
+            if let Some(value) = input_tokens {
+                limits.push(format!("input {value} tokens"));
+            }
+            if let Some(value) = combined_tokens {
+                limits.push(format!("combined context {value} tokens"));
+            }
+            format!(
+                "{role} context uses a harness fallback policy ({}); configure context_limits.input_tokens or context_limits.combined_tokens to set an explicit policy.",
+                limits.join(", ")
+            )
+        }
+        BudgetNotice::LegacyContextUnspecified => format!(
+            "{role} legacy context has no ownership evidence; configure context_limits.input_tokens to preserve an explicit local policy."
+        ),
+        BudgetNotice::StaleObservation(component) => format!(
+            "{role} {} observation is stale; its limit was excluded from the context budget.",
+            component_name(*component)
+        ),
+        BudgetNotice::UnusableObservation(component) => format!(
+            "{role} {} observation cannot establish a usable limit and was excluded from the context budget.",
+            component_name(*component)
+        ),
+    }
 }
 
 struct Snapshot {

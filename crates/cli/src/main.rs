@@ -1611,6 +1611,44 @@ mod owned_startup_tests {
     }
 }
 
+fn local_budget_refusal(
+    prompt: &str,
+    options: &orbit_engine::TurnOptions,
+    transcript: &mut Vec<orbit_adapter::types::ChatMessage>,
+    message: String,
+    events: &mut dyn FnMut(orbit_frontend_protocol::FrontendEvent),
+) -> Result<orbit_engine::TurnReport, String> {
+    let mut user = orbit_engine::user_message(prompt);
+    user.blocks = options.user_blocks.clone();
+    transcript.push(user);
+    events(orbit_frontend_protocol::FrontendEvent::Error {
+        message: message.clone(),
+    });
+    events(orbit_frontend_protocol::FrontendEvent::TurnEnded {
+        ok: false,
+        interrupted: false,
+        rounds: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_microcents: 0,
+    });
+    Err(message)
+}
+
+fn context_meter_text(
+    used_tokens: u64,
+    window_tokens: u64,
+    breakdown: Option<orbit_frontend_protocol::ContextBreakdown>,
+) -> String {
+    match breakdown {
+        Some(parts) => format!(
+            "context estimate {used_tokens}/{window_tokens} tokens; compact at {}, output reserve {}",
+            parts.compact_at, parts.reserve
+        ),
+        None => format!("context estimate {used_tokens}/{window_tokens} tokens"),
+    }
+}
+
 fn cmd_headless(args: &[String]) -> i32 {
     let prompt = args.first().map(String::as_str).unwrap_or("");
     if prompt.is_empty() {
@@ -1845,10 +1883,35 @@ fn cmd_headless(args: &[String]) -> i32 {
             serde_json::json!({"type":"status","text":format!("route {}/{} → {}/{}",decision.phase.as_str(),decision.difficulty.as_str(),decision.provider_id,decision.raw_model)})
         );
     }
+    let mut context_notices = Vec::new();
+    let mut context_usage = Vec::new();
     let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
         if stream_json {
             println!("{}", serde_json::to_string(&ev).unwrap_or_default());
             let _ = std::io::stdout().flush();
+        }
+        match &ev {
+            orbit_frontend_protocol::FrontendEvent::Status { text } => {
+                let text = orbit_hud_tui::safe_text(text);
+                if !stream_json {
+                    eprintln!("{text}");
+                }
+                context_notices.push(text);
+            }
+            orbit_frontend_protocol::FrontendEvent::Usage {
+                used_tokens,
+                window_tokens,
+                breakdown,
+            } => {
+                if !stream_json {
+                    eprintln!(
+                        "{}",
+                        context_meter_text(*used_tokens, *window_tokens, *breakdown)
+                    );
+                }
+                context_usage.push(serde_json::to_value(&ev).unwrap_or_default());
+            }
+            _ => {}
         }
         // C4: a refusal says WHY on stderr — one line a script (or an
         // operator redirected to a log) can read without parsing the
@@ -1858,7 +1921,7 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
     };
     let session_prompt = build_session_prompt(&home, &model);
-    let options = orbit_engine::TurnOptions {
+    let mut options = orbit_engine::TurnOptions {
         tools: tools::session_tool_definitions(&home),
         max_rounds,
         // The frozen system prompt: the model learns the working
@@ -1866,7 +1929,6 @@ fn cmd_headless(args: &[String]) -> i32 {
         // blocker 5).
         memory_bytes: session_prompt.memory_bytes,
         system_directive: Some(session_prompt.text),
-        window_tokens: orbit_cli::context_window_for_turn(&home, &turn_config),
         request_stem: "orbit-p".into(),
         session_id: session_id.clone(),
         compaction_config: Some(
@@ -1928,16 +1990,31 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
     }
 
-    let mut report = orbit_engine::run_turn(
-        &home,
-        &turn_config,
-        &options,
-        prompt,
-        &mut transcript,
-        &mut executor,
-        &orbit_provider_http::CancelToken::new(),
-        &mut events,
-    );
+    let mut report =
+        match orbit_cli::model_limits::apply_turn_budgets(&home, &turn_config, &mut options) {
+            Ok(notices) => {
+                for text in notices {
+                    events(orbit_frontend_protocol::FrontendEvent::Status { text });
+                }
+                orbit_engine::run_turn(
+                    &home,
+                    &turn_config,
+                    &options,
+                    prompt,
+                    &mut transcript,
+                    &mut executor,
+                    &orbit_provider_http::CancelToken::new(),
+                    &mut events,
+                )
+            }
+            Err(error) => local_budget_refusal(
+                prompt,
+                &options,
+                &mut transcript,
+                error.to_string(),
+                &mut events,
+            ),
+        };
 
     // --json-schema (phase 6): validate the final text as JSON
     // against the schema; on failure, retry ONCE with the validation
@@ -2055,7 +2132,10 @@ fn cmd_headless(args: &[String]) -> i32 {
                     orbit_engine::automation::ledger_head(&home),
                 );
                 summary.rta = rta_verdict.clone();
-                println!("{}", summary.to_json());
+                let mut value = summary.to_json();
+                value["context_notices"] = serde_json::json!(context_notices);
+                value["context_usage"] = serde_json::json!(context_usage);
+                println!("{value}");
             } else if !stream_json {
                 // text: the final reply only.
                 println!("{}", r.final_text);
@@ -2085,7 +2165,17 @@ fn cmd_headless(args: &[String]) -> i32 {
             code
         }
         Err(e) => {
+            save_session(&transcript, &orbit_engine::TurnReport::default());
             fire_session_end(&home, "error");
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema":"orbit.cli/v1", "command":"p", "status":"error", "error":e,
+                        "context_notices":context_notices, "context_usage":context_usage
+                    })
+                );
+            }
             eprintln!("{e}");
             1
         }
@@ -3010,17 +3100,26 @@ fn cmd_chat(args: &[String]) -> i32 {
                     eprintln!("{message}");
                 }
                 E::Status { text } => {
-                    eprintln!("{text}");
+                    eprintln!("{}", orbit_hud_tui::safe_text(&text));
+                }
+                E::Usage {
+                    used_tokens,
+                    window_tokens,
+                    breakdown,
+                } => {
+                    eprintln!(
+                        "{}",
+                        context_meter_text(used_tokens, window_tokens, breakdown)
+                    );
                 }
                 _ => {}
             }
         };
         let session_prompt = build_session_prompt(&home, &model);
-        let options = orbit_engine::TurnOptions {
+        let mut options = orbit_engine::TurnOptions {
             tools: tools::session_tool_definitions(&home),
             memory_bytes: session_prompt.memory_bytes,
             system_directive: Some(session_prompt.text),
-            window_tokens: orbit_cli::context_window_for_turn(&home, &turn_config),
             request_stem: "orbit-repl".into(),
             session_id: session.clone(),
             compaction_config: Some(
@@ -3034,16 +3133,31 @@ fn cmd_chat(args: &[String]) -> i32 {
             ),
             ..Default::default()
         };
-        let report = orbit_engine::run_turn(
-            &home,
-            &turn_config,
-            &options,
-            &trimmed,
-            &mut transcript,
-            &mut executor,
-            &orbit_provider_http::CancelToken::new(),
-            &mut events,
-        );
+        let report =
+            match orbit_cli::model_limits::apply_turn_budgets(&home, &turn_config, &mut options) {
+                Ok(notices) => {
+                    for text in notices {
+                        events(orbit_frontend_protocol::FrontendEvent::Status { text });
+                    }
+                    orbit_engine::run_turn(
+                        &home,
+                        &turn_config,
+                        &options,
+                        &trimmed,
+                        &mut transcript,
+                        &mut executor,
+                        &orbit_provider_http::CancelToken::new(),
+                        &mut events,
+                    )
+                }
+                Err(error) => local_budget_refusal(
+                    &trimmed,
+                    &options,
+                    &mut transcript,
+                    error.to_string(),
+                    &mut events,
+                ),
+            };
 
         match report {
             Ok(r) if r.ok => {
@@ -3052,22 +3166,6 @@ fn cmd_chat(args: &[String]) -> i32 {
                 total_output += r.output_tokens;
                 total_cost += r.cost_microcents;
                 turns += 1;
-                let sf = sessions::SessionFile::from_chat(
-                    &session,
-                    &model,
-                    &resolved_gate,
-                    &provider_id,
-                    &transcript,
-                    turns,
-                    total_input,
-                    total_output,
-                    total_cost,
-                )
-                .with_effort(selected_effort.clone())
-                .with_selection_origin(selection_origin);
-                if let Err(e) = live_lease.save(&sf) {
-                    eprintln!("warning: session not saved: {e}");
-                }
             }
             Ok(r) => {
                 println!();
@@ -3090,8 +3188,24 @@ fn cmd_chat(args: &[String]) -> i32 {
                 }
             }
             Err(_) => {
-                // The engine already emitted the error via events.
+                // The engine or local admission emitted the error via events.
             }
+        }
+        let sf = sessions::SessionFile::from_chat(
+            &session,
+            &model,
+            &resolved_gate,
+            &provider_id,
+            &transcript,
+            turns,
+            total_input,
+            total_output,
+            total_cost,
+        )
+        .with_effort(selected_effort.clone())
+        .with_selection_origin(selection_origin);
+        if let Err(e) = live_lease.save(&sf) {
+            eprintln!("warning: session not saved: {e}");
         }
     }
 

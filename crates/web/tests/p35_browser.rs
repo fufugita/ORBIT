@@ -585,3 +585,176 @@ fn owner_display_recovery_never_exposes_hostile_tool_output_or_credentials() {
     drop(client);
     runtime.shutdown().unwrap();
 }
+
+#[cfg(unix)]
+mod context_browser_tests {
+    use super::*;
+    use orbit_adapter::types::{ChatMessage, ChatRole};
+
+    fn configure(
+        f: &mut Fixture,
+        main_limit: Option<Value>,
+        summary_limit: Option<Value>,
+        history: Vec<ChatMessage>,
+    ) {
+        let mut config = orbit_cli::config::ProvidersConfig::load(&f.root).unwrap();
+        config.provider[0].models[0].context_window = None;
+        config.provider[0].models[0].max_output_tokens = Some(1024);
+        config.provider[0].models[0].context_limits =
+            main_limit.map(|value| serde_json::from_value(value).unwrap());
+        config.provider[0].models[1].context_window = None;
+        config.provider[0].models[1].max_output_tokens = Some(512);
+        config.provider[0].models[1].context_limits =
+            summary_limit.map(|value| serde_json::from_value(value).unwrap());
+        config.roles.compaction = "fixture/model-b".into();
+        config.save_atomic(&f.root).unwrap();
+        f.config.turn.initial_transcript = history;
+    }
+    fn prompt(client: &mut orbit_web::BridgeController) {
+        client.send(json!({"type":"prompt","request_id":"budget-browser","text":"continue this bounded request"})).unwrap();
+    }
+    fn assert_budget_refusal(runtime: &OwnerRuntime, cursor: &EventCursor) {
+        let recovery = runtime.handle().subscribe(Some(cursor)).unwrap().recovery;
+        assert!(
+            recovery.events.iter().any(|event| event.kind == "error"
+                && event.payload["message"]
+                    .as_str()
+                    .is_some_and(|message| message
+                        .to_ascii_lowercase()
+                        .contains("context budget"))),
+            "browser fixture must reach actual budget refusal"
+        );
+    }
+    #[test]
+    fn browser_actual_controller_selected_budget_refuses_before_post() {
+        let mut f = Fixture::new();
+        configure(
+            &mut f,
+            Some(json!({"input_tokens":1})),
+            Some(json!({"input_tokens":50_000})),
+            vec![],
+        );
+        let runtime = f.start();
+        let cursor = runtime.handle().snapshot().unwrap().cursor;
+        let state = f.bridge(&runtime);
+        let mut client = state.claim_controller().unwrap();
+        prompt(&mut client);
+        wait_for(&state, |snapshot| {
+            snapshot.state == TurnState::Idle && snapshot.turns == 1
+        });
+        assert!(f.calls().is_empty());
+        assert_budget_refusal(&runtime, &cursor);
+        drop(client);
+        runtime.shutdown().unwrap();
+    }
+    #[test]
+    fn browser_actual_controller_summary_budget_refuses_before_both_posts() {
+        let mut f = Fixture::new();
+        let history = (0..38)
+            .map(|index| ChatMessage {
+                role: if index % 2 == 0 {
+                    ChatRole::User
+                } else {
+                    ChatRole::Assistant
+                },
+                content: if index < 32 {
+                    format!("OLD-{index}:{}", "x".repeat(12_000))
+                } else {
+                    format!("TAIL-{index}")
+                },
+                tool_calls: None,
+                tool_call_id: None,
+                tool_result: None,
+                blocks: None,
+                origin_model: None,
+                origin_provider: None,
+            })
+            .collect();
+        configure(
+            &mut f,
+            Some(json!({"input_tokens":64_000})),
+            Some(json!({"input_tokens":1})),
+            history,
+        );
+        let runtime = f.start();
+        let cursor = runtime.handle().snapshot().unwrap().cursor;
+        let state = f.bridge(&runtime);
+        let mut client = state.claim_controller().unwrap();
+        prompt(&mut client);
+        wait_for(&state, |snapshot| {
+            snapshot.state == TurnState::Idle && snapshot.turns == 1
+        });
+        assert!(f.calls().is_empty());
+        assert_budget_refusal(&runtime, &cursor);
+        drop(client);
+        runtime.shutdown().unwrap();
+    }
+    #[tokio::test]
+    async fn browser_actual_sse_preserves_safe_fallback_notice_and_exact_usage() {
+        let mut f = Fixture::new();
+        configure(&mut f, None, Some(json!({"input_tokens":50_000})), vec![]);
+        let runtime = f.start();
+        let state = f.bridge(&runtime);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .header("host", "127.0.0.1:1234")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let mut client = state.claim_controller().unwrap();
+        prompt(&mut client);
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut buffered = String::new();
+        let mut events = Vec::new();
+        let mut done = false;
+        while !done {
+            let remaining = end.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "browser SSE fixture deadline");
+            let chunk = tokio::time::timeout(remaining, futures::StreamExt::next(&mut stream))
+                .await
+                .expect("browser SSE fixture deadline")
+                .expect("browser SSE ended early")
+                .unwrap();
+            buffered.push_str(std::str::from_utf8(&chunk).unwrap());
+            while let Some(cut) = buffered.find("\n\n") {
+                let frame = buffered[..cut].to_owned();
+                buffered.drain(..cut + 2);
+                let kind = frame.lines().find_map(|line| line.strip_prefix("event: "));
+                let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(data).unwrap();
+                if let Some(kind) = kind {
+                    events.push((kind.to_owned(), value));
+                    if kind == "turn_ended" {
+                        done = true;
+                    }
+                }
+            }
+        }
+        let statuses = events
+            .iter()
+            .filter(|(kind, _)| kind == "status")
+            .filter_map(|(_, value)| value["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(statuses.to_ascii_lowercase().contains("fallback"));
+        assert!(statuses.contains("64000") || statuses.contains("64,000"));
+        assert!(!statuses.contains(&f.config.turn.gate));
+        let usage: Vec<_> = events.iter().filter(|(kind, _)| kind == "usage").collect();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].1["window_tokens"], 64_000);
+        assert_eq!(usage[0].1["breakdown"]["reserve"], 1024);
+        assert_eq!(usage[0].1["breakdown"]["compact_at"], 56_576);
+        assert_eq!(f.calls().len(), 1);
+        drop(client);
+        drop(stream);
+        runtime.shutdown().unwrap();
+    }
+}

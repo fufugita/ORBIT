@@ -802,9 +802,9 @@ impl SavedOwnerFixture {
         assert!(std::env::var_os(&env_b).is_none());
         let config = format!(
             "[[provider]]\nname='provider_a'\nurl={:?}\nenv={env_a:?}\n\
-             [[provider.models]]\nid={SAVED_OWNER_RAW:?}\ncontext_window=65536\nmax_output_tokens=1111\n\
+             [[provider.models]]\nid={SAVED_OWNER_RAW:?}\ncontext_window=65536\ncontext_limits={{input_tokens=65536}}\nmax_output_tokens=1111\n\
              [[provider]]\nname='provider_b'\nurl={:?}\nenv={env_b:?}\n\
-             [[provider.models]]\nid={SAVED_OWNER_RAW:?}\ncontext_window=131072\nmax_output_tokens=733\n\
+             [[provider.models]]\nid={SAVED_OWNER_RAW:?}\ncontext_window=131072\ncontext_limits={{input_tokens=131072}}\nmax_output_tokens=733\n\
              supported_efforts=['medium','high']\ndefault_effort='medium'\n\
              [roles]\nmain='provider_a/{SAVED_OWNER_RAW}'\n\
              [routing.phases.coding]\ndefault='provider_b/{SAVED_OWNER_RAW}'\nhard='provider_b/{SAVED_OWNER_RAW}'\n\
@@ -1102,4 +1102,988 @@ fn saved_private_resumed_owner_reresolves_rotated_key_and_retains_explicit_effor
         ])
     );
     f.assert_public_state_has_no_keys(&resumed);
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+mod context_frontend_tests {
+    use super::*;
+    use orbit_adapter::SecretBytes;
+    use orbit_adapter::provider_credentials::{
+        ExpectedRevision, ProviderAuthIdentity, ProviderCredentialStore,
+    };
+    use orbit_adapter::types::{ChatMessage, ChatRole, ContentBlock};
+    use orbit_cli::attach::AttachClient;
+    use orbit_cli::daemon::UnixServer;
+    use orbit_cli::setup::{SetupRequest, apply_setup, plan_setup};
+    use orbit_hud_tui::ApprovalRegistry;
+    use orbit_hud_tui::bus::Bus;
+    use orbit_hud_tui::msg::Msg;
+    use orbit_hud_tui::worker::{WorkerCommand, WorkerCtx};
+    use std::sync::mpsc;
+
+    const RAW: &str = "family/shared-notools";
+    const QUERY: &str = "scope=frontend-fixture&escaped=left%2Fright";
+    const KEY_A: &str = "synthetic-context-parent-key";
+    const KEY_B: &str = "synthetic-context-selected-key";
+    const KEY_C: &str = "synthetic-context-summary-key";
+    const IMAGE: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJYkAAAAASUVORK5CYII=";
+
+    #[derive(Debug, Clone, Copy)]
+    enum Entry {
+        Headless,
+        Repl,
+        Tui,
+        Owner,
+        Attach,
+    }
+    const ENTRIES: [Entry; 5] = [
+        Entry::Headless,
+        Entry::Repl,
+        Entry::Tui,
+        Entry::Owner,
+        Entry::Attach,
+    ];
+
+    struct ContextFixture {
+        fixture: Fixture,
+        summary: CapturedProvider,
+        envs: [String; 3],
+    }
+    impl ContextFixture {
+        fn new(limits: Option<Value>, output: u32, summary_limits: Value) -> Self {
+            let fixture = Fixture::new();
+            let summary = CapturedProvider::new(fixture.root.join("context-summary"));
+            let plan = plan_setup(&fixture.home, &SetupRequest::default()).unwrap();
+            apply_setup(&plan).unwrap();
+            assert!(fixture.home.join("trust/manifest.json").is_file());
+            let envs = ["A", "B", "C"]
+                .map(|suffix| format!("ORBIT_CONTEXT_FRONTEND_{suffix}_{}", ulid::Ulid::new()));
+            let result = Self {
+                fixture,
+                summary,
+                envs,
+            };
+            result.configure(limits, output, summary_limits, None);
+            let config = orbit_cli::config::ProvidersConfig::load(&result.fixture.home).unwrap();
+            let store = ProviderCredentialStore::new(&result.fixture.home).unwrap();
+            for (provider, key) in config.provider.iter().zip([KEY_A, KEY_B, KEY_C]) {
+                let endpoint =
+                    orbit_cli::config::validate_provider_endpoint(&provider.url).unwrap();
+                let identity = ProviderAuthIdentity::new(
+                    &provider.name,
+                    &provider.kind,
+                    endpoint.as_str(),
+                    provider.env.as_deref(),
+                )
+                .unwrap();
+                assert!(std::env::var_os(provider.env.as_ref().unwrap()).is_none());
+                store
+                    .save(
+                        &identity,
+                        SecretBytes::new(key.as_bytes().to_vec()),
+                        ExpectedRevision::Absent,
+                    )
+                    .unwrap();
+            }
+            result
+        }
+        fn configure(
+            &self,
+            limits: Option<Value>,
+            output: u32,
+            summary_limits: Value,
+            legacy: Option<u64>,
+        ) {
+            let provider = |name: &str,
+                            gate: &str,
+                            env: &str,
+                            output: u32,
+                            limits: Option<Value>,
+                            effort: &str,
+                            legacy: Option<u64>| {
+                json!({
+                    "name":name,"kind":"openai-compatible","url":format!("{gate}/tenant/v1?{QUERY}"),"env":env,
+                    "models":[{"id":RAW,"max_output_tokens":output,"context_window":legacy,"context_limits":limits,
+                        "supported_efforts":["low","high"],"default_effort":effort}]
+                })
+            };
+            let document = json!({"provider":[
+                provider("provider_a",&self.fixture.a.gate,&self.envs[0],1024,Some(json!({"input_tokens":1_000_000})),"low",None),
+                provider("provider_b",&self.fixture.b.gate,&self.envs[1],output,limits,"high",legacy),
+                provider("provider_c",&self.summary.gate,&self.envs[2],1024,Some(summary_limits),"low",None)
+            ],"roles":{"main":format!("provider_a/{RAW}"),"compaction":format!("provider_c/{RAW}")}});
+            let config: orbit_cli::config::ProvidersConfig =
+                serde_json::from_value(document).unwrap();
+            write_private(
+                &self.fixture.home.join("providers.toml"),
+                toml::to_string(&config).unwrap(),
+            );
+        }
+        fn seed(&self, history: &[ChatMessage]) {
+            let config = orbit_cli::config::ProvidersConfig::load(&self.fixture.home).unwrap();
+            let provider = config
+                .provider
+                .iter()
+                .find(|provider| provider.name == "provider_b")
+                .unwrap();
+            let saved = SessionFile::from_chat(
+                SESSION,
+                RAW,
+                &provider.url,
+                "provider_b",
+                history,
+                0,
+                0,
+                0,
+                0,
+            )
+            .with_selection_origin(SelectionOrigin::SavedExplicit);
+            let lease = SessionLease::acquire(&self.fixture.home, SESSION, "context-seed").unwrap();
+            lease.save(&saved).unwrap();
+        }
+        fn run(&self, entry: Entry, prompt: &str) -> Capture {
+            match entry {
+                Entry::Headless => self.process(false, prompt),
+                Entry::Repl => self.process(true, prompt),
+                Entry::Tui => self.tui(prompt),
+                Entry::Owner => {
+                    let mut owner = self.fixture.restart();
+                    let result = owner.send(OwnerAction::Prompt {
+                        request_id: "context-turn".into(),
+                        text: prompt.into(),
+                    });
+                    if result.is_ok() {
+                        owner.finished("context-turn");
+                    }
+                    let mut events: Vec<_> = owner.events().into_iter().map(owner_event).collect();
+                    if let Err(error) = result {
+                        events.push(json!({"type":"error","message":error.to_string()}));
+                    }
+                    owner.shutdown();
+                    Capture {
+                        events,
+                        text: String::new(),
+                    }
+                }
+                Entry::Attach => self.attach(prompt),
+            }
+        }
+        fn process(&self, repl: bool, prompt: &str) -> Capture {
+            let mut command = self.command(env!("CARGO_BIN_EXE_orbit"));
+            let input = if repl {
+                command.args(["--no-tui", "--resume", SESSION]);
+                format!("{prompt}\nexit\n")
+            } else {
+                command.args([
+                    "-p",
+                    prompt,
+                    "--resume",
+                    SESSION,
+                    "--output-format",
+                    "stream-json",
+                ]);
+                String::new()
+            };
+            let output = bounded_process(command, &self.fixture.root, &input);
+            let events = output
+                .0
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            Capture {
+                events,
+                text: format!("{}\n{}", output.0, output.1),
+            }
+        }
+        fn command(&self, executable: impl AsRef<std::ffi::OsStr>) -> Command {
+            let mut command = Command::new(executable);
+            command
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("LANG", "C.UTF-8")
+                .env("ORBIT_HOME", &self.fixture.home)
+                .current_dir(&self.fixture.workspace);
+            command
+        }
+        fn tui(&self, prompt: &str) -> Capture {
+            self.tui_mode(prompt, false)
+        }
+        fn tui_mode(&self, prompt: &str, plan: bool) -> Capture {
+            let result = self.fixture.root.join("tui-result.json");
+            let mut command = self.command(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "context_frontend_tests::tui_child_dispatch",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ORBIT_CONTEXT_TEST_RESULT", &result)
+                .env("ORBIT_CONTEXT_TEST_PROMPT", prompt)
+                .env("ORBIT_CONTEXT_TEST_PLAN", if plan { "1" } else { "0" });
+            let output = bounded_process(command, &self.fixture.root, "");
+            let events: Vec<Value> =
+                serde_json::from_slice(&fs::read(result).unwrap_or_else(|_| {
+                    panic!("TUI fixture did not finish: {} {}", output.0, output.1)
+                }))
+                .unwrap();
+            Capture {
+                events,
+                text: format!("{}\n{}", output.0, output.1),
+            }
+        }
+        fn attach(&self, prompt: &str) -> Capture {
+            let (lease, saved) =
+                SessionLease::acquire_and_load(&self.fixture.home, SESSION, "context-attach")
+                    .unwrap();
+            let runtime = OwnerRuntime::start(
+                OwnerConfig::new(
+                    self.fixture.turn(&saved, PermissionScope::default()),
+                    self.fixture.workspace.clone(),
+                ),
+                lease,
+            )
+            .unwrap();
+            let handle = runtime.handle();
+            let cursor = handle.snapshot().unwrap().cursor;
+            let socket = self.fixture.home.join("run/context.sock");
+            let server = UnixServer::bind(&socket, handle.clone()).unwrap();
+            let stop = orbit_provider_http::CancelToken::new();
+            let shutdown = stop.clone();
+            let thread = std::thread::spawn(move || server.run(&shutdown));
+            let serving = Serving {
+                runtime: Some(runtime),
+                stop,
+                thread: Some(thread),
+            };
+            let mut client = AttachClient::connect(&socket, true, Some(&cursor)).unwrap();
+            let ack = client.send(OwnerAction::Prompt {
+                request_id: "context-attach".into(),
+                text: prompt.into(),
+            });
+            if ack.is_ok() {
+                wait_owner_finished(&handle, "context-attach");
+            }
+            let mut events: Vec<_> = client
+                .logs(Some(&cursor))
+                .unwrap()
+                .events
+                .into_iter()
+                .map(owner_event)
+                .collect();
+            if let Err(error) = ack {
+                events.push(json!({"type":"error","message":error.to_string()}));
+            }
+            drop(client);
+            drop(serving);
+            Capture {
+                events,
+                text: String::new(),
+            }
+        }
+        fn calls(&self) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+            (
+                self.fixture.a.calls(),
+                self.fixture.b.calls(),
+                self.summary.calls(),
+            )
+        }
+        fn assert_call(
+            &self,
+            provider: &CapturedProvider,
+            key: &str,
+            output: u64,
+            effort: &str,
+            no_tools: bool,
+        ) {
+            let calls = provider.calls();
+            let headers = provider.request_metadata();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(headers.len(), 1);
+            assert_eq!(
+                headers[0]["path"],
+                format!("/tenant/v1/chat/completions?{QUERY}")
+            );
+            assert_eq!(
+                headers[0]["authorization"],
+                json!([format!("Bearer {key}")])
+            );
+            assert_eq!(headers[0]["x_api_key"], json!([]));
+            assert_eq!(calls[0]["model"], RAW);
+            assert_eq!(calls[0]["max_tokens"], output);
+            assert_eq!(calls[0]["reasoning_effort"], effort);
+            if no_tools {
+                assert!(
+                    calls[0]
+                        .get("tools")
+                        .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+                );
+            }
+            assert!(calls[0].get("context_window").is_none());
+            assert!(calls[0].get("window_tokens").is_none());
+        }
+        fn assert_no_calls(&self) {
+            let (a, b, c) = self.calls();
+            assert!(
+                a.is_empty() && b.is_empty() && c.is_empty(),
+                "unexpected POST: A={} B={} C={}",
+                a.len(),
+                b.len(),
+                c.len()
+            );
+            assert!(self.fixture.egress().is_empty());
+        }
+    }
+    impl Drop for ContextFixture {
+        fn drop(&mut self) {
+            self.summary.stop();
+        }
+    }
+    struct Serving {
+        runtime: Option<OwnerRuntime>,
+        stop: orbit_provider_http::CancelToken,
+        thread: Option<std::thread::JoinHandle<Result<(), OwnerError>>>,
+    }
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            self.stop.cancel();
+            if let Some(thread) = self.thread.take() {
+                let result = thread.join();
+                if !std::thread::panicking() {
+                    result
+                        .expect("attach server thread")
+                        .expect("attach server completion");
+                }
+            }
+            if let Some(runtime) = self.runtime.take() {
+                let result = runtime.shutdown();
+                if !std::thread::panicking() {
+                    result.expect("attach owner shutdown");
+                }
+            }
+        }
+    }
+
+    struct Capture {
+        events: Vec<Value>,
+        text: String,
+    }
+    fn owner_event(event: OwnerEvent) -> Value {
+        match event.payload {
+            Value::Object(mut payload) => {
+                payload
+                    .entry("type".to_owned())
+                    .or_insert(Value::String(event.kind));
+                Value::Object(payload)
+            }
+            payload => json!({"type":event.kind,"payload":payload}),
+        }
+    }
+    impl Capture {
+        fn statuses(&self) -> String {
+            let events = self
+                .events
+                .iter()
+                .filter(|event| event["type"] == "status")
+                .filter_map(|event| event["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let plain = self
+                .text
+                .lines()
+                .filter(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower.contains("fallback")
+                        || lower.contains("context budget")
+                        || lower.contains("legacy")
+                        || lower.contains("media")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{events}\n{plain}")
+        }
+        fn assert_safe(&self, f: &ContextFixture) {
+            let statuses = self.statuses();
+            for value in [KEY_A, KEY_B, KEY_C, QUERY]
+                .into_iter()
+                .chain(f.envs.iter().map(String::as_str))
+            {
+                assert!(
+                    !statuses.contains(value),
+                    "status leaked a credential/binding value"
+                );
+            }
+        }
+        fn assert_budget_refusal(&self) {
+            let errors = self
+                .events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .filter_map(|event| event["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let actual = format!("{errors}\n{}", self.text).to_ascii_lowercase();
+            assert!(
+                actual.contains("context budget") || actual.contains("context limit required"),
+                "fixture must reach actual budget refusal"
+            );
+        }
+        fn meter(&self, window: u64, reserve: u64, compact_at: u64) {
+            let usage: Vec<_> = self
+                .events
+                .iter()
+                .filter(|event| event["type"] == "usage")
+                .collect();
+            assert_eq!(
+                usage.len(),
+                1,
+                "one ordinary completion has one real usage event"
+            );
+            assert_eq!(usage[0]["window_tokens"], window);
+            assert_eq!(usage[0]["breakdown"]["reserve"], reserve);
+            assert_eq!(usage[0]["breakdown"]["compact_at"], compact_at);
+        }
+    }
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+    fn bounded_process(mut command: Command, root: &Path, input: &str) -> (String, String) {
+        let id = ulid::Ulid::new().to_string();
+        let stdin = root.join(format!("{id}.in"));
+        let stdout = root.join(format!("{id}.out"));
+        let stderr = root.join(format!("{id}.err"));
+        for (path, bytes) in [
+            (&stdin, input.as_bytes()),
+            (&stdout, b"".as_slice()),
+            (&stderr, b"".as_slice()),
+        ] {
+            write_private(path, bytes);
+        }
+        let mut child = ChildGuard(
+            command
+                .stdin(fs::File::open(stdin).unwrap())
+                .stdout(fs::File::options().write(true).open(&stdout).unwrap())
+                .stderr(fs::File::options().write(true).open(&stderr).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let end = Instant::now() + Duration::from_secs(15);
+        loop {
+            if child.0.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < end, "frontend fixture timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (
+            fs::read_to_string(stdout).unwrap(),
+            fs::read_to_string(stderr).unwrap(),
+        )
+    }
+    fn wait_owner_finished(handle: &OwnerHandle, id: &str) {
+        let end = Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = handle.snapshot().unwrap();
+            if snapshot.state == TurnState::Idle
+                && snapshot.requests.get(id).is_some_and(|request| {
+                    !matches!(
+                        request.state,
+                        RequestState::Accepted | RequestState::Running
+                    )
+                })
+            {
+                break;
+            }
+            assert!(Instant::now() < end, "owner fixture did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn text(role: ChatRole, content: String) -> ChatMessage {
+        ChatMessage {
+            role,
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
+            blocks: None,
+            origin_model: None,
+            origin_provider: None,
+        }
+    }
+    fn old_history() -> Vec<ChatMessage> {
+        let mut history: Vec<_> = (0..32)
+            .map(|index| {
+                text(
+                    if index % 2 == 0 {
+                        ChatRole::User
+                    } else {
+                        ChatRole::Assistant
+                    },
+                    format!("OLD-{index}:{}", "x".repeat(12_000)),
+                )
+            })
+            .collect();
+        for index in 0..6 {
+            history.push(text(
+                if index % 2 == 0 {
+                    ChatRole::User
+                } else {
+                    ChatRole::Assistant
+                },
+                format!("VERBATIM-TAIL-{index}"),
+            ));
+        }
+        history
+    }
+    fn selected_refusal(entry: Entry) {
+        let f = ContextFixture::new(
+            Some(json!({"input_tokens":1})),
+            1024,
+            json!({"input_tokens":50_000}),
+        );
+        f.seed(&[]);
+        let result = f.run(entry, "inspect this bounded request");
+        f.assert_no_calls();
+        result.assert_budget_refusal();
+        result.assert_safe(&f);
+    }
+    #[test]
+    fn context_frontend_headless_selected_typed_limit_refuses_before_post() {
+        selected_refusal(Entry::Headless);
+    }
+    #[test]
+    fn context_frontend_repl_selected_typed_limit_refuses_before_post() {
+        selected_refusal(Entry::Repl);
+    }
+    #[test]
+    fn context_frontend_tui_selected_typed_limit_refuses_before_post() {
+        selected_refusal(Entry::Tui);
+    }
+    #[test]
+    fn context_frontend_owner_selected_typed_limit_refuses_before_post() {
+        selected_refusal(Entry::Owner);
+    }
+    #[test]
+    fn context_frontend_attach_selected_typed_limit_refuses_before_post() {
+        selected_refusal(Entry::Attach);
+    }
+
+    #[test]
+    fn context_frontend_fit_exact_selected_binding_and_actual_output_meter() {
+        for entry in ENTRIES {
+            let f = ContextFixture::new(
+                Some(json!({"combined_tokens":128_000})),
+                32_000,
+                json!({"input_tokens":50_000}),
+            );
+            f.seed(&[]);
+            let result = f.run(entry, "inspect this request");
+            let (a, b, c) = f.calls();
+            assert!(a.is_empty() && c.is_empty());
+            assert_eq!(b.len(), 1);
+            f.assert_call(&f.fixture.b, KEY_B, 32_000, "high", false);
+            result.assert_safe(&f);
+            if !matches!(entry, Entry::Repl) {
+                result.meter(128_000, 32_000, 83_200);
+            }
+        }
+    }
+    #[test]
+    fn context_frontend_summary_role_own_typed_limit_prevents_summary_and_ordinary_post() {
+        for entry in ENTRIES {
+            let f = ContextFixture::new(
+                Some(json!({"input_tokens":64_000})),
+                32_000,
+                json!({"input_tokens":1}),
+            );
+            f.seed(&old_history());
+            let result = f.run(entry, "continue from the retained tail");
+            f.assert_no_calls();
+            result.assert_budget_refusal();
+            result.assert_safe(&f);
+        }
+    }
+    #[test]
+    fn context_frontend_summary_then_continuation_keep_exact_keys_outputs_efforts_and_tail() {
+        for entry in ENTRIES {
+            let f = ContextFixture::new(
+                Some(json!({"input_tokens":64_000})),
+                32_000,
+                json!({"input_tokens":50_000}),
+            );
+            f.seed(&old_history());
+            let result = f.run(entry, "continue from the retained tail");
+            let (a, b, c) = f.calls();
+            assert!(a.is_empty());
+            assert_eq!(b.len(), 1);
+            assert_eq!(c.len(), 1);
+            f.assert_call(&f.summary, KEY_C, 1024, "low", true);
+            f.assert_call(&f.fixture.b, KEY_B, 32_000, "high", false);
+            let body = b[0].to_string();
+            assert!(!body.contains("OLD-0:"));
+            for index in 1..6 {
+                assert!(body.contains(&format!("VERBATIM-TAIL-{index}")));
+            }
+            assert!(body.contains("continue from the retained tail"));
+            result.assert_safe(&f);
+            if !matches!(entry, Entry::Repl) {
+                result.meter(64_000, 0, 57_600);
+            }
+        }
+    }
+    #[test]
+    fn context_frontend_unknown_fallback_is_visible_numeric_and_makes_one_ordinary_post() {
+        for entry in ENTRIES {
+            let f = ContextFixture::new(None, 1024, json!({"input_tokens":50_000}));
+            f.seed(&[]);
+            let result = f.run(entry, "inspect one request");
+            let (a, b, c) = f.calls();
+            assert!(a.is_empty() && c.is_empty());
+            assert_eq!(b.len(), 1);
+            let status = result.statuses().to_ascii_lowercase();
+            assert!(status.contains("fallback"));
+            assert!(status.contains("64000") || status.contains("64,000"));
+            result.assert_safe(&f);
+            if !matches!(entry, Entry::Repl) {
+                result.meter(64_000, 1024, 56_576);
+            }
+        }
+    }
+    #[test]
+    fn context_frontend_ambiguous_legacy_value_gets_actionable_notice_and_fallback_meter() {
+        for entry in ENTRIES {
+            let f = ContextFixture::new(None, 1024, json!({"input_tokens":50_000}));
+            f.configure(None, 1024, json!({"input_tokens":50_000}), Some(200_000));
+            f.seed(&[]);
+            let result = f.run(entry, "inspect ambiguous legacy context");
+            let (a, b, c) = f.calls();
+            assert!(a.is_empty() && c.is_empty());
+            assert_eq!(b.len(), 1);
+            assert!(result.statuses().contains("context_limits.input_tokens"));
+            result.assert_safe(&f);
+            if !matches!(entry, Entry::Repl) {
+                result.meter(64_000, 1024, 56_576);
+            }
+        }
+    }
+    #[test]
+    fn context_frontend_actual_output_above_old_reserve_refuses_fixed_oversize_request() {
+        for entry in ENTRIES {
+            let f = ContextFixture::new(
+                Some(json!({"combined_tokens":65_536})),
+                64_000,
+                json!({"input_tokens":50_000}),
+            );
+            f.seed(&[]);
+            let result = f.run(
+                entry,
+                &format!("bounded current intent {}", "z".repeat(16_000)),
+            );
+            f.assert_no_calls();
+            result.assert_budget_refusal();
+            result.assert_safe(&f);
+        }
+    }
+    fn media_case(strict: bool) {
+        for entry in ENTRIES {
+            let mut limits = json!({"input_tokens":64_000});
+            if strict {
+                limits["media_policy"] = json!("refuse");
+            }
+            let f = ContextFixture::new(Some(limits), 1024, json!({"input_tokens":50_000}));
+            let mut image = text(ChatRole::User, "inspect saved image".into());
+            image.blocks = Some(vec![
+                ContentBlock::Text {
+                    text: "inspect saved image".into(),
+                },
+                ContentBlock::Image {
+                    data: IMAGE.into(),
+                    media_type: "image/png".into(),
+                },
+            ]);
+            f.seed(&[image]);
+            let result = f.run(entry, "describe the saved image");
+            if strict {
+                f.assert_no_calls();
+                result.assert_budget_refusal();
+            } else {
+                let (a, b, c) = f.calls();
+                assert!(a.is_empty() && c.is_empty());
+                assert_eq!(b.len(), 1);
+                let expected = format!("data:image/png;base64,{IMAGE}");
+                assert!(b[0]["messages"].as_array().unwrap().iter().any(|message| {
+                    message["content"].as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|block| block["image_url"]["url"] == expected)
+                    })
+                }));
+                let status = result.statuses().to_ascii_lowercase();
+                assert!(status.contains("unknown") && status.contains("media"));
+            }
+            result.assert_safe(&f);
+        }
+    }
+    #[test]
+    fn context_frontend_unknown_media_warns_and_preserves_supported_image_wire() {
+        media_case(false);
+    }
+    #[test]
+    fn context_frontend_strict_media_refuses_before_provider_io() {
+        media_case(true);
+    }
+
+    // The real public TUI spawner runs in a fresh test process so cwd, startup
+    // instructions and the global ask channel cannot leak between fixtures.
+    #[test]
+    #[ignore = "invoked by context_frontend_tests parents in a fresh process"]
+    fn tui_child_dispatch() {
+        let home = PathBuf::from(std::env::var_os("ORBIT_HOME").unwrap());
+        let output = PathBuf::from(std::env::var_os("ORBIT_CONTEXT_TEST_RESULT").unwrap());
+        let prompt = std::env::var("ORBIT_CONTEXT_TEST_PROMPT").unwrap();
+        let (lease, saved) = SessionLease::acquire_and_load(&home, SESSION, "context-tui").unwrap();
+        let config = TuiTurnConfig {
+            home: home.clone(),
+            session_id: saved.session_id.clone(),
+            gate: saved.gate,
+            model: saved.model,
+            provider_id: saved.provider,
+            effort: saved.effort,
+            auto_tools: false,
+            scope: PermissionScope::default(),
+            initial_transcript: saved.transcript,
+            initial_turns: saved.turns,
+            initial_input_tokens: saved.input_tokens,
+            initial_output_tokens: saved.output_tokens,
+            initial_cost_microcents: saved.cost_microcents,
+        };
+        let (bus, sender) = Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        let cancel = orbit_cli::tui_worker::make_spawner_owned(config, lease)(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            commands.clone(),
+        )
+        .unwrap();
+        let command = if std::env::var("ORBIT_CONTEXT_TEST_PLAN").as_deref() == Ok("1") {
+            WorkerCommand::PlanPrompt(prompt)
+        } else {
+            WorkerCommand::Prompt(prompt)
+        };
+        commands.send(command).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        let mut done = false;
+        while Instant::now() < end && !done {
+            match bus.try_recv() {
+                Some(Msg::Status(text)) => events.push(json!({"type":"status","text":text})),
+                Some(Msg::BackendError(message)) => events.push(json!({"type":"error","message":message})),
+                Some(Msg::Usage {used_tokens,window_tokens,breakdown}) => events.push(json!({"type":"usage","used_tokens":used_tokens,"window_tokens":window_tokens,"breakdown":breakdown})),
+                Some(Msg::PlanReady(text)) => events.push(json!({"type":"plan_ready","text":text})),
+                Some(Msg::ResponseFinished {..}) => done=true,
+                Some(_) => {}, None => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        if !done {
+            cancel();
+        }
+        assert!(done, "TUI worker did not finish bounded fixture");
+        drop(commands);
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            match SessionLease::acquire(&home, SESSION, "context-tui-closed") {
+                Ok(lease) => {
+                    drop(lease);
+                    break;
+                }
+                Err(_) => {
+                    assert!(
+                        Instant::now() < end,
+                        "TUI worker retained lease after command EOF"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        while let Some(msg) = bus.try_recv() {
+            if let Msg::PlanReady(text) = &msg {
+                events.push(json!({"type":"plan_ready","text":text}));
+            }
+            if let Msg::Usage {
+                used_tokens,
+                window_tokens,
+                breakdown,
+            } = msg
+            {
+                events.push(json!({"type":"usage","used_tokens":used_tokens,"window_tokens":window_tokens,"breakdown":breakdown}));
+            }
+        }
+        write_private(&output, serde_json::to_vec(&events).unwrap());
+    }
+
+    fn strict_missing_limit_preserves_durable_intent(entry: Entry) {
+        const CURRENT: &str = "strict-local-budget-current-intent-63b2a1";
+        let f = ContextFixture::new(
+            Some(json!({"unknown_policy":"require-limit"})),
+            1024,
+            json!({"input_tokens":50_000}),
+        );
+        let original = vec![
+            text(ChatRole::User, "strict-local-budget-original-user".into()),
+            text(
+                ChatRole::Assistant,
+                "strict-local-budget-original-assistant".into(),
+            ),
+        ];
+        f.seed(&original);
+        let before = f.fixture.saved();
+        assert_eq!(before.to_transcript(), original);
+        let result = f.run(entry, CURRENT);
+        result.assert_budget_refusal();
+        result.assert_safe(&f);
+        f.assert_no_calls();
+
+        let mut expected = original;
+        expected.push(text(ChatRole::User, CURRENT.into()));
+        {
+            // Every public entry helper has completed its real shutdown. Reacquire
+            // the actual lease rather than inferring release from a visible error.
+            let (lease, saved) = SessionLease::acquire_and_load(
+                &f.fixture.home,
+                SESSION,
+                "context-local-refusal-check",
+            )
+            .expect("local budget refusal must release the session lease");
+            assert_eq!(
+                saved.to_transcript(),
+                expected,
+                "local budget refusal must persist all source messages and the current prompt exactly once"
+            );
+            assert_eq!(saved.model, before.model);
+            assert_eq!(saved.provider, before.provider);
+            assert_eq!(saved.gate, before.gate);
+            assert_eq!(saved.selection_origin, before.selection_origin);
+            assert_eq!(saved.effort, before.effort);
+            drop(lease);
+        }
+
+        if matches!(entry, Entry::Owner | Entry::Attach) {
+            let request_id = if matches!(entry, Entry::Owner) {
+                "context-turn"
+            } else {
+                "context-attach"
+            };
+            // A fresh controller must recover a known terminal local failure.
+            // Serialized state avoids depending on any additive enum variant.
+            let mut restarted = f.fixture.restart();
+            let snapshot = restarted.snapshot();
+            assert_eq!(snapshot.state, TurnState::Idle);
+            assert_eq!(snapshot.requests.len(), 1);
+            assert_eq!(
+                serde_json::to_value(
+                    snapshot
+                        .requests
+                        .get(request_id)
+                        .expect("local refusal request record must survive restart")
+                        .state
+                )
+                .unwrap(),
+                json!("failed"),
+                "a known local refusal is not unknown, interrupted or still running"
+            );
+            let ack = restarted
+                .send(OwnerAction::Prompt {
+                    request_id: request_id.into(),
+                    text: CURRENT.into(),
+                })
+                .expect("same request retry must recover the stored terminal acknowledgement");
+            assert!(
+                ack.duplicate,
+                "local refusal retry must not create a second turn"
+            );
+            assert_eq!(ack.request_id.as_deref(), Some(request_id));
+            assert_eq!(ack.state, "failed");
+            assert_eq!(restarted.snapshot().requests.len(), 1);
+            assert_eq!(restarted.snapshot().state, TurnState::Idle);
+            restarted.shutdown();
+            f.assert_no_calls();
+            let (lease, saved) = SessionLease::acquire_and_load(
+                &f.fixture.home,
+                SESSION,
+                "context-local-refusal-retry-check",
+            )
+            .unwrap();
+            assert_eq!(
+                saved.to_transcript(),
+                expected,
+                "deduplicated retry must not append or replay the refused prompt"
+            );
+            drop(lease);
+        }
+    }
+
+    #[test]
+    fn context_frontend_headless_strict_missing_limit_retains_prompt_and_releases_lease() {
+        strict_missing_limit_preserves_durable_intent(Entry::Headless);
+    }
+
+    #[test]
+    fn context_frontend_repl_strict_missing_limit_retains_prompt_and_releases_lease() {
+        strict_missing_limit_preserves_durable_intent(Entry::Repl);
+    }
+
+    #[test]
+    fn context_frontend_tui_strict_missing_limit_retains_prompt_and_releases_lease() {
+        strict_missing_limit_preserves_durable_intent(Entry::Tui);
+    }
+
+    #[test]
+    fn context_frontend_owner_strict_missing_limit_retains_prompt_and_terminal_dedup() {
+        strict_missing_limit_preserves_durable_intent(Entry::Owner);
+    }
+
+    #[test]
+    fn context_frontend_attach_strict_missing_limit_retains_prompt_and_terminal_dedup() {
+        strict_missing_limit_preserves_durable_intent(Entry::Attach);
+    }
+
+    #[test]
+    fn context_frontend_tui_plan_local_refusal_preserves_intent_without_plan_ready() {
+        let f = ContextFixture::new(
+            Some(json!({"unknown_policy":"require-limit"})),
+            1024,
+            json!({"input_tokens":50_000}),
+        );
+        let original = vec![
+            text(ChatRole::User, "original plan context".into()),
+            text(ChatRole::Assistant, "original answer".into()),
+        ];
+        f.seed(&original);
+        let prompt = "prepare the bounded implementation plan";
+        let result = f.tui_mode(prompt, true);
+        result.assert_budget_refusal();
+        f.assert_no_calls();
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| event["type"] == "plan_ready"),
+            "a refused plan must not be offered for execution"
+        );
+        let (lease, saved) =
+            SessionLease::acquire_and_load(&f.fixture.home, SESSION, "plan-refusal-check").unwrap();
+        let mut expected = original;
+        expected.push(text(ChatRole::User, prompt.into()));
+        assert_eq!(saved.to_transcript(), expected);
+        drop(lease);
+    }
 }
