@@ -91,6 +91,13 @@ impl CapturedProvider {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
+    fn request_metadata(&self) -> Vec<Value> {
+        fs::read_to_string(self.directory.join("requests.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
     fn mode(&self, value: Value) {
         write_private(&self.directory.join("mode.json"), value.to_string());
     }
@@ -772,4 +779,327 @@ fn invalid_hot_switch_retains_pin_and_next_turn_uses_original_provider() {
     assert_eq!(f.a.calls().len(), 1);
     assert!(f.b.calls().is_empty());
     assert_eq!(owner.decisions()[0]["source"], "explicit");
+}
+
+const SAVED_OWNER_RAW: &str = "family/shared-notools";
+const SAVED_OWNER_A: &str = "synthetic-owner-private-a-51e420";
+const SAVED_OWNER_B: &str = "synthetic-owner-private-b-829f13";
+const SAVED_OWNER_B_NEXT: &str = "synthetic-owner-private-b-next-45f43c";
+
+struct SavedOwnerFixture {
+    fixture: Fixture,
+    env_b: String,
+    revision_b: orbit_adapter::provider_credentials::ProviderCredentialRevision,
+}
+
+impl SavedOwnerFixture {
+    fn new() -> Self {
+        use orbit_adapter::provider_credentials::{ExpectedRevision, ProviderCredentialStore};
+        let fixture = Fixture::new();
+        let env_a = format!("ORBIT_OWNER_SAVE_A_{}", ulid::Ulid::new());
+        let env_b = format!("ORBIT_OWNER_SAVE_B_{}", ulid::Ulid::new());
+        assert!(std::env::var_os(&env_a).is_none());
+        assert!(std::env::var_os(&env_b).is_none());
+        let config = format!(
+            "[[provider]]\nname='provider_a'\nurl={:?}\nenv={env_a:?}\n\
+             [[provider.models]]\nid={SAVED_OWNER_RAW:?}\ncontext_window=65536\nmax_output_tokens=1111\n\
+             [[provider]]\nname='provider_b'\nurl={:?}\nenv={env_b:?}\n\
+             [[provider.models]]\nid={SAVED_OWNER_RAW:?}\ncontext_window=131072\nmax_output_tokens=733\n\
+             supported_efforts=['medium','high']\ndefault_effort='medium'\n\
+             [roles]\nmain='provider_a/{SAVED_OWNER_RAW}'\n\
+             [routing.phases.coding]\ndefault='provider_b/{SAVED_OWNER_RAW}'\nhard='provider_b/{SAVED_OWNER_RAW}'\n\
+             [routing.phase_keywords]\nclear=true\ncoding=['implement']\n",
+            fixture.a.gate, fixture.b.gate
+        );
+        write_private(&fixture.home.join("providers.toml"), config);
+        let store = ProviderCredentialStore::new(&fixture.home).unwrap();
+        store
+            .save(
+                &Self::identity(&fixture, "provider_a", &env_a),
+                orbit_adapter::SecretBytes::new(SAVED_OWNER_A.as_bytes().to_vec()),
+                ExpectedRevision::Absent,
+            )
+            .unwrap();
+        let revision_b = store
+            .save(
+                &Self::identity(&fixture, "provider_b", &env_b),
+                orbit_adapter::SecretBytes::new(SAVED_OWNER_B.as_bytes().to_vec()),
+                ExpectedRevision::Absent,
+            )
+            .unwrap()
+            .revision;
+        Self {
+            fixture,
+            env_b,
+            revision_b,
+        }
+    }
+
+    fn identity(
+        fixture: &Fixture,
+        provider_id: &str,
+        env: &str,
+    ) -> orbit_adapter::provider_credentials::ProviderAuthIdentity {
+        let config = orbit_cli::config::ProvidersConfig::load(&fixture.home).unwrap();
+        let provider = config
+            .provider
+            .iter()
+            .find(|p| p.name == provider_id)
+            .unwrap();
+        let endpoint = orbit_cli::config::validate_provider_endpoint(&provider.url).unwrap();
+        orbit_adapter::provider_credentials::ProviderAuthIdentity::new(
+            provider_id,
+            &provider.kind,
+            endpoint.as_str(),
+            Some(env),
+        )
+        .unwrap()
+    }
+
+    fn start(&self, explicit: Option<&str>, effort: Option<EffortSetting>) -> Owned {
+        let f = &self.fixture;
+        let config = orbit_cli::config::ProvidersConfig::load(&f.home).unwrap();
+        let spec = explicit.unwrap_or(&config.roles.main);
+        let mut turn = orbit_cli::checked_model_turn(&f.home, spec, None, None, false).unwrap();
+        if let Some(setting) = &effort {
+            orbit_cli::apply_effort_setting(&f.home, &mut turn, setting).unwrap();
+        }
+        let origin = if explicit.is_some() {
+            SelectionOrigin::Flag
+        } else {
+            SelectionOrigin::Default
+        };
+        let saved = SessionFile::from_chat(
+            SESSION,
+            &turn.model,
+            &turn.gate,
+            &turn.provider_id,
+            &[],
+            0,
+            0,
+            0,
+            0,
+        )
+        .with_effort(effort)
+        .with_selection_origin(origin);
+        let lease = SessionLease::acquire(&f.home, SESSION, "saved-auth-test").unwrap();
+        lease.save(&saved).unwrap();
+        Owned::new(
+            OwnerRuntime::start(
+                OwnerConfig::new(
+                    f.turn(&saved, PermissionScope::default()),
+                    f.workspace.clone(),
+                ),
+                lease,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn assert_call(
+        &self,
+        provider: &CapturedProvider,
+        index: usize,
+        key: &str,
+        max: u64,
+        effort: Option<&str>,
+    ) {
+        let calls = provider.calls();
+        let headers = provider.request_metadata();
+        assert_eq!(calls.len(), headers.len(), "one metadata record per POST");
+        let body = &calls[index];
+        assert_eq!(headers[index]["method"], "POST");
+        assert_eq!(headers[index]["path"], "/v1/chat/completions");
+        assert_eq!(
+            headers[index]["authorization"],
+            json!([format!("Bearer {key}")])
+        );
+        assert_eq!(headers[index]["x_api_key"], json!([]));
+        assert_eq!(body["model"], SAVED_OWNER_RAW);
+        assert_eq!(body["max_tokens"], max);
+        match effort {
+            Some(value) => assert_eq!(body["reasoning_effort"], value),
+            None => assert!(body.get("reasoning_effort").is_none()),
+        }
+        assert!(body.get("context_window").is_none());
+        assert!(body.get("window_tokens").is_none());
+        assert!(!body.to_string().contains(key));
+    }
+
+    fn assert_usage(owner: &Owned, expected: u64) {
+        let usage: Vec<_> = owner
+            .events()
+            .into_iter()
+            .filter(|event| event.kind == "usage")
+            .collect();
+        assert_eq!(
+            usage.len(),
+            1,
+            "one real engine usage event for the one completion"
+        );
+        assert_eq!(usage[0].payload["window_tokens"], expected);
+    }
+
+    fn assert_public_state_has_no_keys(&self, owner: &Owned) {
+        let public = format!("{:?}\n{:?}", owner.snapshot(), owner.events());
+        for key in [SAVED_OWNER_A, SAVED_OWNER_B, SAVED_OWNER_B_NEXT] {
+            assert!(!public.contains(key));
+        }
+        fn visit(path: &Path, keys: &[&str]) {
+            if path.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    visit(&entry.unwrap().path(), keys);
+                }
+            } else {
+                let bytes = fs::read(path).unwrap();
+                for key in keys {
+                    assert!(
+                        !bytes.windows(key.len()).any(|w| w == key.as_bytes()),
+                        "secret copied outside private store: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        for relative in ["providers.toml", "sessions", "ledger"] {
+            let path = self.fixture.home.join(relative);
+            if path.exists() {
+                visit(&path, &[SAVED_OWNER_A, SAVED_OWNER_B, SAVED_OWNER_B_NEXT]);
+            }
+        }
+    }
+}
+
+#[test]
+fn saved_private_default_owner_uses_exact_key_output_and_context_with_unknown_effort() {
+    let f = SavedOwnerFixture::new();
+    let mut owner = f.start(None, None);
+    f.fixture.assert_no_calls();
+    owner.prompt("saved-default", "observe this workspace");
+    assert_eq!(
+        owner.snapshot().requests["saved-default"].state,
+        RequestState::Completed
+    );
+    assert_eq!(f.fixture.a.calls().len(), 1);
+    assert!(f.fixture.b.calls().is_empty());
+    f.assert_call(&f.fixture.a, 0, SAVED_OWNER_A, 1111, None);
+    SavedOwnerFixture::assert_usage(&owner, 65536);
+    assert_eq!(owner.snapshot().supported_efforts, None);
+    assert_eq!(owner.snapshot().resolved_effort, None);
+    assert_eq!(f.fixture.saved().provider, "provider_a");
+    assert_eq!(f.fixture.saved().model, SAVED_OWNER_RAW);
+    assert_eq!(f.fixture.saved().effort, None);
+    f.assert_public_state_has_no_keys(&owner);
+    owner.shutdown();
+    let mut resumed = f.fixture.restart();
+    assert_eq!(
+        f.fixture.a.calls().len(),
+        1,
+        "unknown-effort restart is offline"
+    );
+    assert_eq!(resumed.snapshot().supported_efforts, None);
+    assert_eq!(resumed.snapshot().resolved_effort, None);
+    resumed.prompt("saved-default-resumed", "observe the next file");
+    assert_eq!(
+        resumed.snapshot().requests["saved-default-resumed"].state,
+        RequestState::Completed
+    );
+    assert_eq!(f.fixture.a.calls().len(), 2);
+    assert!(f.fixture.b.calls().is_empty());
+    f.assert_call(&f.fixture.a, 1, SAVED_OWNER_A, 1111, None);
+    SavedOwnerFixture::assert_usage(&resumed, 65536);
+    assert_eq!(f.fixture.saved().effort, None);
+    f.assert_public_state_has_no_keys(&resumed);
+}
+
+#[test]
+fn saved_private_explicit_owner_override_resolves_duplicate_raw_model_to_b_key_and_caps() {
+    let f = SavedOwnerFixture::new();
+    let high = Some(EffortSetting::Value(EffortValue::Level("high".into())));
+    let mut owner = f.start(Some("provider_b/family/shared-notools"), high.clone());
+    f.fixture.assert_no_calls();
+    owner.prompt("saved-explicit", PROMPT);
+    assert_eq!(
+        owner.snapshot().requests["saved-explicit"].state,
+        RequestState::Completed
+    );
+    assert!(f.fixture.a.calls().is_empty());
+    assert_eq!(f.fixture.b.calls().len(), 1);
+    f.assert_call(&f.fixture.b, 0, SAVED_OWNER_B, 733, Some("high"));
+    SavedOwnerFixture::assert_usage(&owner, 131072);
+    assert_eq!(owner.snapshot().selection_origin, SelectionOrigin::Flag);
+    assert_eq!(f.fixture.saved().provider, "provider_b");
+    assert_eq!(f.fixture.saved().effort, high);
+    f.assert_public_state_has_no_keys(&owner);
+}
+
+#[test]
+fn saved_private_routed_owner_uses_target_key_caps_context_and_default_effort_once() {
+    let f = SavedOwnerFixture::new();
+    let mut owner = f.start(None, None);
+    owner.prompt("saved-routed", PROMPT);
+    assert_eq!(
+        owner.snapshot().requests["saved-routed"].state,
+        RequestState::Completed
+    );
+    assert!(f.fixture.a.calls().is_empty());
+    assert_eq!(f.fixture.b.calls().len(), 1);
+    f.assert_call(&f.fixture.b, 0, SAVED_OWNER_B, 733, Some("medium"));
+    SavedOwnerFixture::assert_usage(&owner, 131072);
+    assert_eq!(owner.decisions().len(), 1);
+    assert_eq!(
+        owner.snapshot().last_route.unwrap()["provider_id"],
+        "provider_b"
+    );
+    assert_eq!(f.fixture.saved().provider, "provider_a");
+    assert_eq!(f.fixture.saved().model, SAVED_OWNER_RAW);
+    assert_eq!(f.fixture.saved().effort, None);
+    f.assert_public_state_has_no_keys(&owner);
+}
+
+#[test]
+fn saved_private_resumed_owner_reresolves_rotated_key_and_retains_explicit_effort_reset() {
+    use orbit_adapter::provider_credentials::{ExpectedRevision, ProviderCredentialStore};
+    let f = SavedOwnerFixture::new();
+    let mut first = f.start(
+        Some("provider_b/family/shared-notools"),
+        Some(EffortSetting::Default),
+    );
+    first.prompt("saved-before-restart", "observe first");
+    assert_eq!(
+        first.snapshot().requests["saved-before-restart"].state,
+        RequestState::Completed
+    );
+    first.shutdown();
+    ProviderCredentialStore::new(&f.fixture.home)
+        .unwrap()
+        .save(
+            &SavedOwnerFixture::identity(&f.fixture, "provider_b", &f.env_b),
+            orbit_adapter::SecretBytes::new(SAVED_OWNER_B_NEXT.as_bytes().to_vec()),
+            ExpectedRevision::Exact(f.revision_b),
+        )
+        .unwrap();
+    let mut resumed = f.fixture.restart();
+    assert_eq!(f.fixture.b.calls().len(), 1, "restart is offline");
+    assert_eq!(resumed.snapshot().effort, Some(EffortSetting::Default));
+    resumed.prompt("saved-after-restart", PROMPT);
+    assert_eq!(
+        resumed.snapshot().requests["saved-after-restart"].state,
+        RequestState::Completed
+    );
+    assert!(f.fixture.a.calls().is_empty());
+    assert_eq!(f.fixture.b.calls().len(), 2);
+    f.assert_call(&f.fixture.b, 0, SAVED_OWNER_B, 733, Some("medium"));
+    f.assert_call(&f.fixture.b, 1, SAVED_OWNER_B_NEXT, 733, Some("medium"));
+    SavedOwnerFixture::assert_usage(&resumed, 131072);
+    assert_eq!(f.fixture.saved().provider, "provider_b");
+    assert_eq!(f.fixture.saved().effort, Some(EffortSetting::Default));
+    assert_eq!(
+        resumed.snapshot().supported_efforts,
+        Some(vec![
+            EffortValue::Level("medium".into()),
+            EffortValue::Level("high".into())
+        ])
+    );
+    f.assert_public_state_has_no_keys(&resumed);
 }

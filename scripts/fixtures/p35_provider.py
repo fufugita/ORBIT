@@ -25,6 +25,17 @@ class Provider(BaseHTTPRequestHandler):
                 calls.write(json.dumps(body) + "\n")
                 calls.flush()
                 os.fsync(calls.fileno())
+            metadata = {
+                "method": self.command,
+                "path": self.path,
+                "authorization": self.headers.get_all("Authorization", []),
+                "x_api_key": self.headers.get_all("X-Api-Key", []),
+            }
+            descriptor = os.open(root / "requests.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as requests:
+                requests.write(json.dumps(metadata) + "\n")
+                requests.flush()
+                os.fsync(requests.fileno())
         mode_path = root / "mode.json"
         mode = json.loads(mode_path.read_text()) if mode_path.exists() else {}
         if mode.get("disconnect"):

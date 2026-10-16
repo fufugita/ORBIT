@@ -679,6 +679,7 @@ pub(crate) fn execute_task_resolved(
         max_rounds: agent.max_turns,
         system_directive: Some(system_directive),
         request_stem: format!("orbit-task-{id}"),
+        window_tokens: crate::context_window_for_turn(home, &turn_config),
         ..Default::default()
     };
     let child_cx = crate::tool_runtime::child_agent_context(home, session_id, &id, parent_cx);
