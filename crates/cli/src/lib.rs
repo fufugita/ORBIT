@@ -424,6 +424,7 @@ pub mod profile_commands;
 // The stdio backend confines Unix descriptor/signal operations to reviewed helpers.
 #[allow(unsafe_code)]
 pub mod lsp;
+pub mod model_limits;
 pub mod mods;
 pub mod onboarding;
 #[allow(unsafe_code)]

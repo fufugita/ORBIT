@@ -1613,6 +1613,27 @@ mod metadata_storage {
         }) {
             return Err(MetadataError::InvalidProvider);
         }
+        identity_binding(provider)
+    }
+
+    fn read_binding(provider: &ProviderConfig) -> Result<String, MetadataError> {
+        // Configured membership is broader than the stored receipt selection.
+        // Bound the copied identity list before reusing the existing pure
+        // configured-provider validator; keep decode's full provider context.
+        if provider.models.len() > 1024 || provider.models.iter().any(|model| model.id.len() > 512)
+        {
+            return Err(MetadataError::InvalidProvider);
+        }
+        let config = ProvidersConfig {
+            provider: vec![provider.clone()],
+            ..Default::default()
+        };
+        crate::phase_routing::validate_providers(&config)
+            .map_err(|_| MetadataError::InvalidProvider)?;
+        identity_binding(provider)
+    }
+
+    fn identity_binding(provider: &ProviderConfig) -> Result<String, MetadataError> {
         let endpoint = validate_provider_endpoint(&provider.url)
             .map_err(|_| MetadataError::InvalidProvider)?;
         ProviderAuthIdentity::new(
@@ -1920,7 +1941,7 @@ mod metadata_storage {
         home: &Path,
         provider: &ProviderConfig,
     ) -> Result<Vec<ModelProvenance>, MetadataError> {
-        let expected = binding(provider)?;
+        let expected = read_binding(provider)?;
         let home = home_path(home)?;
         let Some(root) = existing_home(&home)? else {
             return Ok(Vec::new());
@@ -2479,6 +2500,90 @@ mod metadata_persistence_tests {
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         change(&mut document);
         write_private(&path, &serde_json::to_vec(&document).unwrap());
+    }
+
+    #[test]
+    fn metadata_reader_accepts_1024_configured_models_but_rejects_1025_before_storage() {
+        let tree = Tree::new();
+        let missing = tree.path().join("missing");
+        let mut provider = provider();
+        let template = provider.models[0].clone();
+        provider.models = (0..1024)
+            .map(|index| {
+                let mut model = template.clone();
+                model.id = format!("configured-{index:04}");
+                model
+            })
+            .collect();
+        assert_eq!(load_model_provenance(&missing, &provider), Ok(Vec::new()));
+        let mut extra = template;
+        extra.id = "configured-1024".into();
+        provider.models.push(extra);
+        assert_eq!(
+            load_model_provenance(&missing, &provider),
+            Err(MetadataError::InvalidProvider)
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn metadata_reader_checks_configured_ids_duplicates_and_provider_identity_before_storage() {
+        let tree = Tree::new();
+        let missing = tree.path().join("missing");
+        let mut longest = provider();
+        longest.models[0].id = "x".repeat(512);
+        assert_eq!(load_model_provenance(&missing, &longest), Ok(Vec::new()));
+        for variant in 0..10 {
+            let mut invalid = provider();
+            match variant {
+                0 => invalid.models[0].id = "x".repeat(513),
+                1 => invalid.models[0].id.clear(),
+                2 => invalid.models[0].id = " leading".into(),
+                3 => invalid.models[0].id = "trailing ".into(),
+                4 => invalid.models[0].id = "control\ncharacter".into(),
+                5 => invalid.models.push(invalid.models[0].clone()),
+                6 => invalid.name = "invalid/provider".into(),
+                7 => invalid.kind = "unsupported".into(),
+                8 => invalid.env = Some("INVALID-REFERENCE".into()),
+                _ => invalid.url = "http://user@127.0.0.1:1/v1".into(),
+            }
+            assert_eq!(
+                load_model_provenance(&missing, &invalid),
+                Err(MetadataError::InvalidProvider)
+            );
+        }
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn metadata_writer_keeps_128_model_and_256_byte_id_selection_bounds() {
+        let (tree, original, _) = seeded();
+        let before = fs::read(sidecar(&tree, &original)).unwrap();
+        let before_config = fs::read(tree.path().join("providers.toml")).unwrap();
+        for long_id in [false, true] {
+            let mut provider = original.clone();
+            if long_id {
+                provider.models[0].id = "x".repeat(257);
+            } else {
+                let template = provider.models[0].clone();
+                provider.models = (0..129)
+                    .map(|index| {
+                        let mut model = template.clone();
+                        model.id = format!("configured-{index:03}");
+                        model
+                    })
+                    .collect();
+            }
+            assert_eq!(
+                save_model_provenance(tree.path(), &provider, &[]),
+                Err(MetadataError::InvalidProvider)
+            );
+            assert_eq!(fs::read(sidecar(&tree, &original)).unwrap(), before);
+            assert_eq!(
+                fs::read(tree.path().join("providers.toml")).unwrap(),
+                before_config
+            );
+        }
     }
 
     #[test]
