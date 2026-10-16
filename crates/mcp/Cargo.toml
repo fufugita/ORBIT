@@ -7,6 +7,11 @@ license.workspace = true
 
 [dependencies]
 orbit-adapter = { path = "../adapter" }
+orbit-provider-http = { path = "../provider-http" }
+reqwest.workspace = true
+tokio.workspace = true
+futures.workspace = true
+url.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -1,4 +1,4 @@
-//! A bounded JSON-RPC MCP client for newline-delimited stdio servers.
+//! Bounded JSON-RPC MCP clients for stdio, Streamable HTTP and legacy SSE servers.
 //!
 //! Unix pipes are nonblocking: waiting for a server never owns a blocking read
 //! thread. Each call has one deadline, including its pool wait and handshake.
@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
+
+mod http;
+mod legacy;
 
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_PAGES: usize = 32;
@@ -29,14 +32,30 @@ fn default_initialize_timeout_ms() -> u64 {
     5_000
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+    Sse,
+}
+
 /// One configured server entry. Tool names are exact server names, not wire names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    #[serde(default)]
+    pub transport: McpTransport,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// None exposes all tools; an empty list exposes none.
@@ -50,8 +69,30 @@ pub struct McpServerConfig {
 
 impl McpServerConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.command.trim().is_empty() {
-            return Err("mcp command must not be empty".into());
+        match self.transport {
+            McpTransport::Stdio => {
+                if self.command.trim().is_empty() {
+                    return Err("mcp command must not be empty".into());
+                }
+                if self.url.is_some() || !self.headers.is_empty() {
+                    return Err(
+                        "mcp stdio configuration cannot contain a URL or HTTP headers".into(),
+                    );
+                }
+            }
+            McpTransport::StreamableHttp | McpTransport::Sse => {
+                if !self.command.is_empty() || !self.args.is_empty() || !self.env.is_empty() {
+                    return Err(
+                        "mcp remote configuration cannot contain command, args or env".into(),
+                    );
+                }
+                http::validate_config(
+                    self.url
+                        .as_deref()
+                        .ok_or("mcp remote configuration requires a URL")?,
+                    &self.headers,
+                )?;
+            }
         }
         for (name, value) in [
             ("timeout_ms", self.timeout_ms),
@@ -74,6 +115,14 @@ impl McpServerConfig {
 
     fn options(&self) -> McpCallOptions {
         McpCallOptions::new(Duration::from_millis(self.timeout_ms))
+    }
+
+    fn effective_cwd(&self, options: &McpCallOptions) -> Result<Option<PathBuf>, String> {
+        if self.transport == McpTransport::Stdio {
+            options.effective_cwd().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -182,12 +231,66 @@ impl McpCallOptions {
 /// A live session, retired immediately after transport or protocol failure.
 pub struct McpSession {
     pub server_name: String,
+    remote: Option<RemoteTransport>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     input: Vec<u8>,
     next_id: u64,
     cfg: McpServerConfig,
+}
+
+enum RemoteTransport {
+    Streamable(Box<http::HttpTransport>),
+    Legacy(Box<legacy::LegacyTransport>),
+}
+
+impl RemoteTransport {
+    fn exchange(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+        options: &McpCallOptions,
+    ) -> Result<serde_json::Value, (String, bool)> {
+        match self {
+            Self::Streamable(transport) => transport.exchange(id, method, params, options),
+            Self::Legacy(transport) => transport.exchange(id, method, params, options),
+        }
+    }
+
+    fn notify(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        options: &McpCallOptions,
+    ) -> Result<(), String> {
+        match self {
+            Self::Streamable(transport) => transport.notify(method, params, options),
+            Self::Legacy(transport) => transport.notify(method, params, options),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::Streamable(transport) => transport.is_alive(),
+            Self::Legacy(transport) => transport.is_alive(),
+        }
+    }
+
+    fn close(&mut self, options: &McpCallOptions) -> Result<(), String> {
+        match self {
+            Self::Streamable(transport) => transport.close(options),
+            Self::Legacy(transport) => transport.close(options),
+        }
+    }
+
+    fn retire(&mut self) {
+        match self {
+            Self::Streamable(transport) => transport.retire(),
+            Self::Legacy(transport) => transport.retire(),
+        }
+    }
 }
 
 impl McpSession {
@@ -205,14 +308,46 @@ impl McpSession {
             return Err(format!("mcp server {name} is disabled"));
         }
         options.check()?;
+        let options = options.bounded(cfg.timeout_ms);
+        let initialize_options = options.bounded(cfg.initialize_timeout_ms);
+        match cfg.transport {
+            McpTransport::StreamableHttp | McpTransport::Sse => {
+                let url = cfg
+                    .url
+                    .as_deref()
+                    .ok_or("mcp remote configuration requires a URL")?;
+                let remote = if cfg.transport == McpTransport::StreamableHttp {
+                    RemoteTransport::Streamable(Box::new(http::HttpTransport::new(
+                        url,
+                        &cfg.headers,
+                    )?))
+                } else {
+                    RemoteTransport::Legacy(Box::new(legacy::LegacyTransport::new(
+                        url,
+                        &cfg.headers,
+                    )?))
+                };
+                let mut session = Self {
+                    server_name: name.into(),
+                    remote: Some(remote),
+                    child: None,
+                    stdin: None,
+                    stdout: None,
+                    input: Vec::new(),
+                    next_id: 1,
+                    cfg: cfg.clone(),
+                };
+                session.initialize(&initialize_options)?;
+                return Ok(session);
+            }
+            McpTransport::Stdio => {}
+        }
         #[cfg(not(unix))]
         {
             return Err("bounded MCP stdio is supported on Unix only".into());
         }
         #[cfg(unix)]
         {
-            let options = options.bounded(cfg.timeout_ms);
-            let initialize_options = options.bounded(cfg.initialize_timeout_ms);
             let cwd = options.effective_cwd()?;
             options.check()?;
             let mut child = Command::new(&cfg.command)
@@ -228,6 +363,7 @@ impl McpSession {
             let stdout = child.stdout.take();
             let mut session = Self {
                 server_name: name.into(),
+                remote: None,
                 child: Some(child),
                 stdin,
                 stdout,
@@ -249,24 +385,26 @@ impl McpSession {
                     .ok_or("mcp has no stdout")?
                     .as_raw_fd(),
             )?;
-            session.request_with_options(
-                "initialize",
-                serde_json::json!({
-                    "protocolVersion": "2025-06-18", "capabilities": {},
-                    "clientInfo": {"name": "orbit", "version": env!("CARGO_PKG_VERSION")}
-                }),
-                &initialize_options,
-            )?;
-            if let Err(error) = session.notify(
-                "notifications/initialized",
-                serde_json::json!({}),
-                &initialize_options,
-            ) {
-                session.retire();
-                return Err(error);
-            }
+            session.initialize(&initialize_options)?;
             Ok(session)
         }
+    }
+
+    fn initialize(&mut self, options: &McpCallOptions) -> Result<(), String> {
+        self.request_with_options(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion":"2025-06-18", "capabilities":{},
+                "clientInfo":{"name":"orbit","version":env!("CARGO_PKG_VERSION")}
+            }),
+            options,
+        )?;
+        if let Err(error) = self.notify("notifications/initialized", serde_json::json!({}), options)
+        {
+            self.retire();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn request(
@@ -292,7 +430,12 @@ impl McpSession {
                 return Err(format!("mcp tool {tool} is disabled"));
             }
         }
-        if self.child.is_none() {
+        if self
+            .remote
+            .as_ref()
+            .is_none_or(|transport| !transport.is_alive())
+            && self.child.is_none()
+        {
             return Err("mcp transport is retired".into());
         }
         let options = options.bounded(self.cfg.timeout_ms);
@@ -322,6 +465,9 @@ impl McpSession {
         params: serde_json::Value,
         options: &McpCallOptions,
     ) -> Result<serde_json::Value, (String, bool)> {
+        if let Some(remote) = self.remote.as_mut() {
+            return remote.exchange(id, method, params, options);
+        }
         let fatal = |error| (error, true);
         let msg = serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
         let mut bytes_sent = false;
@@ -510,6 +656,9 @@ impl McpSession {
         params: serde_json::Value,
         options: &McpCallOptions,
     ) -> Result<(), String> {
+        if let Some(remote) = self.remote.as_mut() {
+            return remote.notify(method, params, options);
+        }
         self.write_frame(
             &serde_json::json!({"jsonrpc":"2.0","method":method,"params":params}),
             options,
@@ -658,12 +807,29 @@ impl McpSession {
     }
 
     pub fn is_alive(&mut self) -> bool {
+        if let Some(remote) = self.remote.as_ref() {
+            return remote.is_alive();
+        }
         self.child
             .as_mut()
             .is_some_and(|child| child.try_wait().is_ok_and(|status| status.is_none()))
     }
 
+    /// Explicit HTTP session teardown. Local retirement and Drop perform no HTTP requests.
+    pub fn close_with_options(&mut self, options: &McpCallOptions) -> Result<(), String> {
+        let result = if let Some(remote) = self.remote.as_mut() {
+            remote.close(&options.bounded(self.cfg.timeout_ms))
+        } else {
+            Ok(())
+        };
+        self.retire();
+        result
+    }
+
     fn retire(&mut self) {
+        if let Some(mut remote) = self.remote.take() {
+            remote.retire();
+        }
         self.stdin.take();
         self.stdout.take();
         self.input.clear();
@@ -774,7 +940,7 @@ pub fn split_wire_name(name: &str) -> Option<(String, String)> {
 
 struct ServerSlot {
     cfg: McpServerConfig,
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
     session: Option<McpSession>,
 }
 type SlotMap = HashMap<String, Arc<Mutex<ServerSlot>>>;
@@ -801,7 +967,7 @@ impl McpPool {
         if !cfg.enabled {
             return Err(format!("mcp server {name} is disabled"));
         }
-        let cwd = options.effective_cwd()?;
+        let cwd = cfg.effective_cwd(options)?;
         let mutex = self.sessions.get_or_init(|| Mutex::new(HashMap::new()));
         let mut map = lock_with_options(mutex, options)?;
         Ok(map
@@ -826,8 +992,8 @@ impl McpPool {
         cfg.validate()?;
         let mut options = options.bounded(cfg.timeout_ms);
         options.check()?;
-        let cwd = options.effective_cwd()?;
-        options.working_dir = Some(cwd.clone());
+        let cwd = cfg.effective_cwd(&options)?;
+        options.working_dir = cwd.clone();
         let slot = self.slot(name, cfg, &options)?;
         let mut entry = lock_with_options(&slot, &options)?;
         options.check()?;
@@ -1058,6 +1224,7 @@ for line in sys.stdin:
             std::fs::create_dir_all(&dir).unwrap();
             let marker = dir.join("events.jsonl");
             let cfg = McpServerConfig {
+                transport: McpTransport::Stdio,
                 command: "python3".into(),
                 args: vec![
                     "-u".into(),
@@ -1067,6 +1234,8 @@ for line in sys.stdin:
                     marker.to_string_lossy().into(),
                 ],
                 env: Default::default(),
+                url: None,
+                headers: Default::default(),
                 enabled: true,
                 tools: None,
                 timeout_ms: 2_000,

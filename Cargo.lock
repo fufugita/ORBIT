@@ -2700,13 +2700,18 @@ dependencies = [
 name = "orbit-mcp"
 version = "0.2.0"
 dependencies = [
+ "futures",
  "hex",
  "libc",
  "orbit-adapter",
+ "orbit-provider-http",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
  "ulid",
+ "url",
 ]
 
 [[package]]
