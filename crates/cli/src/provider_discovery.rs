@@ -1069,3 +1069,1324 @@ pub fn merge_discovered_model(
         provenance: Some(provenance),
     }
 }
+
+pub use metadata_storage::{MetadataError, load_model_provenance, save_model_provenance};
+
+mod metadata_storage {
+    use super::{
+        DiscoveredModel, MetadataSource, ModelProvenance, PROVENANCE_VERSION, display_safe,
+        valid_model_id,
+    };
+    use crate::config::{ProviderConfig, ProvidersConfig, validate_provider_endpoint};
+    use crate::customization::{Directory, Error as StorageError, Lock, publish, read_regular};
+    use orbit_adapter::provider_credentials::ProviderAuthIdentity;
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashSet;
+    use std::fs::Metadata;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::{Component, Path, PathBuf};
+
+    const MAX_METADATA_BYTES: usize = 128 * 1024;
+    const MAX_METADATA_MODELS: usize = 128;
+    const MAX_METADATA_BINDINGS: usize = 128;
+    const MAX_METADATA_STAGES: usize = 1;
+    const MAX_CONFIG_BYTES: usize = 128 * 1024;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+    pub enum MetadataError {
+        #[error("Provider metadata identity is invalid")]
+        InvalidProvider,
+        #[error("Provider metadata document is malformed")]
+        InvalidDocument,
+        #[error("Provider metadata does not match its exact binding")]
+        IdentityMismatch,
+        #[error("Provider metadata path is unsafe")]
+        UnsafePath,
+        #[error("Provider metadata exceeds its bounded size or count")]
+        LimitExceeded,
+        #[error("Published provider configuration is malformed")]
+        InvalidConfig,
+        #[error("Provider configuration changed or has not been published")]
+        StaleConfig,
+        #[error("Provider metadata is busy; retry after the current operation")]
+        Busy,
+        #[error("Provider metadata storage I/O failed")]
+        Io,
+        #[error("Provider metadata publication may have committed; inspect before retrying")]
+        PublicationUncertain,
+    }
+
+    #[derive(Deserialize)]
+    struct VersionHeader {
+        #[serde(default)]
+        schema_version: Option<u32>,
+    }
+
+    // Separate strict wire types keep unknown fields and duplicate JSON keys
+    // out without changing the public provenance/config constructors.
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MetadataDocument {
+        schema_version: u32,
+        provider_binding: String,
+        models: Vec<MetadataRecord>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MetadataRecord {
+        schema_version: u32,
+        provider_binding: String,
+        model_id: String,
+        observed: MetadataObservation,
+        last_applied_context_window: Option<u64>,
+        last_applied_max_output_tokens: Option<u32>,
+        last_applied_label: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MetadataObservation {
+        id: String,
+        label: Option<String>,
+        context_window: Option<u64>,
+        max_output_tokens: Option<u32>,
+        source: MetadataSource,
+        metadata_valid: bool,
+        unrecognized_fields: Vec<String>,
+    }
+
+    impl From<&ModelProvenance> for MetadataRecord {
+        fn from(record: &ModelProvenance) -> Self {
+            let observed = &record.observed;
+            Self {
+                schema_version: record.schema_version,
+                provider_binding: record.provider_binding.clone(),
+                model_id: record.model_id.clone(),
+                observed: MetadataObservation {
+                    id: observed.id.clone(),
+                    label: observed.label.clone(),
+                    context_window: observed.context_window,
+                    max_output_tokens: observed.max_output_tokens,
+                    source: observed.source,
+                    metadata_valid: observed.metadata_valid,
+                    unrecognized_fields: observed.unrecognized_fields.clone(),
+                },
+                last_applied_context_window: record.last_applied_context_window,
+                last_applied_max_output_tokens: record.last_applied_max_output_tokens,
+                last_applied_label: record.last_applied_label.clone(),
+            }
+        }
+    }
+
+    impl From<MetadataRecord> for ModelProvenance {
+        fn from(record: MetadataRecord) -> Self {
+            let observed = record.observed;
+            Self {
+                schema_version: record.schema_version,
+                provider_binding: record.provider_binding,
+                model_id: record.model_id,
+                observed: DiscoveredModel {
+                    id: observed.id,
+                    label: observed.label,
+                    context_window: observed.context_window,
+                    max_output_tokens: observed.max_output_tokens,
+                    source: observed.source,
+                    metadata_valid: observed.metadata_valid,
+                    unrecognized_fields: observed.unrecognized_fields,
+                },
+                last_applied_context_window: record.last_applied_context_window,
+                last_applied_max_output_tokens: record.last_applied_max_output_tokens,
+                last_applied_label: record.last_applied_label,
+            }
+        }
+    }
+
+    fn storage_error(error: StorageError) -> MetadataError {
+        match error {
+            StorageError::Busy => MetadataError::Busy,
+            StorageError::PublicationUncertain(_) => MetadataError::PublicationUncertain,
+            StorageError::UnsafePath(_) | StorageError::Invalid(_) => MetadataError::UnsafePath,
+            StorageError::Io(_) => MetadataError::Io,
+        }
+    }
+
+    fn home_path(home: &Path) -> Result<PathBuf, MetadataError> {
+        let path = std::path::absolute(home).map_err(|_| MetadataError::Io)?;
+        if path == Path::new("/")
+            || path.as_os_str().as_encoded_bytes().len() > 4096
+            || path.components().count() > 256
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        {
+            return Err(MetadataError::UnsafePath);
+        }
+        Ok(path)
+    }
+
+    fn binding(provider: &ProviderConfig) -> Result<String, MetadataError> {
+        if !matches!(
+            provider.kind.as_str(),
+            "openai-compatible" | "anthropic" | "ollama"
+        ) || provider.models.len() > MAX_METADATA_MODELS
+        {
+            return Err(MetadataError::InvalidProvider);
+        }
+        let mut ids = HashSet::new();
+        if provider.models.iter().any(|model| {
+            model.id.is_empty()
+                || model.id.len() > 256
+                || model.id.chars().any(char::is_control)
+                || !ids.insert(model.id.as_str())
+        }) {
+            return Err(MetadataError::InvalidProvider);
+        }
+        let endpoint = validate_provider_endpoint(&provider.url)
+            .map_err(|_| MetadataError::InvalidProvider)?;
+        ProviderAuthIdentity::new(
+            &provider.name,
+            &provider.kind,
+            endpoint.as_str(),
+            provider.env.as_deref(),
+        )
+        .map(|identity| identity.binding_id())
+        .map_err(|_| MetadataError::InvalidProvider)
+    }
+
+    fn check_directory(directory: &Directory) -> Result<(), MetadataError> {
+        directory.check().map_err(storage_error)?;
+        // check() protects the held inode. Reopening also rechecks current
+        // ownership, private mode and every named ancestor after each operation.
+        Directory::open(directory.path(), true).map_err(storage_error)?;
+        Ok(())
+    }
+
+    fn existing_home(path: &Path) -> Result<Option<Directory>, MetadataError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Directory::open(path, true).map(Some).map_err(storage_error),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Missing storage is normal; still reject an existing symlink
+                // ancestor rather than treating its missing destination as empty.
+                let mut ancestor = path.parent().ok_or(MetadataError::UnsafePath)?;
+                loop {
+                    match std::fs::symlink_metadata(ancestor) {
+                        Ok(_) => {
+                            Directory::open(ancestor, false).map_err(storage_error)?;
+                            return Ok(None);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            ancestor = ancestor.parent().ok_or(MetadataError::UnsafePath)?;
+                        }
+                        Err(_) => return Err(MetadataError::Io),
+                    }
+                }
+            }
+            Err(_) => Err(MetadataError::Io),
+        }
+    }
+
+    fn optional_child(parent: &Directory, name: &str) -> Result<Option<Directory>, MetadataError> {
+        check_directory(parent)?;
+        let path = parent.io().map_err(storage_error)?.join(name);
+        let result = match std::fs::symlink_metadata(path) {
+            Ok(_) => parent.child(name, false).map(Some).map_err(storage_error),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(MetadataError::Io),
+        }?;
+        check_directory(parent)?;
+        Ok(result)
+    }
+
+    fn file_metadata(
+        directory: &Directory,
+        path: &Path,
+        maximum: usize,
+    ) -> Result<Metadata, MetadataError> {
+        check_directory(directory)?;
+        let owner = std::fs::metadata(directory.io().map_err(storage_error)?)
+            .map_err(|_| MetadataError::Io)?
+            .uid();
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| MetadataError::Io)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(MetadataError::UnsafePath);
+        }
+        if metadata.len() > maximum as u64 {
+            return Err(MetadataError::LimitExceeded);
+        }
+        Ok(metadata)
+    }
+
+    fn same_file(left: &Metadata, right: &Metadata) -> bool {
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.uid() == right.uid()
+            && left.nlink() == right.nlink()
+            && left.mode() == right.mode()
+            && left.len() == right.len()
+            && left.mtime() == right.mtime()
+            && left.mtime_nsec() == right.mtime_nsec()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+
+    fn read_optional(
+        directory: &Directory,
+        name: &str,
+        maximum: usize,
+    ) -> Result<Option<Vec<u8>>, MetadataError> {
+        let path = directory.io().map_err(storage_error)?.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                check_directory(directory)?;
+                return Ok(None);
+            }
+            Err(_) => return Err(MetadataError::Io),
+            Ok(_) => {}
+        }
+        let before = file_metadata(directory, &path, maximum)?;
+        let bytes = read_regular(&path, maximum, true).map_err(storage_error)?;
+        let after = file_metadata(directory, &path, maximum)?;
+        if !same_file(&before, &after) || bytes.len() as u64 != after.len() {
+            return Err(MetadataError::UnsafePath);
+        }
+        check_directory(directory)?;
+        Ok(Some(bytes))
+    }
+
+    /// Count all directory entries, including at most one atomic-publication
+    /// stage. Every entry is bounded, owned, private, regular and single-link.
+    fn directory_count(directory: &Directory) -> Result<usize, MetadataError> {
+        check_directory(directory)?;
+        let mut bindings = 0_usize;
+        let mut stages = 0_usize;
+        let entries = std::fs::read_dir(directory.io().map_err(storage_error)?)
+            .map_err(|_| MetadataError::Io)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| MetadataError::Io)?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or(MetadataError::UnsafePath)?;
+            if name.len() == 69
+                && name.ends_with(".json")
+                && name.as_bytes()[..64]
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            {
+                bindings += 1;
+            } else if let Some(stage) = name.strip_prefix(".stage-") {
+                if ulid::Ulid::from_string(stage).is_err() {
+                    return Err(MetadataError::UnsafePath);
+                }
+                stages += 1;
+            } else {
+                return Err(MetadataError::UnsafePath);
+            }
+            if bindings > MAX_METADATA_BINDINGS || stages > MAX_METADATA_STAGES {
+                return Err(MetadataError::LimitExceeded);
+            }
+            file_metadata(directory, &entry.path(), MAX_METADATA_BYTES)?;
+        }
+        check_directory(directory)?;
+        Ok(bindings)
+    }
+
+    fn validate_record(
+        record: &ModelProvenance,
+        expected: &str,
+        provider: &ProviderConfig,
+    ) -> Result<(), MetadataError> {
+        let observed = &record.observed;
+        if record.provider_binding != expected {
+            return Err(MetadataError::IdentityMismatch);
+        }
+        if record.schema_version != PROVENANCE_VERSION
+            || !valid_model_id(&record.model_id)
+            || record.model_id != observed.id
+            || !observed.metadata_valid
+            || observed.source.profile().kind() != provider.kind
+            || observed.context_window == Some(0)
+            || observed.max_output_tokens == Some(0)
+            || observed
+                .label
+                .as_ref()
+                .is_some_and(|label| display_safe(label) != *label)
+            || observed.unrecognized_fields.len() > 32
+            || observed
+                .unrecognized_fields
+                .iter()
+                .any(|field| field.is_empty() || display_safe(field) != *field)
+            || record
+                .last_applied_context_window
+                .is_some_and(|value| observed.context_window != Some(value))
+            || record
+                .last_applied_max_output_tokens
+                .is_some_and(|value| observed.max_output_tokens != Some(value))
+            || record
+                .last_applied_label
+                .as_ref()
+                .is_some_and(|value| observed.label.as_ref() != Some(value))
+        {
+            return Err(MetadataError::InvalidDocument);
+        }
+        if matches!(
+            observed.source,
+            MetadataSource::GenericOpenAiModels | MetadataSource::OllamaTags
+        ) && (observed.context_window.is_some() || observed.max_output_tokens.is_some())
+        {
+            return Err(MetadataError::InvalidDocument);
+        }
+        let mut fields = HashSet::new();
+        if observed
+            .unrecognized_fields
+            .iter()
+            .any(|field| !fields.insert(field.as_str()))
+        {
+            return Err(MetadataError::InvalidDocument);
+        }
+        Ok(())
+    }
+
+    fn decode(
+        bytes: &[u8],
+        expected: &str,
+        provider: &ProviderConfig,
+    ) -> Result<Vec<ModelProvenance>, MetadataError> {
+        let header: VersionHeader =
+            serde_json::from_slice(bytes).map_err(|_| MetadataError::InvalidDocument)?;
+        if header.schema_version != Some(PROVENANCE_VERSION) {
+            return Ok(Vec::new());
+        }
+        let document: MetadataDocument =
+            serde_json::from_slice(bytes).map_err(|_| MetadataError::InvalidDocument)?;
+        if document.provider_binding != expected {
+            return Err(MetadataError::IdentityMismatch);
+        }
+        if document.models.len() > MAX_METADATA_MODELS {
+            return Err(MetadataError::LimitExceeded);
+        }
+        if document
+            .models
+            .iter()
+            .any(|record| record.schema_version != PROVENANCE_VERSION)
+        {
+            return Ok(Vec::new());
+        }
+        let mut ids = HashSet::new();
+        let mut output = Vec::new();
+        for record in document.models {
+            let record = ModelProvenance::from(record);
+            validate_record(&record, expected, provider)?;
+            if !ids.insert(record.model_id.clone()) {
+                return Err(MetadataError::InvalidDocument);
+            }
+            // Removed models have no consumer. Existing models retain their
+            // provenance despite manual changes to other fields or models.
+            if provider
+                .models
+                .iter()
+                .any(|model| model.id == record.model_id)
+            {
+                output.push(record);
+            }
+        }
+        Ok(output)
+    }
+
+    fn published_provider(
+        home: &Directory,
+        expected: &ProviderConfig,
+    ) -> Result<(), MetadataError> {
+        let bytes = read_optional(home, "providers.toml", MAX_CONFIG_BYTES)?
+            .ok_or(MetadataError::StaleConfig)?;
+        let raw = std::str::from_utf8(&bytes).map_err(|_| MetadataError::InvalidConfig)?;
+        let config =
+            ProvidersConfig::load_from_str(raw).map_err(|_| MetadataError::InvalidConfig)?;
+        let mut matching = config
+            .provider
+            .iter()
+            .filter(|provider| provider.name == expected.name);
+        if matching.next() != Some(expected) || matching.next().is_some() {
+            return Err(MetadataError::StaleConfig);
+        }
+        check_directory(home)
+    }
+
+    /// Load exact-binding provenance without comparing a provider-wide config
+    /// fingerprint. The existing merge decides field ownership individually.
+    pub fn load_model_provenance(
+        home: &Path,
+        provider: &ProviderConfig,
+    ) -> Result<Vec<ModelProvenance>, MetadataError> {
+        let expected = binding(provider)?;
+        let home = home_path(home)?;
+        let Some(root) = existing_home(&home)? else {
+            return Ok(Vec::new());
+        };
+        let Some(metadata) = optional_child(&root, "metadata")? else {
+            return Ok(Vec::new());
+        };
+        let Some(providers) = optional_child(&metadata, "providers")? else {
+            return Ok(Vec::new());
+        };
+        directory_count(&providers)?;
+        let bytes = read_optional(&providers, &format!("{expected}.json"), MAX_METADATA_BYTES)?;
+        let records = match bytes {
+            Some(bytes) => decode(&bytes, &expected, provider)?,
+            None => Vec::new(),
+        };
+        check_directory(&providers)?;
+        check_directory(&metadata)?;
+        check_directory(&root)?;
+        Ok(records)
+    }
+
+    /// Publish optional provenance only after this exact typed provider is
+    /// present in providers.toml, with the setup-then-config lock order.
+    /// Definite pre-publication failures retain the prior sidecar; uncertainty
+    /// after the atomic rename remains an explicit typed result.
+    pub fn save_model_provenance(
+        home: &Path,
+        provider: &ProviderConfig,
+        records: &[ModelProvenance],
+    ) -> Result<(), MetadataError> {
+        let expected = binding(provider)?;
+        if records.len() > MAX_METADATA_MODELS {
+            return Err(MetadataError::LimitExceeded);
+        }
+        let mut ids = HashSet::new();
+        for record in records {
+            validate_record(record, &expected, provider)?;
+            if !ids.insert(record.model_id.as_str())
+                || !provider
+                    .models
+                    .iter()
+                    .any(|model| model.id == record.model_id)
+            {
+                return Err(MetadataError::InvalidDocument);
+            }
+        }
+        let document = MetadataDocument {
+            schema_version: PROVENANCE_VERSION,
+            provider_binding: expected.clone(),
+            models: records.iter().map(MetadataRecord::from).collect(),
+        };
+        let bytes = serde_json::to_vec(&document).map_err(|_| MetadataError::InvalidDocument)?;
+        if bytes.len() > MAX_METADATA_BYTES {
+            return Err(MetadataError::LimitExceeded);
+        }
+        let home = home_path(home)?;
+        let root = existing_home(&home)?.ok_or(MetadataError::StaleConfig)?;
+        published_provider(&root, provider)?;
+        let _setup_lock = Lock::acquire(&root, ".setup.lock").map_err(storage_error)?;
+        let _config_lock = Lock::acquire(&root, ".config.lock").map_err(storage_error)?;
+        published_provider(&root, provider)?;
+        let metadata = root.child("metadata", true).map_err(storage_error)?;
+        let providers = metadata.child("providers", true).map_err(storage_error)?;
+        let count = directory_count(&providers)?;
+        let name = format!("{expected}.json");
+        let previous = read_optional(&providers, &name, MAX_METADATA_BYTES)?;
+        if let Some(previous) = &previous {
+            let _ = decode(previous, &expected, provider)?;
+        }
+        if previous.is_none() && count >= MAX_METADATA_BINDINGS {
+            return Err(MetadataError::LimitExceeded);
+        }
+        published_provider(&root, provider)?;
+        check_directory(&metadata)?;
+        check_directory(&providers)?;
+        publish(&providers, &name, &bytes, false).map_err(storage_error)?;
+        // A later verification error cannot be called a definite failure: the
+        // sidecar rename has already taken place and its old inode is gone.
+        (|| {
+            let _ = read_optional(&providers, &name, MAX_METADATA_BYTES)?
+                .ok_or(MetadataError::UnsafePath)?;
+            check_directory(&providers)?;
+            check_directory(&metadata)?;
+            published_provider(&root, provider)
+        })()
+        .map_err(|_| MetadataError::PublicationUncertain)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod metadata_persistence_tests {
+    use super::*;
+    use crate::config::ProvidersConfig;
+    use crate::customization::{
+        Directory, Error as StorageError, Lock, PublicationPoint, with_test_hook,
+    };
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("orbit-metadata-{}", ulid::Ulid::new()));
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn provider() -> ProviderConfig {
+        ProviderConfig {
+            name: "fixture".into(),
+            kind: "openai-compatible".into(),
+            url: "http://127.0.0.1:1/tenant/v1?scope=synthetic".into(),
+            env: Some("ORBIT_AUTH_SYNTHETIC".into()),
+            models: vec![ModelEntry {
+                id: "vendor/raw:free".into(),
+                label: None,
+                pricing: Default::default(),
+                context_window: None,
+                max_output_tokens: None,
+                sampling: None,
+                supported_efforts: None,
+                default_effort: None,
+            }],
+        }
+    }
+
+    fn identity(provider: &ProviderConfig) -> ProviderAuthIdentity {
+        let url = crate::config::validate_provider_endpoint(&provider.url).unwrap();
+        ProviderAuthIdentity::new(
+            &provider.name,
+            &provider.kind,
+            url.as_str(),
+            provider.env.as_deref(),
+        )
+        .unwrap()
+    }
+
+    fn observation(id: &str, context: u64, output: u32) -> DiscoveredModel {
+        DiscoveredModel {
+            id: id.into(),
+            label: Some("Visible model".into()),
+            context_window: Some(context),
+            max_output_tokens: Some(output),
+            source: MetadataSource::OpenRouterModels,
+            metadata_valid: true,
+            unrecognized_fields: vec![],
+        }
+    }
+
+    fn applied() -> (ProviderConfig, ModelProvenance) {
+        let mut provider = provider();
+        let observed = observation(&provider.models[0].id, 1000, 100);
+        let merged =
+            merge_discovered_model(&provider.models[0], &observed, None, &identity(&provider));
+        provider.models[0] = merged.model;
+        (provider, merged.provenance.unwrap())
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn publish_config(tree: &Tree, provider: &ProviderConfig) {
+        let config = ProvidersConfig {
+            provider: vec![provider.clone()],
+            ..Default::default()
+        };
+        write_private(
+            &tree.path().join("providers.toml"),
+            toml::to_string(&config).unwrap().as_bytes(),
+        );
+    }
+
+    fn sidecar(tree: &Tree, provider: &ProviderConfig) -> PathBuf {
+        tree.path()
+            .join("metadata/providers")
+            .join(format!("{}.json", identity(provider).binding_id()))
+    }
+
+    fn seeded() -> (Tree, ProviderConfig, ModelProvenance) {
+        let tree = Tree::new();
+        let (provider, record) = applied();
+        publish_config(&tree, &provider);
+        save_model_provenance(tree.path(), &provider, std::slice::from_ref(&record)).unwrap();
+        (tree, provider, record)
+    }
+
+    fn mutate_document(
+        tree: &Tree,
+        provider: &ProviderConfig,
+        change: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let path = sidecar(tree, provider);
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        change(&mut document);
+        write_private(&path, &serde_json::to_vec(&document).unwrap());
+    }
+
+    #[test]
+    fn metadata_missing_home_is_empty_and_does_not_create_it() {
+        let tree = Tree::new();
+        let missing = tree.path().join("missing/home");
+        assert!(
+            load_model_provenance(&missing, &provider())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!tree.path().join("missing").exists());
+    }
+
+    #[test]
+    fn metadata_missing_file_is_empty_and_load_never_creates_directories() {
+        let tree = Tree::new();
+        let provider = provider();
+        publish_config(&tree, &provider);
+        let before = fs::read(tree.path().join("providers.toml")).unwrap();
+        assert!(
+            load_model_provenance(tree.path(), &provider)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!tree.path().join("metadata").exists());
+        assert!(!tree.path().join(".setup.lock").exists());
+        assert_eq!(
+            before,
+            fs::read(tree.path().join("providers.toml")).unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_roundtrip_uses_private_bounded_hash_filename_without_raw_endpoint() {
+        let (tree, provider, record) = seeded();
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider).unwrap(),
+            vec![record]
+        );
+        let path = sidecar(&tree, &provider);
+        let bytes = fs::read(&path).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(bytes.len() < 128 * 1024);
+        assert!(!text.contains(&provider.url));
+        assert!(!text.contains("127.0.0.1"));
+        assert!(!text.contains("ORBIT_AUTH_SYNTHETIC"));
+        assert_eq!(path.file_name().unwrap().to_str().unwrap().len(), 69);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for path in [
+            tree.path().join("metadata"),
+            tree.path().join("metadata/providers"),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_load_keeps_provenance_after_manual_diff_and_merge_updates_only_auto_field() {
+        let (tree, mut provider, record) = seeded();
+        provider.models[0].max_output_tokens = Some(77);
+        provider.models[0].label = Some("Hand edited".into());
+        publish_config(&tree, &provider);
+        let loaded = load_model_provenance(tree.path(), &provider).unwrap();
+        assert_eq!(loaded, vec![record]);
+        let fresh = observation(&provider.models[0].id, 2000, 200);
+        let merged = merge_discovered_model(
+            &provider.models[0],
+            &fresh,
+            loaded.first(),
+            &identity(&provider),
+        );
+        assert_eq!(merged.model.context_window, Some(2000));
+        assert_eq!(merged.model.max_output_tokens, Some(77));
+        assert_eq!(merged.model.label.as_deref(), Some("Hand edited"));
+    }
+
+    #[test]
+    fn metadata_load_filters_removed_models_without_requiring_whole_provider_equality() {
+        let (tree, mut provider, record) = seeded();
+        let mut added = provider.models[0].clone();
+        added.id = "new/raw".into();
+        provider.models.push(added);
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider).unwrap(),
+            vec![record]
+        );
+        provider.models.remove(0);
+        assert!(
+            load_model_provenance(tree.path(), &provider)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn metadata_endpoint_kind_provider_or_env_change_cannot_load_old_binding() {
+        let (tree, provider, _) = seeded();
+        for variant in 0..4 {
+            let mut changed = provider.clone();
+            match variant {
+                0 => changed.url.push_str("&other=scope"),
+                1 => changed.kind = "anthropic".into(),
+                2 => changed.name = "other".into(),
+                _ => changed.env = Some("ORBIT_AUTH_FRESH_SYNTHETIC".into()),
+            }
+            assert!(
+                load_model_provenance(tree.path(), &changed)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_unpublished_provider_is_refused_before_any_storage_creation() {
+        let tree = Tree::new();
+        let (provider, record) = applied();
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[record]),
+            Err(MetadataError::StaleConfig)
+        );
+        for name in ["metadata", ".setup.lock", ".config.lock"] {
+            assert!(!tree.path().join(name).exists());
+        }
+    }
+
+    #[test]
+    fn metadata_config_last_failure_preserves_previous_sidecar_and_configuration() {
+        let (tree, published, record) = seeded();
+        let old_config = fs::read(tree.path().join("providers.toml")).unwrap();
+        let old_sidecar = fs::read(sidecar(&tree, &published)).unwrap();
+        let observed = observation(&published.models[0].id, 2000, 200);
+        let merged = merge_discovered_model(
+            &published.models[0],
+            &observed,
+            Some(&record),
+            &identity(&published),
+        );
+        let mut candidate = published.clone();
+        candidate.models[0] = merged.model;
+        assert_eq!(
+            save_model_provenance(tree.path(), &candidate, &[merged.provenance.unwrap()]),
+            Err(MetadataError::StaleConfig)
+        );
+        assert_eq!(fs::read(sidecar(&tree, &published)).unwrap(), old_sidecar);
+        assert_eq!(
+            fs::read(tree.path().join("providers.toml")).unwrap(),
+            old_config
+        );
+    }
+
+    #[test]
+    fn metadata_failed_optional_save_keeps_old_provenance_conservative_after_config_update() {
+        let (tree, mut provider, old_record) = seeded();
+        provider.models[0].context_window = Some(2000);
+        publish_config(&tree, &provider);
+        let before = fs::read(sidecar(&tree, &provider)).unwrap();
+        let mut invalid = old_record.clone();
+        invalid.observed.metadata_valid = false;
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[invalid]),
+            Err(MetadataError::InvalidDocument)
+        );
+        assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+        let loaded = load_model_provenance(tree.path(), &provider).unwrap();
+        let fresh = observation(&provider.models[0].id, 3000, 200);
+        let merged = merge_discovered_model(
+            &provider.models[0],
+            &fresh,
+            loaded.first(),
+            &identity(&provider),
+        );
+        assert_eq!(merged.model.context_window, Some(2000));
+        assert_eq!(merged.model.max_output_tokens, Some(200));
+    }
+
+    #[test]
+    fn metadata_setup_lock_busy_does_not_try_to_create_config_lock_or_sidecar() {
+        let tree = Tree::new();
+        let (provider, record) = applied();
+        publish_config(&tree, &provider);
+        let root = Directory::open(tree.path(), true).unwrap();
+        let _held = Lock::acquire(&root, ".setup.lock").unwrap();
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[record]),
+            Err(MetadataError::Busy)
+        );
+        assert!(!tree.path().join(".config.lock").exists());
+        assert!(!tree.path().join("metadata").exists());
+    }
+
+    #[test]
+    fn metadata_config_lock_busy_releases_setup_lock_without_publication() {
+        let tree = Tree::new();
+        let (provider, record) = applied();
+        publish_config(&tree, &provider);
+        let root = Directory::open(tree.path(), true).unwrap();
+        let _held = Lock::acquire(&root, ".config.lock").unwrap();
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[record]),
+            Err(MetadataError::Busy)
+        );
+        let _setup_released = Lock::acquire(&root, ".setup.lock").unwrap();
+        assert!(!tree.path().join("metadata").exists());
+    }
+
+    #[test]
+    fn metadata_publication_holds_both_setup_and_config_locks() {
+        let tree = Tree::new();
+        let (provider, record) = applied();
+        publish_config(&tree, &provider);
+        let home = tree.path().to_path_buf();
+        with_test_hook(
+            move |point, _| {
+                if point == PublicationPoint::Staged {
+                    let root = Directory::open(&home, true).unwrap();
+                    assert!(matches!(
+                        Lock::acquire(&root, ".setup.lock"),
+                        Err(StorageError::Busy)
+                    ));
+                    assert!(matches!(
+                        Lock::acquire(&root, ".config.lock"),
+                        Err(StorageError::Busy)
+                    ));
+                }
+            },
+            || save_model_provenance(tree.path(), &provider, &[record]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metadata_staged_directory_substitution_preserves_previous_sidecar_bytes() {
+        let (tree, provider, record) = seeded();
+        let before = fs::read(sidecar(&tree, &provider)).unwrap();
+        let original = tree.path().join("metadata/providers");
+        let moved = tree.path().join("moved-providers");
+        let original_hook = original.clone();
+        let moved_hook = moved.clone();
+        let result = with_test_hook(
+            move |point, _| {
+                if point == PublicationPoint::Staged {
+                    fs::rename(&original_hook, &moved_hook).unwrap();
+                    use std::os::unix::fs::DirBuilderExt;
+                    fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&original_hook)
+                        .unwrap();
+                }
+            },
+            || save_model_provenance(tree.path(), &provider, &[record]),
+        );
+        assert!(matches!(
+            result,
+            Err(MetadataError::UnsafePath | MetadataError::Io)
+        ));
+        fs::remove_dir(&original).unwrap();
+        fs::rename(&moved, &original).unwrap();
+        assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+    }
+
+    #[test]
+    fn metadata_after_rename_failure_is_explicitly_uncertain() {
+        let (tree, provider, record) = seeded();
+        let original = tree.path().join("metadata/providers");
+        let moved = tree.path().join("moved-providers");
+        let original_hook = original.clone();
+        let moved_hook = moved.clone();
+        let result = with_test_hook(
+            move |point, _| {
+                if point == PublicationPoint::Published {
+                    fs::rename(&original_hook, &moved_hook).unwrap();
+                    use std::os::unix::fs::DirBuilderExt;
+                    fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&original_hook)
+                        .unwrap();
+                }
+            },
+            || save_model_provenance(tree.path(), &provider, &[record]),
+        );
+        assert_eq!(result, Err(MetadataError::PublicationUncertain));
+        fs::remove_dir(&original).unwrap();
+        fs::rename(&moved, &original).unwrap();
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn metadata_missing_or_stale_document_version_returns_empty() {
+        for document in [
+            br#"{"models":"old-shape"}"#.as_slice(),
+            br#"{"schema_version":2,"models":"future-shape"}"#.as_slice(),
+        ] {
+            let (tree, provider, _) = seeded();
+            write_private(&sidecar(&tree, &provider), document);
+            assert!(
+                load_model_provenance(tree.path(), &provider)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_stale_record_version_returns_empty_conservatively() {
+        let (tree, provider, _) = seeded();
+        mutate_document(&tree, &provider, |document| {
+            document["models"][0]["schema_version"] = 2.into()
+        });
+        assert!(
+            load_model_provenance(tree.path(), &provider)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn metadata_malformed_json_and_unknown_fields_are_safe_typed_errors() {
+        let (tree, provider, _) = seeded();
+        write_private(&sidecar(&tree, &provider), b"synthetic-secret-not-json");
+        let error = load_model_provenance(tree.path(), &provider).unwrap_err();
+        assert_eq!(error, MetadataError::InvalidDocument);
+        assert!(!format!("{error:?} {error}").contains("synthetic-secret"));
+        let (tree, provider, _) = seeded();
+        mutate_document(&tree, &provider, |document| {
+            document["models"][0]["observed"]["credential"] = "synthetic-secret".into()
+        });
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider),
+            Err(MetadataError::InvalidDocument)
+        );
+    }
+
+    #[test]
+    fn metadata_duplicate_json_fields_are_refused() {
+        let (tree, provider, _) = seeded();
+        let path = sidecar(&tree, &provider);
+        let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        let duplicate = raw.replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"schema_version\":1",
+            1,
+        );
+        write_private(&path, duplicate.as_bytes());
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider),
+            Err(MetadataError::InvalidDocument)
+        );
+    }
+
+    #[test]
+    fn metadata_duplicate_model_ids_are_refused_without_changing_old_sidecar() {
+        let (tree, provider, record) = seeded();
+        let before = fs::read(sidecar(&tree, &provider)).unwrap();
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[record.clone(), record]),
+            Err(MetadataError::InvalidDocument)
+        );
+        assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+        mutate_document(&tree, &provider, |document| {
+            let record = document["models"][0].clone();
+            document["models"].as_array_mut().unwrap().push(record);
+        });
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider),
+            Err(MetadataError::InvalidDocument)
+        );
+    }
+
+    #[test]
+    fn metadata_wrong_document_or_record_binding_is_refused() {
+        for document_binding in [true, false] {
+            let (tree, provider, _) = seeded();
+            mutate_document(&tree, &provider, |document| {
+                if document_binding {
+                    document["provider_binding"] = "wrong".into();
+                } else {
+                    document["models"][0]["provider_binding"] = "wrong".into();
+                }
+            });
+            assert_eq!(
+                load_model_provenance(tree.path(), &provider),
+                Err(MetadataError::IdentityMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_wrong_raw_identity_zero_numeric_or_inconsistent_last_applied_is_refused() {
+        for variant in 0..4 {
+            let (tree, provider, _) = seeded();
+            mutate_document(&tree, &provider, |document| match variant {
+                0 => document["models"][0]["observed"]["id"] = "different/raw".into(),
+                1 => document["models"][0]["observed"]["context_window"] = 0.into(),
+                2 => document["models"][0]["last_applied_context_window"] = 999.into(),
+                _ => document["models"][0]["observed"]["source"] = "anthropic_models".into(),
+            });
+            assert_eq!(
+                load_model_provenance(tree.path(), &provider),
+                Err(MetadataError::InvalidDocument)
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_invalid_observation_strings_counts_and_numeric_types_are_refused() {
+        for variant in 0..5 {
+            let (tree, provider, _) = seeded();
+            mutate_document(&tree, &provider, |document| match variant {
+                0 => document["models"][0]["observed"]["label"] = "unsafe\u{001b}label".into(),
+                1 => {
+                    document["models"][0]["observed"]["unrecognized_fields"] =
+                        serde_json::json!(["same", "same"])
+                }
+                2 => document["models"][0]["observed"]["max_output_tokens"] = 4294967296_u64.into(),
+                3 => document["models"][0]["observed"]["context_window"] = "1000".into(),
+                _ => {
+                    document["models"][0]["observed"]["unrecognized_fields"] =
+                        serde_json::json!(vec!["field"; 33])
+                }
+            });
+            assert_eq!(
+                load_model_provenance(tree.path(), &provider),
+                Err(MetadataError::InvalidDocument)
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_more_than_128_records_is_refused_before_publication() {
+        let (tree, provider, record) = seeded();
+        let before = fs::read(sidecar(&tree, &provider)).unwrap();
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &vec![record; 129]),
+            Err(MetadataError::LimitExceeded)
+        );
+        assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+    }
+
+    #[test]
+    fn metadata_oversized_existing_file_is_refused_without_echo_or_overwrite() {
+        let (tree, provider, record) = seeded();
+        let path = sidecar(&tree, &provider);
+        let oversized = vec![b'x'; 128 * 1024 + 1];
+        write_private(&path, &oversized);
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider),
+            Err(MetadataError::LimitExceeded)
+        );
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[record]),
+            Err(MetadataError::LimitExceeded)
+        );
+        assert_eq!(fs::read(path).unwrap(), oversized);
+    }
+
+    #[test]
+    fn metadata_serialized_document_limit_preserves_old_sidecar() {
+        let (tree, mut provider, record) = seeded();
+        let before = fs::read(sidecar(&tree, &provider)).unwrap();
+        let mut records = Vec::new();
+        for index in 0..128 {
+            let mut item = record.clone();
+            item.model_id = format!("raw-{index}");
+            item.observed.id = item.model_id.clone();
+            item.observed.unrecognized_fields = (0..32)
+                .map(|field| format!("f{field:02}{}", "x".repeat(253)))
+                .collect();
+            let mut model = provider.models[0].clone();
+            model.id = item.model_id.clone();
+            if index == 0 {
+                provider.models.clear();
+            }
+            provider.models.push(model);
+            records.push(item);
+        }
+        publish_config(&tree, &provider);
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &records),
+            Err(MetadataError::LimitExceeded)
+        );
+        assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+    }
+
+    #[test]
+    fn metadata_binding_directory_count_is_bounded() {
+        let tree = Tree::new();
+        let (provider, record) = applied();
+        publish_config(&tree, &provider);
+        let root = Directory::open(tree.path(), true).unwrap();
+        let metadata = root.child("metadata", true).unwrap();
+        let providers = metadata.child("providers", true).unwrap();
+        for index in 0..128 {
+            write_private(&providers.path().join(format!("{index:064x}.json")), b"{}");
+        }
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[record]),
+            Err(MetadataError::LimitExceeded)
+        );
+        assert!(!sidecar(&tree, &provider).exists());
+    }
+
+    #[test]
+    fn metadata_symlink_and_dangling_symlink_files_are_refused() {
+        for dangling in [false, true] {
+            let (tree, provider, record) = seeded();
+            let target = sidecar(&tree, &provider);
+            let outside = tree.path().join("outside.json");
+            if !dangling {
+                fs::rename(&target, &outside).unwrap();
+            } else {
+                fs::remove_file(&target).unwrap();
+            }
+            symlink(&outside, &target).unwrap();
+            assert_eq!(
+                load_model_provenance(tree.path(), &provider),
+                Err(MetadataError::UnsafePath)
+            );
+            assert_eq!(
+                save_model_provenance(tree.path(), &provider, &[record]),
+                Err(MetadataError::UnsafePath)
+            );
+            assert_eq!(outside.exists(), !dangling);
+        }
+    }
+
+    #[test]
+    fn metadata_hardlink_and_public_file_mode_are_refused() {
+        let (tree, provider, record) = seeded();
+        fs::hard_link(
+            sidecar(&tree, &provider),
+            tree.path().join("outside-hardlink.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider),
+            Err(MetadataError::UnsafePath)
+        );
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[record]),
+            Err(MetadataError::UnsafePath)
+        );
+        let (tree, provider, _) = seeded();
+        fs::set_permissions(sidecar(&tree, &provider), fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider),
+            Err(MetadataError::UnsafePath)
+        );
+    }
+
+    #[test]
+    fn metadata_symlink_or_public_directory_is_refused() {
+        for symlink_case in [false, true] {
+            let (tree, provider, _) = seeded();
+            let directory = tree.path().join("metadata");
+            if symlink_case {
+                let moved = tree.path().join("elsewhere");
+                fs::rename(&directory, &moved).unwrap();
+                symlink(&moved, &directory).unwrap();
+            } else {
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+            }
+            assert_eq!(
+                load_model_provenance(tree.path(), &provider),
+                Err(MetadataError::UnsafePath)
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_symlink_ancestor_and_parent_components_are_refused() {
+        let tree = Tree::new();
+        let alias = tree.path().join("alias");
+        symlink(tree.path(), &alias).unwrap();
+        assert_eq!(
+            load_model_provenance(&alias.join("missing"), &provider()),
+            Err(MetadataError::UnsafePath)
+        );
+        assert_eq!(
+            load_model_provenance(&tree.path().join("../unexpected"), &provider()),
+            Err(MetadataError::UnsafePath)
+        );
+    }
+
+    #[test]
+    fn metadata_malformed_published_config_is_typed_and_preserves_sidecar() {
+        let (tree, provider, record) = seeded();
+        let before = fs::read(sidecar(&tree, &provider)).unwrap();
+        write_private(
+            &tree.path().join("providers.toml"),
+            b"synthetic-sensitive-config-is-not-toml",
+        );
+        let error = save_model_provenance(tree.path(), &provider, &[record]).unwrap_err();
+        assert_eq!(error, MetadataError::InvalidConfig);
+        assert!(!format!("{error:?} {error}").contains("synthetic-sensitive"));
+        assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+    }
+
+    #[test]
+    fn metadata_save_refuses_symlink_hardlink_or_public_published_config() {
+        for variant in 0..3 {
+            let (tree, provider, record) = seeded();
+            let before = fs::read(sidecar(&tree, &provider)).unwrap();
+            let path = tree.path().join("providers.toml");
+            let outside = tree.path().join("outside.toml");
+            match variant {
+                0 => {
+                    fs::rename(&path, &outside).unwrap();
+                    symlink(&outside, &path).unwrap();
+                }
+                1 => fs::hard_link(&path, &outside).unwrap(),
+                _ => fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap(),
+            }
+            assert_eq!(
+                save_model_provenance(tree.path(), &provider, &[record]),
+                Err(MetadataError::UnsafePath)
+            );
+            assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn metadata_save_accepts_unrelated_config_changes_and_does_not_rewrite_config() {
+        let (tree, provider, record) = seeded();
+        let mut unrelated = provider.clone();
+        unrelated.name = "unrelated".into();
+        unrelated.models[0].id = "other/raw".into();
+        let config = ProvidersConfig {
+            provider: vec![provider.clone(), unrelated],
+            ..Default::default()
+        };
+        let bytes = toml::to_string(&config).unwrap().into_bytes();
+        write_private(&tree.path().join("providers.toml"), &bytes);
+        save_model_provenance(tree.path(), &provider, &[record]).unwrap();
+        assert_eq!(fs::read(tree.path().join("providers.toml")).unwrap(), bytes);
+    }
+}

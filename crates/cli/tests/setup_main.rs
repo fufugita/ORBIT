@@ -1,7 +1,9 @@
 #![cfg(target_os = "linux")]
 
 // Compile the publication hook locally to exercise failures after config replacement.
-pub use orbit_cli::{config, phase_routing, presets, profile_commands, tool_runtime};
+pub use orbit_cli::{
+    config, phase_routing, presets, profile_commands, provider_discovery, tool_runtime,
+};
 #[path = "../src/customization.rs"]
 #[allow(dead_code)]
 mod customization;

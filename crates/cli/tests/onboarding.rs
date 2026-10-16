@@ -188,7 +188,11 @@ fn commit_missing_env_keeps_actionable_reference_without_inventing_auth() {
         Some("FIXTURE_ONBOARDING_ABSENT")
     );
     assert!(!f.home.join("auth").exists());
-    assert!(terminal.output.contains("Connectivity: not tested"));
+    assert!(
+        terminal
+            .output
+            .contains("Completion connectivity: not tested")
+    );
 }
 
 #[test]

@@ -170,6 +170,22 @@ fn print_human_help() {
         ("theme NAME", "select orbit, midnight or paper"),
         ("models", "list models from all configured providers"),
         (
+            "provider add/list/remove/role/presets",
+            "configure providers without sending a prompt",
+        ),
+        (
+            "provider refresh NAME [--schema SCHEMA] [--json]",
+            "explicitly refresh advertised model metadata",
+        ),
+        (
+            "provider login NAME [--method browser|key|env]",
+            "save provider authentication after review",
+        ),
+        (
+            "provider logout NAME [--yes] [--json]",
+            "remove only the current saved local key",
+        ),
+        (
             "route status/test/setup/set/reset",
             "configure or preview phase and difficulty routing",
         ),
@@ -209,10 +225,23 @@ fn print_human_help() {
     println!();
     println!("SETUP:");
     println!(
-        "    orbit setup                                 choose a provider, hidden key or ENV, models and default"
+        "    orbit setup                                 choose a provider, authentication, models and default"
     );
     println!(
         "    orbit provider add                          add another provider with the same wizard"
+    );
+    println!("    Model source: manual makes no request; discover fetches a filterable catalog.");
+    println!(
+        "    Refresh schema: generic, openrouter, anthropic or ollama; existing manual limits stay authoritative."
+    );
+    println!(
+        "    Browser login: supported OpenRouter endpoint only. Other providers accept key or ENV."
+    );
+    println!(
+        "    Login --no-browser: open the authorization URL manually; --headless: privately paste the displayed code."
+    );
+    println!(
+        "    Login is terminal-only; logout needs --yes for JSON or redirected use. No key is accepted in argv."
     );
     println!(
         "    orbit setup --no-provider [--json]           offline identity setup for automation"
@@ -380,7 +409,11 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "mod allow-issuer <hex-key>       trust a mod issuer",
                 "plugin inspect PATH [--format FORMAT]  inspect local plugin components",
                 "folder trust|untrust|status [DIR]  trust a folder's own settings",
-                "provider add|list|remove|presets    manage model providers",
+                "provider add|list|remove|role|presets    manage model providers",
+                "setup model source manual|discover    offline entry or explicit filterable catalog",
+                "provider refresh NAME [--schema generic|openrouter|anthropic|ollama] [--json]",
+                "provider login NAME [--method browser|key|env] [--headless] [--no-browser]  terminal only",
+                "provider logout NAME [--yes] [--json]  current local binding only; ENV/config/defaults preserved",
                 "web           start the browser harness (orbit-web bridge)"
             ]
         })),
@@ -472,12 +505,13 @@ fn run_onboarding_command(
         .map_err(|error| (error.code(), error.to_string()))?;
     let receipt = orbit_cli::onboarding::run_onboarding(home, preset, &mut terminal)
         .map_err(|error| (error.code(), error.to_string()))?;
+    let offline = receipt.catalog_status == "not_requested" && !receipt.authentication_online;
     let mut result = serde_json::to_value(receipt)
         .map_err(|_| ("ORBIT-E1101", "setup result could not be encoded".into()))?;
     result["schema"] = serde_json::json!("orbit.cli/v1");
     result["command"] = serde_json::json!(command);
     result["status"] = serde_json::json!("ok");
-    result["offline"] = serde_json::json!(true);
+    result["offline"] = serde_json::json!(offline);
     Ok(result)
 }
 
@@ -3539,8 +3573,231 @@ fn cmd_route(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'stati
     Ok(result)
 }
 
+fn provider_refresh_arguments(
+    args: &[String],
+) -> Result<
+    (
+        String,
+        Option<orbit_cli::provider_discovery::DiscoveryProfile>,
+    ),
+    (&'static str, String),
+> {
+    use orbit_cli::provider_discovery::DiscoveryProfile;
+    let tail = command_tail(args)?;
+    let invalid = || {
+        (
+            "ORBIT-E1101",
+            "usage: provider refresh NAME [--schema generic|openrouter|anthropic|ollama] [--json]"
+                .to_owned(),
+        )
+    };
+    if tail.first().map(String::as_str) != Some("refresh")
+        || tail.len() > 6
+        || tail.iter().map(String::len).sum::<usize>() > 4096
+        || tail.iter().any(|arg| arg.contains('\0'))
+    {
+        return Err(invalid());
+    }
+    let (mut name, mut schema, mut json) = (None, None, false);
+    let mut index = 1;
+    while index < tail.len() {
+        match tail[index].as_str() {
+            "--json" if !json => json = true,
+            "--schema" if schema.is_none() => {
+                index += 1;
+                schema = Some(match tail.get(index).map(String::as_str) {
+                    Some("generic") => DiscoveryProfile::GenericOpenAi,
+                    Some("openrouter") => DiscoveryProfile::OpenRouter,
+                    Some("anthropic") => DiscoveryProfile::Anthropic,
+                    Some("ollama") => DiscoveryProfile::Ollama,
+                    _ => return Err(invalid()),
+                });
+            }
+            value
+                if name.is_none()
+                    && !value.starts_with('-')
+                    && !value.is_empty()
+                    && value.len() <= 128
+                    && value.trim() == value
+                    && !value.contains('/')
+                    && !value.chars().any(char::is_control) =>
+            {
+                name = Some(value.to_owned())
+            }
+            _ => return Err(invalid()),
+        }
+        index += 1;
+    }
+    Ok((name.ok_or_else(invalid)?, schema))
+}
+
+enum ProviderCredentialCommand {
+    Login {
+        name: String,
+        request: orbit_cli::onboarding::ProviderLoginRequest,
+    },
+    Logout {
+        name: String,
+        yes: bool,
+    },
+}
+fn provider_credential_subcommand(tail: &[String]) -> Option<&str> {
+    let index = usize::from(tail.first().map(String::as_str) == Some("--json"));
+    tail.get(index)
+        .map(String::as_str)
+        .filter(|word| matches!(*word, "login" | "logout"))
+}
+fn provider_credential_arguments(
+    args: &[String],
+) -> Result<ProviderCredentialCommand, (&'static str, String)> {
+    use orbit_cli::onboarding::provider_login::LoginMode;
+    use orbit_cli::onboarding::{ProviderLoginMethod, ProviderLoginRequest};
+    let tail = command_tail(args)?;
+    let invalid = || {
+        ("ORBIT-E1101", "usage: provider login NAME [--method browser|key|env] [--headless] [--no-browser]; provider logout NAME [--yes] [--json]".to_owned())
+    };
+    if tail.len() > 9
+        || tail.iter().map(String::len).sum::<usize>() > 4096
+        || tail.iter().any(|word| word.contains('\0'))
+    {
+        return Err(invalid());
+    }
+    let sub = provider_credential_subcommand(&tail).ok_or_else(invalid)?;
+    let mut flags = std::collections::BTreeSet::new();
+    let (mut name, mut method) = (None, None);
+    let (mut headless, mut no_browser, mut yes) = (false, false, false);
+    let mut index = 0;
+    while index < tail.len() {
+        let word = tail[index].as_str();
+        if word == sub && (index == 0 || (index == 1 && tail[0] == "--json")) {
+            index += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            if !flags.insert(word) {
+                return Err(invalid());
+            }
+            match word {
+                "--json" if sub == "logout" => {}
+                "--yes" if sub == "logout" => yes = true,
+                "--headless" if sub == "login" => headless = true,
+                "--no-browser" if sub == "login" => no_browser = true,
+                "--method" if sub == "login" => {
+                    index += 1;
+                    method = Some(match tail.get(index).map(String::as_str) {
+                        Some("browser") => ProviderLoginMethod::Browser,
+                        Some("key") => ProviderLoginMethod::Key,
+                        Some("env") => ProviderLoginMethod::Env,
+                        _ => return Err(invalid()),
+                    });
+                }
+                _ => return Err(invalid()),
+            }
+        } else if name.is_none()
+            && !word.is_empty()
+            && word.len() <= 128
+            && word.trim() == word
+            && !word.contains('/')
+            && !word.chars().any(char::is_control)
+        {
+            name = Some(word.to_owned());
+        } else {
+            return Err(invalid());
+        }
+        index += 1;
+    }
+    let name = name.ok_or_else(invalid)?;
+    if sub == "logout" {
+        if flags.contains("--json") && !yes {
+            return Err(invalid());
+        }
+        Ok(ProviderCredentialCommand::Logout { name, yes })
+    } else {
+        if (headless || no_browser)
+            && method.is_some_and(|method| method != ProviderLoginMethod::Browser)
+        {
+            return Err(invalid());
+        }
+        if headless || no_browser {
+            method = Some(ProviderLoginMethod::Browser);
+        }
+        Ok(ProviderCredentialCommand::Login {
+            name,
+            request: ProviderLoginRequest {
+                method,
+                mode: if headless {
+                    LoginMode::Headless
+                } else {
+                    LoginMode::Loopback
+                },
+                open_browser: !headless && !no_browser,
+            },
+        })
+    }
+}
+fn cmd_provider_credentials(
+    home: &Path,
+    args: &[String],
+) -> Result<serde_json::Value, (&'static str, String)> {
+    use orbit_cli::onboarding::{
+        StdSetupTerminal, collect_provider_login, commit_onboarding, commit_provider_logout,
+        confirm_provider_logout, plan_provider_logout,
+    };
+    let (mut result, command, offline) = match provider_credential_arguments(args)? {
+        ProviderCredentialCommand::Login { name, request } => {
+            let mut terminal =
+                StdSetupTerminal::new().map_err(|error| (error.code(), error.to_string()))?;
+            let draft = collect_provider_login(home, &name, &request, &mut terminal)
+                .map_err(|error| (error.code(), error.to_string()))?;
+            let receipt =
+                commit_onboarding(draft).map_err(|error| (error.code(), error.to_string()))?;
+            let offline = !receipt.authentication_online;
+            let result = serde_json::to_value(receipt).map_err(|_| {
+                (
+                    "ORBIT-E1101",
+                    "login result could not be encoded".to_owned(),
+                )
+            })?;
+            (result, "provider login", offline)
+        }
+        ProviderCredentialCommand::Logout { name, yes } => {
+            let mut terminal = if yes {
+                None
+            } else {
+                Some(StdSetupTerminal::new().map_err(|error| (error.code(), error.to_string()))?)
+            };
+            let plan = plan_provider_logout(home, &name)
+                .map_err(|error| (error.code(), error.to_string()))?;
+            let receipt = if let Some(terminal) = &mut terminal {
+                confirm_provider_logout(plan, terminal)
+            } else {
+                commit_provider_logout(plan)
+            }
+            .map_err(|error| (error.code(), error.to_string()))?;
+            let result = serde_json::to_value(receipt).map_err(|_| {
+                (
+                    "ORBIT-E1101",
+                    "logout result could not be encoded".to_owned(),
+                )
+            })?;
+            (result, "provider logout", true)
+        }
+    };
+    result["schema"] = serde_json::json!("orbit.cli/v1");
+    result["command"] = serde_json::json!(command);
+    result["status"] = serde_json::json!("ok");
+    result["offline"] = serde_json::json!(offline);
+    Ok(result)
+}
+
 fn validate_provider_arguments(args: &[String]) -> Result<(), (&'static str, String)> {
     let tail = command_tail(args)?;
+    if provider_credential_subcommand(&tail).is_some() {
+        return provider_credential_arguments(args).map(|_| ());
+    }
+    if tail.first().map(String::as_str) == Some("refresh") {
+        return provider_refresh_arguments(args).map(|_| ());
+    }
     let positions = positionals(args);
     let sub = positions.get(1).copied().unwrap_or("list");
     let mut flags = std::collections::BTreeSet::new();
@@ -3586,9 +3843,26 @@ fn validate_provider_arguments(args: &[String]) -> Result<(), (&'static str, Str
 }
 fn cmd_provider(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
     validate_provider_arguments(args)?;
+    if provider_credential_subcommand(&command_tail(args)?).is_some() {
+        return cmd_provider_credentials(home, args);
+    }
     let pos = positionals(args);
     let sub = pos.get(1).copied().unwrap_or("list");
     match sub {
+        "refresh" => {
+            let (name, schema) = provider_refresh_arguments(args)?;
+            let draft = orbit_cli::onboarding::prepare_provider_refresh_auto(home, &name, schema)
+                .map_err(|error| (error.code(), error.to_string()))?;
+            let receipt = orbit_cli::onboarding::commit_provider_refresh(draft)
+                .map_err(|error| (error.code(), error.to_string()))?;
+            let mut result = serde_json::to_value(receipt)
+                .map_err(|_| ("ORBIT-E1101", "refresh result could not be encoded".into()))?;
+            result["schema"] = serde_json::json!("orbit.cli/v1");
+            result["command"] = serde_json::json!("provider refresh");
+            result["status"] = serde_json::json!("ok");
+            result["offline"] = serde_json::json!(false);
+            Ok(result)
+        }
         "presets" => {
             let list: Vec<serde_json::Value> = orbit_cli::presets::presets()
                 .into_iter()
@@ -5368,5 +5642,150 @@ mod provider_wizard_tests {
         assert!(
             matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_credential_parser_tests {
+    use super::*;
+    use orbit_cli::onboarding::{ProviderLoginMethod, provider_login::LoginMode};
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn login_parser_preserves_name_and_distinguishes_private_browser_modes() {
+        let value = args(&[
+            "provider",
+            "login",
+            "custom provider",
+            "--headless",
+            "--no-browser",
+        ]);
+        validate_provider_arguments(&value).unwrap();
+        let ProviderCredentialCommand::Login { name, request } =
+            provider_credential_arguments(&value).unwrap()
+        else {
+            panic!("login expected");
+        };
+        assert_eq!(name, "custom provider");
+        assert_eq!(request.method, Some(ProviderLoginMethod::Browser));
+        assert_eq!(request.mode, LoginMode::Headless);
+        assert!(!request.open_browser);
+        let ProviderCredentialCommand::Login { request, .. } =
+            provider_credential_arguments(&args(&[
+                "provider", "login", "login", "--method", "key",
+            ]))
+            .unwrap()
+        else {
+            panic!("login expected");
+        };
+        assert_eq!(request.method, Some(ProviderLoginMethod::Key));
+    }
+
+    #[test]
+    fn logout_parser_requires_explicit_yes_for_redirected_json() {
+        for words in [
+            vec!["provider", "logout", "p", "--yes", "--json"],
+            vec!["--json", "provider", "logout", "p", "--yes"],
+        ] {
+            let ProviderCredentialCommand::Logout { name, yes } =
+                provider_credential_arguments(&args(&words)).unwrap()
+            else {
+                panic!("logout expected");
+            };
+            assert_eq!(name, "p");
+            assert!(yes);
+        }
+        assert!(
+            provider_credential_arguments(&args(&["provider", "logout", "p", "--json"])).is_err()
+        );
+    }
+
+    #[test]
+    fn credential_parser_refuses_duplicate_unknown_incomplete_and_conflicting_flags() {
+        for words in [
+            vec!["provider", "login"],
+            vec!["provider", "login", "p", "q"],
+            vec!["provider", "login", "p", "--method"],
+            vec!["provider", "login", "p", "--method", "unknown"],
+            vec!["provider", "login", "p", "--method", "key", "--headless"],
+            vec!["provider", "login", "p", "--method", "env", "--no-browser"],
+            vec![
+                "provider", "login", "p", "--method", "key", "--method", "key",
+            ],
+            vec!["provider", "login", "p", "--headless", "--headless"],
+            vec!["provider", "login", "p", "--json"],
+            vec!["--json", "provider", "login", "p"],
+            vec!["provider", "login", "p", "--api-key", "private"],
+            vec!["provider", "logout", "p", "--yes", "--yes"],
+            vec!["provider", "logout", "p", "--method", "key"],
+            vec!["provider", "logout", "p", "--unknown"],
+            vec!["provider", "logout", "p/q", "--yes"],
+        ] {
+            assert!(validate_provider_arguments(&args(&words)).is_err());
+        }
+    }
+
+    #[test]
+    fn offline_provider_commands_accept_credential_words_as_ordinary_operands() {
+        for words in [
+            vec!["provider", "remove", "login"],
+            vec!["provider", "role", "main", "logout"],
+            vec!["provider", "add", "custom", "--model", "login"],
+            vec!["provider", "list", "--json"],
+        ] {
+            validate_provider_arguments(&args(&words)).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_refresh_parser_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_parser_preserves_exact_name_and_schema() {
+        let args = [
+            "provider",
+            "refresh",
+            "--schema",
+            "openrouter",
+            "custom provider",
+            "--json",
+        ]
+        .map(str::to_owned);
+        let (name, schema) = provider_refresh_arguments(&args).unwrap();
+        assert_eq!(name, "custom provider");
+        assert_eq!(
+            schema,
+            Some(orbit_cli::provider_discovery::DiscoveryProfile::OpenRouter)
+        );
+        validate_provider_arguments(&args).unwrap();
+    }
+
+    #[test]
+    fn refresh_parser_refuses_ambiguous_or_incomplete_flags_before_lookup() {
+        for tail in [
+            vec!["provider", "refresh"],
+            vec!["provider", "refresh", "p", "q"],
+            vec!["provider", "refresh", "p", "--schema"],
+            vec!["provider", "refresh", "p", "--schema", "unknown"],
+            vec!["provider", "refresh", "p", "--json", "--json"],
+            vec![
+                "provider", "refresh", "p", "--schema", "generic", "--schema", "generic",
+            ],
+            vec![
+                "provider",
+                "refresh",
+                "p",
+                "--url",
+                "https://example.invalid",
+            ],
+            vec!["provider", "refresh", "p/q"],
+        ] {
+            let args: Vec<String> = tail.into_iter().map(str::to_owned).collect();
+            assert!(validate_provider_arguments(&args).is_err());
+        }
     }
 }

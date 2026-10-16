@@ -48,12 +48,12 @@ orbit doctor
 
 Plain `orbit setup` opens a provider wizard when both input and output are
 terminals. Choose a preset or custom provider name, adapter and base URL, then
-choose a hidden API key, a credential ENV reference, or explicit no-auth for a
-custom/local provider. Enter exact raw model IDs, optionally choose the main
-default, review the summary and type `yes` to save. `orbit provider add` opens the
-same wizard for another provider. Manual model entry sends no provider requests.
-Online catalog selection, refresh and browser login are not wired into this flow
-yet.
+choose a hidden API key, a credential ENV reference, supported browser sign-in,
+or explicit no-auth for a custom/local provider. Choose manual model IDs or online discovery, optionally
+choose the main default, review the summary and type `yes` to save.
+`orbit provider add` opens the same wizard for another provider. Manual model
+entry with API-key/ENV/no-auth authentication sends no provider requests. Browser
+sign-in and online model discovery contact their selected provider.
 
 Hidden keys are stored in owned private files under the selected home's
 `auth/providers` directory. Public provider configuration contains a generated
@@ -114,6 +114,112 @@ An explicit model flag, environment selection, or `/model` pins a session.
 `/route auto` clears that pin in a live session. A stopped saved session can be
 changed with `orbit route auto --session SESSION_ID`. Queries and settings do not
 send provider requests.
+
+## Sign in and remove a saved key
+
+For a provider already in `providers.toml`, run:
+
+```sh
+orbit provider login work
+```
+
+Choose an API key, ENV reference, or supported browser sign-in. The command
+requires terminal input and output and shows a summary before saving. It keeps
+your models, limits, routing and main default. API-key and ENV choices also work
+with custom provider names and endpoints:
+
+```sh
+orbit provider login work --method key
+orbit provider login work --method env
+```
+
+Browser sign-in is available for the official OpenRouter API endpoint,
+`https://openrouter.ai/api/v1`, regardless of your chosen provider name. Selecting
+a custom endpoint with that name does not enable OpenRouter login. The provider
+asks for consent in your browser, returns a code to ORBIT's temporary local
+callback, and exchanges it for an API key using S256 PKCE. Review and confirm the
+local save afterward. The key stays private; ORBIT does not import another
+application's account files.
+
+Use these browser options when needed:
+
+```sh
+orbit provider login work --method browser --no-browser
+orbit provider login work --headless --no-browser
+```
+
+`--no-browser` prints the authorization URL for you to open manually. It retains
+the local callback unless you also select `--headless`. Headless mode uses the
+provider's code flow: open the URL, then paste the returned authorization code
+into ORBIT's hidden prompt. The code is tied to that login attempt. Authorization
+and exchange have a ten-minute deadline; canceling closes the listener and leaves the
+previous local configuration and credential intact. A code exchange is attempted
+once; an uncertain or refused exchange requires a new login.
+
+To remove the private key for the provider's current exact binding:
+
+```sh
+orbit provider logout work
+orbit provider logout work --yes --json
+```
+
+Interactive logout asks for confirmation; `--yes` explicitly permits removal
+without that prompt. Logout preserves providers, models, defaults and ENV values.
+An active ENV override can therefore still authenticate requests afterward, and
+the result reports that source. This removes ORBIT's local key copy; use the
+provider's own account controls to revoke an issued API key. Older unselected
+credential bindings are not automatically pruned.
+
+## Discover models and refresh limits
+
+In the setup wizard, choose `discover` at **Model source**. ORBIT fetches the
+selected provider's catalog with the credential shown in the wizard. Choose
+comma-separated model numbers, use `next` or `prev` to browse, and use
+`filter TEXT` to find an ID or label. `filter` clears the filter. Enter `manual`
+to supply raw IDs yourself, or `cancel` to leave without saving. A selection
+supports up to 128 distinct models.
+
+A complete catalog and successful completions are separate checks. If the
+catalog is partial, ORBIT asks before using its partial results. An unavailable
+catalog offers manual entry. Context and output limits are used only when the
+provider advertises valid values; names do not imply a context size. Missing
+information stays unknown. Ollama's advertised architectural context is not a
+measurement of the context configured in a running local model.
+
+Discovery supports OpenAI-compatible lists, OpenRouter catalogs, Anthropic
+catalogs/details and Ollama tags. A custom OpenAI-compatible endpoint
+asks whether its catalog uses the generic or OpenRouter schema. Raw model IDs,
+including slashes, are preserved exactly. The catalog/detail operation has a
+shared 45-second budget and bounded pagination, response sizes and concurrency.
+
+Refresh metadata for the models already declared under one provider:
+
+```sh
+orbit provider refresh work
+orbit provider refresh work --schema openrouter
+orbit provider refresh work --json
+```
+
+The optional `--schema` accepts `generic`, `openrouter`, `anthropic` or `ollama`.
+Declared adapter kind selects the default; custom OpenAI-compatible endpoints
+use the generic schema unless their exact binding has recorded OpenRouter
+provenance. Use an explicit schema when your custom gateway needs another
+supported catalog format. Refresh makes network requests; `provider list`,
+`models` and `doctor` do not.
+
+Refresh preserves model membership, manual limit overrides, effort controls,
+pricing, sampling and unrelated providers and roles. Provider observations are
+recorded separately under the selected home's private `metadata/providers`
+directory. If metadata history is missing or invalid, existing explicit limits
+are preserved. An optional metadata-save warning can follow a successful
+provider save; review that warning before relying on later refreshes. A provider
+change during fetching is refused rather than overwriting the newer settings.
+
+Hidden-key setup normally creates a fresh credential reference. The advanced
+`key-env` choice lets you name that reference yourself and still store a key
+privately. A nonempty value in that exact ENV takes precedence over the saved
+key during discovery and later requests. Use ordinary `key` when you do not
+need a deliberate ENV override.
 
 ## Read readiness accurately
 

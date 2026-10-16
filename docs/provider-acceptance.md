@@ -4,16 +4,19 @@ Run this checklist with a disposable home and project before using ORBIT on an
 engagement. Local fixture checks establish the harness's behavior; this trial
 checks your actual endpoints, credentials, model capabilities, and terminal.
 
-Keep credential values in your shell or secret manager. Provider configuration
-contains only their environment-variable names. Use the exact model IDs your
-provider accepts, including any slash characters.
+Use the hidden-key prompt to save a key privately, or keep it in your shell or
+secret manager and configure its ENV reference. Public provider configuration
+contains references, never key values. Use the exact model IDs your provider
+accepts, including any slash characters.
 
 ## Start with one provider
 
 1. Run `orbit setup`, then `orbit doctor`. Resolve required checks first. A
    configured integration marked `not_tested` still needs its own connection test.
-2. Declare one inexpensive model and its endpoint. Check `orbit provider list`
-   and `orbit route status` before sending a prompt.
+2. Choose one inexpensive model and its endpoint in setup. Use discovery if
+   supported, or enter its raw ID manually. Check `orbit provider list`,
+   `orbit models` and `orbit route status` before sending a prompt. Reopen a
+   fresh shell and confirm `orbit` uses your saved main default without flags.
 3. Start a session with `orbit chat --model provider/model`. Ask for one short
    reply. Check the displayed provider, model, usage, and cost. Configured prices
    are estimates; compare usage with the provider's account page.

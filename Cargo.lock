@@ -2491,6 +2491,7 @@ name = "orbit-cli"
 version = "0.2.0"
 dependencies = [
  "age",
+ "base64",
  "ed25519-dalek",
  "hex",
  "libc",

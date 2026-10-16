@@ -81,9 +81,11 @@ terminals. It walks you through:
 
 1. **Provider and endpoint:** choose a preset, or choose `custom` and enter a name,
    adapter kind, and your provider's base URL.
-2. **Authentication:** enter an API key in the hidden prompt to save it privately,
-   name an environment variable, or choose explicit no-auth for a custom/local provider.
-3. **Models:** enter exact raw model IDs manually, including any slashes in the ID.
+2. **Authentication:** enter a hidden API key, name an environment variable, or
+   use browser sign-in for the supported OpenRouter endpoint. Custom/local
+   providers can also use explicit no-auth.
+3. **Models:** choose `discover` to fetch the catalog, filter it and select model
+   numbers, or enter exact raw IDs manually, including any slashes in the ID.
 4. **Default and save:** optionally select the main model, review the complete
    summary, and type `yes` to save.
 
@@ -93,8 +95,8 @@ requires a separate confirmation. Canceling, declining, or reaching EOF before
 commit leaves existing configuration and credentials intact.
 
 `orbit doctor` checks local readiness without contacting providers or starting
-integration servers. Setup reports credential presence and leaves connectivity
-untested; your first prompt makes the provider request. Conversation and tool
+integration servers. Setup reports credential presence and leaves completion
+connectivity untested; your first prompt makes a completion request. Conversation and tool
 context are sent to the provider you select.
 
 To add another provider, use the same wizard:
@@ -105,8 +107,33 @@ orbit provider list
 orbit models
 ```
 
-Manual model entry and API-key/ENV/no-auth setup are available now. Online catalog
-selection, model refresh, and browser login are not part of this setup flow yet.
+Model discovery contacts only the provider you selected. Catalog access does not
+establish that a completion will succeed. If discovery fails or is incomplete,
+you can use manual IDs; missing context and output limits remain unknown.
+
+Refresh advertised limits for the models you already configured:
+
+```sh
+orbit provider refresh work
+```
+
+Refresh preserves manually overridden limits, model IDs and routing choices.
+It does not add every model in the catalog. `provider list`, `models`
+and `doctor` stay offline. See [discovery and refresh](docs/setup.md#discover-models-and-refresh-limits)
+for catalog controls and custom provider schemas.
+
+For an existing provider, choose how to sign in:
+
+```sh
+orbit provider login work
+orbit provider login work --method key
+```
+
+The browser flow is currently supported for OpenRouter's official API endpoint.
+Use `--no-browser` to open its URL yourself, or `--headless` for its hidden code
+flow when a local browser callback is unavailable. Other endpoints can use an
+API key or ENV reference. See [provider sign-in](docs/setup.md#sign-in-and-remove-a-saved-key)
+for the complete flow and local logout.
 
 ### Where configuration lives
 
