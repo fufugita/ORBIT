@@ -230,6 +230,7 @@ fn observed(id: &str) -> DiscoveredModel {
         source: MetadataSource::OpenRouterModels,
         metadata_valid: true,
         unrecognized_fields: vec![],
+        evidence: None,
     }
 }
 fn declared(id: &str) -> ModelEntry {
@@ -999,4 +1000,144 @@ async fn production_discovery_runtime_is_scoped_outside_an_existing_tokio_runtim
     assert_eq!(server.count.load(Ordering::SeqCst), 1);
     drop(draft);
     drop(server);
+}
+
+fn seeded_manual_policy_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    let mut configured = provider(vec![declared("family/raw")]);
+    configured.models[0].context_window = None;
+    let id = ProviderAuthIdentity::new(
+        &configured.name,
+        &configured.kind,
+        &configured.url,
+        configured.env.as_deref(),
+    )
+    .unwrap();
+    let mut first_observation = serde_json::to_value(observed("family/raw")).unwrap();
+    let context = first_observation["context_window"].clone();
+    let output = first_observation["max_output_tokens"].clone();
+    let source = first_observation["source"].clone();
+    first_observation["evidence"] = serde_json::json!({
+        "context_limit": {
+            "value": context, "observed_at_unix": 111, "source": source,
+            "schema": "open_router_models_fields_v1", "semantics": "unspecified",
+            "confidence": "advertised_unspecified"
+        },
+        "output_limit": {
+            "value": output, "observed_at_unix": 222, "source": source,
+            "schema": "open_router_models_fields_v1", "semantics": "unspecified",
+            "confidence": "advertised_unspecified"
+        }
+    });
+    let first_observation: DiscoveredModel = serde_json::from_value(first_observation).unwrap();
+    let first = merge_discovered_model(&configured.models[0], &first_observation, None, &id);
+    configured.models[0] = first.model;
+    fixture.seed(configured.clone());
+    save_model_provenance(&fixture.home, &configured, &[first.provenance.unwrap()]).unwrap();
+    configured.models[0].context_window = Some(77777);
+    let config = ProvidersConfig {
+        provider: vec![configured],
+        ..Default::default()
+    };
+    config.save_atomic(&fixture.home).unwrap();
+    let mut next = observed("family/raw");
+    next.context_window = Some(64000);
+    let mut factory = Factory::new(vec![next]);
+    let draft = prepare_provider_refresh_with_discovery(
+        &fixture.home,
+        "fixture",
+        DiscoveryProfile::OpenRouter,
+        &mut factory,
+    )
+    .unwrap();
+    let receipt = commit_provider_refresh(draft).unwrap();
+    assert_eq!(receipt.metadata_saved, Some(true));
+    let configured = fixture.config();
+    let provider = &configured.provider[0];
+    let record = load_model_provenance(&fixture.home, provider)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        serde_json::to_value(record).unwrap()["manual_input_tokens"],
+        77777,
+        "refresh must persist the exact configured manual input policy"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            load_model_provenance(&fixture.home, provider)
+                .unwrap()
+                .remove(0)
+        )
+        .unwrap()["observed"]["evidence"]["output_limit"]["observed_at_unix"],
+        222,
+        "the caller fixture must retain actual historical evidence before testing preservation"
+    );
+    fixture
+}
+
+#[test]
+fn refresh_invalid_or_unfetched_observation_preserves_existing_manual_policy_receipt() {
+    for missing_catalog_id in [false, true] {
+        let fixture = seeded_manual_policy_fixture();
+        let before_provider = fixture.config().provider.remove(0);
+        let before = load_model_provenance(&fixture.home, &before_provider).unwrap();
+        let mut invalid = observed("family/raw");
+        invalid.metadata_valid = false;
+        let mut factory = Factory::new(if missing_catalog_id {
+            vec![]
+        } else {
+            vec![invalid]
+        });
+        let draft = prepare_provider_refresh_with_discovery(
+            &fixture.home,
+            "fixture",
+            DiscoveryProfile::OpenRouter,
+            &mut factory,
+        )
+        .unwrap();
+        let receipt = commit_provider_refresh(draft).unwrap();
+        assert_eq!(receipt.metadata_saved, Some(true));
+        assert_eq!(receipt.connectivity, "not_tested");
+        let after_provider = fixture.config().provider.remove(0);
+        assert_eq!(after_provider.models[0].context_window, Some(77777));
+        let after = load_model_provenance(&fixture.home, &after_provider).unwrap();
+        assert_eq!(
+            after, before,
+            "merge refusal must retain the original record and its ages/policy"
+        );
+        assert_eq!(
+            serde_json::to_value(&after[0]).unwrap()["manual_input_tokens"],
+            77777
+        );
+    }
+}
+
+#[test]
+fn refresh_valid_absent_context_retains_manual_policy_separately_from_new_numeric_observation() {
+    let fixture = seeded_manual_policy_fixture();
+    let mut next = observed("family/raw");
+    next.context_window = None;
+    next.max_output_tokens = Some(8000);
+    let mut factory = Factory::new(vec![next]);
+    let draft = prepare_provider_refresh_with_discovery(
+        &fixture.home,
+        "fixture",
+        DiscoveryProfile::OpenRouter,
+        &mut factory,
+    )
+    .unwrap();
+    let receipt = commit_provider_refresh(draft).unwrap();
+    assert_eq!(receipt.metadata_saved, Some(true));
+    let provider = fixture.config().provider.remove(0);
+    assert_eq!(provider.models[0].context_window, Some(77777));
+    assert_eq!(provider.models[0].max_output_tokens, Some(8000));
+    let record = load_model_provenance(&fixture.home, &provider)
+        .unwrap()
+        .remove(0);
+    assert_eq!(record.observed.context_window, None);
+    assert_eq!(record.last_applied_context_window, None);
+    assert_eq!(
+        serde_json::to_value(&record).unwrap()["manual_input_tokens"],
+        77777
+    );
 }

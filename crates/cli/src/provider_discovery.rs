@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
@@ -34,7 +35,7 @@ pub const MAX_SELECTED_MODELS: usize = 128;
 pub const MAX_DETAIL_CONCURRENCY: usize = 4;
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-pub const PROVENANCE_VERSION: u32 = 1;
+pub const PROVENANCE_VERSION: u32 = 2;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_UNKNOWN_FIELDS: usize = 32;
@@ -80,6 +81,68 @@ impl MetadataSource {
     }
 }
 
+/// Bounded evidence about fields actually returned by a validated fetch.
+/// Its age is independent of local saves and last-applied field ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<LimitObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_limit: Option<LimitObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitObservation {
+    pub value: u64,
+    pub observed_at_unix: u64,
+    pub source: MetadataSource,
+    pub schema: ObservationSchema,
+    pub semantics: LimitSemantics,
+    pub confidence: ObservationConfidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObservationSchema {
+    #[serde(rename = "anthropic_models_2023_06_01")]
+    AnthropicModels20230601,
+    #[serde(rename = "open_router_models_fields_v1")]
+    OpenRouterModelsFieldsV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitSemantics {
+    InputTokens,
+    CombinedTokens,
+    OutputTokens,
+    Unspecified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationConfidence {
+    DocumentedLimit,
+    AdvertisedUnspecified,
+}
+
+/// Wall-clock evidence only. Monotonic request deadlines use their own clock.
+pub trait ObservationClock: Send + Sync {
+    fn unix_seconds(&self) -> Option<u64>;
+}
+
+struct SystemObservationClock;
+
+impl ObservationClock for SystemObservationClock {
+    fn unix_seconds(&self) -> Option<u64> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredModel {
     /// Exact provider identity; display escaping must never change selection.
@@ -92,6 +155,8 @@ pub struct DiscoveredModel {
     pub metadata_valid: bool,
     /// Unknown values are deliberately not retained or made authoritative.
     pub unrecognized_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ObservationEvidence>,
 }
 
 impl DiscoveredModel {
@@ -131,6 +196,7 @@ pub enum DiscoveryIssueKind {
     UnsupportedDetailSchema,
     DetailNotAttempted,
     DetailIdentityMismatch,
+    ObservationTimeUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +268,7 @@ pub struct DiscoverySession {
     consumed_bytes: AtomicUsize,
     detail_requests: AtomicUsize,
     detail_slots: tokio::sync::Semaphore,
+    observation_clock: Arc<dyn ObservationClock>,
 }
 
 impl std::fmt::Debug for DiscoverySession {
@@ -297,7 +364,14 @@ impl DiscoverySession {
             consumed_bytes: AtomicUsize::new(0),
             detail_requests: AtomicUsize::new(0),
             detail_slots: tokio::sync::Semaphore::new(MAX_DETAIL_CONCURRENCY),
+            observation_clock: Arc::new(SystemObservationClock),
         })
+    }
+
+    /// Construction and pure metadata operations never sample this clock.
+    pub fn with_observation_clock(mut self, clock: Arc<dyn ObservationClock>) -> Self {
+        self.observation_clock = clock;
+        self
     }
 
     pub fn identity(&self) -> &ProviderAuthIdentity {
@@ -310,6 +384,36 @@ impl DiscoverySession {
 
     pub fn consumed_bytes(&self) -> usize {
         self.consumed_bytes.load(Ordering::SeqCst)
+    }
+
+    fn stamp_fetched(&self, models: &mut [DiscoveredModel]) -> Result<(), DiscoveryIssueKind> {
+        if !models.iter().any(has_numeric_observation) {
+            return Ok(());
+        }
+        if self.cancel.is_cancelled() {
+            return Err(DiscoveryIssueKind::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(DiscoveryIssueKind::DeadlineExceeded);
+        }
+        let time = self
+            .observation_clock
+            .unix_seconds()
+            .ok_or(DiscoveryIssueKind::ObservationTimeUnavailable)?;
+        for model in models
+            .iter_mut()
+            .filter(|model| has_numeric_observation(model))
+        {
+            model.evidence = Some(ObservationEvidence {
+                context_limit: model
+                    .context_window
+                    .and_then(|value| limit_observation(model.source, value, time, false)),
+                output_limit: model.max_output_tokens.and_then(|value| {
+                    limit_observation(model.source, u64::from(value), time, true)
+                }),
+            });
+        }
+        Ok(())
     }
 
     fn ready(&self) -> Result<(), DiscoveryIssueKind> {
@@ -469,7 +573,7 @@ impl DiscoverySession {
                     break;
                 }
             };
-            let parsed = match parse_page(&page, self.profile) {
+            let mut parsed = match parse_page(&page, self.profile) {
                 Ok(parsed) => parsed,
                 Err(kind) => {
                     result.issues.push(DiscoveryIssue {
@@ -488,16 +592,29 @@ impl DiscoverySession {
             }
             entries_seen += parsed.entry_count;
             result.issues.extend(parsed.issues);
+            if let Err(kind) = self.stamp_fetched(&mut parsed.models) {
+                result.issues.push(DiscoveryIssue {
+                    kind,
+                    model_id: None,
+                    page: Some(result.pages_fetched),
+                });
+            }
             let mut conflict = false;
             for model in parsed.models {
                 if let Some(index) = positions.get(&model.id).copied() {
                     if !same_observation(&result.models[index], &model) {
+                        // Contradictory values cannot leave a freshly stamped
+                        // fact on the disputed model.
+                        result.models[index].evidence = None;
                         result.issues.push(DiscoveryIssue::model(
                             DiscoveryIssueKind::ConflictingDuplicate,
                             &model.id,
                         ));
                         conflict = true;
                         break;
+                    }
+                    if model.evidence.is_some() {
+                        result.models[index].evidence = model.evidence;
                     }
                     continue;
                 }
@@ -704,10 +821,11 @@ impl DiscoverySession {
             }
         };
         let value = self.fetch(self.models_endpoint(Some(id))?).await?;
-        let model = parse_model(&value, MetadataSource::AnthropicModelDetail)?;
+        let mut model = parse_model(&value, MetadataSource::AnthropicModelDetail)?;
         if model.id != id {
             return Err(DiscoveryIssueKind::DetailIdentityMismatch);
         }
+        self.stamp_fetched(std::slice::from_mut(&mut model))?;
         Ok(model)
     }
 }
@@ -899,6 +1017,7 @@ fn parse_model(
         source,
         metadata_valid: valid,
         unrecognized_fields,
+        evidence: None,
     })
 }
 
@@ -962,6 +1081,111 @@ fn same_observation(left: &DiscoveredModel, right: &DiscoveredModel) -> bool {
         && left.source == right.source
 }
 
+fn evidence_shape(
+    source: MetadataSource,
+    output: bool,
+) -> Option<(ObservationSchema, LimitSemantics, ObservationConfidence)> {
+    match source {
+        MetadataSource::AnthropicModels | MetadataSource::AnthropicModelDetail => Some((
+            ObservationSchema::AnthropicModels20230601,
+            if output {
+                LimitSemantics::OutputTokens
+            } else {
+                LimitSemantics::InputTokens
+            },
+            ObservationConfidence::DocumentedLimit,
+        )),
+        MetadataSource::OpenRouterModels => Some((
+            ObservationSchema::OpenRouterModelsFieldsV1,
+            LimitSemantics::Unspecified,
+            ObservationConfidence::AdvertisedUnspecified,
+        )),
+        MetadataSource::GenericOpenAiModels | MetadataSource::OllamaTags => None,
+    }
+}
+
+fn has_numeric_observation(model: &DiscoveredModel) -> bool {
+    model.metadata_valid
+        && evidence_shape(model.source, false).is_some()
+        && (model.context_window.is_some() || model.max_output_tokens.is_some())
+}
+
+fn limit_observation(
+    source: MetadataSource,
+    value: u64,
+    observed_at_unix: u64,
+    output: bool,
+) -> Option<LimitObservation> {
+    let (schema, semantics, confidence) = evidence_shape(source, output)?;
+    Some(LimitObservation {
+        value,
+        observed_at_unix,
+        source,
+        schema,
+        semantics,
+        confidence,
+    })
+}
+
+fn valid_evidence(model: &DiscoveredModel) -> bool {
+    let Some(evidence) = &model.evidence else {
+        return true;
+    };
+    if !model.metadata_valid
+        || (evidence.context_limit.is_none() && evidence.output_limit.is_none())
+    {
+        return false;
+    }
+    [
+        (&evidence.context_limit, model.context_window, false),
+        (
+            &evidence.output_limit,
+            model.max_output_tokens.map(u64::from),
+            true,
+        ),
+    ]
+    .into_iter()
+    .all(|(component, value, output)| {
+        component.as_ref().is_none_or(|component| {
+            value == Some(component.value)
+                && component.value > 0
+                && component.source.profile() == model.source.profile()
+                && evidence_shape(component.source, output)
+                    == Some((component.schema, component.semantics, component.confidence))
+        })
+    })
+}
+
+/// Preserve a retained component's age without treating an equal value as a
+/// new fetch. A new explicit observation always wins, even with an older clock.
+fn merged_evidence(
+    observed: &DiscoveredModel,
+    previous: Option<&ModelProvenance>,
+) -> Option<ObservationEvidence> {
+    let incoming = observed.evidence.as_ref();
+    let old = previous.and_then(|previous| previous.observed.evidence.as_ref());
+    let context_limit = incoming
+        .and_then(|evidence| evidence.context_limit.clone())
+        .or_else(|| {
+            old.and_then(|evidence| evidence.context_limit.as_ref())
+                .filter(|component| Some(component.value) == observed.context_window)
+                .cloned()
+        });
+    let output_limit = incoming
+        .and_then(|evidence| evidence.output_limit.clone())
+        .or_else(|| {
+            old.and_then(|evidence| evidence.output_limit.as_ref())
+                .filter(|component| {
+                    Some(component.value) == observed.max_output_tokens.map(u64::from)
+                })
+                .cloned()
+        });
+    (context_limit.is_some() || output_limit.is_some()).then_some(ObservationEvidence {
+        context_limit,
+        output_limit,
+    })
+}
+
 /// Non-secret sidecar record. The caller bounds/deserializes and publishes it.
 /// Authentication-reference changes deliberately invalidate this provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -971,8 +1195,63 @@ pub struct ModelProvenance {
     pub model_id: String,
     pub observed: DiscoveredModel,
     pub last_applied_context_window: Option<u64>,
+    /// Local input policy established by an identifiable edit, never a
+    /// provider capacity fact. Usable only while the current value matches.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_input_tokens"
+    )]
+    pub manual_input_tokens: Option<u64>,
     pub last_applied_max_output_tokens: Option<u32>,
     pub last_applied_label: Option<String>,
+}
+
+fn deserialize_manual_input_tokens<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(serde::de::Error::custom(
+            "manual input policy must be positive",
+        ));
+    }
+    Ok(value)
+}
+
+fn valid_manual_ownership(record: &ModelProvenance) -> bool {
+    record.manual_input_tokens.is_none_or(|value| {
+        value > 0
+            && record.schema_version == PROVENANCE_VERSION
+            && record.last_applied_context_window.is_none()
+    })
+}
+
+// Apply the existing strict stored-observation shape to programmatic receipts
+// before they can establish local policy. Current-value matching is separate:
+// an independently edited model must not invalidate historical fetched facts.
+fn valid_prior_observation(observed: &DiscoveredModel) -> bool {
+    if !observed.metadata_valid
+        || !valid_evidence(observed)
+        || observed.context_window == Some(0)
+        || observed.max_output_tokens == Some(0)
+        || observed
+            .label
+            .as_ref()
+            .is_some_and(|label| display_safe(label) != *label)
+        || observed.unrecognized_fields.len() > MAX_UNKNOWN_FIELDS
+        || (matches!(
+            observed.source,
+            MetadataSource::GenericOpenAiModels | MetadataSource::OllamaTags
+        ) && (observed.context_window.is_some() || observed.max_output_tokens.is_some()))
+    {
+        return false;
+    }
+    let mut fields = HashSet::new();
+    observed.unrecognized_fields.iter().all(|field| {
+        !field.is_empty() && display_safe(field) == *field && fields.insert(field.as_str())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -995,6 +1274,7 @@ pub fn merge_discovered_model(
     if current.id != observed.id
         || !valid_model_id(&observed.id)
         || !observed.metadata_valid
+        || !valid_evidence(observed)
         || observed.context_window == Some(0)
         || observed.max_output_tokens == Some(0)
         || observed
@@ -1008,13 +1288,15 @@ pub fn merge_discovered_model(
         };
     }
     let binding = exact_provider_identity.binding_id();
-    let previous = previous.filter(|previous| {
-        previous.schema_version == PROVENANCE_VERSION
+    let policy_previous = previous.filter(|previous| {
+        matches!(previous.schema_version, 1 | PROVENANCE_VERSION)
+            && (previous.schema_version != 1 || previous.observed.evidence.is_none())
+            && valid_manual_ownership(previous)
             && previous.provider_binding == binding
             && previous.model_id == observed.id
             && previous.observed.id == observed.id
-            && previous.observed.metadata_valid
-            && previous.observed.source.profile() == observed.source.profile()
+            && valid_prior_observation(&previous.observed)
+            && previous.observed.source.profile().kind() == observed.source.profile().kind()
             && previous.last_applied_context_window != Some(0)
             && previous.last_applied_max_output_tokens != Some(0)
             && previous
@@ -1028,11 +1310,24 @@ pub fn merge_discovered_model(
                 .as_ref()
                 .is_none_or(|value| previous.observed.label.as_ref() == Some(value))
     });
-    let managed_context = model.context_window.is_none()
-        || previous.is_some_and(|previous| {
-            previous.last_applied_context_window.is_some()
-                && previous.last_applied_context_window == model.context_window
-        });
+    let manual_input_tokens = policy_previous.and_then(|previous| {
+        let current = model.context_window.filter(|value| *value > 0)?;
+        (previous.manual_input_tokens == Some(current)
+            || previous
+                .last_applied_context_window
+                .is_some_and(|applied| applied != current))
+        .then_some(current)
+    });
+    // Local policy survives a same-kind discovery-profile switch. Fetched
+    // numbers, evidence and their timestamps retain the stricter profile gate.
+    let previous = policy_previous
+        .filter(|previous| previous.observed.source.profile() == observed.source.profile());
+    let managed_context = manual_input_tokens.is_none()
+        && (model.context_window.is_none()
+            || previous.is_some_and(|previous| {
+                previous.last_applied_context_window.is_some()
+                    && previous.last_applied_context_window == model.context_window
+            }));
     let managed_output = model.max_output_tokens.is_none()
         || previous.is_some_and(|previous| {
             previous.last_applied_max_output_tokens.is_some()
@@ -1051,12 +1346,15 @@ pub fn merge_discovered_model(
     if managed_label {
         model.label = observed.label.clone();
     }
+    let mut provenance_observed = observed.clone();
+    provenance_observed.evidence = merged_evidence(observed, previous);
     let provenance = ModelProvenance {
         schema_version: PROVENANCE_VERSION,
         provider_binding: binding,
         model_id: observed.id.clone(),
-        observed: observed.clone(),
+        observed: provenance_observed,
         last_applied_context_window: managed_context.then_some(model.context_window).flatten(),
+        manual_input_tokens,
         last_applied_max_output_tokens: managed_output.then_some(model.max_output_tokens).flatten(),
         last_applied_label: if managed_label {
             model.label.clone()
@@ -1074,7 +1372,8 @@ pub use metadata_storage::{MetadataError, load_model_provenance, save_model_prov
 
 mod metadata_storage {
     use super::{
-        DiscoveredModel, MetadataSource, ModelProvenance, PROVENANCE_VERSION, display_safe,
+        DiscoveredModel, MetadataSource, ModelProvenance, ObservationEvidence, PROVENANCE_VERSION,
+        deserialize_manual_input_tokens, display_safe, valid_evidence, valid_manual_ownership,
         valid_model_id,
     };
     use crate::config::{ProviderConfig, ProvidersConfig, validate_provider_endpoint};
@@ -1124,6 +1423,40 @@ mod metadata_storage {
 
     // Separate strict wire types keep unknown fields and duplicate JSON keys
     // out without changing the public provenance/config constructors.
+    // The v1 observation intentionally has no evidence member. A document
+    // cannot manufacture fresh authority by adding v2 fields to that shape.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MetadataDocumentV1 {
+        schema_version: u32,
+        provider_binding: String,
+        models: Vec<MetadataRecordV1>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MetadataRecordV1 {
+        schema_version: u32,
+        provider_binding: String,
+        model_id: String,
+        observed: MetadataObservationV1,
+        last_applied_context_window: Option<u64>,
+        last_applied_max_output_tokens: Option<u32>,
+        last_applied_label: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MetadataObservationV1 {
+        id: String,
+        label: Option<String>,
+        context_window: Option<u64>,
+        max_output_tokens: Option<u32>,
+        source: MetadataSource,
+        metadata_valid: bool,
+        unrecognized_fields: Vec<String>,
+    }
+
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct MetadataDocument {
@@ -1140,6 +1473,12 @@ mod metadata_storage {
         model_id: String,
         observed: MetadataObservation,
         last_applied_context_window: Option<u64>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_manual_input_tokens"
+        )]
+        manual_input_tokens: Option<u64>,
         last_applied_max_output_tokens: Option<u32>,
         last_applied_label: Option<String>,
     }
@@ -1154,13 +1493,15 @@ mod metadata_storage {
         source: MetadataSource,
         metadata_valid: bool,
         unrecognized_fields: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<ObservationEvidence>,
     }
 
     impl From<&ModelProvenance> for MetadataRecord {
         fn from(record: &ModelProvenance) -> Self {
             let observed = &record.observed;
             Self {
-                schema_version: record.schema_version,
+                schema_version: PROVENANCE_VERSION,
                 provider_binding: record.provider_binding.clone(),
                 model_id: record.model_id.clone(),
                 observed: MetadataObservation {
@@ -1171,8 +1512,10 @@ mod metadata_storage {
                     source: observed.source,
                     metadata_valid: observed.metadata_valid,
                     unrecognized_fields: observed.unrecognized_fields.clone(),
+                    evidence: observed.evidence.clone(),
                 },
                 last_applied_context_window: record.last_applied_context_window,
+                manual_input_tokens: record.manual_input_tokens,
                 last_applied_max_output_tokens: record.last_applied_max_output_tokens,
                 last_applied_label: record.last_applied_label.clone(),
             }
@@ -1194,11 +1537,39 @@ mod metadata_storage {
                     source: observed.source,
                     metadata_valid: observed.metadata_valid,
                     unrecognized_fields: observed.unrecognized_fields,
+                    evidence: observed.evidence,
                 },
                 last_applied_context_window: record.last_applied_context_window,
+                manual_input_tokens: record.manual_input_tokens,
                 last_applied_max_output_tokens: record.last_applied_max_output_tokens,
                 last_applied_label: record.last_applied_label,
             }
+        }
+    }
+
+    impl From<MetadataRecordV1> for ModelProvenance {
+        fn from(record: MetadataRecordV1) -> Self {
+            let observed = record.observed;
+            MetadataRecord {
+                schema_version: record.schema_version,
+                provider_binding: record.provider_binding,
+                model_id: record.model_id,
+                observed: MetadataObservation {
+                    id: observed.id,
+                    label: observed.label,
+                    context_window: observed.context_window,
+                    max_output_tokens: observed.max_output_tokens,
+                    source: observed.source,
+                    metadata_valid: observed.metadata_valid,
+                    unrecognized_fields: observed.unrecognized_fields,
+                    evidence: None,
+                },
+                last_applied_context_window: record.last_applied_context_window,
+                manual_input_tokens: None,
+                last_applied_max_output_tokens: record.last_applied_max_output_tokens,
+                last_applied_label: record.last_applied_label,
+            }
+            .into()
         }
     }
 
@@ -1403,10 +1774,13 @@ mod metadata_storage {
         if record.provider_binding != expected {
             return Err(MetadataError::IdentityMismatch);
         }
-        if record.schema_version != PROVENANCE_VERSION
+        if !matches!(record.schema_version, 1 | PROVENANCE_VERSION)
+            || (record.schema_version == 1 && observed.evidence.is_some())
+            || !valid_manual_ownership(record)
             || !valid_model_id(&record.model_id)
             || record.model_id != observed.id
             || !observed.metadata_valid
+            || !valid_evidence(observed)
             || observed.source.profile().kind() != provider.kind
             || observed.context_window == Some(0)
             || observed.max_output_tokens == Some(0)
@@ -1457,28 +1831,53 @@ mod metadata_storage {
     ) -> Result<Vec<ModelProvenance>, MetadataError> {
         let header: VersionHeader =
             serde_json::from_slice(bytes).map_err(|_| MetadataError::InvalidDocument)?;
-        if header.schema_version != Some(PROVENANCE_VERSION) {
+        if !matches!(header.schema_version, Some(1 | PROVENANCE_VERSION)) {
             return Ok(Vec::new());
         }
-        let document: MetadataDocument =
-            serde_json::from_slice(bytes).map_err(|_| MetadataError::InvalidDocument)?;
-        if document.provider_binding != expected {
+        let (version, provider_binding, records): (_, _, Vec<ModelProvenance>) =
+            if header.schema_version == Some(1) {
+                let document: MetadataDocumentV1 =
+                    serde_json::from_slice(bytes).map_err(|_| MetadataError::InvalidDocument)?;
+                (
+                    document.schema_version,
+                    document.provider_binding,
+                    document
+                        .models
+                        .into_iter()
+                        .map(ModelProvenance::from)
+                        .collect(),
+                )
+            } else {
+                let document: MetadataDocument =
+                    serde_json::from_slice(bytes).map_err(|_| MetadataError::InvalidDocument)?;
+                (
+                    document.schema_version,
+                    document.provider_binding,
+                    document
+                        .models
+                        .into_iter()
+                        .map(ModelProvenance::from)
+                        .collect(),
+                )
+            };
+        if provider_binding != expected {
             return Err(MetadataError::IdentityMismatch);
         }
-        if document.models.len() > MAX_METADATA_MODELS {
+        if records.len() > MAX_METADATA_MODELS {
             return Err(MetadataError::LimitExceeded);
         }
-        if document
-            .models
+        if records
             .iter()
-            .any(|record| record.schema_version != PROVENANCE_VERSION)
+            .any(|record| !matches!(record.schema_version, 1 | PROVENANCE_VERSION))
         {
             return Ok(Vec::new());
         }
         let mut ids = HashSet::new();
         let mut output = Vec::new();
-        for record in document.models {
-            let record = ModelProvenance::from(record);
+        for record in records {
+            if record.schema_version != version {
+                return Err(MetadataError::InvalidDocument);
+            }
             validate_record(&record, expected, provider)?;
             if !ids.insert(record.model_id.clone()) {
                 return Err(MetadataError::InvalidDocument);
@@ -1685,7 +2084,189 @@ mod metadata_persistence_tests {
             source: MetadataSource::OpenRouterModels,
             metadata_valid: true,
             unrecognized_fields: vec![],
+            evidence: None,
         }
+    }
+
+    fn evidenced(
+        mut model: DiscoveredModel,
+        context_time: u64,
+        output_time: u64,
+    ) -> DiscoveredModel {
+        model.evidence = Some(ObservationEvidence {
+            context_limit: model
+                .context_window
+                .and_then(|value| limit_observation(model.source, value, context_time, false)),
+            output_limit: model.max_output_tokens.and_then(|value| {
+                limit_observation(model.source, u64::from(value), output_time, true)
+            }),
+        });
+        model
+    }
+
+    #[test]
+    fn evidence_pure_parsers_do_not_invent_fetch_times() {
+        for (source, value) in [
+            (
+                MetadataSource::AnthropicModels,
+                serde_json::json!({"id":"raw", "max_input_tokens":1000,"max_tokens":100}),
+            ),
+            (
+                MetadataSource::OpenRouterModels,
+                serde_json::json!({"id":"raw", "context_length":1000,"top_provider":{"max_completion_tokens":100}}),
+            ),
+        ] {
+            let parsed = parse_model(&value, source).unwrap();
+            assert_eq!(parsed.context_window, Some(1000));
+            assert_eq!(parsed.max_output_tokens, Some(100));
+            assert!(parsed.evidence.is_none());
+        }
+    }
+
+    #[test]
+    fn evidence_closed_matrix_does_not_promote_advertised_or_architectural_values() {
+        let router = evidenced(observation("raw", 1000, 100), 10, 20);
+        assert!(valid_evidence(&router));
+        for component in [
+            &router.evidence.as_ref().unwrap().context_limit,
+            &router.evidence.as_ref().unwrap().output_limit,
+        ] {
+            let component = component.as_ref().unwrap();
+            assert_eq!(component.semantics, LimitSemantics::Unspecified);
+            assert_eq!(
+                component.confidence,
+                ObservationConfidence::AdvertisedUnspecified
+            );
+        }
+        for variant in 0..6 {
+            let mut invalid = router.clone();
+            let component = invalid
+                .evidence
+                .as_mut()
+                .unwrap()
+                .context_limit
+                .as_mut()
+                .unwrap();
+            match variant {
+                0 => component.value += 1,
+                1 => component.source = MetadataSource::AnthropicModels,
+                2 => component.schema = ObservationSchema::AnthropicModels20230601,
+                3 => component.semantics = LimitSemantics::CombinedTokens,
+                4 => component.confidence = ObservationConfidence::DocumentedLimit,
+                _ => invalid.context_window = None,
+            }
+            assert!(!valid_evidence(&invalid));
+        }
+        for source in [
+            MetadataSource::GenericOpenAiModels,
+            MetadataSource::OllamaTags,
+        ] {
+            assert!(evidence_shape(source, false).is_none());
+            assert!(evidence_shape(source, true).is_none());
+        }
+    }
+
+    #[test]
+    fn evidence_pure_merge_carries_each_component_and_accepts_real_backwards_clock() {
+        let provider = provider();
+        let first = evidenced(observation(&provider.models[0].id, 1000, 100), 100, 200);
+        let applied =
+            merge_discovered_model(&provider.models[0], &first, None, &identity(&provider));
+        let mut incoming = first.clone();
+        incoming
+            .evidence
+            .as_mut()
+            .unwrap()
+            .context_limit
+            .as_mut()
+            .unwrap()
+            .observed_at_unix = 50;
+        incoming.evidence.as_mut().unwrap().output_limit = None;
+        let merged = merge_discovered_model(
+            &applied.model,
+            &incoming,
+            applied.provenance.as_ref(),
+            &identity(&provider),
+        );
+        let evidence = merged.provenance.unwrap().observed.evidence.unwrap();
+        assert_eq!(evidence.context_limit.unwrap().observed_at_unix, 50);
+        assert_eq!(evidence.output_limit.unwrap().observed_at_unix, 200);
+        incoming.max_output_tokens = Some(101);
+        let changed = merge_discovered_model(
+            &applied.model,
+            &incoming,
+            applied.provenance.as_ref(),
+            &identity(&provider),
+        );
+        assert_eq!(changed.model.max_output_tokens, Some(101));
+        assert!(
+            changed
+                .provenance
+                .unwrap()
+                .observed
+                .evidence
+                .unwrap()
+                .output_limit
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn evidence_v1_ownership_updates_without_becoming_fresh() {
+        let (provider, mut previous) = applied();
+        previous.schema_version = 1;
+        let next = observation(&previous.model_id, 2000, 200);
+        let merged = merge_discovered_model(
+            &provider.models[0],
+            &next,
+            Some(&previous),
+            &identity(&provider),
+        );
+        assert_eq!(merged.model.context_window, Some(2000));
+        assert_eq!(merged.model.max_output_tokens, Some(200));
+        let record = merged.provenance.unwrap();
+        assert_eq!(record.schema_version, 2);
+        assert!(record.observed.evidence.is_none());
+        previous.observed = evidenced(previous.observed, 100, 200);
+        let refused_previous = merge_discovered_model(
+            &provider.models[0],
+            &next,
+            Some(&previous),
+            &identity(&provider),
+        );
+        assert_eq!(refused_previous.model, provider.models[0]);
+        assert!(
+            refused_previous
+                .provenance
+                .unwrap()
+                .observed
+                .evidence
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn evidence_explicit_limits_and_intervening_manual_values_survive_equal_refetch() {
+        let (provider, previous) = applied();
+        let mut current = provider.models[0].clone();
+        current.context_window = Some(2000);
+        current.context_limits = Some(
+            serde_json::from_value(serde_json::json!({
+                "input_tokens":2000, "combined_tokens":3000, "unknown_policy":"require-limit",
+                "media_policy":"refuse", "max_age_seconds":60
+            }))
+            .unwrap(),
+        );
+        let observed = evidenced(observation(&current.id, 2000, 200), 123, 456);
+        let merged =
+            merge_discovered_model(&current, &observed, Some(&previous), &identity(&provider));
+        assert_eq!(merged.model.context_limits, current.context_limits);
+        assert_eq!(merged.model.context_window, Some(2000));
+        assert_eq!(merged.model.max_output_tokens, Some(200));
+        let record = merged.provenance.unwrap();
+        assert_eq!(record.last_applied_context_window, None);
+        assert_eq!(record.last_applied_max_output_tokens, Some(200));
+        assert_eq!(record.observed.evidence, observed.evidence);
     }
 
     fn applied() -> (ProviderConfig, ModelProvenance) {
@@ -1732,6 +2313,160 @@ mod metadata_persistence_tests {
         publish_config(&tree, &provider);
         save_model_provenance(tree.path(), &provider, std::slice::from_ref(&record)).unwrap();
         (tree, provider, record)
+    }
+
+    fn seeded_evidence() -> (Tree, ProviderConfig, ModelProvenance) {
+        let (tree, provider, mut record) = seeded();
+        record.observed = evidenced(record.observed, 10, 20);
+        save_model_provenance(tree.path(), &provider, std::slice::from_ref(&record)).unwrap();
+        (tree, provider, record)
+    }
+
+    #[test]
+    fn evidence_v1_decode_and_save_upgrade_ownership_without_a_stamp() {
+        let (tree, provider, _) = seeded();
+        mutate_document(&tree, &provider, |document| {
+            document["schema_version"] = 1.into();
+            document["models"][0]["schema_version"] = 1.into();
+        });
+        let records = load_model_provenance(tree.path(), &provider).unwrap();
+        assert_eq!(records[0].schema_version, 1);
+        assert!(records[0].observed.evidence.is_none());
+        save_model_provenance(tree.path(), &provider, &records).unwrap();
+        assert_eq!(
+            records[0].schema_version, 1,
+            "saving cannot mutate the caller's ownership record"
+        );
+        let records = load_model_provenance(tree.path(), &provider).unwrap();
+        assert_eq!(records[0].schema_version, 2);
+        assert!(records[0].observed.evidence.is_none());
+        assert_eq!(records[0].last_applied_context_window, Some(1000));
+        assert_eq!(records[0].last_applied_max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn evidence_v1_cannot_claim_v2_evidence_even_when_well_formed() {
+        let (tree, provider, mut record) = seeded_evidence();
+        let before = fs::read(sidecar(&tree, &provider)).unwrap();
+        record.schema_version = 1;
+        assert_eq!(
+            save_model_provenance(tree.path(), &provider, &[record]),
+            Err(MetadataError::InvalidDocument)
+        );
+        assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+        mutate_document(&tree, &provider, |document| {
+            document["schema_version"] = 1.into();
+            document["models"][0]["schema_version"] = 1.into();
+        });
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider),
+            Err(MetadataError::InvalidDocument)
+        );
+    }
+
+    #[test]
+    fn evidence_v2_rejects_mixed_known_document_and_record_versions() {
+        let (tree, provider, _) = seeded();
+        mutate_document(&tree, &provider, |document| {
+            document["models"][0]["schema_version"] = 1.into()
+        });
+        assert_eq!(
+            load_model_provenance(tree.path(), &provider),
+            Err(MetadataError::InvalidDocument)
+        );
+    }
+
+    #[test]
+    fn evidence_v2_closed_components_reject_value_source_schema_and_semantic_swaps() {
+        for (field, value) in [
+            ("value", serde_json::json!(999)),
+            ("source", serde_json::json!("anthropic_models")),
+            ("schema", serde_json::json!("anthropic_models_2023_06_01")),
+            ("semantics", serde_json::json!("input_tokens")),
+            ("confidence", serde_json::json!("documented_limit")),
+            ("observed_at_unix", serde_json::json!(-1)),
+            ("observed_at_unix", serde_json::json!(1.5)),
+            ("observed_at_unix", serde_json::json!("10")),
+        ] {
+            let (tree, provider, _) = seeded_evidence();
+            mutate_document(&tree, &provider, |document| {
+                document["models"][0]["observed"]["evidence"]["context_limit"][field] = value;
+            });
+            assert_eq!(
+                load_model_provenance(tree.path(), &provider),
+                Err(MetadataError::InvalidDocument),
+                "invalid evidence member {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_v2_unknown_and_duplicate_nested_keys_are_refused() {
+        for path in [0, 1, 2] {
+            let (tree, provider, _) = seeded_evidence();
+            mutate_document(&tree, &provider, |document| {
+                let observed = &mut document["models"][0]["observed"];
+                let target = match path {
+                    0 => observed,
+                    1 => &mut observed["evidence"],
+                    _ => &mut observed["evidence"]["context_limit"],
+                };
+                target["unexpected"] = "synthetic-private-value".into();
+            });
+            let error = load_model_provenance(tree.path(), &provider).unwrap_err();
+            assert_eq!(error, MetadataError::InvalidDocument);
+            assert!(!format!("{error:?} {error}").contains("synthetic-private-value"));
+        }
+        for (needle, replacement) in [
+            (
+                "\"context_limit\":",
+                "\"context_limit\":null,\"context_limit\":",
+            ),
+            (
+                "\"observed_at_unix\":10",
+                "\"observed_at_unix\":10,\"observed_at_unix\":10",
+            ),
+        ] {
+            let (tree, provider, _) = seeded_evidence();
+            let path = sidecar(&tree, &provider);
+            let original = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+            let invalid = original.replacen(needle, replacement, 1);
+            assert_ne!(invalid, original);
+            write_private(&path, invalid.as_bytes());
+            assert_eq!(
+                load_model_provenance(tree.path(), &provider),
+                Err(MetadataError::InvalidDocument)
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_pure_save_preserves_old_and_extreme_component_times_byte_for_byte() {
+        let (tree, provider, mut record) = seeded_evidence();
+        record
+            .observed
+            .evidence
+            .as_mut()
+            .unwrap()
+            .output_limit
+            .as_mut()
+            .unwrap()
+            .observed_at_unix = u64::MAX;
+        save_model_provenance(tree.path(), &provider, std::slice::from_ref(&record)).unwrap();
+        let before = fs::read(sidecar(&tree, &provider)).unwrap();
+        let loaded = load_model_provenance(tree.path(), &provider).unwrap();
+        assert_eq!(loaded, [record]);
+        save_model_provenance(tree.path(), &provider, &loaded).unwrap();
+        assert_eq!(fs::read(sidecar(&tree, &provider)).unwrap(), before);
+        let evidence = loaded[0].observed.evidence.as_ref().unwrap();
+        assert_eq!(
+            evidence.context_limit.as_ref().unwrap().observed_at_unix,
+            10
+        );
+        assert_eq!(
+            evidence.output_limit.as_ref().unwrap().observed_at_unix,
+            u64::MAX
+        );
     }
 
     fn mutate_document(
@@ -2045,7 +2780,7 @@ mod metadata_persistence_tests {
     fn metadata_missing_or_stale_document_version_returns_empty() {
         for document in [
             br#"{"models":"old-shape"}"#.as_slice(),
-            br#"{"schema_version":2,"models":"future-shape"}"#.as_slice(),
+            br#"{"schema_version":3,"models":"future-shape"}"#.as_slice(),
         ] {
             let (tree, provider, _) = seeded();
             write_private(&sidecar(&tree, &provider), document);
@@ -2061,7 +2796,7 @@ mod metadata_persistence_tests {
     fn metadata_stale_record_version_returns_empty_conservatively() {
         let (tree, provider, _) = seeded();
         mutate_document(&tree, &provider, |document| {
-            document["models"][0]["schema_version"] = 2.into()
+            document["models"][0]["schema_version"] = 3.into()
         });
         assert!(
             load_model_provenance(tree.path(), &provider)
@@ -2093,8 +2828,8 @@ mod metadata_persistence_tests {
         let path = sidecar(&tree, &provider);
         let raw = String::from_utf8(fs::read(&path).unwrap()).unwrap();
         let duplicate = raw.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"schema_version\":1",
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"schema_version\":2",
             1,
         );
         write_private(&path, duplicate.as_bytes());

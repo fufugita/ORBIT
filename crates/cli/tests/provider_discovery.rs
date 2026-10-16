@@ -237,6 +237,7 @@ fn observed(
         source,
         metadata_valid: true,
         unrecognized_fields: vec![],
+        evidence: None,
     }
 }
 

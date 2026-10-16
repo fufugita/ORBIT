@@ -1802,6 +1802,7 @@ pub fn prepare_provider_refresh_with_discovery(
                     source: source_kind,
                     metadata_valid: false,
                     unrecognized_fields: Vec::new(),
+                    evidence: None,
                 })
         })
         .collect();

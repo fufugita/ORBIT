@@ -726,6 +726,7 @@ impl ModelDiscovery for WizardCatalog {
                 source: MetadataSource::OpenRouterModels,
                 metadata_valid: true,
                 unrecognized_fields: vec![],
+                evidence: None,
             }],
             completeness: DiscoveryCompleteness::Complete,
             issues: vec![],
