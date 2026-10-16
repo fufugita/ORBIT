@@ -66,6 +66,59 @@ pub fn anthropic_capabilities() -> ProviderCapabilities {
     }
 }
 
+pub(crate) fn render_body(
+    input: crate::request::RequestBodyInput<'_>,
+) -> Result<serde_json::Value, AdapterError> {
+    // Messages: the transcript when present, else the single prompt.
+    let (system, messages) = match input.messages {
+        Some(transcript) => anthropic_messages(transcript),
+        None => (
+            None,
+            vec![serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": String::from_utf8_lossy(input.fallback_input).into_owned(),
+                }],
+            })],
+        ),
+    };
+
+    let mut body = serde_json::json!({
+        "model": input.model,
+        "stream": true,
+        "max_tokens": input.sampling.max_output_tokens,
+        "messages": messages,
+        // Adaptive thinking: it cannot be disabled on current models;
+        // display stays omitted (chain-of-thought never renders).
+        // No temperature: the Messages API rejects temperature combined
+        // with thinking, and adaptive thinking owns sampling (B7).
+        "thinking": { "type": "adaptive" },
+    });
+    if let Some(effort) = input.effort {
+        body["output_config"] = serde_json::json!({ "effort": effort });
+    }
+
+    // One explicit cache breakpoint at the end of the system prompt:
+    // the stable prefix caches, the growing tail re-caches per round.
+    if let Some(sys) = &system {
+        body["system"] = serde_json::json!([{
+            "type": "text",
+            "text": sys,
+            "cache_control": { "type": "ephemeral" },
+        }]);
+    }
+
+    let tools = anthropic_tools(input.tools);
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools);
+        // tool_choice: auto only — forced tool choice 400s on current
+        // Claude models (roadmap §Providers).
+        body["tool_choice"] = serde_json::json!({ "type": "auto" });
+    }
+    Ok(body)
+}
+
 /// Map the transcript to Anthropic messages. System messages are
 /// extracted (the wire format takes them top-level, not inline); tool
 /// results become `tool_result` blocks on user messages; assistant
@@ -241,59 +294,16 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
         }
         let url = crate::endpoint::provider_method_url(&request.route, "/v1", "messages")?;
 
-        // Messages: the transcript when present, else the single prompt.
-        let (system, messages) = match &request.messages {
-            Some(transcript) => anthropic_messages(transcript),
-            None => (
-                None,
-                vec![serde_json::json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": String::from_utf8_lossy(request.input.expose()).into_owned(),
-                    }],
-                })],
-            ),
-        };
-
-        let mut body = serde_json::json!({
-            "model": request.route.expected_model,
-            "stream": true,
-            "max_tokens": request.sampling.max_output_tokens,
-            "messages": messages,
-            // Adaptive thinking: it cannot be disabled on current models;
-            // display stays omitted (chain-of-thought never renders).
-            // No temperature: the Messages API rejects temperature combined
-            // with thinking, and adaptive thinking owns sampling (B7).
-            "thinking": { "type": "adaptive" },
-        });
-        if let Some(effort) = &request.effort {
-            body["output_config"] = serde_json::json!({ "effort": effort });
-        }
-
-        // One explicit cache breakpoint at the end of the system prompt:
-        // the stable prefix caches, the growing tail re-caches per round.
-        if let Some(sys) = &system {
-            body["system"] = serde_json::json!([{
-                "type": "text",
-                "text": sys,
-                "cache_control": { "type": "ephemeral" },
-            }]);
-        }
-
-        let tools = anthropic_tools(&request.tools);
-        if !tools.is_empty() {
-            body["tools"] = serde_json::Value::Array(tools);
-            // tool_choice: auto only — forced tool choice 400s on current
-            // Claude models (roadmap §Providers).
-            body["tool_choice"] = serde_json::json!({ "type": "auto" });
-        }
+        let body = crate::request::render_request_body(
+            crate::request::HttpDialect::AnthropicMessages,
+            crate::request::RequestBodyInput::from(request),
+        )?;
 
         let mut req = self
             .client
             .post(url)
             .header("anthropic-version", "2023-06-01")
-            .json(&body);
+            .json(body.as_json());
         if let Some(secret) = credential {
             req = req.header(
                 "x-api-key",

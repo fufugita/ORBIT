@@ -76,58 +76,15 @@ impl OpenAiCompatibleHttpV1 {
         // the historical `/v1`).
         let url = chat_completions_url(&request.route)?;
 
-        // Build the wire body — sampling as provider floats ONLY here.
-        // Multi-turn transcript wins when present; otherwise the single
-        // user turn (input bytes are always the newest user prompt).
-        let messages = match &request.messages {
-            Some(transcript) => openai_messages(transcript)?,
-            None => serde_json::json!([
-                {"role": "user", "content": String::from_utf8_lossy(request.input.expose()).into_owned()}
-            ]),
-        };
-        let tools: Vec<serde_json::Value> = request
-            .tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                })
-            })
-            .collect();
-        let mut body = serde_json::json!({
-            "model": request.route.expected_model,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-            "max_tokens": request.sampling.max_output_tokens,
-            "messages": messages,
-        });
-        if !tools.is_empty() {
-            body["tools"] = serde_json::Value::Array(tools);
-            body["tool_choice"] = serde_json::Value::String("auto".into());
-        }
-        if let Some(effort) = &request.effort {
-            body["reasoning_effort"] = serde_json::json!(effort);
-        }
-        // E8: sampling is opt-in per model. Zero means unset — omit it
-        // entirely (OpenAI reasoning models reject `temperature`).
-        if request.sampling.temperature_milliunits > 0 {
-            body["temperature"] =
-                serde_json::json!(request.sampling.temperature_milliunits as f64 / 1000.0);
-        }
-        if request.sampling.top_p_millionths > 0 {
-            body["top_p"] =
-                serde_json::json!(request.sampling.top_p_millionths as f64 / 1_000_000.0);
-        }
+        let body = crate::request::render_request_body(
+            crate::request::HttpDialect::OpenAiCompatible,
+            crate::request::RequestBodyInput::from(request),
+        )?;
 
         let mut req = self
             .client
             .post(&url)
-            .json(&body)
+            .json(body.as_json())
             .header("content-type", "application/json");
         if let Some(secret) = credential {
             // GW-16: the credential reaches THIS adapter only. The borrow is
@@ -179,6 +136,58 @@ impl OpenAiCompatibleHttpV1 {
             cancel.clone(),
         ))
     }
+}
+
+pub(crate) fn render_body(
+    input: crate::request::RequestBodyInput<'_>,
+) -> Result<serde_json::Value, AdapterError> {
+    // Build the wire body — sampling as provider floats ONLY here.
+    // Multi-turn transcript wins when present; otherwise the single
+    // user turn (input bytes are always the newest user prompt).
+    let messages = match input.messages {
+        Some(transcript) => openai_messages(transcript)?,
+        None => serde_json::json!([
+            {"role": "user", "content": String::from_utf8_lossy(input.fallback_input).into_owned()}
+        ]),
+    };
+    let tools: Vec<serde_json::Value> = input
+        .tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "model": input.model,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+        "max_tokens": input.sampling.max_output_tokens,
+        "messages": messages,
+    });
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools);
+        body["tool_choice"] = serde_json::Value::String("auto".into());
+    }
+    if let Some(effort) = input.effort {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
+    // E8: sampling is opt-in per model. Zero means unset — omit it
+    // entirely (OpenAI reasoning models reject `temperature`).
+    if input.sampling.temperature_milliunits > 0 {
+        body["temperature"] =
+            serde_json::json!(input.sampling.temperature_milliunits as f64 / 1000.0);
+    }
+    if input.sampling.top_p_millionths > 0 {
+        body["top_p"] = serde_json::json!(input.sampling.top_p_millionths as f64 / 1_000_000.0);
+    }
+    Ok(body)
 }
 
 /// Consume the OpenAI SSE byte stream and emit `ProviderStreamEvent`s.

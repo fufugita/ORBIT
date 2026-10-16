@@ -77,43 +77,15 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
                 .map_err(AdapterError::ProviderConfigurationInvalid)?;
         }
         let url = crate::endpoint::provider_method_url(&request.route, "/api", "chat")?;
-        // Full conversation when present; else the single prompt. Ollama's
-        // chat API takes tool calls/results natively on messages.
-        let messages = match &request.messages {
-            Some(transcript) => ollama_messages(transcript)?,
-            None => serde_json::json!([
-                {"role":"user","content":String::from_utf8_lossy(request.input.expose()).into_owned()}
-            ]),
-        };
-        let mut body = serde_json::json!({
-            "model": request.route.expected_model,
-            "stream": true,
-            "messages": messages,
-            "options": {
-                "num_predict": request.sampling.max_output_tokens,
-            }
-        });
-        if !request.tools.is_empty() {
-            body["tools"] = serde_json::json!(request.tools.iter().map(|tool| serde_json::json!({
-                "type":"function", "function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}
-            })).collect::<Vec<_>>());
-        }
-        // E8: sampling opt-in per model; zero means unset — omitted.
-        if let Some(effort) = &request.effort {
-            body["think"] = serde_json::json!(effort);
-        }
-        if request.sampling.temperature_milliunits > 0 {
-            body["options"]["temperature"] =
-                serde_json::json!(request.sampling.temperature_milliunits as f64 / 1000.0);
-        }
-        if request.sampling.top_p_millionths > 0 {
-            body["options"]["top_p"] =
-                serde_json::json!(request.sampling.top_p_millionths as f64 / 1_000_000.0);
-        }
+        let body = crate::request::render_request_body(
+            crate::request::HttpDialect::Ollama,
+            crate::request::RequestBodyInput::from(request),
+        )?;
+
         let Some(response) = cancel
             .until_cancelled(tokio::time::timeout(
                 std::time::Duration::from_millis(request.connect_timeout_ms),
-                self.client.post(url).json(&body).send(),
+                self.client.post(url).json(body.as_json()).send(),
             ))
             .await
         else {
@@ -154,6 +126,45 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
             cancel.clone(),
         ))
     }
+}
+
+pub(crate) fn render_body(
+    input: crate::request::RequestBodyInput<'_>,
+) -> Result<serde_json::Value, AdapterError> {
+    // Full conversation when present; else the single prompt. Ollama's
+    // chat API takes tool calls/results natively on messages.
+    let messages = match input.messages {
+        Some(transcript) => ollama_messages(transcript)?,
+        None => serde_json::json!([
+            {"role":"user","content":String::from_utf8_lossy(input.fallback_input).into_owned()}
+        ]),
+    };
+    let mut body = serde_json::json!({
+        "model": input.model,
+        "stream": true,
+        "messages": messages,
+        "options": {
+            "num_predict": input.sampling.max_output_tokens,
+        }
+    });
+    if !input.tools.is_empty() {
+        body["tools"] = serde_json::json!(input.tools.iter().map(|tool| serde_json::json!({
+            "type":"function", "function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}
+        })).collect::<Vec<_>>());
+    }
+    // E8: sampling opt-in per model; zero means unset — omitted.
+    if let Some(effort) = input.effort {
+        body["think"] = serde_json::json!(effort);
+    }
+    if input.sampling.temperature_milliunits > 0 {
+        body["options"]["temperature"] =
+            serde_json::json!(input.sampling.temperature_milliunits as f64 / 1000.0);
+    }
+    if input.sampling.top_p_millionths > 0 {
+        body["options"]["top_p"] =
+            serde_json::json!(input.sampling.top_p_millionths as f64 / 1_000_000.0);
+    }
+    Ok(body)
 }
 
 fn ollama_messages(

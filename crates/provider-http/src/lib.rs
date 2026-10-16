@@ -18,6 +18,7 @@ pub mod endpoint;
 pub mod error;
 pub mod ollama;
 pub mod openai;
+pub mod request;
 pub mod sse;
 pub mod stream;
 pub mod tls;
