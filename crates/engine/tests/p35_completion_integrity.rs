@@ -195,25 +195,56 @@ fn sse(text: &str, reason: &str) -> Response {
     }
 }
 
-fn compaction_case(reason: &str, expected_summary: bool) {
-    let fixture = Fixture::new(vec![
-        sse("summary candidate", reason),
-        sse("ordinary answer", "stop"),
-    ]);
+fn compaction_body(messages: &[ChatMessage]) -> serde_json::Value {
+    let route = serde_json::from_value(serde_json::json!({
+        "provider_id":"fixture", "deployment_id":"fixture", "region_id":"local",
+        "adapter_kind":"OpenAiCompatibleHttpV1", "adapter_implementation_digest":"implementation",
+        "adapter_profile_digest":"profile", "endpoint_digest":"endpoint",
+        "expected_model":"local-model", "pricing_digest":"pricing",
+        "endpoint_host":"127.0.0.1", "endpoint_port":80,
+        "endpoint_scheme":"HttpLoopback", "endpoint_path":""
+    }))
+    .unwrap();
+    let mut request = orbit_adapter::conformance::canonical_request(&route, b"latest prompt");
+    request.messages = Some(messages.to_vec());
+    request.sampling = orbit_adapter::types::SamplingParameters {
+        temperature_milliunits: 0,
+        top_p_millionths: 0,
+        max_output_tokens: 2048,
+    };
+    orbit_provider_http::request::render_request_body(
+        orbit_provider_http::request::HttpDialect::OpenAiCompatible,
+        orbit_provider_http::request::RequestBodyInput::from(&request),
+    )
+    .unwrap()
+    .as_json()
+    .clone()
+}
+
+fn compaction_case(summary: &str, reason: &str, expected_summary: bool) {
+    let fixture = Fixture::new(vec![sse(summary, reason), sse("ordinary answer", "stop")]);
     let home = Home::new();
     let mut transcript: Vec<ChatMessage> = (0..12)
         .map(|n| orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50))))
         .collect();
     let original = transcript.clone();
+    let mut original_with_prompt = original.clone();
+    original_with_prompt.push(orbit_engine::user_message("latest prompt"));
+    let original_body = compaction_body(&original_with_prompt);
+    assert!(serde_json::to_vec(&original_body).unwrap().len() > 4000);
     let options = TurnOptions {
-        window_tokens: Some(500),
+        // Legacy callers supply an input-policy ceiling, not a combined
+        // provider fact. Keep selected max_tokens=2048 independent of it.
+        // These byte bounds exercise the documented byte/4 approximation;
+        // they do not claim exact tokenizer/provider capacity knowledge.
+        window_tokens: Some(1000),
         output_reserve_tokens: 0,
         max_attempts: 1,
         ..Default::default()
     };
     let mut events = Vec::new();
     let mut executor = Executor::default();
-    let report = orbit_engine::run_turn(
+    let result = orbit_engine::run_turn(
         &home.0,
         &config(&fixture),
         &options,
@@ -222,10 +253,27 @@ fn compaction_case(reason: &str, expected_summary: bool) {
         &mut executor,
         &CancelToken::new(),
         &mut |event| events.push(event),
-    )
-    .unwrap();
-    assert!(report.ok && !report.interrupted);
-    assert_eq!(fixture.calls(), 2);
+    );
+    {
+        let requests = fixture.requests.lock().unwrap();
+        let summary_body = requests.first().expect("one summary must be attempted");
+        assert!(serde_json::to_vec(summary_body).unwrap().len() < 3600);
+        assert_eq!(summary_body["model"], "local-model");
+        assert_eq!(summary_body["max_tokens"], 2048);
+        assert!(summary_body.get("tools").is_none());
+        assert!(summary_body.get("reasoning_effort").is_none());
+        let summary_messages = summary_body["messages"].as_array().unwrap();
+        assert_eq!(summary_messages.len(), 1);
+        assert_eq!(summary_messages[0]["role"], "user");
+        let text = summary_messages[0]["content"].as_str().unwrap();
+        assert!(text.starts_with("Summarize this conversation for continuation."));
+        assert!(!text.contains("latest prompt"));
+    }
+    assert_eq!(
+        fixture.calls(),
+        if expected_summary { 2 } else { 1 },
+        "an unusable summary must never fall through to an oversized ordinary POST"
+    );
     assert_eq!(executor.0, 0);
     assert_eq!(
         events
@@ -240,59 +288,107 @@ fn compaction_case(reason: &str, expected_summary: bool) {
             .any(|event| matches!(event, FrontendEvent::OutputTruncated { .. })),
         "housekeeping events stay private"
     );
+    assert!(
+        !events.iter().any(|event| matches!(event,
+            FrontendEvent::TextDelta { text } if !summary.is_empty() && text.contains(summary)
+        )),
+        "housekeeping text stays private"
+    );
     if expected_summary {
-        assert!(transcript[0].content.contains("summary candidate"));
+        let report = result.unwrap();
+        assert!(report.ok && !report.interrupted);
+        assert!(transcript[0].content.contains(summary));
         assert!(
             !transcript
                 .iter()
                 .any(|message| message.content == original[0].content)
         );
         let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests[1]["max_tokens"], 2048);
+        assert!(serde_json::to_vec(&requests[1]).unwrap().len() < 3600);
         let wire = requests[1]["messages"].as_array().unwrap();
         assert_eq!(wire.len(), 7, "one summary plus the newest six messages");
-        assert!(
-            wire[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("summary candidate")
-        );
+        assert!(wire[0]["content"].as_str().unwrap().contains(summary));
         for (actual, expected) in wire[1..6].iter().zip(&original[7..]) {
             assert_eq!(actual["content"], expected.content);
         }
         assert_eq!(wire[6]["content"], "latest prompt");
+        assert_eq!(transcript.last().unwrap().content, "ordinary answer");
     } else {
-        assert_eq!(
-            &transcript[..original.len()],
-            original.as_slice(),
-            "incomplete compaction cannot replace history"
-        );
-        let requests = fixture.requests.lock().unwrap();
+        let error = result.expect_err("unusable summary must return a local budget error");
+        assert!(error.len() <= 512, "local budget error must be bounded");
+        let normalized = error.to_ascii_lowercase();
         assert!(
-            requests[1]["messages"]
-                .as_array()
-                .unwrap()
+            normalized.contains("context")
+                || normalized.contains("budget")
+                || normalized.contains("limit")
+        );
+        assert!(!error.contains(&fixture.url));
+        assert!(!error.contains("history-0:") && !error.contains("latest prompt"));
+        if !summary.is_empty() {
+            assert!(!error.contains(summary));
+        }
+        assert_eq!(
+            transcript, original_with_prompt,
+            "unusable compaction must preserve every original message and current intent"
+        );
+        assert!(
+            !events
                 .iter()
-                .any(|message| message["content"] == original[0].content)
+                .any(|event| matches!(event, FrontendEvent::TextDelta { .. }))
         );
     }
-    assert_eq!(transcript.last().unwrap().content, "ordinary answer");
 }
 
 #[test]
 fn compaction_rejects_length_summary() {
-    compaction_case("length", false);
+    compaction_case("summary candidate", "length", false);
 }
 #[test]
 fn compaction_rejects_max_tokens_summary() {
-    compaction_case("max_tokens", false);
+    compaction_case("summary candidate", "max_tokens", false);
 }
 #[test]
 fn compaction_rejects_cancelled_summary() {
-    compaction_case("cancelled", false);
+    compaction_case("summary candidate", "cancelled", false);
 }
 #[test]
 fn compaction_accepts_completed_summary() {
-    compaction_case("stop", true);
+    compaction_case("summary candidate", "stop", true);
+}
+
+#[test]
+fn compaction_rejects_empty_summary() {
+    compaction_case("", "stop", false);
+}
+
+#[test]
+fn compaction_rejects_whitespace_only_completed_summary() {
+    compaction_case(" \n\t", "stop", false);
+}
+
+#[test]
+fn compaction_rejects_ineffective_completed_summary() {
+    let summary = "ineffective ".repeat(550);
+    // A completed response can be valid text but fail to reduce the request.
+    // The selected output cap remains 2048; the input-only ceiling is 1000.
+    // Include the exact retained tail and current intent in this candidate.
+    let mut candidate = vec![orbit_engine::user_message(format!(
+        "[context compacted from 7 older messages]\n\n{summary}"
+    ))];
+    candidate.extend(
+        (7..12).map(|n| {
+            orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50)))
+        }),
+    );
+    candidate.push(orbit_engine::user_message("latest prompt"));
+    assert!(
+        serde_json::to_vec(&compaction_body(&candidate))
+            .unwrap()
+            .len()
+            > 4000
+    );
+    compaction_case(&summary, "stop", false);
 }
 
 #[test]
@@ -307,6 +403,14 @@ fn cancellation_during_compaction_preserves_history_and_skips_main_request() {
         .map(|n| orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50))))
         .collect();
     let original = transcript.clone();
+    let mut original_with_prompt = original.clone();
+    original_with_prompt.push(orbit_engine::user_message("latest prompt"));
+    assert!(
+        serde_json::to_vec(&compaction_body(&original_with_prompt))
+            .unwrap()
+            .len()
+            > 4000
+    );
     let cancel = CancelToken::new();
     let calls = fixture.requests.clone();
     let cancelling = cancel.clone();
@@ -323,7 +427,7 @@ fn cancellation_during_compaction_preserves_history_and_skips_main_request() {
         &home.0,
         &config(&fixture),
         &TurnOptions {
-            window_tokens: Some(500),
+            window_tokens: Some(1000),
             output_reserve_tokens: 0,
             max_attempts: 3,
             ..Default::default()
@@ -338,6 +442,12 @@ fn cancellation_during_compaction_preserves_history_and_skips_main_request() {
     cancel_thread.join().unwrap();
     assert!(report.interrupted && !report.ok);
     assert_eq!(fixture.calls(), 1);
+    {
+        let requests = fixture.requests.lock().unwrap();
+        assert!(serde_json::to_vec(&requests[0]).unwrap().len() < 3600);
+        assert_eq!(requests[0]["max_tokens"], 2048);
+        assert!(requests[0].get("tools").is_none());
+    }
     assert_eq!(&transcript[..original.len()], original.as_slice());
     assert_eq!(transcript.last().unwrap().content, "latest prompt");
     assert!(

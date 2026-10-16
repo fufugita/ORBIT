@@ -88,9 +88,9 @@ pub struct ModelEntry {
     /// answers and file writes.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
-    /// The model's context window (input tokens). When present the
-    /// engine auto-compacts at 90% of window minus the output reserve
-    /// (phase 4); when absent compaction never triggers.
+    /// Legacy context-window metadata retained in the provider configuration.
+    /// Existing callers use it as an input-policy ceiling for auto-compaction;
+    /// typed selected budgets take precedence when supplied.
     #[serde(default)]
     pub context_window: Option<u64>,
     /// Optional sampling override (E8): temperature and top_p. Omitted

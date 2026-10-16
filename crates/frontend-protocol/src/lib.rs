@@ -40,8 +40,9 @@ pub struct ContextBreakdown {
     pub memory: u64,
     /// The conversation so far.
     pub messages: u64,
-    /// The conversation size at which auto-compaction starts (90% of the
-    /// window less the output reserve); 0 when there is no window.
+    /// Estimated input threshold that triggers automatic compaction, derived
+    /// from selected input/combined policies and actual requested output.
+    /// Zero is valid when requested output already reaches the soft threshold.
     pub compact_at: u64,
     /// Tokens kept free for the answer.
     pub reserve: u64,

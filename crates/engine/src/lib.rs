@@ -28,6 +28,7 @@
 pub mod agent_store;
 pub mod automation;
 pub mod context;
+pub mod context_budget;
 pub mod diff;
 pub mod dispatch;
 pub mod hooks;

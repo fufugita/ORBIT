@@ -830,7 +830,6 @@ const SAVED_CONTEXT_BODY: &str =
     "selected-child-context-instruction-c483be\nRead the evidence and return a concise report.";
 const SAVED_CONTEXT_PROMPT: &str = "implement the resumed context boundary review";
 const SAVED_CONTEXT_WINDOW: u64 = 10_000;
-const SAVED_CONTEXT_RESERVE: u64 = 8_192;
 
 impl SavedTaskFixture {
     fn seed_selected_context_resume(
@@ -900,11 +899,11 @@ impl SavedTaskFixture {
         for pair in 0..10 {
             transcript.push(orbit_engine::user_message(format!(
                 "OLD-CONTEXT-{pair:02}-user {}",
-                "x".repeat(1_200)
+                "x".repeat(2_000)
             )));
             transcript.push(orbit_engine::assistant_message(format!(
                 "OLD-CONTEXT-{pair:02}-assistant {}",
-                "y".repeat(1_200)
+                "y".repeat(2_000)
             )));
         }
         for pair in 0..3 {
@@ -915,14 +914,11 @@ impl SavedTaskFixture {
                 "recent-small-assistant-{pair}"
             )));
         }
-        // The engine appends the current prompt before checking its existing
-        // threshold. This precondition separates B's exact selected limit from A.
+        // Complete old messages exceed B's explicit input policy even without
+        // the old 8192 reserve. Actual continuation system/tools are checked below.
         let mut upcoming = transcript.clone();
         upcoming.push(orbit_engine::user_message(SAVED_CONTEXT_PROMPT));
-        let estimated = orbit_engine::turn::estimate_transcript_tokens(&upcoming);
-        let b_threshold = SAVED_CONTEXT_WINDOW.saturating_sub(SAVED_CONTEXT_RESERVE) / 10 * 9;
-        let a_threshold = 65_536u64.saturating_sub(SAVED_CONTEXT_RESERVE) / 10 * 9;
-        assert!(estimated > b_threshold && estimated < a_threshold);
+        assert!(serde_json::to_vec(&upcoming).unwrap().len() > (SAVED_CONTEXT_WINDOW * 4) as usize);
         assert!(serde_json::to_vec(&transcript).unwrap().len() < 64 * 1024);
 
         let effort = Some(EffortSetting::Value(EffortValue::Level("high".into())));
@@ -1107,6 +1103,35 @@ fn saved_private_resumed_child_compacts_for_exact_b_window_then_continues_with_b
 
     let continuation = &bodies[1];
     f.assert_selected_context_normal(continuation);
+    // Reconstruct the unsummarized request from the actual normal wire body:
+    // keep its frozen system/tools/output/effort, substitute the complete source.
+    let mut original_request = continuation.clone();
+    let mut original_messages: Vec<_> = continuation["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "system")
+        .cloned()
+        .collect();
+    original_messages.extend(seeded.transcript.iter().map(|message| {
+        assert!(
+            message.blocks.is_none()
+                && message.tool_calls.is_none()
+                && message.tool_result.is_none()
+        );
+        json!({"role":message.role.as_str(),"content":message.content})
+    }));
+    original_messages.push(json!({"role":"user","content":SAVED_CONTEXT_PROMPT}));
+    original_request["messages"] = Value::Array(original_messages);
+    let original_bytes = serde_json::to_vec(&original_request).unwrap().len();
+    let summary_bytes = serde_json::to_vec(summary).unwrap().len();
+    let continuation_bytes = serde_json::to_vec(continuation).unwrap().len();
+    assert!(original_bytes > (SAVED_CONTEXT_WINDOW * 4) as usize);
+    assert!(original_bytes < (65_536 * 4) as usize);
+    assert!(summary_bytes < (SAVED_CONTEXT_WINDOW / 10 * 9 * 4) as usize);
+    assert!(continuation_bytes < (SAVED_CONTEXT_WINDOW / 10 * 9 * 4) as usize);
+    assert_eq!(summary["max_tokens"], 733);
+    assert_eq!(continuation["max_tokens"], 733);
     let non_system: Vec<_> = continuation["messages"]
         .as_array()
         .unwrap()
@@ -1139,10 +1164,7 @@ fn saved_private_resumed_child_compacts_for_exact_b_window_then_continues_with_b
     }
     // A byte-size guard keeps this particular fixture comfortably bounded; it
     // is not a tokenizer or a general whole-request/context accounting proof.
-    assert!(
-        continuation.to_string().len()
-            < ((SAVED_CONTEXT_WINDOW - SAVED_CONTEXT_RESERVE) * 4) as usize
-    );
+    assert!(continuation.to_string().len() < (SAVED_CONTEXT_WINDOW / 10 * 9 * 4) as usize);
     let saved = f.fixture.store().load(&seeded.agent_id).unwrap();
     assert_eq!(saved.model, format!("b/{SAVED_TASK_RAW}"));
     assert_eq!(saved.status, AgentStatus::Completed);

@@ -133,38 +133,131 @@ impl TurnConfig {
     }
 }
 
-/// Run one provider round through the four-gate async dispatch
-/// pipeline. Shared by every front-end: the TUI worker, the REPL, the
-/// web bridge, the Go bridge and `orbit -p` all call this one function.
-///
-/// - `gate` / `model`: resolved by the caller (flags → env → defaults).
-/// - `messages`: `Some(transcript)` for multi-turn chat, `None` for the
-///   single-turn `ask` contract.
-/// - `observer`: called per streamed event (live TextDelta rendering);
-///   `None` = buffered output only.
-#[allow(clippy::too_many_arguments)]
-pub fn run_dispatch(
-    home: &Path,
-    config: &TurnConfig,
-    prompt: &str,
-    messages: Option<Vec<ChatMessage>>,
-    observer: orbit_provider_http::stream::StreamObserver<'_>,
-    cancel: orbit_provider_http::CancelToken,
+pub(crate) type DispatchFailure = (&'static str, String);
+
+// These construction types intentionally have no content-bearing Debug/Serialize.
+#[derive(Clone)]
+pub(crate) struct RequestPreparationContext {
+    config: TurnConfig,
+    route: orbit_adapter::types::ProviderRouteBinding,
+    dialect: orbit_provider_http::request::HttpDialect,
+    directive: Option<String>,
     tools: Vec<orbit_adapter::types::ToolDefinition>,
-    request_stem: &str,
-    session_id: &str,
-) -> Result<TurnOutcome, (&'static str, String)> {
-    config.validate_effort().map_err(|e| ("ORBIT-E0401", e))?;
-    // Own only the outgoing copy. Saved transcripts keep their original opaque
-    // blocks; every frontend and direct dispatch uses this exact pair guard.
-    let messages = messages.map(|mut wire| {
+    binding_digest: String,
+}
+
+pub(crate) struct PreparedProviderRequest {
+    context: RequestPreparationContext,
+    request: orbit_adapter::types::ProviderRequest,
+    session_id: String,
+}
+impl PreparedProviderRequest {
+    pub(crate) fn binding_digest(&self) -> &str {
+        &self.context.binding_digest
+    }
+    pub(crate) fn rendered_body(
+        &self,
+    ) -> Result<orbit_provider_http::request::RenderedRequestBody, orbit_adapter::error::AdapterError>
+    {
+        orbit_provider_http::request::render_request_body(
+            self.context.dialect,
+            (&self.request).into(),
+        )
+    }
+    pub(crate) fn opaque_prefixes(&self) -> Vec<(usize, usize)> {
+        use orbit_adapter::types::{ChatRole, ContentBlock};
+        if self.context.dialect != orbit_provider_http::request::HttpDialect::AnthropicMessages {
+            return Vec::new();
+        }
+        let mut prefixes = Vec::new();
+        let mut wire_index = 0;
+        for message in self.request.messages.iter().flatten() {
+            match message.role {
+                ChatRole::System => {}
+                ChatRole::Assistant => {
+                    let count = message
+                        .blocks
+                        .iter()
+                        .flatten()
+                        .filter(|block| match block {
+                            ContentBlock::Opaque { json } => {
+                                serde_json::from_str::<serde_json::Value>(json).is_ok()
+                            }
+                            _ => false,
+                        })
+                        .count();
+                    if count > 0
+                        || !message.content.is_empty()
+                        || message
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|calls| !calls.is_empty())
+                    {
+                        if count > 0 {
+                            prefixes.push((wire_index, count));
+                        }
+                        wire_index += 1;
+                    }
+                }
+                ChatRole::User | ChatRole::Tool => wire_index += 1,
+            }
+        }
+        prefixes
+    }
+    pub(crate) fn with_messages_for_measurement(&self, messages: Vec<ChatMessage>) -> Self {
+        let old = &self.request;
+        let prompt = String::from_utf8_lossy(old.input.expose());
+        Self {
+            context: self.context.clone(),
+            session_id: self.session_id.clone(),
+            request: orbit_adapter::types::ProviderRequest {
+                schema_version: old.schema_version,
+                request_id: old.request_id.clone(),
+                decision_id: old.decision_id.clone(),
+                attempt_id: old.attempt_id.clone(),
+                route: old.route.clone(),
+                input: orbit_adapter::credential::SecretBytes::new(old.input.expose().to_vec()),
+                messages: project_messages(&self.context, &prompt, Some(messages)),
+                effort: old.effort.clone(),
+                sampling: old.sampling,
+                output: old.output.clone(),
+                tools: old.tools.clone(),
+                metadata: old.metadata.clone(),
+                connect_timeout_ms: old.connect_timeout_ms,
+                first_byte_timeout_ms: old.first_byte_timeout_ms,
+                idle_timeout_ms: old.idle_timeout_ms,
+            },
+        }
+    }
+}
+
+fn project_messages(
+    context: &RequestPreparationContext,
+    prompt: &str,
+    mut messages: Option<Vec<ChatMessage>>,
+) -> Option<Vec<ChatMessage>> {
+    if let Some(directive) = &context.directive {
+        let wire = messages.get_or_insert_with(|| vec![crate::user_message(prompt)]);
+        let mut system = crate::user_message(directive);
+        system.role = orbit_adapter::types::ChatRole::System;
+        wire.insert(0, system);
+    }
+    if let Some(wire) = &mut messages {
         crate::routing::strip_foreign_opaque_blocks_for(
-            &mut wire,
-            &config.provider_id,
-            &config.model,
+            wire,
+            &context.config.provider_id,
+            &context.config.model,
         );
-        wire
-    });
+    }
+    messages
+}
+
+pub(crate) fn request_preparation_context(
+    config: &TurnConfig,
+    system_directive: Option<&str>,
+    tools: &[orbit_adapter::types::ToolDefinition],
+) -> Result<RequestPreparationContext, DispatchFailure> {
+    config.validate_effort().map_err(|e| ("ORBIT-E0401", e))?;
     // Validate the original URL before parsing can discard controls or whitespace.
     // This shared guard runs before credential-store access and ledger creation.
     let url = orbit_provider_http::endpoint::validate_provider_url(&config.gate)
@@ -200,15 +293,207 @@ pub fn run_dispatch(
         _ => normalize_endpoint_path(url.path()),
     };
 
-    // Build the route binding (generic runtime config — no internal models).
-    // The adapter identity + kind follow the configured provider kind.
+    let (adapter_kind, adapter_identity, dialect) = match config.kind {
+        ProviderKind::OpenAiCompatible => (
+            orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1,
+            orbit_provider_http::openai::openai_identity(),
+            orbit_provider_http::request::HttpDialect::OpenAiCompatible,
+        ),
+        ProviderKind::Anthropic => (
+            orbit_adapter::types::AdapterKind::DeclarativeHttpJsonV1,
+            orbit_provider_http::anthropic::anthropic_identity(),
+            orbit_provider_http::request::HttpDialect::AnthropicMessages,
+        ),
+        ProviderKind::Ollama => (
+            orbit_adapter::types::AdapterKind::LocalProcessV1,
+            orbit_adapter::types::AdapterIdentity {
+                kind: orbit_adapter::types::AdapterKind::LocalProcessV1,
+                implementation_digest: orbit_adapter::types::Sha256Digest("o".repeat(64)),
+                profile_digest: orbit_adapter::types::Sha256Digest(
+                    "ollama-profile".repeat(8).chars().take(64).collect(),
+                ),
+            },
+            orbit_provider_http::request::HttpDialect::Ollama,
+        ),
+    };
+    let route = orbit_adapter::types::ProviderRouteBinding {
+        provider_id: orbit_adapter::types::ProviderId(config.provider_id.clone()),
+        deployment_id: orbit_adapter::types::DeploymentId(config.provider_id.clone()),
+        region_id: orbit_adapter::types::RegionId("local".into()),
+        adapter_kind,
+        adapter_implementation_digest: adapter_identity.implementation_digest.clone(),
+        adapter_profile_digest: adapter_identity.profile_digest.clone(),
+        endpoint_digest: orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(
+            format!("{}:{}", config.gate, config.model).as_bytes(),
+        ))),
+        expected_model: config.model.clone(),
+        pricing_digest: orbit_adapter::types::Sha256Digest("0".repeat(64)),
+        endpoint_host: host,
+        endpoint_port: port,
+        endpoint_scheme: scheme,
+        endpoint_path: endpoint_path.clone(),
+        endpoint_query: url.query().map(str::to_owned),
+    };
+
+    // Check the actual concrete method endpoint before any credentials or I/O.
+    orbit_provider_http::endpoint::provider_method_url(
+        &route,
+        if config.kind == ProviderKind::Ollama {
+            "/api"
+        } else {
+            "/v1"
+        },
+        if config.kind == ProviderKind::Anthropic {
+            "messages"
+        } else if config.kind == ProviderKind::Ollama {
+            "chat"
+        } else {
+            "chat/completions"
+        },
+    )
+    .map_err(|_| ("ORBIT-E0401", "provider endpoint binding is invalid".into()))?;
+    let binding_digest = crate::context_budget::BudgetIdentity::for_config(config, "", "")
+        .map_err(|e| ("ORBIT-E0401", e))?
+        .binding_digest;
+    Ok(RequestPreparationContext {
+        config: config.clone(),
+        route,
+        dialect,
+        directive: system_directive
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        tools: tools.to_vec(),
+        binding_digest,
+    })
+}
+
+pub(crate) fn prepare_provider_request(
+    context: &RequestPreparationContext,
+    prompt: &str,
+    messages: Option<Vec<ChatMessage>>,
+    request_stem: &str,
+    session_id: &str,
+) -> Result<PreparedProviderRequest, DispatchFailure> {
+    let config = &context.config;
+    let messages = project_messages(context, prompt, messages);
     let input = orbit_adapter::credential::SecretBytes::new(prompt.as_bytes().to_vec());
     let input_digest =
         orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(prompt.as_bytes())));
+    // Build the provider request carrying the REAL prompt bytes.
+    // E7: every dispatch mints a fresh ULID request id (unique per
+    // round, turn and retry — the old "{stem}-{pid}" was identical
+    // for the whole process life, so the ledger could not tie rounds
+    // to turns or sessions).
+    let request_ulid = ulid::Ulid::new();
+    let request = orbit_adapter::types::ProviderRequest {
+        schema_version: 1,
+        request_id: orbit_adapter::types::RequestId(format!("{request_stem}-{request_ulid}")),
+        decision_id: orbit_adapter::types::DecisionId(format!("{request_stem}-{request_ulid}")),
+        attempt_id: orbit_adapter::types::AttemptId(format!("{request_stem}-{request_ulid}")),
+        route: context.route.clone(),
+        input,
+        messages,
+        effort: config.effort.clone(),
+        // E8: sampling is opt-in per model. Zero means "not set" —
+        // the wire adapters omit a zero temperature/top_p (B7/E8).
+        sampling: orbit_adapter::types::SamplingParameters {
+            temperature_milliunits: config
+                .sampling
+                .and_then(|(t, _)| t)
+                .and_then(|t| (t >= 0.0).then_some((t * 1000.0) as u32))
+                .unwrap_or(0),
+            top_p_millionths: config
+                .sampling
+                .and_then(|(_, p)| p)
+                .and_then(|p| (p >= 0.0).then_some((p * 1_000_000.0) as u32))
+                .unwrap_or(0),
+            max_output_tokens: config.max_output_tokens,
+        },
+        output: orbit_adapter::types::OutputRequirements::Text,
+        tools: context.tools.clone(),
+        metadata: orbit_adapter::types::RequestMetadata {
+            input_sha256: input_digest,
+            input_bytes: prompt.len() as u64,
+            tools_count: u32::try_from(context.tools.len())
+                .map_err(|_| ("ORBIT-E0406", "too many provider tools".into()))?,
+        },
+        // E5: 30 s to the first byte, 90 s max gap between chunks.
+        // Both overridable for tests (ORBIT_TEST_* never ship in
+        // production configs — the scenarios use them to keep the
+        // suite fast while proving the timeout fires).
+        connect_timeout_ms: 10_000,
+        first_byte_timeout_ms: std::env::var("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000),
+        idle_timeout_ms: std::env::var("ORBIT_TEST_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90_000),
+    };
 
+    let prepared = PreparedProviderRequest {
+        context: context.clone(),
+        request,
+        session_id: session_id.into(),
+    };
+    prepared
+        .rendered_body()
+        .map_err(|error| (error.code(), error.to_string()))?;
+    Ok(prepared)
+}
+
+/// Run one provider round through the four-gate async dispatch
+/// pipeline. Shared by every front-end: the TUI worker, the REPL, the
+/// web bridge, the Go bridge and `orbit -p` all call this one function.
+///
+/// - `gate` / `model`: resolved by the caller (flags → env → defaults).
+/// - `messages`: `Some(transcript)` for multi-turn chat, `None` for the
+///   single-turn `ask` contract.
+/// - `observer`: called per streamed event (live TextDelta rendering);
+///   `None` = buffered output only.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dispatch(
+    home: &Path,
+    config: &TurnConfig,
+    prompt: &str,
+    messages: Option<Vec<ChatMessage>>,
+    observer: orbit_provider_http::stream::StreamObserver<'_>,
+    cancel: orbit_provider_http::CancelToken,
+    tools: Vec<orbit_adapter::types::ToolDefinition>,
+    request_stem: &str,
+    session_id: &str,
+) -> Result<TurnOutcome, (&'static str, String)> {
+    let context = request_preparation_context(config, None, &tools)?;
+    let prepared = prepare_provider_request(&context, prompt, messages, request_stem, session_id)?;
+    run_prepared_dispatch(home, config, prepared, observer, cancel, session_id)
+}
+
+pub(crate) fn run_prepared_dispatch(
+    home: &Path,
+    config: &TurnConfig,
+    prepared: PreparedProviderRequest,
+    observer: orbit_provider_http::stream::StreamObserver<'_>,
+    cancel: orbit_provider_http::CancelToken,
+    session_id: &str,
+) -> Result<TurnOutcome, DispatchFailure> {
+    let current = request_preparation_context(config, None, &[])?;
+    if current.binding_digest != prepared.context.binding_digest
+        || current.route != prepared.request.route
+        || config.pricing != prepared.context.config.pricing
+        || session_id != prepared.session_id
+    {
+        return Err(("ORBIT-E0413", "prepared provider binding changed".into()));
+    }
+    let request = prepared.request;
+    let route = request.route.clone();
+    let port = route.endpoint_port;
+    let endpoint_path = route.endpoint_path.clone();
+    let url = orbit_provider_http::endpoint::validate_provider_url(&config.gate)
+        .map_err(|_| ("ORBIT-E0401", "provider endpoint binding is invalid".into()))?;
     type RegisterAdapter =
         Box<dyn FnOnce(&mut orbit_gateway::ProviderRegistry) -> Result<(), (&'static str, String)>>;
-    let (adapter_kind, adapter_identity, register): (
+    let (_adapter_kind, _adapter_identity, register): (
         orbit_adapter::types::AdapterKind,
         orbit_adapter::types::AdapterIdentity,
         RegisterAdapter,
@@ -275,25 +560,6 @@ pub fn run_dispatch(
         }
     };
 
-    let route = orbit_adapter::types::ProviderRouteBinding {
-        provider_id: orbit_adapter::types::ProviderId(config.provider_id.clone()),
-        deployment_id: orbit_adapter::types::DeploymentId(config.provider_id.clone()),
-        region_id: orbit_adapter::types::RegionId("local".into()),
-        adapter_kind,
-        adapter_implementation_digest: adapter_identity.implementation_digest.clone(),
-        adapter_profile_digest: adapter_identity.profile_digest.clone(),
-        endpoint_digest: orbit_adapter::types::Sha256Digest(hex::encode(sha2::Sha256::digest(
-            format!("{}:{}", config.gate, config.model).as_bytes(),
-        ))),
-        expected_model: config.model.clone(),
-        pricing_digest: orbit_adapter::types::Sha256Digest("0".repeat(64)),
-        endpoint_host: host,
-        endpoint_port: port,
-        endpoint_scheme: scheme,
-        endpoint_path: endpoint_path.clone(),
-        endpoint_query: url.query().map(str::to_owned),
-    };
-
     // Register the model + async adapter in a fresh registry.
     let mut registry = orbit_gateway::ProviderRegistry::new();
     register(&mut registry)?;
@@ -323,58 +589,6 @@ pub fn run_dispatch(
         vec![tuple],
         vec![],
     );
-
-    // Build the provider request carrying the REAL prompt bytes.
-    // E7: every dispatch mints a fresh ULID request id (unique per
-    // round, turn and retry — the old "{stem}-{pid}" was identical
-    // for the whole process life, so the ledger could not tie rounds
-    // to turns or sessions).
-    let request_ulid = ulid::Ulid::new();
-    let request = orbit_adapter::types::ProviderRequest {
-        schema_version: 1,
-        request_id: orbit_adapter::types::RequestId(format!("{request_stem}-{request_ulid}")),
-        decision_id: orbit_adapter::types::DecisionId(format!("{request_stem}-{request_ulid}")),
-        attempt_id: orbit_adapter::types::AttemptId(format!("{request_stem}-{request_ulid}")),
-        route: route.clone(),
-        input,
-        messages,
-        effort: config.effort.clone(),
-        // E8: sampling is opt-in per model. Zero means "not set" —
-        // the wire adapters omit a zero temperature/top_p (B7/E8).
-        sampling: orbit_adapter::types::SamplingParameters {
-            temperature_milliunits: config
-                .sampling
-                .and_then(|(t, _)| t)
-                .and_then(|t| (t >= 0.0).then_some((t * 1000.0) as u32))
-                .unwrap_or(0),
-            top_p_millionths: config
-                .sampling
-                .and_then(|(_, p)| p)
-                .and_then(|p| (p >= 0.0).then_some((p * 1_000_000.0) as u32))
-                .unwrap_or(0),
-            max_output_tokens: config.max_output_tokens,
-        },
-        output: orbit_adapter::types::OutputRequirements::Text,
-        tools: tools.clone(),
-        metadata: orbit_adapter::types::RequestMetadata {
-            input_sha256: input_digest,
-            input_bytes: prompt.len() as u64,
-            tools_count: tools.len() as u32,
-        },
-        // E5: 30 s to the first byte, 90 s max gap between chunks.
-        // Both overridable for tests (ORBIT_TEST_* never ship in
-        // production configs — the scenarios use them to keep the
-        // suite fast while proving the timeout fires).
-        connect_timeout_ms: 10_000,
-        first_byte_timeout_ms: std::env::var("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30_000),
-        idle_timeout_ms: std::env::var("ORBIT_TEST_IDLE_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(90_000),
-    };
 
     // Authentication follows the exact selected provider binding. No declaration
     // means no auth; legacy gate authentication is made explicit by its caller.
@@ -414,7 +628,7 @@ pub fn run_dispatch(
     // session, stable across rounds and turns) — not minted per
     // round, which made the ledger unable to tie rounds to sessions.
     let session: orbit_ledger::SessionId = session_id.to_string();
-    let decision = orbit_gateway::new_decision_id();
+    let decision = request.decision_id.clone();
 
     // Run the full pipeline via tokio.
     // E6: one shared runtime for the process — a round used to spawn
@@ -584,6 +798,127 @@ fn ollama_capabilities() -> orbit_adapter::types::ProviderCapabilities {
         supports_json_schema_output: false,
         max_input_tokens: 262_144,
         max_output_tokens: 32_000,
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    fn config() -> TurnConfig {
+        TurnConfig {
+            provider_id: "fixture".into(),
+            gate: "http://127.0.0.1:12345/tenant/v1?scope=exact".into(),
+            model: "raw-model".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            credential_env: None,
+            pricing: None,
+            max_output_tokens: 73,
+            sampling: None,
+            effort: None,
+            supported_efforts: None,
+        }
+    }
+
+    #[test]
+    fn preparation_freezes_one_identity_and_body_across_measurements() {
+        let config = config();
+        let context = request_preparation_context(&config, Some("frozen system"), &[]).unwrap();
+        let prepared = prepare_provider_request(
+            &context,
+            "question",
+            Some(vec![crate::user_message("question")]),
+            "fixture",
+            "session",
+        )
+        .unwrap();
+        let id = prepared.request.request_id.clone();
+        let budget = crate::context_budget::SelectedBudget::legacy_input(&config, 1000).unwrap();
+        let first = crate::context_budget::estimate_prepared_request(&prepared, &budget).unwrap();
+        let second = crate::context_budget::estimate_prepared_request(&prepared, &budget).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(prepared.request.request_id, id);
+        assert_eq!(prepared.request.decision_id.0, id.0);
+        assert_eq!(prepared.request.attempt_id.0, id.0);
+        let probe = prepared.with_messages_for_measurement(vec![crate::user_message("smaller")]);
+        assert_eq!(probe.request.request_id, id);
+        assert_eq!(probe.request.decision_id, prepared.request.decision_id);
+        assert_eq!(probe.request.attempt_id, prepared.request.attempt_id);
+        assert_eq!(
+            prepared.rendered_body().unwrap().as_json()["messages"],
+            serde_json::json!([
+                {"role":"system","content":"frozen system"}, {"role":"user","content":"question"}
+            ])
+        );
+        let another = prepare_provider_request(
+            &context,
+            "question",
+            Some(vec![crate::user_message("question")]),
+            "fixture",
+            "session",
+        )
+        .unwrap();
+        assert_ne!(another.request.request_id, id);
+        assert_eq!(
+            another.rendered_body().unwrap().as_json(),
+            prepared.rendered_body().unwrap().as_json()
+        );
+    }
+
+    #[test]
+    fn prepared_binding_drift_refuses_before_credentials_or_runtime() {
+        let original = config();
+        let context = request_preparation_context(&original, None, &[]).unwrap();
+        let prepared =
+            prepare_provider_request(&context, "question", None, "fixture", "session").unwrap();
+        let mut changed = original;
+        changed.gate = changed.gate.replace("scope=exact", "scope=different");
+        let error = run_prepared_dispatch(
+            std::path::Path::new("/nonexistent-context-budget-fixture"),
+            &changed,
+            prepared,
+            None,
+            orbit_provider_http::CancelToken::new(),
+            "session",
+        )
+        .unwrap_err();
+        assert_eq!(error.0, "ORBIT-E0413");
+        assert_eq!(error.1, "prepared provider binding changed");
+    }
+
+    #[test]
+    fn prepared_pricing_and_owner_drift_refuse_before_effects() {
+        for change_pricing in [true, false] {
+            let original = config();
+            let context = request_preparation_context(&original, None, &[]).unwrap();
+            let prepared =
+                prepare_provider_request(&context, "question", None, "fixture", "session").unwrap();
+            let mut changed = original;
+            if change_pricing {
+                changed.pricing = Some(orbit_adapter::types::CostRates {
+                    input_per_million_microcents: 1,
+                    output_per_million_microcents: 1,
+                    cache_read_per_million_microcents: None,
+                    cache_write_per_million_microcents: None,
+                    reasoning_per_million_microcents: None,
+                    request_flat_microcents: 1,
+                });
+            }
+            let error = run_prepared_dispatch(
+                std::path::Path::new("/nonexistent-context-budget-fixture"),
+                &changed,
+                prepared,
+                None,
+                orbit_provider_http::CancelToken::new(),
+                if change_pricing {
+                    "session"
+                } else {
+                    "different-owner"
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.0, "ORBIT-E0413");
+        }
     }
 }
 

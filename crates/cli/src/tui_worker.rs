@@ -1938,8 +1938,8 @@ pub fn run_tui_turn(
         session_id: config.session_id.clone(),
         system_directive: (!mods_directive.is_empty()).then(|| mods_directive.to_string()),
         memory_bytes: tool_cx.ext::<MemoryBytes>().map_or(0, |m| m.0),
-        // The model's window: auto-compaction triggers at 90% of
-        // window minus the output reserve (phase 4).
+        // Resolve the selected provider and raw model's legacy input policy.
+        // The engine measures the prepared request and applies the active budget.
         window_tokens: crate::context_window_for_turn(&config.home, &turn_config),
         request_stem: "orbit-tui".into(),
         // The compaction role: a cheap model may summarize while the

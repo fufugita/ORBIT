@@ -69,11 +69,11 @@ pub struct TurnOptions {
     pub memory_bytes: usize,
     /// Request-id stem for ledger records (e.g. "orbit-tui", "orbit-p").
     pub request_stem: String,
-    /// The model's context window (phase 4: compaction threshold =
-    /// 90% of window minus the output reserve).
+    /// Legacy caller-supplied input-policy ceiling when selected_budget is absent.
+    /// A typed selected_budget takes precedence; this is not a provider-capacity fact.
     pub window_tokens: Option<u64>,
-    /// Output reserve subtracted from the window before the compaction
-    /// threshold (the model needs room to answer).
+    /// Reserve used by the legacy context_breakdown display helper.
+    /// Turn admission reserves actual requested output against combined ceilings.
     pub output_reserve_tokens: u64,
     /// True inside a compaction request itself: never compact while
     /// compacting (the recursion loops when the window is small — the
@@ -85,11 +85,16 @@ pub struct TurnOptions {
     /// own config also summarizes. The front-end sets this; the engine
     /// never invents one.
     pub compaction_config: Option<TurnConfig>,
+    /// Exact selected capacity policy. None plus window=None is unmanaged legacy.
+    pub selected_budget: Option<crate::context_budget::SelectedBudget>,
+    /// Independently resolved policy for the selected summarizer.
+    pub compaction_budget: Option<crate::context_budget::SelectedBudget>,
 }
 
-/// What the next request is made of, in estimated tokens (~4 bytes each):
-/// the front-end's meter shows it beside the provider's single total. None
-/// without a window — there is nothing to compare against.
+/// Legacy transcript-only display estimate retained for API compatibility.
+/// Uses window_tokens/output_reserve_tokens and approximate text/tool sizes.
+/// run_turn admission and Usage events use the prepared dialect request and
+/// selected budget, including actual output reservation for combined ceilings.
 pub fn context_breakdown(
     options: &TurnOptions,
     transcript: &[ChatMessage],
@@ -135,18 +140,6 @@ pub fn estimate_transcript_tokens(transcript: &[ChatMessage]) -> u64 {
     (chars as u64) / 4
 }
 
-/// The compaction threshold: compact when the next request would pass
-/// 90% of (window − output reserve).
-fn should_compact(used_tokens: u64, window: Option<u64>, reserve: u64) -> bool {
-    match window {
-        Some(w) => {
-            let usable = w.saturating_sub(reserve);
-            used_tokens >= usable / 10 * 9
-        }
-        None => false,
-    }
-}
-
 impl Default for TurnOptions {
     fn default() -> Self {
         TurnOptions {
@@ -165,6 +158,8 @@ impl Default for TurnOptions {
             output_reserve_tokens: 8_192,
             compacting: false,
             compaction_config: None,
+            selected_budget: None,
+            compaction_budget: None,
         }
     }
 }
@@ -370,64 +365,173 @@ pub fn run_turn(
 
         events(FrontendEvent::RoundStarted { round });
 
-        // Phase 4: auto-compaction — when the next request would pass
-        // 90% of (window − output reserve), compact first. The size is
-        // ESTIMATED from the transcript (~chars/4), not taken from the
-        // last response's usage: a resumed or continued session starts
-        // with a long transcript and zero reported input tokens, and
-        // the first request of such a turn must compact too.
-        let est_tokens = estimate_transcript_tokens(transcript);
-        let mut est_now = est_tokens;
-        if round == 0 && report.input_tokens > 0 {
-            // Later rounds in this same turn: trust the provider's own
-            // count when we have one (more accurate than the estimate).
-            est_now = report.input_tokens;
-        }
-        let grown = match compacted_at {
-            Some(at) => est_now > at,
-            None => true,
+        use crate::context_budget::{
+            BudgetDecision, EstimateStatus, assess_request, estimate_prepared_request, fits,
         };
-        if !options.compacting
-            && grown
-            && should_compact(
-                est_now,
-                options.window_tokens,
-                options.output_reserve_tokens,
-            )
-        {
-            // E9: PreCompact fires before the summarisation.
-            let _ = hooks.fire(
-                crate::hooks::HookEvent::PreCompact,
-                &serde_json::json!({ "estimated_tokens": est_now }),
-            );
-            events(FrontendEvent::Compacting {
-                used_tokens: est_now,
-                window_tokens: options.window_tokens.unwrap_or(0),
-            });
-            if let Some(summary) = compact_transcript(home, config, options, transcript, cancel) {
-                // B6: keep the tail verbatim (the current prompt is the
-                // last message) and let the summary stand in for older
-                // history. The system prompt rides `options`, not the
-                // transcript, so it is untouched here.
-                let keep_from = transcript.len().saturating_sub(COMPACT_KEEP_TAIL);
-                let tail: Vec<ChatMessage> = transcript.split_off(keep_from);
-                transcript.clear();
-                transcript.push(user_message(format!(
-                    "[context compacted from {keep_from} older messages]\n\n{summary}"
-                )));
-                transcript.extend(tail);
-                // E9: PostCompact fires after the swap-in.
-                let _ = hooks.fire(
-                    crate::hooks::HookEvent::PostCompact,
-                    &serde_json::json!({ "summary_bytes": summary.len() }),
-                );
-                let after = estimate_transcript_tokens(transcript);
-                events(FrontendEvent::Compacted {
-                    summary: summary.clone(),
-                    after_tokens: after,
-                });
-                compacted_at = Some(after);
+        let context = crate::dispatch::request_preparation_context(
+            config,
+            options.system_directive.as_deref(),
+            &options.tools,
+        )
+        .map_err(|(code, message)| {
+            local_turn_error(events, &report, round, format!("{code}: {message}"))
+        })?;
+        let mut prepared = crate::dispatch::prepare_provider_request(
+            &context,
+            prompt,
+            Some(transcript.clone()),
+            &options.request_stem,
+            &options.session_id,
+        )
+        .map_err(|(code, message)| {
+            local_turn_error(events, &report, round, format!("{code}: {message}"))
+        })?;
+        let budget = options.selected_budget.clone().or_else(|| {
+            options.window_tokens.and_then(|window| {
+                crate::context_budget::SelectedBudget::legacy_input(config, window).ok()
+            })
+        });
+        let mut preflight_estimate = None;
+        if let Some(budget) = &budget {
+            let before = estimate_prepared_request(&prepared, budget)
+                .map_err(|e| local_turn_error(events, &report, round, e.to_string()))?;
+            let decision = assess_request(&before, budget);
+            if matches!(decision, BudgetDecision::Refuse | BudgetDecision::Unknown) {
+                return Err(local_turn_error(events, &report, round, "context budget policy refuses this request; check selected limits or media policy".into()));
             }
+            if decision == BudgetDecision::Compact
+                && !options.compacting
+                && compacted_at.is_none_or(|at| before.estimated_input_tokens > at)
+            {
+                // Immutable material alone must fit before any summarizer/hook I/O.
+                let immutable = prepared.with_messages_for_measurement(
+                    transcript.last().cloned().into_iter().collect(),
+                );
+                let immutable = estimate_prepared_request(&immutable, budget)
+                    .map_err(|e| local_turn_error(events, &report, round, e.to_string()))?;
+                if !fits(&immutable, budget) {
+                    return Err(local_turn_error(
+                        events,
+                        &report,
+                        round,
+                        "context budget exceeded by immutable system, tools or current intent"
+                            .into(),
+                    ));
+                }
+                // Complete protected groups/media need the later group-aware planner.
+                // Refuse rather than flattening, splitting or exposing hidden blocks.
+                let protected = transcript.iter().any(|m| {
+                    m.role == ChatRole::Tool
+                        || m.tool_calls.is_some()
+                        || m.blocks.as_ref().is_some_and(|blocks| {
+                            blocks.iter().any(|b| {
+                                !matches!(b, orbit_adapter::types::ContentBlock::Text { .. })
+                            })
+                        })
+                });
+                if protected || transcript.len() <= COMPACT_KEEP_TAIL {
+                    if !fits(&before, budget) {
+                        return Err(local_turn_error(
+                            events,
+                            &report,
+                            round,
+                            "context budget cannot safely reduce the retained conversation".into(),
+                        ));
+                    }
+                } else {
+                    let _ = hooks.fire(
+                        crate::hooks::HookEvent::PreCompact,
+                        &serde_json::json!({ "estimated_tokens": before.estimated_input_tokens }),
+                    );
+                    events(FrontendEvent::Compacting {
+                        used_tokens: before.estimated_input_tokens,
+                        window_tokens: budget
+                            .meter_window(before.requested_output_tokens)
+                            .0
+                            .unwrap_or(0),
+                    });
+                    if let Some(summary) =
+                        compact_transcript(home, config, options, transcript, cancel)
+                    {
+                        let keep_from = transcript.len().saturating_sub(COMPACT_KEEP_TAIL);
+                        let mut candidate = vec![user_message(format!(
+                            "[context compacted from {keep_from} older messages]\n\n{summary}"
+                        ))];
+                        candidate.extend_from_slice(&transcript[keep_from..]);
+                        let probe = prepared.with_messages_for_measurement(candidate.clone());
+                        let after = estimate_prepared_request(&probe, budget)
+                            .map_err(|e| local_turn_error(events, &report, round, e.to_string()))?;
+                        if !cancel.is_cancelled()
+                            && fits(&after, budget)
+                            && after.estimated_input_tokens < before.estimated_input_tokens
+                        {
+                            // Allocate a distinct prospective dispatch only after candidate acceptance.
+                            prepared = crate::dispatch::prepare_provider_request(
+                                &context,
+                                prompt,
+                                Some(candidate.clone()),
+                                &options.request_stem,
+                                &options.session_id,
+                            )
+                            .map_err(|(code, message)| {
+                                local_turn_error(
+                                    events,
+                                    &report,
+                                    round,
+                                    format!("{code}: {message}"),
+                                )
+                            })?;
+                            if !cancel.is_cancelled() {
+                                *transcript = candidate;
+                                let _ = hooks.fire(
+                                    crate::hooks::HookEvent::PostCompact,
+                                    &serde_json::json!({ "summary_bytes": summary.len() }),
+                                );
+                                events(FrontendEvent::Compacted {
+                                    summary,
+                                    after_tokens: after.estimated_input_tokens,
+                                });
+                                compacted_at = Some(after.estimated_input_tokens);
+                            }
+                        } else if !cancel.is_cancelled() && !fits(&before, budget) {
+                            return Err(local_turn_error(
+                                events,
+                                &report,
+                                round,
+                                "context budget remains exceeded after an ineffective summary"
+                                    .into(),
+                            ));
+                        }
+                    } else if !cancel.is_cancelled() && !fits(&before, budget) {
+                        return Err(local_turn_error(
+                            events,
+                            &report,
+                            round,
+                            "context budget remains exceeded after an unusable summary".into(),
+                        ));
+                    }
+                }
+            }
+            if cancel.is_cancelled() {
+                report.interrupted = true;
+                report.ok = false;
+                emit_turn_ended(events, &report, round);
+                return Ok(report);
+            }
+            let final_estimate = estimate_prepared_request(&prepared, budget)
+                .map_err(|e| local_turn_error(events, &report, round, e.to_string()))?;
+            if !fits(&final_estimate, budget) {
+                return Err(local_turn_error(
+                    events,
+                    &report,
+                    round,
+                    "context budget exceeded; ordinary request was not sent".into(),
+                ));
+            }
+            if final_estimate.status == EstimateStatus::UnknownMedia {
+                events(FrontendEvent::Status { text: "Media or opaque request cost is unknown; text policy passed, provider capacity is unverified.".into() });
+            }
+            preflight_estimate = Some(final_estimate);
         }
 
         // One dispatch, with retry on rate-limit-class refusals.
@@ -440,6 +544,7 @@ pub fn run_turn(
             transcript,
             cancel,
             round,
+            Some(prepared),
             &mut |event| {
                 if let FrontendEvent::TextDelta { text } = &event {
                     partial_text.push_str(text);
@@ -496,11 +601,25 @@ pub fn run_turn(
         // The context meter (E3/M18): tokens in use vs the window —
         // the LAST round's occupancy (input + cache), not the sum of
         // every round's input. The sums stay for cost accounting.
-        if let Some(w) = options.window_tokens {
+        if let Some((estimate, budget)) = preflight_estimate.as_ref().zip(budget.as_ref())
+            && let (Some(w), reserve) = budget.meter_window(estimate.requested_output_tokens)
+        {
+            let memory = (options.memory_bytes as u64).min(estimate.system_bytes) / 4;
+            let system = estimate.system_bytes / 4 - memory;
+            let tools = estimate.tools_bytes / 4;
             events(FrontendEvent::Usage {
-                used_tokens: o.context_tokens.max(estimate_transcript_tokens(transcript)),
+                used_tokens: o.context_tokens.max(estimate.estimated_input_tokens),
                 window_tokens: w,
-                breakdown: context_breakdown(options, transcript),
+                breakdown: Some(orbit_frontend_protocol::ContextBreakdown {
+                    system,
+                    memory,
+                    tools,
+                    messages: estimate.estimated_input_tokens - system - memory - tools,
+                    compact_at: budget
+                        .compaction_threshold(estimate.requested_output_tokens)
+                        .unwrap_or(0),
+                    reserve,
+                }),
             });
         }
 
@@ -713,6 +832,23 @@ fn emit_turn_ended(events: EventSink<'_>, report: &TurnReport, rounds: u32) {
     });
 }
 
+fn local_turn_error(
+    events: EventSink<'_>,
+    report: &TurnReport,
+    round: u32,
+    message: String,
+) -> String {
+    events(FrontendEvent::Error {
+        message: message.clone(),
+    });
+    let failed = TurnReport {
+        ok: false,
+        ..report.clone()
+    };
+    emit_turn_ended(events, &failed, round);
+    message
+}
+
 // ── dispatch + retry ───────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -724,6 +860,7 @@ fn dispatch_with_retry(
     transcript: &[ChatMessage],
     cancel: &orbit_provider_http::CancelToken,
     _round: u32,
+    mut prepared: Option<crate::dispatch::PreparedProviderRequest>,
     events: EventSink<'_>,
 ) -> Result<crate::dispatch::TurnOutcome, String> {
     let mut attempt: u32 = 1;
@@ -731,27 +868,25 @@ fn dispatch_with_retry(
         if cancel.is_cancelled() {
             return Err("cancelled".into());
         }
-        // Mods directive: a System message at the FRONT of the provider
-        // transcript (never persisted to the session file — it's rebuilt
-        // from the enabled set every turn).
-        let mut wire_transcript = transcript.to_vec();
-        if let Some(directive) = &options.system_directive
-            && !directive.is_empty()
-        {
-            wire_transcript.insert(
-                0,
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: directive.clone(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    tool_result: None,
-                    blocks: None,
-                    origin_model: None,
-                    origin_provider: None,
-                },
-            );
-        }
+        let request = match prepared.take() {
+            Some(request) => request,
+            None => {
+                let context = crate::dispatch::request_preparation_context(
+                    config,
+                    options.system_directive.as_deref(),
+                    &options.tools,
+                )
+                .map_err(|(code, message)| format!("{code}: {message}"))?;
+                crate::dispatch::prepare_provider_request(
+                    &context,
+                    prompt,
+                    Some(transcript.to_vec()),
+                    &options.request_stem,
+                    &options.session_id,
+                )
+                .map_err(|(code, message)| format!("{code}: {message}"))?
+            }
+        };
         // Live stream: forward TextDelta bytes to the front-end as
         // protocol events. The observer borrows `events` for the
         // duration of the dispatch call only.
@@ -768,15 +903,12 @@ fn dispatch_with_retry(
                 });
             }
         };
-        let result = crate::dispatch::run_dispatch(
+        let result = crate::dispatch::run_prepared_dispatch(
             home,
             config,
-            prompt,
-            Some(wire_transcript),
+            request,
             Some(&mut observer),
             cancel.clone(),
-            options.tools.clone(),
-            &options.request_stem,
             &options.session_id,
         );
         if cancel.is_cancelled() && result.is_err() {
@@ -978,8 +1110,19 @@ fn compact_transcript(
         tools: Vec::new(),
         system_directive: None,
         request_stem: format!("{}-compact", options.request_stem),
-        window_tokens: options.window_tokens,
-        output_reserve_tokens: options.output_reserve_tokens,
+        window_tokens: if options.compaction_config.is_none() {
+            options.window_tokens
+        } else {
+            None
+        },
+        selected_budget: options.compaction_budget.clone().or_else(|| {
+            options
+                .compaction_config
+                .is_none()
+                .then(|| options.selected_budget.clone())
+                .flatten()
+        }),
+        output_reserve_tokens: 0,
         compacting: true,
         ..Default::default()
     };
@@ -1015,7 +1158,7 @@ fn compact_transcript(
         &mut private_sink,
     )
     .ok()?;
-    (report.ok && !report.interrupted && !truncated && !report.final_text.is_empty())
+    (report.ok && !report.interrupted && !truncated && !report.final_text.trim().is_empty())
         .then_some(report.final_text)
 }
 
