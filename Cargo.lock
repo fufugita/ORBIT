@@ -2787,10 +2787,16 @@ dependencies = [
 name = "orbit-plugin-compat"
 version = "0.2.0"
 dependencies = [
+ "hex",
  "libyaml-rs",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.20",
+ "toml 0.8.23",
+ "url",
  "yaml_serde",
 ]
 

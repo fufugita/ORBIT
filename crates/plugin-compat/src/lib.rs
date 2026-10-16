@@ -1,8 +1,19 @@
 //! Portable plugin metadata and compatibility boundaries.
 
+mod formats;
 mod frontmatter;
+mod fs;
+mod inspect;
+mod model;
+mod store;
 
 pub use frontmatter::{FrontmatterDocument, parse_frontmatter};
+pub use inspect::inspect;
+pub use model::*;
+pub use store::{
+    ActivationSnapshot, ActivePlugin, ImportReceipt, PluginId, PluginStore, StoreScope,
+    StoreSnapshot, StoredPlugin,
+};
 
 /// A stable diagnostic that never includes source values or parser excerpts.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
