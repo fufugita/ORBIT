@@ -358,6 +358,7 @@ pub fn execute_task(
 pub(crate) struct AgentTaskError {
     pub(crate) message: String,
     agent_id: Option<String>,
+    context_notices: Vec<String>,
 }
 
 impl From<String> for AgentTaskError {
@@ -365,6 +366,7 @@ impl From<String> for AgentTaskError {
         Self {
             message,
             agent_id: None,
+            context_notices: Vec::new(),
         }
     }
 }
@@ -374,11 +376,55 @@ impl AgentTaskError {
         Self {
             message,
             agent_id: Some(id.into()),
+            context_notices: Vec::new(),
         }
     }
 
+    fn with_context_notices(mut self, notices: Vec<String>) -> Self {
+        self.context_notices = notices;
+        self
+    }
+
     pub(crate) fn into_value(self) -> serde_json::Value {
-        serde_json::json!({ "ok": false, "error": self.message, "agent_id": self.agent_id })
+        let mut value =
+            serde_json::json!({ "ok": false, "error": self.message, "agent_id": self.agent_id });
+        if !self.context_notices.is_empty() {
+            value["context_notices"] = serde_json::json!(self.context_notices);
+        }
+        value
+    }
+}
+
+fn task_context_notice(role: &str, notice: &crate::model_limits::BudgetNotice) -> String {
+    use crate::model_limits::{BudgetNotice, LimitComponent};
+    let component = |component: &LimitComponent| match component {
+        LimitComponent::Input => "input",
+        LimitComponent::Combined => "combined context",
+        LimitComponent::Output => "output",
+    };
+    match notice {
+        BudgetNotice::FallbackPolicy { .. } => {
+            format!(
+                "{role} context uses a harness fallback policy; declare an explicit context limit to replace it."
+            )
+        }
+        BudgetNotice::LegacyContextUnspecified => {
+            format!(
+                "{role} legacy context has no ownership evidence; declare an explicit context limit to preserve a local policy."
+            )
+        }
+        BudgetNotice::StaleObservation(limit) => {
+            format!(
+                "{role} {} observation is stale; its limit was excluded from the budget.",
+                component(limit)
+            )
+        }
+        BudgetNotice::UnusableObservation(limit) => {
+            format!(
+                "{role} {} observation cannot establish a usable limit and was excluded from the budget.",
+                component(limit)
+            )
+        }
     }
 }
 
@@ -673,13 +719,12 @@ pub(crate) fn execute_task_resolved(
             )?);
         }
     }
-    let options = orbit_engine::TurnOptions {
+    let mut options = orbit_engine::TurnOptions {
         session_id: id.clone(),
         tools: sub_tools,
         max_rounds: agent.max_turns,
         system_directive: Some(system_directive),
         request_stem: format!("orbit-task-{id}"),
-        window_tokens: crate::context_window_for_turn(home, &turn_config),
         ..Default::default()
     };
     let child_cx = crate::tool_runtime::child_agent_context(home, session_id, &id, parent_cx);
@@ -719,26 +764,86 @@ pub(crate) fn execute_task_resolved(
             .unwrap_or("")
             .into(),
     });
-    let result = orbit_engine::run_turn(
-        home,
-        &turn_config,
-        &options,
-        &input,
-        &mut transcript,
-        &mut executor,
-        &cancel,
-        &mut |event| {
-            if let orbit_frontend_protocol::FrontendEvent::ToolStartedFull {
-                kind, target, ..
-            } = event
-            {
-                notify(SubagentUpdate::Progress {
-                    id: id.clone(),
-                    action: format!("{kind} {target}").trim().into(),
-                });
+    // The lease has resolved the actual child identity, output, effort and
+    // sampling. Resolve its summary role independently, then bind both exact
+    // final configurations without changing either after budget resolution.
+    let resolution: Result<_, String> = (|| {
+        if cancel.is_cancelled() {
+            // Keep the existing engine cancellation lifecycle and prompt
+            // preservation; a pre-cancelled child needs no metadata read.
+            return Ok(None);
+        }
+        let compaction = crate::try_role_turn_config(home, &turn_config, "compaction")?;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "context budget observation time is unavailable".to_owned())?
+            .as_secs();
+        let reports = crate::model_limits::resolve_turn_budgets_detailed(
+            home,
+            &turn_config,
+            &compaction,
+            now_unix,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Some((compaction, reports)))
+    })();
+    let mut context_notices = Vec::new();
+    let result = match resolution {
+        Err(error) => {
+            // No engine call appended this input. Preserve it once and finish
+            // the leased run through the same terminal failure path below.
+            transcript.push(orbit_engine::user_message(input.clone()));
+            Err(error)
+        }
+        Ok(resolved) => {
+            if let Some((compaction, reports)) = resolved {
+                for (role, report) in [("Child", &reports.selected), ("Summary", &reports.summary)]
+                {
+                    for notice in &report.notices {
+                        let action = task_context_notice(role, notice);
+                        notify(SubagentUpdate::Progress {
+                            id: id.clone(),
+                            action: action.clone(),
+                        });
+                        context_notices.push(action);
+                    }
+                }
+                options.selected_budget = Some(reports.selected.budget);
+                options.compaction_budget = Some(reports.summary.budget);
+                options.compaction_config = Some(compaction);
             }
-        },
-    );
+            orbit_engine::run_turn(
+                home,
+                &turn_config,
+                &options,
+                &input,
+                &mut transcript,
+                &mut executor,
+                &cancel,
+                &mut |event| match event {
+                    orbit_frontend_protocol::FrontendEvent::ToolStartedFull {
+                        kind,
+                        target,
+                        ..
+                    } => {
+                        notify(SubagentUpdate::Progress {
+                            id: id.clone(),
+                            action: format!("{kind} {target}").trim().into(),
+                        });
+                    }
+                    orbit_frontend_protocol::FrontendEvent::Status { text } => {
+                        let action = orbit_hud_tui::safe_text(&text);
+                        notify(SubagentUpdate::Progress {
+                            id: id.clone(),
+                            action: action.clone(),
+                        });
+                        context_notices.push(action);
+                    }
+                    _ => {}
+                },
+            )
+        }
+    };
     let (ok, rounds, status, report_text, failure) = match result {
         Ok(report) => {
             let text = report.final_text;
@@ -778,15 +883,21 @@ pub(crate) fn execute_task_resolved(
             }
         }),
     });
-    let snapshot = persisted.map_err(|error| AgentTaskError::for_agent(error, &id))?;
+    let snapshot = persisted.map_err(|error| {
+        AgentTaskError::for_agent(error, &id).with_context_notices(context_notices.clone())
+    })?;
     if let Some(error) = failure {
-        return Err(AgentTaskError::for_agent(error, &id));
+        return Err(AgentTaskError::for_agent(error, &id).with_context_notices(context_notices));
     }
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "ok": ok, "agent": agent.name, "agent_id": id, "name": snapshot.name,
         "model": snapshot.model, "effort": snapshot.effort, "status": snapshot.status, "turns": snapshot.turns,
         "rounds": rounds, "report": report_text,
-    }))
+    });
+    if !context_notices.is_empty() {
+        result["context_notices"] = serde_json::json!(context_notices);
+    }
+    Ok(result)
 }
 
 /// Execute the Skill tool: return the named skill's body.

@@ -5409,6 +5409,11 @@ mod agent_lifecycle_tests {
                 std::env::temp_dir().join(format!("orbit-agent-runtime-{}", ulid::Ulid::new()));
             let work = home.join("work");
             std::fs::create_dir_all(&work).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
             // The public context ID is deliberately different: only the trusted
             // execute_call session ID may establish the owner namespace.
             let cx =

@@ -855,6 +855,10 @@ impl SavedTaskFixture {
         match window {
             Some(window) => {
                 models[0]["context_window"] = toml::Value::Integer(window.try_into().unwrap());
+                models[0].as_table_mut().unwrap().insert(
+                    "context_limits".into(),
+                    toml::Value::try_from(json!({"input_tokens": window})).unwrap(),
+                );
             }
             None => {
                 models[0].as_table_mut().unwrap().remove("context_window");
@@ -1235,4 +1239,605 @@ fn saved_private_resumed_child_with_unknown_b_window_continues_once_without_summ
     assert!(saved.transcript.starts_with(&seeded.transcript));
     assert_eq!(saved.transcript.len(), seeded.transcript.len() + 2);
     f.assert_selected_context_parent_unchanged(&parent_before, &result);
+}
+
+mod typed_task_budget_tracers {
+    use super::*;
+    use orbit_adapter::types::{ChatRole, EffortSetting, EffortValue};
+    use orbit_engine::agent_store::{AgentSnapshot, AgentStatus};
+
+    const CHILD_INPUT: u64 = 10_000;
+    const PARENT_INPUT: u64 = 65_536;
+    const SUMMARY_INPUT: u64 = 3_000;
+    const SUMMARY_RAW: &str = "family/task-summary-notools";
+    const SUMMARY_OUTPUT: u64 = 97;
+
+    // Covers provider readiness, synchronous Task and teardown if a regression
+    // stalls. Each owned Mock also retains its5s startup deadline and Drop kill.
+    struct Watchdog {
+        done: Option<std::sync::mpsc::Sender<()>>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Watchdog {
+        fn new() -> Self {
+            let (done, wait) = std::sync::mpsc::channel();
+            let join = std::thread::spawn(move || {
+                if matches!(
+                    wait.recv_timeout(std::time::Duration::from_secs(30)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    eprintln!("owned typed Task budget tracer exceeded finite watchdog");
+                    std::process::exit(94);
+                }
+            });
+            Self {
+                done: Some(done),
+                join: Some(join),
+            }
+        }
+    }
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            if let Some(done) = self.done.take() {
+                let _ = done.send(());
+            }
+            if let Some(join) = self.join.take() {
+                join.join().unwrap();
+            }
+        }
+    }
+
+    fn configure_typed(f: &mut SavedTaskFixture, child_limits: Value, summary_input: Option<u64>) {
+        let path = f.fixture.home.join("providers.toml");
+        let mut config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for provider in config["provider"].as_array_mut().unwrap() {
+            let is_parent = provider["name"].as_str() == Some("a");
+            for model in provider["models"].as_array_mut().unwrap() {
+                if model["id"].as_str() == Some(SAVED_TASK_RAW) {
+                    let table = model.as_table_mut().unwrap();
+                    table.remove("context_window");
+                    let limits = if is_parent {
+                        json!({"input_tokens":PARENT_INPUT,"unknown_policy":"require-limit"})
+                    } else {
+                        child_limits.clone()
+                    };
+                    table.insert(
+                        "context_limits".into(),
+                        toml::Value::try_from(limits).unwrap(),
+                    );
+                }
+            }
+        }
+        config["routing"]["phases"]["coding"]["default"] =
+            toml::Value::String(format!("a/{SAVED_TASK_RAW}"));
+        config["routing"]["phases"]["coding"]["hard"] =
+            toml::Value::String(format!("a/{SAVED_TASK_RAW}"));
+        config["roles"].as_table_mut().unwrap().remove("compaction");
+        if let Some(input) = summary_input {
+            let b = config["provider"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|provider| provider["name"].as_str() == Some("b"))
+                .unwrap();
+            b["models"].as_array_mut().unwrap().push(
+                toml::Value::try_from(json!({
+                    "id":SUMMARY_RAW,"max_output_tokens":SUMMARY_OUTPUT,
+                    "supported_efforts":["low"],"default_effort":"low",
+                    "context_limits":{"input_tokens":input,"unknown_policy":"require-limit"}
+                }))
+                .unwrap(),
+            );
+            config["roles"].as_table_mut().unwrap().insert(
+                "compaction".into(),
+                toml::Value::String(format!("b/{SUMMARY_RAW}")),
+            );
+        }
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let parsed = orbit_cli::config::ProvidersConfig::load(&f.fixture.home).unwrap();
+        orbit_cli::phase_routing::validate_providers(&parsed).unwrap();
+        for provider in &parsed.provider {
+            let model = provider
+                .models
+                .iter()
+                .find(|model| model.id == SAVED_TASK_RAW)
+                .unwrap();
+            assert!(
+                model.context_window.is_none(),
+                "no legacy window may explain typed admission"
+            );
+            assert!(model.context_limits.is_some());
+        }
+        assert_ne!(parsed.provider[0].url, parsed.provider[1].url);
+
+        // Install the same restricted profile as the retained resume fixture,
+        // also usable by the new fitting/immutable fresh-Task controls.
+        let profiles = f.fixture.home.join("agents");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = profiles.join(format!("{SAVED_CONTEXT_AGENT}.md"));
+        std::fs::write(&profile, format!(
+            "---\nname: {SAVED_CONTEXT_AGENT}\ndescription: Review selected context evidence\nmodel: b/{SAVED_TASK_RAW}\neffort: medium\ntools: [Read]\nmaxTurns: 2\n---\n\n{SAVED_CONTEXT_BODY}\n"
+        )).unwrap();
+        std::fs::set_permissions(profile, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Reconstruct the parent context so neither a remembered child config
+        // nor a legacy-window extension can explain the observed result.
+        let workspace = f.fixture.cx.working_dir.clone();
+        f.fixture.cx =
+            orbit_tools::ToolContext::new(f.fixture.home.clone(), "owner".into(), workspace);
+        let parent = orbit_cli::checked_model_turn(
+            &f.fixture.home,
+            &format!("a/{SAVED_TASK_RAW}"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let child = orbit_cli::checked_model_turn(
+            &f.fixture.home,
+            &format!("b/{SAVED_TASK_RAW}"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(parent.model, child.model);
+        assert_ne!(parent.provider_id, child.provider_id);
+        assert_ne!(parent.gate, child.gate);
+        assert_eq!(parent.max_output_tokens, 1111);
+        assert_eq!(child.max_output_tokens, 733);
+        assert!(orbit_cli::context_window_for_turn(&f.fixture.home, &parent).is_none());
+        assert!(orbit_cli::context_window_for_turn(&f.fixture.home, &child).is_none());
+        tool_runtime::remember_turn_config(&f.fixture.cx, &parent);
+        tool_runtime::remember_effort_setting(&f.fixture.cx, &None);
+        assert_eq!(
+            f.fixture.a.calls() + f.fixture.b.calls(),
+            0,
+            "setup stays offline"
+        );
+    }
+
+    fn seed_typed(f: &mut SavedTaskFixture, summary_input: Option<u64>) -> AgentSnapshot {
+        let seeded = f.seed_selected_context_resume(None);
+        configure_typed(
+            f,
+            json!({"input_tokens":CHILD_INPUT,"unknown_policy":"require-limit"}),
+            summary_input,
+        );
+        let mut original = seeded.transcript.clone();
+        original.push(orbit_engine::user_message(SAVED_CONTEXT_PROMPT));
+        assert!(serde_json::to_vec(&original).unwrap().len() > (CHILD_INPUT * 4) as usize);
+        assert!(serde_json::to_vec(&original).unwrap().len() < (PARENT_INPUT * 4) as usize);
+        assert_eq!(
+            f.fixture.store().load(&seeded.agent_id).unwrap().transcript,
+            seeded.transcript
+        );
+        seeded
+    }
+    fn parent_state(f: &SavedTaskFixture) -> String {
+        format!(
+            "{:?}",
+            f.fixture
+                .cx
+                .ext::<tool_runtime::SessionTurnConfig>()
+                .unwrap()
+                .0
+        )
+    }
+    fn assert_workspace_empty(f: &SavedTaskFixture) {
+        assert!(
+            std::fs::read_dir(&f.fixture.cx.working_dir)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+    fn assert_selected_posts_within_child_input(f: &SavedTaskFixture) {
+        for body in f.fixture.b.bodies() {
+            if body["model"] == SAVED_TASK_RAW {
+                assert!(
+                    serde_json::to_vec(&body).unwrap().len() <= (CHILD_INPUT * 4) as usize,
+                    "an oversized unsummarized child POST escaped its exact typed input policy"
+                );
+            }
+        }
+    }
+    fn assert_summary_request(f: &SavedTaskFixture, index: usize, input: u64, independent: bool) {
+        let body = &f.fixture.b.bodies()[index];
+        let metadata = &f.fixture.b.request_metadata()[index];
+        assert_eq!(metadata["method"], "POST");
+        assert_eq!(metadata["path"], "/v1/chat/completions");
+        assert_eq!(
+            metadata["authorization"],
+            json!([format!("Bearer {SAVED_TASK_B}")])
+        );
+        assert_eq!(metadata["x_api_key"], json!([]));
+        assert_eq!(
+            body["model"],
+            if independent {
+                SUMMARY_RAW
+            } else {
+                SAVED_TASK_RAW
+            }
+        );
+        assert_eq!(
+            body["max_tokens"],
+            if independent { SUMMARY_OUTPUT } else { 733 }
+        );
+        assert_eq!(
+            body["reasoning_effort"],
+            if independent { "low" } else { "high" }
+        );
+        assert!(
+            body.get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let prompt = messages[0]["content"].as_str().unwrap();
+        assert!(prompt.starts_with("Summarize this conversation for continuation."));
+        assert!(
+            prompt.contains("OLD-CONTEXT-00-user") && prompt.contains("OLD-CONTEXT-09-assistant")
+        );
+        assert!(!prompt.contains(SAVED_CONTEXT_PROMPT) && !prompt.contains(SAVED_CONTEXT_MARKER));
+        let bytes = serde_json::to_vec(body).unwrap().len();
+        assert!(
+            bytes > 4000,
+            "smaller1000-token summary refusal has a real request-size boundary"
+        );
+        assert!(
+            bytes < (input / 10 * 9 * 4) as usize,
+            "this allowed summary fits its own soft input threshold"
+        );
+        assert!(!body.to_string().contains(SAVED_TASK_B));
+    }
+    fn assert_compacted_continuation(f: &SavedTaskFixture, seeded: &AgentSnapshot) {
+        SavedTaskFixture::assert_call(&f.fixture.b, 1, SAVED_TASK_B, 733, Some("high"));
+        let body = &f.fixture.b.bodies()[1];
+        f.assert_selected_context_normal(body);
+        assert!(serde_json::to_vec(body).unwrap().len() < (CHILD_INPUT / 10 * 9 * 4) as usize);
+        let non_system: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] != "system")
+            .collect();
+        assert_eq!(non_system.len(), 7);
+        assert!(
+            non_system[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[context compacted from 21 older messages]")
+        );
+        assert!(
+            non_system[0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("owned fixture reply")
+        );
+        assert!(!body.to_string().contains("OLD-CONTEXT-"));
+        let mut tail = seeded.transcript[seeded.transcript.len() - 5..].to_vec();
+        tail.push(orbit_engine::user_message(SAVED_CONTEXT_PROMPT));
+        for (wire, message) in non_system[1..].iter().zip(&tail) {
+            assert_eq!(wire["role"], message.role.as_str());
+            assert_eq!(wire["content"], message.content);
+        }
+        let saved = f.fixture.store().load(&seeded.agent_id).unwrap();
+        assert_eq!(saved.model, seeded.model);
+        assert_eq!(saved.effort, seeded.effort);
+        assert_eq!(saved.status, AgentStatus::Completed);
+        assert_eq!(saved.turns, 14);
+        assert!(saved.active_run_id.is_none());
+        assert_eq!(saved.transcript.len(), 8);
+        assert_eq!(&saved.transcript[1..7], tail.as_slice());
+        assert_eq!(saved.transcript.last().unwrap().role, ChatRole::Assistant);
+        assert_eq!(
+            saved.transcript.last().unwrap().content,
+            "owned fixture reply"
+        );
+    }
+
+    #[test]
+    fn typed_task_budget_oldapi_resumed_small_child_compacts_before_oversized_post() {
+        let _watchdog = Watchdog::new();
+        let mut f = SavedTaskFixture::new();
+        let seeded = seed_typed(&mut f, None);
+        let parent = parent_state(&f);
+        let result = f.resume_selected_context(&seeded.agent_id);
+        assert_selected_posts_within_child_input(&f);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(id(&result), seeded.agent_id);
+        assert_eq!(f.fixture.a.calls(), 0);
+        assert_eq!(
+            f.fixture.b.calls(),
+            2,
+            "one admitted B summary, then one admitted B continuation"
+        );
+        assert_summary_request(&f, 0, CHILD_INPUT, false);
+        assert_compacted_continuation(&f, &seeded);
+        f.assert_selected_context_parent_unchanged(&parent, &result);
+        assert_workspace_empty(&f);
+    }
+
+    #[test]
+    fn typed_task_budget_oldapi_fitting_fresh_child_posts_once_with_own_auth_and_controls() {
+        let _watchdog = Watchdog::new();
+        let mut f = SavedTaskFixture::new();
+        configure_typed(
+            &mut f,
+            json!({"input_tokens":CHILD_INPUT,"unknown_policy":"require-limit"}),
+            None,
+        );
+        let parent = parent_state(&f);
+        let result = f.fixture.task(
+            json!({"agent":SAVED_CONTEXT_AGENT,"prompt":SAVED_CONTEXT_PROMPT,
+            "model":format!("b/{SAVED_TASK_RAW}"),"effort":"high"}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(f.fixture.a.calls(), 0);
+        assert_eq!(f.fixture.b.calls(), 1);
+        SavedTaskFixture::assert_call(&f.fixture.b, 0, SAVED_TASK_B, 733, Some("high"));
+        let body = f.fixture.b.body();
+        f.assert_selected_context_normal(&body);
+        assert!(serde_json::to_vec(&body).unwrap().len() < (CHILD_INPUT / 10 * 9 * 4) as usize);
+        assert!(
+            !body
+                .to_string()
+                .contains("Summarize this conversation for continuation.")
+        );
+        assert!(!body.to_string().contains("[context compacted"));
+        let saved = f.fixture.store().load(&id(&result)).unwrap();
+        assert_eq!(saved.model, format!("b/{SAVED_TASK_RAW}"));
+        assert_eq!(
+            saved.effort,
+            Some(EffortSetting::Value(EffortValue::Level("high".into())))
+        );
+        assert_eq!(saved.status, AgentStatus::Completed);
+        assert_eq!(saved.turns, 1);
+        assert!(saved.active_run_id.is_none());
+        assert_eq!(saved.transcript.len(), 2);
+        assert_eq!(
+            saved.transcript[0],
+            orbit_engine::user_message(SAVED_CONTEXT_PROMPT)
+        );
+        assert_eq!(saved.transcript[1].content, "owned fixture reply");
+        f.assert_selected_context_parent_unchanged(&parent, &result);
+        assert_workspace_empty(&f);
+    }
+
+    #[test]
+    fn typed_task_budget_oldapi_fresh_child_combined_below_actual_output_refuses_zero_posts() {
+        let _watchdog = Watchdog::new();
+        let mut f = SavedTaskFixture::new();
+        //733 requested output cannot fit a512 combined policy even with zero
+        // input. Parent1111 output and65536 input are a different binding.
+        configure_typed(
+            &mut f,
+            json!({"combined_tokens":512,"unknown_policy":"require-limit"}),
+            None,
+        );
+        let parent = parent_state(&f);
+        let result = f.fixture.task(
+            json!({"agent":SAVED_CONTEXT_AGENT,"prompt":SAVED_CONTEXT_PROMPT,
+            "model":format!("b/{SAVED_TASK_RAW}"),"effort":"high"}),
+        );
+        assert_eq!(f.fixture.a.calls(), 0);
+        assert_eq!(
+            f.fixture.b.calls(),
+            0,
+            "the child's actual requested output alone exceeds its typed combined policy"
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        let agents = f.fixture.store().list().unwrap();
+        assert_eq!(agents.len(), 1);
+        let saved = f.fixture.store().load(&agents[0].agent_id).unwrap();
+        assert_eq!(saved.model, format!("b/{SAVED_TASK_RAW}"));
+        assert_eq!(saved.status, AgentStatus::Failed);
+        assert_eq!(saved.turns, 1);
+        assert!(saved.active_run_id.is_none());
+        assert_eq!(
+            saved.transcript,
+            [orbit_engine::user_message(SAVED_CONTEXT_PROMPT)]
+        );
+        f.assert_selected_context_parent_unchanged(&parent, &result);
+        assert_workspace_empty(&f);
+    }
+
+    #[test]
+    fn typed_task_budget_oldapi_own_smaller_summary_role_keeps_final_output_and_effort() {
+        let _watchdog = Watchdog::new();
+        let mut f = SavedTaskFixture::new();
+        let seeded = seed_typed(&mut f, Some(SUMMARY_INPUT));
+        let parent = parent_state(&f);
+        let result = f.resume_selected_context(&seeded.agent_id);
+        assert_selected_posts_within_child_input(&f);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(id(&result), seeded.agent_id);
+        assert_eq!(f.fixture.a.calls(), 0);
+        assert_eq!(f.fixture.b.calls(), 2);
+        assert_summary_request(&f, 0, SUMMARY_INPUT, true);
+        assert_compacted_continuation(&f, &seeded);
+        f.assert_selected_context_parent_unchanged(&parent, &result);
+        assert_workspace_empty(&f);
+    }
+
+    #[test]
+    fn typed_task_budget_oldapi_unfit_summary_role_refuses_and_keeps_complete_source() {
+        let _watchdog = Watchdog::new();
+        let mut f = SavedTaskFixture::new();
+        let seeded = seed_typed(&mut f, Some(1000));
+        let parent = parent_state(&f);
+        // Existing bounded summary projection retains up to400 bytes/message.
+        // Its first20 complete messages alone contribute8000 text bytes, above
+        // the summary's4000-byte input boundary, before framing or instructions.
+        assert!(
+            seeded.transcript[..20]
+                .iter()
+                .all(|message| message.content.len() >= 400)
+        );
+        let result = f.resume_selected_context(&seeded.agent_id);
+        assert_eq!(f.fixture.a.calls(), 0);
+        assert_eq!(
+            f.fixture.b.calls(),
+            0,
+            "neither unfit summary nor oversized ordinary request may escape"
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        let saved = f.fixture.store().load(&seeded.agent_id).unwrap();
+        assert_eq!(saved.model, seeded.model);
+        assert_eq!(saved.effort, seeded.effort);
+        assert_eq!(saved.status, AgentStatus::Failed);
+        assert_eq!(saved.turns, 14);
+        assert!(saved.active_run_id.is_none());
+        let mut original = seeded.transcript.clone();
+        original.push(orbit_engine::user_message(SAVED_CONTEXT_PROMPT));
+        assert_eq!(
+            saved.transcript, original,
+            "failed housekeeping preserves every complete original message and the in-flight prompt"
+        );
+        assert!(
+            !saved
+                .transcript
+                .iter()
+                .any(|message| message.content.contains("[context compacted"))
+        );
+        f.assert_selected_context_parent_unchanged(&parent, &result);
+        assert_workspace_empty(&f);
+    }
+
+    fn assert_failed_budget_run_releases_lease(f: &SavedTaskFixture, saved: &AgentSnapshot) {
+        let store = f.fixture.store();
+        let run = store
+            .begin(&saved.agent_id, None)
+            .expect("failed budget run must release its lease");
+        assert!(
+            !run.interrupted_previous_run(),
+            "a handled policy refusal is a failure, not an interrupted run"
+        );
+        let again = run
+            .finish(
+                saved.transcript.clone(),
+                saved.report.clone(),
+                AgentStatus::Failed,
+                saved.turns,
+            )
+            .unwrap();
+        assert_eq!(again.transcript, saved.transcript);
+        assert_eq!(again.status, AgentStatus::Failed);
+        assert_eq!(again.turns, saved.turns);
+        assert!(again.active_run_id.is_none());
+    }
+
+    #[test]
+    fn typed_task_budget_oldapi_fresh_required_limit_failure_preserves_prompt_and_failed_state() {
+        let _watchdog = Watchdog::new();
+        let mut f = SavedTaskFixture::new();
+        configure_typed(&mut f, json!({"unknown_policy":"require-limit"}), None);
+        let parent = parent_state(&f);
+        let result = f.fixture.task(json!({
+            "agent":SAVED_CONTEXT_AGENT,"prompt":SAVED_CONTEXT_PROMPT,
+            "model":format!("b/{SAVED_TASK_RAW}"),"effort":"high"
+        }));
+        assert_eq!(f.fixture.a.calls(), 0);
+        assert_eq!(
+            f.fixture.b.calls(),
+            0,
+            "a missing required input limit must refuse before any provider POST"
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(
+            result.to_string().contains("context_limits"),
+            "the local refusal must explain how to configure a usable limit"
+        );
+        let agents = f.fixture.store().list().unwrap();
+        assert_eq!(agents.len(), 1);
+        let saved = f.fixture.store().load(&agents[0].agent_id).unwrap();
+        assert_eq!(result["agent_id"], saved.agent_id);
+        assert_eq!(saved.model, format!("b/{SAVED_TASK_RAW}"));
+        assert_eq!(
+            saved.effort,
+            Some(EffortSetting::Value(EffortValue::Level("high".into())))
+        );
+        assert_eq!(saved.status, AgentStatus::Failed);
+        assert_eq!(saved.turns, 1);
+        assert!(saved.active_run_id.is_none());
+        assert_eq!(
+            saved.transcript,
+            [orbit_engine::user_message(SAVED_CONTEXT_PROMPT)]
+        );
+        assert_failed_budget_run_releases_lease(&f, &saved);
+        f.assert_selected_context_parent_unchanged(&parent, &result);
+        assert_workspace_empty(&f);
+    }
+
+    #[test]
+    fn typed_task_budget_oldapi_resumed_required_limit_failure_keeps_source_prompt_and_failed_state()
+     {
+        let _watchdog = Watchdog::new();
+        let mut f = SavedTaskFixture::new();
+        let seeded = seed_typed(&mut f, None);
+        configure_typed(&mut f, json!({"unknown_policy":"require-limit"}), None);
+        let parent = parent_state(&f);
+        let result = f.resume_selected_context(&seeded.agent_id);
+        assert_eq!(f.fixture.a.calls(), 0);
+        assert_eq!(
+            f.fixture.b.calls(),
+            0,
+            "a resumed child cannot bypass strict missing-limit policy with its durable history"
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["agent_id"], seeded.agent_id);
+        assert!(result.to_string().contains("context_limits"));
+        let saved = f.fixture.store().load(&seeded.agent_id).unwrap();
+        assert_eq!(saved.model, seeded.model);
+        assert_eq!(saved.effort, seeded.effort);
+        assert_eq!(saved.status, AgentStatus::Failed);
+        assert_eq!(saved.turns, seeded.turns + 1);
+        assert!(saved.active_run_id.is_none());
+        let mut original = seeded.transcript.clone();
+        original.push(orbit_engine::user_message(SAVED_CONTEXT_PROMPT));
+        assert_eq!(
+            saved.transcript, original,
+            "pre-dispatch resolver failure must preserve all source history and the current prompt exactly once"
+        );
+        assert!(
+            !saved
+                .transcript
+                .iter()
+                .any(|message| message.content.contains("[context compacted"))
+        );
+        assert_failed_budget_run_releases_lease(&f, &saved);
+        f.assert_selected_context_parent_unchanged(&parent, &result);
+        assert_workspace_empty(&f);
+    }
+
+    #[test]
+    fn typed_task_budget_oldapi_fallback_notices_reach_result_without_observer() {
+        let _watchdog = Watchdog::new();
+        let mut f = SavedTaskFixture::new();
+        configure_typed(&mut f, json!({}), None);
+        let result = f.fixture.task(
+            json!({"agent":SAVED_CONTEXT_AGENT,"prompt":SAVED_CONTEXT_PROMPT,
+            "model":format!("b/{SAVED_TASK_RAW}"),"effort":"high"}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(f.fixture.a.calls(), 0);
+        assert_eq!(f.fixture.b.calls(), 1);
+        let notices = result["result"]["context_notices"]
+            .as_array()
+            .expect("Task result must surface fallback policy without an observer");
+        assert!(notices.iter().any(|n| {
+            n.as_str()
+                .is_some_and(|s| s.starts_with("Child context uses a harness fallback policy"))
+        }));
+        assert!(notices.iter().any(|n| {
+            n.as_str()
+                .is_some_and(|s| s.starts_with("Summary context uses a harness fallback policy"))
+        }));
+        f.assert_no_keys_in_parent_or_durable_state(&result);
+    }
 }

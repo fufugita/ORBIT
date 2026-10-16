@@ -1563,10 +1563,11 @@ fn enabled_content_unavailable_managed_store_preserves_native_runtime_and_report
         "content_identity_collision",
         "healthy managed/native identity collisions stopped failing visibly"
     );
-    fs::set_permissions(&fixture.home, fs::Permissions::from_mode(0o755)).unwrap();
+    let managed_root = fixture.home.join("plugins/portable");
+    fs::set_permissions(&managed_root, fs::Permissions::from_mode(0o755)).unwrap();
     let unavailable = PluginStore::open(&fixture.home, &fixture.work, false)
-        .err()
-        .expect("managed store privacy fixture remained available");
+        .and_then(|store| store.active())
+        .expect_err("managed store privacy fixture remained available");
     assert_eq!(unavailable.code, "store_file_unsafe");
     let catalog = orbit_engine::skills::load_catalog(&fixture.home, &fixture.work, true).unwrap();
     assert!(
@@ -1652,9 +1653,13 @@ fn enabled_content_unavailable_managed_store_preserves_native_runtime_and_report
         "quarantined managed ID reached provider"
     );
     assert_eq!(
-        fs::metadata(&fixture.home).unwrap().permissions().mode() & 0o777,
+        fs::metadata(&managed_root).unwrap().permissions().mode() & 0o777,
         0o755,
         "catalog rewrote operator privacy state"
+    );
+    assert_eq!(
+        fs::metadata(&fixture.home).unwrap().permissions().mode() & 0o777,
+        0o700
     );
 }
 
