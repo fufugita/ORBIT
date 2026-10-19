@@ -22,6 +22,10 @@ pub fn transcript_lines(
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line> = Vec::new();
     let mut prev_tool = false;
+    // A live turn with no model output yet still shows the waiting line
+    // (§9.5): the first prompt has only a User line, and a slow provider
+    // would otherwise leave the panel looking frozen until the first delta.
+    let mut waiting_shown = false;
     for l in &scenario.transcript {
         match l.kind {
             LineKind::User => {
@@ -37,9 +41,10 @@ pub fn transcript_lines(
                 if prev_tool {
                     out.push(blank_surface(cl, cw));
                 }
-                if out.is_empty() {
+                if !waiting_shown {
                     // The waiting line (§9.5) opens the turn.
                     out.push(waiting_line(scenario, cl, cw));
+                    waiting_shown = true;
                 }
                 out.extend(model_text(l, scenario, cl, cw));
                 prev_tool = false;
@@ -69,6 +74,11 @@ pub fn transcript_lines(
     // A tool group closes with one blank row.
     if prev_tool {
         out.push(blank_bg());
+    }
+    // A live turn that produced no Model line yet (the slow first-prompt
+    // case) still gets its waiting line, so the panel never looks frozen.
+    if !waiting_shown && scenario.is_busy() && !scenario.visible_output {
+        out.push(waiting_line(scenario, cl, cw));
     }
     out
 }
