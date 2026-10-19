@@ -665,7 +665,11 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         0.0
     };
     let b = vec![Seg::bold(
-        format!("{}%", (ctx * 100.0).round() as u32),
+        if s.window_tokens == 0 {
+            "unknown".into()
+        } else {
+            format!("{}%", (ctx * 100.0).round() as u32)
+        },
         if ctx > 0.85 {
             colors.amber
         } else {
@@ -694,8 +698,8 @@ fn context(cv: &mut Cv, r: Rect, inp: &PaneIn) {
                 inner,
                 "◌",
                 colors.blue,
-                "No usage yet",
-                "The context meter fills as the conversation grows.",
+                "Context unknown",
+                "Waiting for a measurement of the current context.",
             );
             return;
         }

@@ -671,7 +671,7 @@ pub(crate) fn execute_task_resolved(
     }
     input.push_str(prompt);
     let mut transcript = run.snapshot().transcript.clone();
-    let turns = run.snapshot().turns.saturating_add(1);
+    let turns = run.snapshot().turns.checked_add(1);
     let session_tools =
         session_tool_definitions_with_context(home, parent_cx, profile.allowed_tools.as_deref());
     let sub_tools: Vec<_> = if profile.allowed_tools.is_none() {
@@ -767,12 +767,28 @@ pub(crate) fn execute_task_resolved(
     // The lease has resolved the actual child identity, output, effort and
     // sampling. Resolve its summary role independently, then bind both exact
     // final configurations without changing either after budget resolution.
+    // This run came from the local store constructed with this same trusted
+    // home above; neither the run nor its accounting home comes from tool args.
+    let accounting = crate::session_accounting::prepare_child(
+        home,
+        &run,
+        if fresh {
+            crate::session_accounting::ChildOrigin::CreatedThisInvocation
+        } else {
+            crate::session_accounting::ChildOrigin::Resumed
+        },
+    )
+    .map_err(|error| error.to_string());
     let resolution: Result<_, String> = (|| {
+        accounting.as_ref().map_err(Clone::clone)?;
+        turns.ok_or_else(|| "agent turn count overflows".to_owned())?;
         if cancel.is_cancelled() {
             // Keep the existing engine cancellation lifecycle and prompt
             // preservation; a pre-cancelled child needs no metadata read.
             return Ok(None);
         }
+        let retry_policy = crate::provider_policies::load_for_config(home, &turn_config)
+            .map_err(|error| error.to_string())?;
         let compaction = crate::try_role_turn_config(home, &turn_config, "compaction")?;
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -785,79 +801,88 @@ pub(crate) fn execute_task_resolved(
             now_unix,
         )
         .map_err(|error| error.to_string())?;
-        Ok(Some((compaction, reports)))
+        Ok(Some((compaction, reports, retry_policy)))
     })();
     let mut context_notices = Vec::new();
-    let result = match resolution {
-        Err(error) => {
-            // No engine call appended this input. Preserve it once and finish
-            // the leased run through the same terminal failure path below.
-            transcript.push(orbit_engine::user_message(input.clone()));
-            Err(error)
-        }
-        Ok(resolved) => {
-            if let Some((compaction, reports)) = resolved {
-                for (role, report) in [("Child", &reports.selected), ("Summary", &reports.summary)]
-                {
-                    for notice in &report.notices {
-                        let action = task_context_notice(role, notice);
-                        notify(SubagentUpdate::Progress {
-                            id: id.clone(),
-                            action: action.clone(),
-                        });
-                        context_notices.push(action);
-                    }
+    let result: Result<_, String> = (|| {
+        let resolved = resolution?;
+        let retry_policy = if let Some((compaction, reports, retry_policy)) = resolved {
+            for (role, report) in [("Child", &reports.selected), ("Summary", &reports.summary)] {
+                for notice in &report.notices {
+                    let action = task_context_notice(role, notice);
+                    notify(SubagentUpdate::Progress {
+                        id: id.clone(),
+                        action: action.clone(),
+                    });
+                    context_notices.push(action);
                 }
-                options.selected_budget = Some(reports.selected.budget);
-                options.compaction_budget = Some(reports.summary.budget);
-                options.compaction_config = Some(compaction);
             }
-            orbit_engine::run_turn(
-                home,
-                &turn_config,
-                &options,
-                &input,
-                &mut transcript,
-                &mut executor,
-                &cancel,
-                &mut |event| match event {
-                    orbit_frontend_protocol::FrontendEvent::ToolStartedFull {
-                        kind,
-                        target,
-                        ..
-                    } => {
-                        notify(SubagentUpdate::Progress {
-                            id: id.clone(),
-                            action: format!("{kind} {target}").trim().into(),
-                        });
-                    }
-                    orbit_frontend_protocol::FrontendEvent::Status { text } => {
-                        let action = orbit_hud_tui::safe_text(&text);
-                        notify(SubagentUpdate::Progress {
-                            id: id.clone(),
-                            action: action.clone(),
-                        });
-                        context_notices.push(action);
-                    }
-                    _ => {}
-                },
-            )
-        }
-    };
-    let (ok, rounds, status, report_text, failure) = match result {
-        Ok(report) => {
-            let text = report.final_text;
-            let status = if report.interrupted {
-                AgentStatus::Cancelled
-            } else if report.ok {
-                AgentStatus::Completed
-            } else {
-                AgentStatus::Failed
+            options.selected_budget = Some(reports.selected.budget);
+            options.compaction_budget = Some(reports.summary.budget);
+            options.compaction_config = Some(compaction);
+            retry_policy
+        } else {
+            None
+        };
+        accounting
+            .as_ref()
+            .map_err(Clone::clone)?
+            .apply_options_detailed(&mut options, None, retry_policy.as_ref())
+            .map_err(|error| error.to_string())?;
+        Ok(orbit_engine::turn::run_turn_detailed_with_retry_policy(
+            home,
+            &turn_config,
+            &options,
+            &input,
+            &mut transcript,
+            &mut executor,
+            &cancel,
+            &mut |event| match event {
+                orbit_frontend_protocol::FrontendEvent::ToolStartedFull {
+                    kind, target, ..
+                } => {
+                    notify(SubagentUpdate::Progress {
+                        id: id.clone(),
+                        action: format!("{kind} {target}").trim().into(),
+                    });
+                }
+                orbit_frontend_protocol::FrontendEvent::Status { text } => {
+                    let action = orbit_hud_tui::safe_text(&text);
+                    notify(SubagentUpdate::Progress {
+                        id: id.clone(),
+                        action: action.clone(),
+                    });
+                    context_notices.push(action);
+                }
+                _ => {}
+            },
+            retry_policy.as_ref(),
+        )
+        .into_completion())
+    })();
+    let (mut ok, rounds, mut status, report_text, mut failure) = match result {
+        Ok(completion) => {
+            let (ok, status, failure) = match completion.end {
+                orbit_engine::TurnEnd::Completed => (true, AgentStatus::Completed, None),
+                orbit_engine::TurnEnd::Cancelled => (false, AgentStatus::Cancelled, None),
+                orbit_engine::TurnEnd::Failed(error) => {
+                    (false, AgentStatus::Failed, Some(error.message))
+                }
             };
-            (report.ok, report.rounds, status, text, None)
+            let text = if completion.report.final_text.is_empty() {
+                failure.clone().unwrap_or_default()
+            } else {
+                completion.report.final_text
+            };
+            (ok, completion.report.rounds, status, text, failure)
         }
         Err(error) => {
-            let status = if cancel.is_cancelled() {
+            // The engine did not append this input. Keep it exactly once even
+            // when checked accounting refuses the operation before dispatch.
+            transcript.push(orbit_engine::user_message(input.clone()));
+            let status = if accounting.is_err() {
+                AgentStatus::Interrupted
+            } else if cancel.is_cancelled() {
                 AgentStatus::Cancelled
             } else {
                 AgentStatus::Failed
@@ -865,6 +890,28 @@ pub(crate) fn execute_task_resolved(
             (false, 0, status, error.clone(), Some(error))
         }
     };
+    if let Ok(accounting) = &accounting {
+        let inspected = accounting
+            .checkpoint_detailed()
+            .map_err(|error| error.to_string());
+        let uncertain = match &inspected {
+            Ok(checkpoint) => {
+                checkpoint.pending().is_some()
+                    || checkpoint.totals().knownness == orbit_engine::AccountingKnownness::Uncertain
+            }
+            Err(_) => true,
+        };
+        if uncertain {
+            ok = false;
+            status = AgentStatus::Interrupted;
+            if failure.is_none() {
+                failure = Some(inspected.err().unwrap_or_else(|| {
+                    "child request accounting is uncertain; inspect before continuing".into()
+                }));
+            }
+        }
+    }
+    let turns = turns.unwrap_or(run.snapshot().turns);
     let persisted = run.finish(transcript, report_text.clone(), status, turns);
     let _ = hooks.fire(
         orbit_engine::hooks::HookEvent::SubagentStop,

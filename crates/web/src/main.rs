@@ -3,6 +3,7 @@
 
 use orbit_cli::{
     config::ProvidersConfig,
+    session_accounting::{RootOrigin, prepare_root},
     sessions::{SessionFile, SessionLease},
     tui_worker::TuiTurnConfig,
 };
@@ -146,20 +147,23 @@ fn startup(args: &[String]) -> Result<(BridgeConfig, SessionLease, bool), String
             false,
         )?;
     }
-    let (lease, saved): (_, Option<SessionFile>) = match value_after(args, "--resume") {
-        Some(id) => {
-            let (lease, saved) = SessionLease::acquire_and_load(&home, &id, "browser")
-                .map_err(|error| error.to_string())?;
-            (lease, Some(saved))
-        }
-        None => {
-            let id = orbit_gateway::new_session_id();
-            (
-                SessionLease::acquire(&home, &id, "browser").map_err(|error| error.to_string())?,
-                None,
-            )
-        }
-    };
+    let (lease, saved, accounting_origin): (_, Option<SessionFile>, _) =
+        match value_after(args, "--resume") {
+            Some(id) => {
+                let (lease, saved) = SessionLease::acquire_and_load(&home, &id, "browser")
+                    .map_err(|error| error.to_string())?;
+                (lease, Some(saved), RootOrigin::RestoredOrLegacy)
+            }
+            None => {
+                let id = orbit_gateway::new_session_id();
+                (
+                    SessionLease::acquire(&home, &id, "browser")
+                        .map_err(|error| error.to_string())?,
+                    None,
+                    RootOrigin::FreshCandidate,
+                )
+            }
+        };
     let manual = value_after(args, "--model").or_else(|| std::env::var("ORBIT_MODEL").ok());
     let spec = manual
         .clone()
@@ -246,26 +250,26 @@ fn startup(args: &[String]) -> Result<(BridgeConfig, SessionLease, bool), String
         saved.as_ref(),
         !providers.roles.main.is_empty(),
     );
-    lease
-        .save(
-            &SessionFile::from_chat(
-                lease.session_id(),
-                &checked.model,
-                &checked.gate,
-                &checked.provider_id,
-                &saved
-                    .as_ref()
-                    .map(SessionFile::to_transcript)
-                    .unwrap_or_default(),
-                saved.as_ref().map_or(0, |saved| saved.turns),
-                saved.as_ref().map_or(0, |saved| saved.input_tokens),
-                saved.as_ref().map_or(0, |saved| saved.output_tokens),
-                saved.as_ref().map_or(0, |saved| saved.cost_microcents),
-            )
-            .with_effort(effort.clone())
-            .with_selection_origin(origin),
-        )
-        .map_err(|error| error.to_string())?;
+    let mut seed = SessionFile::from_chat(
+        lease.session_id(),
+        &checked.model,
+        &checked.gate,
+        &checked.provider_id,
+        &saved
+            .as_ref()
+            .map(SessionFile::to_transcript)
+            .unwrap_or_default(),
+        saved.as_ref().map_or(0, |saved| saved.turns),
+        saved.as_ref().map_or(0, |saved| saved.input_tokens),
+        saved.as_ref().map_or(0, |saved| saved.output_tokens),
+        saved.as_ref().map_or(0, |saved| saved.cost_microcents),
+    )
+    .with_effort(effort.clone())
+    .with_selection_origin(origin);
+    seed.accounting_watermark = saved
+        .as_ref()
+        .and_then(|saved| saved.accounting_watermark.clone());
+    prepare_root(&lease, &mut seed, accounting_origin).map_err(|error| error.to_string())?;
     let turn = TuiTurnConfig {
         home,
         session_id: lease.session_id().to_owned(),
@@ -275,14 +279,11 @@ fn startup(args: &[String]) -> Result<(BridgeConfig, SessionLease, bool), String
         effort,
         auto_tools: args.iter().any(|argument| argument == "--auto-tools"),
         scope,
-        initial_transcript: saved
-            .as_ref()
-            .map(SessionFile::to_transcript)
-            .unwrap_or_default(),
-        initial_turns: saved.as_ref().map_or(0, |saved| saved.turns),
-        initial_input_tokens: saved.as_ref().map_or(0, |saved| saved.input_tokens),
-        initial_output_tokens: saved.as_ref().map_or(0, |saved| saved.output_tokens),
-        initial_cost_microcents: saved.as_ref().map_or(0, |saved| saved.cost_microcents),
+        initial_transcript: seed.to_transcript(),
+        initial_turns: seed.turns,
+        initial_input_tokens: seed.input_tokens,
+        initial_output_tokens: seed.output_tokens,
+        initial_cost_microcents: seed.cost_microcents,
     };
     Ok((
         BridgeConfig {
@@ -417,5 +418,192 @@ mod browser_startup_tests {
                 .contains("requires --provider")
         );
         assert!(!home.0.join("sessions").exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod browser_accounting_startup_tests {
+    use super::*;
+    use orbit_cli::context_history::context_journal;
+    use orbit_cli::session_accounting::{FullCostStatus, RootOrigin, prepare_root};
+    use orbit_engine::{
+        AccountingBaseline, AccountingKnownness, AccountingTotals, AttemptIntent, AttemptPurpose,
+        RequestAccountingReceipt,
+    };
+    use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
+
+    struct Home(PathBuf);
+    impl Home {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("orbit-browser-accounting-{}", ulid::Ulid::new()));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            fs::create_dir(path.join("trust")).unwrap();
+            fs::write(path.join("providers.toml"), "[[provider]]\nname=\"fixture\"\nurl=\"http://127.0.0.1:45678\"\n[[provider.models]]\nid=\"vendor/model-a\"\n").unwrap();
+            Self(path)
+        }
+        fn args(&self) -> Vec<String> {
+            vec![
+                "--home".into(),
+                self.0.display().to_string(),
+                "--model".into(),
+                "vendor/model-a".into(),
+                "--no-browser".into(),
+            ]
+        }
+    }
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn fresh_browser_startup_publishes_a_qualified_zero_anchor_before_bridge_work() {
+        let home = Home::new();
+        let (config, lease, no_browser) = startup(&home.args()).unwrap();
+        assert!(no_browser);
+        let checkpoint = context_journal(&home.0, lease.session_id(), None)
+            .unwrap()
+            .accounting_checkpoint();
+        assert!(
+            matches!(&checkpoint, Ok(value) if value.baseline == AccountingBaseline::FreshKnownZero
+            && value.revision.0 == 0 && value.pending.is_none()),
+            "fresh browser startup must establish accounting before bridge work"
+        );
+        let saved = lease.load().unwrap();
+        let watermark = saved.accounting_watermark.unwrap();
+        assert_eq!(watermark.owner_session_id, config.turn.session_id);
+        assert_eq!(watermark.revision, 0);
+        assert_eq!(watermark.full_cost_status, FullCostStatus::Known);
+        assert_eq!(
+            (
+                saved.input_tokens,
+                saved.output_tokens,
+                saved.cost_microcents
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn resumed_browser_startup_preserves_legacy_anchor_and_catches_up_settled_bills() {
+        let home = Home::new();
+        let id = "browser-migrated";
+        let lease = SessionLease::acquire(&home.0, id, "browser-fixture").unwrap();
+        let mut saved = SessionFile::from_chat(
+            id,
+            "vendor/model-a",
+            "http://127.0.0.1:45678",
+            "fixture",
+            &[],
+            1,
+            10,
+            20,
+            30,
+        );
+        lease.save(&saved).unwrap();
+        let accounting = prepare_root(&lease, &mut saved, RootOrigin::RestoredOrLegacy).unwrap();
+        let journal = context_journal(&home.0, id, None).unwrap();
+        let selected = orbit_cli::try_engine_turn_config(
+            &home.0,
+            "fixture",
+            "http://127.0.0.1:45678",
+            "vendor/model-a",
+            None,
+            None,
+        )
+        .unwrap();
+        for (index, input, output, cost) in [(0, 2, 3, 5), (1, 4, 6, 7)] {
+            let request_id = format!("browser-paid-{index}");
+            let intent = AttemptIntent {
+                owner_session_id: id.into(),
+                child_id: None,
+                request_id: request_id.clone(),
+                purpose: AttemptPurpose::Ordinary,
+                budget: orbit_engine::context_budget::BudgetIdentity::for_config(
+                    &selected,
+                    "browser-fixture",
+                    "browser-fixture",
+                )
+                .unwrap(),
+            };
+            let reference = journal
+                .begin_attempt(journal.accounting_checkpoint().unwrap().revision, &intent)
+                .unwrap();
+            journal
+                .settle_attempt(
+                    &reference,
+                    &RequestAccountingReceipt {
+                        request_id,
+                        purpose: AttemptPurpose::Ordinary,
+                        totals: AccountingTotals {
+                            input_tokens: input,
+                            output_tokens: output,
+                            cost_microcents: Some(cost),
+                        },
+                        usage: Some(orbit_adapter::types::ProviderUsage {
+                            input_tokens: input,
+                            output_tokens: output,
+                            ..Default::default()
+                        }),
+                        knownness: AccountingKnownness::Known,
+                        completed: true,
+                    },
+                )
+                .unwrap();
+            if index == 0 {
+                accounting.persist(&lease, &mut saved).unwrap();
+            }
+        }
+        assert_eq!(
+            lease.load().unwrap().accounting_watermark.unwrap().revision,
+            2
+        );
+        let journal_path = home
+            .0
+            .join("context-history")
+            .join(id)
+            .join("accounting.json");
+        let before = fs::read(&journal_path).unwrap();
+        drop(journal);
+        drop(accounting);
+        drop(lease);
+        let mut args = home.args();
+        args.extend(["--resume".into(), id.into()]);
+        let (config, lease, _) = startup(&args).unwrap();
+        let after = lease.load().unwrap();
+        let watermark = after
+            .accounting_watermark
+            .as_ref()
+            .expect("browser startup must preserve the saved migration anchor");
+        assert_eq!(watermark.owner_session_id, id);
+        assert_eq!(watermark.revision, 4);
+        assert_eq!(watermark.full_cost_status, FullCostStatus::UnknownLegacy);
+        assert_eq!(
+            (
+                after.input_tokens,
+                after.output_tokens,
+                after.cost_microcents
+            ),
+            (16, 29, 42)
+        );
+        assert_eq!(
+            (
+                config.turn.initial_input_tokens,
+                config.turn.initial_output_tokens,
+                config.turn.initial_cost_microcents
+            ),
+            (16, 29, 42)
+        );
+        assert_eq!(fs::read(&journal_path).unwrap(), before);
+        assert_eq!(
+            context_journal(&home.0, id, None)
+                .unwrap()
+                .accounting_checkpoint()
+                .unwrap()
+                .baseline,
+            AccountingBaseline::UnknownLegacy
+        );
     }
 }

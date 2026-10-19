@@ -554,22 +554,32 @@ fn run_proto_inner(
                     });
                 }
             }
-            let bus_dirty = scenario.state_version() != msgs_before;
+            let mut bus_dirty = scenario.state_version() != msgs_before;
             // The queue (§11.4): when the turn ends and prompts are
             // queued, the head becomes the next user turn.
-            if !scenario.turn_live && !queued.is_empty() {
-                let next = queued.remove(0);
-                if let Some(pos) = scenario
-                    .transcript
-                    .iter()
-                    .position(|l| l.kind == LineKind::Queued && l.text == next)
+            if !scenario.is_busy() && !queued.is_empty() {
+                let next = queued[0].clone();
+                if submit_foreground(
+                    &mut scenario,
+                    &command_sink,
+                    WorkerCommand::Prompt(next.clone()),
+                )
+                .is_ok()
                 {
-                    scenario.transcript[pos].kind = LineKind::User;
+                    queued.remove(0);
+                    if let Some(pos) = scenario
+                        .transcript
+                        .iter()
+                        .position(|l| l.kind == LineKind::Queued && l.text == next)
+                    {
+                        scenario.transcript[pos].kind = LineKind::User;
+                    }
+                    scenario.turn_started_ms = now_ms;
+                    scenario.apply("round_started", 0);
                 }
-                let _ = command_sink.send(WorkerCommand::Prompt(next));
-                scenario.turn_started_ms = now_ms;
-                scenario.apply("round_started", 0);
             }
+            let view_dirty = scenario.take_view_dirty();
+            bus_dirty |= view_dirty;
             // Anything that moves keeps the 16 ms redraw alive: the
             // startup window, a live turn, the first-prompt orbit, a
             // fresh message, a breathing approval card.
@@ -668,14 +678,10 @@ fn run_proto_inner(
             scenario.session_id
         )
     };
-    let cost = if scenario.priced {
-        format!("${:.4}", scenario.cost_microcents as f64 / 1_000_000.0)
-    } else {
-        "n/a".into()
-    };
+    let cost = scenario.cost_status_text();
     let _ = writeln!(
         std::io::stdout(),
-        "✦ ORBIT  session saved · {} turns · {} in · {} out · {cost}{session}",
+        "✦ ORBIT  session · {} turns · {} in · {} out · {cost}{session}",
         scenario.turns,
         scenario.input_tokens,
         scenario.output_tokens
@@ -811,13 +817,15 @@ fn handle_key(
     // the turn — MD §The agent loop: "Esc cancels the stream and kills
     // each running tool's process group". Outside a turn Esc keeps its
     // per-context meaning (close completion, defocus…).
-    if k.code == KeyCode::Esc && scenario.is_turning() {
+    if k.code == KeyCode::Esc && scenario.is_busy() {
         if let Some(search) = tui.history_search.take() {
             search.restore(composer);
         }
         tui.file_completion.sync(composer);
         tui.file_completion.dismiss();
-        if let Some(cancel) = &cancel_handle {
+        if let Some(operation) = scenario.pending_manual() {
+            let _ = operation.cancel();
+        } else if let Some(cancel) = &cancel_handle {
             cancel();
         }
         return false;
@@ -874,7 +882,7 @@ fn handle_key(
     // esc on an idle, empty composer starts arranging.
     if k.code == KeyCode::Esc
         && composer.is_empty()
-        && !scenario.is_turning()
+        && !scenario.is_busy()
         && !composer.starts_with('/')
     {
         tui.app.arranging = true;
@@ -944,6 +952,14 @@ fn handle_key(
             return false;
         }
         KeyCode::BackTab => {
+            if scenario.is_busy() {
+                *toast = Some(Toast {
+                    text: "wait for the active work to finish".into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+                return false;
+            }
             // Shift+Tab cycles the permission mode (S5, Claude Code
             // parity): default → acceptEdits → plan → dontAsk →
             // bypass → default. Focus cycling stays on Tab.
@@ -954,7 +970,17 @@ fn handle_key(
                 .and_then(|m| MODES.iter().position(|c| *c == m))
                 .unwrap_or(0);
             let next = MODES[(current + 1) % MODES.len()];
-            let _ = command_sink.send(WorkerCommand::SetMode(next.to_string()));
+            if let Err(message) = submit_foreground(
+                scenario,
+                command_sink,
+                WorkerCommand::SetMode(next.to_string()),
+            ) {
+                *toast = Some(Toast {
+                    text: message.into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            }
             return false;
         }
         _ => {}
@@ -986,6 +1012,14 @@ fn handle_key(
             }
             KeyCode::Enter => {
                 // The shell bang (gate 1): `!command` runs one command
+                if !composer.starts_with('/') && scenario.session_binding().is_none() {
+                    *toast = Some(Toast { text: "session ownership is not ready; draft retained".into(), ok: false, shown_ms: now_ms });
+                    return false;
+                }
+                if scenario.is_busy() && ((!scenario.ordinary_pending() && !composer.starts_with('/')) || composer.starts_with('!')) {
+                    *toast = Some(Toast { text: "wait for the active work to finish; draft retained".into(), ok: false, shown_ms: now_ms });
+                    return false;
+                }
                 // through the Bash tool's full path on the worker
                 // thread — the composer stays responsive (the "!
                 // sleep 5" gate).
@@ -994,14 +1028,9 @@ fn handle_key(
                     composer.clear();
                     history.insert(0, format!("!{command}"));
                     *history_idx = None;
-                    scenario.transcript.push(TranscriptLine {
-                        kind: LineKind::Tool,
-                        text: command.clone(),
-                        tool_name: "Bash".into(),
-                        tool_state: super::scenario::ToolState::Running,
-                        ..Default::default()
-                    });
-                    let _ = command_sink.send(WorkerCommand::ShellBang(command));
+                    if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::ShellBang(command)) {
+                        *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
+                    }
                     return false;
                 }
                 if composer.starts_with('/') && !composer.trim().eq("/") {
@@ -1041,7 +1070,7 @@ fn handle_key(
                     composer.clear();
                     history.insert(0, text.clone());
                     *history_idx = None;
-                    if scenario.turn_live {
+                    if scenario.ordinary_pending() {
                         queued.push(text.clone());
                         scenario.transcript.push(TranscriptLine {
                             kind: LineKind::Queued,
@@ -1049,6 +1078,11 @@ fn handle_key(
                             ..Default::default()
                         });
                     } else {
+                        if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::Prompt(text.clone())) {
+                            *composer = text;
+                            *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
+                            return false;
+                        }
                         scenario.transcript.push(TranscriptLine {
                             kind: LineKind::User,
                             text: text.clone(),
@@ -1056,24 +1090,26 @@ fn handle_key(
                             ..Default::default()
                         });
                         *last_prompt = Some(text.clone());
-                        let _ = command_sink.send(WorkerCommand::Prompt(text.clone()));
                         scenario.turn_started_ms = now_ms;
                         scenario.apply("round_started", 0);
                         if scenario.transcript.len() == 1 {
                             scenario.first_prompt_waiting = true;
                         }
                     }
-                } else if composer.is_empty() && scenario.last_failed {
+                } else if composer.is_empty() && scenario.last_failed && !scenario.is_busy() {
                     // §11.3: an empty ⏎ after a failed turn resends
                     // it, with the toast.
                     if let Some(p) = last_prompt.clone() {
+                        if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::Prompt(p.clone())) {
+                            *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
+                            return false;
+                        }
                         scenario.transcript.push(TranscriptLine {
                             kind: LineKind::User,
                             text: p.clone(),
                             time: Some(now_hhmm()),
                             ..Default::default()
                         });
-                        let _ = command_sink.send(WorkerCommand::Prompt(p));
                         scenario.turn_started_ms = now_ms;
                         scenario.apply("round_started", 0);
                         *toast = Some(Toast {
@@ -1417,6 +1453,31 @@ fn copy_mode(guard: &mut crate::terminal::TerminalGuard, scenario: &Scenario) {
     guard.terminal.clear().ok();
 }
 
+fn submit_foreground(
+    scenario: &mut Scenario,
+    sink: &CommandSink,
+    command: WorkerCommand,
+) -> Result<(), &'static str> {
+    let kind = command
+        .foreground_kind()
+        .ok_or("command cannot own foreground work")?;
+    let operation = scenario.new_foreground_operation(kind)?;
+    if sink
+        .send(WorkerCommand::Bound {
+            operation: operation.clone(),
+            command: Box::new(command),
+        })
+        .is_err()
+    {
+        let _ = operation.finish_unstarted();
+        return Err("worker is unavailable");
+    }
+    // The event loop cannot consume a worker message between this send and
+    // admission, even if the worker has already produced its terminal frame.
+    scenario.admit_foreground(operation);
+    Ok(())
+}
+
 /// Run a `/command` or bare `quit`/`exit` (§11.6). TUI-local ones
 /// run at once; the rest go to the worker in order.
 #[allow(clippy::too_many_arguments)]
@@ -1428,12 +1489,12 @@ fn run_command(
     sender: &BusSender,
     now_ms: u64,
     toast: &mut Option<Toast>,
-    queued: &mut Vec<String>,
+    queued: &mut [String],
     history: &mut Vec<String>,
     history_idx: &mut Option<usize>,
     focus_sessions: &mut bool,
 ) -> Option<Overlay> {
-    let _ = (composer, queued, history, history_idx, sender, now_ms);
+    let _ = (composer, history, history_idx, sender);
     if text == "quit" || text == "exit" {
         return Some(Overlay::Quit);
     }
@@ -1441,6 +1502,14 @@ fn run_command(
         Some((c, a)) => (c, a.trim()),
         None => (text, ""),
     };
+    if scenario.is_busy() && !matches!(cmd, "/help" | "/usage" | "/sessions" | "/models") {
+        *toast = Some(Toast {
+            text: "wait for the active work to finish".into(),
+            ok: false,
+            shown_ms: now_ms,
+        });
+        return None;
+    }
     let notice = |s: &mut Scenario, t: String| {
         s.transcript.push(TranscriptLine {
             kind: LineKind::System,
@@ -1450,7 +1519,17 @@ fn run_command(
     };
     let open: Option<Overlay> = match cmd {
         "/route" => {
-            let _ = command_sink.send(WorkerCommand::Route(arg.to_string()));
+            if let Err(message) = submit_foreground(
+                scenario,
+                command_sink,
+                WorkerCommand::Route(arg.to_string()),
+            ) {
+                *toast = Some(Toast {
+                    text: message.into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            }
             None
         }
         "/help" => Some(Overlay::Help),
@@ -1462,11 +1541,7 @@ fn run_command(
             None
         }
         "/usage" => {
-            let cost = if scenario.priced {
-                format!("${:.4}", scenario.cost_microcents as f64 / 1_000_000.0)
-            } else {
-                "n/a".into()
-            };
+            let cost = scenario.cost_status_text();
             notice(
                 scenario,
                 format!(
@@ -1477,6 +1552,8 @@ fn run_command(
             // The same numbers the Context panel draws.
             if let Some(line) = context_summary(scenario) {
                 notice(scenario, line);
+            } else {
+                notice(scenario, "context unknown".into());
             }
             None
         }
@@ -1488,41 +1565,102 @@ fn run_command(
             if arg.is_empty() {
                 notice(scenario, "usage: /model <model-id>".into());
             } else {
-                let _ = command_sink.send(WorkerCommand::SetModel(arg.to_string()));
+                if let Err(message) = submit_foreground(
+                    scenario,
+                    command_sink,
+                    WorkerCommand::SetModel(arg.to_string()),
+                ) {
+                    *toast = Some(Toast {
+                        text: message.into(),
+                        ok: false,
+                        shown_ms: now_ms,
+                    });
+                }
             }
             None
         }
         "/effort" => {
-            let _ = command_sink.send(WorkerCommand::Effort(arg.to_string()));
+            if let Err(message) = submit_foreground(
+                scenario,
+                command_sink,
+                WorkerCommand::Effort(arg.to_string()),
+            ) {
+                *toast = Some(Toast {
+                    text: message.into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            }
             None
         }
         "/resume" => {
             if arg.is_empty() {
                 notice(scenario, "usage: /resume <session-id>".into());
-            } else if scenario.turn_live {
+            } else if scenario.is_busy() {
                 *toast = Some(Toast {
                     text: "wait for this turn to finish first".into(),
                     ok: false,
                     shown_ms: now_ms,
                 });
             } else {
-                let _ = command_sink.send(WorkerCommand::ResumeSession(arg.to_string()));
+                if let Err(message) = submit_foreground(
+                    scenario,
+                    command_sink,
+                    WorkerCommand::ResumeSession(arg.to_string()),
+                ) {
+                    *toast = Some(Toast {
+                        text: message.into(),
+                        ok: false,
+                        shown_ms: now_ms,
+                    });
+                }
             }
             None
         }
-        "/clear" => {
-            let _ = command_sink.send(WorkerCommand::Compact);
-            scenario.transcript.clear();
-            scenario.tapes.clear();
-            scenario.tape_sel = None;
-            notice(
-                scenario,
-                "conversation cleared · earlier turns are no longer sent to the model".into(),
-            );
-            None
-        }
-        "/compact" => {
-            let _ = command_sink.send(WorkerCommand::Compact);
+        "/clear" | "/compact" => {
+            if !arg.is_empty() || !queued.is_empty() {
+                *toast = Some(Toast {
+                    text: if !arg.is_empty() {
+                        format!("usage: {cmd}")
+                    } else {
+                        "wait for queued prompts to finish".into()
+                    },
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+                return None;
+            }
+            let action = if cmd == "/clear" {
+                crate::worker::ManualAction::Clear
+            } else {
+                crate::worker::ManualAction::Compact
+            };
+            match scenario.new_manual_operation(action) {
+                Ok(operation) => {
+                    let command = if action == crate::worker::ManualAction::Clear {
+                        WorkerCommand::ClearSession(operation.clone())
+                    } else {
+                        WorkerCommand::Compact(operation.clone())
+                    };
+                    if command_sink.send(command).is_ok() {
+                        scenario.admit_manual(operation);
+                    } else {
+                        let _ = operation.finish_unstarted();
+                        *toast = Some(Toast {
+                            text: "worker is unavailable".into(),
+                            ok: false,
+                            shown_ms: now_ms,
+                        });
+                    }
+                }
+                Err(message) => {
+                    *toast = Some(Toast {
+                        text: message.into(),
+                        ok: false,
+                        shown_ms: now_ms,
+                    })
+                }
+            }
             None
         }
         "/mode" => {
@@ -1534,7 +1672,17 @@ fn run_command(
                     format!("mode: {cur} · /mode <{}>", MODES.join("|")),
                 );
             } else if MODES.contains(&arg) {
-                let _ = command_sink.send(WorkerCommand::SetMode(arg.to_string()));
+                if let Err(message) = submit_foreground(
+                    scenario,
+                    command_sink,
+                    WorkerCommand::SetMode(arg.to_string()),
+                ) {
+                    *toast = Some(Toast {
+                        text: message.into(),
+                        ok: false,
+                        shown_ms: now_ms,
+                    });
+                }
             } else {
                 notice(
                     scenario,
@@ -1544,30 +1692,57 @@ fn run_command(
             None
         }
         "/permissions" => {
-            let _ = command_sink.send(WorkerCommand::Permissions(arg.to_string()));
+            if let Err(message) = submit_foreground(
+                scenario,
+                command_sink,
+                WorkerCommand::Permissions(arg.to_string()),
+            ) {
+                *toast = Some(Toast {
+                    text: message.into(),
+                    ok: false,
+                    shown_ms: now_ms,
+                });
+            }
             None
         }
         "/rewind" => {
-            if scenario.turn_live {
+            if scenario.is_busy() {
                 *toast = Some(Toast {
                     text: "wait for this turn to finish first".into(),
                     ok: false,
                     shown_ms: now_ms,
                 });
             } else {
-                let _ = command_sink.send(WorkerCommand::Rewind(arg.to_string()));
+                if let Err(message) = submit_foreground(
+                    scenario,
+                    command_sink,
+                    WorkerCommand::Rewind(arg.to_string()),
+                ) {
+                    *toast = Some(Toast {
+                        text: message.into(),
+                        ok: false,
+                        shown_ms: now_ms,
+                    });
+                }
             }
             None
         }
         "/undo" => {
-            if scenario.turn_live {
+            if scenario.is_busy() {
                 *toast = Some(Toast {
                     text: "wait for this turn to finish first".into(),
                     ok: false,
                     shown_ms: now_ms,
                 });
             } else {
-                let _ = command_sink.send(WorkerCommand::Undo);
+                if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::Undo)
+                {
+                    *toast = Some(Toast {
+                        text: message.into(),
+                        ok: false,
+                        shown_ms: now_ms,
+                    });
+                }
             }
             None
         }
@@ -1679,8 +1854,217 @@ fn restored_transcript_line(line: crate::model::TranscriptLine) -> TranscriptLin
     }
 }
 
+/// Apply one checked, session-bound view. Rejection has no side effects.
+pub fn apply_session_projection(
+    projection: crate::msg::SessionProjection,
+    scenario: &mut Scenario,
+    now_ms: u64,
+) -> bool {
+    use crate::msg::{ContextProjection, CostQualification, ManualOutcome, ProjectionReason};
+    use crate::worker::ManualAction;
+    let same = scenario.frontend.binding.as_ref() == Some(&projection.binding);
+    let switching = match &projection.reason {
+        ProjectionReason::Initial => {
+            if scenario.frontend.binding.is_some()
+                || scenario.frontend.pending.is_some()
+                || (!scenario.session_id.is_empty()
+                    && scenario.session_id != projection.binding.session_id)
+                || projection.binding.generation != 1
+            {
+                return false;
+            }
+            true
+        }
+        ProjectionReason::Refresh => {
+            if !same || scenario.session_id != projection.binding.session_id || scenario.is_busy() {
+                return false;
+            }
+            false
+        }
+        ProjectionReason::Resume { previous } => {
+            if scenario.frontend.binding.as_ref() != Some(previous)
+                || scenario.frontend.pending.is_some()
+                || scenario.is_busy()
+                || previous.session_id == projection.binding.session_id
+                || previous.generation.checked_add(1) != Some(projection.binding.generation)
+            {
+                return false;
+            }
+            true
+        }
+        ProjectionReason::Operation { operation } => {
+            if scenario.frontend.foreground.as_ref() != Some(operation)
+                || scenario.frontend.binding.as_ref() != Some(operation.source())
+                || scenario.session_id != operation.source().session_id
+                || scenario.frontend.pending.is_some()
+            {
+                return false;
+            }
+            if same {
+                false
+            } else {
+                if operation.kind() != crate::worker::ForegroundKind::Resume
+                    || projection.binding.session_id == operation.source().session_id
+                    || operation.source().generation.checked_add(1)
+                        != Some(projection.binding.generation)
+                {
+                    return false;
+                }
+                true
+            }
+        }
+        ProjectionReason::Manual {
+            operation,
+            outcome,
+            applied,
+        } => {
+            if scenario.frontend.pending.as_ref() != Some(operation)
+                || scenario.frontend.binding.as_ref() != Some(operation.source())
+            {
+                return false;
+            }
+            match operation.action() {
+                ManualAction::Compact => {
+                    if !same || projection.turns != scenario.turns {
+                        return false;
+                    }
+                    false
+                }
+                ManualAction::Clear => {
+                    if *outcome == ManualOutcome::Completed && *applied {
+                        if projection.binding.session_id == operation.source().session_id
+                            || operation.source().generation.checked_add(1)
+                                != Some(projection.binding.generation)
+                        {
+                            return false;
+                        }
+                        true
+                    } else {
+                        if !same || *applied {
+                            return false;
+                        }
+                        false
+                    }
+                }
+            }
+        }
+    };
+    if projection.binding.session_id.is_empty()
+        || projection.binding.session_id.len() > 128
+        || !projection
+            .binding
+            .session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return false;
+    }
+    if !switching
+        && projection.cost.revision().is_some_and(|revision| {
+            scenario
+                .frontend
+                .revision_floor
+                .is_some_and(|floor| revision < floor)
+        })
+    {
+        return false;
+    }
+    let mut lines: Vec<_> = projection
+        .lines
+        .into_iter()
+        .map(restored_transcript_line)
+        .collect();
+    if projection.context == ContextProjection::PreserveUnchanged
+        && (switching
+            || !matches!(&projection.reason,
+            ProjectionReason::Manual { operation, applied: false, .. }
+                if operation.action() == ManualAction::Compact))
+    {
+        return false;
+    }
+    if switching {
+        // Reuse the established identity-transition reset, once.
+        apply_msg(
+            crate::msg::Msg::TranscriptLoaded {
+                lines: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: 0,
+                turns: 0,
+            },
+            scenario,
+            now_ms,
+        );
+        scenario.compactions.clear();
+        scenario.frontend.revision_floor = None;
+    }
+    if !switching
+        && matches!(&projection.reason, ProjectionReason::Operation { operation }
+        if operation.kind().is_ordinary())
+    {
+        // Queued drafts belong to the local ordinary admission policy and
+        // have not entered the worker's typed working history yet.
+        lines.extend(
+            scenario
+                .transcript
+                .iter()
+                .filter(|line| line.kind == LineKind::Queued)
+                .cloned(),
+        );
+    }
+    scenario.model = projection.model.clone();
+    scenario.model_id = projection.model;
+    scenario.provider = projection.provider;
+    scenario.session_prefix = projection
+        .binding
+        .session_id
+        .strip_prefix("session-")
+        .unwrap_or(&projection.binding.session_id)
+        .chars()
+        .take(8)
+        .collect();
+    scenario.session_id = projection.binding.session_id.clone();
+    scenario.priced = projection.priced;
+    scenario.frontend.binding = Some(projection.binding);
+    scenario.transcript = lines;
+    scenario.turns = projection.turns;
+    scenario.input_tokens = projection.input_tokens;
+    scenario.output_tokens = projection.output_tokens;
+    scenario.cost_microcents = projection.cost_microcents;
+    if let Some(revision) = projection.cost.revision() {
+        scenario.frontend.revision_floor = Some(revision);
+    }
+    let manual = matches!(&projection.reason, ProjectionReason::Manual { .. });
+    let foreground = matches!(&projection.reason, ProjectionReason::Operation { .. });
+    scenario.frontend.cost = if !manual && !foreground && scenario.is_busy() {
+        CostQualification::Unavailable
+    } else {
+        projection.cost
+    };
+    if projection.context == ContextProjection::Unavailable {
+        scenario.invalidate_context_sample();
+    }
+    if manual {
+        scenario.frontend.pending = None;
+        scenario.compacting = false;
+        scenario.compacting_from = None;
+    }
+    if foreground {
+        scenario.frontend.foreground = None;
+        scenario.turn_live = false;
+        scenario.compacting = false;
+        scenario.compacting_from = None;
+    }
+    scenario.frontend.dirty = true;
+    true
+}
+
 fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Option<String> {
     use crate::msg::Msg;
+    if let Msg::SessionProjection(projection) = msg {
+        apply_session_projection(projection, scenario, now_ms);
+        return None;
+    }
     // Every message may start a motion: keep redrawing for a second.
     scenario.motion_until_ms = now_ms + 1000;
     match msg {
@@ -1705,6 +2089,9 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             cost_microcents,
             turns,
         } => {
+            scenario.invalidate_cost_qualification();
+            scenario.invalidate_context_sample();
+            scenario.frontend.dirty = true;
             scenario.routing_lines.clear();
             scenario.transcript = lines.into_iter().map(restored_transcript_line).collect();
             scenario.input_tokens = input_tokens;
@@ -1994,6 +2381,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             cost_microcents,
             ..
         } => {
+            let managed = scenario.session_binding().is_some();
             // A turn that is over leaves no card "running": a call that
             // never reported (Esc, an error, the round guard) was cut
             // off, and says so.
@@ -2005,15 +2393,33 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 }
             }
             scenario.running.clear();
-            scenario.turns += 1;
-            scenario.input_tokens += input_tokens;
-            scenario.output_tokens += output_tokens;
-            scenario.cost_microcents += cost_microcents;
+            scenario.compacting = false;
+            scenario.compacting_from = None;
+            // Managed workers publish whole checked totals immediately after
+            // this lifecycle event. Legacy bridges still send per-turn deltas.
+            if !managed {
+                let totals = scenario
+                    .turns
+                    .checked_add(1)
+                    .zip(scenario.input_tokens.checked_add(input_tokens))
+                    .zip(scenario.output_tokens.checked_add(output_tokens))
+                    .zip(scenario.cost_microcents.checked_add(cost_microcents));
+                if let Some((((turns, input), output), cost)) = totals {
+                    scenario.turns = turns;
+                    scenario.input_tokens = input;
+                    scenario.output_tokens = output;
+                    scenario.cost_microcents = cost;
+                } else {
+                    scenario.invalidate_cost_qualification();
+                }
+            }
             scenario.turn_report = Some(TurnReport {
                 duration_ms: now_ms.saturating_sub(scenario.turn_started_ms),
                 tools: scenario.turn_tools,
-                cost_microcents,
-                priced: scenario.priced,
+                // Managed completion counters describe the whole session. The
+                // report keeps its lifecycle facts and omits a monetary claim.
+                cost_microcents: if managed { 0 } else { cost_microcents },
+                priced: !managed && scenario.priced,
             });
             scenario.turn_ended_ms = Some(now_ms);
             scenario.apply("turn_ended", 0);
@@ -2236,6 +2642,12 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             session_id,
             priced,
         } => {
+            scenario.invalidate_cost_qualification();
+            scenario.invalidate_context_sample();
+            if scenario.session_id != session_id {
+                scenario.frontend.binding = None;
+            }
+            scenario.frontend.dirty = true;
             scenario.model = model.clone();
             scenario.model_id = model;
             scenario.provider = provider;
@@ -4484,9 +4896,32 @@ mod composer_key_tests {
             let mut tui = Tui::new();
             tui.app = super::super::app::App::new(root.clone(), true);
             tui.file_completion = super::super::composer::FileCompletion::new(root.clone());
+            let mut scenario = Scenario::new();
+            assert!(apply_session_projection(
+                crate::msg::SessionProjection {
+                    binding: crate::worker::SessionBinding {
+                        session_id: "session-keyboard-fixture".into(),
+                        generation: 1
+                    },
+                    model: "fixture-model".into(),
+                    provider: "fixture-provider".into(),
+                    priced: false,
+                    lines: Vec::new(),
+                    turns: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microcents: 0,
+                    cost: crate::msg::CostQualification::Known { revision: 0 },
+                    context: crate::msg::ContextProjection::Unavailable,
+                    reason: crate::msg::ProjectionReason::Initial,
+                },
+                &mut scenario,
+                0
+            ));
+            scenario.take_view_dirty();
             Self {
                 tui,
-                scenario: Scenario::new(),
+                scenario,
                 draft: String::new(),
                 history: Vec::new(),
                 history_idx: None,
@@ -4545,6 +4980,16 @@ mod composer_key_tests {
             assert!(self.rx.try_recv().is_err());
         }
 
+        fn received_command(&self) -> WorkerCommand {
+            let WorkerCommand::Bound { operation, command } = self.rx.try_recv().unwrap() else {
+                panic!("managed keyboard admission must be bound");
+            };
+            assert_eq!(self.scenario.pending_foreground(), Some(&operation));
+            assert_eq!(self.scenario.session_binding(), Some(operation.source()));
+            assert_eq!(command.foreground_kind(), Some(operation.kind()));
+            *command
+        }
+
         fn frame(&mut self, width: u16, height: u16) -> String {
             self.tui.reduced = true;
             self.tui.tick_ms = 5_000;
@@ -4600,7 +5045,7 @@ mod composer_key_tests {
         k.no_send();
         k.plain(KeyCode::Enter);
         assert!(
-            matches!(k.rx.try_recv().unwrap(), WorkerCommand::Prompt(text) if text == "Read @\"docs/a b\\\"c.rs\"")
+            matches!(k.received_command(), WorkerCommand::Prompt(text) if text == "Read @\"docs/a b\\\"c.rs\"")
         );
     }
 
@@ -4649,7 +5094,7 @@ mod composer_key_tests {
         k.no_send();
         k.plain(KeyCode::Enter);
         assert!(
-            matches!(k.rx.try_recv().unwrap(), WorkerCommand::Prompt(text) if text == "old build\nnext")
+            matches!(k.received_command(), WorkerCommand::Prompt(text) if text == "old build\nnext")
         );
     }
 
@@ -5041,6 +5486,15 @@ fn reduce_frontend_message(
     s: &mut Scenario,
     now: u64,
 ) -> Option<String> {
+    if let crate::msg::Msg::SessionProjection(projection) = msg {
+        if apply_session_projection(projection, s, now)
+            && let Some(session) = tui.customization.as_mut()
+        {
+            session.invalidate_session(pane_context(s, session.context.controller));
+            s.custom_panes = session.outputs.clone();
+        }
+        return None;
+    }
     let restored = matches!(&msg, crate::msg::Msg::TranscriptLoaded { .. });
     let result = apply_msg(msg, s, now);
     if restored && let Some(session) = tui.customization.as_mut() {
@@ -5081,7 +5535,9 @@ fn run_pane_action(
             tui.sync_focus();
         }
         Ok(crate::customization::ActionEffect::OwnerCancel) => {
-            if let Some(cancel) = cancel {
+            if let Some(operation) = s.pending_manual() {
+                let _ = operation.cancel();
+            } else if let Some(cancel) = cancel {
                 cancel();
             }
         }
@@ -5805,5 +6261,390 @@ mod customization_review_tests {
         );
         assert!(!home.join(".customization.lock").exists());
         std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bound_projection_tests {
+    use super::*;
+    use crate::msg::{ContextProjection, CostQualification, ProjectionReason, SessionProjection};
+    use crate::worker::{ForegroundKind, ForegroundOperation, ManualAction, SessionBinding};
+    use orbit_frontend_protocol::customization::*;
+    use std::{collections::BTreeMap, sync::Arc};
+
+    fn binding() -> SessionBinding {
+        SessionBinding {
+            session_id: "session-bound-test".into(),
+            generation: 1,
+        }
+    }
+
+    fn projection(reason: ProjectionReason) -> SessionProjection {
+        SessionProjection {
+            binding: binding(),
+            model: "model".into(),
+            provider: "provider".into(),
+            priced: true,
+            lines: vec![crate::model::TranscriptLine::User {
+                text: "preserved".into(),
+                time: None,
+            }],
+            turns: 2,
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_microcents: 30,
+            cost: CostQualification::Known { revision: 3 },
+            context: ContextProjection::Unavailable,
+            reason,
+        }
+    }
+
+    fn establish(s: &mut Scenario) {
+        assert!(apply_session_projection(
+            projection(ProjectionReason::Initial),
+            s,
+            1
+        ));
+        assert!(s.take_view_dirty());
+    }
+
+    #[test]
+    fn actual_finish_and_error_keep_bound_prompt_and_plan_ownership_until_checked_terminal() {
+        for command in [
+            WorkerCommand::Prompt("prompt".into()),
+            WorkerCommand::PlanPrompt("plan".into()),
+        ] {
+            let mut s = Scenario::new();
+            establish(&mut s);
+            let (sink, receiver) = std::sync::mpsc::channel();
+            submit_foreground(&mut s, &sink, command).unwrap();
+            let WorkerCommand::Bound { operation, command } = receiver.recv().unwrap() else {
+                panic!("bound admission")
+            };
+            let registration = operation.start(&command).unwrap();
+            s.turn_live = true;
+            apply_msg(
+                crate::msg::Msg::BackendError("snapshot unavailable".into()),
+                &mut s,
+                2,
+            );
+            assert!(!s.turn_live && s.is_busy());
+            assert_eq!(s.pending_foreground(), Some(&operation));
+            assert!(s.new_manual_operation(ManualAction::Compact).is_err());
+            apply_msg(
+                crate::msg::Msg::ResponseFinished {
+                    output: String::new(),
+                    input_tokens: 110,
+                    output_tokens: 220,
+                    cost_microcents: 330,
+                },
+                &mut s,
+                3,
+            );
+            assert_eq!(
+                (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+                (2, 10, 20, 30)
+            );
+            assert_eq!(s.cost_qualification(), CostQualification::Unavailable);
+            assert_eq!(s.qualified_revision_floor(), Some(3));
+            assert!(s.is_busy() && s.new_manual_operation(ManualAction::Clear).is_err());
+            assert!(!s.turn_report.as_ref().unwrap().priced);
+            assert_eq!(s.turn_report.as_ref().unwrap().cost_microcents, 0);
+            let mut terminal = projection(ProjectionReason::Operation {
+                operation: operation.clone(),
+            });
+            terminal.turns = 3;
+            terminal.input_tokens = 110;
+            terminal.output_tokens = 220;
+            terminal.cost_microcents = 330;
+            terminal.cost = CostQualification::Known { revision: 5 };
+            drop(registration);
+            assert!(apply_session_projection(terminal.clone(), &mut s, 4));
+            assert_eq!(
+                (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+                (3, 110, 220, 330)
+            );
+            assert!(!s.is_busy() && s.pending_foreground().is_none());
+            assert!(s.take_view_dirty());
+            assert!(!apply_session_projection(terminal, &mut s, 5));
+            assert!(!s.take_view_dirty());
+        }
+    }
+
+    #[test]
+    fn startup_and_control_admission_cannot_queue_a_stale_manual_source() {
+        let (sink, receiver) = std::sync::mpsc::channel();
+        let mut s = Scenario::new();
+        assert!(submit_foreground(&mut s, &sink, WorkerCommand::Prompt("early".into())).is_err());
+        assert!(receiver.try_recv().is_err());
+        establish(&mut s);
+        for command in [
+            WorkerCommand::Undo,
+            WorkerCommand::ResumeSession("session-target".into()),
+        ] {
+            let is_resume = matches!(&command, WorkerCommand::ResumeSession(_));
+            submit_foreground(&mut s, &sink, command).unwrap();
+            let WorkerCommand::Bound { operation, command } = receiver.recv().unwrap() else {
+                panic!("bound control")
+            };
+            let registration = operation.start(&command).unwrap();
+            assert!(s.new_manual_operation(ManualAction::Compact).is_err());
+            assert!(
+                submit_foreground(&mut s, &sink, WorkerCommand::Prompt("racing".into())).is_err()
+            );
+            let mut terminal = projection(ProjectionReason::Operation { operation });
+            terminal.turns = 1;
+            if is_resume {
+                terminal.binding = SessionBinding {
+                    session_id: "session-target".into(),
+                    generation: 2,
+                };
+                terminal.cost = CostQualification::Known { revision: 0 };
+            }
+            drop(registration);
+            assert!(apply_session_projection(terminal, &mut s, 10));
+            assert_eq!(s.turns, 1);
+            assert!(!s.is_busy());
+        }
+    }
+
+    #[test]
+    fn ordinary_checked_terminal_preserves_local_queued_drafts_for_promotion() {
+        let mut s = Scenario::new();
+        establish(&mut s);
+        let (sink, receiver) = std::sync::mpsc::channel();
+        submit_foreground(&mut s, &sink, WorkerCommand::Prompt("active".into())).unwrap();
+        let WorkerCommand::Bound { operation, command } = receiver.recv().unwrap() else {
+            panic!("bound prompt")
+        };
+        let registration = operation.start(&command).unwrap();
+        for text in ["next", "later"] {
+            s.transcript.push(TranscriptLine {
+                kind: LineKind::Queued,
+                text: text.into(),
+                ..Default::default()
+            });
+        }
+        drop(registration);
+        assert!(apply_session_projection(
+            projection(ProjectionReason::Operation { operation }),
+            &mut s,
+            2
+        ));
+        assert_eq!(
+            s.transcript
+                .iter()
+                .filter(|line| line.kind == LineKind::Queued)
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["next", "later"]
+        );
+        submit_foreground(&mut s, &sink, WorkerCommand::Prompt("next".into())).unwrap();
+        assert!(s.ordinary_pending() && s.is_busy());
+    }
+
+    struct Host(ResolvedProfile);
+    impl ProfileHost for Host {
+        fn load(&self) -> Result<ResolvedProfile, CustomizationError> {
+            Ok(self.0.clone())
+        }
+        fn replace(&self, _: Profile, _: &str) -> Result<ResolvedProfile, CustomizationError> {
+            Err(CustomizationError::Busy)
+        }
+        fn reset(&self, _: &str) -> Result<ResolvedProfile, CustomizationError> {
+            Err(CustomizationError::Busy)
+        }
+        fn read_pane(
+            &self,
+            id: &str,
+            context: &PaneContext,
+        ) -> Result<PaneOutput, CustomizationError> {
+            Ok(PaneOutput {
+                id: id.into(),
+                title: "Usage".into(),
+                state: PaneState::Ready,
+                text: format!("input {}", context.input_tokens),
+                truncated: false,
+                actions: vec![PaneAction::Refresh],
+            })
+        }
+    }
+
+    fn customized_tui() -> Tui {
+        let mut profile = Profile::default();
+        profile.panes.push(PaneDef {
+            id: "usage".into(),
+            title: "Usage".into(),
+            surfaces: vec![Surface::Terminal],
+            source: PaneSource::Snapshot {
+                snapshot: SnapshotKind::Usage,
+            },
+            actions: vec![PaneAction::Refresh],
+        });
+        let host = Arc::new(Host(ResolvedProfile {
+            profile,
+            revision: "fixture".into(),
+            sources: BTreeMap::new(),
+            capabilities: CustomizationCapabilities::default(),
+        }));
+        let mut tui = Tui::new();
+        tui.reduced = true;
+        tui.customization = Some(crate::customization::CustomizationSession::open(host).unwrap());
+        tui
+    }
+
+    #[test]
+    fn reduced_motion_wrapper_invalidates_only_accepted_projection_and_rejects_duplicate_terminal()
+    {
+        let mut s = Scenario::new();
+        let mut tui = customized_tui();
+        reduce_frontend_message(
+            crate::msg::Msg::SessionProjection(projection(ProjectionReason::Initial)),
+            &mut tui,
+            &mut s,
+            1,
+        );
+        assert!(s.take_view_dirty());
+        tui.customization
+            .as_mut()
+            .unwrap()
+            .refresh("usage")
+            .unwrap();
+        let operation = s.new_foreground_operation(ForegroundKind::Control).unwrap();
+        assert!(s.admit_foreground(operation.clone()));
+        assert!(s.take_view_dirty());
+        let wrong = ForegroundOperation::new(binding(), ForegroundKind::Control, 99).unwrap();
+        for rejected in [
+            projection(ProjectionReason::Refresh),
+            projection(ProjectionReason::Operation { operation: wrong }),
+        ] {
+            let before = format!("{s:?}");
+            let context = tui.customization.as_ref().unwrap().context.clone();
+            let outputs = tui.customization.as_ref().unwrap().outputs.clone();
+            reduce_frontend_message(
+                crate::msg::Msg::SessionProjection(rejected),
+                &mut tui,
+                &mut s,
+                2,
+            );
+            assert_eq!(format!("{s:?}"), before);
+            assert!(!s.take_view_dirty());
+            assert_eq!(tui.customization.as_ref().unwrap().context, context);
+            assert_eq!(tui.customization.as_ref().unwrap().outputs, outputs);
+        }
+        let mut terminal = projection(ProjectionReason::Operation { operation });
+        terminal.input_tokens = 55;
+        terminal.cost = CostQualification::Known { revision: 4 };
+        reduce_frontend_message(
+            crate::msg::Msg::SessionProjection(terminal.clone()),
+            &mut tui,
+            &mut s,
+            3,
+        );
+        assert!(tui.reduced && s.take_view_dirty());
+        assert_eq!(tui.customization.as_ref().unwrap().context.input_tokens, 55);
+        assert_eq!(s.custom_panes["usage"].state, PaneState::Stale);
+        tui.customization
+            .as_mut()
+            .unwrap()
+            .refresh("usage")
+            .unwrap();
+        s.custom_panes = tui.customization.as_ref().unwrap().outputs.clone();
+        let before = format!("{s:?}");
+        let context = tui.customization.as_ref().unwrap().context.clone();
+        let outputs = tui.customization.as_ref().unwrap().outputs.clone();
+        reduce_frontend_message(
+            crate::msg::Msg::SessionProjection(terminal),
+            &mut tui,
+            &mut s,
+            4,
+        );
+        assert!(!s.take_view_dirty());
+        assert_eq!(format!("{s:?}"), before);
+        assert_eq!(tui.customization.as_ref().unwrap().context, context);
+        assert_eq!(tui.customization.as_ref().unwrap().outputs, outputs);
+        let mut stale = projection(ProjectionReason::Refresh);
+        stale.cost = CostQualification::Known { revision: 3 };
+        reduce_frontend_message(
+            crate::msg::Msg::SessionProjection(stale),
+            &mut tui,
+            &mut s,
+            5,
+        );
+        assert!(!s.take_view_dirty());
+        assert_eq!(format!("{s:?}"), before);
+        assert_eq!(tui.customization.as_ref().unwrap().outputs, outputs);
+    }
+
+    #[test]
+    fn foreground_ticket_refuses_wrong_kind_nested_wrapping_and_reuse() {
+        let operation = ForegroundOperation::new(binding(), ForegroundKind::Control, 1).unwrap();
+        assert!(
+            operation
+                .start(&WorkerCommand::Prompt("wrong".into()))
+                .is_err()
+        );
+        assert!(
+            operation
+                .start(&WorkerCommand::Bound {
+                    operation: operation.clone(),
+                    command: Box::new(WorkerCommand::Undo)
+                })
+                .is_err()
+        );
+        let registration = operation.start(&WorkerCommand::Undo).unwrap();
+        assert!(operation.start(&WorkerCommand::Undo).is_err());
+        drop(registration);
+        assert!(operation.start(&WorkerCommand::Undo).is_err());
+    }
+
+    #[test]
+    fn legacy_finish_uses_checked_deltas_and_preserves_entire_prefix_on_overflow() {
+        let mut s = Scenario::new();
+        s.turns = u64::MAX;
+        s.input_tokens = 7;
+        s.output_tokens = 8;
+        s.cost_microcents = 9;
+        s.turn_tools = 1;
+        apply_msg(
+            crate::msg::Msg::ResponseFinished {
+                output: String::new(),
+                input_tokens: 1,
+                output_tokens: 2,
+                cost_microcents: 3,
+            },
+            &mut s,
+            1,
+        );
+        assert_eq!(
+            (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+            (u64::MAX, 7, 8, 9)
+        );
+        assert_eq!(s.cost_qualification(), CostQualification::Unavailable);
+        assert_eq!(s.state_version(), u64::MAX);
+        let mut normal = Scenario::new();
+        normal.turns = 2;
+        normal.input_tokens = 7;
+        normal.output_tokens = 8;
+        normal.cost_microcents = 9;
+        apply_msg(
+            crate::msg::Msg::ResponseFinished {
+                output: String::new(),
+                input_tokens: 1,
+                output_tokens: 2,
+                cost_microcents: 3,
+            },
+            &mut normal,
+            1,
+        );
+        assert_eq!(
+            (
+                normal.turns,
+                normal.input_tokens,
+                normal.output_tokens,
+                normal.cost_microcents
+            ),
+            (3, 8, 10, 12)
+        );
     }
 }

@@ -44,3 +44,6 @@ orbit-release = { path = "../crates/release" }
 orbit-migrator = { path = "../migrator" }
 orbit-conformance = { path = "../conformance" }
 tempfile = "3"
+
+[dev-dependencies]
+orbit-provider-http = { path = "../crates/provider-http" }

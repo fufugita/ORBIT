@@ -16,8 +16,8 @@
 //! - Stop reasons: `end_turn`/`stop` ends the turn; `tool_calls` runs
 //!   them; `length`/`max_tokens` inside text ends the turn with a
 //!   visible cut-off note (the old loops treated it as done).
-//! - Retry with backoff on 429/529-class refusals: up to 8 attempts,
-//!   exponential with jitter, each attempt a fresh dispatch.
+//! - Request accounting precedes each dispatch. Opaque failures stop with
+//!   uncertainty; another attempt requires positive non-admission evidence.
 //! - Turn events in `orbit-frontend-protocol` v2: the same stream the
 //!   TUI, REPL, web and `orbit -p` consume.
 //!
@@ -27,21 +27,34 @@
 
 pub mod agent_store;
 pub mod automation;
+pub mod compaction;
 pub mod context;
 pub mod context_budget;
 pub mod diff;
 pub mod dispatch;
 pub mod hooks;
+pub mod retry;
 pub mod routing;
 pub mod skills;
 pub mod transcript;
 pub mod turn;
 
+pub use compaction::{
+    AccountingBaseline, AccountingCheckpoint, AccountingDelta, AccountingKnownness,
+    AccountingRevision, AccountingTotals, AttemptIntent, AttemptPurpose, AttemptRef,
+    CompactionAttempt, CompactionCandidate, CompactionCoverage, CompactionJournal,
+    CompactionReceipt, CompactionRecordRef, CompactionStatus, HistoryError, KnownPricedSubtotals,
+    ManualCompactionCompletion, MessageRange, PendingAttempt, RequestAccountingReceipt,
+    SettledAttempt, compact_context, compact_context_detailed,
+};
 pub use dispatch::{
     BudgetedDispatchFailure, BudgetedTurnOutcome, PendingToolCall, ProviderKind, TurnConfig,
     TurnOutcome, run_budgeted_dispatch, run_dispatch,
 };
-pub use turn::{DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS, TurnOptions, run_turn};
+pub use turn::{
+    DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS, MAX_TURN_ACCOUNTING_ATTEMPTS, SpendAllowance,
+    TurnCompletion, TurnEnd, TurnFailure, TurnOptions, run_turn, run_turn_detailed,
+};
 
 use orbit_adapter::types::ChatMessage;
 use orbit_frontend_protocol::FrontendEvent;
@@ -60,6 +73,11 @@ pub struct TurnReport {
     pub output_tokens: u64,
     pub cost_microcents: u64,
     pub final_text: String,
+    /// Current-turn deltas, separate from occupancy and historical checkpoints.
+    pub accounting: AccountingDelta,
+    /// At most MAX_TURN_ACCOUNTING_ATTEMPTS actual request receipts. These are
+    /// already included in accounting and must never be applied a second time.
+    pub attempts: Vec<RequestAccountingReceipt>,
 }
 
 /// Executes tool calls decided by the engine. Injected by the caller

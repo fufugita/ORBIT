@@ -21,7 +21,6 @@ use orbit_adapter::types::{
 pub struct AnthropicMessagesV1 {
     identity: AdapterIdentity,
     capabilities: ProviderCapabilities,
-    client: reqwest::Client,
 }
 
 impl AnthropicMessagesV1 {
@@ -34,13 +33,11 @@ impl AnthropicMessagesV1 {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
-        // E6: shared client — one connection pool for the process.
-        let client = crate::shared_plain_client()
-            .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
+        // Validate default construction; each invocation selects its own budget.
+        let _ = crate::shared_plain_client().map_err(AdapterError::from)?;
         Ok(Self {
             identity,
             capabilities,
-            client,
         })
     }
 }
@@ -287,6 +284,7 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
         cancel: &CancelToken,
     ) -> Result<AsyncProviderEventStream, AdapterError> {
         self.validate_route(&request.route)?;
+        let timeouts = crate::RequestTimeouts::new(request)?;
         if let Some(effort) = &request.effort {
             effort
                 .validate_for_anthropic()
@@ -299,8 +297,8 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
             crate::request::RequestBodyInput::from(request),
         )?;
 
-        let mut req = self
-            .client
+        let client = crate::plain_client_for_request(&timeouts).map_err(AdapterError::from)?;
+        let mut req = client
             .post(url)
             .header("anthropic-version", "2023-06-01")
             .json(body.as_json());
@@ -310,18 +308,21 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
                 String::from_utf8_lossy(secret.expose()).into_owned(),
             );
         }
+        let response_deadline = timeouts.response_deadline()?;
         let Some(response) = cancel
-            .until_cancelled(tokio::time::timeout(
-                std::time::Duration::from_millis(request.connect_timeout_ms),
-                req.send(),
-            ))
+            .until_cancelled(crate::response_start_wait(response_deadline, req.send()))
             .await
         else {
             return Ok(crate::cancel::cancelled_stream());
         };
+        if cancel.is_cancelled() {
+            return Ok(crate::cancel::cancelled_stream());
+        }
         let resp = response
-            .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
-            .map_err(|e| AdapterError::ProviderTransportFailure(e.to_string()))?;
+            .map_err(|_| {
+                AdapterError::ProviderTimeout("response headers timed out (E0409)".into())
+            })?
+            .map_err(|error| crate::reqwest_error(error, "response headers"))?;
         if resp.status().is_redirection() {
             return Err(AdapterError::ProtocolOrStreamViolation(
                 "provider redirects are not permitted (E0411)".into(),
@@ -331,11 +332,9 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
             // E1: the body carries the provider's own message; E2:
             // 529/5xx classify retryable.
             let status = resp.status();
+            let error_body_deadline = timeouts.idle_deadline()?;
             let Some(body) = cancel
-                .until_cancelled(tokio::time::timeout(
-                    std::time::Duration::from_millis(request.idle_timeout_ms),
-                    resp.text(),
-                ))
+                .until_cancelled(tokio::time::timeout_at(error_body_deadline, resp.text()))
                 .await
             else {
                 return Ok(crate::cancel::cancelled_stream());
@@ -349,8 +348,8 @@ impl AsyncProviderAdapter for AnthropicMessagesV1 {
         }
         Ok(anthropic_stream(
             resp.bytes_stream(),
-            request.first_byte_timeout_ms,
-            request.idle_timeout_ms,
+            response_deadline,
+            timeouts.idle,
             cancel.clone(),
         ))
     }
@@ -697,8 +696,8 @@ fn anthropic_stream(
     + Unpin
     + Send
     + 'static,
-    first_byte_timeout_ms: u64,
-    idle_timeout_ms: u64,
+    response_deadline: tokio::time::Instant,
+    idle_timeout: std::time::Duration,
     cancel: CancelToken,
 ) -> AsyncProviderEventStream {
     use crate::stream::{count_bytes, incomplete_reason, protocol, validate_calls};
@@ -712,16 +711,26 @@ fn anthropic_stream(
         yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ResponseStarted { upstream_request_id:None } }); seq += 1;
         let mut first = true;
         while let Some(chunk) = {
-            let budget = std::time::Duration::from_millis(if first { first_byte_timeout_ms } else { idle_timeout_ms });
-            match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
+            let waited = if first {
+                cancel.until_cancelled(crate::response_start_wait(response_deadline, bytes.next())).await
+            } else {
+                let deadline = match crate::checked_deadline(tokio::time::Instant::now(), idle_timeout, "stream idle") {
+                    Ok(deadline) => deadline,
+                    Err(error) => { yield Err(error); return; }
+                };
+                cancel.until_cancelled(async {
+                    tokio::time::timeout_at(deadline, bytes.next()).await.map_err(|_| ())
+                }).await
+            };
+            match waited {
                 None => None,
                 Some(Ok(item)) => item,
                 Some(Err(_)) => { yield Err(AdapterError::ProviderTimeout("Anthropic stream stalled (E0409)".into())); return; }
             }
         } {
             if cancel.is_cancelled() { break; }
-            first = false;
-            let chunk = match chunk { Ok(chunk) => chunk, Err(error) => { yield Err(AdapterError::ProviderTransportFailure(error.to_string())); return; } };
+            let chunk = match chunk { Ok(chunk) => chunk, Err(error) => { yield Err(crate::reqwest_error(error, "stream")); return; } };
+            if !chunk.is_empty() { first = false; }
             if let Err(error) = count_bytes(&mut total, chunk.len()) { yield Err(error); return; }
             let events = match parser.feed(&chunk) { Ok(events) => events, Err(error) => { yield Err(error.into()); return; } };
             for event in events {

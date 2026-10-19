@@ -14,10 +14,19 @@ use orbit_ledger::{LedgerWriter, verify_ledger};
 use orbit_reactor::{CancelOrigin, CancelTarget, CancellationToken, Reactor};
 use std::path::{Path, PathBuf};
 
+use orbit_cli::session_accounting::{self, FullCostStatus, NamespaceSpendPolicy, RootOrigin};
 use orbit_cli::{config, sessions, tool_runtime, tools, tui_worker};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = orbit_cli::recovery_commands::try_run(&args) {
+        std::process::exit(code);
+    }
+    // Local compaction has its own complete grammar, including rejection of
+    // help/prompt/model overrides before any ownership or discovery effects.
+    if positionals(&args).first().copied() == Some("compact") {
+        std::process::exit(cmd_compact(&args));
+    }
 
     // Web search backend (roadmap §Wave 2): off until configured. The
     // env pair names a search API; the tool answers honestly otherwise.
@@ -190,6 +199,18 @@ fn print_human_help() {
             "configure or preview phase and difficulty routing",
         ),
         ("ask PROMPT", "send one prompt through a configured gateway"),
+        (
+            "compact --session ID [--json]",
+            "compact an inactive saved session without another user turn",
+        ),
+        (
+            "recovery status --session ID [--child CHILD] [--json]",
+            "inspect tracked accounting without provider requests or replay",
+        ),
+        (
+            "recovery export --session ID --expect-revision REV --expect-inspection DIGEST --to DIR [--json]",
+            "preserve an inactive root session in a new private directory",
+        ),
         (
             "-p PROMPT",
             "headless one-shot with tools (stream-json output)",
@@ -395,6 +416,9 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "models        list models from all configured providers",
                 "route status|test|setup|set|reset|auto  configure and preview model routing",
                 "ask PROMPT    send one prompt through a configured gateway",
+                "compact --session ID [--home PATH] [--json]  compact an inactive saved session",
+                "recovery status --session ID [--child CHILD] [--json]  inspect existing accounting without replay",
+                "recovery export --session ID --expect-revision REV --expect-inspection DIGEST --to DIR [--json]  preserve an inactive root session",
                 "-p PROMPT     headless one-shot with tools (stream-json output)",
                 "run           run the example phase chain",
                 "cancel        cancel the session (terminal: cancelled)",
@@ -1274,6 +1298,14 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
 fn build_session_prompt(home: &Path, model: &str) -> orbit_engine::context::SystemPrompt {
     let defs = tools::session_tool_definitions(home);
     let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    build_session_prompt_with_tool_names(home, model, &tool_names)
+}
+
+fn build_session_prompt_with_tool_names(
+    home: &Path,
+    model: &str,
+    tool_names: &[&str],
+) -> orbit_engine::context::SystemPrompt {
     let mods = orbit_cli::mods::load_all(home);
     let enabled = orbit_cli::mods::initial_enabled(home, &mods);
     let mods_directive = orbit_cli::mods::system_directive(&mods, &enabled);
@@ -1281,9 +1313,367 @@ fn build_session_prompt(home: &Path, model: &str) -> orbit_engine::context::Syst
         home,
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         model,
-        &tool_names,
+        tool_names,
         &mods_directive,
     )
+}
+
+fn parse_compact_arguments(args: &[String]) -> Result<(String, PathBuf, bool), &'static str> {
+    let mut session = None;
+    let mut seen_home = false;
+    let mut json = false;
+    let mut command = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "compact" if !command => command = true,
+            "--home" if !seen_home => {
+                args.get(index + 1)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or("compact_usage")?;
+                seen_home = true;
+                index += 1;
+            }
+            "--session" if command && session.is_none() => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or("compact_usage")?;
+                let id = value.strip_suffix(".json").unwrap_or(value);
+                if id.is_empty()
+                    || id.len() > 128
+                    || !id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                {
+                    return Err("invalid_session_id");
+                }
+                session = Some(id.to_owned());
+                index += 1;
+            }
+            "--json" if command && !json => json = true,
+            _ => return Err("compact_usage"),
+        }
+        index += 1;
+    }
+    if !command {
+        return Err("compact_usage");
+    }
+    Ok((
+        session.ok_or("compact_usage")?,
+        config::resolve_home(args),
+        json,
+    ))
+}
+
+/// The same held namespace and actual token cover discovery, summaries and the
+/// single final publication. Returned receipts have already settled in journal.
+fn compact_local_session(
+    owner: (
+        &sessions::SessionLease,
+        &session_accounting::RootSessionAccounting,
+    ),
+    working: &mut sessions::SessionFile,
+    scope: &tool_runtime::PermissionScope,
+    cancel: &orbit_provider_http::CancelToken,
+    events: orbit_engine::EventSink<'_>,
+) -> (
+    Result<orbit_engine::ManualCompactionCompletion, &'static str>,
+    Result<session_accounting::AccountingView, session_accounting::AccountingError>,
+) {
+    let (lease, accounting) = owner;
+    let result = (|| {
+        if cancel.is_cancelled() {
+            return Err("cancelled");
+        }
+        let home = lease.home();
+        let turn = chat_effort_config(
+            home,
+            &working.model,
+            &working.gate,
+            Some(&working.provider),
+            working.effort.as_ref(),
+        )
+        .map_err(|_| "selection_invalid")?;
+        let compaction = orbit_cli::try_role_turn_config(home, &turn, "compaction")
+            .map_err(|_| "compaction_selection_invalid")?;
+        let mut options = orbit_engine::TurnOptions {
+            session_id: working.session_id.clone(),
+            request_stem: format!("orbit-local-compact-{}", orbit_gateway::new_session_id()),
+            max_attempts: 1,
+            compaction_config: Some(compaction),
+            ..Default::default()
+        };
+        let notices = orbit_cli::model_limits::apply_turn_budgets(home, &turn, &mut options)
+            .map_err(|_| "context_budget_invalid")?;
+        accounting
+            .namespace()
+            .apply_options_detailed(&mut options, None, None)
+            .map_err(|_| "accounting_admission_refused")?;
+        let cx = orbit_tools::ToolContext::new(
+            home.to_path_buf(),
+            working.session_id.clone(),
+            std::env::current_dir().map_err(|_| "workspace_unavailable")?,
+        );
+        tool_runtime::remember_effort_setting(&cx, &working.effort);
+        tool_runtime::begin_cancel_scope(&cx, cancel);
+        struct CancelScope<'a>(&'a orbit_tools::ToolContext);
+        impl Drop for CancelScope<'_> {
+            fn drop(&mut self) {
+                self.0.pop_cancel_check();
+            }
+        }
+        let _scope = CancelScope(&cx);
+        if cancel.is_cancelled() {
+            return Err("cancelled");
+        }
+        let mut definitions =
+            tools::session_tool_definitions_with_context(home, &cx, scope.allowlist.as_deref());
+        definitions.retain(|definition| {
+            !scope.disallowlist.contains(&definition.name)
+                && scope
+                    .allowlist
+                    .as_ref()
+                    .is_none_or(|allow| allow.contains(&definition.name))
+        });
+        let tool_names: Vec<&str> = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect();
+        let prompt = build_session_prompt_with_tool_names(home, &turn.model, &tool_names);
+        options.memory_bytes = prompt.memory_bytes;
+        options.system_directive = Some(prompt.text);
+        options.tools = definitions;
+        for text in notices {
+            events(orbit_frontend_protocol::FrontendEvent::Status { text });
+        }
+        Ok(orbit_engine::compact_context_detailed(
+            home,
+            &turn,
+            &options,
+            &mut working.transcript,
+            cancel,
+            events,
+        ))
+    })();
+    // This common path also retains paid failure/cancel results. Never fold the
+    // completion's accounting delta a second time or retry a failed save here.
+    let persisted = accounting.persist(lease, working);
+    (result, persisted)
+}
+
+/// A successful inspection may advance the namespace floor, so exact equality
+/// with the just-projected revision is required before showing its qualification.
+fn checked_local_accounting(
+    accounting: &session_accounting::RootSessionAccounting,
+    working: &sessions::SessionFile,
+    persisted: &Result<session_accounting::AccountingView, session_accounting::AccountingError>,
+) -> Option<session_accounting::AccountingView> {
+    let projected = match persisted {
+        Ok(view) => Some(*view),
+        Err(session_accounting::AccountingError::Session(_)) => working
+            .accounting_watermark
+            .as_ref()
+            .filter(|anchor| {
+                anchor.owner_session_id == working.session_id && anchor.child_id.is_none()
+            })
+            .map(|anchor| session_accounting::AccountingView {
+                revision: anchor.revision,
+                input_tokens: working.input_tokens,
+                output_tokens: working.output_tokens,
+                known_cost_microcents: working.cost_microcents,
+                full_cost_status: anchor.full_cost_status,
+            }),
+        _ => None,
+    };
+    let checkpoint = accounting.namespace().checkpoint_detailed().ok()?;
+    let view = projected?;
+    let uncertain = checkpoint.pending().is_some()
+        || checkpoint.totals().knownness == orbit_engine::AccountingKnownness::Uncertain;
+    (checkpoint.owner_session_id() == working.session_id
+        && checkpoint.child_id().is_none()
+        && checkpoint.revision().0 == view.revision
+        && uncertain == (view.full_cost_status == FullCostStatus::Uncertain))
+        .then_some(view)
+}
+
+fn compact_local_output(
+    working: &sessions::SessionFile,
+    result: &Result<orbit_engine::ManualCompactionCompletion, &'static str>,
+    persisted: &Result<session_accounting::AccountingView, session_accounting::AccountingError>,
+    checked: Option<session_accounting::AccountingView>,
+) -> (serde_json::Value, i32) {
+    use orbit_engine::CompactionStatus as S;
+    let (reason, applied) = match result {
+        Err(reason) => (*reason, false),
+        Ok(completion) => (
+            match completion.status {
+                S::NothingToCompact => "nothing_to_compact",
+                S::InvalidHistory => "invalid_history",
+                S::ProtectedTooLarge => "protected_too_large",
+                S::SummaryTooLarge => "summary_too_large",
+                S::SourceTooLarge => "source_too_large",
+                S::MissingJournal => "missing_journal",
+                S::SummaryUnusable => "summary_unusable",
+                S::Cancelled => "cancelled",
+                S::StorageUnsafe => "storage_unsafe",
+                S::PublicationUncertain => "publication_uncertain",
+                S::AccountingUncertain => "accounting_uncertain",
+                S::SpendRefused => "spend_refused",
+                S::AccountingLimit => "accounting_limit",
+                S::PublishedReady => "published_ready",
+            },
+            completion.applied,
+        ),
+    };
+    let status = if persisted.is_err()
+        || checked.is_none_or(|view| view.full_cost_status == FullCostStatus::Uncertain)
+        || matches!(reason, "publication_uncertain" | "accounting_uncertain")
+    {
+        "unknown"
+    } else if reason == "nothing_to_compact" || (reason == "published_ready" && applied) {
+        "completed"
+    } else if reason == "cancelled" {
+        "cancelled"
+    } else {
+        "failed"
+    };
+    (
+        serde_json::json!({
+            "schema":"orbit.cli/v1", "command":"compact", "session":working.session_id,
+            "status":status, "reason":reason, "applied":applied, "snapshot_saved":persisted.is_ok(),
+            "turns":working.turns,
+            "usage":{"input_tokens":working.input_tokens,"output_tokens":working.output_tokens},
+            "cost_microcents":working.cost_microcents,
+            "accounting_revision":checked.map(|view| view.revision),
+            "full_cost_status":checked.map(|view| view.full_cost_status),
+        }),
+        if status == "completed" { 0 } else { 1 },
+    )
+}
+
+fn print_compact_output(value: &serde_json::Value, json: bool) {
+    if json {
+        println!("{value}");
+    } else {
+        println!(
+            "compaction: {} ({}); applied={}, snapshot_saved={}; known cost {} microcents; full cost {}",
+            value["status"].as_str().unwrap_or("unknown"),
+            value["reason"].as_str().unwrap_or("unavailable"),
+            value["applied"],
+            value["snapshot_saved"],
+            value["cost_microcents"],
+            value["full_cost_status"].as_str().unwrap_or("unavailable")
+        );
+    }
+}
+
+fn compact_local_progress(event: orbit_frontend_protocol::FrontendEvent) {
+    if matches!(
+        event,
+        orbit_frontend_protocol::FrontendEvent::Compacting { .. }
+    ) {
+        eprintln!("compacting context");
+    }
+}
+
+fn compact_local_failed(
+    result: &Result<orbit_engine::ManualCompactionCompletion, &'static str>,
+    persisted: &Result<session_accounting::AccountingView, session_accounting::AccountingError>,
+    checked: Option<session_accounting::AccountingView>,
+) -> bool {
+    if persisted.is_err() || checked.is_none() {
+        return true;
+    }
+    match result {
+        Err(reason) => *reason != "cancelled",
+        Ok(completion) if completion.status == orbit_engine::CompactionStatus::Cancelled => false,
+        Ok(completion)
+            if completion.status == orbit_engine::CompactionStatus::NothingToCompact
+                || (completion.status == orbit_engine::CompactionStatus::PublishedReady
+                    && completion.applied) =>
+        {
+            checked.is_some_and(|view| view.full_cost_status == FullCostStatus::Uncertain)
+        }
+        Ok(_) => true,
+    }
+}
+
+fn plain_signal_exit_code(signal: i32, ordinary: i32, failed: bool) -> i32 {
+    if failed {
+        1
+    } else if signal != 0 {
+        128 + signal
+    } else {
+        ordinary
+    }
+}
+
+fn close_plain_signals(
+    guard: &mut ProcessSignalGuard,
+    ordinary: i32,
+    failed: impl FnOnce(i32) -> bool,
+) -> i32 {
+    match guard.close() {
+        Ok(signal) => plain_signal_exit_code(signal, ordinary, failed(signal)),
+        Err(error) => {
+            eprintln!("process signal cleanup failed: {error}");
+            1
+        }
+    }
+}
+
+fn cmd_compact(args: &[String]) -> i32 {
+    let (id, home, json) = match parse_compact_arguments(args) {
+        Ok(arguments) => arguments,
+        Err(reason) => {
+            eprintln!(
+                "ORBIT-E1101: {reason}; usage: orbit compact --session ID [--home PATH] [--json]"
+            );
+            return 2;
+        }
+    };
+    let (lease, mut working) = match sessions::SessionLease::acquire_and_load(&home, &id, "compact")
+    {
+        Ok(owned) => owned,
+        Err(_) => {
+            eprintln!("ORBIT-E0400: saved session unavailable or busy");
+            return 2;
+        }
+    };
+    let accounting = match session_accounting::prepare_root(
+        &lease,
+        &mut working,
+        RootOrigin::RestoredOrLegacy,
+    ) {
+        Ok(accounting) => accounting,
+        Err(_) => {
+            eprintln!("ORBIT-E0400: session accounting inspection required");
+            return 2;
+        }
+    };
+    let mut signal_guard = match ProcessSignalGuard::new() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("process signal setup failed: {error}");
+            return 1;
+        }
+    };
+    signal_guard.sync_signal();
+    let mut events = compact_local_progress;
+    let (result, persisted) = compact_local_session(
+        (&lease, &accounting),
+        &mut working,
+        &tool_runtime::PermissionScope::default(),
+        signal_guard.token(),
+        &mut events,
+    );
+    let checked = checked_local_accounting(&accounting, &working, &persisted);
+    let failed = compact_local_failed(&result, &persisted, checked);
+    signal_guard.sync_signal();
+    let (output, code) = compact_local_output(&working, &result, &persisted, checked);
+    print_compact_output(&output, json);
+    close_plain_signals(&mut signal_guard, code, |_| failed)
 }
 
 /// `orbit -p "<prompt>"` — headless one-shot with tools.
@@ -1368,12 +1758,19 @@ fn validate_value(
     }
 }
 
-fn owned_startup_session(
+fn owned_startup_session_with_origin(
     home: &Path,
     args: &[String],
     kind: &str,
     fresh_id: &str,
-) -> Result<(sessions::SessionLease, Option<sessions::SessionFile>), String> {
+) -> Result<
+    (
+        sessions::SessionLease,
+        Option<sessions::SessionFile>,
+        RootOrigin,
+    ),
+    String,
+> {
     let requested = if args.iter().any(|arg| arg == "--resume") {
         Some(
             value_after(args, "--resume")
@@ -1393,23 +1790,51 @@ fn owned_startup_session(
         requested
     };
     let Some(source_id) = source_id else {
-        return sessions::SessionLease::acquire(home, fresh_id, kind)
-            .map(|lease| (lease, None))
-            .map_err(|error| error.to_string());
+        let lease = sessions::SessionLease::acquire(home, fresh_id, kind)
+            .map_err(|error| error.to_string())?;
+        if lease
+            .load_optional()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("session already exists; use --resume <id>".into());
+        }
+        return Ok((lease, None, RootOrigin::FreshCandidate));
     };
     let (source_lease, mut saved) =
         sessions::SessionLease::acquire_and_load(home, &source_id, kind)
             .map_err(|error| error.to_string())?;
     if !forking {
-        return Ok((source_lease, Some(saved)));
+        return Ok((source_lease, Some(saved), RootOrigin::RestoredOrLegacy));
     }
     let lease =
         sessions::SessionLease::acquire(home, fresh_id, kind).map_err(|error| error.to_string())?;
+    if lease
+        .load_optional()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("fork target already exists".into());
+    }
     copy_owned_fork_transcript(home, source_lease.session_id(), lease.session_id())?;
     saved.session_id = lease.session_id().into();
+    saved.accounting_watermark = None;
     saved.updated_at = orbit_cli::timestamp_now();
-    lease.save(&saved).map_err(|error| error.to_string())?;
-    Ok((lease, Some(saved)))
+    lease
+        .save_if_absent(&saved)
+        .map_err(|error| error.to_string())?;
+    Ok((lease, Some(saved), RootOrigin::ForkedThisInvocation))
+}
+
+#[cfg(test)]
+fn owned_startup_session(
+    home: &Path,
+    args: &[String],
+    kind: &str,
+    fresh_id: &str,
+) -> Result<(sessions::SessionLease, Option<sessions::SessionFile>), String> {
+    owned_startup_session_with_origin(home, args, kind, fresh_id)
+        .map(|(lease, saved, _origin)| (lease, saved))
 }
 
 fn copy_owned_fork_transcript(home: &Path, source: &str, target: &str) -> Result<(), String> {
@@ -1637,6 +2062,40 @@ mod owned_startup_tests {
             std::fs::remove_dir_all(home).unwrap();
         }
     }
+
+    #[test]
+    fn fresh_session_id_collision_refuses_without_overwriting_the_existing_snapshot() {
+        let home = home();
+        let id = "already-saved-id";
+        let mut original = saved(&home, id, "2026-10-14T12:00:00Z");
+        original.transcript = vec![
+            orbit_engine::user_message("existing synthetic intent"),
+            orbit_engine::assistant_message("existing synthetic answer"),
+        ];
+        let prior = SessionLease::acquire(&home, id, "fixture").unwrap();
+        prior.save(&original).unwrap();
+        drop(prior);
+        let path = home.join("sessions").join(format!("{id}.json"));
+        let before = std::fs::read(&path).unwrap();
+        let result = owned_startup_session(&home, &[], "headless", id);
+        let refused = result.is_err();
+        drop(result);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let inspection = SessionLease::acquire(&home, id, "inspection").unwrap();
+        let after = inspection.load().unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+        assert!(!home.join("context-history").exists());
+        assert!(!home.join("ledger").exists());
+        drop(inspection);
+        std::fs::remove_dir_all(home).unwrap();
+        assert!(
+            refused,
+            "an existing saved ID cannot establish a new fresh namespace"
+        );
+    }
 }
 
 fn local_budget_refusal(
@@ -1645,7 +2104,7 @@ fn local_budget_refusal(
     transcript: &mut Vec<orbit_adapter::types::ChatMessage>,
     message: String,
     events: &mut dyn FnMut(orbit_frontend_protocol::FrontendEvent),
-) -> Result<orbit_engine::TurnReport, String> {
+) -> Result<orbit_engine::TurnCompletion, String> {
     let mut user = orbit_engine::user_message(prompt);
     user.blocks = options.user_blocks.clone();
     transcript.push(user);
@@ -1661,6 +2120,20 @@ fn local_budget_refusal(
         cost_microcents: 0,
     });
     Err(message)
+}
+
+fn retain_local_session_intent(
+    lease: &sessions::SessionLease,
+    accounting: &session_accounting::RootSessionAccounting,
+    snapshot: &mut sessions::SessionFile,
+    transcript: &mut Vec<orbit_adapter::types::ChatMessage>,
+    prompt: &str,
+) {
+    transcript.push(orbit_engine::user_message(prompt));
+    snapshot.transcript = transcript.clone();
+    if let Err(error) = accounting.persist(lease, snapshot) {
+        eprintln!("current prompt could not be saved: {error}");
+    }
 }
 
 fn context_meter_text(
@@ -1759,14 +2232,18 @@ fn cmd_headless(args: &[String]) -> i32 {
         eprintln!("ORBIT-E0401: {error}");
         return 1;
     }
-    let (live_lease, resumed_file) =
-        match owned_startup_session(&home, args, "headless", &format!("p-{}", ulid::Ulid::new())) {
-            Ok(owned) => owned,
-            Err(error) => {
-                eprintln!("cannot open session: {error}");
-                return 1;
-            }
-        };
+    let (live_lease, resumed_file, startup_origin) = match owned_startup_session_with_origin(
+        &home,
+        args,
+        "headless",
+        &format!("p-{}", ulid::Ulid::new()),
+    ) {
+        Ok(owned) => owned,
+        Err(error) => {
+            eprintln!("cannot open session: {error}");
+            return 1;
+        }
+    };
     let spec = requested_model
         .clone()
         .or_else(|| resumed_file.as_ref().map(|saved| saved.model.clone()))
@@ -1847,7 +2324,7 @@ fn cmd_headless(args: &[String]) -> i32 {
         cost_microcents = sf.cost_microcents;
         transcript = sf.to_transcript();
     }
-    let initial = sessions::SessionFile::from_chat(
+    let mut initial = sessions::SessionFile::from_chat(
         &session_id,
         &model,
         &resolved_gate,
@@ -1860,10 +2337,63 @@ fn cmd_headless(args: &[String]) -> i32 {
     )
     .with_effort(selected_effort.clone())
     .with_selection_origin(selection_origin);
-    if let Err(error) = live_lease.save(&initial) {
-        eprintln!("ORBIT-E0400: {error}");
-        return 1;
-    }
+    let accounting =
+        match session_accounting::prepare_root(&live_lease, &mut initial, startup_origin) {
+            Ok(accounting) => accounting,
+            Err(error) => {
+                eprintln!("ORBIT-E0400: {error}");
+                return 1;
+            }
+        };
+    let next_turns = match turns.checked_add(1) {
+        Some(value) => value,
+        None => {
+            retain_local_session_intent(
+                &live_lease,
+                &accounting,
+                &mut initial,
+                &mut transcript,
+                prompt,
+            );
+            eprintln!("session turn count overflows");
+            return 1;
+        }
+    };
+    let spend_policy = match cost_guard
+        .max_microcents
+        .map(|allowance| {
+            let checkpoint = accounting
+                .namespace()
+                .checkpoint_detailed()
+                .map_err(|error| error.to_string())?;
+            let spent = checkpoint
+                .known_priced_subtotals()
+                .ok_or("known priced accounting is unavailable")?;
+            let maximum_microcents = spent
+                .ordinary_microcents
+                .checked_add(spent.housekeeping_microcents)
+                .and_then(|sum| sum.checked_add(allowance))
+                .ok_or("invocation spend ceiling overflows")?;
+            Ok::<_, String>(NamespaceSpendPolicy {
+                maximum_microcents,
+                allow_unpriced_housekeeping: false,
+            })
+        })
+        .transpose()
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            retain_local_session_intent(
+                &live_lease,
+                &accounting,
+                &mut initial,
+                &mut transcript,
+                prompt,
+            );
+            eprintln!("ORBIT-E0411: {error}");
+            return 1;
+        }
+    };
     let base_turn_config = turn_config.clone();
     let (turn_config, routing_decision) = match orbit_cli::try_phase_turn_config(
         &home,
@@ -1873,6 +2403,13 @@ fn cmd_headless(args: &[String]) -> i32 {
     ) {
         Ok(value) => value,
         Err(error) => {
+            retain_local_session_intent(
+                &live_lease,
+                &accounting,
+                &mut initial,
+                &mut transcript,
+                prompt,
+            );
             eprintln!("ORBIT-E0401: {error}");
             return 1;
         }
@@ -1963,6 +2500,13 @@ fn cmd_headless(args: &[String]) -> i32 {
             match orbit_cli::try_role_turn_config(&home, &turn_config, "compaction") {
                 Ok(c) => c,
                 Err(e) => {
+                    retain_local_session_intent(
+                        &live_lease,
+                        &accounting,
+                        &mut initial,
+                        &mut transcript,
+                        prompt,
+                    );
                     eprintln!("ORBIT-E0401: {e}");
                     return 1;
                 }
@@ -2018,69 +2562,163 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
     }
 
-    let mut report =
-        match orbit_cli::model_limits::apply_turn_budgets(&home, &turn_config, &mut options) {
-            Ok(notices) => {
-                for text in notices {
-                    events(orbit_frontend_protocol::FrontendEvent::Status { text });
-                }
-                orbit_engine::run_turn(
-                    &home,
-                    &turn_config,
-                    &options,
-                    prompt,
-                    &mut transcript,
-                    &mut executor,
-                    &orbit_provider_http::CancelToken::new(),
-                    &mut events,
-                )
-            }
-            Err(error) => local_budget_refusal(
-                prompt,
-                &options,
+    let mut signal_guard = match ProcessSignalGuard::new() {
+        Ok(guard) => guard,
+        Err(error) => {
+            retain_local_session_intent(
+                &live_lease,
+                &accounting,
+                &mut initial,
                 &mut transcript,
-                error.to_string(),
-                &mut events,
-            ),
-        };
-
-    // --json-schema (phase 6): validate the final text as JSON
-    // against the schema; on failure, retry ONCE with the validation
-    // error appended to the transcript (validate-and-retry — the
-    // honest path for providers without native structured output).
-    if let Some(schema) = &json_schema
-        && let Ok(r) = &report
-        && let Err(problems) = validate_json_against_schema(&r.final_text, schema)
-    {
-        if stream_json {
-            println!(
-                "{}",
-                serde_json::to_string(&orbit_frontend_protocol::FrontendEvent::Status {
-                    text: format!("schema validation failed, retrying: {problems}")
-                })
-                .unwrap_or_default()
+                prompt,
             );
+            eprintln!("ORBIT-E0400: {error}");
+            return 1;
         }
-        transcript.push(orbit_engine::user_message(format!(
-                    "Your previous reply did not match the required JSON schema: {problems}. Reply again with ONLY valid JSON matching the schema."
-                )));
-        report = orbit_engine::run_turn(
-            &home,
-            &turn_config,
-            &options,
-            "Reply with only valid JSON matching the schema.",
-            &mut transcript,
-            &mut executor,
-            &orbit_provider_http::CancelToken::new(),
-            &mut events,
+    };
+    signal_guard.sync_signal();
+    let first = match orbit_cli::model_limits::apply_turn_budgets(&home, &turn_config, &mut options)
+        .map_err(|error| error.to_string())
+        .and_then(|notices| {
+            for text in notices {
+                events(orbit_frontend_protocol::FrontendEvent::Status { text });
+            }
+            let retry_policy = orbit_cli::provider_policies::load_for_config(&home, &turn_config)
+                .map_err(|error| error.to_string())?;
+            accounting
+                .namespace()
+                .apply_options_detailed(&mut options, spend_policy, retry_policy.as_ref())
+                .map_err(|error| error.to_string())?;
+            Ok(retry_policy)
+        }) {
+        Ok(retry_policy) => {
+            signal_guard.sync_signal();
+            Ok(orbit_engine::turn::run_turn_detailed_with_retry_policy(
+                &home,
+                &turn_config,
+                &options,
+                prompt,
+                &mut transcript,
+                &mut executor,
+                signal_guard.token(),
+                &mut events,
+                retry_policy.as_ref(),
+            )
+            .into_completion())
+        }
+        Err(error) => local_budget_refusal(prompt, &options, &mut transcript, error, &mut events),
+    };
+    let mut completions = Vec::with_capacity(2);
+    let mut local_error = match first {
+        Ok(completion) => {
+            completions.push(completion);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    if signal_guard.sync_signal() == 0
+        && !signal_guard.token().is_cancelled()
+        && let Some(schema) = &json_schema
+        && let Some(first) = completions.first()
+        && first.end == orbit_engine::TurnEnd::Completed
+        && !first.report.final_text.trim().is_empty()
+        && let Err(problems) = validate_json_against_schema(&first.report.final_text, schema)
+    {
+        let repair_prompt = format!(
+            "Your previous reply did not match the required JSON schema: {problems}. Reply with ONLY valid JSON matching this schema: {schema}"
         );
+        events(orbit_frontend_protocol::FrontendEvent::Status {
+            text: format!("schema validation failed, repairing once: {problems}"),
+        });
+        let mut repair_options = options.clone();
+        repair_options.tools.clear();
+        repair_options.max_rounds = 1;
+        struct RepairExecutor;
+        impl orbit_engine::ToolExecutor for RepairExecutor {
+            fn execute(
+                &mut self,
+                calls: &[orbit_engine::PendingToolCall],
+                _: u32,
+            ) -> Vec<orbit_engine::ToolRoundResult> {
+                calls.iter().map(|call| orbit_engine::ToolRoundResult {
+                    call_id: call.id.clone(),
+                    content: r#"{"ok":false,"denied":true,"error":"schema repair cannot execute tools"}"#.into(),
+                }).collect()
+            }
+        }
+        let repair_admission = orbit_cli::provider_policies::load_for_config(&home, &turn_config)
+            .map_err(|error| error.to_string())
+            .and_then(|retry_policy| {
+                accounting
+                    .namespace()
+                    .apply_options_detailed(
+                        &mut repair_options,
+                        spend_policy,
+                        retry_policy.as_ref(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(retry_policy)
+            });
+        // A latched signal skips both dispatch and a synthetic repair refusal
+        // prompt: this second engine operation has not been entered.
+        if signal_guard.sync_signal() == 0 && !signal_guard.token().is_cancelled() {
+            match repair_admission {
+                Ok(retry_policy) => {
+                    let repair = orbit_engine::turn::run_turn_detailed_with_retry_policy(
+                        &home,
+                        &turn_config,
+                        &repair_options,
+                        &repair_prompt,
+                        &mut transcript,
+                        &mut RepairExecutor,
+                        signal_guard.token(),
+                        &mut events,
+                        retry_policy.as_ref(),
+                    )
+                    .into_completion();
+                    if repair.end == orbit_engine::TurnEnd::Completed
+                        && let Err(problems) =
+                            validate_json_against_schema(&repair.report.final_text, schema)
+                    {
+                        local_error = Some(format!(
+                            "schema repair did not produce valid output: {problems}"
+                        ));
+                    }
+                    completions.push(repair);
+                }
+                Err(error) => {
+                    let _ = local_budget_refusal(
+                        &repair_prompt,
+                        &repair_options,
+                        &mut transcript,
+                        error.clone(),
+                        &mut events,
+                    );
+                    local_error = Some(error);
+                }
+            }
+        }
     }
+    if json_schema.is_some()
+        && completions.last().is_some_and(|completion| {
+            completion.end == orbit_engine::TurnEnd::Completed
+                && completion.report.final_text.trim().is_empty()
+        })
+    {
+        local_error = Some("schema output is empty".into());
+    }
+    let mut completed = signal_guard.sync_signal() == 0
+        && !signal_guard.token().is_cancelled()
+        && local_error.is_none()
+        && completions.last().is_some_and(|completion| {
+            completion.end == orbit_engine::TurnEnd::Completed && completion.report.ok
+        });
 
     // RTA (E10): attest from the structured exit status of the last
     // test-like command, in every front-end. A claim after a failing
     // command is an unverified claim and is shown as one.
     let mut rta_verdict: Option<serde_json::Value> = None;
-    if let Ok(_r) = &report
+    if completed
         && let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
         && scan.claimed_pass
     {
@@ -2127,84 +2765,153 @@ fn cmd_headless(args: &[String]) -> i32 {
         rta_verdict = Some(verdict);
     }
 
-    // Persist the session whatever the outcome (a failed turn still
-    // belongs to the transcript; --continue resumes from what was
-    // WRITTEN, and the kill -9 case proves the write happens before
-    // the process can die mid-turn).
-    let save_session = |t: &Vec<orbit_adapter::types::ChatMessage>,
-                        r: &orbit_engine::TurnReport| {
-        let sf = orbit_cli::sessions::SessionFile::from_chat(
-            &session_id,
-            &model,
-            &resolved_gate,
-            &provider_id,
-            t,
-            turns + 1,
-            in_tokens + r.input_tokens,
-            out_tokens + r.output_tokens,
-            cost_microcents + r.cost_microcents,
-        )
-        .with_effort(selected_effort.clone())
-        .with_selection_origin(selection_origin);
-        if let Err(e) = live_lease.save(&sf) {
-            eprintln!("warning: cannot save session: {e}");
-        }
+    // Every entered operation, including failures, is projected from the journal.
+    let mut saved = sessions::SessionFile::from_chat(
+        &session_id,
+        &model,
+        &resolved_gate,
+        &provider_id,
+        &transcript,
+        next_turns,
+        initial.input_tokens,
+        initial.output_tokens,
+        initial.cost_microcents,
+    )
+    .with_effort(selected_effort.clone())
+    .with_selection_origin(selection_origin);
+    let persisted = accounting.persist(&live_lease, &mut saved);
+    // A signal during the single final publication cannot leave an earlier
+    // Completed result labelled as invocation success.
+    completed &= signal_guard.sync_signal() == 0 && !signal_guard.token().is_cancelled();
+    let storage_error = persisted.as_ref().err().map(|error| error.to_string());
+    if let Some(error) = &storage_error {
+        eprintln!("session not saved: {error}");
+    }
+    let full_status = saved
+        .accounting_watermark
+        .as_ref()
+        .map_or(FullCostStatus::UnknownLegacy, |anchor| {
+            anchor.full_cost_status
+        });
+    if full_status != FullCostStatus::Known {
+        eprintln!(
+            "full session cost is unknown ({full_status:?}); displayed cost is the known priced subtotal"
+        );
+    }
+    let totals = completions
+        .iter()
+        .try_fold((0u64, 0u64, 0u64, 0u32), |sum, completion| {
+            let report = &completion.report;
+            Some((
+                sum.0.checked_add(report.input_tokens)?,
+                sum.1.checked_add(report.output_tokens)?,
+                sum.2.checked_add(report.cost_microcents)?,
+                sum.3.checked_add(report.rounds)?,
+            ))
+        });
+    if totals.is_none() {
+        local_error = Some("invocation accounting overflows".into());
+    }
+    let error = storage_error.or(local_error).or_else(|| {
+        completions.last().and_then(|completion| {
+            if let orbit_engine::TurnEnd::Failed(error) = &completion.end {
+                Some(error.message.clone())
+            } else {
+                None
+            }
+        })
+    });
+    let final_report = completions.last().map(|completion| &completion.report);
+    completed &= signal_guard.sync_signal() == 0 && !signal_guard.token().is_cancelled();
+    let final_text = if completed {
+        final_report.map_or("", |report| report.final_text.as_str())
+    } else {
+        completions
+            .first()
+            .map_or("", |completion| completion.report.final_text.as_str())
     };
-
-    match report {
-        Ok(r) => {
-            save_session(&transcript, &r);
-            if json_out {
-                let mut summary = orbit_engine::automation::HeadlessSummary::from_report(
-                    &r,
-                    orbit_engine::automation::ledger_head(&home),
-                );
-                summary.rta = rta_verdict.clone();
-                let mut value = summary.to_json();
-                value["context_notices"] = serde_json::json!(context_notices);
-                value["context_usage"] = serde_json::json!(context_usage);
-                println!("{value}");
-            } else if !stream_json {
-                // text: the final reply only.
-                println!("{}", r.final_text);
+    if json_out {
+        let mut value = if let Some(report) = final_report {
+            let mut summary = orbit_engine::automation::HeadlessSummary::from_report(
+                report,
+                orbit_engine::automation::ledger_head(&home),
+            );
+            summary.ok = completed && error.is_none();
+            summary.final_text = final_text.to_owned();
+            if let Some((input, output, cost, rounds)) = totals {
+                summary.input_tokens = input;
+                summary.output_tokens = output;
+                summary.cost_microcents = cost;
+                summary.rounds = rounds;
             }
-            // The cost guard fires after the turn (the engine checks
-            // between rounds; here it gates the exit class).
-            if let Some(reason) = cost_guard.check(r.cost_microcents)
-                && (stream_json || json_out)
-            {
-                eprintln!("{reason}");
-            }
-            // Exit codes: 0 done, 1 failed, 2 permission denial,
-            // 3 max-turns, 130 interrupted. A permission denial is
-            // detectable from the transcript's typed flag (C4): every
-            // policy refusal carries `"denied": true` — no substring
-            // hunt (E4's lesson: text-matching fires on content that
-            // merely looks like a marker).
-            let permission_denied = transcript.iter().any(|m| {
-                m.role == orbit_adapter::types::ChatRole::Tool
-                    && m.tool_result
-                        .as_deref()
-                        .is_some_and(orbit_tools::result_is_denial)
-            });
-            let code = orbit_engine::automation::exit_code(&r, max_rounds, permission_denied);
-            // E9: SessionEnd fires when the headless session closes.
-            fire_session_end(&home, if code == 0 { "ended" } else { "error" });
-            code
+            summary.rta = rta_verdict;
+            summary.to_json()
+        } else {
+            serde_json::json!({"schema":"orbit.cli/v1", "command":"p", "status":"error"})
+        };
+        if totals.is_none() {
+            value["usage"] = serde_json::Value::Null;
+            value["cost_microcents"] = serde_json::Value::Null;
+            value["rounds"] = serde_json::Value::Null;
         }
-        Err(e) => {
-            save_session(&transcript, &orbit_engine::TurnReport::default());
-            fire_session_end(&home, "error");
-            if json_out {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "schema":"orbit.cli/v1", "command":"p", "status":"error", "error":e,
-                        "context_notices":context_notices, "context_usage":context_usage
-                    })
-                );
+        if let Some(error) = &error {
+            value["status"] = serde_json::json!("error");
+            value["error"] = serde_json::json!(error);
+        }
+        value["context_notices"] = serde_json::json!(context_notices);
+        value["context_usage"] = serde_json::json!(context_usage);
+        value["full_cost_status"] = serde_json::json!(full_status);
+        println!("{value}");
+    } else if !stream_json && final_report.is_some() {
+        println!("{final_text}");
+    }
+    if let Some(reason) = totals.and_then(|(_, _, cost, _)| cost_guard.check(cost)) {
+        eprintln!("{reason}");
+    }
+    if let Some(error) = error {
+        eprintln!("{error}");
+        fire_session_end(&home, "error");
+        if let Err(error) = signal_guard.close() {
+            eprintln!("process signal cleanup failed: {error}");
+        }
+        return 1;
+    }
+    let permission_denied = transcript.iter().any(|message| {
+        message.role == orbit_adapter::types::ChatRole::Tool
+            && message
+                .tool_result
+                .as_deref()
+                .is_some_and(orbit_tools::result_is_denial)
+    });
+    let ordinary_code = final_report.map_or(1, |report| {
+        orbit_engine::automation::exit_code(report, max_rounds, permission_denied)
+    });
+    let signal = signal_guard.sync_signal();
+    let code = if signal == 0 {
+        ordinary_code
+    } else {
+        128 + signal
+    };
+    fire_session_end(
+        &home,
+        if signal != 0 {
+            "cancelled"
+        } else if code == 0 {
+            "ended"
+        } else {
+            "error"
+        },
+    );
+    match signal_guard.close() {
+        Ok(signal) => {
+            if signal == 0 {
+                code
+            } else {
+                128 + signal
             }
-            eprintln!("{e}");
+        }
+        Err(error) => {
+            eprintln!("process signal cleanup failed: {error}");
             1
         }
     }
@@ -2558,14 +3265,18 @@ fn cmd_chat(args: &[String]) -> i32 {
     // transcript so the conversation continues across invocations.
     // `--continue` reopens the LATEST session in this directory
     // (phase 4; Claude Code parity).
-    let (mut live_lease, resumed_file) =
-        match owned_startup_session(&home, args, "chat", &orbit_gateway::new_session_id()) {
-            Ok(owned) => owned,
-            Err(error) => {
-                eprintln!("cannot open session: {error}");
-                return 2;
-            }
-        };
+    let (mut live_lease, resumed_file, startup_origin) = match owned_startup_session_with_origin(
+        &home,
+        args,
+        "chat",
+        &orbit_gateway::new_session_id(),
+    ) {
+        Ok(owned) => owned,
+        Err(error) => {
+            eprintln!("cannot open session: {error}");
+            return 2;
+        }
+    };
 
     let saved_identity = requested_model.is_none() && resumed_file.is_some();
     if saved_identity {
@@ -2608,7 +3319,7 @@ fn cmd_chat(args: &[String]) -> i32 {
         resumed_file.as_ref(),
         !cfg.roles.main.is_empty(),
     );
-    let initial = sessions::SessionFile::from_chat(
+    let mut initial = sessions::SessionFile::from_chat(
         live_lease.session_id(),
         &model,
         &gate,
@@ -2626,10 +3337,18 @@ fn cmd_chat(args: &[String]) -> i32 {
     )
     .with_effort(selected_effort.clone())
     .with_selection_origin(selection_origin);
-    if let Err(error) = live_lease.save(&initial) {
-        eprintln!("ORBIT-E0400: {error}");
-        return 2;
-    }
+    let mut accounting =
+        match session_accounting::prepare_root(&live_lease, &mut initial, startup_origin) {
+            Ok(accounting) => accounting,
+            Err(error) => {
+                eprintln!("ORBIT-E0400: {error}");
+                return 2;
+            }
+        };
+    let mut full_cost_status = initial
+        .accounting_watermark
+        .as_ref()
+        .map(|anchor| anchor.full_cost_status);
 
     // TUI front-end (DR-20): if TTY + --tui (default), forward to the ratatui
     // TUI. --no-tui, non-TTY stdin/stdout, or the `tui` feature off → fall
@@ -2655,17 +3374,11 @@ fn cmd_chat(args: &[String]) -> i32 {
                     value_after(args, "--allowedTools").as_deref(),
                     value_after(args, "--disallowedTools").as_deref(),
                 ),
-                initial_transcript: resumed_file
-                    .as_ref()
-                    .map(|s| s.to_transcript())
-                    .unwrap_or_default(),
-                initial_turns: resumed_file.as_ref().map(|s| s.turns).unwrap_or(0),
-                initial_input_tokens: resumed_file.as_ref().map(|s| s.input_tokens).unwrap_or(0),
-                initial_output_tokens: resumed_file.as_ref().map(|s| s.output_tokens).unwrap_or(0),
-                initial_cost_microcents: resumed_file
-                    .as_ref()
-                    .map(|s| s.cost_microcents)
-                    .unwrap_or(0),
+                initial_transcript: initial.to_transcript(),
+                initial_turns: initial.turns,
+                initial_input_tokens: initial.input_tokens,
+                initial_output_tokens: initial.output_tokens,
+                initial_cost_microcents: initial.cost_microcents,
             };
             let identity = orbit_hud_tui::model::StartupIdentity {
                 model: tui_config.model.clone(),
@@ -2688,6 +3401,16 @@ fn cmd_chat(args: &[String]) -> i32 {
         }
     }
 
+    let mut signal_guard = match ProcessSignalGuard::new() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("process signal setup failed: {error}");
+            return 1;
+        }
+    };
+    let mut exit_error = false;
+    let mut last_operation_failed = false;
+
     // Plain front-end (REPL / non-TTY): the shared plain grammar owns
     // stdout lines (§11.4). The TUI never enables this — its worker threads
     // must not print to the alt screen.
@@ -2703,17 +3426,11 @@ fn cmd_chat(args: &[String]) -> i32 {
     }
     let mut session = live_lease.session_id().to_string();
     // Conversation transcript: role + content per turn (multi-turn wire payload).
-    let mut transcript: Vec<orbit_adapter::types::ChatMessage> = resumed_file
-        .as_ref()
-        .map(|s| s.to_transcript())
-        .unwrap_or_default();
-    let mut total_input = resumed_file.as_ref().map(|s| s.input_tokens).unwrap_or(0);
-    let mut total_output = resumed_file.as_ref().map(|s| s.output_tokens).unwrap_or(0);
-    let mut total_cost = resumed_file
-        .as_ref()
-        .map(|s| s.cost_microcents)
-        .unwrap_or(0);
-    let mut turns = resumed_file.as_ref().map(|s| s.turns).unwrap_or(0);
+    let mut transcript = initial.to_transcript();
+    let mut total_input = initial.input_tokens;
+    let mut total_output = initial.output_tokens;
+    let mut total_cost = initial.cost_microcents;
+    let mut turns = initial.turns;
 
     // HUD (DR-10 Part B): display-only, display-safe (H-3), brand + output
     // mode negotiated from the environment (NO_COLOR/CI/TERM).
@@ -2735,15 +3452,28 @@ fn cmd_chat(args: &[String]) -> i32 {
         },
     );
 
-    let stdin = std::io::stdin();
-    use std::io::BufRead;
-    let lines = stdin.lock().lines();
-
-    for line in lines {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    loop {
+        if signal_guard.sync_signal() != 0 {
+            exit_error |= last_operation_failed;
+            break;
+        }
+        last_operation_failed = false;
+        let line = match orbit_cli::plain_input::read_stdin_line(signal_guard.token()) {
+            Ok(orbit_cli::plain_input::PlainInput::Line(line)) => line,
+            Ok(
+                orbit_cli::plain_input::PlainInput::Eof
+                | orbit_cli::plain_input::PlainInput::Cancelled,
+            ) => break,
+            Err(error) => {
+                eprintln!("input failed: {error}");
+                exit_error = true;
+                break;
+            }
         };
+        if signal_guard.sync_signal() != 0 {
+            exit_error |= last_operation_failed;
+            break;
+        }
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
@@ -2751,21 +3481,73 @@ fn cmd_chat(args: &[String]) -> i32 {
 
         // Slash commands / control.
         if trimmed == "exit" || trimmed == "quit" {
+            last_operation_failed = false;
             break;
         }
+        last_operation_failed = true;
         if trimmed.starts_with('/') {
+            if trimmed.split_whitespace().next() == Some("/compact") {
+                if trimmed != "/compact" {
+                    eprintln!("usage: /compact");
+                    continue;
+                }
+                let mut working = sessions::SessionFile::from_chat(
+                    &session,
+                    &model,
+                    &gate,
+                    &active_provider,
+                    &transcript,
+                    turns,
+                    total_input,
+                    total_output,
+                    total_cost,
+                )
+                .with_effort(selected_effort.clone())
+                .with_selection_origin(selection_origin);
+                let scope = tool_runtime::PermissionScope::from_flags(
+                    value_after(args, "--permission-mode").as_deref(),
+                    value_after(args, "--allowedTools").as_deref(),
+                    value_after(args, "--disallowedTools").as_deref(),
+                );
+                signal_guard.sync_signal();
+                let mut events = compact_local_progress;
+                let (result, persisted) = compact_local_session(
+                    (&live_lease, &accounting),
+                    &mut working,
+                    &scope,
+                    signal_guard.token(),
+                    &mut events,
+                );
+                let checked = checked_local_accounting(&accounting, &working, &persisted);
+                last_operation_failed = compact_local_failed(&result, &persisted, checked);
+                let (output, _) = compact_local_output(&working, &result, &persisted, checked);
+                transcript = working.to_transcript();
+                total_input = working.input_tokens;
+                total_output = working.output_tokens;
+                total_cost = working.cost_microcents;
+                full_cost_status = checked.map(|view| view.full_cost_status);
+                print_compact_output(&output, false);
+                if persisted.is_err() || checked.is_none() {
+                    eprintln!("session accounting publication or inspection failed");
+                    exit_error = true;
+                    break;
+                }
+                continue;
+            }
             // `/resume <id>` needs the mutable session id, so it is handled
             // here (in the loop) rather than in handle_chat_command.
             if let Some(id) = trimmed.strip_prefix("/resume ") {
                 let id = id.trim();
-                let target = if id.strip_suffix(".json").unwrap_or(id) == live_lease.session_id() {
+                let same_session =
+                    id.strip_suffix(".json").unwrap_or(id) == live_lease.session_id();
+                let target = if same_session {
                     live_lease.load().map(|saved| (None, saved))
                 } else {
                     sessions::SessionLease::acquire_and_load(&home, id, "chat")
                         .map(|(lease, saved)| (Some(lease), saved))
                 };
                 match target {
-                    Ok((candidate_lease, s)) => {
+                    Ok((candidate_lease, mut s)) => {
                         let resolved = match chat_effort_config(
                             &home,
                             &s.model,
@@ -2779,9 +3561,28 @@ fn cmd_chat(args: &[String]) -> i32 {
                                 continue;
                             }
                         };
+                        let candidate_accounting = match session_accounting::prepare_root(
+                            candidate_lease.as_ref().unwrap_or(&live_lease),
+                            &mut s,
+                            RootOrigin::RestoredOrLegacy,
+                        ) {
+                            Ok(accounting) => accounting,
+                            Err(error) => {
+                                if same_session {
+                                    full_cost_status = None;
+                                }
+                                eprintln!("cannot resume {id}: {error}");
+                                continue;
+                            }
+                        };
                         if let Some(candidate_lease) = candidate_lease {
                             live_lease = candidate_lease;
                         }
+                        accounting = candidate_accounting;
+                        full_cost_status = s
+                            .accounting_watermark
+                            .as_ref()
+                            .map(|anchor| anchor.full_cost_status);
                         selection_origin = sessions::model_origin(Some(&s));
                         model = s.model.clone();
                         selected_effort = s.effort.clone();
@@ -2794,8 +3595,14 @@ fn cmd_chat(args: &[String]) -> i32 {
                         total_output = s.output_tokens;
                         total_cost = s.cost_microcents;
                         eprintln!("resumed {id} ({} prior turns)", s.turns);
+                        last_operation_failed = false;
                     }
-                    Err(e) => eprintln!("cannot resume {id}: {e}"),
+                    Err(e) => {
+                        if same_session {
+                            full_cost_status = None;
+                        }
+                        eprintln!("cannot resume {id}: {e}");
+                    }
                 }
                 continue;
             }
@@ -2812,7 +3619,10 @@ fn cmd_chat(args: &[String]) -> i32 {
                     &working_dir,
                     trimmed.strip_prefix("/permissions").unwrap_or_default(),
                 ) {
-                    Ok(text) => println!("{text}"),
+                    Ok(text) => {
+                        last_operation_failed = false;
+                        println!("{text}");
+                    }
                     Err(error) => eprintln!("permissions: {error}"),
                 }
                 continue;
@@ -2860,10 +3670,13 @@ fn cmd_chat(args: &[String]) -> i32 {
                     args.iter().any(|arg| arg == "--safe-customization"),
                 );
                 match orbit_cli::customization_host::command_for(host.as_ref(), &words) {
-                    Ok(value) => println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    ),
+                    Ok(value) => {
+                        last_operation_failed = false;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                    }
                     Err(error) => eprintln!("customize: {error}"),
                 }
                 continue;
@@ -2885,7 +3698,7 @@ fn cmd_chat(args: &[String]) -> i32 {
                         eprintln!("routing unchanged: {error}");
                         continue;
                     }
-                    let saved = sessions::SessionFile::from_chat(
+                    let mut saved = sessions::SessionFile::from_chat(
                         &session,
                         &model,
                         &gate,
@@ -2898,12 +3711,30 @@ fn cmd_chat(args: &[String]) -> i32 {
                     )
                     .with_effort(selected_effort.clone())
                     .with_selection_origin(orbit_cli::phase_routing::SelectionOrigin::Default);
-                    match live_lease.save(&saved) {
-                        Ok(()) => {
+                    match accounting.persist(&live_lease, &mut saved) {
+                        Ok(view) => {
+                            total_input = view.input_tokens;
+                            total_output = view.output_tokens;
+                            total_cost = view.known_cost_microcents;
+                            full_cost_status = Some(view.full_cost_status);
                             selection_origin = orbit_cli::phase_routing::SelectionOrigin::Default;
                             println!("Automatic routing enabled for this session");
+                            last_operation_failed = false;
                         }
-                        Err(error) => eprintln!("routing unchanged: {error}"),
+                        Err(error) => {
+                            total_input = saved.input_tokens;
+                            total_output = saved.output_tokens;
+                            total_cost = saved.cost_microcents;
+                            let persisted = Err(error);
+                            full_cost_status =
+                                checked_local_accounting(&accounting, &saved, &persisted)
+                                    .map(|view| view.full_cost_status);
+                            if let Err(error) = persisted {
+                                eprintln!("routing unchanged: {error}");
+                            }
+                            exit_error = true;
+                            break;
+                        }
                     }
                 } else {
                     match chat_effort_config(
@@ -2916,16 +3747,25 @@ fn cmd_chat(args: &[String]) -> i32 {
                     .and_then(|base| {
                         orbit_cli::route_command(&home, &words, Some(&base), selection_origin)
                     }) {
-                        Ok(value) => println!(
-                            "{}",
-                            serde_json::to_string_pretty(&value).unwrap_or_default()
-                        ),
+                        Ok(value) => {
+                            last_operation_failed = false;
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&value).unwrap_or_default()
+                            );
+                        }
                         Err(error) => eprintln!("route: {error}"),
                     }
                 }
                 continue;
             }
-            let prior_selection = (model.clone(), selected_effort.clone(), selection_origin);
+            let prior_selection = (
+                model.clone(),
+                selected_effort.clone(),
+                selection_origin,
+                active_provider.clone(),
+                gate.clone(),
+            );
             let handled = handle_chat_command(
                 &trimmed,
                 &home,
@@ -2936,6 +3776,7 @@ fn cmd_chat(args: &[String]) -> i32 {
                 &mut transcript,
                 (&turns, &total_input, &total_output, &total_cost),
             );
+            last_operation_failed = !handled;
             if handled && trimmed.starts_with("/model ") {
                 let requested = trimmed["/model ".len()..].trim();
                 if orbit_cli::checked_model_turn(
@@ -2956,16 +3797,37 @@ fn cmd_chat(args: &[String]) -> i32 {
             }
             if !handled {
                 eprintln!("unknown command: {trimmed}; try /help");
-            } else if prior_selection != (model.clone(), selected_effort.clone(), selection_origin)
-                && let Ok(resolved) = chat_effort_config(
+            } else if prior_selection
+                != (
+                    model.clone(),
+                    selected_effort.clone(),
+                    selection_origin,
+                    active_provider.clone(),
+                    gate.clone(),
+                )
+            {
+                let resolved = match chat_effort_config(
                     &home,
                     &model,
                     &gate,
                     Some(&active_provider),
                     selected_effort.as_ref(),
-                )
-            {
-                let sf = sessions::SessionFile::from_chat(
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        (
+                            model,
+                            selected_effort,
+                            selection_origin,
+                            active_provider,
+                            gate,
+                        ) = prior_selection;
+                        eprintln!("settings unchanged: {error}");
+                        last_operation_failed = true;
+                        continue;
+                    }
+                };
+                let mut sf = sessions::SessionFile::from_chat(
                     &session,
                     &model,
                     &resolved.gate,
@@ -2978,8 +3840,38 @@ fn cmd_chat(args: &[String]) -> i32 {
                 )
                 .with_effort(selected_effort.clone())
                 .with_selection_origin(selection_origin);
-                if let Err(e) = live_lease.save(&sf) {
-                    eprintln!("warning: session not saved: {e}");
+                match accounting.persist(&live_lease, &mut sf) {
+                    Ok(view) => {
+                        gate = resolved.gate;
+                        active_provider = resolved.provider_id;
+                        total_input = view.input_tokens;
+                        total_output = view.output_tokens;
+                        total_cost = view.known_cost_microcents;
+                        full_cost_status = Some(view.full_cost_status);
+                    }
+                    Err(error) => {
+                        total_input = sf.input_tokens;
+                        total_output = sf.output_tokens;
+                        total_cost = sf.cost_microcents;
+                        let persisted = Err(error);
+                        full_cost_status = checked_local_accounting(&accounting, &sf, &persisted)
+                            .map(|view| view.full_cost_status);
+                        if let Err(error) = persisted {
+                            eprintln!("settings unchanged: {error}");
+                        }
+                        exit_error = true;
+                        break;
+                    }
+                }
+            }
+            if trimmed == "/usage" && full_cost_status != Some(FullCostStatus::Known) {
+                match full_cost_status {
+                    Some(status) => eprintln!(
+                        "full session cost is unknown ({status:?}); displayed cost is the known priced subtotal"
+                    ),
+                    None => eprintln!(
+                        "full session cost is unavailable; displayed cost is the known priced subtotal"
+                    ),
                 }
             }
             continue;
@@ -2987,7 +3879,32 @@ fn cmd_chat(args: &[String]) -> i32 {
 
         // Plain grammar (§11.4): the turn boundary is stamped — one event
         // per line, words not glyphs. Same grammar as copy mode and non-TTY.
+        full_cost_status = None;
         println!("{} you: {}", hhmm_now(), trimmed);
+        let mut local_snapshot = sessions::SessionFile::from_chat(
+            &session,
+            &model,
+            &gate,
+            &active_provider,
+            &transcript,
+            turns,
+            total_input,
+            total_output,
+            total_cost,
+        )
+        .with_effort(selected_effort.clone())
+        .with_selection_origin(selection_origin);
+        let Some(next_turns) = turns.checked_add(1) else {
+            retain_local_session_intent(
+                &live_lease,
+                &accounting,
+                &mut local_snapshot,
+                &mut transcript,
+                &trimmed,
+            );
+            eprintln!("session turn count overflows");
+            continue;
+        };
 
         // Resolve the provider for the current model (config overrides the
         // default gate). `credential_env` names the env var holding the token.
@@ -3012,7 +3929,7 @@ fn cmd_chat(args: &[String]) -> i32 {
         render_hud(
             &hud,
             &orbit_hud::HudEvent::PhaseChanged {
-                phase: format!("turn {}({model})", turns + 1),
+                phase: format!("turn {next_turns}({model})"),
             },
         );
 
@@ -3029,6 +3946,13 @@ fn cmd_chat(args: &[String]) -> i32 {
         ) {
             Ok(c) => c,
             Err(e) => {
+                retain_local_session_intent(
+                    &live_lease,
+                    &accounting,
+                    &mut local_snapshot,
+                    &mut transcript,
+                    &trimmed,
+                );
                 eprintln!("ORBIT-E0401: {e}");
                 continue;
             }
@@ -3036,6 +3960,13 @@ fn cmd_chat(args: &[String]) -> i32 {
         if let Err(error) =
             apply_selected_effort(&home, &mut base_turn_config, selected_effort.as_ref())
         {
+            retain_local_session_intent(
+                &live_lease,
+                &accounting,
+                &mut local_snapshot,
+                &mut transcript,
+                &trimmed,
+            );
             eprintln!("ORBIT-E0401: {error}");
             continue;
         }
@@ -3047,6 +3978,13 @@ fn cmd_chat(args: &[String]) -> i32 {
         ) {
             Ok(value) => value,
             Err(error) => {
+                retain_local_session_intent(
+                    &live_lease,
+                    &accounting,
+                    &mut local_snapshot,
+                    &mut transcript,
+                    &trimmed,
+                );
                 eprintln!("ORBIT-E0401: {error}");
                 continue;
             }
@@ -3070,7 +4008,10 @@ fn cmd_chat(args: &[String]) -> i32 {
             total_output,
             auto_tools,
             interactive,
-            approval_channel: tool_runtime::StdApprovalChannel::new(interactive),
+            approval_channel: tool_runtime::StdApprovalChannel::with_cancel(
+                interactive,
+                signal_guard.token().clone(),
+            ),
             auto_grants: tool_runtime::AutoGrants::new(),
             scope: tool_runtime::PermissionScope::from_flags(
                 value_after(args, "--permission-mode").as_deref(),
@@ -3154,6 +4095,13 @@ fn cmd_chat(args: &[String]) -> i32 {
                 match orbit_cli::try_role_turn_config(&home, &turn_config, "compaction") {
                     Ok(c) => c,
                     Err(e) => {
+                        retain_local_session_intent(
+                            &live_lease,
+                            &accounting,
+                            &mut local_snapshot,
+                            &mut transcript,
+                            &trimmed,
+                        );
                         eprintln!("ORBIT-E0401: {e}");
                         continue;
                     }
@@ -3161,65 +4109,68 @@ fn cmd_chat(args: &[String]) -> i32 {
             ),
             ..Default::default()
         };
-        let report =
-            match orbit_cli::model_limits::apply_turn_budgets(&home, &turn_config, &mut options) {
-                Ok(notices) => {
+        signal_guard.sync_signal();
+        let completion =
+            match orbit_cli::model_limits::apply_turn_budgets(&home, &turn_config, &mut options)
+                .map_err(|error| error.to_string())
+                .and_then(|notices| {
                     for text in notices {
                         events(orbit_frontend_protocol::FrontendEvent::Status { text });
                     }
-                    orbit_engine::run_turn(
-                        &home,
-                        &turn_config,
-                        &options,
-                        &trimmed,
-                        &mut transcript,
-                        &mut executor,
-                        &orbit_provider_http::CancelToken::new(),
-                        &mut events,
-                    )
-                }
-                Err(error) => local_budget_refusal(
-                    &trimmed,
+                    let retry_policy =
+                        orbit_cli::provider_policies::load_for_config(&home, &turn_config)
+                            .map_err(|error| error.to_string())?;
+                    accounting
+                        .namespace()
+                        .apply_options_detailed(&mut options, None, retry_policy.as_ref())
+                        .map_err(|error| error.to_string())?;
+                    Ok(retry_policy)
+                }) {
+                Ok(retry_policy) => Ok(orbit_engine::turn::run_turn_detailed_with_retry_policy(
+                    &home,
+                    &turn_config,
                     &options,
+                    &trimmed,
                     &mut transcript,
-                    error.to_string(),
+                    &mut executor,
+                    signal_guard.token(),
                     &mut events,
-                ),
+                    retry_policy.as_ref(),
+                )
+                .into_completion()),
+                Err(error) => {
+                    local_budget_refusal(&trimmed, &options, &mut transcript, error, &mut events)
+                }
             };
-
-        match report {
-            Ok(r) if r.ok => {
-                println!();
-                total_input += r.input_tokens;
-                total_output += r.output_tokens;
-                total_cost += r.cost_microcents;
-                turns += 1;
+        last_operation_failed = match &completion {
+            Err(_) => true,
+            Ok(completion) => {
+                matches!(completion.end, orbit_engine::TurnEnd::Failed(_))
+                    || (completion.end == orbit_engine::TurnEnd::Completed && !completion.report.ok)
             }
-            Ok(r) => {
-                println!();
-                total_input += r.input_tokens;
-                total_output += r.output_tokens;
-                total_cost += r.cost_microcents;
-                if r.interrupted {
-                    eprintln!("turn cancelled");
-                }
-                // E10: the attestation scan runs in EVERY front-end —
-                // an unverified claim is shown, not just in headless.
-                if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
-                    && scan.claimed_pass
-                    && scan.exit_code != 0
-                {
-                    eprintln!(
-                        "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
-                        scan.command, scan.exit_code
-                    );
-                }
+        };
+        exit_error |= executor.approval_channel.input_failed();
+        if let Ok(completion) = &completion {
+            println!();
+            if completion.end == orbit_engine::TurnEnd::Completed && completion.report.ok {
+                turns = next_turns;
             }
-            Err(_) => {
-                // The engine or local admission emitted the error via events.
+            match &completion.end {
+                orbit_engine::TurnEnd::Cancelled => eprintln!("turn cancelled"),
+                orbit_engine::TurnEnd::Failed(error) => eprintln!("{error}"),
+                orbit_engine::TurnEnd::Completed => {}
+            }
+            if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
+                && scan.claimed_pass
+                && scan.exit_code != 0
+            {
+                eprintln!(
+                    "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
+                    scan.command, scan.exit_code
+                );
             }
         }
-        let sf = sessions::SessionFile::from_chat(
+        let mut sf = sessions::SessionFile::from_chat(
             &session,
             &model,
             &resolved_gate,
@@ -3232,18 +4183,46 @@ fn cmd_chat(args: &[String]) -> i32 {
         )
         .with_effort(selected_effort.clone())
         .with_selection_origin(selection_origin);
-        if let Err(e) = live_lease.save(&sf) {
-            eprintln!("warning: session not saved: {e}");
+        let persisted = accounting.persist(&live_lease, &mut sf);
+        let checked = checked_local_accounting(&accounting, &sf, &persisted);
+        let persist_failed = persisted.is_err();
+        match persisted {
+            Ok(view) => {
+                total_input = view.input_tokens;
+                total_output = view.output_tokens;
+                total_cost = view.known_cost_microcents;
+                full_cost_status = checked.map(|view| view.full_cost_status);
+            }
+            Err(error) => {
+                // Reconcile may have projected newer durable charges before a snapshot save failed.
+                total_input = sf.input_tokens;
+                total_output = sf.output_tokens;
+                total_cost = sf.cost_microcents;
+                full_cost_status = checked.map(|view| view.full_cost_status);
+                eprintln!("session not saved: {error}");
+            }
+        }
+        if persist_failed || checked.is_none() {
+            if !persist_failed {
+                eprintln!("session accounting inspection failed");
+            }
+            exit_error = true;
+        }
+        if exit_error || signal_guard.sync_signal() != 0 {
+            exit_error |= last_operation_failed;
+            break;
         }
     }
 
+    let signal = signal_guard.sync_signal();
+    exit_error |= signal != 0 && last_operation_failed;
     // Exit summary (JSON envelope, consistent with other commands).
     println!(
         "{}",
         serde_json::json!({
             "schema": "orbit.cli/v1",
             "command": "chat",
-            "status": "exit",
+            "status": if exit_error { "error" } else if signal != 0 { "cancelled" } else { "exit" },
             "session": session,
             "turns": turns,
             "usage": {
@@ -3251,13 +4230,16 @@ fn cmd_chat(args: &[String]) -> i32 {
                 "output_tokens": total_output,
             },
             "cost_microcents": total_cost,
+            "full_cost_status": full_cost_status,
         })
     );
-    0
+    close_plain_signals(&mut signal_guard, 0, |signal| {
+        exit_error || (signal != 0 && last_operation_failed)
+    })
 }
 
 /// The REPL's tool executor: bridges the engine's `ToolExecutor` trait
-/// to the REPL's StdApprovalChannel (blocking stdin) and session grants.
+/// to the REPL's cancellable StdApprovalChannel and session grants.
 /// The TUI injects its own executor (TuiApprovalChannel via the bus).
 struct ReplToolExecutor {
     home: std::path::PathBuf,
@@ -4330,7 +5312,7 @@ fn handle_chat_command(
     match cmd {
         "/help" => {
             println!(
-                "commands: exit, /help, /model <M>, /effort [VALUE|default], /permissions [<tool>|allow|ask|deny|reset <tool>], /clear, /usage, /models, /sessions, /resume <ID>"
+                "commands: exit, /help, /compact, /model <M>, /effort [VALUE|default], /permissions [<tool>|allow|ask|deny|reset <tool>], /clear, /usage, /models, /sessions, /resume <ID>"
             );
             true
         }
@@ -4783,7 +5765,7 @@ fn owner_model_entry<'a>(
 
 #[cfg(unix)]
 fn cmd_serve(args: &[String]) -> i32 {
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<i32, String> {
         orbit_cli::validate_owner_arguments("serve", args).map_err(|error| error.to_string())?;
         let home = command_home(args);
         ensure_initialized(&home).map_err(|(code, text)| format!("{code}: {text}"))?;
@@ -4811,17 +5793,8 @@ fn cmd_serve(args: &[String]) -> i32 {
             )?;
         }
         let fresh_id = named.unwrap_or_else(orbit_gateway::new_session_id);
-        let (lease, saved) = owned_startup_session(&home, args, "daemon", &fresh_id)?;
-        if saved.is_none() {
-            match std::fs::symlink_metadata(
-                home.join("sessions")
-                    .join(format!("{}.json", lease.session_id())),
-            ) {
-                Ok(_) => return Err("session already exists; use --resume <id>".into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("cannot inspect new session: {error}")),
-            }
-        }
+        let (lease, saved, startup_origin) =
+            owned_startup_session_with_origin(&home, args, "daemon", &fresh_id)?;
         let model = manual
             .clone()
             .or_else(|| saved.as_ref().map(|session| session.model.clone()))
@@ -4857,7 +5830,7 @@ fn cmd_serve(args: &[String]) -> i32 {
         {
             return Err(format!("unknown permission mode {mode}"));
         }
-        let turn = tui_worker::TuiTurnConfig {
+        let mut turn = tui_worker::TuiTurnConfig {
             home: home.clone(),
             session_id: lease.session_id().into(),
             gate: checked.gate.clone(),
@@ -4894,23 +5867,26 @@ fn cmd_serve(args: &[String]) -> i32 {
             saved.as_ref(),
             !providers.roles.main.is_empty(),
         );
-        lease
-            .save(
-                &sessions::SessionFile::from_chat(
-                    &turn.session_id,
-                    &turn.model,
-                    &turn.gate,
-                    &turn.provider_id,
-                    &turn.initial_transcript,
-                    turn.initial_turns,
-                    turn.initial_input_tokens,
-                    turn.initial_output_tokens,
-                    turn.initial_cost_microcents,
-                )
-                .with_effort(turn.effort.clone())
-                .with_selection_origin(origin),
-            )
+        let mut seed = sessions::SessionFile::from_chat(
+            &turn.session_id,
+            &turn.model,
+            &turn.gate,
+            &turn.provider_id,
+            &turn.initial_transcript,
+            turn.initial_turns,
+            turn.initial_input_tokens,
+            turn.initial_output_tokens,
+            turn.initial_cost_microcents,
+        )
+        .with_effort(turn.effort.clone())
+        .with_selection_origin(origin);
+        session_accounting::prepare_root(&lease, &mut seed, startup_origin)
             .map_err(|error| error.to_string())?;
+        turn.initial_transcript = seed.to_transcript();
+        turn.initial_turns = seed.turns;
+        turn.initial_input_tokens = seed.input_tokens;
+        turn.initial_output_tokens = seed.output_tokens;
+        turn.initial_cost_microcents = seed.cost_microcents;
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
         if args.iter().any(|argument| argument == "--bare") {
             tools::enable_bare_mode();
@@ -4923,23 +5899,254 @@ fn cmd_serve(args: &[String]) -> i32 {
         )
         .map_err(|error| error.to_string())
     })();
-    let code = match result {
-        Ok(()) => 0,
+    match result {
+        Ok(code) => code,
         Err(error) => {
             eprintln!("orbit serve: {error}");
             2
         }
-    };
-    let signal = OWNER_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
-    if signal == 0 { code } else { 128 + signal }
+    }
 }
 
 #[cfg(unix)]
 static OWNER_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(unix)]
+static PROCESS_SIGNAL_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(unix)]
 extern "C" fn owner_signal(signal: i32) {
-    OWNER_SIGNAL.store(signal, std::sync::atomic::Ordering::Relaxed);
+    let _ = OWNER_SIGNAL.compare_exchange(
+        0,
+        signal,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(unix)]
+struct SavedSignalDisposition {
+    signal: i32,
+    previous: libc::sigaction,
+    installed: Option<libc::sigaction>,
+}
+
+/// Owns process signal registration and the actual cooperative token. The
+/// handler only latches an integer; cancellation happens outside signal context.
+struct ProcessSignalGuard {
+    token: orbit_provider_http::CancelToken,
+    signal: i32,
+    #[cfg(unix)]
+    handlers: Vec<SavedSignalDisposition>,
+    #[cfg(unix)]
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    watcher: Option<std::thread::JoinHandle<()>>,
+    #[cfg(unix)]
+    owns_installer: bool,
+}
+
+#[cfg(unix)]
+fn read_signal_action(signal: i32) -> Result<libc::sigaction, String> {
+    // SAFETY: zero initializes this C output structure, and sigaction receives
+    // a valid writable pointer. No field is read after a failed syscall.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) } != 0 {
+        return Err(format!(
+            "cannot inspect process signal action: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(action)
+}
+
+#[cfg(unix)]
+fn replace_signal_action(signal: i32, action: &libc::sigaction) -> Result<libc::sigaction, String> {
+    // SAFETY: both C structures live for this call and the kernel writes the
+    // complete previous disposition into the initialized output structure.
+    let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(signal, action, &mut previous) } != 0 {
+        return Err(format!(
+            "cannot replace process signal action: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(previous)
+}
+
+#[cfg(unix)]
+fn same_signal_action(left: &libc::sigaction, right: &libc::sigaction) -> bool {
+    if left.sa_sigaction != right.sa_sigaction || left.sa_flags != right.sa_flags {
+        return false;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if left
+        .sa_restorer
+        .map(|handler| handler as *const () as usize)
+        != right
+            .sa_restorer
+            .map(|handler| handler as *const () as usize)
+    {
+        return false;
+    }
+    // Compare membership, never padding bytes in an opaque libc signal set.
+    // Invalid signal numbers return -1 for both sets; every representable
+    // valid signal is covered by this bounded bit-capacity walk.
+    (1..=std::mem::size_of::<libc::sigset_t>() * 8).all(|signal| {
+        // SAFETY: both masks are initialized and live throughout these reads.
+        unsafe {
+            libc::sigismember(&left.sa_mask, signal as i32)
+                == libc::sigismember(&right.sa_mask, signal as i32)
+        }
+    })
+}
+
+impl ProcessSignalGuard {
+    fn new() -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            Self::install(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                token: orbit_provider_http::CancelToken::new(),
+                signal: 0,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn install(signals: &[i32]) -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        if PROCESS_SIGNAL_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("another process signal guard is already active".into());
+        }
+        OWNER_SIGNAL.store(0, Ordering::Relaxed);
+        let mut guard = Self {
+            token: orbit_provider_http::CancelToken::new(),
+            signal: 0,
+            handlers: Vec::new(),
+            done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            watcher: None,
+            owns_installer: true,
+        };
+        // SAFETY: zero is the C default action/mask representation; sigemptyset
+        // initializes the mask before any membership or installation operation.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+            return Err("cannot initialize process signal mask".into());
+        }
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: the mask is initialized and this is a valid signal.
+            if unsafe { libc::sigaddset(&mut action.sa_mask, signal) } != 0 {
+                return Err("cannot initialize process signal mask".into());
+            }
+        }
+        action.sa_sigaction = owner_signal as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        for signal in signals {
+            let previous = replace_signal_action(*signal, &action)?;
+            let index = guard.handlers.len();
+            guard.handlers.push(SavedSignalDisposition {
+                signal: *signal,
+                previous,
+                installed: None,
+            });
+            // Capture kernel-normalized flags/restorer for later ownership checks.
+            guard.handlers[index].installed = Some(read_signal_action(*signal)?);
+        }
+        let done = guard.done.clone();
+        let token = guard.token.clone();
+        guard.watcher = Some(
+            std::thread::Builder::new()
+                .name("orbit-signal".into())
+                .spawn(move || {
+                    while !done.load(Ordering::Acquire) {
+                        if OWNER_SIGNAL.load(Ordering::Relaxed) != 0 {
+                            token.cancel();
+                            break;
+                        }
+                        std::thread::park_timeout(std::time::Duration::from_millis(10));
+                    }
+                })
+                .map_err(|error| format!("cannot start process signal watcher: {error}"))?,
+        );
+        Ok(guard)
+    }
+
+    fn token(&self) -> &orbit_provider_http::CancelToken {
+        &self.token
+    }
+
+    fn sync_signal(&self) -> i32 {
+        #[cfg(unix)]
+        let signal = if self.owns_installer {
+            OWNER_SIGNAL.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.signal
+        };
+        #[cfg(not(unix))]
+        let signal = self.signal;
+        if signal != 0 {
+            self.token.cancel();
+        }
+        signal
+    }
+
+    fn close(&mut self) -> Result<i32, String> {
+        #[cfg(unix)]
+        if self.owns_installer {
+            self.signal = self.sync_signal();
+            self.done.store(true, std::sync::atomic::Ordering::Release);
+            let mut failure = None;
+            if let Some(watcher) = self.watcher.take() {
+                watcher.thread().unpark();
+                if watcher.join().is_err() {
+                    failure = Some("process signal watcher panicked".to_owned());
+                }
+            }
+            for saved in self.handlers.drain(..).rev() {
+                let restored = (|| {
+                    let current = read_signal_action(saved.signal)?;
+                    let owned = saved.installed.as_ref().map_or_else(
+                        || current.sa_sigaction == owner_signal as *const () as libc::sighandler_t,
+                        |installed| same_signal_action(&current, installed),
+                    );
+                    if !owned {
+                        return Err(
+                            "process signal action changed ownership; foreign action retained"
+                                .to_owned(),
+                        );
+                    }
+                    replace_signal_action(saved.signal, &saved.previous)?;
+                    Ok(())
+                })();
+                if let Err(error) = restored {
+                    failure.get_or_insert(error);
+                }
+            }
+            self.signal = OWNER_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+            self.owns_installer = false;
+            PROCESS_SIGNAL_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        Ok(self.signal)
+    }
+}
+
+impl Drop for ProcessSignalGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "process signal cleanup failed: {error}");
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -4947,48 +6154,20 @@ fn foreground_owner(
     config: orbit_cli::daemon::OwnerConfig,
     lease: sessions::SessionLease,
     socket: &Path,
-) -> Result<(), orbit_cli::daemon::OwnerError> {
-    struct Handlers(Vec<(i32, libc::sighandler_t)>);
-    impl Drop for Handlers {
-        fn drop(&mut self) {
-            for (signal, handler) in &self.0 {
-                // Restore exactly the handlers replaced in this foreground process.
-                unsafe {
-                    libc::signal(*signal, *handler);
-                }
-            }
+) -> Result<i32, orbit_cli::daemon::OwnerError> {
+    let mut guard = ProcessSignalGuard::new().map_err(orbit_cli::daemon::OwnerError::Runtime)?;
+    let result = orbit_cli::daemon::run_server(config, lease, socket, guard.token());
+    let signal = guard
+        .close()
+        .map_err(orbit_cli::daemon::OwnerError::Runtime)?;
+    match result {
+        Ok(()) => Ok(if signal == 0 { 0 } else { 128 + signal }),
+        Err(error) if signal != 0 => {
+            eprintln!("orbit serve: {error}");
+            Ok(128 + signal)
         }
+        Err(error) => Err(error),
     }
-    OWNER_SIGNAL.store(0, std::sync::atomic::Ordering::Relaxed);
-    let mut handlers = Handlers(vec![]);
-    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        // The handler only writes a lock-free flag; the watcher cancels outside it.
-        let previous =
-            unsafe { libc::signal(signal, owner_signal as *const () as libc::sighandler_t) };
-        if previous == libc::SIG_ERR {
-            return Err(orbit_cli::daemon::OwnerError::Runtime(
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
-        handlers.0.push((signal, previous));
-    }
-    let shutdown = orbit_provider_http::CancelToken::new();
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watch_done = done.clone();
-    let watch_token = shutdown.clone();
-    let watcher = std::thread::spawn(move || {
-        while !watch_done.load(std::sync::atomic::Ordering::Relaxed) {
-            if OWNER_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-                watch_token.cancel();
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    });
-    let result = orbit_cli::daemon::run_server(config, lease, socket, &shutdown);
-    done.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = watcher.join();
-    result
 }
 
 #[cfg(unix)]
@@ -5932,5 +7111,357 @@ mod provider_refresh_parser_tests {
             let args: Vec<String> = tail.into_iter().map(str::to_owned).collect();
             assert!(validate_provider_arguments(&args).is_err());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod process_signal_guard_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    // Only these tests alter the main binary's process-wide dispositions.
+    // Kernel delivery belongs to the isolated CLI integration cases, not libtest.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    extern "C" fn preserved_handler(_: i32) {}
+
+    struct DispositionFixture {
+        originals: Vec<(i32, libc::sigaction)>,
+        expected: Vec<(i32, libc::sigaction)>,
+    }
+
+    impl DispositionFixture {
+        fn new() -> Self {
+            let mut fixture = Self {
+                originals: Vec::new(),
+                expected: Vec::new(),
+            };
+            // SAFETY: initialize the entire C action and then initialize its
+            // signal mask before installing this benign, never-signalled fixture.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+            assert_eq!(
+                unsafe { libc::sigaddset(&mut action.sa_mask, libc::SIGUSR1) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::sigaddset(&mut action.sa_mask, libc::SIGUSR2) },
+                0
+            );
+            action.sa_sigaction = preserved_handler as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART | libc::SA_NODEFER;
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                fixture
+                    .originals
+                    .push((signal, replace_signal_action(signal, &action).unwrap()));
+                fixture
+                    .expected
+                    .push((signal, read_signal_action(signal).unwrap()));
+            }
+            fixture
+        }
+
+        fn assert_restored(&self) {
+            for (signal, expected) in &self.expected {
+                let current = read_signal_action(*signal).unwrap();
+                assert_eq!(current.sa_flags, expected.sa_flags);
+                assert_eq!(current.sa_sigaction, expected.sa_sigaction);
+                for member in [
+                    libc::SIGUSR1,
+                    libc::SIGUSR2,
+                    libc::SIGINT,
+                    libc::SIGTERM,
+                    libc::SIGHUP,
+                ] {
+                    assert_eq!(
+                        unsafe { libc::sigismember(&current.sa_mask, member) },
+                        unsafe { libc::sigismember(&expected.sa_mask, member) }
+                    );
+                }
+                assert!(
+                    same_signal_action(&current, expected),
+                    "complete handler/mask/flags/restorer for signal {signal}"
+                );
+            }
+        }
+    }
+
+    impl Drop for DispositionFixture {
+        fn drop(&mut self) {
+            for (signal, original) in self.originals.iter().rev() {
+                // Preserve the outer libtest process even on a failed assertion.
+                let _ = replace_signal_action(*signal, original);
+            }
+        }
+    }
+
+    #[test]
+    fn full_dispositions_restore_and_normal_cleanup_joins_the_actual_watcher() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = DispositionFixture::new();
+        for (_, expected) in &fixture.expected {
+            assert_ne!(expected.sa_flags & libc::SA_NODEFER, 0);
+            assert_eq!(
+                unsafe { libc::sigismember(&expected.sa_mask, libc::SIGUSR1) },
+                1
+            );
+            assert_eq!(
+                unsafe { libc::sigismember(&expected.sa_mask, libc::SIGUSR2) },
+                1
+            );
+        }
+        let mut guard = ProcessSignalGuard::new().unwrap();
+        assert!(guard.watcher.is_some() && guard.owns_installer);
+        assert_eq!(guard.close().unwrap(), 0);
+        assert!(guard.watcher.is_none() && guard.handlers.is_empty() && !guard.owns_installer);
+        assert!(guard.done.load(Ordering::Acquire));
+        assert!(!PROCESS_SIGNAL_ACTIVE.load(Ordering::Acquire));
+        fixture.assert_restored();
+        assert_eq!(guard.close().unwrap(), 0);
+    }
+
+    #[test]
+    fn nested_guard_cannot_reset_first_signal_and_sync_cancels_both_shared_operation_tokens() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = DispositionFixture::new();
+        for (first_signal, exit) in [
+            (libc::SIGINT, 130),
+            (libc::SIGTERM, 143),
+            (libc::SIGHUP, 129),
+        ] {
+            let mut guard = ProcessSignalGuard::new().unwrap();
+            let first = guard.token().clone();
+            let repair = guard.token().clone();
+            let installed: Vec<_> = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+                .into_iter()
+                .map(|signal| (signal, read_signal_action(signal).unwrap()))
+                .collect();
+            // Direct calls exercise the real atomic handler without process-wide
+            // signal delivery into unrelated parallel libtest workers.
+            owner_signal(first_signal);
+            assert!(ProcessSignalGuard::new().is_err());
+            owner_signal(if first_signal == libc::SIGINT {
+                libc::SIGTERM
+            } else {
+                libc::SIGINT
+            });
+            assert_eq!(guard.sync_signal(), first_signal);
+            assert!(first.is_cancelled() && repair.is_cancelled());
+            let may_repair = guard.sync_signal() == 0 && !guard.token().is_cancelled();
+            assert!(!may_repair, "repair admission must stay closed");
+            for (signal, expected) in installed {
+                assert!(same_signal_action(
+                    &read_signal_action(signal).unwrap(),
+                    &expected
+                ));
+            }
+            let signal = guard.close().unwrap();
+            assert_eq!(signal, first_signal);
+            assert_eq!(128 + signal, exit);
+            fixture.assert_restored();
+        }
+    }
+
+    #[test]
+    fn an_early_return_drops_and_joins_before_releasing_the_installer() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = DispositionFixture::new();
+        fn leave(
+            done: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        ) -> Result<(), &'static str> {
+            let guard = ProcessSignalGuard::new().unwrap();
+            *done = Some(guard.done.clone());
+            Err("ordinary early return")
+        }
+        let mut done = None;
+        assert_eq!(leave(&mut done), Err("ordinary early return"));
+        assert!(done.unwrap().load(Ordering::Acquire));
+        assert!(!PROCESS_SIGNAL_ACTIVE.load(Ordering::Acquire));
+        fixture.assert_restored();
+        let mut next = ProcessSignalGuard::new().unwrap();
+        next.close().unwrap();
+    }
+
+    #[test]
+    fn unwind_restores_complete_actions_and_releases_the_actual_guard() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = DispositionFixture::new();
+        let mut done = None;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = ProcessSignalGuard::new().unwrap();
+            done = Some(guard.done.clone());
+            panic!("signal guard unwind control");
+        }));
+        assert!(unwind.is_err());
+        assert!(done.unwrap().load(Ordering::Acquire));
+        assert!(!PROCESS_SIGNAL_ACTIVE.load(Ordering::Acquire));
+        fixture.assert_restored();
+        let mut next = ProcessSignalGuard::new().unwrap();
+        next.close().unwrap();
+    }
+
+    #[test]
+    fn a_real_later_sigaction_failure_rolls_back_prior_complete_dispositions() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = DispositionFixture::new();
+        // Signal zero is invalid for sigaction. The first two replacements are
+        // real successes before the deterministic later syscall failure.
+        assert!(ProcessSignalGuard::install(&[libc::SIGINT, libc::SIGTERM, 0]).is_err());
+        assert!(!PROCESS_SIGNAL_ACTIVE.load(Ordering::Acquire));
+        fixture.assert_restored();
+        let mut next = ProcessSignalGuard::new().unwrap();
+        next.close().unwrap();
+    }
+
+    #[test]
+    fn foreign_mask_and_flag_changes_are_reported_and_never_overwritten() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = DispositionFixture::new();
+        for mask_change in [false, true] {
+            let mut guard = ProcessSignalGuard::new().unwrap();
+            let mut foreign = read_signal_action(libc::SIGTERM).unwrap();
+            if mask_change {
+                assert_eq!(
+                    unsafe { libc::sigaddset(&mut foreign.sa_mask, libc::SIGUSR1) },
+                    0
+                );
+            } else {
+                foreign.sa_flags ^= libc::SA_RESTART;
+            }
+            replace_signal_action(libc::SIGTERM, &foreign).unwrap();
+            let foreign = read_signal_action(libc::SIGTERM).unwrap();
+            let error = guard.close().unwrap_err();
+            assert!(error.contains("changed ownership"));
+            assert!(same_signal_action(
+                &read_signal_action(libc::SIGTERM).unwrap(),
+                &foreign
+            ));
+            for (signal, expected) in &fixture.expected {
+                if *signal != libc::SIGTERM {
+                    assert!(same_signal_action(
+                        &read_signal_action(*signal).unwrap(),
+                        expected
+                    ));
+                }
+            }
+            assert!(guard.watcher.is_none() && !PROCESS_SIGNAL_ACTIVE.load(Ordering::Acquire));
+            // The fixture, not the guard, owns restoration of this deliberately
+            // foreign replacement. It restores the outer process on scope exit.
+            let expected = &fixture
+                .expected
+                .iter()
+                .find(|(signal, _)| *signal == libc::SIGTERM)
+                .unwrap()
+                .1;
+            replace_signal_action(libc::SIGTERM, expected).unwrap();
+            fixture.assert_restored();
+        }
+    }
+}
+
+#[cfg(test)]
+mod plain_signal_result_tests {
+    use super::*;
+
+    #[test]
+    fn caught_signals_preserve_their_exit_codes_but_never_override_a_real_error() {
+        assert_eq!(plain_signal_exit_code(0, 2, false), 2);
+        for (signal, expected) in [(2, 130), (15, 143), (1, 129)] {
+            assert_eq!(plain_signal_exit_code(signal, 0, false), expected);
+            assert_eq!(plain_signal_exit_code(signal, 1, false), expected);
+            assert_eq!(plain_signal_exit_code(signal, 0, true), 1);
+            assert_eq!(plain_signal_exit_code(signal, 1, true), 1);
+        }
+    }
+
+    #[test]
+    fn cancelled_uncertain_compaction_is_distinct_from_failed_publication_or_inspection() {
+        use orbit_engine::CompactionStatus as S;
+        let view = session_accounting::AccountingView {
+            revision: 2,
+            input_tokens: 100,
+            output_tokens: 40,
+            known_cost_microcents: 60,
+            full_cost_status: FullCostStatus::Uncertain,
+        };
+        let completion = |status, applied| {
+            Ok(orbit_engine::ManualCompactionCompletion {
+                status,
+                applied,
+                accounting: orbit_engine::AccountingDelta::known_zero(),
+                attempts: Vec::new(),
+            })
+        };
+        assert!(!compact_local_failed(
+            &completion(S::Cancelled, false),
+            &Ok(view),
+            Some(view)
+        ));
+        assert!(!compact_local_failed(
+            &Err("cancelled"),
+            &Ok(view),
+            Some(view)
+        ));
+        let known = session_accounting::AccountingView {
+            full_cost_status: FullCostStatus::Known,
+            ..view
+        };
+        assert!(!compact_local_failed(
+            &completion(S::PublishedReady, true),
+            &Ok(known),
+            Some(known)
+        ));
+        assert!(compact_local_failed(
+            &completion(S::PublishedReady, true),
+            &Ok(view),
+            Some(view)
+        ));
+        for status in [
+            S::PublicationUncertain,
+            S::AccountingUncertain,
+            S::StorageUnsafe,
+            S::InvalidHistory,
+        ] {
+            assert!(compact_local_failed(
+                &completion(status, false),
+                &Ok(view),
+                Some(view)
+            ));
+        }
+        assert!(compact_local_failed(
+            &completion(S::PublishedReady, false),
+            &Ok(view),
+            Some(view)
+        ));
+        assert!(compact_local_failed(
+            &Err("selection_invalid"),
+            &Ok(view),
+            Some(view)
+        ));
+        assert!(compact_local_failed(
+            &completion(S::Cancelled, false),
+            &Ok(view),
+            None
+        ));
+        let failed = Err(session_accounting::AccountingError::InvalidState(
+            "publication failed",
+        ));
+        assert!(compact_local_failed(
+            &completion(S::Cancelled, false),
+            &failed,
+            Some(view)
+        ));
     }
 }

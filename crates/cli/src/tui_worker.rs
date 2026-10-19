@@ -7,11 +7,16 @@
 //! This is the TUI-specific counterpart to the REPL loop — the REPL's inline
 //! logic in `cmd_chat` is untouched.
 
+use crate::session_accounting::{
+    self, FullCostStatus, NamespaceAccounting, RootOrigin, RootSessionAccounting,
+};
 use orbit_adapter::types::{ChatMessage, ChatRole, ContentBlock, EffortSetting};
 use orbit_hud_tui::bus::BusSender;
 use orbit_hud_tui::model::TranscriptLine;
-use orbit_hud_tui::msg::Msg;
-use orbit_hud_tui::worker::{CommandSink, WorkerCommand, WorkerCtx};
+use orbit_hud_tui::msg::{
+    ContextProjection, CostQualification, ManualOutcome, Msg, ProjectionReason, SessionProjection,
+};
+use orbit_hud_tui::worker::{CommandSink, ManualAction, SessionBinding, WorkerCommand, WorkerCtx};
 use orbit_hud_tui::{ApprovalRegistry, ApprovalResponse};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -54,33 +59,121 @@ fn configured_turn(config: &TuiTurnConfig) -> Result<orbit_engine::TurnConfig, S
     Ok(turn)
 }
 
+fn checked_cost(
+    accounting: &RootSessionAccounting,
+    saved: &crate::sessions::SessionFile,
+    reconciled: bool,
+) -> CostQualification {
+    if !reconciled {
+        return CostQualification::Unavailable;
+    }
+    let Some(anchor) = &saved.accounting_watermark else {
+        return CostQualification::Unavailable;
+    };
+    let Ok(checkpoint) = accounting.namespace().checkpoint_detailed() else {
+        return CostQualification::Unavailable;
+    };
+    if checkpoint.revision().0 != anchor.revision {
+        return CostQualification::Unavailable;
+    }
+    if (checkpoint.pending().is_some()
+        || checkpoint.totals().knownness == orbit_engine::AccountingKnownness::Uncertain)
+        && anchor.full_cost_status != FullCostStatus::Uncertain
+    {
+        return CostQualification::Unavailable;
+    }
+    let revision = anchor.revision;
+    match anchor.full_cost_status {
+        FullCostStatus::Known => CostQualification::Known { revision },
+        FullCostStatus::UnknownLegacy => CostQualification::UnknownHistory { revision },
+        FullCostStatus::UnknownUsage => CostQualification::UnknownUsage { revision },
+        FullCostStatus::Unpriced => CostQualification::Unpriced { revision },
+        FullCostStatus::Uncertain => CostQualification::Uncertain { revision },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn save_controls(
+fn emit_session_projection(
+    sender: &BusSender,
     config: &TuiTurnConfig,
-    lease: &crate::sessions::SessionLease,
+    binding: &SessionBinding,
     transcript: &[ChatMessage],
     turns: u64,
     input: u64,
     output: u64,
     cost: u64,
+    qualification: CostQualification,
+    reason: ProjectionReason,
+    context: ContextProjection,
+) {
+    sender.send(Msg::SessionProjection(SessionProjection {
+        binding: binding.clone(),
+        model: config.model.clone(),
+        provider: config.provider_id.clone(),
+        priced: crate::config::ProvidersConfig::load(&config.home)
+            .ok()
+            .and_then(|cfg| cfg.pricing_for_model(&config.model))
+            .is_some(),
+        lines: session_to_transcript_lines(transcript),
+        turns,
+        input_tokens: input,
+        output_tokens: output,
+        cost_microcents: cost,
+        cost: qualification,
+        context,
+        reason,
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_controls(
+    config: &TuiTurnConfig,
+    lease: &crate::sessions::SessionLease,
+    accounting: &RootSessionAccounting,
+    transcript: &[ChatMessage],
+    turns: u64,
+    input: &mut u64,
+    output: &mut u64,
+    cost: &mut u64,
     sender: &BusSender,
     origin: crate::phase_routing::SelectionOrigin,
+    qualification: &mut CostQualification,
 ) -> bool {
-    let sf = crate::sessions::SessionFile::from_chat(
+    let mut saved = crate::sessions::SessionFile::from_chat(
         &config.session_id,
         &config.model,
         &config.gate,
         &config.provider_id,
         transcript,
         turns,
-        input,
-        output,
-        cost,
+        *input,
+        *output,
+        *cost,
     )
     .with_effort(config.effort.clone())
     .with_selection_origin(origin);
-    if let Err(e) = lease.save(&sf) {
-        orbit_hud_tui::emit_error(sender, &format!("settings unchanged: {e}"));
+    let result = accounting.persist(lease, &mut saved);
+    *qualification = checked_cost(
+        accounting,
+        &saved,
+        result.is_ok()
+            || matches!(
+                &result,
+                Err(session_accounting::AccountingError::Session(_))
+            ),
+    );
+    *input = saved.input_tokens;
+    *output = saved.output_tokens;
+    *cost = saved.cost_microcents;
+    if let Err(error) = result {
+        let message = if error.is_publication_uncertain() {
+            format!(
+                "settings save may have committed; inspect the session before changing settings: {error}"
+            )
+        } else {
+            format!("settings unchanged: {error}")
+        };
+        orbit_hud_tui::emit_error(sender, &message);
         return false;
     }
     true
@@ -103,43 +196,75 @@ fn retain_local_intent(
     });
 }
 
-fn save_failed_turn(
+#[allow(clippy::too_many_arguments)]
+fn save_turn(
     config: &TuiTurnConfig,
     lease: &crate::sessions::SessionLease,
+    accounting: &RootSessionAccounting,
     transcript: &[ChatMessage],
-    counters: (u64, u64, u64, u64),
+    turns: u64,
+    input: &mut u64,
+    output: &mut u64,
+    cost: &mut u64,
     origin: crate::phase_routing::SelectionOrigin,
     sender: &BusSender,
-) {
-    let (turns, input, output, cost) = counters;
-    let saved = crate::sessions::SessionFile::from_chat(
+    qualification: &mut CostQualification,
+    manual: bool,
+) -> bool {
+    let mut saved = crate::sessions::SessionFile::from_chat(
         &config.session_id,
         &config.model,
         &config.gate,
         &config.provider_id,
         transcript,
         turns,
-        input,
-        output,
-        cost,
+        *input,
+        *output,
+        *cost,
     )
     .with_effort(config.effort.clone())
     .with_selection_origin(origin);
-    match lease.save(&saved) {
-        Ok(()) => {}
-        Err(error @ crate::sessions::SessionLeaseError::PublicationUncertain(_)) => {
-            orbit_hud_tui::emit_error(
+    let result = accounting.persist(lease, &mut saved);
+    *qualification = checked_cost(
+        accounting,
+        &saved,
+        result.is_ok()
+            || matches!(
+                &result,
+                Err(session_accounting::AccountingError::Session(_))
+            ),
+    );
+    // A failed snapshot publication does not erase charges already in the journal.
+    if let Some(anchor) = &saved.accounting_watermark {
+        *input = saved.input_tokens;
+        *output = saved.output_tokens;
+        *cost = saved.cost_microcents;
+        if anchor.full_cost_status != FullCostStatus::Known {
+            orbit_hud_tui::emit_status(
                 sender,
                 &format!(
-                    "current prompt save may have committed; inspect the session before retrying: {error}"
+                    "Full session cost is unknown ({:?}); displayed cost is the known priced subtotal",
+                    anchor.full_cost_status
                 ),
             );
         }
+    }
+    match result {
+        Ok(_) => true,
         Err(error) => {
-            orbit_hud_tui::emit_error(
-                sender,
-                &format!("current prompt could not be saved: {error}"),
-            );
+            let message = if error.is_publication_uncertain() {
+                format!(
+                    "current prompt save may have committed; inspect the session before retrying: {error}"
+                )
+            } else {
+                format!("current prompt could not be saved: {error}")
+            };
+            if manual {
+                orbit_hud_tui::emit_status(sender, &message);
+            } else {
+                orbit_hud_tui::emit_error(sender, &message);
+            }
+            false
         }
     }
 }
@@ -320,6 +445,7 @@ fn worker_main_owned(
     cancel_slot: std::sync::Arc<std::sync::Mutex<Option<orbit_provider_http::CancelToken>>>,
     mut lease: crate::sessions::SessionLease,
 ) {
+    config.home = lease.home().to_path_buf();
     let mut selection_origin =
         match crate::sessions::read_selection_origin(lease.home(), lease.session_id()) {
             Ok(origin) => origin,
@@ -328,6 +454,43 @@ fn worker_main_owned(
                 return;
             }
         };
+    let mut seed = match lease.load_optional() {
+        Ok(Some(saved)) => saved,
+        Ok(None) => crate::sessions::SessionFile::from_chat(
+            &config.session_id,
+            &config.model,
+            &config.gate,
+            &config.provider_id,
+            &config.initial_transcript,
+            config.initial_turns,
+            config.initial_input_tokens,
+            config.initial_output_tokens,
+            config.initial_cost_microcents,
+        )
+        .with_effort(config.effort.clone())
+        .with_selection_origin(selection_origin),
+        Err(error) => {
+            orbit_hud_tui::emit_error(&ctx.sender, &error.to_string());
+            return;
+        }
+    };
+    let mut accounting =
+        match session_accounting::prepare_root(&lease, &mut seed, RootOrigin::RestoredOrLegacy) {
+            Ok(accounting) => accounting,
+            Err(error) => {
+                orbit_hud_tui::emit_error(&ctx.sender, &error.to_string());
+                return;
+            }
+        };
+    config.model = seed.model.clone();
+    config.gate = seed.gate.clone();
+    config.provider_id = seed.provider.clone();
+    config.effort = seed.effort.clone();
+    config.initial_transcript = seed.to_transcript();
+    config.initial_turns = seed.turns;
+    config.initial_input_tokens = seed.input_tokens;
+    config.initial_output_tokens = seed.output_tokens;
+    config.initial_cost_microcents = seed.cost_microcents;
     let mut transcript: Vec<ChatMessage> = config.initial_transcript.clone();
     let mut turns: u64 = config.initial_turns;
     let mut tool_cx = session_tool_context(&config, &ctx.sender);
@@ -377,23 +540,28 @@ fn worker_main_owned(
     tool_cx.set_ext(MemoryBytes(built.memory_bytes));
     let mut system_prompt = built.text;
 
-    // Send identity to the TUI so the status bar shows model/provider/session.
-    // D18: priced=false makes the status bar show `cost n/a` for models
-    // without a pricing entry (never a fake $0.0000).
-    let boot_priced = crate::config::ProvidersConfig::load(&config.home)
-        .ok()
-        .and_then(|cfg| cfg.pricing_for_model(&config.model))
-        .is_some();
-    ctx.sender.send(Msg::Identity {
-        model: config.model.clone(),
-        provider: config.provider_id.clone(),
-        session_prefix: short_session_id(&config.session_id),
+    let mut binding = SessionBinding {
         session_id: config.session_id.clone(),
-        priced: boot_priced,
-    });
-
-    // The sandbox is a readiness fact the welcome screen must not hide:
-    // measured once, shown as it is.
+        generation: 1,
+    };
+    let mut qualification = checked_cost(&accounting, &seed, true);
+    orbit_hud_tui::emit_status(
+        &ctx.sender,
+        &format!("session {}", short_session_id(&config.session_id)),
+    );
+    emit_session_projection(
+        &ctx.sender,
+        &config,
+        &binding,
+        &transcript,
+        turns,
+        cum_input,
+        cum_output,
+        cum_cost,
+        qualification,
+        ProjectionReason::Initial,
+        ContextProjection::Unavailable,
+    );
     orbit_hud_tui::emit_readiness(
         &ctx.sender,
         vec![(
@@ -402,72 +570,92 @@ fn worker_main_owned(
         )],
     );
 
-    // Boot with a resumed session, if any.
-    if config.initial_transcript.is_empty() && config.initial_turns == 0 {
-        // Fresh chat — nothing to restore.
-    } else {
-        let lines = session_to_transcript_lines(&config.initial_transcript);
-        ctx.sender.send(Msg::TranscriptLoaded {
-            lines,
-            input_tokens: config.initial_input_tokens,
-            output_tokens: config.initial_output_tokens,
-            cost_microcents: config.initial_cost_microcents,
-            turns: config.initial_turns,
-        });
-    }
     // Locally-queued commands (mod commands re-enter the Prompt flow).
     let mut pending: Vec<WorkerCommand> = Vec::new();
     loop {
-        let cmd = match pending.pop() {
+        let mut cmd = match pending.pop() {
             Some(c) => c,
             None => match ctx.command_rx.recv() {
                 Ok(c) => c,
                 Err(_) => break,
             },
         };
-        match cmd {
-            WorkerCommand::PlanPrompt(prompt) => {
-                let token = orbit_provider_http::CancelToken::new();
-                if let Ok(mut guard) = cancel_slot.lock() {
-                    *guard = Some(token.clone());
-                }
-                // Plan mode appends its read-only posture to the frozen
-                // prompt (the model keeps its context; only the posture
-                // changes).
-                let plan_directive = format!(
-                    "{system_prompt}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes; all tool calls will be denied. Explore the problem, then respond with a concise, numbered implementation plan. End with a line: `PLAN READY`."
-                );
-                // Take the scope out of config for the turn (borrow
-                // rules: config is borrowed immutably by run_tui_turn).
-                let mut scope = std::mem::take(&mut config.scope);
-                let (ok, input, output, cost, plan_text) = match run_tui_turn(
-                    &config,
-                    &mut transcript,
-                    &prompt,
-                    None,
+        let mut foreground = None;
+        if let WorkerCommand::Bound { operation, command } = cmd {
+            let registration = if operation.source() == &binding {
+                operation.start(&command).ok()
+            } else {
+                None
+            };
+            let Some(registration) = registration else {
+                let _ = operation.finish_unstarted();
+                emit_session_projection(
                     &ctx.sender,
-                    &ctx.approvals,
-                    &token,
+                    &config,
+                    &binding,
+                    &transcript,
                     turns,
-                    &mut auto_grants,
-                    &plan_directive,
-                    true,
-                    &mut scope,
-                    &tool_cx,
-                ) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        config.scope = scope;
-                        orbit_hud_tui::emit_error(&ctx.sender, &e);
-                        // Resolution failed before the engine appended this intent.
+                    cum_input,
+                    cum_output,
+                    cum_cost,
+                    qualification,
+                    ProjectionReason::Operation { operation },
+                    ContextProjection::Unavailable,
+                );
+                continue;
+            };
+            cmd = *command;
+            foreground = Some((operation, registration));
+        }
+        // A bound mod intent owns the ordinary prompt it expands to, without
+        // releasing ownership or trying to consume its ticket a second time.
+        if foreground.is_some()
+            && let WorkerCommand::ModCommand(mod_name, cmd_name) = &cmd
+            && let Some(body) = mods
+                .iter()
+                .find(|entry| &entry.name == mod_name)
+                .and_then(|entry| entry.commands.get(cmd_name))
+                .cloned()
+        {
+            cmd = WorkerCommand::Prompt(body);
+        }
+        let project_after = matches!(
+            &cmd,
+            WorkerCommand::Prompt(_)
+                | WorkerCommand::PlanPrompt(_)
+                | WorkerCommand::ResumeSession(_)
+                | WorkerCommand::SetModel(_)
+                | WorkerCommand::Effort(_)
+                | WorkerCommand::Undo
+        ) || matches!(&cmd, WorkerCommand::Route(value) if value.trim() == "auto");
+        let mut projection_reason = ProjectionReason::Refresh;
+        let manual_action = match &cmd {
+            WorkerCommand::Compact(_) => Some(ManualAction::Compact),
+            WorkerCommand::ClearSession(_) => Some(ManualAction::Clear),
+            _ => None,
+        };
+        'command: {
+            match cmd {
+                WorkerCommand::Bound { .. } => {
+                    unreachable!("bound commands are unwrapped before admission")
+                }
+                WorkerCommand::PlanPrompt(prompt) => {
+                    let Some(next_turns) = turns.checked_add(1) else {
+                        orbit_hud_tui::emit_error(&ctx.sender, "session turn count overflows");
                         retain_local_intent(&mut transcript, &prompt, None);
-                        save_failed_turn(
+                        save_turn(
                             &config,
                             &lease,
+                            &accounting,
                             &transcript,
-                            (turns, cum_input, cum_output, cum_cost),
+                            turns,
+                            &mut cum_input,
+                            &mut cum_output,
+                            &mut cum_cost,
                             selection_origin,
                             &ctx.sender,
+                            &mut qualification,
+                            false,
                         );
                         orbit_hud_tui::emit_response_finished(
                             &ctx.sender,
@@ -476,30 +664,62 @@ fn worker_main_owned(
                             cum_output,
                             cum_cost,
                         );
-                        if let Ok(mut guard) = cancel_slot.lock() {
-                            *guard = None;
-                        }
-                        continue;
+                        break 'command;
+                    };
+                    let token = orbit_provider_http::CancelToken::new();
+                    if let Ok(mut guard) = cancel_slot.lock() {
+                        *guard = Some(token.clone());
                     }
-                };
-                config.scope = scope;
-                if let Ok(mut guard) = cancel_slot.lock() {
-                    *guard = None;
-                }
-                turns = turns.saturating_add(1);
-                if !ok {
-                    // The engine already retained this attempt. Preserve its
-                    // history and actual accounting without publishing a plan.
-                    cum_input = cum_input.saturating_add(input);
-                    cum_output = cum_output.saturating_add(output);
-                    cum_cost = cum_cost.saturating_add(cost);
-                    save_failed_turn(
+                    let plan_directive = format!(
+                        "{system_prompt}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes; all tool calls will be denied. Explore the problem, then respond with a concise, numbered implementation plan. End with a line: `PLAN READY`."
+                    );
+                    let mut scope = std::mem::take(&mut config.scope);
+                    let completion = run_tui_turn_inner(
+                        &config,
+                        &mut transcript,
+                        &prompt,
+                        None,
+                        &ctx.sender,
+                        &ctx.approvals,
+                        &token,
+                        turns,
+                        &mut auto_grants,
+                        &plan_directive,
+                        true,
+                        &mut scope,
+                        &tool_cx,
+                        Some(accounting.namespace()),
+                    );
+                    config.scope = scope;
+                    if let Ok(mut guard) = cancel_slot.lock() {
+                        *guard = None;
+                    }
+                    let usable_plan = match &completion {
+                        Ok(completion) => {
+                            turns = next_turns;
+                            completion.end == orbit_engine::TurnEnd::Completed
+                                && completion.report.ok
+                                && !completion.report.final_text.trim().is_empty()
+                        }
+                        Err(error) => {
+                            orbit_hud_tui::emit_error(&ctx.sender, error);
+                            retain_local_intent(&mut transcript, &prompt, None);
+                            false
+                        }
+                    };
+                    let saved = save_turn(
                         &config,
                         &lease,
+                        &accounting,
                         &transcript,
-                        (turns, cum_input, cum_output, cum_cost),
+                        turns,
+                        &mut cum_input,
+                        &mut cum_output,
+                        &mut cum_cost,
                         selection_origin,
                         &ctx.sender,
+                        &mut qualification,
+                        false,
                     );
                     orbit_hud_tui::emit_response_finished(
                         &ctx.sender,
@@ -508,66 +728,30 @@ fn worker_main_owned(
                         cum_output,
                         cum_cost,
                     );
-                    continue;
+                    if usable_plan
+                        && saved
+                        && let Ok(completion) = completion
+                    {
+                        orbit_hud_tui::emit_plan_ready(&ctx.sender, &completion.report.final_text);
+                    }
                 }
-                // The plan is HELD for approval — no counters commit, no
-                // session save yet (the plan isn't part of the transcript
-                // until approved and executed).
-                orbit_hud_tui::emit_response_finished(&ctx.sender, "", 0, 0, 0);
-                orbit_hud_tui::emit_plan_ready(&ctx.sender, &plan_text);
-            }
-            WorkerCommand::Prompt(prompt) => {
-                // E7: a new user prompt opens a new checkpoint turn.
-                session_tool_cx.reset_turn_checkpoint();
-                let token = orbit_provider_http::CancelToken::new();
-                if let Ok(mut guard) = cancel_slot.lock() {
-                    *guard = Some(token.clone());
-                }
-                // @file mentions expand through the Read tool before the
-                // turn runs: deny-read, the scanner and the
-                // read-before-edit record all apply to a mention, the
-                // same as to a Read call. The transcript logs the
-                // ORIGINAL prompt (what the operator typed); the
-                // expansion is what the model sees.
-                let expanded = expand_file_mentions(&prompt, &session_tool_cx);
-                let (expanded_prompt, user_blocks) = expanded.into_prompt();
-                if let Some(log) = &transcript_log {
-                    let _ = log.append(&orbit_engine::transcript::TranscriptEvent::UserPrompt {
-                        text: prompt.clone(),
-                    });
-                }
-                let transcript_len_before = transcript.len();
-                let directive = system_prompt.clone();
-                let mut scope = std::mem::take(&mut config.scope);
-                let (_ok, input, output, cost, _final) = match run_tui_turn(
-                    &config,
-                    &mut transcript,
-                    &expanded_prompt,
-                    user_blocks.clone(),
-                    &ctx.sender,
-                    &ctx.approvals,
-                    &token,
-                    turns,
-                    &mut auto_grants,
-                    &directive,
-                    false,
-                    &mut scope,
-                    &tool_cx,
-                ) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        config.scope = scope;
-                        orbit_hud_tui::emit_error(&ctx.sender, &e);
-                        // Keep expanded typed media with the same intent the
-                        // engine would have appended after local resolution.
-                        retain_local_intent(&mut transcript, &expanded_prompt, user_blocks);
-                        save_failed_turn(
+                WorkerCommand::Prompt(prompt) => {
+                    let Some(next_turns) = turns.checked_add(1) else {
+                        orbit_hud_tui::emit_error(&ctx.sender, "session turn count overflows");
+                        retain_local_intent(&mut transcript, &prompt, None);
+                        save_turn(
                             &config,
                             &lease,
+                            &accounting,
                             &transcript,
-                            (turns, cum_input, cum_output, cum_cost),
+                            turns,
+                            &mut cum_input,
+                            &mut cum_output,
+                            &mut cum_cost,
                             selection_origin,
                             &ctx.sender,
+                            &mut qualification,
+                            false,
                         );
                         orbit_hud_tui::emit_response_finished(
                             &ctx.sender,
@@ -576,799 +760,1359 @@ fn worker_main_owned(
                             cum_output,
                             cum_cost,
                         );
-                        if let Ok(mut guard) = cancel_slot.lock() {
-                            *guard = None;
-                        }
-                        continue;
+                        break 'command;
+                    };
+                    // E7: a new user prompt opens a new checkpoint turn.
+                    session_tool_cx.reset_turn_checkpoint();
+                    let token = orbit_provider_http::CancelToken::new();
+                    if let Ok(mut guard) = cancel_slot.lock() {
+                        *guard = Some(token.clone());
                     }
-                };
-                config.scope = scope;
-                if let Ok(mut guard) = cancel_slot.lock() {
-                    *guard = None;
-                }
-                turns = turns.saturating_add(1);
-                // D9: accumulate CUMULATIVE session totals (initial + every
-                // turn this run). The save below persists these, and
-                // ResponseFinished commits them to the TUI so a later resume
-                // shows the full history, not just the last turn.
-                cum_input = cum_input.saturating_add(input);
-                cum_output = cum_output.saturating_add(output);
-                cum_cost = cum_cost.saturating_add(cost);
-                // E10: the attestation scan runs in EVERY front-end —
-                // an unverified claim becomes a visible status, not a
-                // silent exit 0.
-                if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
-                    && scan.claimed_pass
-                    && scan.exit_code != 0
-                {
-                    orbit_hud_tui::emit_status(
+                    // @file mentions expand through the Read tool before the
+                    // turn runs: deny-read, the scanner and the
+                    // read-before-edit record all apply to a mention, the
+                    // same as to a Read call. The transcript logs the
+                    // ORIGINAL prompt (what the operator typed); the
+                    // expansion is what the model sees.
+                    let expanded = expand_file_mentions(&prompt, &session_tool_cx);
+                    let (expanded_prompt, user_blocks) = expanded.into_prompt();
+                    if let Some(log) = &transcript_log {
+                        let _ =
+                            log.append(&orbit_engine::transcript::TranscriptEvent::UserPrompt {
+                                text: prompt.clone(),
+                            });
+                    }
+                    let transcript_len_before = transcript.len();
+                    let directive = system_prompt.clone();
+                    let mut scope = std::mem::take(&mut config.scope);
+                    let completion = run_tui_turn_inner(
+                        &config,
+                        &mut transcript,
+                        &expanded_prompt,
+                        user_blocks.clone(),
                         &ctx.sender,
-                        &format!(
-                            "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
-                            scan.command, scan.exit_code
-                        ),
+                        &ctx.approvals,
+                        &token,
+                        turns,
+                        &mut auto_grants,
+                        &directive,
+                        false,
+                        &mut scope,
+                        &tool_cx,
+                        Some(accounting.namespace()),
                     );
-                }
-                // Always emit ResponseFinished — the TUI's turn_in_flight flag
-                // and queue drain both depend on it, whether the turn
-                // completed, was cancelled by the operator, or errored. The
-                // reducer stamps a "cancelled" note when cancel_requested was
-                // set.
-                orbit_hud_tui::emit_response_finished(
-                    &ctx.sender,
-                    "",
-                    cum_input,
-                    cum_output,
-                    cum_cost,
-                );
-                // D9 (§13.5 rule 5): save with CUMULATIVE totals — the
-                // resumed baseline plus every turn this run — so a
-                // save/resume/save cycle accumulates instead of
-                // overwriting, and turns reflects the full count.
-                let sf = crate::sessions::SessionFile::from_chat(
-                    &config.session_id,
-                    &config.model,
-                    &config.gate,
-                    &config.provider_id,
-                    &transcript,
-                    turns,
-                    cum_input,
-                    cum_output,
-                    cum_cost,
-                )
-                .with_effort(config.effort.clone())
-                .with_selection_origin(selection_origin);
-                if let Err(e) = lease.save(&sf) {
-                    orbit_hud_tui::emit_error(
-                        &ctx.sender,
-                        &format!("warning: session not saved: {e}"),
-                    );
-                }
-                // The JSONL transcript: assistant blocks + tool results
-                // for the turn just finished, in order.
-                if let Some(log) = &transcript_log {
-                    for m in transcript.iter().skip(transcript_len_before) {
-                        match m.role {
-                            ChatRole::Assistant => {
-                                let calls: Vec<orbit_engine::transcript::ToolCallRecord> = m
-                                    .tool_calls
-                                    .as_ref()
-                                    .map(|tcs| {
-                                        tcs.iter()
-                                            .map(|tc| orbit_engine::transcript::ToolCallRecord {
-                                                id: tc.id.clone(),
-                                                name: tc.name.clone(),
-                                                arguments: tc.arguments.clone(),
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let _ = log.append(
-                                    &orbit_engine::transcript::TranscriptEvent::Assistant {
-                                        text: m.content.clone(),
-                                        tool_calls: calls,
-                                    },
-                                );
-                            }
-                            ChatRole::Tool => {
-                                let _ = log.append(
-                                    &orbit_engine::transcript::TranscriptEvent::ToolResult {
-                                        call_id: m.tool_call_id.clone().unwrap_or_default(),
-                                        content: m.tool_result.clone().unwrap_or_default(),
-                                    },
-                                );
-                            }
-                            _ => {}
+                    config.scope = scope;
+                    if let Ok(mut guard) = cancel_slot.lock() {
+                        *guard = None;
+                    }
+                    match completion {
+                        Ok(_) => turns = next_turns,
+                        Err(error) => {
+                            orbit_hud_tui::emit_error(&ctx.sender, &error);
+                            retain_local_intent(&mut transcript, &expanded_prompt, user_blocks);
                         }
                     }
-                }
-            }
-            WorkerCommand::SetModel(model) => {
-                if model.is_empty() {
-                    continue;
-                }
-                let providers = match crate::config::ProvidersConfig::load(&config.home) {
-                    Ok(providers) => providers,
-                    Err(error) => {
-                        ctx.sender
-                            .send(Msg::EffortStatus(format!("Model unchanged:\n{error}")));
-                        continue;
-                    }
-                };
-                let selected = match crate::resolve_selected_model(&providers, &model, None, false)
-                {
-                    Ok(selected) => selected,
-                    Err(error) => {
-                        ctx.sender
-                            .send(Msg::EffortStatus(format!("Model unchanged:\n{error}")));
-                        continue;
-                    }
-                };
-                let mut candidate = config.clone();
-                candidate.model = selected.raw_model;
-                candidate.provider_id = selected.provider_id;
-                candidate.gate = selected.url;
-                let resolved = match configured_turn(&candidate) {
-                    Ok(turn) => turn,
-                    Err(e) => {
-                        ctx.sender.send(Msg::EffortStatus(format!(
-                            "Model unchanged:\n{e}\nUse /effort default before switching."
-                        )));
-                        continue;
-                    }
-                };
-                if !save_controls(
-                    &candidate,
-                    &lease,
-                    &transcript,
-                    turns,
-                    cum_input,
-                    cum_output,
-                    cum_cost,
-                    &ctx.sender,
-                    crate::phase_routing::SelectionOrigin::Interactive,
-                ) {
-                    continue;
-                }
-                selection_origin = crate::phase_routing::SelectionOrigin::Interactive;
-                let old = config.model.clone();
-                candidate.provider_id = resolved.provider_id;
-                candidate.gate = resolved.gate;
-                config = candidate;
-                let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
-                tool_cx.set_ext(MemoryBytes(built.memory_bytes));
-                system_prompt = built.text;
-                ctx.sender.send(Msg::ModelChanged(config.model.clone()));
-                orbit_hud_tui::emit_status(&ctx.sender, &format!("model → {model} (was {old})"));
-            }
-            WorkerCommand::Effort(value) => {
-                let mut candidate = config.clone();
-                if !value.is_empty() {
-                    match crate::parse_effort_setting(&value) {
-                        Ok(choice) => candidate.effort = Some(choice),
-                        Err(e) => {
-                            ctx.sender
-                                .send(Msg::EffortStatus(format!("Effort unchanged:\n{e}")));
-                            continue;
-                        }
-                    }
-                }
-                match configured_turn(&candidate) {
-                    Ok(turn) => {
-                        if !value.is_empty() {
-                            if !save_controls(
-                                &candidate,
-                                &lease,
-                                &transcript,
-                                turns,
-                                cum_input,
-                                cum_output,
-                                cum_cost,
-                                &ctx.sender,
-                                selection_origin,
-                            ) {
-                                continue;
-                            }
-                            config = candidate;
-                        }
-                        ctx.sender
-                            .send(Msg::EffortStatus(crate::effort_status(&config.home, &turn)));
-                    }
-                    Err(e) => ctx
-                        .sender
-                        .send(Msg::EffortStatus(format!("Effort unchanged:\n{e}"))),
-                }
-            }
-            WorkerCommand::Route(argument) => {
-                let words: Vec<String> = argument.split_whitespace().map(str::to_owned).collect();
-                let base = match configured_turn(&config) {
-                    Ok(base) => base,
-                    Err(error) => {
-                        ctx.sender
-                            .send(Msg::SystemMessage(format!("route: {error}")));
-                        continue;
-                    }
-                };
-                if words.as_slice() == ["auto"] {
-                    let validation = crate::route_command(
-                        &config.home,
-                        &["status".into()],
-                        Some(&base),
-                        selection_origin,
-                    );
-                    if let Err(error) = validation {
-                        ctx.sender
-                            .send(Msg::SystemMessage(format!("routing unchanged: {error}")));
-                        continue;
-                    }
-                    if save_controls(
+                    save_turn(
                         &config,
                         &lease,
+                        &accounting,
                         &transcript,
                         turns,
+                        &mut cum_input,
+                        &mut cum_output,
+                        &mut cum_cost,
+                        selection_origin,
+                        &ctx.sender,
+                        &mut qualification,
+                        false,
+                    );
+                    // E10: the attestation scan runs in EVERY front-end —
+                    // an unverified claim becomes a visible status, not a
+                    // silent exit 0.
+                    if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
+                        && scan.claimed_pass
+                        && scan.exit_code != 0
+                    {
+                        orbit_hud_tui::emit_status(
+                            &ctx.sender,
+                            &format!(
+                                "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
+                                scan.command, scan.exit_code
+                            ),
+                        );
+                    }
+                    // Always emit ResponseFinished — the TUI's turn_in_flight flag
+                    // and queue drain both depend on it, whether the turn
+                    // completed, was cancelled by the operator, or errored. The
+                    // reducer stamps a "cancelled" note when cancel_requested was
+                    // set.
+                    orbit_hud_tui::emit_response_finished(
+                        &ctx.sender,
+                        "",
                         cum_input,
                         cum_output,
                         cum_cost,
-                        &ctx.sender,
-                        crate::phase_routing::SelectionOrigin::Default,
-                    ) {
-                        selection_origin = crate::phase_routing::SelectionOrigin::Default;
-                        ctx.sender.send(Msg::Routing(Vec::new()));
-                        ctx.sender.send(Msg::SystemMessage(
-                            "Automatic routing enabled for this session".into(),
-                        ));
-                    }
-                } else {
-                    match crate::route_command(&config.home, &words, Some(&base), selection_origin)
-                    {
-                        Ok(value) => ctx.sender.send(Msg::SystemMessage(
-                            serde_json::to_string_pretty(&value).unwrap_or_default(),
-                        )),
-                        Err(error) => ctx
-                            .sender
-                            .send(Msg::SystemMessage(format!("route: {error}"))),
-                    }
-                }
-            }
-            WorkerCommand::ListModels => {
-                let cfg = crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
-                let entries = cfg.all_models();
-                let text = if entries.is_empty() {
-                    "(no providers configured)".into()
-                } else {
-                    entries
-                        .iter()
-                        .map(|(p, m)| format!("{p} \t{m}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                ctx.sender.send(Msg::SystemMessage(text));
-            }
-            WorkerCommand::ListSessions => {
-                let text = match crate::sessions::list_sessions(&config.home) {
-                    Ok(list) if list.is_empty() => "(no saved sessions)".into(),
-                    Ok(list) => list
-                        .iter()
-                        .map(|s| {
-                            format!(
-                                "{} \tmodel={} \tturns={} \tupdated={}",
-                                s.session_id, s.model, s.turns, s.updated_at
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    Err(e) => format!("error listing sessions: {e}"),
-                };
-                ctx.sender.send(Msg::SystemMessage(text));
-            }
-            WorkerCommand::ResumeSession(id) => {
-                let target = if id.strip_suffix(".json").unwrap_or(&id) == lease.session_id() {
-                    lease.load().map(|saved| (None, saved))
-                } else {
-                    crate::sessions::SessionLease::acquire_and_load(&config.home, &id, "tui")
-                        .map(|(guard, saved)| (Some(guard), saved))
-                };
-                match target {
-                    Ok((candidate_lease, s)) => {
-                        let mut candidate = config.clone();
-                        candidate.session_id = s.session_id.clone();
-                        candidate.model = s.model.clone();
-                        candidate.gate = s.gate.clone();
-                        candidate.provider_id = s.provider.clone();
-                        candidate.effort = s.effort.clone();
-                        match configured_turn(&candidate) {
-                            Ok(turn) => {
-                                candidate.gate = turn.gate;
-                                candidate.provider_id = turn.provider_id;
-                            }
-                            Err(e) => {
-                                ctx.sender
-                                    .send(Msg::SystemMessage(format!("cannot resume {id}: {e}")));
-                                continue;
+                    );
+                    // The JSONL transcript: assistant blocks + tool results
+                    // for the turn just finished, in order.
+                    if let Some(log) = &transcript_log {
+                        for m in transcript.iter().skip(transcript_len_before) {
+                            match m.role {
+                                ChatRole::Assistant => {
+                                    let calls: Vec<orbit_engine::transcript::ToolCallRecord> = m
+                                        .tool_calls
+                                        .as_ref()
+                                        .map(|tcs| {
+                                            tcs.iter()
+                                                .map(|tc| {
+                                                    orbit_engine::transcript::ToolCallRecord {
+                                                        id: tc.id.clone(),
+                                                        name: tc.name.clone(),
+                                                        arguments: tc.arguments.clone(),
+                                                    }
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let _ = log.append(
+                                        &orbit_engine::transcript::TranscriptEvent::Assistant {
+                                            text: m.content.clone(),
+                                            tool_calls: calls,
+                                        },
+                                    );
+                                }
+                                ChatRole::Tool => {
+                                    let _ = log.append(
+                                        &orbit_engine::transcript::TranscriptEvent::ToolResult {
+                                            call_id: m.tool_call_id.clone().unwrap_or_default(),
+                                            content: m.tool_result.clone().unwrap_or_default(),
+                                        },
+                                    );
+                                }
+                                _ => {}
                             }
                         }
-                        let candidate_log = match orbit_engine::transcript::Transcript::open(
-                            &config.home,
-                            &s.session_id,
-                        ) {
-                            Ok(log) => log,
+                    }
+                }
+                WorkerCommand::SetModel(model) => {
+                    if model.is_empty() {
+                        break 'command;
+                    }
+                    let providers = match crate::config::ProvidersConfig::load(&config.home) {
+                        Ok(providers) => providers,
+                        Err(error) => {
+                            ctx.sender
+                                .send(Msg::EffortStatus(format!("Model unchanged:\n{error}")));
+                            break 'command;
+                        }
+                    };
+                    let selected =
+                        match crate::resolve_selected_model(&providers, &model, None, false) {
+                            Ok(selected) => selected,
                             Err(error) => {
-                                ctx.sender.send(Msg::SystemMessage(format!(
-                                    "cannot resume {id}: transcript: {error}"
-                                )));
-                                continue;
+                                ctx.sender
+                                    .send(Msg::EffortStatus(format!("Model unchanged:\n{error}")));
+                                break 'command;
                             }
                         };
-                        transcript_log = Some(candidate_log);
-                        selection_origin = crate::sessions::model_origin(Some(&s));
-                        ctx.sender.send(Msg::Routing(Vec::new()));
-                        config = candidate;
-                        if let Some(candidate_lease) = candidate_lease {
-                            lease = candidate_lease;
+                    let mut candidate = config.clone();
+                    candidate.model = selected.raw_model;
+                    candidate.provider_id = selected.provider_id;
+                    candidate.gate = selected.url;
+                    let resolved = match configured_turn(&candidate) {
+                        Ok(turn) => turn,
+                        Err(e) => {
+                            ctx.sender.send(Msg::EffortStatus(format!(
+                                "Model unchanged:\n{e}\nUse /effort default before switching."
+                            )));
+                            break 'command;
                         }
-                        transcript = s.to_transcript();
-                        turns = s.turns;
-                        config.session_id = s.session_id.clone();
-                        config.model = s.model.clone();
-                        tool_cx = session_tool_context(&config, &ctx.sender);
-                        session_tool_cx = orbit_tools::ToolContext::new(
-                            config.home.clone(),
-                            config.session_id.clone(),
-                            tool_cx.working_dir.clone(),
+                    };
+                    if !save_controls(
+                        &candidate,
+                        &lease,
+                        &accounting,
+                        &transcript,
+                        turns,
+                        &mut cum_input,
+                        &mut cum_output,
+                        &mut cum_cost,
+                        &ctx.sender,
+                        crate::phase_routing::SelectionOrigin::Interactive,
+                        &mut qualification,
+                    ) {
+                        break 'command;
+                    }
+                    selection_origin = crate::phase_routing::SelectionOrigin::Interactive;
+                    let old = config.model.clone();
+                    candidate.provider_id = resolved.provider_id;
+                    candidate.gate = resolved.gate;
+                    config = candidate;
+                    let built =
+                        build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                    tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                    system_prompt = built.text;
+                    ctx.sender.send(Msg::ModelChanged(config.model.clone()));
+                    orbit_hud_tui::emit_status(
+                        &ctx.sender,
+                        &format!("model → {model} (was {old})"),
+                    );
+                }
+                WorkerCommand::Effort(value) => {
+                    let mut candidate = config.clone();
+                    if !value.is_empty() {
+                        match crate::parse_effort_setting(&value) {
+                            Ok(choice) => candidate.effort = Some(choice),
+                            Err(e) => {
+                                ctx.sender
+                                    .send(Msg::EffortStatus(format!("Effort unchanged:\n{e}")));
+                                break 'command;
+                            }
+                        }
+                    }
+                    match configured_turn(&candidate) {
+                        Ok(turn) => {
+                            if !value.is_empty() {
+                                if !save_controls(
+                                    &candidate,
+                                    &lease,
+                                    &accounting,
+                                    &transcript,
+                                    turns,
+                                    &mut cum_input,
+                                    &mut cum_output,
+                                    &mut cum_cost,
+                                    &ctx.sender,
+                                    selection_origin,
+                                    &mut qualification,
+                                ) {
+                                    break 'command;
+                                }
+                                config = candidate;
+                            }
+                            ctx.sender
+                                .send(Msg::EffortStatus(crate::effort_status(&config.home, &turn)));
+                        }
+                        Err(e) => ctx
+                            .sender
+                            .send(Msg::EffortStatus(format!("Effort unchanged:\n{e}"))),
+                    }
+                }
+                WorkerCommand::Route(argument) => {
+                    let words: Vec<String> =
+                        argument.split_whitespace().map(str::to_owned).collect();
+                    let base = match configured_turn(&config) {
+                        Ok(base) => base,
+                        Err(error) => {
+                            ctx.sender
+                                .send(Msg::SystemMessage(format!("route: {error}")));
+                            break 'command;
+                        }
+                    };
+                    if words.as_slice() == ["auto"] {
+                        let validation = crate::route_command(
+                            &config.home,
+                            &["status".into()],
+                            Some(&base),
+                            selection_origin,
                         );
-                        let built =
-                            build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
-                        tool_cx.set_ext(MemoryBytes(built.memory_bytes));
-                        system_prompt = built.text;
-                        let lines = session_to_transcript_lines(&s.transcript);
-                        ctx.sender.send(Msg::TranscriptLoaded {
-                            lines,
-                            input_tokens: s.input_tokens,
-                            output_tokens: s.output_tokens,
-                            cost_microcents: s.cost_microcents,
-                            turns: s.turns,
-                        });
-                        ctx.sender.send(Msg::Identity {
-                            model: s.model.clone(),
-                            provider: s.provider.clone(),
-                            session_prefix: short_session_id(&s.session_id),
-                            session_id: s.session_id.clone(),
-                            // D18: priced stays true unless we know the
-                            // resumed model is unpriced.
-                            priced: crate::config::ProvidersConfig::load(&config.home)
-                                .ok()
-                                .and_then(|cfg| cfg.pricing_for_model(&s.model))
-                                .is_some(),
-                        });
-                        // D9: the resumed session's totals become the new
-                        // baseline — the next save carries them plus whatever
-                        // this run adds.
-                        cum_input = s.input_tokens;
-                        cum_output = s.output_tokens;
-                        cum_cost = s.cost_microcents;
-                        // D8: resuming into a different session clears any
-                        // R-grants made in the previous one.
-                        auto_grants = crate::tool_runtime::AutoGrants::new();
-                    }
-                    Err(e) => {
-                        ctx.sender
-                            .send(Msg::SystemMessage(format!("cannot resume {id}: {e}")));
-                    }
-                }
-            }
-            WorkerCommand::Compact => {
-                // Claude Code `/compact`: fold the transcript into a single
-                // summary message via the provider, replacing the working
-                // transcript. The session FILE keeps the full history; only
-                // the in-memory context window shrinks. A no-op on an empty
-                // or single-message transcript.
-                let worth_compacting = transcript
-                    .iter()
-                    .filter(|m| matches!(m.role, ChatRole::User | ChatRole::Assistant))
-                    .count()
-                    >= 2;
-                if !worth_compacting {
-                    ctx.sender.send(Msg::SystemMessage(
-                        "nothing to compact yet (need at least one exchange)".into(),
-                    ));
-                    continue;
-                }
-                // Render the transcript as the model's own conversation,
-                // dropping tool plumbing (ids/results carry no context value
-                // at summary time; the file retains them).
-                let mut dump = String::new();
-                for m in &transcript {
-                    match m.role {
-                        ChatRole::User => {
-                            dump.push_str("USER: ");
-                            dump.push_str(&m.content);
+                        if let Err(error) = validation {
+                            ctx.sender
+                                .send(Msg::SystemMessage(format!("routing unchanged: {error}")));
+                            break 'command;
                         }
-                        ChatRole::Assistant => {
-                            dump.push_str("ASSISTANT: ");
-                            dump.push_str(&m.content);
-                        }
-                        _ => continue,
-                    }
-                    if let Some(calls) = &m.tool_calls {
-                        for c in calls {
-                            dump.push_str(&format!(
-                                "
-  [tool {} {}]",
-                                c.name, c.arguments
+                        if save_controls(
+                            &config,
+                            &lease,
+                            &accounting,
+                            &transcript,
+                            turns,
+                            &mut cum_input,
+                            &mut cum_output,
+                            &mut cum_cost,
+                            &ctx.sender,
+                            crate::phase_routing::SelectionOrigin::Default,
+                            &mut qualification,
+                        ) {
+                            selection_origin = crate::phase_routing::SelectionOrigin::Default;
+                            ctx.sender.send(Msg::Routing(Vec::new()));
+                            ctx.sender.send(Msg::SystemMessage(
+                                "Automatic routing enabled for this session".into(),
                             ));
                         }
-                    }
-                    dump.push('\n');
-                }
-                let prompt = format!(
-                    "Summarize the conversation below for handoff to a fresh context window. Preserve: the user's goal, decisions made, file paths and identifiers mentioned, open questions, and the next step. Reply with the summary only.
-
-{dump}"
-                );
-                ctx.sender.send(Msg::SystemMessage("compacting…".into()));
-                let token = orbit_provider_http::CancelToken::new();
-                if let Ok(mut guard) = cancel_slot.lock() {
-                    *guard = Some(token.clone());
-                }
-                let outcome = configured_turn(&config)
-                    .and_then(|turn| crate::try_role_turn_config(&config.home, &turn, "compaction"))
-                    .map_err(|e| ("ORBIT-E0401", e))
-                    .and_then(|turn| {
-                        orbit_engine::run_dispatch(
+                    } else {
+                        match crate::route_command(
                             &config.home,
-                            &turn,
-                            &prompt,
-                            Some(vec![]),
-                            None,
-                            token.clone(),
-                            vec![],
-                            "orbit-compact",
-                            &config.session_id,
-                        )
-                    });
-                if let Ok(mut guard) = cancel_slot.lock() {
-                    *guard = None;
+                            &words,
+                            Some(&base),
+                            selection_origin,
+                        ) {
+                            Ok(value) => ctx.sender.send(Msg::SystemMessage(
+                                serde_json::to_string_pretty(&value).unwrap_or_default(),
+                            )),
+                            Err(error) => ctx
+                                .sender
+                                .send(Msg::SystemMessage(format!("route: {error}"))),
+                        }
+                    }
                 }
-                match outcome {
-                    Ok(o) if !o.output.trim().is_empty() && o.tool_calls.is_empty() => {
-                        let before = transcript.len();
-                        // Replace the entire transcript with ONE summary
-                        // message. The model sees: summary + (next prompt).
-                        let summary = format!(
-                            "[context compacted from {before} messages]
-
-{}",
-                            o.output.trim()
-                        );
-                        transcript.clear();
-                        transcript.push(ChatMessage {
-                            role: ChatRole::User,
-                            content: summary,
-                            tool_calls: None,
-                            tool_call_id: None,
-                            tool_result: None,
-                            blocks: None,
-                            origin_model: None,
-                            origin_provider: None,
-                        });
-                        // Usage counts for the compaction request itself.
-                        cum_input = cum_input.saturating_add(o.input_tokens);
-                        cum_output = cum_output.saturating_add(o.output_tokens);
-                        cum_cost = cum_cost.saturating_add(o.cost_microcents);
-                        ctx.sender.send(Msg::SystemMessage(format!(
-                            "compacted {} messages → 1 (summary {} chars)",
-                            before,
-                            o.output.trim().chars().count()
-                        )));
-                        // Persist the compacted state so a resume doesn't
-                        // resurrect the full transcript.
-                        let sf = crate::sessions::SessionFile::from_chat(
-                            &config.session_id,
-                            &config.model,
-                            &config.gate,
-                            &config.provider_id,
+                WorkerCommand::ListModels => {
+                    let cfg =
+                        crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
+                    let entries = cfg.all_models();
+                    let text = if entries.is_empty() {
+                        "(no providers configured)".into()
+                    } else {
+                        entries
+                            .iter()
+                            .map(|(p, m)| format!("{p} \t{m}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    ctx.sender.send(Msg::SystemMessage(text));
+                }
+                WorkerCommand::ListSessions => {
+                    let text = match crate::sessions::list_sessions(&config.home) {
+                        Ok(list) if list.is_empty() => "(no saved sessions)".into(),
+                        Ok(list) => list
+                            .iter()
+                            .map(|s| {
+                                format!(
+                                    "{} \tmodel={} \tturns={} \tupdated={}",
+                                    s.session_id, s.model, s.turns, s.updated_at
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        Err(e) => format!("error listing sessions: {e}"),
+                    };
+                    ctx.sender.send(Msg::SystemMessage(text));
+                }
+                WorkerCommand::ResumeSession(id) => {
+                    let same_id = id.strip_suffix(".json").unwrap_or(&id) == lease.session_id();
+                    let target = if same_id {
+                        lease.load().map(|saved| (None, saved))
+                    } else {
+                        crate::sessions::SessionLease::acquire_and_load(&config.home, &id, "tui")
+                            .map(|(guard, saved)| (Some(guard), saved))
+                    };
+                    match target {
+                        Ok((candidate_lease, mut saved)) => {
+                            let mut candidate = config.clone();
+                            candidate.session_id = saved.session_id.clone();
+                            candidate.model = saved.model.clone();
+                            candidate.gate = saved.gate.clone();
+                            candidate.provider_id = saved.provider.clone();
+                            candidate.effort = saved.effort.clone();
+                            let resolved = match configured_turn(&candidate) {
+                                Ok(turn) => turn,
+                                Err(_) => {
+                                    orbit_hud_tui::emit_status(
+                                        &ctx.sender,
+                                        "resume refused: model configuration unavailable",
+                                    );
+                                    break 'command;
+                                }
+                            };
+                            candidate.gate = resolved.gate;
+                            candidate.provider_id = resolved.provider_id;
+                            let candidate_binding = if same_id {
+                                binding.clone()
+                            } else {
+                                let Some(generation) = binding.generation.checked_add(1) else {
+                                    orbit_hud_tui::emit_status(
+                                        &ctx.sender,
+                                        "resume refused: session generation exhausted",
+                                    );
+                                    break 'command;
+                                };
+                                SessionBinding {
+                                    session_id: candidate.session_id.clone(),
+                                    generation,
+                                }
+                            };
+                            let candidate_log = match orbit_engine::transcript::Transcript::open(
+                                &config.home,
+                                &saved.session_id,
+                            ) {
+                                Ok(log) => log,
+                                Err(_) => {
+                                    orbit_hud_tui::emit_status(
+                                        &ctx.sender,
+                                        "resume refused: transcript unavailable",
+                                    );
+                                    break 'command;
+                                }
+                            };
+                            let candidate_accounting = match session_accounting::prepare_root(
+                                candidate_lease.as_ref().unwrap_or(&lease),
+                                &mut saved,
+                                RootOrigin::RestoredOrLegacy,
+                            ) {
+                                Ok(accounting) => accounting,
+                                Err(_) => {
+                                    if same_id {
+                                        qualification = CostQualification::Unavailable;
+                                    }
+                                    orbit_hud_tui::emit_status(
+                                        &ctx.sender,
+                                        "resume refused: accounting cannot be verified",
+                                    );
+                                    break 'command;
+                                }
+                            };
+                            let mut candidate_cx = session_tool_context(&candidate, &ctx.sender);
+                            candidate_cx.working_dir = tool_cx.working_dir.clone();
+                            let built = build_session_prompt(
+                                &config.home,
+                                &candidate.model,
+                                &mods,
+                                &mods_enabled,
+                            );
+                            candidate_cx.set_ext(MemoryBytes(built.memory_bytes));
+                            let candidate_session_cx = orbit_tools::ToolContext::new(
+                                candidate.home.clone(),
+                                candidate.session_id.clone(),
+                                tool_cx.working_dir.clone(),
+                            );
+                            let previous = binding.clone();
+                            qualification = checked_cost(&candidate_accounting, &saved, true);
+                            accounting = candidate_accounting;
+                            transcript_log = Some(candidate_log);
+                            config = candidate;
+                            if let Some(candidate_lease) = candidate_lease {
+                                lease = candidate_lease;
+                            }
+                            transcript = saved.to_transcript();
+                            turns = saved.turns;
+                            cum_input = saved.input_tokens;
+                            cum_output = saved.output_tokens;
+                            cum_cost = saved.cost_microcents;
+                            selection_origin = crate::sessions::model_origin(Some(&saved));
+                            system_prompt = built.text;
+                            if !same_id {
+                                tool_cx = candidate_cx;
+                                session_tool_cx = candidate_session_cx;
+                                auto_grants = crate::tool_runtime::AutoGrants::new();
+                                projection_reason = ProjectionReason::Resume { previous };
+                            }
+                            binding = candidate_binding;
+                        }
+                        Err(_) => {
+                            if same_id {
+                                qualification = CostQualification::Unavailable;
+                            }
+                            orbit_hud_tui::emit_status(
+                                &ctx.sender,
+                                "resume refused: saved session unavailable or busy",
+                            );
+                        }
+                    }
+                }
+                WorkerCommand::Compact(operation) | WorkerCommand::ClearSession(operation) => {
+                    let expected = manual_action.unwrap_or(ManualAction::Compact);
+                    let valid = operation.source() == &binding && operation.action() == expected;
+                    let token = orbit_provider_http::CancelToken::new();
+                    let registration = if valid {
+                        operation
+                            .install_cancel(std::sync::Arc::new({
+                                let token = token.clone();
+                                move || token.cancel()
+                            }))
+                            .ok()
+                    } else {
+                        None
+                    };
+                    if let Some(registration) = registration {
+                        if let Ok(mut slot) = cancel_slot.lock() {
+                            *slot = Some(token.clone());
+                        }
+                        let scope_guard = ToolCancelScope::new(&tool_cx, &token);
+                        let original_source = serde_json::to_vec(&transcript).ok();
+                        let mut applied = false;
+                        let outcome;
+                        if expected == ManualAction::Compact {
+                            let result = compact_manual(
+                                &config,
+                                &accounting,
+                                &mut transcript,
+                                &tool_cx,
+                                &mods,
+                                &mods_enabled,
+                                &token,
+                                &ctx.sender,
+                            );
+                            let saved = save_turn(
+                                &config,
+                                &lease,
+                                &accounting,
+                                &transcript,
+                                turns,
+                                &mut cum_input,
+                                &mut cum_output,
+                                &mut cum_cost,
+                                selection_origin,
+                                &ctx.sender,
+                                &mut qualification,
+                                true,
+                            );
+                            let checkpoint = accounting.namespace().checkpoint_detailed();
+                            let uncertain = !matches!(&checkpoint, Ok(cp) if cp.pending().is_none()
+                            && cp.totals().knownness != orbit_engine::AccountingKnownness::Uncertain);
+                            if !matches!(&checkpoint, Ok(cp) if qualification.revision() == Some(cp.revision().0)
+                            && ((cp.pending().is_none() && cp.totals().knownness != orbit_engine::AccountingKnownness::Uncertain)
+                                || matches!(qualification, CostQualification::Uncertain { .. })))
+                            {
+                                qualification = CostQualification::Unavailable;
+                            }
+                            match result {
+                                Ok(completion) => {
+                                    applied = completion.applied;
+                                    outcome = if !saved || uncertain {
+                                        ManualOutcome::Unknown
+                                    } else if completion.status
+                                        == orbit_engine::CompactionStatus::Cancelled
+                                    {
+                                        ManualOutcome::Cancelled
+                                    } else if completion.applied
+                                        || completion.status
+                                            == orbit_engine::CompactionStatus::NothingToCompact
+                                    {
+                                        ManualOutcome::Completed
+                                    } else {
+                                        ManualOutcome::Failed
+                                    };
+                                }
+                                Err(_) => {
+                                    outcome = if !saved || uncertain {
+                                        ManualOutcome::Unknown
+                                    } else if token.is_cancelled() {
+                                        ManualOutcome::Cancelled
+                                    } else {
+                                        ManualOutcome::Failed
+                                    };
+                                }
+                            }
+                        } else {
+                            let previous_id = binding.session_id.clone();
+                            let clear = stage_clear(
+                                &config,
+                                &lease,
+                                &accounting,
+                                &transcript,
+                                turns,
+                                &mut cum_input,
+                                &mut cum_output,
+                                &mut cum_cost,
+                                selection_origin,
+                                &binding,
+                                &token,
+                            );
+                            match clear {
+                                Ok(candidate) => {
+                                    let mut new_tool_cx =
+                                        session_tool_context(&candidate.config, &ctx.sender);
+                                    new_tool_cx.working_dir = tool_cx.working_dir.clone();
+                                    new_tool_cx.set_ext(MemoryBytes(
+                                        tool_cx.ext::<MemoryBytes>().map_or(0, |bytes| bytes.0),
+                                    ));
+                                    let new_session_cx = orbit_tools::ToolContext::new(
+                                        candidate.config.home.clone(),
+                                        candidate.config.session_id.clone(),
+                                        tool_cx.working_dir.clone(),
+                                    );
+                                    if token.is_cancelled() {
+                                        qualification = CostQualification::Unavailable;
+                                        outcome = ManualOutcome::Cancelled;
+                                        orbit_hud_tui::emit_status(
+                                            &ctx.sender,
+                                            &format!(
+                                                "clear cancelled; current session retained; candidate {} contains staged files",
+                                                candidate.binding.session_id
+                                            ),
+                                        );
+                                    } else {
+                                        // All fallible candidate work is complete before this identity swap.
+                                        config = candidate.config;
+                                        lease = candidate.lease;
+                                        accounting = candidate.accounting;
+                                        qualification = candidate.cost;
+                                        binding = candidate.binding;
+                                        transcript_log = Some(candidate.log);
+                                        tool_cx = new_tool_cx;
+                                        session_tool_cx = new_session_cx;
+                                        auto_grants = crate::tool_runtime::AutoGrants::new();
+                                        transcript.clear();
+                                        turns = 0;
+                                        cum_input = 0;
+                                        cum_output = 0;
+                                        cum_cost = 0;
+                                        applied = true;
+                                        outcome = ManualOutcome::Completed;
+                                        orbit_hud_tui::emit_status(
+                                            &ctx.sender,
+                                            &format!(
+                                                "new session started; previous session {previous_id} retained"
+                                            ),
+                                        );
+                                    }
+                                }
+                                Err(failure) => {
+                                    qualification =
+                                        failure.cost.unwrap_or(CostQualification::Unavailable);
+                                    outcome = if token.is_cancelled() {
+                                        ManualOutcome::Cancelled
+                                    } else if failure.uncertain {
+                                        ManualOutcome::Unknown
+                                    } else {
+                                        ManualOutcome::Failed
+                                    };
+                                    orbit_hud_tui::emit_status(&ctx.sender, &failure.message);
+                                }
+                            }
+                        }
+                        drop(scope_guard);
+                        if let Ok(mut slot) = cancel_slot.lock() {
+                            *slot = None;
+                        }
+                        drop(registration);
+                        let context = if expected == ManualAction::Compact
+                            && !applied
+                            && original_source.is_some_and(|before| {
+                                serde_json::to_vec(&transcript).is_ok_and(|after| after == before)
+                            }) {
+                            ContextProjection::PreserveUnchanged
+                        } else {
+                            ContextProjection::Unavailable
+                        };
+                        emit_session_projection(
+                            &ctx.sender,
+                            &config,
+                            &binding,
                             &transcript,
                             turns,
                             cum_input,
                             cum_output,
                             cum_cost,
-                        )
-                        .with_effort(config.effort.clone())
-                        .with_selection_origin(selection_origin);
-                        if let Err(e) = lease.save(&sf) {
-                            orbit_hud_tui::emit_error(
-                                &ctx.sender,
-                                &format!("warning: session not saved: {e}"),
-                            );
+                            qualification,
+                            ProjectionReason::Manual {
+                                operation,
+                                outcome,
+                                applied,
+                            },
+                            context,
+                        );
+                        if expected == ManualAction::Compact {
+                            let text = match outcome {
+                                ManualOutcome::Completed if applied => "context compacted",
+                                ManualOutcome::Completed => "nothing to compact",
+                                ManualOutcome::Cancelled => {
+                                    "compaction cancelled; history retained"
+                                }
+                                ManualOutcome::Failed => "compaction refused; history retained",
+                                ManualOutcome::Unknown if applied => {
+                                    "context applied in memory; inspect the saved outcome before continuing"
+                                }
+                                ManualOutcome::Unknown => {
+                                    "compaction accounting is uncertain; inspect before continuing"
+                                }
+                            };
+                            ctx.sender.send(Msg::SystemMessage(text.into()));
                         }
-                    }
-                    Ok(_) => {
-                        ctx.sender
-                            .send(Msg::SystemMessage("compact failed: empty summary".into()));
-                    }
-                    Err((code, msg)) => {
-                        orbit_hud_tui::emit_error(&ctx.sender, &format!("{code}: {msg}"));
-                    }
-                }
-            }
-            WorkerCommand::ListInstalledMods => {
-                if crate::mods::validation_status(&config.home).is_err() {
-                    ctx.sender.send(Msg::SystemMessage("Instruction bundle validation failed; run orbit doctor. Malformed enabled metadata is preserved and defaults stay disabled.".into()));
-                }
-
-                if mods.is_empty() {
-                    ctx.sender.send(Msg::SystemMessage(
-                        "no mods installed — add $ORBIT_HOME/mods/<name>/instructions.md".into(),
-                    ));
-                    continue;
-                }
-                for m in &mods {
-                    let state = if mods_enabled.contains(&m.name) {
-                        "on"
                     } else {
-                        "off"
-                    };
-                    let cmds = if m.commands.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            " · commands: {}",
-                            m.commands
-                                .keys()
-                                .map(|c| format!("/{}:{}", m.name, c))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        )
-                    };
-                    ctx.sender.send(Msg::SystemMessage(format!(
-                        "[{state}] {} — {}{cmds}",
-                        m.name,
-                        if m.description.is_empty() {
-                            "(no description)"
-                        } else {
-                            &m.description
-                        }
-                    )));
-                }
-            }
-            WorkerCommand::ToggleMod(name) => {
-                match crate::mods::toggle(&config.home, &mods, &name) {
-                    Ok(now_on) => {
-                        if now_on {
-                            mods_enabled.push(name.clone());
-                        } else {
-                            mods_enabled.retain(|n| n != &name);
-                        }
-                        // The frozen prompt rebuilds so the next turn
-                        // carries the new mods set (append-only: the
-                        // change arrives as a new prompt, never an edit).
-                        let built =
-                            build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
-                        tool_cx.set_ext(MemoryBytes(built.memory_bytes));
-                        system_prompt = built.text;
-                        ctx.sender.send(Msg::SystemMessage(format!(
-                            "mod {name}: {}",
-                            if now_on { "enabled" } else { "disabled" }
-                        )));
-                    }
-                    Err(e) => {
-                        ctx.sender.send(Msg::SystemMessage(e));
-                    }
-                }
-            }
-            WorkerCommand::RefreshMods => {
-                mods = crate::mods::load_all(&config.home);
-                mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
-                let built = build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
-                tool_cx.set_ext(MemoryBytes(built.memory_bytes));
-                system_prompt = built.text;
-                ctx.sender.send(Msg::SystemMessage(format!(
-                    "mods reloaded: {} installed, {} enabled",
-                    mods.len(),
-                    mods_enabled.len()
-                )));
-            }
-            WorkerCommand::Rewind(arg) => {
-                // /rewind (phase 4): no argument lists checkpoints;
-                // with an id restores every snapshotted file and
-                // reports. Conversation restore reuses /undo's
-                // transcript pop per checkpoint event.
-                let cps =
-                    orbit_engine::transcript::Checkpoints::new(&config.home, &config.session_id);
-                if arg.trim().is_empty() {
-                    let list = cps.list();
-                    if list.is_empty() {
-                        ctx.sender.send(Msg::SystemMessage(
-                            "no checkpoints yet (one opens at each prompt that changes files)"
-                                .into(),
-                        ));
-                    } else {
-                        let text = list
-                            .iter()
-                            .rev()
-                            .map(|id| format!("  {id}"))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        ctx.sender.send(Msg::SystemMessage(format!(
-                            "checkpoints (newest first):\n{text}"
-                        )));
-                    }
-                } else {
-                    match cps.restore(arg.trim()) {
-                        Ok(files) if !files.is_empty() => {
-                            if let Some(log) = &transcript_log {
-                                let _ = log.append(
-                                    &orbit_engine::transcript::TranscriptEvent::Rewound {
-                                        to_checkpoint: arg.trim().to_string(),
-                                    },
-                                );
-                            }
-                            ctx.sender.send(Msg::SystemMessage(format!(
-                                "restored {} file(s) to checkpoint {}",
-                                files.len(),
-                                arg.trim()
-                            )));
-                        }
-                        Ok(_) => {
-                            ctx.sender.send(Msg::SystemMessage(format!(
-                                "checkpoint {} has no file snapshots (nothing was written that turn)",
-                                arg.trim()
-                            )));
-                        }
-                        Err(e) => {
-                            ctx.sender
-                                .send(Msg::SystemMessage(format!("rewind failed: {e}")));
-                        }
-                    }
-                }
-            }
-            WorkerCommand::Undo => {
-                // Claude Code `/undo`: pop the last user message + every
-                // assistant/tool message after it. The session FILE keeps
-                // history; only the working context rewinds.
-                let last_user = transcript.iter().rposition(|m| m.role == ChatRole::User);
-                match last_user {
-                    Some(idx) => {
-                        let removed: Vec<String> = transcript
-                            .split_off(idx)
-                            .iter()
-                            .filter(|m| m.tool_result.is_none())
-                            .map(|m| m.content.clone())
-                            .filter(|c| !c.trim().is_empty())
-                            .collect();
-                        let removed_text = removed.join(" / ");
-                        // Persist the rewound state.
-                        let sf = crate::sessions::SessionFile::from_chat(
-                            &config.session_id,
-                            &config.model,
-                            &config.gate,
-                            &config.provider_id,
+                        let _ = operation.finish_unstarted();
+                        emit_session_projection(
+                            &ctx.sender,
+                            &config,
+                            &binding,
                             &transcript,
-                            turns.saturating_sub(1),
+                            turns,
                             cum_input,
                             cum_output,
                             cum_cost,
-                        )
-                        .with_effort(config.effort.clone())
-                        .with_selection_origin(selection_origin);
-                        match lease.save(&sf) {
-                            Ok(()) => {
+                            qualification,
+                            ProjectionReason::Manual {
+                                operation,
+                                outcome: ManualOutcome::Failed,
+                                applied: false,
+                            },
+                            ContextProjection::Unavailable,
+                        );
+                    }
+                }
+                WorkerCommand::ListInstalledMods => {
+                    if crate::mods::validation_status(&config.home).is_err() {
+                        ctx.sender.send(Msg::SystemMessage("Instruction bundle validation failed; run orbit doctor. Malformed enabled metadata is preserved and defaults stay disabled.".into()));
+                    }
+
+                    if mods.is_empty() {
+                        ctx.sender.send(Msg::SystemMessage(
+                            "no mods installed — add $ORBIT_HOME/mods/<name>/instructions.md"
+                                .into(),
+                        ));
+                        break 'command;
+                    }
+                    for m in &mods {
+                        let state = if mods_enabled.contains(&m.name) {
+                            "on"
+                        } else {
+                            "off"
+                        };
+                        let cmds = if m.commands.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " · commands: {}",
+                                m.commands
+                                    .keys()
+                                    .map(|c| format!("/{}:{}", m.name, c))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            )
+                        };
+                        ctx.sender.send(Msg::SystemMessage(format!(
+                            "[{state}] {} — {}{cmds}",
+                            m.name,
+                            if m.description.is_empty() {
+                                "(no description)"
+                            } else {
+                                &m.description
+                            }
+                        )));
+                    }
+                }
+                WorkerCommand::ToggleMod(name) => {
+                    match crate::mods::toggle(&config.home, &mods, &name) {
+                        Ok(now_on) => {
+                            if now_on {
+                                mods_enabled.push(name.clone());
+                            } else {
+                                mods_enabled.retain(|n| n != &name);
+                            }
+                            // The frozen prompt rebuilds so the next turn
+                            // carries the new mods set (append-only: the
+                            // change arrives as a new prompt, never an edit).
+                            let built = build_session_prompt(
+                                &config.home,
+                                &config.model,
+                                &mods,
+                                &mods_enabled,
+                            );
+                            tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                            system_prompt = built.text;
+                            ctx.sender.send(Msg::SystemMessage(format!(
+                                "mod {name}: {}",
+                                if now_on { "enabled" } else { "disabled" }
+                            )));
+                        }
+                        Err(e) => {
+                            ctx.sender.send(Msg::SystemMessage(e));
+                        }
+                    }
+                }
+                WorkerCommand::RefreshMods => {
+                    mods = crate::mods::load_all(&config.home);
+                    mods_enabled = crate::mods::initial_enabled(&config.home, &mods);
+                    let built =
+                        build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
+                    tool_cx.set_ext(MemoryBytes(built.memory_bytes));
+                    system_prompt = built.text;
+                    ctx.sender.send(Msg::SystemMessage(format!(
+                        "mods reloaded: {} installed, {} enabled",
+                        mods.len(),
+                        mods_enabled.len()
+                    )));
+                }
+                WorkerCommand::Rewind(arg) => {
+                    // /rewind (phase 4): no argument lists checkpoints;
+                    // with an id restores every snapshotted file and
+                    // reports. Conversation restore reuses /undo's
+                    // transcript pop per checkpoint event.
+                    let cps = orbit_engine::transcript::Checkpoints::new(
+                        &config.home,
+                        &config.session_id,
+                    );
+                    if arg.trim().is_empty() {
+                        let list = cps.list();
+                        if list.is_empty() {
+                            ctx.sender.send(Msg::SystemMessage(
+                                "no checkpoints yet (one opens at each prompt that changes files)"
+                                    .into(),
+                            ));
+                        } else {
+                            let text = list
+                                .iter()
+                                .rev()
+                                .map(|id| format!("  {id}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            ctx.sender.send(Msg::SystemMessage(format!(
+                                "checkpoints (newest first):\n{text}"
+                            )));
+                        }
+                    } else {
+                        match cps.restore(arg.trim()) {
+                            Ok(files) if !files.is_empty() => {
+                                if let Some(log) = &transcript_log {
+                                    let _ = log.append(
+                                        &orbit_engine::transcript::TranscriptEvent::Rewound {
+                                            to_checkpoint: arg.trim().to_string(),
+                                        },
+                                    );
+                                }
                                 ctx.sender.send(Msg::SystemMessage(format!(
-                                    "undid last exchange ({})",
-                                    if removed_text.is_empty() {
-                                        "no text".to_string()
-                                    } else {
-                                        removed_text
-                                    }
+                                    "restored {} file(s) to checkpoint {}",
+                                    files.len(),
+                                    arg.trim()
                                 )));
                             }
+                            Ok(_) => {
+                                ctx.sender.send(Msg::SystemMessage(format!(
+                                "checkpoint {} has no file snapshots (nothing was written that turn)",
+                                arg.trim()
+                            )));
+                            }
                             Err(e) => {
-                                orbit_hud_tui::emit_error(
-                                    &ctx.sender,
-                                    &format!("warning: session not saved: {e}"),
-                                );
+                                ctx.sender
+                                    .send(Msg::SystemMessage(format!("rewind failed: {e}")));
                             }
                         }
                     }
-                    None => {
+                }
+                WorkerCommand::Undo => {
+                    if let Some(index) = transcript
+                        .iter()
+                        .rposition(|message| message.role == ChatRole::User)
+                    {
+                        let mut candidate = transcript.clone();
+                        let removed: Vec<String> = candidate
+                            .split_off(index)
+                            .iter()
+                            .filter(|message| message.tool_result.is_none())
+                            .map(|message| message.content.clone())
+                            .filter(|text| !text.trim().is_empty())
+                            .collect();
+                        let candidate_turns = turns.saturating_sub(1);
+                        if save_controls(
+                            &config,
+                            &lease,
+                            &accounting,
+                            &candidate,
+                            candidate_turns,
+                            &mut cum_input,
+                            &mut cum_output,
+                            &mut cum_cost,
+                            &ctx.sender,
+                            selection_origin,
+                            &mut qualification,
+                        ) {
+                            transcript = candidate;
+                            turns = candidate_turns;
+                            let text = removed.join(" / ");
+                            ctx.sender.send(Msg::SystemMessage(format!(
+                                "undid last exchange ({})",
+                                if text.is_empty() { "no text" } else { &text }
+                            )));
+                        }
+                    } else {
                         ctx.sender
                             .send(Msg::SystemMessage("nothing to undo".into()));
                     }
                 }
-            }
-            WorkerCommand::SetMode(mode_name) => {
-                // S5: runtime mode change. The scope is session state
-                // (no env var); the next turn obeys it.
-                match orbit_tools::permissions::PermissionMode::from_config(&mode_name) {
-                    Some(mode) => {
-                        config.scope.mode = mode;
-                        orbit_hud_tui::emit_mode_changed(&ctx.sender, &mode_name);
-                    }
-                    None => {
-                        orbit_hud_tui::emit_error(
-                            &ctx.sender,
-                            &format!(
-                                "unknown mode {mode_name} (default, acceptEdits, plan, dontAsk, bypass)"
-                            ),
-                        );
+                WorkerCommand::SetMode(mode_name) => {
+                    // S5: runtime mode change. The scope is session state
+                    // (no env var); the next turn obeys it.
+                    match orbit_tools::permissions::PermissionMode::from_config(&mode_name) {
+                        Some(mode) => {
+                            config.scope.mode = mode;
+                            orbit_hud_tui::emit_mode_changed(&ctx.sender, &mode_name);
+                        }
+                        None => {
+                            orbit_hud_tui::emit_error(
+                                &ctx.sender,
+                                &format!(
+                                    "unknown mode {mode_name} (default, acceptEdits, plan, dontAsk, bypass)"
+                                ),
+                            );
+                        }
                     }
                 }
-            }
-            WorkerCommand::Permissions(arg) => {
-                let text = crate::tool_runtime::permission_command(
-                    &config.home,
-                    &config.scope,
-                    &tool_cx.working_dir,
-                    &arg,
-                )
-                .unwrap_or_else(|error| format!("permissions: {error}"));
-                ctx.sender.send(Msg::SystemMessage(text));
-            }
-            WorkerCommand::ShellBang(command) => {
-                // The shell bang (gate 1): one command through the Bash
-                // tool's FULL path — sandbox, permissions, approvals,
-                // scanner, ledger — exactly as if the model had called
-                // it. The transcript shows the tool line; the composer
-                // never blocks (this runs on the worker thread).
-                let call = orbit_engine::PendingToolCall {
-                    index: 0,
-                    id: format!("bang-{}", ulid::Ulid::new()),
-                    name: "Bash".into(),
-                    arguments: serde_json::json!({ "command": command })
-                        .to_string()
-                        .into_bytes(),
-                };
-                let decision_id = format!("bang-{}", ulid::Ulid::new());
-                let mut approval_channel =
-                    TuiApprovalChannel::new(ctx.sender.clone(), ctx.approvals.clone());
-                // The session's context: its ledger sink announces the
-                // `!` command's records like any other call's.
-                let tool_cx = tool_cx.clone();
-                orbit_hud_tui::emit_tool_started(&ctx.sender, &call.id, "Bash", &command);
-                tool_cx.set_output_sink(Some(live_output_sink(&ctx.sender, &call.id)));
-                let (result, _) = crate::tool_runtime::execute_call(
-                    &config.home,
-                    &config.session_id,
-                    &decision_id,
-                    &call,
-                    false, // never auto-allow: the bang asks like any Bash call
-                    true,
-                    &mut approval_channel,
-                    &mut auto_grants,
-                    &config.scope,
-                    &tool_cx,
-                )
-                .unwrap_or_else(|e| {
-                    (
-                        serde_json::json!({ "ok": false, "error": e }).to_string(),
-                        None,
+                WorkerCommand::Permissions(arg) => {
+                    let text = crate::tool_runtime::permission_command(
+                        &config.home,
+                        &config.scope,
+                        &tool_cx.working_dir,
+                        &arg,
                     )
-                });
-                tool_cx.set_output_sink(None);
-                let outcome = classify_tool_result(&result);
-                let fact = result_fact("Bash", &result);
-                orbit_hud_tui::emit_tool_finished(&ctx.sender, &call.id, "Bash", outcome, &fact);
-            }
-            WorkerCommand::ModCommand(mod_name, cmd_name) => {
-                // A mod command runs its body as a normal prompt turn.
-                let body = mods
-                    .iter()
-                    .find(|m| m.name == mod_name)
-                    .and_then(|m| m.commands.get(&cmd_name))
-                    .cloned();
-                match body {
-                    Some(prompt) => {
-                        pending.push(WorkerCommand::Prompt(prompt));
+                    .unwrap_or_else(|error| format!("permissions: {error}"));
+                    ctx.sender.send(Msg::SystemMessage(text));
+                }
+                WorkerCommand::ShellBang(command) => {
+                    // The shell bang (gate 1): one command through the Bash
+                    // tool's FULL path — sandbox, permissions, approvals,
+                    // scanner, ledger — exactly as if the model had called
+                    // it. The transcript shows the tool line; the composer
+                    // never blocks (this runs on the worker thread).
+                    let call = orbit_engine::PendingToolCall {
+                        index: 0,
+                        id: format!("bang-{}", ulid::Ulid::new()),
+                        name: "Bash".into(),
+                        arguments: serde_json::json!({ "command": command })
+                            .to_string()
+                            .into_bytes(),
+                    };
+                    let decision_id = format!("bang-{}", ulid::Ulid::new());
+                    let mut approval_channel =
+                        TuiApprovalChannel::new(ctx.sender.clone(), ctx.approvals.clone());
+                    let token = orbit_provider_http::CancelToken::new();
+                    if let Ok(mut slot) = cancel_slot.lock() {
+                        *slot = Some(token.clone());
                     }
-                    None => {
-                        ctx.sender.send(Msg::SystemMessage(format!(
-                            "no command {cmd_name} in mod {mod_name}"
-                        )));
+                    let scope_guard = ToolCancelScope::new(&tool_cx, &token);
+                    // The session's context: its ledger sink announces the
+                    // `!` command's records like any other call's.
+                    let tool_cx = tool_cx.clone();
+                    orbit_hud_tui::emit_tool_started(&ctx.sender, &call.id, "Bash", &command);
+                    tool_cx.set_output_sink(Some(live_output_sink(&ctx.sender, &call.id)));
+                    let (result, _) = crate::tool_runtime::execute_call(
+                        &config.home,
+                        &config.session_id,
+                        &decision_id,
+                        &call,
+                        false, // never auto-allow: the bang asks like any Bash call
+                        true,
+                        &mut approval_channel,
+                        &mut auto_grants,
+                        &config.scope,
+                        &tool_cx,
+                    )
+                    .unwrap_or_else(|e| {
+                        (
+                            serde_json::json!({ "ok": false, "error": e }).to_string(),
+                            None,
+                        )
+                    });
+                    tool_cx.set_output_sink(None);
+                    let outcome = classify_tool_result(&result);
+                    let fact = result_fact("Bash", &result);
+                    orbit_hud_tui::emit_tool_finished(
+                        &ctx.sender,
+                        &call.id,
+                        "Bash",
+                        outcome,
+                        &fact,
+                    );
+                    drop(scope_guard);
+                    if let Ok(mut slot) = cancel_slot.lock() {
+                        *slot = None;
+                    }
+                }
+                WorkerCommand::ModCommand(mod_name, cmd_name) => {
+                    // A mod command runs its body as a normal prompt turn.
+                    let body = mods
+                        .iter()
+                        .find(|m| m.name == mod_name)
+                        .and_then(|m| m.commands.get(&cmd_name))
+                        .cloned();
+                    match body {
+                        Some(prompt) => {
+                            pending.push(WorkerCommand::Prompt(prompt));
+                        }
+                        None => {
+                            ctx.sender.send(Msg::SystemMessage(format!(
+                                "no command {cmd_name} in mod {mod_name}"
+                            )));
+                        }
                     }
                 }
             }
         }
+        if let Some((operation, registration)) = foreground {
+            let mut view = crate::sessions::SessionFile::from_chat(
+                &config.session_id,
+                &config.model,
+                &config.gate,
+                &config.provider_id,
+                &transcript,
+                turns,
+                cum_input,
+                cum_output,
+                cum_cost,
+            )
+            .with_effort(config.effort.clone())
+            .with_selection_origin(selection_origin);
+            if accounting.reconcile(&mut view).is_ok() {
+                cum_input = view.input_tokens;
+                cum_output = view.output_tokens;
+                cum_cost = view.cost_microcents;
+                qualification = checked_cost(&accounting, &view, true);
+            } else {
+                qualification = CostQualification::Unavailable;
+            }
+            drop(registration);
+            emit_session_projection(
+                &ctx.sender,
+                &config,
+                &binding,
+                &transcript,
+                turns,
+                cum_input,
+                cum_output,
+                cum_cost,
+                qualification,
+                ProjectionReason::Operation { operation },
+                ContextProjection::Unavailable,
+            );
+        } else if project_after {
+            emit_session_projection(
+                &ctx.sender,
+                &config,
+                &binding,
+                &transcript,
+                turns,
+                cum_input,
+                cum_output,
+                cum_cost,
+                qualification,
+                projection_reason,
+                ContextProjection::Unavailable,
+            );
+        }
     }
+}
+
+struct ToolCancelScope(orbit_tools::ToolContext);
+impl ToolCancelScope {
+    fn new(cx: &orbit_tools::ToolContext, token: &orbit_provider_http::CancelToken) -> Self {
+        crate::tool_runtime::begin_cancel_scope(cx, token);
+        Self(cx.clone())
+    }
+}
+impl Drop for ToolCancelScope {
+    fn drop(&mut self) {
+        self.0.pop_cancel_check();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compact_manual(
+    config: &TuiTurnConfig,
+    accounting: &RootSessionAccounting,
+    transcript: &mut Vec<ChatMessage>,
+    cx: &orbit_tools::ToolContext,
+    mods: &[crate::mods::Mod],
+    enabled: &[String],
+    token: &orbit_provider_http::CancelToken,
+    sender: &BusSender,
+) -> Result<orbit_engine::ManualCompactionCompletion, &'static str> {
+    if token.is_cancelled() {
+        return Err("cancelled");
+    }
+    let turn = configured_turn(config).map_err(|_| "selected model unavailable")?;
+    let summary = crate::try_role_turn_config(&config.home, &turn, "compaction")
+        .map_err(|_| "summary model unavailable")?;
+    let mut options = orbit_engine::TurnOptions {
+        session_id: config.session_id.clone(),
+        request_stem: format!("orbit-manual-{}", ulid::Ulid::new()),
+        max_attempts: 1,
+        compaction_config: Some(summary),
+        ..Default::default()
+    };
+    let notices = crate::model_limits::apply_turn_budgets(&config.home, &turn, &mut options)
+        .map_err(|_| "context policy unavailable")?;
+    accounting
+        .namespace()
+        .apply_options_detailed(&mut options, None, None)
+        .map_err(|_| "accounting admission refused")?;
+    if token.is_cancelled() {
+        return Err("cancelled");
+    }
+    let mut definitions = crate::tools::session_tool_definitions_with_context(
+        &config.home,
+        cx,
+        config.scope.allowlist.as_deref(),
+    );
+    definitions.retain(|definition| {
+        !config.scope.disallowlist.contains(&definition.name)
+            && config
+                .scope
+                .allowlist
+                .as_ref()
+                .is_none_or(|allow| allow.contains(&definition.name))
+    });
+    let names: Vec<&str> = definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect();
+    let directive = crate::mods::system_directive(mods, enabled);
+    let built = orbit_engine::context::build_system_prompt(
+        &config.home,
+        &cx.working_dir,
+        &config.model,
+        &names,
+        &directive,
+    );
+    options.system_directive = Some(built.text);
+    options.memory_bytes = built.memory_bytes;
+    options.tools = definitions;
+    for notice in notices {
+        orbit_hud_tui::emit_status(sender, &notice);
+    }
+    let mut events = |event| match event {
+        orbit_frontend_protocol::FrontendEvent::Compacting { used_tokens, .. } => {
+            orbit_hud_tui::emit_compaction(sender, true, used_tokens);
+        }
+        orbit_frontend_protocol::FrontendEvent::Compacted { after_tokens, .. } => {
+            orbit_hud_tui::emit_compaction(sender, false, after_tokens);
+        }
+        // Private summary/reasoning text never becomes an ordinary response.
+        _ => {}
+    };
+    Ok(orbit_engine::compact_context_detailed(
+        &config.home,
+        &turn,
+        &options,
+        transcript,
+        token,
+        &mut events,
+    ))
+}
+
+struct ClearCandidate {
+    config: TuiTurnConfig,
+    lease: crate::sessions::SessionLease,
+    accounting: RootSessionAccounting,
+    binding: SessionBinding,
+    cost: CostQualification,
+    log: orbit_engine::transcript::Transcript,
+}
+
+struct ClearFailure {
+    message: String,
+    cost: Option<CostQualification>,
+    uncertain: bool,
+}
+
+fn source_covered(
+    saved: &crate::sessions::SessionFile,
+    working: &crate::sessions::SessionFile,
+) -> bool {
+    saved.session_id == working.session_id
+        && saved.schema == working.schema
+        && saved.model == working.model
+        && saved.provider == working.provider
+        && saved.gate == working.gate
+        && saved.effort == working.effort
+        && saved.selection_origin == working.selection_origin
+        && saved.turns == working.turns
+        && saved.input_tokens == working.input_tokens
+        && saved.output_tokens == working.output_tokens
+        && saved.cost_microcents == working.cost_microcents
+        && saved.accounting_watermark == working.accounting_watermark
+        && matches!((serde_json::to_vec(&saved.transcript), serde_json::to_vec(&working.transcript)), (Ok(a), Ok(b)) if a == b)
+}
+
+fn fresh_candidate_transcript(
+    home: &std::path::Path,
+    id: &str,
+) -> Result<orbit_engine::transcript::Transcript, &'static str> {
+    let directory_path = home.join("projects");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&directory_path)
+        .map_err(|_| "candidate transcript directory unavailable")?;
+    let mut directory_options = std::fs::OpenOptions::new();
+    directory_options.read(true);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        directory_options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let directory = directory_options
+        .open(&directory_path)
+        .map_err(|_| "candidate transcript directory unsafe")?;
+    // Transcript::open is create+append; an atomic exclusive reservation must
+    // establish absence first, including orphan logs and dangling symlinks.
+    let path = directory_path.join(format!("{id}.jsonl"));
+    let reservation = options
+        .open(&path)
+        .map_err(|_| "candidate transcript already exists or is unsafe")?;
+    reservation
+        .sync_all()
+        .map_err(|_| "candidate transcript reservation uncertain")?;
+    let log = orbit_engine::transcript::Transcript::open(home, id)
+        .map_err(|_| "candidate transcript unavailable")?;
+    let current = std::fs::symlink_metadata(&path).map_err(|_| "candidate transcript changed")?;
+    let current_directory = std::fs::symlink_metadata(&directory_path)
+        .map_err(|_| "candidate transcript directory changed")?;
+    if !current.is_file() || current.len() != 0 || !current_directory.is_dir() {
+        return Err("candidate transcript changed");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let reserved = reservation
+            .metadata()
+            .map_err(|_| "candidate transcript reservation unavailable")?;
+        let held_directory = directory
+            .metadata()
+            .map_err(|_| "candidate transcript directory unavailable")?;
+        if (current.dev(), current.ino()) != (reserved.dev(), reserved.ino())
+            || (current_directory.dev(), current_directory.ino())
+                != (held_directory.dev(), held_directory.ino())
+            || current.nlink() != 1
+            || current.mode() & 0o077 != 0
+            || current_directory.mode() & 0o077 != 0
+            || current.uid() != held_directory.uid()
+        {
+            return Err("candidate transcript identity changed or is unsafe");
+        }
+    }
+    directory
+        .sync_all()
+        .map_err(|_| "candidate transcript directory publication uncertain")?;
+    Ok(log)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_clear(
+    config: &TuiTurnConfig,
+    lease: &crate::sessions::SessionLease,
+    accounting: &RootSessionAccounting,
+    transcript: &[ChatMessage],
+    turns: u64,
+    input: &mut u64,
+    output: &mut u64,
+    cost: &mut u64,
+    origin: crate::phase_routing::SelectionOrigin,
+    binding: &SessionBinding,
+    token: &orbit_provider_http::CancelToken,
+) -> Result<ClearCandidate, ClearFailure> {
+    let refuse = |message: &str| ClearFailure {
+        message: message.into(),
+        cost: None,
+        uncertain: false,
+    };
+    if token.is_cancelled() {
+        return Err(refuse("clear cancelled; current session retained"));
+    }
+    let generation = binding
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| refuse("session generation exhausted"))?;
+    let mut source = crate::sessions::SessionFile::from_chat(
+        &config.session_id,
+        &config.model,
+        &config.gate,
+        &config.provider_id,
+        transcript,
+        turns,
+        *input,
+        *output,
+        *cost,
+    )
+    .with_effort(config.effort.clone())
+    .with_selection_origin(origin);
+    accounting
+        .reconcile(&mut source)
+        .map_err(|_| refuse("clear refused; current accounting cannot be verified"))?;
+    *input = source.input_tokens;
+    *output = source.output_tokens;
+    *cost = source.cost_microcents;
+    let saved = lease
+        .load()
+        .map_err(|_| refuse("clear refused; current saved history cannot be verified"))?;
+    if !source_covered(&saved, &source) {
+        accounting.persist(lease, &mut source).map_err(|error| ClearFailure {
+            message: "clear refused; current work could not be durably saved; repair storage and retry".into(),
+            cost: Some(checked_cost(accounting, &source, matches!(&error, session_accounting::AccountingError::Session(_)))),
+            uncertain: true,
+        })?;
+        let saved = lease
+            .load()
+            .map_err(|_| refuse("clear refused; saved current work cannot be verified"))?;
+        if !source_covered(&saved, &source) {
+            return Err(refuse("clear refused; saved current work differs"));
+        }
+    }
+    let source_cost = checked_cost(accounting, &source, true);
+    if token.is_cancelled() {
+        return Err(ClearFailure {
+            message: "clear cancelled; current session retained".into(),
+            cost: Some(source_cost),
+            uncertain: false,
+        });
+    }
+    let id = orbit_gateway::new_session_id();
+    let stage = (|| -> Result<ClearCandidate, &'static str> {
+        let candidate_lease = crate::sessions::SessionLease::acquire(lease.home(), &id, "tui")
+            .map_err(|_| "candidate ownership unavailable")?;
+        if candidate_lease
+            .load_optional()
+            .map_err(|_| "candidate snapshot unsafe")?
+            .is_some()
+        {
+            return Err("candidate identity already exists");
+        }
+        let mut candidate_config = config.clone();
+        candidate_config.session_id = id.clone();
+        candidate_config.initial_transcript.clear();
+        candidate_config.initial_turns = 0;
+        candidate_config.initial_input_tokens = 0;
+        candidate_config.initial_output_tokens = 0;
+        candidate_config.initial_cost_microcents = 0;
+        let log = fresh_candidate_transcript(lease.home(), &id)?;
+        let mut fresh = crate::sessions::SessionFile::from_chat(
+            &id,
+            &config.model,
+            &config.gate,
+            &config.provider_id,
+            &[],
+            0,
+            0,
+            0,
+            0,
+        )
+        .with_effort(config.effort.clone())
+        .with_selection_origin(origin);
+        let candidate_accounting = session_accounting::prepare_root(
+            &candidate_lease,
+            &mut fresh,
+            RootOrigin::FreshCandidate,
+        )
+        .map_err(|_| "candidate accounting publication failed")?;
+        let cost = checked_cost(&candidate_accounting, &fresh, true);
+        if !matches!(cost, CostQualification::Known { revision: 0 }) {
+            return Err("candidate accounting could not be verified");
+        }
+        if token.is_cancelled() {
+            return Err("cancelled after candidate staging");
+        }
+        Ok(ClearCandidate {
+            config: candidate_config,
+            lease: candidate_lease,
+            accounting: candidate_accounting,
+            binding: SessionBinding {
+                session_id: id.clone(),
+                generation,
+            },
+            cost,
+            log,
+        })
+    })();
+    stage.map_err(|reason| ClearFailure { message: format!("clear refused; current session retained; candidate {id} may contain staged files ({reason})"),
+        cost: Some(source_cost), uncertain: true })
 }
 
 /// Convert a saved session's transcript to TUI display lines. Assistant messages
@@ -1412,7 +2156,7 @@ fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
                         }
                     } else if !msg.content.is_empty() {
                         Some(TranscriptLine::Assistant {
-                            text: msg.content.clone(),
+                            text: orbit_hud_tui::bridge::strip_cot(&msg.content),
                             time: None,
                         })
                     } else {
@@ -1746,6 +2490,8 @@ impl crate::tool_runtime::ApprovalChannel for TuiApprovalChannel {
     }
 }
 
+/// Compatibility entry point without leased durable accounting.
+/// The actual session worker uses the namespace-qualified detailed bridge.
 /// Run one user turn against the gateway, streaming through the TUI bridge.
 /// Returns (turn_ok, input_tokens, output_tokens, cost_microcents).
 /// `cancel` is the per-turn token the TUI fires on Ctrl+C-mid-stream.
@@ -1765,7 +2511,7 @@ pub fn run_tui_turn(
     cancel: &orbit_provider_http::CancelToken,
     // Kept for signature stability; the worker loop owns turn counting and
     // session saving (D9) — the turn itself no longer needs it.
-    _turns: u64,
+    turns: u64,
     auto_grants: &mut crate::tool_runtime::AutoGrants,
     mods_directive: &str,
     plan_mode: bool,
@@ -1776,6 +2522,55 @@ pub fn run_tui_turn(
     // The session's tool context (see `session_tool_context`).
     tool_cx: &orbit_tools::ToolContext,
 ) -> Result<(bool, u64, u64, u64, String), String> {
+    let completion = run_tui_turn_inner(
+        config,
+        transcript,
+        prompt,
+        user_blocks,
+        sender,
+        approvals,
+        cancel,
+        turns,
+        auto_grants,
+        mods_directive,
+        plan_mode,
+        scope,
+        tool_cx,
+        None,
+    )?;
+    let report = completion.report;
+    Ok((
+        report.ok,
+        report.input_tokens,
+        report.output_tokens,
+        report.cost_microcents,
+        report.final_text,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tui_turn_inner(
+    config: &TuiTurnConfig,
+    transcript: &mut Vec<ChatMessage>,
+    prompt: &str,
+    user_blocks: Option<Vec<ContentBlock>>,
+    sender: &BusSender,
+    approvals: &ApprovalRegistry,
+    cancel: &orbit_provider_http::CancelToken,
+    // Kept for signature stability; the worker loop owns turn counting and
+    // session saving (D9) — the turn itself no longer needs it.
+    _turns: u64,
+    auto_grants: &mut crate::tool_runtime::AutoGrants,
+    mods_directive: &str,
+    plan_mode: bool,
+    // The session's permission scope (S5), mutable across turns: the
+    // worker loop's SetMode command updates config.scope in place —
+    // no process env, no per-call reads.
+    scope: &mut crate::tool_runtime::PermissionScope,
+    // The session's tool context (see `session_tool_context`).
+    tool_cx: &orbit_tools::ToolContext,
+    accounting: Option<&NamespaceAccounting>,
+) -> Result<orbit_engine::TurnCompletion, String> {
     // One checkpoint per prompt (E7): /rewind restores a turn. The context
     // is the session's now, so the turn boundary is marked here.
     tool_cx.reset_turn_checkpoint();
@@ -1785,6 +2580,11 @@ pub fn run_tui_turn(
         crate::try_phase_turn_config(&config.home, &base_turn_config, prompt, origin)?;
     let resolved_gate = turn_config.gate.clone();
     turn_config.validate_effort()?;
+    let retry_policy = crate::provider_policies::load_for_config(&config.home, &turn_config)
+        .map_err(|error| error.to_string())?;
+    if retry_policy.is_some() && accounting.is_none() {
+        return Err("final-rejection retry requires managed session accounting".into());
+    }
     let compaction_config = crate::try_role_turn_config(&config.home, &turn_config, "compaction")?;
     crate::tool_runtime::remember_effort_setting(
         tool_cx,
@@ -2042,6 +2842,12 @@ pub fn run_tui_turn(
         orbit_hud_tui::emit_status(sender, &notice);
     }
 
+    if let Some(accounting) = accounting {
+        accounting
+            .apply_options_detailed(&mut options, None, retry_policy.as_ref())
+            .map_err(|error| error.to_string())?;
+    }
+
     let mut executor = TuiToolExecutor {
         home: config.home.clone(),
         session_id: config.session_id.clone(),
@@ -2054,7 +2860,7 @@ pub fn run_tui_turn(
         tool_cx: tool_cx.clone(),
     };
 
-    let report = orbit_engine::run_turn(
+    let completion = orbit_engine::turn::run_turn_detailed_with_retry_policy(
         &config.home,
         &turn_config,
         &options,
@@ -2063,27 +2869,12 @@ pub fn run_tui_turn(
         &mut executor,
         cancel,
         &mut events,
-    );
-
-    // Restore the grants and the scope into the caller's slots (the
-    // executor borrowed them for the turn; SetMode may have changed
-    // the scope mid-turn).
+        retry_policy.as_ref(),
+    )
+    .into_completion();
     *auto_grants = executor.auto_grants;
     *scope = executor.scope;
-
-    match report {
-        Ok(r) => Ok((
-            r.ok,
-            r.input_tokens,
-            r.output_tokens,
-            r.cost_microcents,
-            r.final_text,
-        )),
-        Err(e) => {
-            orbit_hud_tui::emit_error(sender, &e);
-            Ok((false, 0, 0, 0, String::new()))
-        }
-    }
+    Ok(completion)
 }
 
 /// The TUI's tool executor: bridges the engine's `ToolExecutor` trait
@@ -2445,13 +3236,61 @@ mod session_tests {
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut switched = false;
+        let mut source = None;
+        let mut backend_failure = false;
         while std::time::Instant::now() < deadline {
-            if matches!(bus.try_recv(), Some(Msg::Identity { session_id, .. }) if session_id == "target")
-            {
-                switched = true;
-                break;
+            match bus.try_recv() {
+                Some(Msg::SessionProjection(view)) => match &view.reason {
+                    ProjectionReason::Initial => {
+                        assert_eq!(view.binding.session_id, "session-test");
+                        assert_eq!(view.binding.generation, 1);
+                        assert_eq!((view.model.as_str(), view.provider.as_str()), ("m", "p"));
+                        assert!(view.lines.is_empty());
+                        assert_eq!(
+                            (
+                                view.turns,
+                                view.input_tokens,
+                                view.output_tokens,
+                                view.cost_microcents
+                            ),
+                            (0, 0, 0, 0)
+                        );
+                        assert_eq!(view.cost, CostQualification::UnknownHistory { revision: 0 });
+                        assert_eq!(view.context, ContextProjection::Unavailable);
+                        source = Some(view.binding);
+                    }
+                    ProjectionReason::Resume { previous }
+                        if view.binding.session_id == "target" =>
+                    {
+                        let source = source
+                            .as_ref()
+                            .expect("resume follows the actual Initial view");
+                        assert_eq!(previous, source);
+                        assert_eq!(
+                            source.generation.checked_add(1),
+                            Some(view.binding.generation)
+                        );
+                        assert_eq!((view.model.as_str(), view.provider.as_str()), ("m", "p"));
+                        assert!(view.lines.is_empty());
+                        assert_eq!(
+                            (
+                                view.turns,
+                                view.input_tokens,
+                                view.output_tokens,
+                                view.cost_microcents
+                            ),
+                            (0, 0, 0, 0)
+                        );
+                        assert_eq!(view.cost, CostQualification::UnknownHistory { revision: 0 });
+                        assert_eq!(view.context, ContextProjection::Unavailable);
+                        switched = true;
+                        break;
+                    }
+                    _ => {}
+                },
+                Some(Msg::BackendError(_)) => backend_failure = true,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let previous = SessionLease::acquire(&home, "session-test", "another-frontend").ok();
         let old_path = home.join("projects/session-test.jsonl");
@@ -2460,12 +3299,14 @@ mod session_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut rewound = false;
         while std::time::Instant::now() < deadline {
-            if matches!(bus.try_recv(), Some(Msg::SystemMessage(text)) if text.starts_with("restored 1 file"))
-            {
-                rewound = true;
-                break;
+            match bus.try_recv() {
+                Some(Msg::SystemMessage(text)) if text.starts_with("restored 1 file") => {
+                    rewound = true;
+                    break;
+                }
+                Some(Msg::BackendError(_)) => backend_failure = true,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let target_owned = matches!(
             SessionLease::acquire(&home, "target", "other"),
@@ -2473,7 +3314,16 @@ mod session_tests {
         );
         drop(commands);
         worker.join().unwrap();
+        while let Some(message) = bus.try_recv() {
+            if matches!(message, Msg::BackendError(_)) {
+                backend_failure = true;
+            }
+        }
         assert!(switched && rewound && previous.is_some() && target_owned);
+        assert!(
+            !backend_failure,
+            "resume/rewind controls must not fail a provider turn"
+        );
         assert_eq!(
             std::fs::read(old_path).unwrap(),
             old_bytes,
@@ -2534,11 +3384,49 @@ mod session_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut refused = false;
         let mut backend_failure = false;
+        let mut source: Option<SessionProjection> = None;
+        let mut refusal_notice = false;
         while std::time::Instant::now() < deadline {
             match bus.try_recv() {
-                Some(Msg::SystemMessage(text))
-                    if text.contains("cannot resume target: transcript") =>
+                Some(Msg::SessionProjection(view))
+                    if matches!(&view.reason, ProjectionReason::Initial) =>
                 {
+                    assert_eq!(view.binding.session_id, "session-test");
+                    assert_eq!(view.binding.generation, 1);
+                    assert_eq!(view.cost, CostQualification::UnknownHistory { revision: 0 });
+                    source = Some(view);
+                }
+                Some(Msg::Status(text)) if text == "resume refused: transcript unavailable" => {
+                    refusal_notice = true;
+                }
+                Some(Msg::SessionProjection(view))
+                    if refusal_notice && matches!(&view.reason, ProjectionReason::Refresh) =>
+                {
+                    let source = source
+                        .as_ref()
+                        .expect("refusal follows the actual Initial view");
+                    assert_eq!(view.binding, source.binding);
+                    assert_eq!(
+                        (&view.model, &view.provider),
+                        (&source.model, &source.provider)
+                    );
+                    assert_eq!(view.lines, source.lines);
+                    assert_eq!(
+                        (
+                            view.turns,
+                            view.input_tokens,
+                            view.output_tokens,
+                            view.cost_microcents
+                        ),
+                        (
+                            source.turns,
+                            source.input_tokens,
+                            source.output_tokens,
+                            source.cost_microcents
+                        )
+                    );
+                    assert_eq!(view.cost, source.cost);
+                    assert_eq!(view.context, ContextProjection::Unavailable);
                     refused = true;
                     break;
                 }
@@ -2553,6 +3441,11 @@ mod session_tests {
         let candidate_released = SessionLease::acquire(&home, "target", "other").is_ok();
         drop(commands);
         worker.join().unwrap();
+        while let Some(message) = bus.try_recv() {
+            if matches!(message, Msg::BackendError(_)) {
+                backend_failure = true;
+            }
+        }
         assert!(refused && old_owned && candidate_released && !backend_failure);
         std::fs::remove_dir_all(home).unwrap();
     }
@@ -2612,10 +3505,52 @@ default_effort = "low"
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut refused = false;
+        let mut source: Option<SessionProjection> = None;
+        let mut refusal_notice = false;
         while std::time::Instant::now() < deadline {
             if let Some(message) = bus.try_recv() {
                 match message {
-                    Msg::SystemMessage(text) if text.contains("already owned") => {
+                    Msg::SessionProjection(view)
+                        if matches!(&view.reason, ProjectionReason::Initial) =>
+                    {
+                        assert_eq!(view.binding.session_id, "session-test");
+                        assert_eq!(view.binding.generation, 1);
+                        assert_eq!(view.cost, CostQualification::UnknownHistory { revision: 0 });
+                        source = Some(view);
+                    }
+                    Msg::Status(text)
+                        if text == "resume refused: saved session unavailable or busy" =>
+                    {
+                        refusal_notice = true;
+                    }
+                    Msg::SessionProjection(view)
+                        if refusal_notice && matches!(&view.reason, ProjectionReason::Refresh) =>
+                    {
+                        let source = source
+                            .as_ref()
+                            .expect("refusal follows the actual Initial view");
+                        assert_eq!(view.binding, source.binding);
+                        assert_eq!(
+                            (&view.model, &view.provider),
+                            (&source.model, &source.provider)
+                        );
+                        assert_eq!(view.lines, source.lines);
+                        assert_eq!(
+                            (
+                                view.turns,
+                                view.input_tokens,
+                                view.output_tokens,
+                                view.cost_microcents
+                            ),
+                            (
+                                source.turns,
+                                source.input_tokens,
+                                source.output_tokens,
+                                source.cost_microcents
+                            )
+                        );
+                        assert_eq!(view.cost, source.cost);
+                        assert_eq!(view.context, ContextProjection::Unavailable);
                         refused = true;
                         break;
                     }
@@ -2634,6 +3569,11 @@ default_effort = "low"
         );
         drop(commands);
         worker.join().unwrap();
+        while let Some(message) = bus.try_recv() {
+            if let Msg::BackendError(error) = message {
+                panic!("idle rejection failed a provider turn: {error}");
+            }
+        }
         assert!(
             refused,
             "busy target must be refused through the worker control path"
@@ -3580,5 +4520,125 @@ mod mention_tests {
         assert!(expanded.text.contains("truncated"));
         assert!(expanded.images.is_empty());
         assert!(expanded.into_prompt().1.is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fresh_candidate_transcript_tests {
+    use super::fresh_candidate_transcript;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempHome(PathBuf);
+    impl TempHome {
+        fn new() -> Self {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "orbit-fresh-candidate-log-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+        fn projects(&self) -> PathBuf {
+            let path = self.0.join("projects");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            path
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_fresh_fixed_candidate_id_creates_one_private_empty_log() {
+        let home = TempHome::new();
+        let id = "session-fresh-empty";
+        let log = fresh_candidate_transcript(&home.0, id).unwrap();
+        let expected = home.0.join("projects").join(format!("{id}.jsonl"));
+        assert_eq!(log.path(), expected);
+        let metadata = std::fs::symlink_metadata(&expected).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert!(log.events().is_empty());
+        assert_eq!(
+            std::fs::read_dir(home.0.join("projects")).unwrap().count(),
+            1
+        );
+        drop(log);
+    }
+
+    #[test]
+    fn an_existing_orphan_log_refuses_and_preserves_its_exact_bytes_and_identity() {
+        use std::io::Write;
+        let home = TempHome::new();
+        let id = "session-existing-orphan";
+        let path = home.projects().join(format!("{id}.jsonl"));
+        let bytes = b"{\"kind\":\"note\",\"text\":\"orphan marker\"}\n";
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            fresh_candidate_transcript(&home.0, id).err(),
+            Some("candidate transcript already exists or is unsafe")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (after.dev(), after.ino(), after.nlink(), after.mode()),
+            (before.dev(), before.ino(), before.nlink(), before.mode())
+        );
+        assert_eq!(
+            std::fs::read_dir(home.0.join("projects")).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_dangling_candidate_log_symlink_refuses_and_preserves_the_exact_link() {
+        let home = TempHome::new();
+        let id = "session-dangling-log";
+        let path = home.projects().join(format!("{id}.jsonl"));
+        let target = home.0.join("uncreated-target");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        assert!(before.file_type().is_symlink());
+        assert_eq!(
+            fresh_candidate_transcript(&home.0, id).err(),
+            Some("candidate transcript already exists or is unsafe")
+        );
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert!(after.file_type().is_symlink());
+        assert_eq!(
+            (after.dev(), after.ino(), after.mode()),
+            (before.dev(), before.ino(), before.mode())
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            std::fs::read_dir(home.0.join("projects")).unwrap().count(),
+            1
+        );
     }
 }

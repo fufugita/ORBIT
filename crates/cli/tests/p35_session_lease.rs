@@ -616,3 +616,215 @@ fn oversized_saved_file_refuses_before_content_allocation() {
         64 * 1024 * 1024 + 1
     );
 }
+
+#[test]
+fn optional_load_distinguishes_absence_and_create_only_preserves_the_first_snapshot() {
+    let home = Home::new();
+    let lease = SessionLease::acquire(&home.0, "new-session", "headless").unwrap();
+    assert!(lease.load_optional().unwrap().is_none());
+    let first = sample("new-session", "first-model");
+    lease.save_if_absent(&first).unwrap();
+    let path = session_path(&home.0, "new-session");
+    let before = fs::read(&path).unwrap();
+    assert_eq!(lease.load_optional().unwrap().unwrap().model, "first-model");
+    assert!(matches!(
+        lease.save_if_absent(&sample("new-session", "replacement")),
+        Err(SessionLeaseError::AlreadyExists { session_id }) if session_id == "new-session"
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let metadata = fs::metadata(path).unwrap();
+    assert_eq!(metadata.mode() & 0o777, 0o600);
+    assert_eq!(metadata.nlink(), 1);
+    assert_eq!(fs::read_dir(home.0.join("sessions")).unwrap().count(), 2);
+}
+
+#[test]
+fn optional_load_never_turns_present_invalid_data_into_absence() {
+    let mut invalid_schema = sample("bad-session", "original");
+    invalid_schema.schema = "unsupported.schema".into();
+    let invalid_id = sample("different-session", "original");
+    for bytes in [
+        b"{broken".to_vec(),
+        vec![0xff, 0xfe],
+        serde_json::to_vec(&invalid_schema).unwrap(),
+        serde_json::to_vec(&invalid_id).unwrap(),
+    ] {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "bad-session", "headless").unwrap();
+        lease.save(&sample("bad-session", "original")).unwrap();
+        let path = session_path(&home.0, "bad-session");
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            lease.load_optional(),
+            Err(SessionLeaseError::InvalidData(_))
+        ));
+        assert!(
+            lease
+                .save_if_absent(&sample("bad-session", "replacement"))
+                .is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn optional_load_and_create_only_refuse_unsafe_present_targets() {
+    for kind in ["dangling-link", "hard-link", "socket", "public-file"] {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "unsafe-session", "headless").unwrap();
+        let path = session_path(&home.0, "unsafe-session");
+        let outside = home.0.join("outside");
+        let socket = match kind {
+            "dangling-link" => {
+                symlink(&outside, &path).unwrap();
+                None
+            }
+            "hard-link" => {
+                lease.save(&sample("unsafe-session", "original")).unwrap();
+                fs::hard_link(&path, &outside).unwrap();
+                None
+            }
+            "socket" => Some(std::os::unix::net::UnixListener::bind(&path).unwrap()),
+            "public-file" => {
+                lease.save(&sample("unsafe-session", "original")).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                None
+            }
+            _ => unreachable!(),
+        };
+        let before = fs::symlink_metadata(&path).unwrap();
+        assert!(
+            lease.load_optional().is_err(),
+            "unsafe target {kind} became absent"
+        );
+        assert!(
+            lease
+                .save_if_absent(&sample("unsafe-session", "replacement"))
+                .is_err()
+        );
+        let after = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (after.ino(), after.mode(), after.nlink()),
+            (before.ino(), before.mode(), before.nlink())
+        );
+        if kind == "hard-link" {
+            assert_eq!(fs::read(&outside).unwrap(), fs::read(&path).unwrap());
+        }
+        if kind == "dangling-link" {
+            assert!(!outside.exists());
+        }
+        drop(socket);
+    }
+}
+
+#[test]
+fn optional_absence_and_create_only_require_the_original_private_parent() {
+    for replace in [false, true] {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "parent-session", "headless").unwrap();
+        let sessions = home.0.join("sessions");
+        let moved = home.0.join("original-sessions");
+        fs::rename(&sessions, &moved).unwrap();
+        if replace {
+            fs::DirBuilder::new().mode(0o700).create(&sessions).unwrap();
+        }
+        assert!(lease.load_optional().is_err());
+        assert!(
+            lease
+                .save_if_absent(&sample("parent-session", "replacement"))
+                .is_err()
+        );
+        assert!(!moved.join("parent-session.json").exists());
+        assert!(!sessions.join("parent-session.json").exists());
+    }
+}
+
+#[test]
+fn create_only_concurrent_writers_publish_one_complete_snapshot_without_clobbering() {
+    let home = Home::new();
+    let lease = SessionLease::acquire(&home.0, "racing-session", "headless").unwrap();
+    let barrier = std::sync::Barrier::new(4);
+    let outcomes = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..4)
+            .map(|index| {
+                let lease = &lease;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let model = format!("complete-writer-{index}");
+                    let candidate = sample("racing-session", &model);
+                    barrier.wait();
+                    (model, lease.save_if_absent(&candidate))
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let winners: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, result)| result.is_ok())
+        .collect();
+    assert_eq!(winners.len(), 1);
+    for (_, result) in outcomes.iter().filter(|(_, result)| result.is_err()) {
+        // The short link/unlink publication interval may also be safely refused
+        // as a non-single-link target by a concurrent reader of the same lease.
+        assert!(
+            matches!(result, Err(SessionLeaseError::AlreadyExists { session_id }) if session_id == "racing-session")
+                || matches!(result, Err(SessionLeaseError::UnsafePath(_)))
+        );
+    }
+    assert_eq!(lease.load().unwrap().model, winners[0].0);
+    let path = session_path(&home.0, "racing-session");
+    let before = fs::read(&path).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().nlink(), 1);
+    let entries: Vec<_> = fs::read_dir(home.0.join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.to_string_lossy().ends_with(".tmp"))
+    );
+    assert!(
+        lease
+            .save_if_absent(&sample("racing-session", "late-writer"))
+            .is_err()
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn create_only_validates_identity_schema_and_watermark_before_publication() {
+    let home = Home::new();
+    let lease = SessionLease::acquire(&home.0, "validated-session", "headless").unwrap();
+    let mut bad_schema = sample("validated-session", "model");
+    bad_schema.schema = "unknown".into();
+    for candidate in [sample("wrong-session", "model"), bad_schema] {
+        assert!(matches!(
+            lease.save_if_absent(&candidate),
+            Err(SessionLeaseError::InvalidData(_))
+        ));
+        assert!(lease.load_optional().unwrap().is_none());
+    }
+    let mut candidate = sample("validated-session", "model");
+    candidate.accounting_watermark =
+        Some(orbit_cli::session_accounting::SessionAccountingWatermark {
+            owner_session_id: "foreign-session".into(),
+            child_id: None,
+            revision: 0,
+            known_input_tokens: 0,
+            known_output_tokens: 0,
+            known_ordinary_microcents: 0,
+            known_housekeeping_microcents: 0,
+            full_cost_status: orbit_cli::session_accounting::FullCostStatus::Known,
+        });
+    assert!(matches!(
+        lease.save_if_absent(&candidate),
+        Err(SessionLeaseError::InvalidData(_))
+    ));
+    assert!(lease.load_optional().unwrap().is_none());
+}

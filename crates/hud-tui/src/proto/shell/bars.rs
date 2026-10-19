@@ -111,7 +111,7 @@ fn overflow_switcher(
     // Leave a cell on each side for omitted-tab markers. Bound the title to
     // eighteen cells so compact neighbors remain useful on wider terminals.
     let base = text_width(&format!(" {number}  ")) + if *attention { 2 } else { 0 };
-    let title = clip_text(title, (room - base - 3).clamp(0, 18));
+    let title = clip_text(title, (room - base - 2).clamp(0, 18));
     let label = format!(" {number} {title} {}", if *attention { "◆ " } else { "" });
     let compact_width = |index: usize| {
         let (number, _, attention) = &panels[index];
@@ -158,7 +158,9 @@ fn overflow_switcher(
                 );
             }
             cv.hit(from, 0, x - from, 1, super::hits::Click::Panel(*number - 1));
-            x += 1;
+            if index < last {
+                x += 1;
+            }
         }
         if last + 1 < panels.len() {
             x = cv.text(x, 0, "›", colors.faint, Some(bg_at(x)));
@@ -169,6 +171,7 @@ fn overflow_switcher(
 
 pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
     let colors = cv.palette;
+    let cost_text = tb.scenario.cost_status_text();
     // Gradient strip: deep violet fading into the bar colour.
     let strip = (w as f32 * 0.42).max(20.0);
     for x in 0..w {
@@ -208,19 +211,36 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             .iter()
             .map(|(n, t, a)| tab_w(n, t, *a, *n - 1 == tb.focus_idx, false) + 1)
             .sum();
-        const COST_CHIP: i32 = 10;
-        let short = x + full > w - 2 - COST_CHIP;
+        let minimum_selected = panels
+            .iter()
+            .find(|(number, _, _)| number.checked_sub(1) == Some(tb.focus_idx))
+            .or_else(|| panels.first())
+            .map_or(0, |(number, title, attention)| {
+                text_width(&format!(" {number}  "))
+                    + if *attention { 2 } else { 0 }
+                    + text_width(title).min(5)
+                    + 3
+            });
+        // Reserve the actual complete bill label only when it can coexist
+        // with a readable selected tab. Otherwise the chip drops as a whole.
+        let cost_width = (text_width(&cost_text) + 2).max(10);
+        let cost_reserve = if w - 2 - x - cost_width >= minimum_selected {
+            cost_width
+        } else {
+            0
+        };
+        let short = x + full > w - 2 - cost_reserve;
         let compact: i32 = panels
             .iter()
             .map(|(n, t, a)| tab_w(n, t, *a, *n - 1 == tb.focus_idx, true) + 1)
             .sum();
-        if short && x + compact > w - 2 {
+        if short && x + compact > w - 2 - cost_reserve {
             x = overflow_switcher(
                 cv,
                 panels,
                 tb.focus_idx,
                 x,
-                (w - 2 - COST_CHIP - x).max(0),
+                (w - 2 - cost_reserve - x).max(0),
                 bg_at,
             );
         } else {
@@ -375,6 +395,8 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             },
         ));
         chips.push((meter, None, 9));
+    } else if s.session_binding().is_some() {
+        chips.push((vec![Seg::new("ctx unknown", colors.faint)], None, 9));
     }
     if let Some(n) = s.ledger_count {
         chips.push((
@@ -399,12 +421,9 @@ pub fn top_bar(cv: &mut Cv, w: i32, tb: &TopBar) {
             4,
         ));
     }
-    if s.priced {
+    {
         chips.push((
-            vec![Seg::bold(
-                format!("${:.3}", s.cost_microcents as f64 / 1_000_000.0),
-                colors.amber,
-            )],
+            vec![Seg::bold(cost_text, colors.amber)],
             Some(colors.amber),
             10,
         ));
@@ -717,8 +736,27 @@ mod tests {
     ) -> (Buffer, Vec<Hit>) {
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, 2));
         let mut scenario = Scenario::new();
-        scenario.priced = true;
-        scenario.cost_microcents = 1_234_000;
+        assert!(crate::proto::runtime::apply_session_projection(
+            crate::msg::SessionProjection {
+                binding: crate::worker::SessionBinding {
+                    session_id: "session-switcher-fixture".into(),
+                    generation: 1
+                },
+                model: String::new(),
+                provider: String::new(),
+                priced: true,
+                lines: Vec::new(),
+                turns: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: 1_234_000,
+                cost: crate::msg::CostQualification::Known { revision: 0 },
+                context: crate::msg::ContextProjection::Unavailable,
+                reason: crate::msg::ProjectionReason::Initial,
+            },
+            &mut scenario,
+            0
+        ));
         let mut cv = Cv::new(&mut buffer);
         top_bar(
             &mut cv,
@@ -826,6 +864,110 @@ mod tests {
             assert_eq!(hits[1].rect, Rect::new(21, 0, 9, 1));
             assert_eq!(hits[1].click, Click::Panel(1));
             assert!(cells(&buffer, 31, width).contains("$1.234"));
+        }
+    }
+
+    #[test]
+    fn zero_bill_is_known_or_fully_qualified_and_never_partially_clipped() {
+        use crate::msg::{
+            ContextProjection, CostQualification, ProjectionReason, SessionProjection,
+        };
+        for qualification in [
+            CostQualification::Known { revision: 0 },
+            CostQualification::Unavailable,
+        ] {
+            for width in [40u16, 60, 120] {
+                let mut scenario = Scenario::new();
+                assert!(crate::proto::runtime::apply_session_projection(
+                    SessionProjection {
+                        binding: crate::worker::SessionBinding {
+                            session_id: "session-zero-bill".into(),
+                            generation: 1
+                        },
+                        model: String::new(),
+                        provider: String::new(),
+                        priced: true,
+                        lines: Vec::new(),
+                        turns: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_microcents: 0,
+                        cost: qualification,
+                        context: ContextProjection::Unavailable,
+                        reason: ProjectionReason::Initial,
+                    },
+                    &mut scenario,
+                    0
+                ));
+                let expected = scenario.cost_status_text();
+                let mut buffer = Buffer::empty(Rect::new(0, 0, width, 2));
+                let mut cv = Cv::new(&mut buffer);
+                top_bar(
+                    &mut cv,
+                    i32::from(width),
+                    &TopBar {
+                        scenario: &scenario,
+                        preset: None,
+                        approval_pending: false,
+                        now_ms: 5000,
+                        reduced: true,
+                        mono: false,
+                        saved_ms: None,
+                        zoom: false,
+                        switcher: Some(
+                            (1..=24)
+                                .map(|number| {
+                                    (
+                                        number,
+                                        "Named pane with a very long description".into(),
+                                        number == 12,
+                                    )
+                                })
+                                .collect(),
+                        ),
+                        focus_idx: 11,
+                        cwd: String::new(),
+                        branch: None,
+                    },
+                );
+                let hits = cv.take_hits();
+                let selected = hits
+                    .iter()
+                    .find(|hit| hit.click == Click::Panel(11))
+                    .unwrap();
+                assert!(cells(&buffer, selected.rect.x, selected.rect.right()).contains("Named"));
+                assert!(cells(&buffer, selected.rect.x, selected.rect.right()).contains('◆'));
+                assert_eq!(
+                    hits::at(&hits, selected.rect.x + 1, 0),
+                    Some(Click::Panel(11))
+                );
+                let row = cells(&buffer, 0, width);
+                if row.contains('$') {
+                    assert!(
+                        row.contains(&expected),
+                        "complete bill label at {width}: {row}"
+                    );
+                } else {
+                    assert!(
+                        !row.contains("bill unavailable"),
+                        "no detached qualifier: {row}"
+                    );
+                }
+                if qualification == CostQualification::Unavailable && width == 40 {
+                    assert!(
+                        !row.contains('$'),
+                        "an impossible full bill chip drops as a whole: {row}"
+                    );
+                } else {
+                    assert!(
+                        row.contains(&expected),
+                        "bill and selected tab fit at {width}: {row}"
+                    );
+                }
+                if matches!(qualification, CostQualification::Known { .. }) {
+                    assert!(!row.contains("bill unavailable"));
+                }
+            }
         }
     }
 }

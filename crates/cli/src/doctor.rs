@@ -602,6 +602,17 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
         "Private local home is readable",
         true,
     );
+    let adapter_identity = orbit_engine::retry::adapter_identity_digest(
+        &orbit_provider_http::openai::openai_identity(),
+    );
+    report.add(
+        "retry.openai_adapter_identity",
+        CheckStatus::Configured,
+        &format!(
+            "Current OpenAI-compatible adapter identity SHA256: {adapter_identity}; offline implementation digest"
+        ),
+        false,
+    );
     match verify_identity(home) {
         Ok(_) => report.add(
             "identity",
@@ -646,6 +657,57 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
                     "Offline provider declarations; connectivity is not tested",
                     true,
                 );
+                let routing_valid = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|raw| crate::phase_routing::parse_settings(raw).ok())
+                    .is_some_and(|settings| {
+                        crate::phase_routing::validate_settings(&config, &settings).is_ok()
+                    });
+                let default_spec = if config.roles.main.is_empty() {
+                    config.provider.iter().find_map(|provider| {
+                        provider
+                            .models
+                            .first()
+                            .map(|model| format!("{}/{}", provider.name, model.id))
+                    })
+                } else {
+                    Some(config.roles.main.clone())
+                };
+                let default_config = default_spec
+                    .as_deref()
+                    .and_then(|spec| crate::phase_routing::resolve_model(&config, spec, None).ok())
+                    .and_then(|model| model.turn_config(None).ok());
+                match default_config {
+                    Some(selected) => match crate::provider_policies::load_for_config(home, &selected) {
+                        Ok(Some(binding)) => report.add(
+                            "retry.policy",
+                            CheckStatus::Configured,
+                            &format!(
+                                "Configured main/default only: total max_attempts={}; requires managed uncapped ordinary admission; smaller caller ceilings apply; final generation-refusal assumption; provider usage/billing unknown; connectivity untested",
+                                binding.max_attempts()
+                            ),
+                            false,
+                        ),
+                        Ok(None) => report.add(
+                            "retry.policy",
+                            CheckStatus::NotTested,
+                            "No usable optional retry declaration matches the configured main/default model; ordinary retries remain conservative; connectivity not tested",
+                            false,
+                        ),
+                        Err(_) => report.add(
+                            "retry.policy",
+                            CheckStatus::Invalid,
+                            "Provider retry policy is invalid or unsafe; no policy details shown or provider request sent",
+                            true,
+                        ),
+                    },
+                    None => report.add(
+                        "retry.policy",
+                        CheckStatus::Unavailable,
+                        "Configured main/default model could not be resolved; optional retry policy was not checked",
+                        false,
+                    ),
+                }
                 for (index, provider) in config.provider.iter().enumerate().take(64) {
                     let id = format!("provider.{index}");
                     if validate_provider(provider).is_err() {
@@ -666,12 +728,6 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
                     let (status, detail) = provider_credential_status(home, provider);
                     report.add(&format!("credential.{index}"), status, detail, true);
                 }
-                let routing_valid = std::str::from_utf8(&bytes)
-                    .ok()
-                    .and_then(|raw| crate::phase_routing::parse_settings(raw).ok())
-                    .is_some_and(|settings| {
-                        crate::phase_routing::validate_settings(&config, &settings).is_ok()
-                    });
                 report.add("routing",if routing_valid{CheckStatus::Configured}else{CheckStatus::Invalid},"Exact roles, phase/difficulty targets and keyword bounds checked without dispatch",true);
             }
             None => report.add(
@@ -756,7 +812,13 @@ pub fn doctor(home: &Path, workspace: &Path) -> DoctorReport {
         false,
     );
     if let Ok(binary) = std::env::current_exe() {
-        report.checks.push(browser_check(&binary));
+        let browser = browser_check(&binary);
+        report.add(
+            &browser.id,
+            browser.status,
+            &browser.detail,
+            browser.required,
+        );
     }
     report.add(
         "provider.connectivity",

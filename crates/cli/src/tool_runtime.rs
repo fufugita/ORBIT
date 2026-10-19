@@ -118,10 +118,13 @@ pub trait ApprovalChannel: Send {
     }
 }
 
-/// The standard stdin-based approval channel (REPL behavior, unchanged).
+/// The standard stdin-based approval channel, optionally sharing cancellation
+/// with the plain frontend's command reader and current operation.
 pub struct StdApprovalChannel {
     interactive: bool,
     note: Option<String>,
+    cancel: Option<orbit_provider_http::CancelToken>,
+    input_failed: bool,
 }
 
 impl StdApprovalChannel {
@@ -129,6 +132,57 @@ impl StdApprovalChannel {
         Self {
             interactive,
             note: None,
+            cancel: None,
+            input_failed: false,
+        }
+    }
+
+    pub fn with_cancel(interactive: bool, cancel: orbit_provider_http::CancelToken) -> Self {
+        Self {
+            cancel: Some(cancel),
+            ..Self::new(interactive)
+        }
+    }
+
+    /// A failed input boundary ends its owning plain command after persistence.
+    pub fn input_failed(&self) -> bool {
+        self.input_failed
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.is_cancelled())
+    }
+
+    fn fail_input(&mut self) {
+        self.input_failed = true;
+        self.note = None;
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
+    }
+
+    fn verdict_for_line(&mut self, req: &ApprovalRequest, line: &str) -> ApprovalVerdict {
+        self.note = None;
+        if self.cancelled() {
+            return ApprovalVerdict::Deny;
+        }
+        let answer = line.trim().to_ascii_lowercase();
+        match answer.as_str() {
+            "y" | "yes" => ApprovalVerdict::AllowOnce,
+            "s" if req.grant.is_some() => ApprovalVerdict::AllowRuleSession,
+            "a" if req.grant.is_some() => ApprovalVerdict::AllowRuleAlways,
+            _ => {
+                // `n use make instead`: the note reaches the model, not the ledger.
+                self.note = line
+                    .trim()
+                    .strip_prefix(['n', 'N'])
+                    .map(str::trim)
+                    .filter(|note| !note.is_empty())
+                    .map(str::to_string);
+                ApprovalVerdict::Deny
+            }
         }
     }
 }
@@ -139,6 +193,10 @@ impl ApprovalChannel for StdApprovalChannel {
     }
 
     fn ask(&mut self, req: &ApprovalRequest, auto_tools: bool) -> ApprovalVerdict {
+        self.note = None;
+        if self.cancelled() {
+            return ApprovalVerdict::Deny;
+        }
         if auto_tools {
             return ApprovalVerdict::AllowOnce;
         }
@@ -164,26 +222,26 @@ impl ApprovalChannel for StdApprovalChannel {
             req.risk.as_str(),
         );
         let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
-            return ApprovalVerdict::Deny;
-        }
-        let answer = line.trim().to_ascii_lowercase();
-        match answer.as_str() {
-            "y" | "yes" => ApprovalVerdict::AllowOnce,
-            "s" if req.grant.is_some() => ApprovalVerdict::AllowRuleSession,
-            "a" if req.grant.is_some() => ApprovalVerdict::AllowRuleAlways,
-            _ => {
-                // `n use make instead`: whatever follows the n is the note.
-                self.note = line
-                    .trim()
-                    .strip_prefix(['n', 'N'])
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_string);
-                ApprovalVerdict::Deny
+        let line = if let Some(cancel) = &self.cancel {
+            match crate::plain_input::read_stdin_line(cancel) {
+                Ok(crate::plain_input::PlainInput::Line(line)) => line,
+                Ok(
+                    crate::plain_input::PlainInput::Eof | crate::plain_input::PlainInput::Cancelled,
+                ) => return ApprovalVerdict::Deny,
+                Err(error) => {
+                    self.fail_input();
+                    eprintln!("approval input failed: {error}");
+                    return ApprovalVerdict::Deny;
+                }
             }
-        }
+        } else {
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return ApprovalVerdict::Deny;
+            }
+            line
+        };
+        self.verdict_for_line(req, &line)
     }
 }
 
@@ -6222,5 +6280,91 @@ mod agent_lifecycle_tests {
             .task(json!({"agent":"slash","prompt":"reject other model choice","effort":"high"}));
         assert_eq!(invalid["ok"], false, "{invalid}");
         assert_eq!(mock.requests(), before);
+    }
+}
+
+#[cfg(test)]
+mod cancellable_approval_tests {
+    use super::*;
+
+    fn request() -> ApprovalRequest {
+        ApprovalRequest {
+            call_id: "plain-approval".into(),
+            tool_name: "Bash".into(),
+            summary: "run a requested check".into(),
+            risk: crate::tools::RiskLevel::Medium,
+            preview: Vec::new(),
+            grant: Some(GrantOffer {
+                rule: "Bash(check *)".into(),
+                tool: "Bash".into(),
+                pattern: "check *".into(),
+                can_save: true,
+            }),
+        }
+    }
+
+    #[test]
+    fn pre_cancelled_approval_never_prompts_or_uses_the_auto_tools_bypass() {
+        let cancel = orbit_provider_http::CancelToken::new();
+        let mut channel = StdApprovalChannel::with_cancel(true, cancel.clone());
+        cancel.cancel();
+        assert_eq!(channel.ask(&request(), false), ApprovalVerdict::Deny);
+        assert_eq!(channel.ask(&request(), true), ApprovalVerdict::Deny);
+        assert!(!channel.input_failed());
+        assert_eq!(
+            StdApprovalChannel::new(false).ask(&request(), true),
+            ApprovalVerdict::AllowOnce
+        );
+    }
+
+    #[test]
+    fn cancellation_after_input_refuses_allow_and_saved_rule_answers_without_stale_notes() {
+        let cancel = orbit_provider_http::CancelToken::new();
+        let mut channel = StdApprovalChannel::with_cancel(true, cancel.clone());
+        assert_eq!(
+            channel.verdict_for_line(&request(), "n use the smaller check"),
+            ApprovalVerdict::Deny
+        );
+        cancel.cancel();
+        for answer in ["y", "s", "a", "n stale note"] {
+            assert_eq!(
+                channel.verdict_for_line(&request(), answer),
+                ApprovalVerdict::Deny
+            );
+            assert!(channel.take_note().is_none());
+        }
+        let mut next =
+            StdApprovalChannel::with_cancel(true, orbit_provider_http::CancelToken::new());
+        assert_eq!(
+            next.verdict_for_line(&request(), "y"),
+            ApprovalVerdict::AllowOnce
+        );
+        assert_eq!(
+            next.verdict_for_line(&request(), "s"),
+            ApprovalVerdict::AllowRuleSession
+        );
+        assert_eq!(
+            next.verdict_for_line(&request(), "a"),
+            ApprovalVerdict::AllowRuleAlways
+        );
+        assert!(!next.input_failed());
+    }
+
+    #[test]
+    fn an_input_failure_cancels_the_actual_shared_token_and_latches_the_terminal_error() {
+        let cancel = orbit_provider_http::CancelToken::new();
+        let ordinary = cancel.clone();
+        let summary = cancel.clone();
+        let mut channel = StdApprovalChannel::with_cancel(true, cancel);
+        channel.note = Some("old note".into());
+        channel.fail_input();
+        assert!(channel.input_failed() && ordinary.is_cancelled() && summary.is_cancelled());
+        assert!(channel.take_note().is_none());
+        assert_eq!(channel.ask(&request(), true), ApprovalVerdict::Deny);
+        assert_eq!(
+            channel.verdict_for_line(&request(), "a"),
+            ApprovalVerdict::Deny
+        );
+        assert!(channel.input_failed());
     }
 }

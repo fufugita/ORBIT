@@ -4,6 +4,91 @@
 //! the `Bus`: stream events, usage, tool calls, approvals. The screen's
 //! reducer is `proto::runtime::apply_msg`.
 
+use crate::worker::{ForegroundOperation, ManualOperation, SessionBinding};
+
+/// Display qualification only; the worker's checked accounting remains authoritative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CostQualification {
+    #[default]
+    Unavailable,
+    Known {
+        revision: u64,
+    },
+    UnknownHistory {
+        revision: u64,
+    },
+    UnknownUsage {
+        revision: u64,
+    },
+    Unpriced {
+        revision: u64,
+    },
+    Uncertain {
+        revision: u64,
+    },
+}
+
+impl CostQualification {
+    pub fn revision(self) -> Option<u64> {
+        match self {
+            Self::Unavailable => None,
+            Self::Known { revision }
+            | Self::UnknownHistory { revision }
+            | Self::UnknownUsage { revision }
+            | Self::Unpriced { revision }
+            | Self::Uncertain { revision } => Some(revision),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextProjection {
+    Unavailable,
+    PreserveUnchanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionReason {
+    Initial,
+    Refresh,
+    Resume {
+        previous: SessionBinding,
+    },
+    Operation {
+        operation: ForegroundOperation,
+    },
+    Manual {
+        operation: ManualOperation,
+        outcome: ManualOutcome,
+        applied: bool,
+    },
+}
+
+/// A single checked view of one held session, without raw provider or receipt data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProjection {
+    pub binding: SessionBinding,
+    pub model: String,
+    pub provider: String,
+    pub priced: bool,
+    pub lines: Vec<crate::model::TranscriptLine>,
+    pub turns: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_microcents: u64,
+    pub cost: CostQualification,
+    pub context: ContextProjection,
+    pub reason: ProjectionReason,
+}
+
 /// The rule an approval card offers to remember (`s` for the session, `a`
 /// for good), as the backend derived it from the call: shown as written,
 /// so what the key grants is what the card says.
@@ -18,6 +103,7 @@ pub struct ApprovalGrant {
 /// A message from the worker thread to the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
+    SessionProjection(SessionProjection),
     // ── Data (from the worker thread / backend bridge) ──────────────────────
     /// A chunk of streamed text from the model. Already passed through
     /// `display_safe` by the bridge before it reaches the reducer.
@@ -53,7 +139,10 @@ pub enum Msg {
     /// status line shows the amber "compacting context" while it runs.
     /// `tokens` is the conversation's estimated size: before the compaction
     /// when it starts, after it when it ends.
-    Compaction { running: bool, tokens: u64 },
+    Compaction {
+        running: bool,
+        tokens: u64,
+    },
     /// Something for the Activity panel: a ledger record the session just
     /// appended (`digest` set) or a notable runtime event (a request, a
     /// compaction, a retry). Display-safe.
@@ -85,7 +174,10 @@ pub enum Msg {
     TasksUpdate(Vec<(String, String)>),
     /// One line of a running command's live output, for the Terminal
     /// panel. Already display-safe.
-    ToolOutput { call_id: String, line: String },
+    ToolOutput {
+        call_id: String,
+        line: String,
+    },
     /// A tool call finished. `outcome` distinguishes success, failure, an
     /// operator denial (a decision, not an error — §11.5 rule 4) and an
     /// unknown-tool block (deny-by-default), so the transcript never shows
@@ -128,7 +220,9 @@ pub enum Msg {
     CostUpdated(u64),
     /// The bridge rejected a text chunk (D7) — never renders the text.
     /// `kind` names the gate that rejected it for the chip label.
-    Redacted { kind: crate::model::RedactionKind },
+    Redacted {
+        kind: crate::model::RedactionKind,
+    },
     /// Initialize status-bar identity before the first render.
     Identity {
         model: String,
@@ -167,7 +261,10 @@ pub enum Msg {
         model: String,
     },
     /// A subagent's current action.
-    SubagentProgress { id: String, action: String },
+    SubagentProgress {
+        id: String,
+        action: String,
+    },
     /// A subagent finished with its report.
     /// `ok` is whether the subagent completed (false: it failed or was
     /// stopped); `report` is its final words, or why it stopped.
@@ -184,7 +281,9 @@ pub enum Msg {
         breakdown: Option<orbit_frontend_protocol::ContextBreakdown>,
     },
     /// The ledger grew: the record count after the append.
-    LedgerAppended { record_count: u64 },
+    LedgerAppended {
+        record_count: u64,
+    },
     /// A display-safe system line appended to the transcript (e.g. command
     /// results such as `/help`, `/usage`, `/models`, `/sessions`).
     SystemMessage(String),

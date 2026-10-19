@@ -217,6 +217,49 @@ pub(crate) struct Lock {
     file: File,
 }
 impl Lock {
+    /// Share the existing writer lock without creating or modifying its inode.
+    pub(crate) fn read_existing(dir: &Directory, name: &str) -> Result<Self, Error> {
+        use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(Error::UnsafePath("invalid lock name".into()));
+        }
+        let path = dir.io()?.join(name);
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(io_error)?;
+        let result = Self { file };
+        result.check_existing(dir, name)?;
+        if unsafe { libc::flock(result.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            return Err(Error::Busy);
+        }
+        result.check_existing(dir, name)?;
+        Ok(result)
+    }
+
+    pub(crate) fn check_existing(&self, dir: &Directory, name: &str) -> Result<(), Error> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let path = dir.io()?.join(name);
+        let held = self.file.metadata().map_err(io_error)?;
+        let current = std::fs::symlink_metadata(path).map_err(io_error)?;
+        for metadata in [&held, &current] {
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(Error::UnsafePath("lock file is unsafe".into()));
+            }
+        }
+        if !same(&held, &current) {
+            return Err(Error::UnsafePath("lock file identity changed".into()));
+        }
+        dir.check()?;
+        Directory::open(dir.path(), true)?;
+        dir.check()
+    }
+
     pub(crate) fn acquire(dir: &Directory, name: &str) -> Result<Self, Error> {
         use std::os::unix::{
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -1096,5 +1139,142 @@ mod directory_tests {
                 .contains(rustix::fs::OFlags::PATH)
         );
         directory.check().unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod existing_read_lock_tests {
+    use super::{Directory, Error, Lock};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    use std::path::PathBuf;
+
+    struct Tree(PathBuf);
+    impl Tree {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("orbit-existing-read-lock-{}", ulid::Ulid::new()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+        fn directory(&self) -> Directory {
+            Directory::open(&self.0, true).unwrap()
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn missing_existing_read_lock_never_creates_an_inode() {
+        let tree = Tree::new();
+        assert!(matches!(
+            Lock::read_existing(&tree.directory(), ".history.lock"),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(std::fs::read_dir(&tree.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn existing_read_locks_share_and_exclude_the_actual_writer_inode() {
+        let tree = Tree::new();
+        let dir = tree.directory();
+        drop(Lock::acquire(&dir, ".history.lock").unwrap());
+        let writer = Lock::acquire(&dir, ".history.lock").unwrap();
+        assert!(matches!(
+            Lock::read_existing(&dir, ".history.lock"),
+            Err(Error::Busy)
+        ));
+        drop(writer);
+        let first = Lock::read_existing(&dir, ".history.lock").unwrap();
+        let second = Lock::read_existing(&dir, ".history.lock").unwrap();
+        assert!(
+            !rustix::fs::fcntl_getfl(&first.file)
+                .unwrap()
+                .intersects(rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::RDWR)
+        );
+        assert!(matches!(
+            Lock::acquire(&dir, ".history.lock"),
+            Err(Error::Busy)
+        ));
+        drop(first);
+        assert!(matches!(
+            Lock::acquire(&dir, ".history.lock"),
+            Err(Error::Busy)
+        ));
+        second.check_existing(&dir, ".history.lock").unwrap();
+        drop(second);
+        drop(Lock::acquire(&dir, ".history.lock").unwrap());
+        assert!(
+            std::fs::read(tree.0.join(".history.lock"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn existing_read_lock_rejects_links_special_entries_and_public_permissions() {
+        for kind in ["dangling", "symlink", "directory", "hardlink", "public"] {
+            let tree = Tree::new();
+            let dir = tree.directory();
+            let path = tree.0.join(".history.lock");
+            match kind {
+                "dangling" => symlink(tree.0.join("absent"), &path).unwrap(),
+                "directory" => std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .unwrap(),
+                "symlink" | "hardlink" => {
+                    let target = tree.0.join("target");
+                    std::fs::write(&target, b"retained").unwrap();
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    if kind == "symlink" {
+                        symlink(&target, &path).unwrap();
+                    } else {
+                        std::fs::hard_link(&target, &path).unwrap();
+                    }
+                }
+                "public" => {
+                    std::fs::write(&path, b"retained").unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                Lock::read_existing(&dir, ".history.lock").is_err(),
+                "{kind}"
+            );
+            assert!(!tree.0.join("absent").exists());
+        }
+    }
+
+    #[test]
+    fn existing_read_lock_rechecks_private_directory_and_original_inode_identity() {
+        let tree = Tree::new();
+        let dir = tree.directory();
+        drop(Lock::acquire(&dir, ".history.lock").unwrap());
+        let reader = Lock::read_existing(&dir, ".history.lock").unwrap();
+        std::fs::set_permissions(&tree.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            reader.check_existing(&dir, ".history.lock"),
+            Err(Error::UnsafePath(_))
+        ));
+        std::fs::set_permissions(&tree.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = tree.0.join(".history.lock");
+        let retained = tree.0.join("retained");
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            reader.check_existing(&dir, ".history.lock"),
+            Err(Error::UnsafePath(_))
+        ));
+        assert!(std::fs::read(retained).unwrap().is_empty());
     }
 }

@@ -1,5 +1,8 @@
 //! One owned session shared by local transports and browser adapters.
 
+use crate::session_accounting::{
+    AccountingError, FullCostStatus, RootOrigin, RootSessionAccounting, prepare_root,
+};
 use crate::sessions::{SessionFile, SessionLease, SessionLeaseError};
 use crate::tool_runtime::{ApprovalChannel, ApprovalRequest, ApprovalVerdict, AutoGrants};
 use crate::tui_worker::TuiTurnConfig;
@@ -36,6 +39,17 @@ pub enum OwnerError {
     Runtime(String),
     #[error(transparent)]
     Storage(#[from] SessionLeaseError),
+    #[error(transparent)]
+    Accounting(AccountingError),
+}
+
+impl From<AccountingError> for OwnerError {
+    fn from(error: AccountingError) -> Self {
+        match error {
+            AccountingError::Session(error) => Self::Storage(error),
+            error => Self::Accounting(error),
+        }
+    }
 }
 
 impl OwnerError {
@@ -49,7 +63,19 @@ impl OwnerError {
             Self::Runtime(_) => "runtime",
             Self::Storage(SessionLeaseError::PublicationUncertain(_)) => "publication_uncertain",
             Self::Storage(_) => "storage",
+            Self::Accounting(error) if error.is_publication_uncertain() => "publication_uncertain",
+            Self::Accounting(_) => "runtime",
         }
+    }
+
+    fn session_publication_uncertain(&self) -> bool {
+        matches!(
+            self,
+            Self::Storage(SessionLeaseError::PublicationUncertain(_))
+                | Self::Accounting(AccountingError::Session(
+                    SessionLeaseError::PublicationUncertain(_)
+                ))
+        )
     }
 }
 
@@ -122,6 +148,41 @@ impl RequestState {
 pub struct RequestRecord {
     pub payload_digest: String,
     pub state: RequestState,
+    #[serde(default, skip_serializing_if = "RequestKind::is_prompt")]
+    pub kind: RequestKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    #[default]
+    Prompt,
+    Compact,
+}
+
+impl RequestKind {
+    fn is_prompt(&self) -> bool {
+        *self == Self::Prompt
+    }
+}
+
+fn compact_request_digest() -> String {
+    format!("{:x}", Sha256::digest(b"orbit-owner-compact-v1\0"))
+}
+
+fn valid_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerAccountingSummary {
+    pub revision: u64,
+    pub full_cost_status: FullCostStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +210,8 @@ pub struct OwnerSnapshot {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_microcents: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<OwnerAccountingSummary>,
 }
 
 fn control_settings(snapshot: &OwnerSnapshot) -> Value {
@@ -207,6 +270,9 @@ pub enum OwnerAction {
     Prompt {
         request_id: String,
         text: String,
+    },
+    Compact {
+        request_id: String,
     },
     Approval {
         call_id: String,
@@ -390,6 +456,10 @@ enum Work {
         text: String,
         reply: mpsc::SyncSender<Result<ActionAck, OwnerError>>,
     },
+    Compact {
+        request_id: String,
+        reply: mpsc::SyncSender<Result<ActionAck, OwnerError>>,
+    },
     Configure {
         action: OwnerAction,
         reply: mpsc::SyncSender<Result<ActionAck, OwnerError>>,
@@ -544,7 +614,7 @@ impl ControllerLease {
         if hub.controller.as_deref() != Some(&self.token) {
             return Err(OwnerError::NotController);
         }
-        if hub.stopping {
+        if hub.stopping && !matches!(&action, OwnerAction::Compact { .. }) {
             return Err(OwnerError::Busy);
         }
         match action {
@@ -563,7 +633,7 @@ impl ControllerLease {
                 }
                 let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
                 if let Some(record) = hub.snapshot.requests.get(&request_id) {
-                    if record.payload_digest != digest {
+                    if record.kind != RequestKind::Prompt || record.payload_digest != digest {
                         return Err(OwnerError::Invalid(
                             "request identity was reused with a different payload".into(),
                         ));
@@ -587,6 +657,7 @@ impl ControllerLease {
                     RequestRecord {
                         payload_digest: digest,
                         state: RequestState::Accepted,
+                        kind: RequestKind::Prompt,
                     },
                 );
                 let cancel = CancelToken::new();
@@ -594,6 +665,7 @@ impl ControllerLease {
                 hub.snapshot.state = TurnState::Running;
                 hub.snapshot.current_request = Some(request_id.clone());
                 hub.snapshot.partial_response.clear();
+                let previous_accounting = hub.snapshot.accounting.take();
                 let (reply, answer) = mpsc::sync_channel(1);
                 if self
                     .handle
@@ -606,6 +678,67 @@ impl ControllerLease {
                     .is_err()
                 {
                     hub.snapshot.requests.remove(&request_id);
+                    hub.snapshot.state = TurnState::Idle;
+                    hub.snapshot.accounting = previous_accounting;
+                    hub.cancel = None;
+                    return Err(OwnerError::Busy);
+                }
+                drop(hub);
+                await_ack(answer)
+            }
+            OwnerAction::Compact { request_id } => {
+                if !valid_request_id(&request_id) {
+                    return Err(OwnerError::Invalid(
+                        "invalid compact request identity".into(),
+                    ));
+                }
+                let digest = compact_request_digest();
+                if let Some(record) = hub.snapshot.requests.get(&request_id) {
+                    if record.kind != RequestKind::Compact || record.payload_digest != digest {
+                        return Err(OwnerError::Invalid(
+                            "request identity was reused with a different payload".into(),
+                        ));
+                    }
+                    return Ok(ActionAck {
+                        request_id: Some(request_id),
+                        state: record.state.label().into(),
+                        duplicate: true,
+                    });
+                }
+                if hub.stopping || hub.configuring || hub.snapshot.state != TurnState::Idle {
+                    return Err(OwnerError::Busy);
+                }
+                if hub.snapshot.requests.len() >= MAX_REQUESTS {
+                    return Err(OwnerError::Invalid(
+                        "request history is full; start a new session".into(),
+                    ));
+                }
+                hub.snapshot.requests.insert(
+                    request_id.clone(),
+                    RequestRecord {
+                        payload_digest: digest,
+                        state: RequestState::Accepted,
+                        kind: RequestKind::Compact,
+                    },
+                );
+                let previous_request = hub.snapshot.current_request.replace(request_id.clone());
+                let previous_accounting = hub.snapshot.accounting.take();
+                hub.cancel = Some(CancelToken::new());
+                hub.snapshot.state = TurnState::Running;
+                hub.snapshot.partial_response.clear();
+                let (reply, answer) = mpsc::sync_channel(1);
+                if self
+                    .handle
+                    .commands
+                    .try_send(Work::Compact {
+                        request_id: request_id.clone(),
+                        reply,
+                    })
+                    .is_err()
+                {
+                    hub.snapshot.requests.remove(&request_id);
+                    hub.snapshot.current_request = previous_request;
+                    hub.snapshot.accounting = previous_accounting;
                     hub.snapshot.state = TurnState::Idle;
                     hub.cancel = None;
                     return Err(OwnerError::Busy);
@@ -762,7 +895,7 @@ pub struct OwnerRuntime {
     worker: Option<JoinHandle<Result<(), OwnerError>>>,
 }
 impl OwnerRuntime {
-    pub fn start(config: OwnerConfig, lease: SessionLease) -> Result<Self, OwnerError> {
+    pub fn start(mut config: OwnerConfig, lease: SessionLease) -> Result<Self, OwnerError> {
         let configured_home = if config.turn.home.is_absolute() {
             config.turn.home.clone()
         } else {
@@ -799,6 +932,32 @@ impl OwnerRuntime {
         {
             masks.push(value);
         }
+        let saved = lease.load_optional()?;
+        let origin = crate::sessions::model_origin(saved.as_ref());
+        if let Some(saved) = &saved {
+            config.turn.initial_transcript = saved.transcript.clone();
+            config.turn.initial_turns = saved.turns;
+            config.turn.initial_input_tokens = saved.input_tokens;
+            config.turn.initial_output_tokens = saved.output_tokens;
+            config.turn.initial_cost_microcents = saved.cost_microcents;
+        }
+        let mut file = SessionFile::from_chat(
+            &config.turn.session_id,
+            &config.turn.model,
+            &config.turn.gate,
+            &config.turn.provider_id,
+            &config.turn.initial_transcript,
+            config.turn.initial_turns,
+            config.turn.initial_input_tokens,
+            config.turn.initial_output_tokens,
+            config.turn.initial_cost_microcents,
+        )
+        .with_effort(config.turn.effort.clone())
+        .with_selection_origin(origin);
+        // Normal startup has already anchored its precise origin. A standalone
+        // owner cannot infer a fresh namespace from an empty initial transcript.
+        let adapter = prepare_root(&lease, &mut file, RootOrigin::RestoredOrLegacy)?;
+        let mut accounting = OwnedAccounting::new(adapter, file);
         let snapshot = OwnerSnapshot {
             cursor: EventCursor {
                 instance: ulid::Ulid::new().to_string(),
@@ -807,11 +966,7 @@ impl OwnerRuntime {
             session_id: config.turn.session_id.clone(),
             provider: config.turn.provider_id.clone(),
             model: config.turn.model.clone(),
-            selection_origin: crate::sessions::read_selection_origin(
-                lease.home(),
-                lease.session_id(),
-            )
-            .map_err(OwnerError::Invalid)?,
+            selection_origin: origin,
             last_route: None,
             effort: config.turn.effort.clone(),
             effort_status: crate::effort_status(&config.turn.home, &turn),
@@ -825,9 +980,10 @@ impl OwnerRuntime {
             current_request: None,
             requests: BTreeMap::new(),
             turns: config.turn.initial_turns,
-            input_tokens: config.turn.initial_input_tokens,
-            output_tokens: config.turn.initial_output_tokens,
-            cost_microcents: config.turn.initial_cost_microcents,
+            input_tokens: accounting.file.input_tokens,
+            output_tokens: accounting.file.output_tokens,
+            cost_microcents: accounting.file.cost_microcents,
+            accounting: accounting.summary,
         };
         let (commands, receiver) = mpsc::sync_channel(1);
         let handle = OwnerHandle {
@@ -872,14 +1028,23 @@ impl OwnerRuntime {
             &config.turn,
             &config.turn.initial_transcript,
             &handle.snapshot()?,
+            &mut accounting,
         )?;
+        accounting.project(&mut handle.lock()?.snapshot);
         request_store.save(&handle.snapshot()?)?;
         let worker_handle = handle.clone();
         let worker = std::thread::Builder::new()
             .name("orbit-session-owner".into())
             .spawn(move || {
                 let completion = worker_handle.clone();
-                let result = owner_loop(config, lease, request_store, worker_handle, receiver);
+                let result = owner_loop(
+                    config,
+                    lease,
+                    request_store,
+                    accounting,
+                    worker_handle,
+                    receiver,
+                );
                 if let Err(error) = &result
                     && let Ok(mut hub) = completion.lock()
                 {
@@ -1103,6 +1268,8 @@ mod request_storage {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
                     || record.payload_digest.len() != 64
+                    || (record.kind == RequestKind::Compact
+                        && record.payload_digest != compact_request_digest())
                     || !record
                         .payload_digest
                         .bytes()
@@ -1181,29 +1348,134 @@ mod request_storage {
     }
 }
 
+struct OwnedAccounting {
+    adapter: RootSessionAccounting,
+    file: SessionFile,
+    summary: Option<OwnerAccountingSummary>,
+}
+
+impl OwnedAccounting {
+    fn new(adapter: RootSessionAccounting, file: SessionFile) -> Self {
+        let summary = Self::summary(&file);
+        Self {
+            adapter,
+            file,
+            summary,
+        }
+    }
+
+    fn summary(file: &SessionFile) -> Option<OwnerAccountingSummary> {
+        // Only called after prepare_root or persist has reconciled this file.
+        // A Session publication error from persist still follows reconciliation.
+        let watermark = file.accounting_watermark.as_ref()?;
+        Some(OwnerAccountingSummary {
+            revision: watermark.revision,
+            full_cost_status: watermark.full_cost_status,
+        })
+    }
+
+    fn project(&self, snapshot: &mut OwnerSnapshot) {
+        snapshot.input_tokens = self.file.input_tokens;
+        snapshot.output_tokens = self.file.output_tokens;
+        snapshot.cost_microcents = self.file.cost_microcents;
+        snapshot.accounting = self.summary;
+    }
+
+    fn uncertain(&mut self) -> Result<bool, OwnerError> {
+        let checkpoint = match self.adapter.namespace().checkpoint_detailed() {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.summary = None;
+                return Err(error.into());
+            }
+        };
+        if self
+            .summary
+            .is_some_and(|summary| summary.revision != checkpoint.revision().0)
+        {
+            self.summary = None;
+        }
+        let uncertain = checkpoint.pending().is_some()
+            || checkpoint.totals().knownness == orbit_engine::AccountingKnownness::Uncertain;
+        if uncertain
+            && self
+                .summary
+                .is_some_and(|summary| summary.full_cost_status == FullCostStatus::Known)
+        {
+            self.summary = None;
+        }
+        Ok(uncertain)
+    }
+
+    fn notice(&self, hub: &mut Hub) {
+        let Some(summary) = self.summary else {
+            hub.emit("status", json!({"text":"Request accounting is unavailable; retained charges are not a complete bill."}));
+            return;
+        };
+        let text = match summary.full_cost_status {
+            FullCostStatus::Known => return,
+            FullCostStatus::UnknownLegacy => {
+                "Known charges are shown; earlier session cost is unknown."
+            }
+            FullCostStatus::UnknownUsage => {
+                "Known charges are shown; some provider usage was unavailable."
+            }
+            FullCostStatus::Unpriced => {
+                "Known charges are shown; some provider work has no verified price."
+            }
+            FullCostStatus::Uncertain => {
+                "Request accounting is uncertain; inspect the saved state before continuing."
+            }
+        };
+        hub.emit("status", json!({"text":text}));
+    }
+}
+
 fn save_live(
     lease: &SessionLease,
     config: &TuiTurnConfig,
     transcript: &[ChatMessage],
     snapshot: &OwnerSnapshot,
+    accounting: &mut OwnedAccounting,
 ) -> Result<(), OwnerError> {
-    lease
-        .save(
-            &SessionFile::from_chat(
-                &config.session_id,
-                &config.model,
-                &config.gate,
-                &config.provider_id,
-                transcript,
-                snapshot.turns,
-                snapshot.input_tokens,
-                snapshot.output_tokens,
-                snapshot.cost_microcents,
-            )
-            .with_effort(config.effort.clone())
-            .with_selection_origin(snapshot.selection_origin),
+    let mut candidate = SessionFile::from_chat(
+        &config.session_id,
+        &config.model,
+        &config.gate,
+        &config.provider_id,
+        transcript,
+        snapshot.turns,
+        accounting.file.input_tokens,
+        accounting.file.output_tokens,
+        accounting.file.cost_microcents,
+    )
+    .with_effort(config.effort.clone())
+    .with_selection_origin(snapshot.selection_origin);
+    candidate.accounting_watermark = accounting.file.accounting_watermark.clone();
+    let saved = accounting.adapter.persist(lease, &mut candidate);
+    accounting.summary = if saved.is_ok() || matches!(&saved, Err(AccountingError::Session(_))) {
+        OwnedAccounting::summary(&candidate)
+    } else {
+        None
+    };
+    if saved.is_ok()
+        || matches!(
+            &saved,
+            Err(AccountingError::Session(
+                SessionLeaseError::PublicationUncertain(_)
+            ))
         )
-        .map_err(OwnerError::Storage)
+    {
+        accounting.file = candidate;
+    } else {
+        // A settled journal can advance even when snapshot publication fails.
+        // Retain its projection without adopting unpublished control metadata.
+        accounting.file.input_tokens = candidate.input_tokens;
+        accounting.file.output_tokens = candidate.output_tokens;
+        accounting.file.cost_microcents = candidate.cost_microcents;
+        accounting.file.accounting_watermark = candidate.accounting_watermark;
+    }
+    saved.map(|_| ()).map_err(OwnerError::from)
 }
 
 fn masks_for(config: &TuiTurnConfig, turn: &orbit_engine::TurnConfig) -> Vec<String> {
@@ -1238,11 +1510,12 @@ fn configure_owned(
     action: OwnerAction,
     config: &mut OwnerConfig,
     lease: &mut SessionLease,
-    store: &mut request_storage::RequestStore,
+    persistence: (&mut request_storage::RequestStore, &mut OwnedAccounting),
     transcript: &mut Vec<ChatMessage>,
     grants: &mut AutoGrants,
     handle: &OwnerHandle,
 ) -> Result<ActionAck, OwnerError> {
+    let (store, accounting) = persistence;
     if let OwnerAction::Resume { session_id } = action {
         if session_id.strip_suffix(".json").unwrap_or(&session_id) == lease.session_id() {
             return Ok(ActionAck {
@@ -1251,15 +1524,15 @@ fn configure_owned(
                 duplicate: false,
             });
         }
-        let (candidate_lease, saved) =
+        let (candidate_lease, mut saved) =
             SessionLease::acquire_and_load(lease.home(), &session_id, "daemon")?;
         let saved_origin = crate::sessions::model_origin(Some(&saved));
         let mut candidate = config.clone();
         candidate.turn.session_id = saved.session_id.clone();
-        candidate.turn.model = saved.model;
-        candidate.turn.provider_id = saved.provider;
-        candidate.turn.gate = saved.gate;
-        candidate.turn.effort = saved.effort;
+        candidate.turn.model = saved.model.clone();
+        candidate.turn.provider_id = saved.provider.clone();
+        candidate.turn.gate = saved.gate.clone();
+        candidate.turn.effort = saved.effort.clone();
         let turn = configured_turn(&candidate.turn)?;
         let masks = masks_for(&candidate.turn, &turn);
         let candidate_store = request_storage::RequestStore::new(
@@ -1267,6 +1540,9 @@ fn configure_owned(
             candidate_lease.session_id(),
         )?;
         let saved_requests = candidate_store.load(candidate_lease.session_id())?;
+        let adapter = prepare_root(&candidate_lease, &mut saved, RootOrigin::RestoredOrLegacy)?;
+        let candidate_accounting = OwnedAccounting::new(adapter, saved);
+        let saved = &candidate_accounting.file;
         let mut snapshot = handle.snapshot()?;
         apply_identity(&mut snapshot, &candidate.turn, &turn);
         snapshot.selection_origin = saved_origin;
@@ -1275,6 +1551,7 @@ fn configure_owned(
         snapshot.input_tokens = saved.input_tokens;
         snapshot.output_tokens = saved.output_tokens;
         snapshot.cost_microcents = saved.cost_microcents;
+        snapshot.accounting = candidate_accounting.summary;
         snapshot.messages = visible_messages(&saved.transcript, &masks);
         snapshot.partial_response.clear();
         snapshot.pending_approvals.clear();
@@ -1296,12 +1573,13 @@ fn configure_owned(
             TurnState::Idle
         };
         candidate_store.save(&snapshot)?;
+        let mut hub = handle.lock()?;
         *lease = candidate_lease;
         *store = candidate_store;
         *config = candidate;
-        *transcript = saved.transcript;
+        *transcript = saved.transcript.clone();
+        *accounting = candidate_accounting;
         *grants = AutoGrants::new();
-        let mut hub = handle.lock()?;
         hub.snapshot = snapshot;
         hub.pane_agents.clear();
         hub.masks = masks;
@@ -1311,9 +1589,10 @@ fn configure_owned(
         let turns = hub.snapshot.turns;
         let projection = json!({"messages":messages,"turns":turns,
             "input_tokens":hub.snapshot.input_tokens,"output_tokens":hub.snapshot.output_tokens,
-            "cost_microcents":hub.snapshot.cost_microcents,"state":hub.snapshot.state,
+            "cost_microcents":hub.snapshot.cost_microcents,"accounting":hub.snapshot.accounting,"state":hub.snapshot.state,
             "settings":control_settings(&hub.snapshot)});
         hub.emit("transcript", projection);
+        accounting.notice(&mut hub);
         return Ok(ActionAck {
             request_id: None,
             state: "resumed".into(),
@@ -1359,13 +1638,13 @@ fn configure_owned(
     snapshot.last_route = None;
     let masks = masks_for(&candidate.turn, &turn);
     snapshot.messages = visible_messages(transcript, &masks);
-    let saved = save_live(lease, &candidate.turn, transcript, &snapshot);
-    let published = matches!(
-        &saved,
-        Err(OwnerError::Storage(
-            SessionLeaseError::PublicationUncertain(_)
-        ))
-    );
+    let saved = save_live(lease, &candidate.turn, transcript, &snapshot, accounting);
+    accounting.project(&mut snapshot);
+    accounting.project(&mut handle.lock()?.snapshot);
+    let published = saved
+        .as_ref()
+        .err()
+        .is_some_and(OwnerError::session_publication_uncertain);
     if saved.is_ok() || published {
         *config = candidate;
         let mut hub = handle.lock()?;
@@ -1534,10 +1813,230 @@ fn session_context(config: &OwnerConfig, handle: &OwnerHandle) -> orbit_tools::T
     cx
 }
 
+fn emit_request_finished(hub: &mut Hub, request_id: &str) {
+    let record = hub.snapshot.requests.get(request_id);
+    let finished = json!({"request_id":request_id,"turns":hub.snapshot.turns,
+        "state":record.map(|record| record.state),
+        "input_tokens":hub.snapshot.input_tokens,"output_tokens":hub.snapshot.output_tokens,
+        "cost_microcents":hub.snapshot.cost_microcents,"accounting":hub.snapshot.accounting});
+    hub.emit("request_finished", finished);
+}
+
+fn compact_owned(
+    config: &OwnerConfig,
+    lease: &SessionLease,
+    persistence: (&request_storage::RequestStore, &mut OwnedAccounting),
+    transcript: &mut Vec<ChatMessage>,
+    handle: &OwnerHandle,
+    cx: &orbit_tools::ToolContext,
+    request: (String, mpsc::SyncSender<Result<ActionAck, OwnerError>>),
+) -> Result<(), OwnerError> {
+    use orbit_engine::CompactionStatus;
+    let (store, accounting) = persistence;
+    let (request_id, reply) = request;
+    // This is the durable replay boundary. No catalog, budget or model work may
+    // precede it, and a lost acknowledgement never resubmits the operation.
+    if let Err(error) = store.save(&handle.snapshot()?) {
+        let mut hub = handle.lock()?;
+        accounting.project(&mut hub.snapshot);
+        if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
+            record.state = RequestState::Unknown;
+        }
+        hub.snapshot.state = TurnState::Interrupted;
+        hub.cancel = None;
+        hub.emit(
+            "error",
+            json!({"message":error.to_string(),"request_id":request_id}),
+        );
+        emit_request_finished(&mut hub, &request_id);
+        let _ = reply.try_send(Err(error));
+        return Ok(());
+    }
+    let cancel = {
+        let mut hub = handle.lock()?;
+        if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
+            record.state = RequestState::Running;
+        }
+        hub.emit(
+            "request_accepted",
+            json!({"request_id":request_id,"action":"compact"}),
+        );
+        hub.cancel
+            .clone()
+            .ok_or_else(|| OwnerError::Runtime("missing compact cancellation scope".into()))?
+    };
+    let _ = reply.try_send(Ok(ActionAck {
+        request_id: Some(request_id.clone()),
+        state: "accepted".into(),
+        duplicate: false,
+    }));
+    let result = (|| -> Result<(CompactionStatus, bool), OwnerError> {
+        if cancel.is_cancelled() {
+            return Ok((CompactionStatus::Cancelled, false));
+        }
+        // Manual compaction uses the current selection, without prompt routing.
+        let turn = configured_turn(&config.turn)?;
+        let compaction = crate::try_role_turn_config(&config.turn.home, &turn, "compaction")
+            .map_err(OwnerError::Invalid)?;
+        let mut options = orbit_engine::TurnOptions {
+            max_attempts: 1,
+            compaction_config: Some(compaction),
+            session_id: config.turn.session_id.clone(),
+            request_stem: format!("orbit-owned-compact-{request_id}"),
+            ..Default::default()
+        };
+        let notices =
+            crate::model_limits::apply_turn_budgets(&config.turn.home, &turn, &mut options)
+                .map_err(|error| OwnerError::Invalid(error.to_string()))?;
+        accounting
+            .adapter
+            .namespace()
+            .apply_options_detailed(&mut options, None, None)?;
+        let mut definitions = crate::tools::session_tool_definitions_with_context(
+            &config.turn.home,
+            cx,
+            config.turn.scope.allowlist.as_deref(),
+        );
+        definitions.retain(|definition| {
+            !config.turn.scope.disallowlist.contains(&definition.name)
+                && config
+                    .turn
+                    .scope
+                    .allowlist
+                    .as_ref()
+                    .is_none_or(|allow| allow.contains(&definition.name))
+        });
+        options.tools = definitions;
+        {
+            let mut hub = handle.lock()?;
+            hub.masks = masks_for(&config.turn, &turn);
+            if let Some(compaction) = &options.compaction_config {
+                for mask in masks_for(&config.turn, compaction) {
+                    if !hub.masks.contains(&mask) {
+                        hub.masks.push(mask);
+                    }
+                }
+            }
+            for text in notices {
+                hub.emit("status", json!({"text":text}));
+            }
+        }
+        let mut events = |event: orbit_frontend_protocol::FrontendEvent| {
+            if let Ok(mut hub) = handle.lock() {
+                let payload = serde_json::to_value(event).unwrap_or(Value::Null);
+                let kind = payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("status")
+                    .to_owned();
+                hub.emit(&kind, payload);
+            }
+        };
+        let completion = orbit_engine::compact_context_detailed(
+            &config.turn.home,
+            &turn,
+            &options,
+            transcript,
+            &cancel,
+            &mut events,
+        );
+        // Its receipts already settled in the injected journal. Reconciliation
+        // below projects them once, including paid attempts that did not apply.
+        Ok((completion.status, completion.applied))
+    })();
+    {
+        let mut hub = handle.lock()?;
+        hub.snapshot.messages = visible_messages(transcript, &hub.masks);
+        hub.snapshot.partial_response.clear();
+        hub.snapshot.pending_approvals.clear();
+        hub.approvals.clear();
+        hub.cancel = None;
+    }
+    let saved = save_live(
+        lease,
+        &config.turn,
+        transcript,
+        &handle.snapshot()?,
+        accounting,
+    );
+    let uncertain = accounting.uncertain();
+    {
+        let mut hub = handle.lock()?;
+        accounting.project(&mut hub.snapshot);
+        hub.snapshot.accounting = None;
+        let state = if saved.is_err() || !matches!(&uncertain, Ok(false)) {
+            RequestState::Unknown
+        } else {
+            match &result {
+                Ok((
+                    CompactionStatus::PublicationUncertain | CompactionStatus::AccountingUncertain,
+                    _,
+                )) => RequestState::Unknown,
+                Ok((CompactionStatus::PublishedReady, true))
+                | Ok((CompactionStatus::NothingToCompact, false)) => RequestState::Completed,
+                Ok((_, true)) => RequestState::Unknown,
+                Ok((CompactionStatus::Cancelled, false)) => RequestState::Interrupted,
+                _ if cancel.is_cancelled() => RequestState::Interrupted,
+                _ => RequestState::Failed,
+            }
+        };
+        if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
+            record.state = state;
+        }
+    }
+    let saved_request = store.save(&handle.snapshot()?);
+    let mut hub = handle.lock()?;
+    if let Err(error) = &result {
+        hub.emit(
+            "error",
+            json!({"message":error.to_string(),"request_id":request_id}),
+        );
+    } else if let Ok((status, false)) = &result
+        && !matches!(
+            status,
+            CompactionStatus::NothingToCompact | CompactionStatus::Cancelled
+        )
+    {
+        hub.emit(
+            "status",
+            json!({"text":status.to_string(),"request_id":request_id}),
+        );
+    }
+    for error in [saved.err(), uncertain.err(), saved_request.err()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
+            record.state = RequestState::Unknown;
+        }
+        hub.emit(
+            "error",
+            json!({"message":error.to_string(),"request_id":request_id}),
+        );
+    }
+    hub.snapshot.state = if hub.stopping {
+        TurnState::Stopping
+    } else if hub
+        .snapshot
+        .requests
+        .get(&request_id)
+        .is_some_and(|record| record.state == RequestState::Unknown)
+    {
+        TurnState::Interrupted
+    } else {
+        TurnState::Idle
+    };
+    accounting.project(&mut hub.snapshot);
+    emit_request_finished(&mut hub, &request_id);
+    accounting.notice(&mut hub);
+    Ok(())
+}
+
 fn owner_loop(
     mut config: OwnerConfig,
     mut lease: SessionLease,
     mut store: request_storage::RequestStore,
+    mut accounting: OwnedAccounting,
     handle: OwnerHandle,
     receiver: mpsc::Receiver<Work>,
 ) -> Result<(), OwnerError> {
@@ -1557,11 +2056,14 @@ fn owner_loop(
             Work::Stop => break,
             Work::Configure { action, reply } => {
                 let old_id = config.turn.session_id.clone();
+                // Resume stages only candidate accounting until the final swap.
+                // A refused candidate cannot invalidate the current projection;
+                // current-source checks invalidate it in save_live/uncertain.
                 let result = configure_owned(
                     action,
                     &mut config,
                     &mut lease,
-                    &mut store,
+                    (&mut store, &mut accounting),
                     &mut transcript,
                     &mut grants,
                     &handle,
@@ -1573,6 +2075,18 @@ fn owner_loop(
                     hub.configuring = false;
                 }
                 let _ = reply.try_send(result);
+                continue;
+            }
+            Work::Compact { request_id, reply } => {
+                compact_owned(
+                    &config,
+                    &lease,
+                    (&store, &mut accounting),
+                    &mut transcript,
+                    &handle,
+                    &cx,
+                    (request_id, reply),
+                )?;
                 continue;
             }
             Work::Prompt {
@@ -1592,15 +2106,23 @@ fn owner_loop(
             origin_model: None,
             origin_provider: None,
         });
+        let next_turn = handle.snapshot()?.turns.checked_add(1);
+        let mut intent_save_attempted = false;
         let accepted = configured_turn(&config.turn).and_then(|base| {
+            let next_turn = next_turn
+                .ok_or_else(|| OwnerError::Runtime("session turn count overflows".into()))?;
             let origin = handle.snapshot()?.selection_origin;
             let (turn, decision) =
                 crate::try_phase_turn_config(&config.turn.home, &base, &text, origin)
                     .map_err(OwnerError::Invalid)?;
+            let retry_policy = crate::provider_policies::load_for_config(&config.turn.home, &turn)
+                .map_err(|error| OwnerError::Invalid(error.to_string()))?;
             let compaction = crate::try_role_turn_config(&config.turn.home, &turn, "compaction")
                 .map_err(OwnerError::Invalid)?;
             let mut options = orbit_engine::TurnOptions {
-                max_attempts: 1,
+                max_attempts: retry_policy
+                    .as_ref()
+                    .map_or(1, |policy| policy.max_attempts()),
                 compaction_config: Some(compaction),
                 session_id: config.turn.session_id.clone(),
                 request_stem: format!("orbit-owned-{request_id}"),
@@ -1616,29 +2138,81 @@ fn owner_loop(
             } else {
                 crate::model_limits::apply_turn_budgets(&config.turn.home, &turn, &mut options)
             };
+            accounting.adapter.namespace().apply_options_detailed(
+                &mut options,
+                None,
+                retry_policy.as_ref(),
+            )?;
             store.save(&handle.snapshot()?)?;
-            save_live(&lease, &config.turn, &intent, &handle.snapshot()?)?;
-            Ok((base, turn, decision, options, notices))
+            intent_save_attempted = true;
+            save_live(
+                &lease,
+                &config.turn,
+                &intent,
+                &handle.snapshot()?,
+                &mut accounting,
+            )?;
+            Ok((
+                base,
+                turn,
+                decision,
+                options,
+                notices,
+                next_turn,
+                retry_policy,
+            ))
         });
-        let (base_turn, turn, decision, mut options, notices) = match accepted {
-            Ok(turn) => turn,
-            Err(error) => {
-                let mut hub = handle.lock()?;
-                if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
-                    record.state = RequestState::Unknown;
+        let (base_turn, turn, decision, mut options, notices, next_turn, retry_policy) =
+            match accepted {
+                Ok(turn) => turn,
+                Err(error) => {
+                    transcript = intent;
+                    if let Some(next_turn) = next_turn {
+                        handle.lock()?.snapshot.turns = next_turn;
+                    }
+                    let saved = if intent_save_attempted {
+                        Ok(())
+                    } else {
+                        save_live(
+                            &lease,
+                            &config.turn,
+                            &transcript,
+                            &handle.snapshot()?,
+                            &mut accounting,
+                        )
+                    };
+                    let mut hub = handle.lock()?;
+                    accounting.project(&mut hub.snapshot);
+                    hub.snapshot.messages = visible_messages(&transcript, &hub.masks);
+                    if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
+                        record.state = RequestState::Unknown;
+                    }
+                    hub.snapshot.state = TurnState::Interrupted;
+                    let interrupted = hub.cancel.as_ref().is_some_and(CancelToken::is_cancelled);
+                    hub.cancel = None;
+                    hub.emit(
+                        "error",
+                        json!({"message":error.to_string(),"request_id":request_id}),
+                    );
+                    hub.emit(
+                        "turn_ended",
+                        json!({"type":"turn_ended","ok":false,"interrupted":interrupted,
+                        "rounds":0,"input_tokens":0,"output_tokens":0,"cost_microcents":0}),
+                    );
+                    if let Err(error) = saved {
+                        hub.emit(
+                            "error",
+                            json!({"message":error.to_string(),"request_id":request_id}),
+                        );
+                    }
+                    accounting.notice(&mut hub);
+                    emit_request_finished(&mut hub, &request_id);
+                    drop(hub);
+                    let _ = store.save(&handle.snapshot()?);
+                    let _ = reply.try_send(Err(error));
+                    continue;
                 }
-                hub.snapshot.state = TurnState::Interrupted;
-                hub.cancel = None;
-                hub.emit(
-                    "error",
-                    json!({"message":error.to_string(),"request_id":request_id}),
-                );
-                drop(hub);
-                let _ = store.save(&handle.snapshot()?);
-                let _ = reply.try_send(Err(error));
-                continue;
-            }
-        };
+            };
         let notices = match notices {
             Ok(notices) => notices,
             Err(error) => {
@@ -1650,11 +2224,18 @@ fn owner_loop(
                 {
                     let mut hub = handle.lock()?;
                     interrupted = hub.cancel.as_ref().is_some_and(CancelToken::is_cancelled);
-                    hub.snapshot.turns = hub.snapshot.turns.saturating_add(1);
+                    hub.snapshot.turns = next_turn;
                     hub.snapshot.messages = visible_messages(&transcript, &hub.masks);
                 }
                 let mut terminal = handle.snapshot()?;
-                let saved = save_live(&lease, &config.turn, &transcript, &terminal);
+                let saved = save_live(
+                    &lease,
+                    &config.turn,
+                    &transcript,
+                    &terminal,
+                    &mut accounting,
+                );
+                accounting.project(&mut terminal);
                 if let Some(record) = terminal.requests.get_mut(&request_id) {
                     record.state = if saved.is_err() {
                         RequestState::Unknown
@@ -1675,6 +2256,7 @@ fn owner_loop(
                 };
                 {
                     let mut hub = handle.lock()?;
+                    accounting.project(&mut hub.snapshot);
                     if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
                         record.state = if publication_error.is_some() {
                             RequestState::Unknown
@@ -1710,10 +2292,8 @@ fn owner_loop(
                             json!({"message":error.to_string(),"request_id":request_id}),
                         );
                     }
-                    let finished = json!({"request_id":request_id,"turns":hub.snapshot.turns,
-                        "input_tokens":hub.snapshot.input_tokens,"output_tokens":hub.snapshot.output_tokens,
-                        "cost_microcents":hub.snapshot.cost_microcents});
-                    hub.emit("request_finished", finished);
+                    emit_request_finished(&mut hub, &request_id);
+                    accounting.notice(&mut hub);
                 }
                 let ack = match publication_error {
                     Some(error) => Err(error),
@@ -1822,7 +2402,7 @@ fn owner_loop(
                 }
             }
         };
-        let report = orbit_engine::run_turn(
+        let completion = orbit_engine::turn::run_turn_detailed_with_retry_policy(
             &config.turn.home,
             &turn,
             &options,
@@ -1831,7 +2411,9 @@ fn owner_loop(
             &mut executor,
             &cancel,
             &mut events,
-        );
+            retry_policy.as_ref(),
+        )
+        .into_completion();
         {
             let mut hub = handle.lock()?;
             display.flush(&mut hub);
@@ -1839,21 +2421,7 @@ fn owner_loop(
         grants = executor.grants;
         {
             let mut hub = handle.lock()?;
-            hub.snapshot.turns = hub.snapshot.turns.saturating_add(1);
-            if let Ok(report) = &report {
-                hub.snapshot.input_tokens = hub
-                    .snapshot
-                    .input_tokens
-                    .saturating_add(report.input_tokens);
-                hub.snapshot.output_tokens = hub
-                    .snapshot
-                    .output_tokens
-                    .saturating_add(report.output_tokens);
-                hub.snapshot.cost_microcents = hub
-                    .snapshot
-                    .cost_microcents
-                    .saturating_add(report.cost_microcents);
-            }
+            hub.snapshot.turns = next_turn;
             hub.snapshot.messages = visible_messages(&transcript, &hub.masks);
             if let Some(scan) = orbit_engine::automation::scan_attestation(&transcript)
                 && scan.claimed_pass
@@ -1866,25 +2434,37 @@ fn owner_loop(
             hub.approvals.clear();
             hub.cancel = None;
         }
-        let saved = save_live(&lease, &config.turn, &transcript, &handle.snapshot()?);
+        let saved = save_live(
+            &lease,
+            &config.turn,
+            &transcript,
+            &handle.snapshot()?,
+            &mut accounting,
+        );
+        let uncertain = accounting.uncertain();
         {
             let mut hub = handle.lock()?;
+            accounting.project(&mut hub.snapshot);
+            hub.snapshot.accounting = None;
             if let Some(record) = hub.snapshot.requests.get_mut(&request_id) {
-                record.state = if saved.is_err() {
+                record.state = if saved.is_err() || !matches!(&uncertain, Ok(false)) {
                     RequestState::Unknown
-                } else if report.as_ref().is_ok_and(|report| report.interrupted) {
-                    RequestState::Interrupted
-                } else if report.as_ref().is_ok_and(|report| report.ok) {
-                    RequestState::Completed
                 } else {
-                    RequestState::Unknown
+                    match &completion.end {
+                        orbit_engine::TurnEnd::Completed => RequestState::Completed,
+                        orbit_engine::TurnEnd::Cancelled => RequestState::Interrupted,
+                        orbit_engine::TurnEnd::Failed(_) => RequestState::Failed,
+                    }
                 };
             }
         }
         let saved_request = store.save(&handle.snapshot()?);
         let mut hub = handle.lock()?;
-        if let Err(error) = report {
-            hub.emit("error", json!({"message":error}));
+        if let orbit_engine::TurnEnd::Failed(error) = &completion.end {
+            hub.emit("error", json!({"message":error.message}));
+        }
+        if let Err(error) = uncertain {
+            hub.emit("error", json!({"message":error.to_string()}));
         }
         if let Err(error) = saved {
             hub.emit("error", json!({"message":error.to_string()}));
@@ -1897,13 +2477,19 @@ fn owner_loop(
         }
         hub.snapshot.state = if hub.stopping {
             TurnState::Stopping
+        } else if hub
+            .snapshot
+            .requests
+            .get(&request_id)
+            .is_some_and(|record| record.state == RequestState::Unknown)
+        {
+            TurnState::Interrupted
         } else {
             TurnState::Idle
         };
-        let finished = json!({"request_id":request_id,"turns":hub.snapshot.turns,
-            "input_tokens":hub.snapshot.input_tokens,"output_tokens":hub.snapshot.output_tokens,
-            "cost_microcents":hub.snapshot.cost_microcents});
-        hub.emit("request_finished", finished);
+        accounting.project(&mut hub.snapshot);
+        emit_request_finished(&mut hub, &request_id);
+        accounting.notice(&mut hub);
         if hub.stopping {
             break;
         }
@@ -2525,6 +3111,66 @@ mod transport {
             if newline.is_some() {
                 return Ok(Some(bytes));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compact_wire_tests {
+    use super::*;
+
+    #[test]
+    fn compact_owner_frames_require_exact_intent() {
+        let action: OwnerAction =
+            serde_json::from_str(r#"{"type":"compact","request_id":"compact-1"}"#).unwrap();
+        assert!(matches!(action, OwnerAction::Compact { request_id } if request_id == "compact-1"));
+        for invalid in [
+            r#"{"type":"compact"}"#,
+            r#"{"type":"compact","request_id":1}"#,
+            r#"{"type":"compact","request_id":"compact-1","text":"hidden prompt"}"#,
+        ] {
+            assert!(serde_json::from_str::<OwnerAction>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_prompt_records_keep_their_original_wire_bytes() {
+        let wire = format!(
+            r#"{{"payload_digest":"{}","state":"completed"}}"#,
+            "a".repeat(64)
+        );
+        let record: RequestRecord = serde_json::from_str(&wire).unwrap();
+        assert_eq!(record.kind, RequestKind::Prompt);
+        assert_eq!(serde_json::to_string(&record).unwrap(), wire);
+        let compact = RequestRecord {
+            payload_digest: compact_request_digest(),
+            state: RequestState::Accepted,
+            kind: RequestKind::Compact,
+        };
+        let wire = serde_json::to_value(&compact).unwrap();
+        assert_eq!(wire["kind"], "compact");
+        assert_eq!(
+            serde_json::from_value::<RequestRecord>(wire).unwrap().kind,
+            RequestKind::Compact
+        );
+    }
+
+    #[test]
+    fn cold_accounting_summary_preserves_qualification() {
+        for full_cost_status in [
+            FullCostStatus::Known,
+            FullCostStatus::UnknownLegacy,
+            FullCostStatus::UnknownUsage,
+            FullCostStatus::Unpriced,
+            FullCostStatus::Uncertain,
+        ] {
+            let summary = OwnerAccountingSummary {
+                revision: 2,
+                full_cost_status,
+            };
+            let decoded: OwnerAccountingSummary =
+                serde_json::from_value(serde_json::to_value(summary).unwrap()).unwrap();
+            assert_eq!(decoded, summary);
         }
     }
 }

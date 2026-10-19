@@ -191,8 +191,10 @@ Disconnecting does not cancel a turn. Prompt request IDs prevent duplicate
 dispatch; reusing an ID with different text is refused. If an acknowledgement is
 lost, the client reports an unknown outcome: inspect status and conversation
 before deciding what to do. It does not automatically resubmit. Restarting a
-stopped owner with `--resume` loads saved conversation and labels interrupted or
-uncertain work; it does not replay a provider request.
+stopped owner with `--resume` loads its saved conversation when accounting permits
+admission. Pending uncertain work is refused; use `orbit recovery status --session
+SESSION_ID` to inspect it. Reconnecting or restarting does not replay a provider
+request.
 
 ## Enable language-server diagnostics
 

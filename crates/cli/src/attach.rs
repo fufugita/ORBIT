@@ -1,8 +1,8 @@
 //! Plain local client: disconnecting releases control without cancelling work.
 
 use crate::daemon::{
-    ActionAck, ApprovalChoice, EventCursor, OwnerAction, OwnerError, OwnerSnapshot, Recovery,
-    TurnState,
+    ActionAck, ApprovalChoice, EventCursor, OwnerAccountingSummary, OwnerAction, OwnerError,
+    OwnerSnapshot, Recovery, TurnState,
 };
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -65,7 +65,9 @@ impl AttachClient {
             return Err(OwnerError::NotController);
         }
         let request_id = match &action {
-            OwnerAction::Prompt { request_id, .. } => Some(request_id.clone()),
+            OwnerAction::Prompt { request_id, .. } | OwnerAction::Compact { request_id } => {
+                Some(request_id.clone())
+            }
             _ => None,
         };
         let value = self.request(json!({"type":"action","action":action}));
@@ -205,6 +207,37 @@ fn display(text: &str) -> String {
     crate::daemon::scan_display(text)
 }
 
+fn render_accounting(
+    cost: Option<u64>,
+    accounting: Option<&OwnerAccountingSummary>,
+    output: &mut impl Write,
+) -> Result<(), OwnerError> {
+    let accounting = accounting.filter(|_| cost.is_some());
+    let amount = cost.map_or_else(
+        || "unavailable".to_owned(),
+        |value| format!("${}.{:04}", value / 1_000_000, (value % 1_000_000) / 100),
+    );
+    let qualification = accounting.map_or("unavailable", |summary| {
+        use crate::session_accounting::FullCostStatus;
+        match summary.full_cost_status {
+            FullCostStatus::Known => "known",
+            FullCostStatus::UnknownLegacy => "unknown history",
+            FullCostStatus::UnknownUsage => "unknown usage",
+            FullCostStatus::Unpriced => "unpriced",
+            FullCostStatus::Uncertain => "uncertain",
+        }
+    });
+    write!(
+        output,
+        "Known priced subtotal {amount}; full cost {qualification}"
+    )
+    .map_err(io_error)?;
+    if let Some(summary) = accounting {
+        write!(output, " (revision {})", summary.revision).map_err(io_error)?;
+    }
+    writeln!(output).map_err(io_error)
+}
+
 pub fn render_snapshot(
     snapshot: &OwnerSnapshot,
     output: &mut impl Write,
@@ -219,6 +252,21 @@ pub fn render_snapshot(
     )
     .map_err(io_error)?;
     writeln!(output, "{}", display(&snapshot.effort_status)).map_err(io_error)?;
+    writeln!(
+        output,
+        "{} turns · {} input · {} output",
+        snapshot.turns, snapshot.input_tokens, snapshot.output_tokens
+    )
+    .map_err(io_error)?;
+    render_accounting(
+        Some(snapshot.cost_microcents),
+        if matches!(snapshot.state, TurnState::Running | TurnState::Stopping) {
+            None
+        } else {
+            snapshot.accounting.as_ref()
+        },
+        output,
+    )?;
     writeln!(output, "Context estimate unavailable in this snapshot").map_err(io_error)?;
     for message in &snapshot.messages {
         if let Some(text) = message.get("text").and_then(Value::as_str) {
@@ -318,7 +366,21 @@ pub fn render_recovery(recovery: &Recovery, output: &mut impl Write) -> Result<(
             )
             .map_err(io_error)?,
             "approval_requested" => render_approval(&event.payload, output)?,
-            "response_finished" | "request_finished" => writeln!(output).map_err(io_error)?,
+            "response_finished" => writeln!(output).map_err(io_error)?,
+            "request_accepted" => {
+                writeln!(output, "Full cost unavailable while the request is active")
+                    .map_err(io_error)?;
+            }
+            "request_finished" => {
+                let accounting = event.payload.get("accounting").and_then(|value| {
+                    serde_json::from_value::<OwnerAccountingSummary>(value.clone()).ok()
+                });
+                render_accounting(
+                    event.payload.get("cost_microcents").and_then(Value::as_u64),
+                    accounting.as_ref(),
+                    output,
+                )?;
+            }
             "error" | "status" => writeln!(
                 output,
                 "{}",
@@ -413,6 +475,34 @@ fn input_action(
         "/detach" | "/quit" => return Ok(false),
         "/status" => render_snapshot(&client.snapshot()?, output)?,
         "/logs" => render_recovery(&client.logs(None)?, output)?,
+        "/usage" => {
+            let snapshot = client.snapshot()?;
+            writeln!(
+                output,
+                "{} turns · {} input · {} output",
+                snapshot.turns, snapshot.input_tokens, snapshot.output_tokens
+            )
+            .map_err(io_error)?;
+            render_accounting(
+                Some(snapshot.cost_microcents),
+                if matches!(snapshot.state, TurnState::Running | TurnState::Stopping) {
+                    None
+                } else {
+                    snapshot.accounting.as_ref()
+                },
+                output,
+            )?;
+        }
+        "/compact" => {
+            let request_id = ulid::Ulid::new().to_string();
+            let acknowledged = client.send(OwnerAction::Compact { request_id })?;
+            writeln!(
+                output,
+                "Compaction request {} accepted",
+                display(acknowledged.request_id.as_deref().unwrap_or("unknown"))
+            )
+            .map_err(io_error)?;
+        }
         "/effort" => {
             client.send(OwnerAction::Effort)?;
             render_snapshot(&client.snapshot()?, output)?;
@@ -545,7 +635,7 @@ pub fn run_interactive(socket: &Path) -> Result<(), OwnerError> {
     render_recovery(&client.recovery, &mut output)?;
     writeln!(
         output,
-        "/detach leaves work running · /cancel interrupts · /stop ends the owner · /effort [choice|default] · /model [model]"
+        "/detach leaves work running · /cancel interrupts · /stop ends the owner · /compact summarizes context · /usage shows the bill · /effort [choice|default] · /model [model]"
     )
     .map_err(io_error)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(16);

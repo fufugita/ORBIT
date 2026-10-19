@@ -415,12 +415,16 @@ pub fn validate_owner_arguments(command: &str, args: &[String]) -> Result<(), Cl
 pub mod attach;
 pub mod cli_release_commands;
 pub mod config;
+pub mod context_history;
 #[allow(unsafe_code)]
 pub mod customization;
 pub mod customization_host;
 pub mod daemon;
 pub mod doctor;
+pub mod plain_input;
 pub mod profile_commands;
+mod recovery;
+pub mod recovery_commands;
 // The stdio backend confines Unix descriptor/signal operations to reviewed helpers.
 #[allow(unsafe_code)]
 pub mod lsp;
@@ -435,6 +439,8 @@ pub mod plugin_commands;
 pub mod plugin_content;
 pub mod presets;
 pub mod provider_discovery;
+pub mod provider_policies;
+pub mod session_accounting;
 pub mod sessions;
 #[allow(unsafe_code)]
 pub mod setup;

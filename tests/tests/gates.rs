@@ -530,18 +530,96 @@ compaction = "gate/gate-test-model-notools-summary"
         required.as_slice(),
         "newest complete text exchanges and current intent survive exactly"
     );
-    let summary = compacted[0]["summary"].as_str().unwrap();
-    assert!(!summary.trim().is_empty() && resumed.transcript[0].content.contains(summary));
+    // This is the automatic route: its public preview is scanned/bounded,
+    // while manual compact_context_detailed deliberately emits an empty one.
+    assert_eq!(compacted[0]["summary"], "hello world");
+    assert_eq!(
+        &resumed.transcript[..2],
+        &[
+            orbit_engine::user_message("[Earlier conversation summary: historical data]"),
+            orbit_engine::assistant_message("hello world"),
+        ]
+    );
+    let lease =
+        orbit_cli::sessions::SessionLease::acquire(&home, SESSION, "gate-archive-check").unwrap();
+    let archive_dir = home.join("context-history").join(SESSION).join("archives");
+    let archives: Vec<_> = std::fs::read_dir(&archive_dir)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        archives.len(),
+        1,
+        "one applied candidate retains one full original"
+    );
+    let archive_path = archives[0].path();
+    let archive: serde_json::Value =
+        serde_json::from_slice(&gate_read_bounded(&archive_path)).unwrap();
+    let record_id = archive["operation_id"].as_str().unwrap();
+    assert_eq!(
+        archive_path.file_name().unwrap(),
+        format!("{record_id}.json").as_str()
+    );
+    let mut original = history.clone();
+    original.push(orbit_engine::user_message(PROMPT));
+    assert_eq!(
+        orbit_cli::context_history::load_compaction_source(&home, SESSION, None, record_id)
+            .unwrap(),
+        original,
+        "the actual canonical reader must recover the complete typed original"
+    );
+    let candidate: Vec<orbit_adapter::types::ChatMessage> =
+        serde_json::from_value(archive["candidate"].clone()).unwrap();
+    assert_eq!(
+        candidate,
+        resumed.transcript[..resumed.transcript.len() - 1]
+    );
+    assert_eq!(archive["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(archive["attempts"][0]["purpose"], "chunk");
+    let checkpoint = orbit_cli::context_history::inspect_accounting(&home, SESSION, None)
+        .unwrap()
+        .checkpoint;
+    assert_eq!(
+        checkpoint.revision.0, 4,
+        "one summary and one ordinary request are settled once"
+    );
+    assert_eq!(
+        checkpoint.baseline,
+        orbit_engine::AccountingBaseline::UnknownLegacy
+    );
+    assert!(checkpoint.pending.is_none());
+    assert_eq!(
+        (
+            checkpoint.totals.ordinary.input_tokens,
+            checkpoint.totals.ordinary.output_tokens
+        ),
+        (3, 2)
+    );
+    assert_eq!(
+        (
+            checkpoint.totals.housekeeping.input_tokens,
+            checkpoint.totals.housekeeping.output_tokens
+        ),
+        (3, 2)
+    );
+    assert_eq!(
+        resumed
+            .accounting_watermark
+            .as_ref()
+            .unwrap()
+            .full_cost_status,
+        orbit_cli::sessions::FullCostStatus::UnknownLegacy
+    );
+    drop(lease);
 
     drop(_mock_guard); // The retained guard already owns/kills/waits for this child.
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Gate 4, part 2: kill -9 mid-turn, then `orbit --continue` resumes
-/// with the earlier turns intact (nothing written before the kill is
-/// lost).
+/// Gate 4, part 2: SIGKILL retains the completed prefix and the begun-only
+/// request. Admission refuses replay; explicit cold inspection remains useful.
 #[test]
-fn gate4_continue_after_kill9() {
+fn gate4_sigkill_retains_pending_prefix_and_requires_inspection() {
     let (port, _mock_guard) = spawn_mock_guarded();
     let home = fresh_home("g4-continue");
     let bin = orbit_bin();
@@ -555,9 +633,15 @@ fn gate4_continue_after_kill9() {
             .iter()
             .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended"))
     );
+    let saved = gate_only_session(&home);
+    assert_eq!(saved.turns, 1);
+    let baseline = orbit_cli::context_history::inspect_accounting(&home, &saved.session_id, None)
+        .unwrap()
+        .checkpoint;
+    assert!(baseline.pending.is_none());
 
     // Turn 2 is killed mid-flight with SIGKILL (nothing can intercept).
-    let mut child = Command::new(&bin)
+    let child = Command::new(&bin)
         .arg("-p")
         .arg("you will not finish this")
         .arg("--continue")
@@ -574,52 +658,310 @@ fn gate4_continue_after_kill9() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn orbit turn 2");
-    // Give it a moment to start streaming, then SIGKILL.
-    std::thread::sleep(std::time::Duration::from_millis(700));
-    let _ = child.kill(); // SIGKILL on unix
-    let _ = child.wait();
-
-    // --continue must resume the FIRST turn's session and complete a
-    // fresh turn (the killed one never ended, so the newest saved
-    // state is turn 1).
-    let (events, code) = run_orbit_p(
-        port,
-        &home,
-        "and we are back",
-        &["--auto-tools", "--continue"],
-    );
-    assert_eq!(code, 0, "--continue must work after a kill -9");
-    assert!(
+    let mut interrupted = MockGuard { child: Some(child) };
+    let out = interrupted.child.as_mut().unwrap().stdout.take().unwrap();
+    let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut events = Vec::new();
+        let mut signalled = false;
+        let mut bytes = 0usize;
+        // A total stream bound also bounds a hostile single line.
+        for line in BufReader::new(out.take(2 * 1024 * 1024 + 1)).lines() {
+            let line = line.unwrap();
+            bytes = bytes.checked_add(line.len() + 1).unwrap();
+            assert!(bytes <= 2 * 1024 * 1024, "interrupted stream output bound");
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                if !signalled
+                    && event["type"] == "text_delta"
+                    && event["text"].as_str().is_some_and(|text| !text.is_empty())
+                {
+                    first_tx.send(()).unwrap();
+                    signalled = true;
+                }
+                events.push(event);
+            }
+        }
         events
-            .iter()
-            .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("turn_ended")),
-        "the resumed turn must complete"
+    });
+    let reached = first_rx.recv_timeout(std::time::Duration::from_secs(10));
+    let child = interrupted.child.as_mut().unwrap();
+    child.kill().expect("kill the owned streaming process");
+    let status = child.wait().unwrap();
+    let interrupted_events = reader.join().unwrap();
+    assert!(
+        reached.is_ok(),
+        "SIGKILL requires an actually observed provider delta"
     );
-    // The stream-json transcript must show turn 1's content preserved
-    // (the provider received the prior conversation: we assert via the
-    // session file instead — turns > 1).
-    let sessions_dir = home.join("sessions");
-    let mut found_turns = 0u64;
-    if let Ok(rd) = std::fs::read_dir(&sessions_dir) {
-        for entry in rd.flatten() {
-            if let Ok(text) = std::fs::read_to_string(entry.path())
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-                && let Some(t) = v.get("turns").and_then(|t| t.as_u64())
-            {
-                found_turns = found_turns.max(t);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(9));
+    assert!(
+        !interrupted_events
+            .iter()
+            .any(|event| event["type"] == "turn_ended")
+    );
+
+    let after_kill = gate_only_session(&home);
+    assert_eq!(after_kill.session_id, saved.session_id);
+    assert_eq!(after_kill.transcript, saved.transcript);
+    assert_eq!(
+        (
+            after_kill.turns,
+            after_kill.input_tokens,
+            after_kill.output_tokens,
+            after_kill.cost_microcents
+        ),
+        (
+            saved.turns,
+            saved.input_tokens,
+            saved.output_tokens,
+            saved.cost_microcents
+        )
+    );
+    let pending =
+        orbit_cli::context_history::inspect_accounting(&home, &saved.session_id, None).unwrap();
+    assert_eq!(pending.checkpoint.revision.0, baseline.revision.0 + 1);
+    assert_eq!(pending.checkpoint.totals, baseline.totals);
+    assert_eq!(
+        pending.checkpoint.known_priced_subtotals,
+        baseline.known_priced_subtotals
+    );
+    assert_eq!(pending.checkpoint.last_settlement, baseline.last_settlement);
+    let attempt = pending.checkpoint.pending.as_ref().unwrap();
+    assert_eq!(attempt.intent.owner_session_id, saved.session_id);
+    assert!(attempt.intent.child_id.is_none());
+    assert_eq!(
+        attempt.intent.purpose,
+        orbit_engine::AttemptPurpose::Ordinary
+    );
+    assert!(
+        !attempt.uncertain,
+        "SIGKILL cannot invent a settled uncertain receipt"
+    );
+    assert!(pending.pending_receipt.is_none());
+    let reference = attempt.reference.clone();
+    let source = gate_payload_bytes(&home, &saved.session_id);
+    drop(_mock_guard); // Actual provider is stopped before any recovery command.
+    let trap = GateReplayTrap::new();
+
+    // The original --continue selection remains exercised, but pending work
+    // must not be silently retried or counted as a completed second turn.
+    let refused = Command::new(&bin)
+        .args([
+            "-p",
+            "and we are back",
+            "--continue",
+            "--auto-tools",
+            "--output-format",
+            "stream-json",
+        ])
+        .arg("--home")
+        .arg(&home)
+        .arg("--gate")
+        .arg(format!("http://127.0.0.1:{}", trap.port))
+        .arg("--model")
+        .arg("gate-test-model")
+        .env("ORBIT_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains(
+        "ORBIT-E0400: a pending uncertain request requires explicit inspection before admission"
+    ));
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("\"type\":\"turn_ended\""));
+    assert_eq!(gate_payload_bytes(&home, &saved.session_id), source);
+
+    let status = Command::new(&bin)
+        .args([
+            "recovery",
+            "status",
+            "--session",
+            &saved.session_id,
+            "--json",
+        ])
+        .arg("--home")
+        .arg(&home)
+        .env("ORBIT_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(status.stderr.is_empty() && status.stdout.len() <= 16 * 1024);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["schema"], "orbit.recovery-status/v1");
+    assert_eq!(status["status"], "available");
+    assert_eq!(status["owner_session_id"], saved.session_id);
+    assert_eq!(status["lifecycle"], "begun_only");
+    assert_eq!(
+        status["checkpoint_revision"].as_u64(),
+        Some(pending.checkpoint.revision.0)
+    );
+    assert_eq!(
+        status["pending"]["reference"]["request_id"],
+        reference.request_id
+    );
+    assert_eq!(
+        status["pending"]["reference"]["intent_digest"],
+        reference.intent_digest
+    );
+    assert_eq!(status["inspection_digest"], pending.inspection_digest);
+    assert_eq!(status["inspection"]["qualification"], "visible_validated");
+    assert_eq!(
+        status["inspection"]["provider_outcome"],
+        "not_established_by_inspection"
+    );
+    assert_eq!(gate_payload_bytes(&home, &saved.session_id), source);
+    assert_eq!(
+        orbit_cli::context_history::inspect_accounting(&home, &saved.session_id, None).unwrap(),
+        pending
+    );
+    let lease = orbit_cli::sessions::SessionLease::acquire(
+        &home,
+        &saved.session_id,
+        "gate-released-after-kill",
+    )
+    .unwrap();
+    assert_eq!(lease.load().unwrap().transcript, saved.transcript);
+    drop(lease);
+    assert_eq!(
+        trap.finish(),
+        0,
+        "no recovery command may connect to the selected provider"
+    );
+    assert_eq!(gate_only_session(&home).turns, 1);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+fn gate_only_session(home: &std::path::Path) -> orbit_cli::sessions::SessionFile {
+    let json_files = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count();
+    assert_eq!(json_files, 1);
+    let mut sessions = orbit_cli::sessions::list_sessions(home).unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "no fresh fallback may replace the selected owner"
+    );
+    sessions.remove(0)
+}
+
+fn gate_read_bounded(path: &std::path::Path) -> Vec<u8> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::symlink_metadata(path).unwrap();
+    assert!(before.is_file() && before.nlink() == 1 && before.len() <= 4 * 1024 * 1024);
+    let file = std::fs::File::open(path).unwrap();
+    let opened = file.metadata().unwrap();
+    assert_eq!((opened.dev(), opened.ino()), (before.dev(), before.ino()));
+    let mut bytes = Vec::new();
+    file.take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes.len() as u64, before.len());
+    bytes
+}
+
+fn gate_payload_bytes(
+    home: &std::path::Path,
+    id: &str,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut paths = vec![
+        home.join("sessions").join(format!("{id}.json")),
+        home.join("context-history")
+            .join(id)
+            .join("accounting.json"),
+    ];
+    let archives = home.join("context-history").join(id).join("archives");
+    let entries: Vec<_> = std::fs::read_dir(archives)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(entries.len() <= 64);
+    paths.extend(entries.into_iter().map(|entry| entry.path()));
+    let legacy = home.join("projects").join(format!("{id}.jsonl"));
+    match std::fs::symlink_metadata(&legacy) {
+        Ok(_) => paths.push(legacy),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("legacy fixture metadata: {error}"),
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            (
+                path.strip_prefix(home).unwrap().to_owned(),
+                gate_read_bounded(&path),
+            )
+        })
+        .collect()
+}
+
+struct GateReplayTrap {
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<Result<usize, &'static str>>>,
+}
+impl GateReplayTrap {
+    fn new() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let join = std::thread::spawn(move || {
+            use std::io::Write;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut count = 0usize;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err("trap deadline before acknowledged stop");
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count = count.checked_add(1).ok_or("trap count overflow")?;
+                        stream
+                            .set_write_timeout(Some(std::time::Duration::from_millis(100)))
+                            .map_err(|_| "trap timeout")?;
+                        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Ok(count);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return Err("trap accept failed"),
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            join: Some(join),
+        }
+    }
+    fn finish(mut self) -> usize {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.join.take().unwrap().join().unwrap().unwrap()
+    }
+}
+impl Drop for GateReplayTrap {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let result = join.join();
+            if !std::thread::panicking() {
+                result.unwrap().unwrap();
             }
         }
     }
-    assert!(
-        found_turns >= 2,
-        "the session after --continue must carry the pre-kill turns (found {found_turns})"
-    );
-
-    let _ = Command::new("fuser")
-        .arg("-k")
-        .arg(format!("{port}/tcp"))
-        .status();
-    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// Phase 5, part 1: the signed-mod flow through the binary. A mod is
@@ -724,6 +1066,26 @@ fn gate6_ci_run_allowlist_and_exit_codes() {
     let home = fresh_home("g6-ci");
     let bin = orbit_bin();
     init_home(&bin.to_string_lossy(), &home);
+    write_providers(
+        home.join("providers.toml"),
+        format!(
+            r#"[[provider]]
+name = "gate"
+kind = "openai-compatible"
+url = "http://127.0.0.1:{port}"
+[[provider.models]]
+id = "gate-test-model"
+[provider.models.pricing]
+input_per_million_microdollars = 10000
+output_per_million_microdollars = 10000
+cache_read_per_million_microdollars = 10000
+cache_write_per_million_microdollars = 10000
+reasoning_per_million_microdollars = 10000
+request_flat_microdollars = 1
+"#
+        ),
+    )
+    .unwrap();
 
     // The CI shape: explicit allowlist, bare start, json summary,
     // cost budget. The mock's implicit script calls a tool NOT in the
@@ -760,8 +1122,46 @@ fn gate6_ci_run_allowlist_and_exit_codes() {
     );
 
     // The denial is recorded in the session (auditable).
-    let all = serde_json::to_string(&events).unwrap_or_default();
-    let _ = all;
+    let summary = summary.unwrap();
+    assert_eq!(summary["command"], "p");
+    assert_eq!(summary["full_cost_status"], "known");
+    assert!(summary["cost_microcents"].as_u64().unwrap() > 0);
+    let saved = gate_only_session(&home);
+    let denied: Vec<_> = saved
+        .transcript
+        .iter()
+        .filter(|message| {
+            message.role == orbit_adapter::types::ChatRole::Tool
+                && message
+                    .tool_result
+                    .as_deref()
+                    .is_some_and(orbit_tools::result_is_denial)
+        })
+        .collect();
+    assert_eq!(denied.len(), 1);
+    let verified = Command::new(&bin)
+        .arg("--home")
+        .arg(&home)
+        .arg("verify-ledger")
+        .output()
+        .unwrap();
+    assert!(verified.status.success());
+    let verified: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+    let calls = verified["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "calculator");
+    assert!(calls[0]["intent"].is_object());
+    assert_eq!(calls[0]["decision"]["allowed"], false);
+    assert_eq!(calls[0]["result"]["status"], "denied");
+    let checkpoint = orbit_cli::context_history::inspect_accounting(&home, &saved.session_id, None)
+        .unwrap()
+        .checkpoint;
+    assert!(checkpoint.pending.is_none());
+    assert_eq!(
+        checkpoint.totals.ordinary.cost_microcents,
+        summary["cost_microcents"].as_u64()
+    );
+    assert_eq!(checkpoint.totals.housekeeping.input_tokens, 0);
     let _ = std::fs::remove_dir_all(&home);
     let _ = Command::new("fuser")
         .arg("-k")

@@ -4,10 +4,23 @@
 
 use super::anim::StarState;
 
+/// Local display ownership; kept opaque so callers cannot forge accepted state.
+#[derive(Debug, Clone, Default)]
+pub struct SessionViewState {
+    pub(super) binding: Option<crate::worker::SessionBinding>,
+    pub(super) pending: Option<crate::worker::ManualOperation>,
+    pub(super) foreground: Option<crate::worker::ForegroundOperation>,
+    pub(super) cost: crate::msg::CostQualification,
+    pub(super) revision_floor: Option<u64>,
+    pub(super) dirty: bool,
+    next_manual_id: u64,
+}
+
 /// What a panel of the scenario knows. The reducer is total: every
 /// FrontendEvent maps to a state change (or an explicit ignore).
 #[derive(Debug, Clone, Default)]
 pub struct Scenario {
+    pub frontend: SessionViewState,
     pub routing_lines: Vec<String>,
     pub custom_panes:
         std::collections::BTreeMap<String, orbit_frontend_protocol::customization::PaneOutput>,
@@ -208,7 +221,7 @@ pub struct TurnReport {
 }
 
 /// One visible transcript line.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptLine {
     pub kind: LineKind,
     pub text: String,
@@ -342,6 +355,143 @@ impl Scenario {
         Self::default()
     }
 
+    pub fn session_binding(&self) -> Option<&crate::worker::SessionBinding> {
+        self.frontend.binding.as_ref()
+    }
+
+    pub fn pending_manual(&self) -> Option<&crate::worker::ManualOperation> {
+        self.frontend.pending.as_ref()
+    }
+
+    pub fn cost_qualification(&self) -> crate::msg::CostQualification {
+        self.frontend.cost
+    }
+    pub fn qualified_revision_floor(&self) -> Option<u64> {
+        self.frontend.revision_floor
+    }
+
+    pub fn pending_foreground(&self) -> Option<&crate::worker::ForegroundOperation> {
+        self.frontend.foreground.as_ref()
+    }
+
+    pub fn ordinary_pending(&self) -> bool {
+        self.frontend
+            .foreground
+            .as_ref()
+            .is_some_and(|operation| operation.kind().is_ordinary())
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.turn_live
+            || self.compacting
+            || self.frontend.pending.is_some()
+            || self.frontend.foreground.is_some()
+            || !self.running.is_empty()
+            || self.approval_pending.is_some()
+            || !self.approval_queue.is_empty()
+            || self.agents_running > 0
+    }
+
+    pub fn new_foreground_operation(
+        &mut self,
+        kind: crate::worker::ForegroundKind,
+    ) -> Result<crate::worker::ForegroundOperation, &'static str> {
+        if self.is_busy() {
+            return Err("wait for the active work to finish");
+        }
+        let source = self
+            .frontend
+            .binding
+            .clone()
+            .ok_or("session ownership is not ready")?;
+        let id = self
+            .frontend
+            .next_manual_id
+            .checked_add(1)
+            .ok_or("foreground operation limit reached")?;
+        let operation = crate::worker::ForegroundOperation::new(source, kind, id)?;
+        self.frontend.next_manual_id = id;
+        Ok(operation)
+    }
+
+    pub fn admit_foreground(&mut self, operation: crate::worker::ForegroundOperation) -> bool {
+        if self.is_busy() || self.frontend.binding.as_ref() != Some(operation.source()) {
+            return false;
+        }
+        self.frontend.foreground = Some(operation);
+        self.invalidate_cost_qualification();
+        self.frontend.dirty = true;
+        true
+    }
+
+    pub fn new_manual_operation(
+        &mut self,
+        action: crate::worker::ManualAction,
+    ) -> Result<crate::worker::ManualOperation, &'static str> {
+        if self.is_busy() {
+            return Err("wait for the active work to finish");
+        }
+        let source = self
+            .frontend
+            .binding
+            .clone()
+            .ok_or("session ownership is not ready")?;
+        let id = self
+            .frontend
+            .next_manual_id
+            .checked_add(1)
+            .ok_or("manual operation limit reached")?;
+        let operation = crate::worker::ManualOperation::new(source, action, id)?;
+        self.frontend.next_manual_id = id;
+        Ok(operation)
+    }
+
+    pub fn admit_manual(&mut self, operation: crate::worker::ManualOperation) -> bool {
+        if self.is_busy() || self.frontend.binding.as_ref() != Some(operation.source()) {
+            return false;
+        }
+        self.frontend.pending = Some(operation);
+        self.invalidate_cost_qualification();
+        self.frontend.dirty = true;
+        true
+    }
+
+    pub fn invalidate_cost_qualification(&mut self) {
+        if self.frontend.cost != crate::msg::CostQualification::Unavailable {
+            self.frontend.cost = crate::msg::CostQualification::Unavailable;
+            self.frontend.dirty = true;
+        }
+    }
+
+    pub fn take_view_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.frontend.dirty)
+    }
+
+    pub(super) fn invalidate_context_sample(&mut self) {
+        self.used_tokens = 0;
+        self.window_tokens = 0;
+        self.ctx_breakdown = None;
+        self.usage_shown_ms = 0;
+        self.ctx_from = 0.0;
+        self.ctx_to = 0.0;
+        self.ctx_ms = 0;
+        self.compacting_from = None;
+    }
+
+    pub fn cost_status_text(&self) -> String {
+        use crate::msg::CostQualification as C;
+        let amount = format!("${:.4}", self.cost_microcents as f64 / 1_000_000.0);
+        let suffix = match self.frontend.cost {
+            C::Known { .. } => return amount,
+            C::Unavailable => "bill unavailable",
+            C::UnknownHistory { .. } => "earlier cost unknown",
+            C::UnknownUsage { .. } => "usage incomplete",
+            C::Unpriced { .. } => "unpriced work",
+            C::Uncertain { .. } => "accounting uncertain",
+        };
+        format!("{amount} · {suffix}")
+    }
+
     /// The rule `s` and `a` would remember for the call the card is asking
     /// about. A rule derived for another call (its detail arrived late or
     /// out of order) is not offered: the card must never name one rule
@@ -356,20 +506,23 @@ impl Scenario {
     /// A monotonic change counter (§10.5): any state mutation bumps
     /// it, so the loop can skip draws when nothing changed.
     pub fn state_version(&self) -> u64 {
-        self.transcript.len() as u64
-            + self.turns
-            + self.turn_tools
-            + self.running.len() as u64
-            + self.approval_queue.len() as u64
-            + self.approval_summary.is_some() as u64
-            + self
-                .tapes
+        [
+            self.transcript.len() as u64,
+            self.turns,
+            self.turn_tools,
+            self.running.len() as u64,
+            self.approval_queue.len() as u64,
+            self.approval_summary.is_some() as u64,
+            self.tapes
                 .iter()
                 .map(|t| t.lines.len() + t.dropped)
-                .sum::<usize>() as u64
-            + self.tapes.len() as u64
-            + (self.turn_live as u64)
-            + (self.last_failed as u64)
+                .sum::<usize>() as u64,
+            self.tapes.len() as u64,
+            self.turn_live as u64,
+            self.last_failed as u64,
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add)
     }
 
     /// The star is turning (an animation is in flight).
@@ -536,7 +689,7 @@ impl Scenario {
             // thinking: 2 fps
             return StarState::Turning { period_ms: 500 };
         }
-        if self.compacting {
+        if self.compacting || self.frontend.pending.is_some() {
             return StarState::StillAmber;
         }
         if self.last_failed {
@@ -602,6 +755,7 @@ impl Scenario {
         let _ = tick_ms;
         match ev {
             "round_started" => {
+                self.invalidate_cost_qualification();
                 self.turn_live = true;
                 self.visible_output = false;
                 self.last_failed = false;

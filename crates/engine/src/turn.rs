@@ -5,6 +5,9 @@
 //! loop runs until the model stops calling tools, a stop reason ends
 //! the turn, the operator cancels, or the round guard fires.
 
+use crate::compaction::{
+    AccountingKnownness, AccountingTotals, AttemptIntent, AttemptPurpose, RequestAccountingReceipt,
+};
 use crate::{
     EventSink, ToolExecutor, TurnReport, assistant_message, dispatch::TurnConfig, user_message,
 };
@@ -15,8 +18,85 @@ use std::time::Duration;
 /// Guard against a runaway turn (roadmap default: 100).
 pub const DEFAULT_MAX_ROUNDS: u32 = 100;
 
-/// Retry budget for rate-limit/server refusals (roadmap: 8).
+/// Compatibility retry setting; opaque dispatch errors cannot prove safe replay.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 8;
+
+/// Bounded current-turn metadata, independent of operator round/retry settings.
+pub const MAX_TURN_ACCOUNTING_ATTEMPTS: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendAllowance {
+    /// Admission policy over prepared token estimates, not a provider-enforced
+    /// monetary reservation. The caller supplies this namespace's remaining sum.
+    pub remaining_microcents: u64,
+    pub allow_unpriced_housekeeping: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFailure {
+    pub message: String,
+}
+impl std::fmt::Display for TurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for TurnFailure {}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEnd {
+    Completed,
+    Cancelled,
+    Failed(TurnFailure),
+}
+#[derive(Debug, Clone)]
+pub struct TurnCompletion {
+    pub report: TurnReport,
+    pub end: TurnEnd,
+}
+
+/// Invocation-local final rejections, kept separate from measured receipts.
+#[derive(Debug, Clone)]
+pub struct RetryTurnCompletion {
+    completion: TurnCompletion,
+    refusals: Vec<crate::retry::RefusalRecord>,
+}
+impl RetryTurnCompletion {
+    pub fn completion(&self) -> &TurnCompletion {
+        &self.completion
+    }
+    pub fn refusals(&self) -> &[crate::retry::RefusalRecord] {
+        &self.refusals
+    }
+    pub fn into_parts(self) -> (TurnCompletion, Vec<crate::retry::RefusalRecord>) {
+        (self.completion, self.refusals)
+    }
+    pub fn into_completion(self) -> TurnCompletion {
+        self.completion
+    }
+}
+
+fn remaining_accounting_metadata(
+    report: &TurnReport,
+    refusals: &[crate::retry::RefusalRecord],
+) -> Result<usize, &'static str> {
+    report
+        .attempts
+        .len()
+        .checked_add(refusals.len())
+        .and_then(|used| MAX_TURN_ACCOUNTING_ATTEMPTS.checked_sub(used))
+        .ok_or("turn accounting metadata limit reached; start a new turn (ORBIT-E0411)")
+}
+
+fn record_accounting_with_refusals(
+    report: &mut TurnReport,
+    refusals: &[crate::retry::RefusalRecord],
+    receipts: &[RequestAccountingReceipt],
+) -> Result<bool, &'static str> {
+    if receipts.len() > remaining_accounting_metadata(report, refusals)? {
+        return Err("turn accounting metadata limit reached; start a new turn (ORBIT-E0411)");
+    }
+    record_accounting(report, receipts)
+}
 
 fn accumulate_accounting(
     report: &mut TurnReport,
@@ -38,6 +118,223 @@ fn accumulate_accounting(
     report.output_tokens = output_tokens;
     report.cost_microcents = cost_microcents;
     Ok(())
+}
+
+/// Preserve only validated summary subtotals in the legacy numeric report.
+/// Missing usage or pricing is separately visible, never a fabricated zero bill.
+fn record_accounting(
+    report: &mut TurnReport,
+    receipts: &[RequestAccountingReceipt],
+) -> Result<bool, &'static str> {
+    if receipts.len() > MAX_TURN_ACCOUNTING_ATTEMPTS.saturating_sub(report.attempts.len()) {
+        return Err("turn accounting metadata limit reached; start a new turn (ORBIT-E0411)");
+    }
+    for receipt in receipts {
+        receipt
+            .validate()
+            .map_err(|_| "provider request accounting is invalid (ORBIT-E0411)")?;
+    }
+    // Every receipt describes work that has already happened. Retain the full
+    // bounded batch before a subtotal overflow can stop arithmetic progress.
+    report.attempts.extend_from_slice(receipts);
+    let mut incomplete = false;
+    let mut delta_overflow = false;
+    let mut numeric_overflow = false;
+    for receipt in receipts {
+        if !delta_overflow {
+            match report.accounting.checked_with(receipt) {
+                Ok(delta) => report.accounting = delta,
+                Err(_) => delta_overflow = true,
+            }
+        }
+        if !numeric_overflow && receipt.knownness == AccountingKnownness::Known {
+            numeric_overflow = accumulate_accounting(
+                report,
+                &crate::TurnOutcome {
+                    input_tokens: receipt.totals.input_tokens,
+                    output_tokens: receipt.totals.output_tokens,
+                    cost_microcents: receipt.totals.cost_microcents.unwrap_or(0),
+                    ..Default::default()
+                },
+            )
+            .is_err();
+        }
+        incomplete |= receipt.knownness != AccountingKnownness::Known
+            || receipt.totals.cost_microcents.is_none();
+    }
+    if delta_overflow || numeric_overflow {
+        report.accounting.knownness = AccountingKnownness::Uncertain;
+        report.accounting.ordinary.cost_microcents = None;
+        report.accounting.housekeeping.cost_microcents = None;
+        return Err("provider accounting overflow; inspect request receipts (ORBIT-E0411)");
+    }
+    Ok(incomplete)
+}
+
+fn remaining_allowance(
+    options: &TurnOptions,
+    report: &TurnReport,
+) -> Result<Option<SpendAllowance>, String> {
+    let Some(mut allowance) = options.spend_allowance else {
+        return Ok(None);
+    };
+    if report.accounting.knownness != AccountingKnownness::Known
+        || report.attempts.iter().any(|receipt| {
+            receipt.knownness != AccountingKnownness::Known
+                || (receipt.totals.cost_microcents.is_none()
+                    && (receipt.purpose == AttemptPurpose::Ordinary
+                        || !allowance.allow_unpriced_housekeeping))
+        })
+    {
+        return Err("spend allowance cannot continue with unknown request costs".into());
+    }
+    allowance.remaining_microcents = allowance
+        .remaining_microcents
+        .checked_sub(report.cost_microcents)
+        .ok_or_else(|| "spend allowance exhausted before another provider request".to_string())?;
+    Ok(Some(allowance))
+}
+
+struct OccupancyAnchor {
+    before: crate::context_budget::RequestEstimate,
+    identity: crate::context_budget::BudgetIdentity,
+    prefix_len: usize,
+    observed_context_tokens: Option<u64>,
+}
+
+impl OccupancyAnchor {
+    fn observed_after(
+        &self,
+        probe: &crate::dispatch::MeasurementProbe,
+        budget: &crate::context_budget::SelectedBudget,
+        messages: &[ChatMessage],
+        after: &crate::context_budget::RequestEstimate,
+    ) -> Option<u64> {
+        use crate::context_budget::EstimateStatus;
+        if self.identity != budget.identity
+            || self.before.status != EstimateStatus::Approximate
+            || after.status != EstimateStatus::Approximate
+        {
+            return None;
+        }
+        // Re-render the unchanged prefix with this round's frozen system,
+        // tools, selection and effort. A replaced prefix or changed renderer
+        // must not inherit an observation from a different request.
+        let before = probe
+            .estimate_messages(messages.get(..self.prefix_len)?, budget)
+            .ok()?;
+        if before != self.before {
+            return None;
+        }
+        let growth = after
+            .estimated_input_tokens
+            .checked_sub(before.estimated_input_tokens)?;
+        self.observed_context_tokens?.checked_add(growth)
+    }
+}
+
+struct OrdinaryDispatch {
+    outcome: crate::dispatch::TurnOutcome,
+    occupancy: OccupancyAnchor,
+}
+
+// Accounting publication errors must survive a concurrent cancellation token.
+enum OrdinaryDispatchError {
+    Failure(String),
+    Accounting(String),
+    Cancelled,
+}
+impl From<String> for OrdinaryDispatchError {
+    fn from(message: String) -> Self {
+        Self::Failure(message)
+    }
+}
+impl From<&str> for OrdinaryDispatchError {
+    fn from(message: &str) -> Self {
+        Self::Failure(message.into())
+    }
+}
+impl OrdinaryDispatchError {
+    fn accounting(error: impl std::fmt::Display) -> Self {
+        Self::Accounting(error.to_string())
+    }
+    fn into_message(self) -> String {
+        match self {
+            Self::Failure(message) | Self::Accounting(message) => message,
+            Self::Cancelled => "cancelled".into(),
+        }
+    }
+}
+
+fn emit_context_usage(
+    context: &crate::dispatch::RequestPreparationContext,
+    options: &TurnOptions,
+    budget: Option<&crate::context_budget::SelectedBudget>,
+    messages: &[ChatMessage],
+    anchor: Option<&OccupancyAnchor>,
+    events: EventSink<'_>,
+) {
+    let Some(budget) = budget else {
+        return;
+    };
+    let measured = crate::dispatch::measurement_probe(context)
+        .ok()
+        .and_then(|probe| {
+            probe
+                .estimate_messages(messages, budget)
+                .ok()
+                .map(|after| (probe, after))
+        });
+    let Some((probe, after)) = measured else {
+        events(FrontendEvent::Status {
+            text: "Current context usage is unknown because the updated request could not be measured."
+                .into(),
+        });
+        return;
+    };
+    let used_tokens = anchor
+        .and_then(|anchor| anchor.observed_after(&probe, budget, messages, &after))
+        .unwrap_or(after.estimated_input_tokens)
+        .max(after.estimated_input_tokens);
+    if after.status == crate::context_budget::EstimateStatus::UnknownMedia {
+        events(FrontendEvent::Status {
+            text: "Current context usage includes a text estimate; media or opaque request cost remains unknown."
+                .into(),
+        });
+    }
+    if let (Some(window_tokens), reserve) = budget.meter_window(after.requested_output_tokens) {
+        let memory = (options.memory_bytes as u64).min(after.system_bytes) / 4;
+        let system = after.system_bytes / 4 - memory;
+        let tools = after.tools_bytes / 4;
+        events(FrontendEvent::Usage {
+            used_tokens,
+            window_tokens,
+            breakdown: Some(orbit_frontend_protocol::ContextBreakdown {
+                system,
+                memory,
+                tools,
+                messages: after.estimated_input_tokens - system - memory - tools,
+                compact_at: budget
+                    .compaction_threshold(after.requested_output_tokens)
+                    .unwrap_or(0),
+                reserve,
+            }),
+        });
+    }
+}
+
+fn compaction_display(summary: &str) -> String {
+    fn bounded(text: &str) -> &str {
+        let mut end = text.len().min(8192);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+    // Scan the entire transport-bounded value before cutting its public
+    // preview: a cut through a token must not hide it from the scanner.
+    let scanned = orbit_tools::scan::scan_result(summary);
+    bounded(&scanned.text).to_string()
 }
 
 /// Configuration for one engine turn.
@@ -89,6 +386,11 @@ pub struct TurnOptions {
     pub selected_budget: Option<crate::context_budget::SelectedBudget>,
     /// Independently resolved policy for the selected summarizer.
     pub compaction_budget: Option<crate::context_budget::SelectedBudget>,
+    /// Owner-qualified durable compaction/accounting storage. Registration only;
+    /// callers inject the implementation when the shared service is activated.
+    pub journal: Option<std::sync::Arc<dyn crate::compaction::CompactionJournal>>,
+    /// Explicit namespace-local allowance; never inherited as a global cap.
+    pub spend_allowance: Option<SpendAllowance>,
 }
 
 /// Legacy transcript-only display estimate retained for API compatibility.
@@ -160,6 +462,8 @@ impl Default for TurnOptions {
             compaction_config: None,
             selected_budget: None,
             compaction_budget: None,
+            journal: None,
+            spend_allowance: None,
         }
     }
 }
@@ -331,6 +635,178 @@ pub fn run_turn(
     cancel: &orbit_provider_http::CancelToken,
     events: EventSink<'_>,
 ) -> Result<TurnReport, String> {
+    let mut report = TurnReport::default();
+    let mut refusals = Vec::new();
+    run_turn_observed(
+        home,
+        config,
+        options,
+        prompt,
+        transcript,
+        executor,
+        cancel,
+        events,
+        &mut report,
+        None,
+        &mut refusals,
+    )?;
+    Ok(report)
+}
+
+/// Retain request accounting and valid partial history on every terminal path.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_detailed(
+    home: &std::path::Path,
+    config: &TurnConfig,
+    options: &TurnOptions,
+    prompt: &str,
+    transcript: &mut Vec<ChatMessage>,
+    executor: &mut dyn ToolExecutor,
+    cancel: &orbit_provider_http::CancelToken,
+    events: EventSink<'_>,
+) -> TurnCompletion {
+    run_turn_detailed_with_retry_policy(
+        home, config, options, prompt, transcript, executor, cancel, events, None,
+    )
+    .into_completion()
+}
+
+/// Run with an explicitly selected policy; stored metadata never enables retry.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_detailed_with_retry_policy(
+    home: &std::path::Path,
+    config: &TurnConfig,
+    options: &TurnOptions,
+    prompt: &str,
+    transcript: &mut Vec<ChatMessage>,
+    executor: &mut dyn ToolExecutor,
+    cancel: &orbit_provider_http::CancelToken,
+    events: EventSink<'_>,
+    policy: Option<&crate::retry::RetryPolicyBinding>,
+) -> RetryTurnCompletion {
+    let mut report = TurnReport::default();
+    let mut refusals = Vec::new();
+    let result = run_turn_observed(
+        home,
+        config,
+        options,
+        prompt,
+        transcript,
+        executor,
+        cancel,
+        events,
+        &mut report,
+        policy,
+        &mut refusals,
+    );
+    let end = if report.interrupted {
+        TurnEnd::Cancelled
+    } else if let Err(message) = result {
+        TurnEnd::Failed(TurnFailure {
+            message: safe_failure(&message),
+        })
+    } else if report.ok {
+        TurnEnd::Completed
+    } else {
+        TurnEnd::Failed(TurnFailure {
+            message: "turn ended before a complete response".into(),
+        })
+    };
+    RetryTurnCompletion {
+        completion: TurnCompletion { report, end },
+        refusals,
+    }
+}
+
+fn safe_failure(message: &str) -> String {
+    let plain: String = message
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect();
+    compaction_display(&plain)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_turn_observed(
+    home: &std::path::Path,
+    config: &TurnConfig,
+    options: &TurnOptions,
+    prompt: &str,
+    transcript: &mut Vec<ChatMessage>,
+    executor: &mut dyn ToolExecutor,
+    cancel: &orbit_provider_http::CancelToken,
+    events: EventSink<'_>,
+    report: &mut TurnReport,
+    policy: Option<&crate::retry::RetryPolicyBinding>,
+    refusals: &mut Vec<crate::retry::RefusalRecord>,
+) -> Result<(), String> {
+    let mut ended = false;
+    let result = run_turn_inner(
+        home,
+        config,
+        options,
+        prompt,
+        transcript,
+        executor,
+        cancel,
+        &mut |event| {
+            let event = match event {
+                FrontendEvent::TurnEnded { .. } if ended => return,
+                event @ FrontendEvent::TurnEnded { .. } => {
+                    ended = true;
+                    event
+                }
+                FrontendEvent::Error { message } => FrontendEvent::Error {
+                    message: safe_failure(&message),
+                },
+                event => event,
+            };
+            events(event);
+        },
+        report,
+        policy,
+        refusals,
+    );
+    if !ended {
+        if let Err(message) = &result {
+            events(FrontendEvent::Error {
+                message: safe_failure(message),
+            });
+        }
+        emit_turn_ended(events, report, report.rounds);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_turn_inner(
+    home: &std::path::Path,
+    config: &TurnConfig,
+    options: &TurnOptions,
+    prompt: &str,
+    transcript: &mut Vec<ChatMessage>,
+    executor: &mut dyn ToolExecutor,
+    cancel: &orbit_provider_http::CancelToken,
+    events: EventSink<'_>,
+    report: &mut TurnReport,
+    policy: Option<&crate::retry::RetryPolicyBinding>,
+    refusals: &mut Vec<crate::retry::RefusalRecord>,
+) -> Result<(), String> {
+    // Reject retry-ineligible turns before hooks, transcript mutation or summaries.
+    if policy.is_some() {
+        if options.journal.is_none() {
+            return Err("final-rejection retry requires a context journal".into());
+        }
+        if options.spend_allowance.is_some() {
+            return Err("final-rejection retry cannot use a spend allowance".into());
+        }
+        if options.compacting {
+            return Err("final-rejection retry is unavailable for context summaries".into());
+        }
+        if options.max_attempts == 0 {
+            return Err("final-rejection retry has a zero provider-send limit".into());
+        }
+    }
     // Reject invalid selections before hooks, transcript mutation or tools.
     config.validate_effort()?;
     // E9: hooks — the prompt enters the session before the turn runs.
@@ -345,9 +821,9 @@ pub fn run_turn(
     if let Some(blocks) = &options.user_blocks {
         user.blocks = Some(blocks.clone());
     }
+    let mut current_user_index = transcript.len();
     transcript.push(user);
 
-    let mut report = TurnReport::default();
     let mut round: u32 = 0;
     // Compaction latch: once this turn has compacted, do not compact
     // again until the transcript grows past the threshold by NEW
@@ -359,8 +835,8 @@ pub fn run_turn(
         if cancel.is_cancelled() {
             report.interrupted = true;
             report.ok = false;
-            emit_turn_ended(events, &report, round);
-            return Ok(report);
+            emit_turn_ended(events, report, round);
+            return Ok(());
         }
 
         events(FrontendEvent::RoundStarted { round });
@@ -374,7 +850,7 @@ pub fn run_turn(
             &options.tools,
         )
         .map_err(|(code, message)| {
-            local_turn_error(events, &report, round, format!("{code}: {message}"))
+            local_turn_error(events, report, round, format!("{code}: {message}"))
         })?;
         let mut prepared = crate::dispatch::prepare_provider_request(
             &context,
@@ -384,146 +860,176 @@ pub fn run_turn(
             &options.session_id,
         )
         .map_err(|(code, message)| {
-            local_turn_error(events, &report, round, format!("{code}: {message}"))
+            local_turn_error(events, report, round, format!("{code}: {message}"))
         })?;
         let budget = options.selected_budget.clone().or_else(|| {
             options.window_tokens.and_then(|window| {
                 crate::context_budget::SelectedBudget::legacy_input(config, window).ok()
             })
         });
-        let mut preflight_estimate = None;
         if let Some(budget) = &budget {
             let before = estimate_prepared_request(&prepared, budget)
-                .map_err(|e| local_turn_error(events, &report, round, e.to_string()))?;
+                .map_err(|e| local_turn_error(events, report, round, e.to_string()))?;
             let decision = assess_request(&before, budget);
             if matches!(decision, BudgetDecision::Refuse | BudgetDecision::Unknown) {
-                return Err(local_turn_error(events, &report, round, "context budget policy refuses this request; check selected limits or media policy".into()));
+                return Err(local_turn_error(events, report, round, "context budget policy refuses this request; check selected limits or media policy".into()));
             }
             if decision == BudgetDecision::Compact
                 && !options.compacting
                 && compacted_at.is_none_or(|at| before.estimated_input_tokens > at)
             {
-                // Immutable material alone must fit before any summarizer/hook I/O.
-                let immutable = prepared.with_messages_for_measurement(
-                    transcript.last().cloned().into_iter().collect(),
-                );
-                let immutable = estimate_prepared_request(&immutable, budget)
-                    .map_err(|e| local_turn_error(events, &report, round, e.to_string()))?;
-                if !fits(&immutable, budget) {
+                use crate::compaction::{CompactionContexts, CompactionStatus};
+                if transcript
+                    .iter()
+                    .rposition(|message| message.role == ChatRole::User)
+                    != Some(current_user_index)
+                {
                     return Err(local_turn_error(
                         events,
-                        &report,
+                        report,
                         round,
-                        "context budget exceeded by immutable system, tools or current intent"
-                            .into(),
+                        "context compaction current intent no longer matches the source".into(),
                     ));
                 }
-                // Complete protected groups/media need the later group-aware planner.
-                // Refuse rather than flattening, splitting or exposing hidden blocks.
-                let protected = transcript.iter().any(|m| {
-                    m.role == ChatRole::Tool
-                        || m.tool_calls.is_some()
-                        || m.blocks.as_ref().is_some_and(|blocks| {
-                            blocks.iter().any(|b| {
-                                !matches!(b, orbit_adapter::types::ContentBlock::Text { .. })
-                            })
-                        })
-                });
-                if protected || transcript.len() <= COMPACT_KEEP_TAIL {
-                    if !fits(&before, budget) {
-                        return Err(local_turn_error(
-                            events,
-                            &report,
-                            round,
-                            "context budget cannot safely reduce the retained conversation".into(),
-                        ));
-                    }
-                } else {
-                    let _ = hooks.fire(
-                        crate::hooks::HookEvent::PreCompact,
-                        &serde_json::json!({ "estimated_tokens": before.estimated_input_tokens }),
-                    );
-                    events(FrontendEvent::Compacting {
-                        used_tokens: before.estimated_input_tokens,
-                        window_tokens: budget
-                            .meter_window(before.requested_output_tokens)
-                            .0
-                            .unwrap_or(0),
-                    });
-                    if let Some(summary) =
-                        compact_transcript(home, config, options, transcript, cancel)
-                    {
-                        let keep_from = transcript.len().saturating_sub(COMPACT_KEEP_TAIL);
-                        let mut candidate = vec![user_message(format!(
-                            "[context compacted from {keep_from} older messages]\n\n{summary}"
-                        ))];
-                        candidate.extend_from_slice(&transcript[keep_from..]);
-                        let probe = prepared.with_messages_for_measurement(candidate.clone());
-                        let after = estimate_prepared_request(&probe, budget)
-                            .map_err(|e| local_turn_error(events, &report, round, e.to_string()))?;
-                        if !cancel.is_cancelled()
-                            && fits(&after, budget)
-                            && after.estimated_input_tokens < before.estimated_input_tokens
-                        {
-                            // Allocate a distinct prospective dispatch only after candidate acceptance.
-                            prepared = crate::dispatch::prepare_provider_request(
-                                &context,
-                                prompt,
-                                Some(candidate.clone()),
-                                &options.request_stem,
-                                &options.session_id,
+                let summary_config = options.compaction_config.as_ref().unwrap_or(config);
+                let summary_context =
+                    crate::dispatch::request_preparation_context(summary_config, None, &[])
+                        .map_err(|_| {
+                            local_turn_error(
+                                events,
+                                report,
+                                round,
+                                "context summary configuration is invalid".into(),
                             )
-                            .map_err(|(code, message)| {
-                                local_turn_error(
-                                    events,
-                                    &report,
-                                    round,
-                                    format!("{code}: {message}"),
-                                )
-                            })?;
-                            if !cancel.is_cancelled() {
-                                *transcript = candidate;
-                                let _ = hooks.fire(
-                                    crate::hooks::HookEvent::PostCompact,
-                                    &serde_json::json!({ "summary_bytes": summary.len() }),
-                                );
-                                events(FrontendEvent::Compacted {
-                                    summary,
-                                    after_tokens: after.estimated_input_tokens,
-                                });
-                                compacted_at = Some(after.estimated_input_tokens);
-                            }
-                        } else if !cancel.is_cancelled() && !fits(&before, budget) {
+                        })?;
+                let mut summary_options = options.clone();
+                summary_options.spend_allowance = remaining_allowance(options, report)
+                    .map_err(|message| local_turn_error(events, report, round, message))?;
+                let attempt = crate::compaction::compact_with_contexts(
+                    home,
+                    config,
+                    &summary_options,
+                    transcript,
+                    CompactionContexts {
+                        conversation: &context,
+                        summary: &summary_context,
+                        remaining_attempts: remaining_accounting_metadata(report, refusals)
+                            .map_err(|message| {
+                                local_turn_error(events, report, round, message.into())
+                            })?,
+                    },
+                    cancel,
+                    &mut |estimate| {
+                        let _ = hooks.fire(
+                            crate::hooks::HookEvent::PreCompact,
+                            &serde_json::json!({ "estimated_tokens": estimate.estimated_input_tokens }),
+                        );
+                        events(FrontendEvent::Compacting {
+                            used_tokens: estimate.estimated_input_tokens,
+                            window_tokens: budget
+                                .meter_window(estimate.requested_output_tokens)
+                                .0
+                                .unwrap_or(0),
+                        });
+                    },
+                );
+                let incomplete =
+                    record_accounting_with_refusals(report, refusals, &attempt.attempts).map_err(
+                        |message| local_turn_error(events, report, round, message.into()),
+                    )?;
+                if !attempt.attempts.is_empty() {
+                    events(FrontendEvent::CostUpdated {
+                        total_microcents: report.cost_microcents,
+                    });
+                }
+                if incomplete {
+                    events(FrontendEvent::Status {
+                        text: "Context summary usage or pricing is incomplete; displayed totals include only validated subtotals.".into(),
+                    });
+                }
+                if cancel.is_cancelled() || attempt.status == CompactionStatus::Cancelled {
+                    report.interrupted = true;
+                    report.ok = false;
+                    emit_turn_ended(events, report, round);
+                    return Ok(());
+                }
+                if attempt.status == CompactionStatus::PublishedReady {
+                    let candidate = attempt.candidate.ok_or_else(|| {
+                        local_turn_error(
+                            events,
+                            report,
+                            round,
+                            "context history publication is incomplete".into(),
+                        )
+                    })?;
+                    let application = match crate::compaction::prepare_compaction_application(
+                        candidate,
+                        transcript,
+                        &context,
+                        budget,
+                        options,
+                        current_user_index,
+                        cancel,
+                    ) {
+                        Ok(value) => value,
+                        Err(CompactionStatus::Cancelled) => {
+                            report.interrupted = true;
+                            report.ok = false;
+                            emit_turn_ended(events, report, round);
+                            return Ok(());
+                        }
+                        Err(status) => {
                             return Err(local_turn_error(
                                 events,
-                                &report,
+                                report,
                                 round,
-                                "context budget remains exceeded after an ineffective summary"
-                                    .into(),
+                                status.to_string(),
                             ));
                         }
-                    } else if !cancel.is_cancelled() && !fits(&before, budget) {
-                        return Err(local_turn_error(
-                            events,
-                            &report,
-                            round,
-                            "context budget remains exceeded after an unusable summary".into(),
-                        ));
+                    };
+                    // The caller owns this mutable source for the entire final
+                    // digest/coverage check and this single working assignment.
+                    if cancel.is_cancelled() {
+                        report.interrupted = true;
+                        report.ok = false;
+                        emit_turn_ended(events, report, round);
+                        return Ok(());
                     }
+                    *transcript = application.messages;
+                    prepared = application.prepared;
+                    current_user_index = application.current_user;
+                    compacted_at = Some(application.after_tokens);
+                    let _ = hooks.fire(
+                        crate::hooks::HookEvent::PostCompact,
+                        &serde_json::json!({ "summary_bytes": application.summary.len() }),
+                    );
+                    events(FrontendEvent::Compacted {
+                        summary: compaction_display(&application.summary),
+                        after_tokens: application.after_tokens,
+                    });
+                } else if attempt.status != CompactionStatus::NothingToCompact
+                    || !fits(&before, budget)
+                {
+                    return Err(local_turn_error(
+                        events,
+                        report,
+                        round,
+                        attempt.status.to_string(),
+                    ));
                 }
             }
             if cancel.is_cancelled() {
                 report.interrupted = true;
                 report.ok = false;
-                emit_turn_ended(events, &report, round);
-                return Ok(report);
+                emit_turn_ended(events, report, round);
+                return Ok(());
             }
             let final_estimate = estimate_prepared_request(&prepared, budget)
-                .map_err(|e| local_turn_error(events, &report, round, e.to_string()))?;
+                .map_err(|e| local_turn_error(events, report, round, e.to_string()))?;
             if !fits(&final_estimate, budget) {
                 return Err(local_turn_error(
                     events,
-                    &report,
+                    report,
                     round,
                     "context budget exceeded; ordinary request was not sent".into(),
                 ));
@@ -531,10 +1037,10 @@ pub fn run_turn(
             if final_estimate.status == EstimateStatus::UnknownMedia {
                 events(FrontendEvent::Status { text: "Media or opaque request cost is unknown; text policy passed, provider capacity is unverified.".into() });
             }
-            preflight_estimate = Some(final_estimate);
         }
 
-        // One dispatch, with retry on rate-limit-class refusals.
+        // Each actual dispatch has its own intent and accounting disposition.
+        // Only checked final-rejection evidence permits managed retry.
         let mut partial_text = String::new();
         let outcome = dispatch_with_retry(
             home,
@@ -545,6 +1051,9 @@ pub fn run_turn(
             cancel,
             round,
             Some(prepared),
+            report,
+            policy,
+            refusals,
             &mut |event| {
                 if let FrontendEvent::TextDelta { text } = &event {
                     partial_text.push_str(text);
@@ -553,21 +1062,35 @@ pub fn run_turn(
             },
         );
 
-        let o = match outcome {
-            Ok(o) => o,
+        let OrdinaryDispatch {
+            outcome: o,
+            occupancy,
+        } = match outcome {
+            Ok(outcome) => outcome,
             Err(e) => {
                 if !partial_text.is_empty() {
                     transcript.push(assistant_message(partial_text.clone()));
                     report.final_text = partial_text;
+                    emit_context_usage(
+                        &context,
+                        options,
+                        budget.as_ref(),
+                        transcript,
+                        None,
+                        events,
+                    );
                 }
-                if e == "cancelled" || cancel.is_cancelled() {
+                if matches!(&e, OrdinaryDispatchError::Cancelled)
+                    || (matches!(&e, OrdinaryDispatchError::Failure(_)) && cancel.is_cancelled())
+                {
                     report.interrupted = true;
                     report.ok = false;
-                    emit_turn_ended(events, &report, round);
-                    return Ok(report);
+                    emit_turn_ended(events, report, round);
+                    return Ok(());
                 }
+                let e = e.into_message();
                 events(FrontendEvent::Error { message: e.clone() });
-                emit_turn_ended(events, &report, round);
+                emit_turn_ended(events, report, round);
                 return Err(e);
             }
         };
@@ -578,51 +1101,23 @@ pub fn run_turn(
             if !o.output.is_empty() {
                 transcript.push(assistant_message(o.output.clone()));
             }
+            emit_context_usage(
+                &context,
+                options,
+                budget.as_ref(),
+                transcript,
+                Some(&occupancy),
+                events,
+            );
             report.final_text = o.output;
             report.interrupted = true;
             report.ok = false;
-            emit_turn_ended(events, &report, report.rounds);
-            return Ok(report);
-        }
-        if let Err(message) = accumulate_accounting(&mut report, &o) {
-            if !o.output.is_empty() {
-                transcript.push(assistant_message(o.output.clone()));
-            }
-            report.final_text = o.output;
-            events(FrontendEvent::Error {
-                message: message.into(),
-            });
-            emit_turn_ended(events, &report, report.rounds);
-            return Err(message.into());
+            emit_turn_ended(events, report, report.rounds);
+            return Ok(());
         }
         events(FrontendEvent::CostUpdated {
             total_microcents: report.cost_microcents,
         });
-        // The context meter (E3/M18): tokens in use vs the window —
-        // the LAST round's occupancy (input + cache), not the sum of
-        // every round's input. The sums stay for cost accounting.
-        if let Some((estimate, budget)) = preflight_estimate.as_ref().zip(budget.as_ref())
-            && let (Some(w), reserve) = budget.meter_window(estimate.requested_output_tokens)
-        {
-            let memory = (options.memory_bytes as u64).min(estimate.system_bytes) / 4;
-            let system = estimate.system_bytes / 4 - memory;
-            let tools = estimate.tools_bytes / 4;
-            events(FrontendEvent::Usage {
-                used_tokens: o.context_tokens.max(estimate.estimated_input_tokens),
-                window_tokens: w,
-                breakdown: Some(orbit_frontend_protocol::ContextBreakdown {
-                    system,
-                    memory,
-                    tools,
-                    messages: estimate.estimated_input_tokens - system - memory - tools,
-                    compact_at: budget
-                        .compaction_threshold(estimate.requested_output_tokens)
-                        .unwrap_or(0),
-                    reserve,
-                }),
-            });
-        }
-
         if matches!(
             stop_reason,
             StopReason::Truncated | StopReason::Filtered | StopReason::Incomplete
@@ -632,6 +1127,14 @@ pub fn run_turn(
             if !o.output.is_empty() {
                 transcript.push(assistant_message(o.output.clone()));
             }
+            emit_context_usage(
+                &context,
+                options,
+                budget.as_ref(),
+                transcript,
+                Some(&occupancy),
+                events,
+            );
             report.final_text = o.output;
             report.ok = false;
             if stop_reason == StopReason::Truncated {
@@ -655,8 +1158,8 @@ pub fn run_turn(
                     message: message.into(),
                 });
             }
-            emit_turn_ended(events, &report, report.rounds);
-            return Ok(report);
+            emit_turn_ended(events, report, report.rounds);
+            return Ok(());
         }
 
         if stop_reason == StopReason::CompleteText {
@@ -672,6 +1175,14 @@ pub fn run_turn(
                 m.origin_provider = Some(config.provider_id.clone());
             }
             transcript.push(m);
+            emit_context_usage(
+                &context,
+                options,
+                budget.as_ref(),
+                transcript,
+                Some(&occupancy),
+                events,
+            );
             report.final_text = o.output.clone();
             report.ok = true;
             events(FrontendEvent::ResponseFinished {
@@ -686,8 +1197,8 @@ pub fn run_turn(
                 crate::hooks::HookEvent::Stop,
                 &serde_json::json!({ "final_text_bytes": o.output.len() }),
             );
-            emit_turn_ended(events, &report, report.rounds);
-            return Ok(report);
+            emit_turn_ended(events, report, report.rounds);
+            return Ok(());
         }
 
         // Tool round: append the assistant call message, execute each
@@ -789,6 +1300,14 @@ pub fn run_turn(
                 origin_provider: None,
             });
         }
+        emit_context_usage(
+            &context,
+            options,
+            budget.as_ref(),
+            transcript,
+            Some(&occupancy),
+            events,
+        );
 
         round += 1;
         if round >= options.max_rounds {
@@ -798,8 +1317,8 @@ pub fn run_turn(
             );
             events(FrontendEvent::Status { text: msg.clone() });
             report.final_text = o.output;
-            emit_turn_ended(events, &report, round);
-            return Ok(report);
+            emit_turn_ended(events, report, round);
+            return Ok(());
         }
     }
 }
@@ -861,13 +1380,20 @@ fn dispatch_with_retry(
     cancel: &orbit_provider_http::CancelToken,
     _round: u32,
     mut prepared: Option<crate::dispatch::PreparedProviderRequest>,
+    report: &mut TurnReport,
+    policy: Option<&crate::retry::RetryPolicyBinding>,
+    refusals: &mut Vec<crate::retry::RefusalRecord>,
     events: EventSink<'_>,
-) -> Result<crate::dispatch::TurnOutcome, String> {
-    let mut attempt: u32 = 1;
+) -> Result<OrdinaryDispatch, OrdinaryDispatchError> {
+    let mut attempt = 1u32;
+    let max_attempts = policy.map_or(options.max_attempts, |policy| {
+        options.max_attempts.min(policy.max_attempts())
+    });
     loop {
         if cancel.is_cancelled() {
-            return Err("cancelled".into());
+            return Err(OrdinaryDispatchError::Cancelled);
         }
+        require_accounting_slot(report, refusals)?;
         let request = match prepared.take() {
             Some(request) => request,
             None => {
@@ -887,52 +1413,245 @@ fn dispatch_with_retry(
                 .map_err(|(code, message)| format!("{code}: {message}"))?
             }
         };
-        // Live stream: forward TextDelta bytes to the front-end as
-        // protocol events. The observer borrows `events` for the
-        // duration of the dispatch call only.
-        let mut observed = false;
-        let mut lifecycle = ToolLifecycle::default();
-        let mut observer = |ev: &orbit_adapter::types::ProviderStreamEvent| {
-            // Admission itself makes replay unsafe, even while an adapter
-            // is buffering tool identity and has not delivered text yet.
-            observed = true;
-            lifecycle.observe(&ev.event);
-            if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &ev.event {
-                events(FrontendEvent::TextDelta {
-                    text: String::from_utf8_lossy(bytes).into_owned(),
-                });
-            }
+        let mut budget = match &options.selected_budget {
+            Some(budget) => budget.clone(),
+            None => crate::context_budget::SelectedBudget::legacy_input(
+                config,
+                options.window_tokens.unwrap_or(u64::MAX),
+            )?,
         };
-        let result = crate::dispatch::run_prepared_dispatch(
+        if options.selected_budget.is_none() && options.window_tokens.is_none() {
+            budget.identity = crate::context_budget::BudgetIdentity::for_config(
+                config,
+                "unmanaged",
+                "unmanaged",
+            )?;
+        }
+        let estimate = crate::context_budget::estimate_prepared_request(&request, &budget)
+            .map_err(|error| error.to_string())?;
+        let allowance = remaining_allowance(options, report)?;
+        let mut checkpoint = if let Some(journal) = &options.journal {
+            let checkpoint = journal
+                .accounting_checkpoint_detailed()
+                .map_err(OrdinaryDispatchError::accounting)?;
+            if !qualified_detailed(&checkpoint, &options.session_id) {
+                return Err(OrdinaryDispatchError::accounting(
+                    "context accounting owner or child does not match this turn",
+                ));
+            }
+            if checkpoint.pending().is_some()
+                || checkpoint.totals().knownness == AccountingKnownness::Uncertain
+            {
+                mark_ordinary_uncertain(report);
+                return Err(OrdinaryDispatchError::accounting(
+                    "context accounting has a pending uncertain request; inspect before continuing",
+                ));
+            }
+            if let Some(allowance) = allowance
+                && (checkpoint.baseline() == crate::AccountingBaseline::UnknownLegacy
+                    || checkpoint.totals().knownness != AccountingKnownness::Known
+                    || checkpoint.totals().ordinary.cost_microcents.is_none()
+                    || (checkpoint.totals().housekeeping.cost_microcents.is_none()
+                        && !allowance.allow_unpriced_housekeeping))
+            {
+                report.accounting.knownness = checkpoint.totals().knownness;
+                report.accounting.ordinary.cost_microcents = None;
+                return Err("spend allowance cannot use unknown historical namespace costs".into());
+            }
+            Some(checkpoint)
+        } else {
+            None
+        };
+        crate::compaction::admit_spend(allowance, config, &estimate, 0, false)
+            .map_err(str::to_owned)?;
+        let binding = policy
+            .map(|policy| request.ordinary_attempt_binding(policy))
+            .transpose()
+            .map_err(OrdinaryDispatchError::accounting)?;
+        let intent = AttemptIntent {
+            owner_session_id: checkpoint.as_ref().map_or_else(
+                || options.session_id.clone(),
+                |c| c.owner_session_id().to_owned(),
+            ),
+            child_id: checkpoint
+                .as_ref()
+                .and_then(|c| c.child_id().map(str::to_owned)),
+            request_id: request.request_id().into(),
+            purpose: AttemptPurpose::Ordinary,
+            budget: budget.identity,
+        };
+        let digest = intent.digest().map_err(OrdinaryDispatchError::accounting)?;
+        // No intent is published after cancellation, including a long preparation.
+        if cancel.is_cancelled() {
+            return Err(OrdinaryDispatchError::Cancelled);
+        }
+        let reference = if let (Some(journal), Some(checkpoint)) = (&options.journal, &checkpoint) {
+            checkpoint.revision().0.checked_add(2).ok_or_else(|| {
+                OrdinaryDispatchError::accounting("context accounting revision overflow")
+            })?;
+            if binding.is_some()
+                && let Some(rollup) = checkpoint.refusals()
+            {
+                rollup.count().checked_add(1).ok_or_else(|| {
+                    OrdinaryDispatchError::accounting("context refusal count overflow")
+                })?;
+            }
+            let reference = journal
+                .begin_attempt_detailed(checkpoint.revision(), &intent, binding.as_ref())
+                .map_err(|error| {
+                    if error == crate::HistoryError::Uncertain {
+                        mark_ordinary_uncertain(report);
+                    }
+                    OrdinaryDispatchError::accounting(error)
+                })?;
+            if reference.request_id != intent.request_id
+                || reference.intent_digest != digest
+                || reference.revision.0 != checkpoint.revision().0 + 1
+            {
+                mark_ordinary_uncertain(report);
+                return Err(OrdinaryDispatchError::accounting(
+                    "context accounting begin publication is uncertain",
+                ));
+            }
+            Some(reference)
+        } else {
+            None
+        };
+        if cancel.is_cancelled() {
+            if let Some(reference) = &reference {
+                // This is the only proven NotSent path after a successful begin.
+                let receipt = RequestAccountingReceipt {
+                    request_id: intent.request_id.clone(),
+                    purpose: AttemptPurpose::Ordinary,
+                    totals: AccountingTotals::known_zero(),
+                    usage: None,
+                    knownness: AccountingKnownness::Known,
+                    completed: false,
+                };
+                let recorded = record_accounting_with_refusals(
+                    report,
+                    refusals,
+                    std::slice::from_ref(&receipt),
+                );
+                settle_ordinary(options, &mut checkpoint, reference, &intent, &receipt)
+                    .inspect_err(|_| mark_ordinary_uncertain(report))
+                    .map_err(OrdinaryDispatchError::accounting)?;
+                recorded.map_err(OrdinaryDispatchError::accounting)?;
+            }
+            return Err(OrdinaryDispatchError::Cancelled);
+        }
+        let mut observed = false;
+        let mut metadata = crate::compaction::MetadataAccounting::default();
+        let mut lifecycle = ToolLifecycle::default();
+        let detailed = crate::dispatch::run_prepared_dispatch_detailed(
             home,
             config,
             request,
-            Some(&mut observer),
+            Some(&mut |event| {
+                observe_ordinary_event(event, &mut observed, &mut metadata, &mut lifecycle, events);
+            }),
             cancel.clone(),
             &options.session_id,
         );
-        if cancel.is_cancelled() && result.is_err() {
-            return Err("cancelled".into());
+        // Every provider event disqualifies a final-refusal proof. The private
+        // text flag conservatively summarizes the all-event latch, including
+        // admission, thinking, signature, usage, tools and terminal events.
+        let eligibility = crate::retry::RefusalEligibility {
+            text_observed: observed,
+            cancelled: cancel.is_cancelled(),
+            spend_capped: options.spend_allowance.is_some(),
+            ..Default::default()
+        };
+        let refusal = match (&detailed, &reference, &binding, policy) {
+            (Err(failure), Some(reference), Some(binding), Some(policy)) => failure
+                .qualify_final_refusal(&intent, reference, binding, policy, &eligibility)
+                .ok(),
+            _ => None,
+        };
+        if let Some(refusal) = refusal {
+            // Once live proof exists, finish exactly this settlement and ACK
+            // despite a racing cancel. No normal receipt may also settle it.
+            let journal = options
+                .journal
+                .as_ref()
+                .ok_or_else(|| OrdinaryDispatchError::accounting("context journal is missing"))?;
+            let before = checkpoint.as_ref().ok_or_else(|| {
+                OrdinaryDispatchError::accounting("context accounting checkpoint is missing")
+            })?;
+            let ack = journal
+                .settle_refused_ordinary(refusal.attempt(), &refusal)
+                .inspect_err(|_| mark_ordinary_uncertain(report))
+                .map_err(OrdinaryDispatchError::accounting)?;
+            ack.validate_for(&refusal, before)
+                .inspect_err(|_| mark_ordinary_uncertain(report))
+                .map_err(OrdinaryDispatchError::accounting)?;
+            require_accounting_slot(report, refusals)?;
+            let record = refusal.to_record();
+            let _ = checkpoint.replace(ack.checkpoint().clone());
+            report.accounting = record.totals_after(&report.accounting);
+            refusals.push(record);
+            events(FrontendEvent::Status {
+                text: "Provider returned a final rejection; usage and billing remain unknown under the selected retry policy.".into(),
+            });
+            if cancel.is_cancelled() {
+                return Err(OrdinaryDispatchError::Cancelled);
+            }
+            // Qualification above requires an actual failure; this projection
+            // is read-only and never feeds a second settlement.
+            let failure = detailed.as_ref().err().ok_or_else(|| {
+                OrdinaryDispatchError::accounting("final rejection lost its failure")
+            })?;
+            let (code, message) = failure.legacy();
+            if is_retryable(code) && attempt < max_attempts {
+                require_accounting_slot(report, refusals)?;
+                retry_wait(attempt, code, message, cancel, events)?;
+                attempt += 1;
+                // The accepted ACK was consumed before this loop can read a
+                // new checkpoint or publish another genuine request identity.
+                continue;
+            }
+            return Err(OrdinaryDispatchError::Failure(format!("{code}: {message}")));
         }
+        // Unknown transport evidence and admitted streams use the original
+        // measured/provisional receipt exactly once, without managed replay.
+        let result = detailed.map_err(crate::dispatch::DetailedDispatchFailure::into_legacy);
+        let lifecycle_valid = result
+            .as_ref()
+            .is_ok_and(|o| lifecycle.matches(&o.tool_calls) && valid_tool_set(&o.tool_calls));
+        let receipt =
+            metadata.ordinary_receipt(intent.request_id.clone(), config, &result, lifecycle_valid);
+        let uncertain = receipt.knownness == AccountingKnownness::Uncertain;
+        let recorded =
+            record_accounting_with_refusals(report, refusals, std::slice::from_ref(&receipt));
+        if recorded.as_ref().is_ok_and(|incomplete| *incomplete) {
+            events(FrontendEvent::Status { text: "Provider usage or pricing is incomplete; totals include validated subtotals only.".into() });
+        }
+        if let Some(reference) = &reference {
+            settle_ordinary(options, &mut checkpoint, reference, &intent, &receipt)
+                .inspect_err(|_| mark_ordinary_uncertain(report))
+                .map_err(OrdinaryDispatchError::accounting)?;
+        }
+        recorded.map_err(OrdinaryDispatchError::accounting)?;
         match result {
             Ok(o) => {
                 if matches!(
                     StopReason::classify(&o),
                     StopReason::CompleteText | StopReason::CompleteTools
-                ) && !lifecycle.matches(&o.tool_calls)
-                {
-                    return Err("E0411: incomplete provider tool-call lifecycle".into());
+                ) {
+                    if !lifecycle_valid {
+                        return Err("E0411: incomplete provider tool-call lifecycle".into());
+                    }
+                    if uncertain {
+                        return Err(
+                            "provider accounting is uncertain; inspect before continuing".into(),
+                        );
+                    }
                 }
-                // The egress record was durable BEFORE the request left
-                // (GW-04); tell the front-end its hash, now that the round
-                // has finished, so the proof surface lists it.
                 if let Some(digest) = &o.egress_digest {
                     events(FrontendEvent::LedgerAppended {
                         record_count: orbit_ledger::count_records(&home.join("ledger")),
                         head_digest: digest.clone(),
                         kind: "egress".into(),
-                        // A provider that reported no usage is not a request
-                        // that cost nothing: say the model, not "0 in / 0 out".
                         summary: if o.input_tokens == 0 && o.output_tokens == 0 {
                             config.model.clone()
                         } else {
@@ -943,34 +1662,177 @@ fn dispatch_with_retry(
                         },
                     });
                 }
-                return Ok(o);
-            }
-            Err((code, msg))
-                if !observed && is_retryable(code) && attempt < options.max_attempts =>
-            {
-                // Exponential backoff with jitter: 1s, 2s, 4s, … capped
-                // at 32s; ~8 attempts span about two minutes.
-                let base = 1000u64.saturating_mul(1 << (attempt - 1).min(5));
-                let jitter = ulid::Ulid::new().timestamp_ms() % 250;
-                let delay = base + jitter;
-                events(FrontendEvent::Retrying {
-                    attempt,
-                    retry_in_ms: delay,
-                    reason: format!("{code}: {msg}"),
+                let observed_context_tokens = (receipt.knownness == AccountingKnownness::Known)
+                    .then_some(receipt.usage)
+                    .flatten()
+                    .and_then(|usage| {
+                        usage
+                            .input_tokens
+                            .checked_add(usage.cache_read_tokens)?
+                            .checked_add(usage.cache_write_tokens)
+                    });
+                return Ok(OrdinaryDispatch {
+                    outcome: o,
+                    occupancy: OccupancyAnchor {
+                        before: estimate,
+                        identity: intent.budget,
+                        prefix_len: transcript.len(),
+                        observed_context_tokens,
+                    },
                 });
-                // Abort the backoff wait when cancelled.
-                let deadline = std::time::Instant::now() + Duration::from_millis(delay);
-                while std::time::Instant::now() < deadline {
-                    if cancel.is_cancelled() {
-                        return Err("cancelled".into());
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+            }
+            Err(_) if cancel.is_cancelled() => return Err(OrdinaryDispatchError::Cancelled),
+            Err((code, message))
+                if options.journal.is_none()
+                    && options.spend_allowance.is_none()
+                    && !observed
+                    && is_retryable(code)
+                    && attempt < max_attempts =>
+            {
+                require_accounting_slot(report, refusals)?;
+                retry_wait(attempt, code, &message, cancel, events)?;
                 attempt += 1;
             }
-            Err((code, msg)) => return Err(format!("{code}: {msg}")),
+            Err((code, message)) => return Err(format!("{code}: {message}").into()),
         }
     }
+}
+
+fn observe_ordinary_event(
+    event: &orbit_adapter::types::ProviderStreamEvent,
+    observed: &mut bool,
+    metadata: &mut crate::compaction::MetadataAccounting,
+    lifecycle: &mut ToolLifecycle,
+    events: EventSink<'_>,
+) {
+    // Every actual provider event denies final-refusal retry, even events
+    // carrying no visible text. Keep accounting and tool observations intact.
+    *observed = true;
+    metadata.observe(event);
+    lifecycle.observe(&event.event);
+    if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &event.event {
+        events(FrontendEvent::TextDelta {
+            text: String::from_utf8_lossy(bytes).into_owned(),
+        });
+    }
+}
+
+fn mark_ordinary_uncertain(report: &mut TurnReport) {
+    report.accounting.knownness = AccountingKnownness::Uncertain;
+    report.accounting.ordinary.cost_microcents = None;
+}
+
+fn require_accounting_slot(
+    report: &TurnReport,
+    refusals: &[crate::retry::RefusalRecord],
+) -> Result<(), OrdinaryDispatchError> {
+    if remaining_accounting_metadata(report, refusals).map_err(OrdinaryDispatchError::accounting)?
+        == 0
+    {
+        return Err(OrdinaryDispatchError::accounting(
+            "turn accounting metadata limit reached; start a new turn (ORBIT-E0411)",
+        ));
+    }
+    Ok(())
+}
+
+fn qualified_detailed(
+    checkpoint: &crate::retry::DetailedAccountingCheckpoint,
+    session: &str,
+) -> bool {
+    checkpoint.validate().is_ok()
+        && checkpoint
+            .child_id()
+            .unwrap_or(checkpoint.owner_session_id())
+            == session
+}
+
+fn retry_wait(
+    attempt: u32,
+    code: &str,
+    message: &str,
+    cancel: &orbit_provider_http::CancelToken,
+    events: EventSink<'_>,
+) -> Result<(), OrdinaryDispatchError> {
+    if cancel.is_cancelled() {
+        return Err(OrdinaryDispatchError::Cancelled);
+    }
+    let base = 1000u64.saturating_mul(1 << (attempt - 1).min(5));
+    let delay = base + ulid::Ulid::new().timestamp_ms() % 250;
+    events(FrontendEvent::Retrying {
+        attempt,
+        retry_in_ms: delay,
+        reason: safe_failure(&format!("{code}: {message}")),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_millis(delay);
+    while std::time::Instant::now() < deadline {
+        if cancel.is_cancelled() {
+            return Err(OrdinaryDispatchError::Cancelled);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+fn settle_ordinary(
+    options: &TurnOptions,
+    checkpoint: &mut Option<crate::retry::DetailedAccountingCheckpoint>,
+    reference: &crate::AttemptRef,
+    intent: &AttemptIntent,
+    receipt: &RequestAccountingReceipt,
+) -> Result<(), String> {
+    let journal = options
+        .journal
+        .as_ref()
+        .ok_or_else(|| "context journal is missing".to_string())?;
+    let previous = checkpoint
+        .as_ref()
+        .ok_or_else(|| "context accounting checkpoint is missing".to_string())?;
+    let expected = previous
+        .totals()
+        .checked_with(receipt)
+        .map_err(|error| error.to_string())?;
+    let expected_priced_subtotals = previous
+        .known_priced_subtotals()
+        .map(|subtotals| subtotals.checked_with(receipt))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let revision = reference
+        .revision
+        .0
+        .checked_add(1)
+        .ok_or_else(|| "context accounting revision overflow".to_string())?;
+    let digest = receipt.digest().map_err(|error| error.to_string())?;
+    let next = journal
+        .settle_attempt_detailed(reference, receipt)
+        .map_err(|error| error.to_string())?;
+    let linked = if receipt.knownness == AccountingKnownness::Uncertain {
+        next.pending().is_some_and(|pending| {
+            pending.reference == *reference && pending.intent == *intent && pending.uncertain
+        }) && next.last_settlement() == previous.last_settlement()
+    } else {
+        next.pending().is_none()
+            && next.last_settlement().is_some_and(|last| {
+                matches!(last,
+                    crate::retry::DetailedLastSettlement::Legacy(last)
+                        if last.reference == *reference && last.receipt_digest == digest
+                )
+            })
+    };
+    if next.owner_session_id() != previous.owner_session_id()
+        || next.child_id() != previous.child_id()
+        || next.baseline() != previous.baseline()
+        || !qualified_detailed(&next, &options.session_id)
+        || next.revision().0 != revision
+        || next.totals() != &expected
+        || next.known_priced_subtotals() != expected_priced_subtotals
+        || next.refusals() != previous.refusals()
+        || !linked
+    {
+        return Err("context accounting settlement publication is uncertain".into());
+    }
+    *checkpoint = Some(next);
+    Ok(())
 }
 
 /// Rate-limit and server-overload classes retry; authentication and
@@ -1050,8 +1912,10 @@ pub(crate) fn assistant_with_calls_and_thinking(
 
 /// An executor that never runs anything (compaction dispatch carries
 /// no tools, so nothing can be called).
+#[cfg(test)]
 struct NoopExecutor;
 
+#[cfg(test)]
 impl ToolExecutor for NoopExecutor {
     fn execute(
         &mut self,
@@ -1065,112 +1929,6 @@ impl ToolExecutor for NoopExecutor {
                 content: r#"{"ok":false,"error":"compaction dispatch advertises no tools"}"#.into(),
             })
             .collect()
-    }
-}
-
-/// Run one no-tools summarization dispatch over the transcript and
-/// return the summary. Simple compaction (roadmap: the whole history
-/// becomes one summary + the latest user message; server-side
-/// compaction arrives with the live Anthropic leg).
-/// How many trailing messages survive compaction verbatim. The current
-/// prompt is always among them (it is the transcript's tail); the rest
-/// keep the newest exchanges in their own words.
-const COMPACT_KEEP_TAIL: usize = 6;
-
-fn compact_transcript(
-    home: &std::path::Path,
-    config: &TurnConfig,
-    options: &TurnOptions,
-    transcript: &[ChatMessage],
-    cancel: &orbit_provider_http::CancelToken,
-) -> Option<String> {
-    // Split: the newest COMPACT_KEEP_TAIL messages survive verbatim;
-    // only what precedes them is summarised (B6: never summarise the
-    // in-flight prompt — it sits at the tail).
-    let keep_from = transcript.len().saturating_sub(COMPACT_KEEP_TAIL);
-    let digest: String = transcript[..keep_from]
-        .iter()
-        .map(|m| match m.role {
-            ChatRole::User | ChatRole::Assistant => format!(
-                "{}: {}\n",
-                m.role.as_str(),
-                truncate(m.content.as_str(), 400)
-            ),
-            ChatRole::Tool => format!(
-                "tool result: {}\n",
-                truncate(m.tool_result.as_deref().unwrap_or(""), 200)
-            ),
-            ChatRole::System => String::new(),
-        })
-        .collect();
-    let prompt = format!(
-        "Summarize this conversation for continuation. Keep: the task, decisions made, files touched, open questions, and the current plan. Be concise.\n\n{digest}"
-    );
-    let mut opts = TurnOptions {
-        tools: Vec::new(),
-        system_directive: None,
-        request_stem: format!("{}-compact", options.request_stem),
-        window_tokens: if options.compaction_config.is_none() {
-            options.window_tokens
-        } else {
-            None
-        },
-        selected_budget: options.compaction_budget.clone().or_else(|| {
-            options
-                .compaction_config
-                .is_none()
-                .then(|| options.selected_budget.clone())
-                .flatten()
-        }),
-        output_reserve_tokens: 0,
-        compacting: true,
-        ..Default::default()
-    };
-    opts.max_rounds = 1;
-    opts.max_attempts = 2;
-    // The compaction role: a cheap model may summarize while the
-    // conversation keeps its own (task-based routing). The role's
-    // config carries its own gate/kind/credential; the summary turn
-    // runs on it when the front-end resolved one.
-    let summary_config = options
-        .compaction_config
-        .clone()
-        .unwrap_or_else(|| config.clone());
-    let mut scratch: Vec<ChatMessage> = Vec::new();
-    let mut noop = NoopExecutor;
-    // Private sink (B6): the summary turn is housekeeping, not a turn
-    // the front-end should see. Its deltas, usage and turn_ended would
-    // land mid-turn on the real stream — swallow everything.
-    let mut truncated = false;
-    let mut private_sink = |ev: FrontendEvent| {
-        if matches!(ev, FrontendEvent::OutputTruncated { .. }) {
-            truncated = true;
-        }
-    };
-    let report = run_turn(
-        home,
-        &summary_config,
-        &opts,
-        &prompt,
-        &mut scratch,
-        &mut noop,
-        cancel,
-        &mut private_sink,
-    )
-    .ok()?;
-    (report.ok && !report.interrupted && !truncated && !report.final_text.trim().is_empty())
-        .then_some(report.final_text)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut cut = max;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!("{}…", &s[..cut])
     }
 }
 
@@ -1465,6 +2223,343 @@ mod accounting_tests {
             ),
             (u64::MAX, u64::MAX, u64::MAX)
         );
+    }
+
+    #[test]
+    fn current_turn_receipt_bound_refuses_before_growing_or_applying_an_extra_bill() {
+        let mut report = TurnReport::default();
+        let receipts: Vec<_> = (0..MAX_TURN_ACCOUNTING_ATTEMPTS)
+            .map(|index| RequestAccountingReceipt {
+                request_id: format!("bounded-{index}"),
+                purpose: if index.is_multiple_of(2) {
+                    AttemptPurpose::Ordinary
+                } else {
+                    AttemptPurpose::Chunk
+                },
+                totals: AccountingTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microcents: Some(1),
+                },
+                usage: Some(orbit_adapter::types::ProviderUsage::default()),
+                knownness: AccountingKnownness::Known,
+                completed: true,
+            })
+            .collect();
+        assert!(!record_accounting(&mut report, &receipts).unwrap());
+        assert_eq!(report.attempts.len(), MAX_TURN_ACCOUNTING_ATTEMPTS);
+        assert_eq!(report.cost_microcents, MAX_TURN_ACCOUNTING_ATTEMPTS as u64);
+        assert_eq!(report.accounting.ordinary.cost_microcents, Some(512));
+        assert_eq!(report.accounting.housekeeping.cost_microcents, Some(512));
+        let before = report.accounting.clone();
+        assert!(record_accounting(&mut report, &receipts[..1]).is_err());
+        assert_eq!(report.attempts.len(), MAX_TURN_ACCOUNTING_ATTEMPTS);
+        assert_eq!(report.accounting, before);
+        assert_eq!(report.cost_microcents, MAX_TURN_ACCOUNTING_ATTEMPTS as u64);
+    }
+
+    #[test]
+    fn unpriced_housekeeping_policy_never_authorizes_unknown_ordinary_cost() {
+        let mut report = TurnReport::default();
+        let mut receipt = RequestAccountingReceipt {
+            request_id: "unpriced".into(),
+            purpose: AttemptPurpose::Chunk,
+            totals: AccountingTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: None,
+            },
+            usage: Some(orbit_adapter::types::ProviderUsage::default()),
+            knownness: AccountingKnownness::Known,
+            completed: true,
+        };
+        record_accounting(&mut report, std::slice::from_ref(&receipt)).unwrap();
+        let mut options = TurnOptions {
+            spend_allowance: Some(SpendAllowance {
+                remaining_microcents: 5,
+                allow_unpriced_housekeeping: true,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            remaining_allowance(&options, &report)
+                .unwrap()
+                .unwrap()
+                .remaining_microcents,
+            5
+        );
+        options
+            .spend_allowance
+            .as_mut()
+            .unwrap()
+            .allow_unpriced_housekeeping = false;
+        assert!(remaining_allowance(&options, &report).is_err());
+        receipt.purpose = AttemptPurpose::Ordinary;
+        let mut ordinary = TurnReport::default();
+        record_accounting(&mut ordinary, &[receipt]).unwrap();
+        options
+            .spend_allowance
+            .as_mut()
+            .unwrap()
+            .allow_unpriced_housekeeping = true;
+        assert!(remaining_allowance(&options, &ordinary).is_err());
+    }
+
+    #[test]
+    fn review_regression_accounting_overflow_preserves_all_paid_batch_receipts() {
+        let receipt = |id: &str, purpose, cost| RequestAccountingReceipt {
+            request_id: id.into(),
+            purpose,
+            totals: AccountingTotals {
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_microcents: Some(cost),
+            },
+            usage: Some(orbit_adapter::types::ProviderUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            }),
+            knownness: AccountingKnownness::Known,
+            completed: true,
+        };
+        let ordinary = receipt("prior-ordinary", AttemptPurpose::Ordinary, u64::MAX - 5);
+        let batch = [
+            receipt("paid-chunk-a", AttemptPurpose::Chunk, 4),
+            receipt("paid-chunk-b", AttemptPurpose::Chunk, 4),
+            receipt("paid-merge", AttemptPurpose::Merge, 4),
+        ];
+        let mut report = TurnReport::default();
+        record_accounting(&mut report, std::slice::from_ref(&ordinary)).unwrap();
+        let mut independently_attributed = report.accounting.clone();
+        for paid in &batch {
+            independently_attributed = independently_attributed.checked_with(paid).unwrap();
+        }
+        assert_eq!(
+            independently_attributed.ordinary.cost_microcents,
+            Some(u64::MAX - 5)
+        );
+        assert_eq!(
+            independently_attributed.housekeeping.cost_microcents,
+            Some(12)
+        );
+        assert!(record_accounting(&mut report, &batch).is_err());
+        let mut all_paid = vec![ordinary];
+        all_paid.extend(batch);
+        assert_eq!(
+            report.attempts, all_paid,
+            "numeric overflow must not discard already-paid later receipts"
+        );
+        assert_eq!(
+            report.cost_microcents,
+            u64::MAX - 1,
+            "keep the last representable numeric subtotal without wrapping"
+        );
+        assert_eq!(report.accounting.knownness, AccountingKnownness::Uncertain);
+        let capped = TurnOptions {
+            spend_allowance: Some(SpendAllowance {
+                remaining_microcents: u64::MAX,
+                allow_unpriced_housekeeping: true,
+            }),
+            ..Default::default()
+        };
+        assert!(remaining_allowance(&capped, &report).is_err());
+    }
+}
+
+#[cfg(test)]
+mod combined_accounting_tests {
+    use super::*;
+
+    // Checked inert metadata supplies lengths only; it cannot become live proof.
+    fn refusal_snapshot() -> crate::retry::RefusalRecord {
+        let intent = AttemptIntent {
+            owner_session_id: "session".into(),
+            child_id: None,
+            request_id: "metadata-slot".into(),
+            purpose: AttemptPurpose::Ordinary,
+            budget: crate::context_budget::BudgetIdentity {
+                binding_digest: "a".repeat(64),
+                metadata_revision: "fixture".into(),
+                policy_revision: "fixture".into(),
+            },
+        };
+        let reference = crate::compaction::AttemptRef {
+            revision: crate::compaction::AccountingRevision(1),
+            request_id: intent.request_id.clone(),
+            intent_digest: intent.digest().unwrap(),
+        };
+        let binding = crate::retry::OrdinaryAttemptBindingRecord::new(
+            intent.request_id.clone(),
+            intent.request_id.clone(),
+            intent.request_id.clone(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            "e".repeat(64),
+            "f".repeat(64),
+        )
+        .unwrap();
+        crate::retry::RefusalRecord::new(intent, reference, binding, "1".repeat(64), 503, 0)
+            .unwrap()
+    }
+
+    fn measured_receipt() -> RequestAccountingReceipt {
+        RequestAccountingReceipt {
+            request_id: "measured-slot".into(),
+            purpose: AttemptPurpose::Ordinary,
+            totals: AccountingTotals {
+                input_tokens: 1,
+                output_tokens: 0,
+                cost_microcents: Some(7),
+            },
+            usage: Some(orbit_adapter::types::ProviderUsage {
+                input_tokens: 1,
+                ..Default::default()
+            }),
+            knownness: AccountingKnownness::Known,
+            completed: true,
+        }
+    }
+
+    #[test]
+    fn ordinary_observer_latches_all_provider_kinds_and_preserves_private_observations() {
+        use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent, ProviderUsage};
+        let usage = ProviderUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_read_tokens: 3,
+            cache_write_tokens: 2,
+            reasoning_tokens: 5,
+        };
+        let config = TurnConfig {
+            provider_id: "fixture".into(),
+            gate: "http://127.0.0.1:12345/v1".into(),
+            model: "fixture-model".into(),
+            kind: crate::ProviderKind::OpenAiCompatible,
+            credential_env: None,
+            pricing: None,
+            max_output_tokens: 64,
+            sampling: None,
+            effort: None,
+            supported_efforts: None,
+        };
+        let kinds = [
+            ProviderEventKind::ResponseStarted {
+                upstream_request_id: None,
+            },
+            ProviderEventKind::TextDelta {
+                bytes: b"visible-text".to_vec(),
+            },
+            ProviderEventKind::ThinkingDelta {
+                bytes: b"private-thinking".to_vec(),
+            },
+            ProviderEventKind::ThinkingSignatureDelta {
+                bytes: b"private-signature".to_vec(),
+            },
+            ProviderEventKind::ToolCallStarted {
+                call_index: 0,
+                provider_call_id: Some("call".into()),
+                name: "Read".into(),
+            },
+            ProviderEventKind::ToolCallArgumentsDelta {
+                call_index: 0,
+                bytes: b"{}".to_vec(),
+            },
+            ProviderEventKind::ToolCallFinished { call_index: 0 },
+            ProviderEventKind::UsageUpdate(usage),
+            ProviderEventKind::Finished {
+                finish_reason: Some("stop".into()),
+                final_usage: Some(usage),
+            },
+        ];
+        for kind in kinds {
+            let carries_usage = matches!(
+                &kind,
+                ProviderEventKind::UsageUpdate(_) | ProviderEventKind::Finished { .. }
+            );
+            let is_text = matches!(&kind, ProviderEventKind::TextDelta { .. });
+            let is_tool_start = matches!(&kind, ProviderEventKind::ToolCallStarted { .. });
+            let invalid_tool_order = matches!(
+                &kind,
+                ProviderEventKind::ToolCallArgumentsDelta { .. }
+                    | ProviderEventKind::ToolCallFinished { .. }
+            );
+            let mut observed = false;
+            let mut metadata = crate::compaction::MetadataAccounting::default();
+            let mut lifecycle = ToolLifecycle::default();
+            let mut frontend = Vec::new();
+            observe_ordinary_event(
+                &ProviderStreamEvent {
+                    sequence: 0,
+                    event: kind,
+                },
+                &mut observed,
+                &mut metadata,
+                &mut lifecycle,
+                &mut |event| frontend.push(event),
+            );
+            // This is the actual latch passed to the private eligibility flag;
+            // live transport qualification is tested separately with real HTTP.
+            assert!(observed);
+            assert_eq!(frontend.len(), usize::from(is_text));
+            if is_text {
+                assert!(
+                    matches!(&frontend[0], FrontendEvent::TextDelta { text } if text == "visible-text")
+                );
+            }
+            assert_eq!(lifecycle.calls.len(), usize::from(is_tool_start));
+            assert_eq!(lifecycle.invalid, invalid_tool_order);
+            let receipt = metadata.ordinary_receipt(
+                "observed-request".into(),
+                &config,
+                &Err(("E0410", "fixture failure".into())),
+                false,
+            );
+            assert_eq!(receipt.usage, carries_usage.then_some(usage));
+            assert_eq!(receipt.knownness, AccountingKnownness::Uncertain);
+        }
+    }
+
+    #[test]
+    fn combined_refusal_receipt_boundary_retains_last_measured_slot_and_refuses_extra() {
+        let refusals = vec![refusal_snapshot(); MAX_TURN_ACCOUNTING_ATTEMPTS - 1];
+        let mut report = TurnReport::default();
+        assert_eq!(remaining_accounting_metadata(&report, &refusals), Ok(1));
+        assert!(require_accounting_slot(&report, &refusals).is_ok());
+        record_accounting_with_refusals(&mut report, &refusals, &[measured_receipt()]).unwrap();
+        assert_eq!(report.attempts.len(), 1);
+        assert_eq!(report.input_tokens, 1);
+        assert_eq!(report.cost_microcents, 7);
+        assert_eq!(remaining_accounting_metadata(&report, &refusals), Ok(0));
+        assert!(require_accounting_slot(&report, &refusals).is_err());
+        let before = report.accounting.clone();
+        assert!(
+            record_accounting_with_refusals(&mut report, &refusals, &[measured_receipt()]).is_err()
+        );
+        assert_eq!(report.attempts.len(), 1);
+        assert_eq!(report.accounting, before);
+        assert_eq!(report.cost_microcents, 7);
+    }
+
+    #[test]
+    fn refusal_only_limit_and_mixed_over_limit_cannot_dispatch_or_append() {
+        let mut refusals = vec![refusal_snapshot(); MAX_TURN_ACCOUNTING_ATTEMPTS];
+        let mut report = TurnReport::default();
+        assert_eq!(remaining_accounting_metadata(&report, &refusals), Ok(0));
+        assert!(require_accounting_slot(&report, &refusals).is_err());
+        assert!(
+            record_accounting_with_refusals(&mut report, &refusals, &[measured_receipt()]).is_err()
+        );
+        assert!(report.attempts.is_empty());
+        refusals.push(refusal_snapshot());
+        assert!(remaining_accounting_metadata(&report, &refusals).is_err());
+        assert!(require_accounting_slot(&report, &refusals).is_err());
+        record_accounting(&mut report, &[measured_receipt()]).unwrap();
+        refusals.pop();
+        assert!(remaining_accounting_metadata(&report, &refusals).is_err());
+        assert_eq!(report.attempts.len(), 1);
     }
 }
 

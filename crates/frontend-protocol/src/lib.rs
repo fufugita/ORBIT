@@ -228,12 +228,21 @@ pub enum FrontendEvent {
 
 // ── Actions: frontend → harness ─────────────────────────────────────────────
 
+/// One explicit manual-compaction intent. Legacy actions retain their parsing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompactRequest {
+    pub request_id: String,
+}
+
 /// Something the operator asked the harness to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendAction {
     /// Send a prompt (starts or queues a turn).
     Prompt { text: String },
+    /// Compact the idle session through its existing owner.
+    Compact(CompactRequest),
     /// Cancel the in-flight turn.
     Cancel,
     /// Decide a pending approval.
@@ -359,6 +368,35 @@ mod tests {
         let json = serde_json::to_string(&act).unwrap();
         let back: FrontendAction = serde_json::from_str(&json).unwrap();
         assert_eq!(act, back);
+    }
+
+    #[test]
+    fn compact_intent_is_additive_and_strict() {
+        let action = FrontendAction::Compact(CompactRequest {
+            request_id: "compact-1".into(),
+        });
+        let wire = r#"{"type":"compact","request_id":"compact-1"}"#;
+        assert_eq!(serde_json::to_string(&action).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_str::<FrontendAction>(wire).unwrap(),
+            action
+        );
+        for invalid in [
+            r#"{"type":"compact"}"#,
+            r#"{"type":"compact","request_id":1}"#,
+            r#"{"type":"compact","request_id":"compact-1","text":"hidden prompt"}"#,
+        ] {
+            assert!(serde_json::from_str::<FrontendAction>(invalid).is_err());
+        }
+        let legacy: FrontendAction =
+            serde_json::from_str(r#"{"type":"prompt","text":"hello","legacy_extra":true}"#)
+                .unwrap();
+        assert_eq!(
+            legacy,
+            FrontendAction::Prompt {
+                text: "hello".into()
+            }
+        );
     }
 
     #[test]

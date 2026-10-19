@@ -2893,6 +2893,7 @@ dependencies = [
  "orbit-migrator",
  "orbit-pib",
  "orbit-plugin",
+ "orbit-provider-http",
  "orbit-reactor",
  "orbit-release",
  "orbit-sandbox",

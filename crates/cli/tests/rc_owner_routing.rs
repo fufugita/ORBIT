@@ -320,6 +320,36 @@ impl Owned {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    fn prompt_uncertain(&mut self, id: &str, text: &str) {
+        let ack = self
+            .send(OwnerAction::Prompt {
+                request_id: id.into(),
+                text: text.into(),
+            })
+            .unwrap();
+        assert_eq!(ack.request_id.as_deref(), Some(id));
+        assert!(!ack.duplicate);
+        self.finished_uncertain(id);
+    }
+    fn finished_uncertain(&self, id: &str) -> OwnerSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = self.snapshot();
+            if snapshot.state == TurnState::Interrupted
+                && snapshot
+                    .requests
+                    .get(id)
+                    .is_some_and(|record| record.state == RequestState::Unknown)
+            {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owner did not preserve explicit request uncertainty: {snapshot:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     fn snapshot(&self) -> OwnerSnapshot {
         self.handle.snapshot().unwrap()
     }
@@ -690,14 +720,14 @@ fn cancelling_routed_provider_headers_keeps_origin_effort_and_no_replay() {
     f.b.wait_calls(1);
     let before = Instant::now();
     owner.send(OwnerAction::Cancel).unwrap();
-    let snapshot = owner.finished("cancel-routed");
+    let snapshot = owner.finished_uncertain("cancel-routed");
     assert!(
         before.elapsed() < Duration::from_secs(2),
         "routed provider cancellation exceeded bound"
     );
     assert_eq!(
         snapshot.requests["cancel-routed"].state,
-        RequestState::Interrupted
+        RequestState::Unknown
     );
     let duplicate = owner
         .send(OwnerAction::Prompt {
@@ -706,7 +736,7 @@ fn cancelling_routed_provider_headers_keeps_origin_effort_and_no_replay() {
         })
         .unwrap();
     assert!(duplicate.duplicate);
-    assert_eq!(duplicate.state, "interrupted");
+    assert_eq!(duplicate.state, "unknown");
     assert_eq!(f.b.calls().len(), 1);
     assert!(f.a.calls().is_empty());
     f.assert_base(&owner, SelectionOrigin::Default, low());
@@ -715,7 +745,7 @@ fn cancelling_routed_provider_headers_keeps_origin_effort_and_no_replay() {
         &fs::read(f.home.join("sessions/.requests/routing-owner.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(durable["requests"]["cancel-routed"]["state"], "interrupted");
+    assert_eq!(durable["requests"]["cancel-routed"]["state"], "unknown");
 }
 
 #[test]
@@ -1705,7 +1735,18 @@ mod context_frontend_tests {
             f.seed(&old_history());
             let result = f.run(entry, "continue from the retained tail");
             f.assert_no_calls();
-            result.assert_budget_refusal();
+            let errors = result
+                .events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .filter_map(|event| event["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                format!("{errors}\n{}", result.text)
+                    .contains("context summary cannot fit its independently selected budget"),
+                "fixture must reach the independently selected summary budget refusal for {entry:?}"
+            );
             result.assert_safe(&f);
         }
     }
@@ -2314,5 +2355,2641 @@ mod context_frontend_tests {
                     .any(|notice| notice.contains(secret))
             );
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod caller_journal_activation {
+    use super::*;
+    use orbit_adapter::types::ChatMessage;
+    use orbit_cli::context_history::{context_journal, load_compaction_source};
+    use orbit_engine::{
+        AccountingBaseline, AccountingKnownness, AttemptPurpose, CompactionJournal,
+    };
+    use orbit_hud_tui::worker::{CancelHandle, WorkerCommand, WorkerCtx};
+    use orbit_hud_tui::{ApprovalRegistry, bus::Bus, msg::Msg};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    const MAX_BODY: usize = 4 * 1024 * 1024;
+    const MAX_REQUESTS: usize = 4;
+    const ANSWER: &str = "actual caller answer";
+    const SUMMARY: &str = "private summary of closed historical work";
+
+    fn dispatch_isolated(exact: &str) -> bool {
+        let isolated = std::env::var_os("ORBIT_ACTIVATION_ISOLATED");
+        let depth = std::env::var_os("ORBIT_ACTIVATION_RUNNER_DEPTH");
+        if isolated.as_deref() == Some(std::ffi::OsStr::new("1")) {
+            assert_eq!(
+                depth.as_deref(),
+                Some(std::ffi::OsStr::new("1")),
+                "invalid isolated runner depth"
+            );
+            return true;
+        }
+        assert!(
+            isolated.is_none() && depth.is_none(),
+            "malformed isolation dispatch controls"
+        );
+        let required =
+            std::env::var("ORBIT_REQUIRE_CONTEXT_SESSION_ISOLATION").as_deref() == Ok("1");
+        let output = std::process::Command::new("/usr/bin/python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/fixtures/context_session_isolation.py"
+            ))
+            .arg("--binary")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", exact, "--timeout", "45"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("tracked isolation runner did not start");
+        assert!(
+            output.stdout.len() <= 512 * 1024 && output.stderr.len() <= 64 * 1024,
+            "runner receipt output bound"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+            panic!(
+                "invalid isolation runner receipt, exit {:?}",
+                output.status.code()
+            )
+        });
+        assert_eq!(report["schema"], "orbit.context-session-isolation/v1");
+        assert_eq!(report["test_filter"], exact);
+        let visible = json!({"schema":report["schema"],"test_filter":exact,"status":report["status"],
+            "test_started":report["test_started"],"reason":report["reason"],"harness":report["harness"],
+            "binary_sha256":report["binary_sha256"],"binary_metadata_and_hash_unchanged":report["binary_metadata_and_hash_unchanged"],
+            "host_managed_path_metadata_unchanged":report["host_managed_path_metadata_unchanged"],"owned_fixture_removed":report["owned_fixture_removed"]});
+        // Direct Write bypasses libtest's println capture. A returning NOTRUN
+        // wrapper must stay visible and must not count as an inner pass.
+        let line = format!("ORBIT_CONTEXT_SESSION_ISOLATION {visible}\n");
+        std::io::Write::write_all(&mut std::io::stdout().lock(), line.as_bytes()).unwrap();
+        match report["status"].as_str() {
+            Some("TEST_PASSED") => {
+                assert_eq!(output.status.code(), Some(0));
+                assert_eq!(report["test_started"], true);
+                assert_eq!(report["harness"]["passed"], 1);
+                assert_eq!(report["harness"]["failed"], 0);
+                assert_eq!(report["harness"]["ignored"], 0);
+                for field in [
+                    "binary_metadata_and_hash_unchanged",
+                    "host_managed_path_metadata_unchanged",
+                    "owned_fixture_removed",
+                    "binary_postcheck_inside",
+                ] {
+                    assert_eq!(report[field], true);
+                }
+            }
+            Some("NOTRUN") => {
+                assert_eq!(output.status.code(), Some(77));
+                assert_eq!(report["test_started"], false);
+                assert!(
+                    !required,
+                    "NOTRUN: this infrastructure-required job needs namespace capability"
+                );
+            }
+            Some("TEST_FAILED") | Some("INFRA_FAILURE") => {
+                panic!(
+                    "isolated test did not pass: {} / {} / {}",
+                    report["status"], report["stdout_excerpt"], report["stderr_excerpt"]
+                );
+            }
+            _ => panic!("unknown isolation runner status"),
+        }
+        false
+    }
+
+    fn require_private_system_fixture() {
+        // Check descriptors/namespace identity BEFORE opening managed content,
+        // creating a fixture, spawning a provider or starting any caller.
+        let descriptor = |name: &str| {
+            let value: u32 = std::env::var(name)
+                .expect("isolated runner descriptor missing")
+                .parse()
+                .unwrap();
+            assert!(value < 4096);
+            fs::metadata(format!("/proc/self/fd/{value}")).unwrap()
+        };
+        let parent_mount = descriptor("ORBIT_ACTIVATION_PARENT_MOUNT_FD");
+        let parent_user = descriptor("ORBIT_ACTIVATION_PARENT_USER_FD");
+        let own_mount = fs::metadata("/proc/self/ns/mnt").unwrap();
+        let own_user = fs::metadata("/proc/self/ns/user").unwrap();
+        assert_ne!(
+            (parent_mount.dev(), parent_mount.ino()),
+            (own_mount.dev(), own_mount.ino())
+        );
+        assert_ne!(
+            (parent_user.dev(), parent_user.ino()),
+            (own_user.dev(), own_user.ino())
+        );
+        let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(mounts.lines().any(
+            |line| line.split_whitespace().nth(4) == Some("/etc") && line.contains(" - tmpfs ")
+        ));
+        let expected = std::env::var("ORBIT_ACTIVATION_MANAGED_MARKER").unwrap();
+        assert!(expected.starts_with("ORBIT_ACTIVATION_MANAGED_") && expected.len() <= 128);
+        assert!(
+            expected
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        );
+        let path = Path::new("/etc/orbit/ORBIT.md");
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(metadata.len() <= 128);
+        assert_eq!(fs::read(path).unwrap(), expected.as_bytes());
+        assert_eq!(fs::read_dir("/etc/orbit").unwrap().count(), 1);
+        let root =
+            PathBuf::from(std::env::var_os("ORBIT_ACTIVATION_ROOT").expect("private root missing"));
+        assert!(root.is_absolute());
+        assert_eq!(root.canonicalize().unwrap(), root);
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("oc-")
+        );
+        assert_eq!(fs::symlink_metadata(&root).unwrap().mode() & 0o777, 0o700);
+        for name in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            let path = PathBuf::from(std::env::var_os(name).expect("private user path missing"));
+            assert!(path.is_absolute() && path.starts_with(&root) && path != root);
+            assert_eq!(path.canonicalize().unwrap(), path);
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+        }
+        assert!(std::env::current_dir().unwrap().starts_with(&root));
+        for name in [
+            "ORBIT_HOME",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "OPENAI_BASE_URL",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "runner did not clear an inherited provider setting"
+            );
+        }
+    }
+
+    struct Cwd(PathBuf);
+    impl Cwd {
+        fn enter(path: &Path) -> Self {
+            let old = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self(old)
+        }
+    }
+    impl Drop for Cwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    struct Captured {
+        target: String,
+        headers: Vec<(String, String)>,
+        body: Value,
+    }
+
+    struct Response {
+        body: String,
+        pause: bool,
+    }
+    impl Response {
+        fn text(text: &str, reason: &str, usage: Option<Value>) -> Self {
+            let mut event =
+                json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":reason}]});
+            if let Some(usage) = usage {
+                event["usage"] = usage;
+            }
+            Self {
+                body: format!("data: {event}\n\ndata: [DONE]\n\n"),
+                pause: false,
+            }
+        }
+        fn complete(text: &str) -> Self {
+            Self::text(
+                text,
+                "stop",
+                Some(json!({"prompt_tokens":11,"completion_tokens":7,"total_tokens":18})),
+            )
+        }
+    }
+
+    struct Wire {
+        url: String,
+        authority: String,
+        requests: Arc<Mutex<Vec<Captured>>>,
+        connections: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<Result<(), &'static str>>>,
+        watchdog: Option<std::sync::mpsc::Sender<()>>,
+        watchdog_thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Wire {
+        fn new(responses: Vec<Response>) -> Self {
+            Self::with_held_headers(responses, false)
+        }
+        fn with_held_headers(responses: Vec<Response>, hold_headers: bool) -> Self {
+            let (watchdog, receive) = std::sync::mpsc::channel();
+            let watchdog_thread = std::thread::spawn(move || {
+                if matches!(
+                    receive.recv_timeout(Duration::from_secs(25)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    eprintln!("compaction fixture watchdog expired");
+                    std::process::exit(91);
+                }
+            });
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let authority = listener.local_addr().unwrap().to_string();
+            let url = format!("http://{authority}/tenant/v1?scope=compaction");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let accepted = connections.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut responses = responses.into_iter();
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err("listener deadline");
+                    }
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            if accepted.fetch_add(1, Ordering::SeqCst) >= MAX_REQUESTS {
+                                return Err("request bound");
+                            }
+                            socket
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .map_err(|_| "read timeout")?;
+                            socket
+                                .set_write_timeout(Some(Duration::from_secs(2)))
+                                .map_err(|_| "write timeout")?;
+                            let request = read_request(&mut socket)?;
+                            captured.lock().map_err(|_| "capture lock")?.push(request);
+                            if hold_headers {
+                                while !stopping.load(Ordering::SeqCst) {
+                                    if Instant::now() >= deadline {
+                                        return Err("held headers deadline");
+                                    }
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                                continue;
+                            }
+                            let response = responses.next().ok_or("unexpected extra request")?;
+                            let length = if response.pause {
+                                response.body.len() + 1_000_000
+                            } else {
+                                response.body.len()
+                            };
+                            if let Err(error) = write!(
+                                socket,
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{}",
+                                response.body
+                            ) {
+                                if response.pause
+                                    && matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::BrokenPipe
+                                            | std::io::ErrorKind::ConnectionReset
+                                    )
+                                {
+                                    continue;
+                                }
+                                return Err("response write");
+                            }
+                            socket.flush().map_err(|_| "response flush")?;
+                            while response.pause && !stopping.load(Ordering::SeqCst) {
+                                if Instant::now() >= deadline {
+                                    return Err("paused response deadline");
+                                }
+                                let mut byte = [0];
+                                match socket.read(&mut byte) {
+                                    Ok(0) => break,
+                                    Ok(_) => {}
+                                    Err(e)
+                                        if matches!(
+                                            e.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                        ) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stopping.load(Ordering::SeqCst) {
+                                return Ok(());
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => return Err("listener accept"),
+                    }
+                }
+            });
+            Self {
+                url,
+                authority,
+                requests,
+                connections,
+                stop,
+                thread: Some(thread),
+                watchdog: Some(watchdog),
+                watchdog_thread: Some(watchdog_thread),
+            }
+        }
+        fn finish(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread
+                    .join()
+                    .expect("fixture thread panic")
+                    .expect("bounded fixture failure");
+            }
+            assert_eq!(
+                self.connections.load(Ordering::SeqCst),
+                self.requests.lock().unwrap().len()
+            );
+        }
+    }
+    impl Drop for Wire {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            if let Some(done) = self.watchdog.take() {
+                let _ = done.send(());
+            }
+            if let Some(thread) = self.watchdog_thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn read_request(socket: &mut TcpStream) -> Result<Captured, &'static str> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            if header.len() >= 16 * 1024 || Instant::now() >= deadline {
+                return Err("header bound");
+            }
+            let mut byte = [0];
+            match socket.read(&mut byte) {
+                Ok(1) => header.push(byte[0]),
+                Ok(_) => return Err("incomplete header"),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return Err("header read"),
+            }
+        }
+        let header = std::str::from_utf8(&header).map_err(|_| "header encoding")?;
+        let mut lines = header.lines();
+        let target = lines.next().ok_or("request line")?.to_owned();
+        let mut headers = Vec::new();
+        for line in lines.filter(|line| !line.is_empty()) {
+            let (name, value) = line.split_once(':').ok_or("header form")?;
+            headers.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+        }
+        let lengths: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| name == "content-length")
+            .collect();
+        if lengths.len() != 1 {
+            return Err("single content length required");
+        }
+        let size = lengths[0]
+            .1
+            .parse::<usize>()
+            .map_err(|_| "content length")?;
+        if size == 0 || size > MAX_BODY {
+            return Err("body bound");
+        }
+        let mut bytes = vec![0; size];
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if Instant::now() >= deadline {
+                return Err("body deadline");
+            }
+            match socket.read(&mut bytes[offset..]) {
+                Ok(0) => return Err("incomplete body"),
+                Ok(count) => offset += count,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return Err("body read"),
+            }
+        }
+        let body = serde_json::from_slice(&bytes).map_err(|_| "body JSON")?;
+        Ok(Captured {
+            target,
+            headers,
+            body,
+        })
+    }
+
+    fn configure(f: &Fixture, wire: &Wire, selected_input: u64) {
+        let model = |id: &str, input: u64, price: u64| {
+            json!({
+                "id":id, "max_output_tokens":73, "context_limits":{"input_tokens":input},
+                "pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,
+                    "cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,
+                    "reasoning_per_million_microdollars":0,"request_flat_microdollars":price}
+            })
+        };
+        let document = json!({"provider":[{"name":"provider_a","kind":"openai-compatible","url":wire.url,
+            "models":[model(RAW_A,selected_input,5),model("summary-model",64_000,7)]}],
+            "roles":{"main":format!("provider_a/{RAW_A}"),"compaction":"provider_a/summary-model"}});
+        let parsed: orbit_cli::config::ProvidersConfig = serde_json::from_value(document).unwrap();
+        write_private(
+            &f.home.join("providers.toml"),
+            toml::to_string(&parsed).unwrap(),
+        );
+    }
+    fn seed(
+        f: &Fixture,
+        wire: &Wire,
+        session: &str,
+        source: &[ChatMessage],
+        prefix: (u64, u64, u64),
+    ) {
+        let saved = SessionFile::from_chat(
+            session,
+            RAW_A,
+            &wire.url,
+            "provider_a",
+            source,
+            0,
+            prefix.0,
+            prefix.1,
+            prefix.2,
+        )
+        .with_selection_origin(SelectionOrigin::SavedExplicit);
+        let lease = SessionLease::acquire(&f.home, session, "activation-seed").unwrap();
+        lease.save(&saved).unwrap();
+    }
+    fn history() -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+        for index in 0..3 {
+            messages.push(orbit_engine::user_message(format!(
+                "{}old user {index}",
+                "u".repeat(12_000)
+            )));
+            messages.push(orbit_engine::assistant_message(format!(
+                "{}old answer {index}",
+                "a".repeat(12_000)
+            )));
+        }
+        for index in 0..2 {
+            messages.push(orbit_engine::user_message(format!(
+                "exact recent question {index}"
+            )));
+            messages.push(orbit_engine::assistant_message(format!(
+                "exact recent answer {index}"
+            )));
+        }
+        messages
+    }
+    fn journal(f: &Fixture, session: &str) -> Arc<dyn CompactionJournal> {
+        context_journal(&f.home, session, None).unwrap()
+    }
+    fn saved(f: &Fixture, session: &str) -> SessionFile {
+        sessions::load_session(&f.home, session).unwrap()
+    }
+    fn assert_known(
+        f: &Fixture,
+        session: &str,
+        revision: u64,
+        prefix: (u64, u64, u64),
+        calls: u64,
+    ) {
+        let checkpoint = journal(f, session).accounting_checkpoint().unwrap();
+        assert_eq!(checkpoint.owner_session_id, session);
+        assert_eq!(checkpoint.child_id, None);
+        assert_eq!(checkpoint.baseline, AccountingBaseline::UnknownLegacy);
+        assert_eq!(checkpoint.revision.0, revision);
+        assert_eq!(checkpoint.totals.ordinary.input_tokens, 11 * calls);
+        assert_eq!(checkpoint.totals.ordinary.output_tokens, 7 * calls);
+        assert_eq!(
+            checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .ordinary_microcents,
+            5 * calls
+        );
+        assert!(checkpoint.pending.is_none());
+        let saved = saved(f, session);
+        assert_eq!(
+            (
+                saved.input_tokens,
+                saved.output_tokens,
+                saved.cost_microcents
+            ),
+            (
+                prefix.0 + 11 * calls,
+                prefix.1 + 7 * calls,
+                prefix.2 + 5 * calls
+            )
+        );
+        let watermark = saved.accounting_watermark.unwrap();
+        assert_eq!(watermark.owner_session_id, session);
+        assert_eq!(watermark.revision, revision);
+        assert_eq!(watermark.known_ordinary_microcents, 5 * calls);
+    }
+    fn assert_wire(wire: &Wire, expected: usize) {
+        let requests = wire.requests.lock().unwrap();
+        assert_eq!(requests.len(), expected);
+        for request in requests.iter() {
+            assert_eq!(
+                request.target,
+                "POST /tenant/v1/chat/completions?scope=compaction HTTP/1.1"
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .iter()
+                    .filter_map(|(name, value)| (name == "host").then_some(value.as_str()))
+                    .collect::<Vec<_>>(),
+                [wire.authority.as_str()]
+            );
+            assert!(
+                !request
+                    .headers
+                    .iter()
+                    .any(|(name, _)| matches!(name.as_str(), "authorization" | "x-api-key"))
+            );
+            assert_eq!(request.body["max_tokens"], 73);
+        }
+    }
+
+    struct Tui {
+        bus: Bus,
+        commands: Option<mpsc::Sender<WorkerCommand>>,
+        cancel: CancelHandle,
+    }
+    impl Tui {
+        fn start(f: &Fixture, session: &str) -> Self {
+            let (lease, saved) =
+                SessionLease::acquire_and_load(&f.home, session, "activation-tui").unwrap();
+            let (bus, sender) = Bus::new();
+            let (commands, command_rx) = mpsc::channel();
+            let cancel = orbit_cli::tui_worker::make_spawner_owned(
+                f.turn(&saved, PermissionScope::default()),
+                lease,
+            )(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                commands.clone(),
+            )
+            .unwrap();
+            Self {
+                bus,
+                commands: Some(commands),
+                cancel,
+            }
+        }
+        fn run(
+            &self,
+            command: WorkerCommand,
+            cancel_after_post: Option<(&Wire, usize)>,
+        ) -> Vec<Value> {
+            self.commands.as_ref().unwrap().send(command).unwrap();
+            if let Some((wire, count)) = cancel_after_post {
+                let end = Instant::now() + Duration::from_secs(5);
+                while wire.requests.lock().unwrap().len() < count {
+                    assert!(
+                        Instant::now() < end,
+                        "actual TUI POST missing before cancel"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                (self.cancel)();
+            }
+            let end = Instant::now() + Duration::from_secs(10);
+            let mut events = Vec::new();
+            let mut done = false;
+            while Instant::now() < end && !done {
+                match self.bus.try_recv() {
+                    Some(Msg::BackendError(message)) => {
+                        events.push(json!({"type":"error","message":message}))
+                    }
+                    Some(Msg::Status(text)) => events.push(json!({"type":"status","text":text})),
+                    Some(Msg::PlanReady(text)) => {
+                        events.push(json!({"type":"plan_ready","text":text}))
+                    }
+                    Some(Msg::ResponseFinished {
+                        output,
+                        input_tokens,
+                        output_tokens,
+                        cost_microcents,
+                    }) => {
+                        events.push(json!({"type":"finished","output":output,"input_tokens":input_tokens,"output_tokens":output_tokens,"cost_microcents":cost_microcents}));
+                        done = true;
+                    }
+                    Some(_) => {}
+                    None => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+            assert!(done, "actual TUI terminal response missing");
+            events
+        }
+        fn wait_plan(&self) -> Value {
+            let end = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(Msg::PlanReady(text)) = self.bus.try_recv() {
+                    return json!({"type":"plan_ready","text":text});
+                }
+                assert!(
+                    Instant::now() < end,
+                    "successful plan was not offered for approval"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn close(mut self, f: &Fixture, session: &str) {
+            self.commands.take();
+            let end = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Ok(lease) = SessionLease::acquire(&f.home, session, "activation-closed") {
+                    drop(lease);
+                    return;
+                }
+                assert!(Instant::now() < end, "TUI retained session lease after EOF");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    impl Drop for Tui {
+        fn drop(&mut self) {
+            (self.cancel)();
+            self.commands.take();
+        }
+    }
+
+    #[test]
+    fn actual_tui_prompt_journals_work_and_restart_projects_the_known_charge_once() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_tui_prompt_journals_work_and_restart_projects_the_known_charge_once",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let _cwd = Cwd::enter(&f.workspace);
+        let mut wire = Wire::new(vec![
+            Response::complete(ANSWER),
+            Response::complete("second answer"),
+        ]);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (10, 20, 30));
+        let tui = Tui::start(&f, SESSION);
+        let events = tui.run(WorkerCommand::Prompt("first TUI intent".into()), None);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "finished")
+                .count(),
+            1
+        );
+        assert_known(&f, SESSION, 2, (10, 20, 30), 1);
+        tui.close(&f, SESSION);
+        let first = saved(&f, SESSION).transcript;
+        let tui = Tui::start(&f, SESSION);
+        tui.run(WorkerCommand::Prompt("second TUI intent".into()), None);
+        tui.close(&f, SESSION);
+        assert_known(&f, SESSION, 4, (10, 20, 30), 2);
+        assert!(saved(&f, SESSION).transcript.starts_with(&first));
+        wire.finish();
+        assert_wire(&wire, 2);
+    }
+
+    #[test]
+    fn actual_tui_successful_plan_is_billed_and_saved_before_any_approval() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_tui_successful_plan_is_billed_and_saved_before_any_approval",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let _cwd = Cwd::enter(&f.workspace);
+        const PLAN: &str = "1. Inspect the synthetic file.\nPLAN READY";
+        const PROMPT: &str = "prepare a synthetic plan";
+        let mut wire = Wire::new(vec![Response::complete(PLAN)]);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (0, 0, 0));
+        let tui = Tui::start(&f, SESSION);
+        let events = tui.run(WorkerCommand::PlanPrompt(PROMPT.into()), None);
+        let plan = events
+            .iter()
+            .find(|event| event["type"] == "plan_ready")
+            .cloned()
+            .unwrap_or_else(|| tui.wait_plan());
+        assert_eq!(plan["text"], PLAN);
+        // No approval/execution command has been sent, and the worker still owns
+        // the session. Provider billing and its watermark must already be durable.
+        assert_known(&f, SESSION, 2, (0, 0, 0), 1);
+        let observed = saved(&f, SESSION);
+        assert_eq!(
+            observed
+                .transcript
+                .iter()
+                .filter(
+                    |message| message.role == orbit_adapter::types::ChatRole::User
+                        && message.content == PROMPT
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .transcript
+                .iter()
+                .filter(
+                    |message| message.role == orbit_adapter::types::ChatRole::Assistant
+                        && message.content == PLAN
+                )
+                .count(),
+            1
+        );
+        assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+        tui.close(&f, SESSION);
+        wire.finish();
+        assert_wire(&wire, 1);
+        assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn actual_tui_paid_summary_then_failed_ordinary_retains_cost_and_halts_replay() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_tui_paid_summary_then_failed_ordinary_retains_cost_and_halts_replay",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let _cwd = Cwd::enter(&f.workspace);
+        let malformed = Response {
+            body: "data: {invalid-json}\n\n".into(),
+            pause: false,
+        };
+        let mut wire = Wire::new(vec![
+            Response::complete(SUMMARY),
+            malformed,
+            Response::complete("must not be called"),
+        ]);
+        configure(&f, &wire, 10_000);
+        let original = history();
+        seed(&f, &wire, SESSION, &original, (0, 0, 0));
+        let tui = Tui::start(&f, SESSION);
+        let events = tui.run(
+            WorkerCommand::Prompt("retain this failed current intent".into()),
+            None,
+        );
+        assert!(!events.iter().any(|event| event["type"] == "plan_ready"));
+        let checkpoint = journal(&f, SESSION).accounting_checkpoint().unwrap();
+        assert_eq!(checkpoint.revision.0, 4);
+        assert_eq!(checkpoint.totals.housekeeping.input_tokens, 11);
+        assert_eq!(checkpoint.totals.housekeeping.output_tokens, 7);
+        assert_eq!(
+            checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .housekeeping_microcents,
+            7
+        );
+        assert_eq!(
+            checkpoint.pending.as_ref().unwrap().intent.purpose,
+            AttemptPurpose::Ordinary
+        );
+        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+        let durable = saved(&f, SESSION);
+        assert_eq!(
+            (
+                durable.input_tokens,
+                durable.output_tokens,
+                durable.cost_microcents
+            ),
+            (11, 7, 7)
+        );
+        assert_eq!(
+            durable
+                .accounting_watermark
+                .as_ref()
+                .unwrap()
+                .full_cost_status,
+            orbit_cli::session_accounting::FullCostStatus::Uncertain
+        );
+        assert_eq!(
+            durable
+                .transcript
+                .iter()
+                .filter(|message| message.content == "retain this failed current intent")
+                .count(),
+            1
+        );
+        let archive_dir = f
+            .home
+            .join("context-history")
+            .join(SESSION)
+            .join("archives");
+        let files: Vec<_> = fs::read_dir(archive_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let record = files[0].file_stem().unwrap().to_str().unwrap();
+        let mut archived = original;
+        archived.push(orbit_engine::user_message(
+            "retain this failed current intent",
+        ));
+        assert_eq!(
+            load_compaction_source(&f.home, SESSION, None, record).unwrap(),
+            archived
+        );
+        let bytes = fs::read(
+            f.home
+                .join("context-history")
+                .join(SESSION)
+                .join("accounting.json"),
+        )
+        .unwrap();
+        tui.run(
+            WorkerCommand::Prompt("new intent cannot replay uncertain work".into()),
+            None,
+        );
+        assert_eq!(
+            fs::read(
+                f.home
+                    .join("context-history")
+                    .join(SESSION)
+                    .join("accounting.json")
+            )
+            .unwrap(),
+            bytes
+        );
+        tui.close(&f, SESSION);
+        wire.finish();
+        assert_wire(&wire, 2);
+        let calls = wire.requests.lock().unwrap();
+        assert_eq!(calls[0].body["model"], "summary-model");
+        assert_eq!(calls[1].body["model"], RAW_A);
+    }
+
+    #[test]
+    fn actual_tui_cancel_after_accepted_post_is_uncertain_and_refuses_next_turn() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_tui_cancel_after_accepted_post_is_uncertain_and_refuses_next_turn",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let _cwd = Cwd::enter(&f.workspace);
+        let mut wire = Wire::with_held_headers(vec![], true);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (0, 0, 0));
+        let tui = Tui::start(&f, SESSION);
+        tui.run(
+            WorkerCommand::Prompt("cancel this actual TUI request".into()),
+            Some((&wire, 1)),
+        );
+        let checkpoint = journal(&f, SESSION).accounting_checkpoint().unwrap();
+        assert_eq!(checkpoint.revision.0, 2);
+        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+        assert_eq!(checkpoint.totals.knownness, AccountingKnownness::Uncertain);
+        let saved = saved(&f, SESSION);
+        assert_eq!(saved.cost_microcents, 0);
+        assert_eq!(
+            saved.accounting_watermark.unwrap().full_cost_status,
+            orbit_cli::session_accounting::FullCostStatus::Uncertain
+        );
+        assert_eq!(
+            saved
+                .transcript
+                .iter()
+                .filter(|message| message.content == "cancel this actual TUI request")
+                .count(),
+            1
+        );
+        tui.run(
+            WorkerCommand::Prompt("no automatic retry after cancel".into()),
+            None,
+        );
+        assert_eq!(
+            journal(&f, SESSION).accounting_checkpoint().unwrap(),
+            checkpoint
+        );
+        tui.close(&f, SESSION);
+        wire.finish();
+        assert_wire(&wire, 1);
+    }
+
+    #[test]
+    fn actual_owner_journals_qualified_work_and_controller_replacement_does_not_rebill() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_owner_journals_qualified_work_and_controller_replacement_does_not_rebill",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let mut wire = Wire::new(vec![
+            Response::complete(ANSWER),
+            Response::complete("after restart"),
+        ]);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (10, 20, 30));
+        let mut owner = f.restart();
+        owner.prompt("owner-first", "owner first intent");
+        assert_known(&f, SESSION, 2, (10, 20, 30), 1);
+        owner.controller.take();
+        owner.controller = Some(owner.handle.claim_controller().unwrap());
+        let duplicate = owner
+            .send(OwnerAction::Prompt {
+                request_id: "owner-first".into(),
+                text: "owner first intent".into(),
+            })
+            .unwrap();
+        assert!(duplicate.duplicate);
+        assert_known(&f, SESSION, 2, (10, 20, 30), 1);
+        owner.shutdown();
+        let mut owner = f.restart();
+        owner.prompt("owner-second", "owner second intent");
+        assert_known(&f, SESSION, 4, (10, 20, 30), 2);
+        owner.shutdown();
+        wire.finish();
+        assert_wire(&wire, 2);
+    }
+
+    #[test]
+    fn actual_owner_cancelled_wire_attempt_is_durable_and_cannot_be_resubmitted() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_owner_cancelled_wire_attempt_is_durable_and_cannot_be_resubmitted",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let mut wire = Wire::with_held_headers(vec![], true);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (0, 0, 0));
+        let mut owner = f.restart();
+        owner
+            .send(OwnerAction::Prompt {
+                request_id: "owner-cancel".into(),
+                text: "owner cancellation intent".into(),
+            })
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while wire.requests.lock().unwrap().is_empty() {
+            assert!(Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        owner.send(OwnerAction::Cancel).unwrap();
+        owner.finished_uncertain("owner-cancel");
+        let checkpoint = journal(&f, SESSION).accounting_checkpoint().unwrap();
+        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+        let durable = saved(&f, SESSION);
+        assert_eq!(
+            durable.accounting_watermark.unwrap().full_cost_status,
+            orbit_cli::session_accounting::FullCostStatus::Uncertain
+        );
+        assert_eq!(
+            durable
+                .transcript
+                .iter()
+                .filter(|message| message.content == "owner cancellation intent")
+                .count(),
+            1
+        );
+        let before_refusal = saved(&f, SESSION);
+        let previous_requests = owner.snapshot().requests;
+        let accounting_path = f
+            .home
+            .join("context-history")
+            .join(SESSION)
+            .join("accounting.json");
+        let accounting_bytes = fs::read(&accounting_path).unwrap();
+        let egress_before = f.egress();
+        let assert_pending_refusal = |error: OwnerError| match error {
+            OwnerError::Accounting(
+                orbit_cli::session_accounting::AccountingError::InvalidState(reason),
+            ) => assert_eq!(
+                reason,
+                "a pending uncertain request requires explicit inspection before admission",
+            ),
+            other => panic!("wrong pending admission refusal: {other:?}"),
+        };
+        let refusal = owner
+            .send(OwnerAction::Prompt {
+                request_id: "owner-after-cancel".into(),
+                text: "refuse next request".into(),
+            })
+            .expect_err("pending accounting must refuse fresh provider admission");
+        assert_pending_refusal(refusal);
+        let terminal = owner.finished_uncertain("owner-after-cancel");
+        assert_eq!(terminal.requests.len(), previous_requests.len() + 1);
+        for (id, prior) in &previous_requests {
+            let retained = &terminal.requests[id];
+            assert_eq!(retained.payload_digest, prior.payload_digest);
+            assert_eq!(retained.state, prior.state);
+        }
+        assert_eq!(
+            terminal.requests["owner-cancel"].state,
+            RequestState::Unknown
+        );
+        let after_refusal = saved(&f, SESSION);
+        let mut expected_history = before_refusal.transcript.clone();
+        expected_history.push(orbit_engine::user_message("refuse next request"));
+        assert_eq!(after_refusal.transcript, expected_history);
+        assert_eq!(
+            after_refusal.turns,
+            before_refusal.turns.checked_add(1).unwrap()
+        );
+        assert_eq!(
+            (
+                after_refusal.input_tokens,
+                after_refusal.output_tokens,
+                after_refusal.cost_microcents
+            ),
+            (
+                before_refusal.input_tokens,
+                before_refusal.output_tokens,
+                before_refusal.cost_microcents
+            ),
+        );
+        assert_eq!(
+            after_refusal.accounting_watermark,
+            before_refusal.accounting_watermark
+        );
+        assert_eq!(after_refusal.model, before_refusal.model);
+        assert_eq!(after_refusal.provider, before_refusal.provider);
+        assert_eq!(after_refusal.gate, before_refusal.gate);
+        assert_eq!(after_refusal.effort, before_refusal.effort);
+        assert_eq!(
+            after_refusal.selection_origin,
+            before_refusal.selection_origin
+        );
+        assert_eq!(fs::read(&accounting_path).unwrap(), accounting_bytes);
+        assert_eq!(f.egress(), egress_before);
+        let session_path = f.home.join("sessions").join(format!("{SESSION}.json"));
+        let refused_session_bytes = fs::read(&session_path).unwrap();
+        let duplicate = owner
+            .send(OwnerAction::Prompt {
+                request_id: "owner-after-cancel".into(),
+                text: "refuse next request".into(),
+            })
+            .unwrap();
+        assert_eq!(duplicate.request_id.as_deref(), Some("owner-after-cancel"));
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.state, "unknown");
+        assert_eq!(fs::read(&session_path).unwrap(), refused_session_bytes);
+        assert_eq!(
+            journal(&f, SESSION).accounting_checkpoint().unwrap(),
+            checkpoint
+        );
+        owner.shutdown();
+        let requests_path = f
+            .home
+            .join("sessions/.requests")
+            .join(format!("{SESSION}.json"));
+        let requests_bytes = fs::read(&requests_path).unwrap();
+        assert_eq!(fs::read(&session_path).unwrap(), refused_session_bytes);
+        let (lease, restored) =
+            SessionLease::acquire_and_load(&f.home, SESSION, "pending-owner-restart-refusal")
+                .unwrap();
+        let config = OwnerConfig::new(
+            f.turn(&restored, PermissionScope::default()),
+            f.workspace.clone(),
+        );
+        let refusal = match OwnerRuntime::start(config, lease) {
+            Err(error) => error,
+            Ok(runtime) => {
+                runtime.shutdown().unwrap();
+                panic!("pending accounting unexpectedly admitted a restarted owner");
+            }
+        };
+        assert_pending_refusal(refusal);
+        let released =
+            SessionLease::acquire(&f.home, SESSION, "pending-owner-restart-released").unwrap();
+        drop(released);
+        assert_eq!(fs::read(&session_path).unwrap(), refused_session_bytes);
+        assert_eq!(fs::read(&accounting_path).unwrap(), accounting_bytes);
+        assert_eq!(fs::read(&requests_path).unwrap(), requests_bytes);
+        assert_eq!(
+            journal(&f, SESSION).accounting_checkpoint().unwrap(),
+            checkpoint
+        );
+        assert_eq!(f.egress(), egress_before);
+        wire.finish();
+        assert_wire(&wire, 1);
+    }
+
+    #[test]
+    fn actual_owner_failed_second_attempt_preserves_the_paid_prefix_and_pending_admission_halt() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_owner_failed_second_attempt_preserves_the_paid_prefix_and_pending_admission_halt",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let malformed = Response {
+            body: "data: {invalid-json}\n\n".into(),
+            pause: false,
+        };
+        let mut wire = Wire::new(vec![
+            Response::complete(ANSWER),
+            malformed,
+            Response::complete("must not retry"),
+        ]);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (0, 0, 0));
+        let mut owner = f.restart();
+        owner.prompt("owner-paid-prefix", "first paid owner intent");
+        assert_known(&f, SESSION, 2, (0, 0, 0), 1);
+        owner.prompt_uncertain("owner-failed", "preserve this failed owner intent");
+        let checkpoint = journal(&f, SESSION).accounting_checkpoint().unwrap();
+        assert_eq!(checkpoint.revision.0, 4);
+        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+        assert_eq!(
+            checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .ordinary_microcents,
+            5
+        );
+        assert_eq!(
+            (
+                checkpoint.totals.ordinary.input_tokens,
+                checkpoint.totals.ordinary.output_tokens
+            ),
+            (11, 7)
+        );
+        let durable = saved(&f, SESSION);
+        assert_eq!(
+            (
+                durable.input_tokens,
+                durable.output_tokens,
+                durable.cost_microcents
+            ),
+            (11, 7, 5)
+        );
+        assert_eq!(
+            durable.accounting_watermark.unwrap().full_cost_status,
+            orbit_cli::session_accounting::FullCostStatus::Uncertain
+        );
+        assert_eq!(
+            durable
+                .transcript
+                .iter()
+                .filter(|message| message.content == "preserve this failed owner intent")
+                .count(),
+            1
+        );
+        let before_refusal = saved(&f, SESSION);
+        let previous_requests = owner.snapshot().requests;
+        let accounting_path = f
+            .home
+            .join("context-history")
+            .join(SESSION)
+            .join("accounting.json");
+        let accounting_bytes = fs::read(&accounting_path).unwrap();
+        let egress_before = f.egress();
+        let assert_pending_refusal = |error: OwnerError| match error {
+            OwnerError::Accounting(
+                orbit_cli::session_accounting::AccountingError::InvalidState(reason),
+            ) => assert_eq!(
+                reason,
+                "a pending uncertain request requires explicit inspection before admission",
+            ),
+            other => panic!("wrong pending admission refusal: {other:?}"),
+        };
+        let refusal = owner
+            .send(OwnerAction::Prompt {
+                request_id: "owner-blocked-after-failure".into(),
+                text: "no new request after uncertainty".into(),
+            })
+            .expect_err("pending accounting must refuse fresh provider admission");
+        assert_pending_refusal(refusal);
+        let terminal = owner.finished_uncertain("owner-blocked-after-failure");
+        assert_eq!(terminal.requests.len(), previous_requests.len() + 1);
+        for (id, prior) in &previous_requests {
+            let retained = &terminal.requests[id];
+            assert_eq!(retained.payload_digest, prior.payload_digest);
+            assert_eq!(retained.state, prior.state);
+        }
+        assert_eq!(
+            terminal.requests["owner-failed"].state,
+            RequestState::Unknown
+        );
+        let after_refusal = saved(&f, SESSION);
+        let mut expected_history = before_refusal.transcript.clone();
+        expected_history.push(orbit_engine::user_message(
+            "no new request after uncertainty",
+        ));
+        assert_eq!(after_refusal.transcript, expected_history);
+        assert_eq!(
+            after_refusal.turns,
+            before_refusal.turns.checked_add(1).unwrap()
+        );
+        assert_eq!(
+            (
+                after_refusal.input_tokens,
+                after_refusal.output_tokens,
+                after_refusal.cost_microcents
+            ),
+            (
+                before_refusal.input_tokens,
+                before_refusal.output_tokens,
+                before_refusal.cost_microcents
+            ),
+        );
+        assert_eq!(
+            after_refusal.accounting_watermark,
+            before_refusal.accounting_watermark
+        );
+        assert_eq!(after_refusal.model, before_refusal.model);
+        assert_eq!(after_refusal.provider, before_refusal.provider);
+        assert_eq!(after_refusal.gate, before_refusal.gate);
+        assert_eq!(after_refusal.effort, before_refusal.effort);
+        assert_eq!(
+            after_refusal.selection_origin,
+            before_refusal.selection_origin
+        );
+        assert_eq!(fs::read(&accounting_path).unwrap(), accounting_bytes);
+        assert_eq!(f.egress(), egress_before);
+        let session_path = f.home.join("sessions").join(format!("{SESSION}.json"));
+        let refused_session_bytes = fs::read(&session_path).unwrap();
+        let duplicate = owner
+            .send(OwnerAction::Prompt {
+                request_id: "owner-blocked-after-failure".into(),
+                text: "no new request after uncertainty".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            duplicate.request_id.as_deref(),
+            Some("owner-blocked-after-failure")
+        );
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.state, "unknown");
+        assert_eq!(fs::read(&session_path).unwrap(), refused_session_bytes);
+        assert_eq!(
+            journal(&f, SESSION).accounting_checkpoint().unwrap(),
+            checkpoint
+        );
+        owner.shutdown();
+        let requests_path = f
+            .home
+            .join("sessions/.requests")
+            .join(format!("{SESSION}.json"));
+        let requests_bytes = fs::read(&requests_path).unwrap();
+        assert_eq!(fs::read(&session_path).unwrap(), refused_session_bytes);
+        let (lease, restored) =
+            SessionLease::acquire_and_load(&f.home, SESSION, "pending-owner-restart-refusal")
+                .unwrap();
+        let config = OwnerConfig::new(
+            f.turn(&restored, PermissionScope::default()),
+            f.workspace.clone(),
+        );
+        let refusal = match OwnerRuntime::start(config, lease) {
+            Err(error) => error,
+            Ok(runtime) => {
+                runtime.shutdown().unwrap();
+                panic!("pending accounting unexpectedly admitted a restarted owner");
+            }
+        };
+        assert_pending_refusal(refusal);
+        let released =
+            SessionLease::acquire(&f.home, SESSION, "pending-owner-restart-released").unwrap();
+        drop(released);
+        assert_eq!(fs::read(&session_path).unwrap(), refused_session_bytes);
+        assert_eq!(fs::read(&accounting_path).unwrap(), accounting_bytes);
+        assert_eq!(fs::read(&requests_path).unwrap(), requests_bytes);
+        assert_eq!(
+            journal(&f, SESSION).accounting_checkpoint().unwrap(),
+            checkpoint
+        );
+        assert_eq!(f.egress(), egress_before);
+        wire.finish();
+        assert_wire(&wire, 2);
+    }
+
+    #[test]
+    fn actual_owner_session_switch_preserves_independent_anchors_and_returned_totals() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_owner_session_switch_preserves_independent_anchors_and_returned_totals",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let mut wire = Wire::new(vec![
+            Response::complete("first"),
+            Response::complete("other"),
+            Response::complete("back"),
+        ]);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (10, 20, 30));
+        seed(&f, &wire, "switch-target", &[], (100, 200, 300));
+        let mut owner = f.restart();
+        owner.prompt("switch-first", "first owned intent");
+        assert_known(&f, SESSION, 2, (10, 20, 30), 1);
+        owner
+            .send(OwnerAction::Resume {
+                session_id: "switch-target".into(),
+            })
+            .unwrap();
+        assert_eq!(owner.snapshot().session_id, "switch-target");
+        owner.prompt("switch-other", "other owned intent");
+        assert_known(&f, "switch-target", 2, (100, 200, 300), 1);
+        owner
+            .send(OwnerAction::Resume {
+                session_id: SESSION.into(),
+            })
+            .unwrap();
+        assert_eq!(owner.snapshot().session_id, SESSION);
+        owner.prompt("switch-back", "back to first owner");
+        assert_known(&f, SESSION, 4, (10, 20, 30), 2);
+        assert_known(&f, "switch-target", 2, (100, 200, 300), 1);
+        owner.shutdown();
+        wire.finish();
+        assert_wire(&wire, 3);
+    }
+
+    #[test]
+    fn actual_tui_session_switch_preserves_each_namespace_and_legacy_prefix() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_tui_session_switch_preserves_each_namespace_and_legacy_prefix",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let _cwd = Cwd::enter(&f.workspace);
+        let mut wire = Wire::new(vec![
+            Response::complete("first"),
+            Response::complete("other"),
+            Response::complete("back"),
+        ]);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (10, 20, 30));
+        seed(&f, &wire, "switch-target", &[], (100, 200, 300));
+        let tui = Tui::start(&f, SESSION);
+        tui.run(WorkerCommand::Prompt("first TUI owned intent".into()), None);
+        assert_known(&f, SESSION, 2, (10, 20, 30), 1);
+        tui.commands
+            .as_ref()
+            .unwrap()
+            .send(WorkerCommand::ResumeSession("switch-target".into()))
+            .unwrap();
+        tui.run(WorkerCommand::Prompt("other TUI intent".into()), None);
+        assert_known(&f, "switch-target", 2, (100, 200, 300), 1);
+        tui.commands
+            .as_ref()
+            .unwrap()
+            .send(WorkerCommand::ResumeSession(SESSION.into()))
+            .unwrap();
+        tui.run(WorkerCommand::Prompt("back TUI intent".into()), None);
+        assert_known(&f, SESSION, 4, (10, 20, 30), 2);
+        assert_known(&f, "switch-target", 2, (100, 200, 300), 1);
+        tui.close(&f, SESSION);
+        wire.finish();
+        assert_wire(&wire, 3);
+    }
+
+    #[test]
+    fn actual_tui_prompt_turn_counter_overflow_retains_intent_without_dispatch() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_tui_prompt_turn_counter_overflow_retains_intent_without_dispatch",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        const INTENT: &str = "exact plain prompt intent at exhausted turn counter";
+        let f = Fixture::new();
+        let _cwd = Cwd::enter(&f.workspace);
+        let mut wire = Wire::new(vec![Response::complete(
+            "a refused counter must not call this provider",
+        )]);
+        configure(&f, &wire, 64_000);
+        let prior = vec![
+            orbit_engine::user_message("previous durable question"),
+            orbit_engine::assistant_message("previous durable answer"),
+        ];
+        seed(&f, &wire, SESSION, &prior, (10, 20, 30));
+        let before = {
+            let lease = SessionLease::acquire(&f.home, SESSION, "overflow-seed").unwrap();
+            let mut original = lease.load().unwrap();
+            original.turns = u64::MAX;
+            lease.save(&original).unwrap();
+            let adapter = orbit_cli::session_accounting::prepare_root(
+                &lease,
+                &mut original,
+                orbit_cli::session_accounting::RootOrigin::RestoredOrLegacy,
+            )
+            .unwrap();
+            adapter.namespace().checkpoint().unwrap()
+        };
+        assert!(before.pending.is_none());
+        assert_eq!(before.revision.0, 0);
+        let mut tui = Tui::start(&f, SESSION);
+        let events = tui.run(WorkerCommand::Prompt(INTENT.into()), None);
+        // Wait for actual worker EOF before checking the complete terminal bus,
+        // so a late empty PlanReady or duplicate finish cannot escape detection.
+        tui.commands.take();
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(lease) = SessionLease::acquire(&f.home, SESSION, "overflow-closed") {
+                drop(lease);
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "overflow refusal retained the worker lease"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut finished = events
+            .iter()
+            .filter(|event| event["type"] == "finished")
+            .count();
+        let mut errors = events
+            .iter()
+            .filter(|event| event["type"] == "error")
+            .map(|event| event["message"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let mut plans = events
+            .iter()
+            .filter(|event| event["type"] == "plan_ready")
+            .count();
+        while let Some(message) = tui.bus.try_recv() {
+            match message {
+                Msg::ResponseFinished { .. } => finished += 1,
+                Msg::BackendError(message) => errors.push(message),
+                Msg::PlanReady(_) => plans += 1,
+                _ => {}
+            }
+        }
+        drop(tui);
+        wire.finish();
+        assert_wire(&wire, 0);
+        assert_eq!(wire.connections.load(Ordering::SeqCst), 0);
+        assert_eq!(finished, 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("session turn count overflows"));
+        assert_eq!(plans, 0);
+        let retained = saved(&f, SESSION);
+        assert_eq!(retained.turns, u64::MAX);
+        assert_eq!(
+            (
+                retained.input_tokens,
+                retained.output_tokens,
+                retained.cost_microcents
+            ),
+            (10, 20, 30)
+        );
+        assert_eq!(
+            journal(&f, SESSION).accounting_checkpoint().unwrap(),
+            before
+        );
+        let mut expected = prior;
+        expected.push(orbit_engine::user_message(INTENT));
+        assert_eq!(retained.transcript, expected);
+        assert_eq!(
+            retained
+                .transcript
+                .iter()
+                .filter(|message| message.content == INTENT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn actual_tui_plan_prompt_turn_counter_overflow_retains_intent_without_dispatch() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_tui_plan_prompt_turn_counter_overflow_retains_intent_without_dispatch",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        const INTENT: &str = "exact plain plan_prompt intent at exhausted turn counter";
+        let f = Fixture::new();
+        let _cwd = Cwd::enter(&f.workspace);
+        let mut wire = Wire::new(vec![Response::complete(
+            "a refused counter must not call this provider",
+        )]);
+        configure(&f, &wire, 64_000);
+        let prior = vec![
+            orbit_engine::user_message("previous durable question"),
+            orbit_engine::assistant_message("previous durable answer"),
+        ];
+        seed(&f, &wire, SESSION, &prior, (10, 20, 30));
+        let before = {
+            let lease = SessionLease::acquire(&f.home, SESSION, "overflow-seed").unwrap();
+            let mut original = lease.load().unwrap();
+            original.turns = u64::MAX;
+            lease.save(&original).unwrap();
+            let adapter = orbit_cli::session_accounting::prepare_root(
+                &lease,
+                &mut original,
+                orbit_cli::session_accounting::RootOrigin::RestoredOrLegacy,
+            )
+            .unwrap();
+            adapter.namespace().checkpoint().unwrap()
+        };
+        assert!(before.pending.is_none());
+        assert_eq!(before.revision.0, 0);
+        let mut tui = Tui::start(&f, SESSION);
+        let events = tui.run(WorkerCommand::PlanPrompt(INTENT.into()), None);
+        // Wait for actual worker EOF before checking the complete terminal bus,
+        // so a late empty PlanReady or duplicate finish cannot escape detection.
+        tui.commands.take();
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(lease) = SessionLease::acquire(&f.home, SESSION, "overflow-closed") {
+                drop(lease);
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "overflow refusal retained the worker lease"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut finished = events
+            .iter()
+            .filter(|event| event["type"] == "finished")
+            .count();
+        let mut errors = events
+            .iter()
+            .filter(|event| event["type"] == "error")
+            .map(|event| event["message"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let mut plans = events
+            .iter()
+            .filter(|event| event["type"] == "plan_ready")
+            .count();
+        while let Some(message) = tui.bus.try_recv() {
+            match message {
+                Msg::ResponseFinished { .. } => finished += 1,
+                Msg::BackendError(message) => errors.push(message),
+                Msg::PlanReady(_) => plans += 1,
+                _ => {}
+            }
+        }
+        drop(tui);
+        wire.finish();
+        assert_wire(&wire, 0);
+        assert_eq!(wire.connections.load(Ordering::SeqCst), 0);
+        assert_eq!(finished, 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("session turn count overflows"));
+        assert_eq!(plans, 0);
+        let retained = saved(&f, SESSION);
+        assert_eq!(retained.turns, u64::MAX);
+        assert_eq!(
+            (
+                retained.input_tokens,
+                retained.output_tokens,
+                retained.cost_microcents
+            ),
+            (10, 20, 30)
+        );
+        assert_eq!(
+            journal(&f, SESSION).accounting_checkpoint().unwrap(),
+            before
+        );
+        let mut expected = prior;
+        expected.push(orbit_engine::user_message(INTENT));
+        assert_eq!(retained.transcript, expected);
+        assert_eq!(
+            retained
+                .transcript
+                .iter()
+                .filter(|message| message.content == INTENT)
+                .count(),
+            1
+        );
+    }
+    struct CliResult {
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    }
+    impl CliResult {
+        fn json(&self) -> Value {
+            let values: Vec<Value> = self
+                .stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .filter(|value: &Value| value["schema"] == "orbit.cli/v1")
+                .collect();
+            assert_eq!(
+                values.len(),
+                1,
+                "one invocation summary is required: {}",
+                self.stderr
+            );
+            values.into_iter().next().unwrap()
+        }
+    }
+    struct CliProcess(std::process::Child);
+    impl Drop for CliProcess {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+    fn accounting_cli(
+        f: &Fixture,
+        args: &[&str],
+        input: &str,
+        interrupt: Option<(&Wire, usize)>,
+    ) -> CliResult {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        const CAPTURE_LIMIT: u64 = 2 * 1024 * 1024;
+        let id = ulid::Ulid::new().to_string();
+        let stdin = f.root.join(format!("{id}.stdin"));
+        let stdout = f.root.join(format!("{id}.stdout"));
+        let stderr = f.root.join(format!("{id}.stderr"));
+        for (path, bytes) in [
+            (&stdin, input.as_bytes()),
+            (&stdout, b"".as_slice()),
+            (&stderr, b"".as_slice()),
+        ] {
+            write_private(path, bytes);
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orbit"));
+        command
+            .args(args)
+            .arg("--home")
+            .arg(&f.home)
+            .arg("--bare")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
+            .current_dir(&f.workspace)
+            .stdin(fs::File::open(&stdin).unwrap())
+            .stdout(fs::File::options().write(true).open(&stdout).unwrap())
+            .stderr(fs::File::options().write(true).open(&stderr).unwrap())
+            .process_group(0);
+        for name in [
+            "HOME",
+            "TMPDIR",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            command.env(name, std::env::var_os(name).unwrap());
+        }
+        let mut child = CliProcess(command.spawn().unwrap());
+        if let Some((wire, count)) = interrupt {
+            let end = Instant::now() + Duration::from_secs(5);
+            while wire.requests.lock().unwrap().len() < count {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "CLI exited before the intended actual POST"
+                );
+                assert!(
+                    Instant::now() < end,
+                    "no actual POST at the interrupt boundary"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(
+                Command::new("/bin/kill")
+                    .args(["-KILL", &child.0.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let end = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            for path in [&stdout, &stderr] {
+                assert!(
+                    fs::metadata(path).unwrap().len() <= CAPTURE_LIMIT,
+                    "CLI capture bound"
+                );
+            }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < end, "bounded CLI process did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let lengths = [
+            fs::metadata(&stdout).unwrap().len(),
+            fs::metadata(&stderr).unwrap().len(),
+        ];
+        assert!(
+            lengths.iter().all(|length| *length <= CAPTURE_LIMIT),
+            "final CLI capture bound"
+        );
+        assert!(
+            lengths[0].checked_add(lengths[1]).unwrap() <= 2 * CAPTURE_LIMIT,
+            "final aggregate CLI capture bound"
+        );
+        let read_capture = |path: &std::path::Path| {
+            let mut bytes = Vec::new();
+            fs::File::open(path)
+                .unwrap()
+                .take(CAPTURE_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(
+                bytes.len() as u64 <= CAPTURE_LIMIT,
+                "bounded final CLI capture read overflow"
+            );
+            String::from_utf8(bytes).expect("CLI capture must be UTF-8")
+        };
+        let stdout = read_capture(&stdout);
+        let stderr = read_capture(&stderr);
+        assert!(
+            stdout.len().checked_add(stderr.len()).unwrap() as u64 <= 2 * CAPTURE_LIMIT,
+            "read aggregate CLI capture bound"
+        );
+        CliResult {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+    fn headless_home(f: &Fixture, wire: &Wire) -> PathBuf {
+        let plan =
+            orbit_cli::setup::plan_setup(&f.home, &orbit_cli::setup::SetupRequest::default())
+                .unwrap();
+        orbit_cli::setup::apply_setup(&plan).unwrap();
+        configure(f, wire, 64_000);
+        let schema = f.root.join("answer.schema.json");
+        write_private(&schema,json!({"type":"object","required":["answer"],"properties":{"answer":{"type":"integer"}}}).to_string());
+        schema
+    }
+    fn headless_sessions(f: &Fixture) -> Vec<SessionFile> {
+        sessions::list_sessions(&f.home).unwrap()
+    }
+    fn headless_checkpoint(f: &Fixture, id: &str) -> orbit_engine::AccountingCheckpoint {
+        let _lease = SessionLease::acquire(&f.home, id, "headless-inspection").unwrap();
+        journal(f, id).accounting_checkpoint().unwrap()
+    }
+    fn assert_headless_known(
+        f: &Fixture,
+        id: &str,
+        revision: u64,
+        input: u64,
+        output: u64,
+        known_cost: u64,
+    ) {
+        let checkpoint = headless_checkpoint(f, id);
+        assert_eq!(checkpoint.revision.0, revision);
+        assert_eq!(checkpoint.owner_session_id, id);
+        assert_eq!(checkpoint.child_id, None);
+        assert!(checkpoint.pending.is_none());
+        assert_eq!(checkpoint.totals.knownness, AccountingKnownness::Known);
+        assert_eq!(checkpoint.totals.ordinary.cost_microcents, Some(known_cost));
+        assert_eq!(
+            (
+                checkpoint.totals.housekeeping.input_tokens,
+                checkpoint.totals.housekeeping.output_tokens,
+                checkpoint.totals.housekeeping.cost_microcents
+            ),
+            (0, 0, Some(0))
+        );
+        assert_eq!(
+            (
+                checkpoint.totals.ordinary.input_tokens,
+                checkpoint.totals.ordinary.output_tokens
+            ),
+            (input, output)
+        );
+        assert_eq!(
+            checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .ordinary_microcents,
+            known_cost
+        );
+        let saved = saved(f, id);
+        assert_eq!(
+            (
+                saved.input_tokens,
+                saved.output_tokens,
+                saved.cost_microcents
+            ),
+            (input, output, known_cost)
+        );
+        assert_eq!(
+            saved.accounting_watermark.as_ref().unwrap().revision,
+            revision
+        );
+        assert_eq!(
+            saved
+                .accounting_watermark
+                .as_ref()
+                .unwrap()
+                .owner_session_id,
+            id
+        );
+        let events = orbit_ledger::verify_ledger(&f.home.join("ledger"))
+            .unwrap()
+            .0;
+        let ids: Vec<_> = events
+            .into_iter()
+            .filter_map(|record| match record.record.event {
+                orbit_ledger::LedgerEvent::EgressIntent(event) if event.session_id == id => {
+                    Some(event.decision_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len() as u64, revision / 2);
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len()
+        );
+        if let Some(last) = checkpoint.last_settlement {
+            assert_eq!(last.reference.request_id, *ids.last().unwrap());
+        }
+    }
+    fn assert_schema_wire(wire: &Wire, count: usize) {
+        assert_wire(wire, count);
+        let requests = wire.requests.lock().unwrap();
+        for request in requests.iter() {
+            assert_eq!(request.body["model"], RAW_A);
+        }
+        if count > 1 {
+            let first = &requests[0].body["messages"];
+            let repair = &requests[1].body;
+            assert!(repair.get("tools").is_none());
+            assert!(repair.get("tool_choice").is_none());
+            let first = first.as_array().unwrap();
+            let second = repair["messages"].as_array().unwrap();
+            assert_eq!(&second[..first.len()], first.as_slice());
+            assert!(
+                second.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Your previous reply did not match the required JSON schema:")
+            );
+            assert!(
+                second.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Reply with ONLY valid JSON")
+            );
+        }
+    }
+
+    #[test]
+    fn actual_headless_schema_repair_saves_both_distinct_bills_and_observed_history() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_schema_repair_saves_both_distinct_bills_and_observed_history",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let first = r#"{"answer":"wrong type"}"#;
+        let answer = r#"{"answer":42}"#;
+        let mut wire = Wire::new(vec![Response::complete(first), Response::complete(answer)]);
+        let schema = headless_home(&f, &wire);
+        let result = accounting_cli(
+            &f,
+            &[
+                "-p",
+                "produce the synthetic answer",
+                "--json-schema",
+                schema.to_str().unwrap(),
+                "--output-format",
+                "json",
+            ],
+            "",
+            None,
+        );
+        wire.finish();
+        assert!(result.status.success(), "{}", result.stderr);
+        let summary = result.json();
+        assert_eq!(summary["status"], "ok");
+        assert_eq!(summary["final_text"], answer);
+        assert_eq!(
+            summary["usage"],
+            json!({"input_tokens":22,"output_tokens":14})
+        );
+        assert_eq!(summary["cost_microcents"], 10);
+        assert_eq!(summary["rounds"], 2);
+        assert_eq!(summary["full_cost_status"], "known");
+        let sessions = headless_sessions(&f);
+        assert_eq!(sessions.len(), 1);
+        let saved = &sessions[0];
+        assert_eq!(saved.turns, 1);
+        assert_headless_known(&f, &saved.session_id, 4, 22, 14, 10);
+        assert_eq!(
+            headless_checkpoint(&f, &saved.session_id).baseline,
+            AccountingBaseline::FreshKnownZero
+        );
+        assert_eq!(saved.transcript.len(), 4);
+        assert_eq!(saved.transcript[0].content, "produce the synthetic answer");
+        assert_eq!(saved.transcript[1].content, first);
+        assert_eq!(saved.transcript[3].content, answer);
+        assert_schema_wire(&wire, 2);
+        assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn actual_headless_final_invalid_repair_keeps_both_paid_replies_and_does_not_repair_twice() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_final_invalid_repair_keeps_both_paid_replies_and_does_not_repair_twice",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let first = r#"{"answer":"first invalid"}"#;
+        let last = r#"{"answer":"still invalid"}"#;
+        let mut wire = Wire::new(vec![
+            Response::complete(first),
+            Response::complete(last),
+            Response::complete("must not repair a second time"),
+        ]);
+        let schema = headless_home(&f, &wire);
+        let result = accounting_cli(
+            &f,
+            &[
+                "-p",
+                "invalid repair fixture",
+                "--json-schema",
+                schema.to_str().unwrap(),
+                "--output-format",
+                "json",
+            ],
+            "",
+            None,
+        );
+        wire.finish();
+        assert_eq!(result.status.code(), Some(1));
+        let summary = result.json();
+        assert_eq!(summary["status"], "error");
+        assert_eq!(summary["cost_microcents"], 10);
+        assert_eq!(
+            summary["usage"],
+            json!({"input_tokens":22,"output_tokens":14})
+        );
+        assert!(
+            result
+                .stderr
+                .contains("schema repair did not produce valid output")
+        );
+        let sessions = headless_sessions(&f);
+        assert_eq!(sessions.len(), 1);
+        let saved = &sessions[0];
+        assert_headless_known(&f, &saved.session_id, 4, 22, 14, 10);
+        assert_eq!(saved.transcript.len(), 4);
+        assert_eq!(saved.transcript[1].content, first);
+        assert_eq!(saved.transcript[3].content, last);
+        assert_schema_wire(&wire, 2);
+        assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn actual_headless_failed_repair_retains_the_first_bill_and_pending_resume_refusal() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_failed_repair_retains_the_first_bill_and_pending_resume_refusal",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let malformed = Response {
+            body: "data: {invalid-json}\n\n".into(),
+            pause: false,
+        };
+        let mut wire = Wire::new(vec![
+            Response::complete(r#"{"answer":"invalid"}"#),
+            malformed,
+            Response::complete("must not replay"),
+        ]);
+        let schema = headless_home(&f, &wire);
+        let result = accounting_cli(
+            &f,
+            &[
+                "-p",
+                "repair failure current intent",
+                "--json-schema",
+                schema.to_str().unwrap(),
+                "--output-format",
+                "json",
+            ],
+            "",
+            None,
+        );
+        assert_eq!(result.status.code(), Some(1));
+        let summary = result.json();
+        assert_eq!(summary["status"], "error");
+        assert_eq!(summary["cost_microcents"], 5);
+        assert_eq!(
+            summary["usage"],
+            json!({"input_tokens":11,"output_tokens":7})
+        );
+        assert_eq!(summary["full_cost_status"], "uncertain");
+        let saved = headless_sessions(&f).remove(0);
+        let checkpoint = headless_checkpoint(&f, &saved.session_id);
+        assert_eq!(checkpoint.revision.0, 4);
+        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+        assert_eq!(
+            checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .ordinary_microcents,
+            5
+        );
+        assert_eq!(
+            (
+                saved.input_tokens,
+                saved.output_tokens,
+                saved.cost_microcents
+            ),
+            (11, 7, 5)
+        );
+        assert_eq!(
+            saved
+                .transcript
+                .iter()
+                .filter(|message| message.content == "repair failure current intent")
+                .count(),
+            1
+        );
+        let before = fs::read(
+            f.home
+                .join("sessions")
+                .join(format!("{}.json", saved.session_id)),
+        )
+        .unwrap();
+        let refused = accounting_cli(
+            &f,
+            &[
+                "-p",
+                "do not replay uncertain repair",
+                "--resume",
+                &saved.session_id,
+                "--output-format",
+                "json",
+            ],
+            "",
+            None,
+        );
+        assert_eq!(refused.status.code(), Some(1));
+        assert_eq!(headless_checkpoint(&f, &saved.session_id), checkpoint);
+        assert_eq!(
+            fs::read(
+                f.home
+                    .join("sessions")
+                    .join(format!("{}.json", saved.session_id))
+            )
+            .unwrap(),
+            before
+        );
+        wire.finish();
+        assert_schema_wire(&wire, 2);
+        assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn actual_headless_repair_cannot_execute_a_provider_returned_write_tool() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_repair_cannot_execute_a_provider_returned_write_tool",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let destination = f.workspace.join("forbidden-repair-write.txt");
+        let event = json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"repair-write","type":"function","function":{"name":"Write","arguments":json!({"file_path":destination,"content":"forbidden effect"}).to_string()}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":7}});
+        let tool = Response {
+            body: format!("data: {event}\n\ndata: [DONE]\n\n"),
+            pause: false,
+        };
+        let mut wire = Wire::new(vec![
+            Response::complete(r#"{"answer":"invalid"}"#),
+            tool,
+            Response::complete("must not make a third POST"),
+        ]);
+        let schema = headless_home(&f, &wire);
+        let result = accounting_cli(
+            &f,
+            &[
+                "-p",
+                "repair with no tool effects",
+                "--json-schema",
+                schema.to_str().unwrap(),
+                "--output-format",
+                "json",
+                "--auto-tools",
+            ],
+            "",
+            None,
+        );
+        wire.finish();
+        assert!(!result.status.success());
+        let summary = result.json();
+        assert_ne!(summary["status"], "ok");
+        assert_eq!(summary["cost_microcents"], 10);
+        assert_eq!(
+            summary["usage"],
+            json!({"input_tokens":22,"output_tokens":14})
+        );
+        let saved = headless_sessions(&f).remove(0);
+        assert_headless_known(&f, &saved.session_id, 4, 22, 14, 10);
+        assert!(!destination.exists());
+        assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+        assert_schema_wire(&wire, 2);
+    }
+
+    #[test]
+    fn actual_headless_schema_repair_reuses_the_fixed_invocation_spend_remainder() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_schema_repair_reuses_the_fixed_invocation_spend_remainder",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        for (limit, posts, cost, exit) in [("7", 1, 5, 1), ("10", 2, 10, 0)] {
+            let f = Fixture::new();
+            let mut wire = Wire::new(vec![
+                Response::complete(r#"{"answer":"invalid"}"#),
+                Response::complete(r#"{"answer":42}"#),
+            ]);
+            let schema = headless_home(&f, &wire);
+            let result = accounting_cli(
+                &f,
+                &[
+                    "-p",
+                    "bounded repair allowance",
+                    "--json-schema",
+                    schema.to_str().unwrap(),
+                    "--output-format",
+                    "json",
+                    "--max-cost",
+                    limit,
+                ],
+                "",
+                None,
+            );
+            wire.finish();
+            assert_eq!(result.status.code(), Some(exit));
+            let summary = result.json();
+            assert_eq!(summary["cost_microcents"], cost);
+            let saved = headless_sessions(&f).remove(0);
+            assert_headless_known(
+                &f,
+                &saved.session_id,
+                posts * 2,
+                posts * 11,
+                posts * 7,
+                cost,
+            );
+            assert_wire(&wire, posts as usize);
+            if posts == 2 {
+                assert_schema_wire(&wire, 2);
+            } else {
+                assert_eq!(summary["status"], "error");
+            }
+            assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn actual_headless_failed_first_call_never_enters_schema_repair() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_failed_first_call_never_enters_schema_repair",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        for known_length in [false, true] {
+            let f = Fixture::new();
+            let first = if known_length {
+                Response::text(
+                    "{\"answer\":",
+                    "length",
+                    Some(json!({"prompt_tokens":11,"completion_tokens":7})),
+                )
+            } else {
+                Response {
+                    body: "data: {invalid-json}\n\n".into(),
+                    pause: false,
+                }
+            };
+            let mut wire = Wire::new(vec![
+                first,
+                Response::complete("must not enter schema repair"),
+            ]);
+            let schema = headless_home(&f, &wire);
+            let result = accounting_cli(
+                &f,
+                &[
+                    "-p",
+                    "failed first schema call",
+                    "--json-schema",
+                    schema.to_str().unwrap(),
+                    "--output-format",
+                    "json",
+                ],
+                "",
+                None,
+            );
+            wire.finish();
+            assert_eq!(result.status.code(), Some(1));
+            let summary = result.json();
+            assert_ne!(summary["status"], "ok");
+            assert!(
+                !result
+                    .stderr
+                    .contains("schema validation failed, repairing once")
+            );
+            let saved = headless_sessions(&f).remove(0);
+            let checkpoint = headless_checkpoint(&f, &saved.session_id);
+            assert_eq!(checkpoint.revision.0, 2);
+            if known_length {
+                assert_headless_known(&f, &saved.session_id, 2, 11, 7, 5);
+            } else {
+                assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+                assert_eq!(saved.cost_microcents, 0);
+            }
+            assert_eq!(
+                saved
+                    .transcript
+                    .iter()
+                    .filter(|message| message.content == "failed first schema call")
+                    .count(),
+                1
+            );
+            assert_wire(&wire, 1);
+            assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn actual_headless_sigkill_first_or_repair_keeps_pending_truth_and_never_replays() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_sigkill_first_or_repair_keeps_pending_truth_and_never_replays",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        use std::os::unix::process::ExitStatusExt;
+        for during_repair in [false, true] {
+            let f = Fixture::new();
+            let prefix = json!({"choices":[{"index":0,"delta":{"content":"incomplete private response"},"finish_reason":null}]});
+            let paused = Response {
+                body: format!("data: {prefix}\n\n"),
+                pause: true,
+            };
+            let mut replies = Vec::new();
+            if during_repair {
+                replies.push(Response::complete(r#"{"answer":"invalid"}"#));
+            }
+            replies.push(paused);
+            replies.push(Response::complete("must not replay"));
+            let mut wire = Wire::new(replies);
+            let schema = headless_home(&f, &wire);
+            let posts = if during_repair { 2 } else { 1 };
+            let result = accounting_cli(
+                &f,
+                &[
+                    "-p",
+                    "interrupted schema invocation",
+                    "--json-schema",
+                    schema.to_str().unwrap(),
+                    "--output-format",
+                    "json",
+                ],
+                "",
+                Some((&wire, posts)),
+            );
+            // SIGKILL deliberately bypasses graceful cancellation. The current
+            // request must retain begun-only truth, with any prior bill unchanged.
+            assert_eq!(result.status.signal(), Some(9));
+            let saved = headless_sessions(&f).remove(0);
+            let checkpoint = headless_checkpoint(&f, &saved.session_id);
+            assert_eq!(checkpoint.revision.0, if during_repair { 3 } else { 1 });
+            assert!(checkpoint.pending.is_some());
+            assert_eq!(
+                checkpoint
+                    .known_priced_subtotals
+                    .unwrap()
+                    .ordinary_microcents,
+                if during_repair { 5 } else { 0 }
+            );
+            let reference = checkpoint.pending.as_ref().unwrap().reference.clone();
+            let refused = accounting_cli(
+                &f,
+                &[
+                    "-p",
+                    "must not replay interrupted request",
+                    "--resume",
+                    &saved.session_id,
+                    "--output-format",
+                    "json",
+                ],
+                "",
+                None,
+            );
+            assert_eq!(refused.status.code(), Some(1));
+            assert_eq!(headless_checkpoint(&f, &saved.session_id), checkpoint);
+            assert_eq!(
+                headless_checkpoint(&f, &saved.session_id)
+                    .pending
+                    .unwrap()
+                    .reference,
+                reference
+            );
+            wire.finish();
+            assert_wire(&wire, posts);
+            assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn actual_headless_resume_and_fork_preserve_authoritative_owner_watermarks() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_resume_and_fork_preserve_authoritative_owner_watermarks",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let mut wire = Wire::new(vec![
+            Response::complete("first"),
+            Response::complete("resumed"),
+            Response::complete("forked"),
+        ]);
+        headless_home(&f, &wire);
+        let first = accounting_cli(
+            &f,
+            &["-p", "fresh authority", "--output-format", "json"],
+            "",
+            None,
+        );
+        assert!(first.status.success());
+        let id = headless_sessions(&f).remove(0).session_id;
+        assert_headless_known(&f, &id, 2, 11, 7, 5);
+        let second = accounting_cli(
+            &f,
+            &[
+                "-p",
+                "resumed authority",
+                "--resume",
+                &id,
+                "--output-format",
+                "json",
+            ],
+            "",
+            None,
+        );
+        assert!(second.status.success());
+        assert_eq!(second.json()["cost_microcents"], 5);
+        assert_headless_known(&f, &id, 4, 22, 14, 10);
+        let source = saved(&f, &id);
+        let source_bytes = fs::read(f.home.join("sessions").join(format!("{id}.json"))).unwrap();
+        let source_checkpoint = headless_checkpoint(&f, &id);
+        let fork = accounting_cli(
+            &f,
+            &[
+                "-p",
+                "forked authority",
+                "--resume",
+                &id,
+                "--fork-session",
+                "--output-format",
+                "json",
+            ],
+            "",
+            None,
+        );
+        assert!(fork.status.success(), "{}", fork.stderr);
+        assert_eq!(fork.json()["cost_microcents"], 5);
+        let all = headless_sessions(&f);
+        assert_eq!(all.len(), 2);
+        let fork = all.iter().find(|saved| saved.session_id != id).unwrap();
+        assert_eq!(
+            (fork.input_tokens, fork.output_tokens, fork.cost_microcents),
+            (33, 21, 15)
+        );
+        assert!(fork.transcript.starts_with(&source.transcript));
+        let checkpoint = headless_checkpoint(&f, &fork.session_id);
+        assert_eq!(checkpoint.baseline, AccountingBaseline::UnknownLegacy);
+        assert_eq!(checkpoint.revision.0, 2);
+        assert_eq!(
+            checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .ordinary_microcents,
+            5
+        );
+        assert_eq!(
+            fork.accounting_watermark.as_ref().unwrap().owner_session_id,
+            fork.session_id
+        );
+        assert_eq!(fork.accounting_watermark.as_ref().unwrap().revision, 2);
+        assert_eq!(headless_checkpoint(&f, &id), source_checkpoint);
+        assert_eq!(
+            fs::read(f.home.join("sessions").join(format!("{id}.json"))).unwrap(),
+            source_bytes
+        );
+        wire.finish();
+        assert_wire(&wire, 3);
+    }
+
+    #[test]
+    fn actual_plain_repl_controls_and_failed_resume_preserve_each_accounting_anchor() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_plain_repl_controls_and_failed_resume_preserve_each_accounting_anchor",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let mut wire = Wire::new(vec![
+            Response::complete("first session"),
+            Response::complete("other session"),
+        ]);
+        headless_home(&f, &wire);
+        assert!(
+            accounting_cli(
+                &f,
+                &["-p", "first control session", "--output-format", "json"],
+                "",
+                None
+            )
+            .status
+            .success()
+        );
+        let first = headless_sessions(&f).remove(0).session_id;
+        assert!(
+            accounting_cli(
+                &f,
+                &["-p", "second control session", "--output-format", "json"],
+                "",
+                None
+            )
+            .status
+            .success()
+        );
+        let second = headless_sessions(&f)
+            .into_iter()
+            .find(|saved| saved.session_id != first)
+            .unwrap()
+            .session_id;
+        let first_checkpoint = headless_checkpoint(&f, &first);
+        let second_checkpoint = headless_checkpoint(&f, &second);
+        let first_anchor = saved(&f, &first).accounting_watermark;
+        let second_anchor = saved(&f, &second).accounting_watermark;
+        let input = format!(
+            "/usage\n/model provider_a/{RAW_A}\n/effort default\n/route auto\n/resume {second}\n/usage\n/resume nonexistent-accounting-session\n/route\nexit\n"
+        );
+        let result = accounting_cli(&f, &["chat", "--no-tui", "--resume", &first], &input, None);
+        assert!(result.status.success(), "{}", result.stderr);
+        let summary = result.json();
+        assert_eq!(summary["command"], "chat");
+        assert_eq!(summary["session"], second);
+        assert_eq!(
+            summary["usage"],
+            json!({"input_tokens":11,"output_tokens":7})
+        );
+        assert_eq!(summary["cost_microcents"], 5);
+        assert!(
+            result
+                .stderr
+                .contains("cannot resume nonexistent-accounting-session")
+        );
+        assert_eq!(headless_checkpoint(&f, &first), first_checkpoint);
+        assert_eq!(headless_checkpoint(&f, &second), second_checkpoint);
+        assert_eq!(saved(&f, &first).accounting_watermark, first_anchor);
+        assert_eq!(saved(&f, &second).accounting_watermark, second_anchor);
+        assert_eq!(
+            saved(&f, &first).effort,
+            Some(orbit_adapter::types::EffortSetting::Default)
+        );
+        assert_eq!(
+            saved(&f, &first).selection_origin,
+            Some(SelectionOrigin::Default)
+        );
+        wire.finish();
+        assert_wire(&wire, 2);
+    }
+
+    #[test]
+    fn actual_headless_resumed_schema_call_gets_one_new_allowance_shared_with_its_repair() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_headless_resumed_schema_call_gets_one_new_allowance_shared_with_its_repair",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let mut wire = Wire::new(vec![
+            Response::complete("old paid work"),
+            Response::complete(r#"{"answer":"invalid"}"#),
+            Response::complete("must not reset the allowance"),
+        ]);
+        let schema = headless_home(&f, &wire);
+        let first = accounting_cli(
+            &f,
+            &["-p", "older invocation", "--output-format", "json"],
+            "",
+            None,
+        );
+        assert!(first.status.success());
+        let id = headless_sessions(&f).remove(0).session_id;
+        assert_headless_known(&f, &id, 2, 11, 7, 5);
+        let resumed = accounting_cli(
+            &f,
+            &[
+                "-p",
+                "new bounded invocation",
+                "--resume",
+                &id,
+                "--json-schema",
+                schema.to_str().unwrap(),
+                "--output-format",
+                "json",
+                "--max-cost",
+                "7",
+            ],
+            "",
+            None,
+        );
+        wire.finish();
+        assert_eq!(resumed.status.code(), Some(1));
+        let summary = resumed.json();
+        assert_eq!(summary["status"], "error");
+        // Existing spend5 does not consume this invocation's7, so its first5 bill
+        // is admitted; that same invocation then has2, which cannot buy repair5.
+        assert_eq!(summary["cost_microcents"], 5);
+        assert_eq!(
+            summary["usage"],
+            json!({"input_tokens":11,"output_tokens":7})
+        );
+        assert_headless_known(&f, &id, 4, 22, 14, 10);
+        assert_wire(&wire, 2);
+        let durable = saved(&f, &id);
+        assert_eq!(durable.turns, 2);
+        assert_eq!(
+            durable
+                .transcript
+                .iter()
+                .filter(|message| message.content == "new bounded invocation")
+                .count(),
+            1
+        );
+        assert!(fs::read_dir(&f.workspace).unwrap().next().is_none());
     }
 }

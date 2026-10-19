@@ -6,6 +6,7 @@
 //! transcript back into the conversation so a session continues across
 //! invocations.
 
+pub use crate::session_accounting::{FullCostStatus, SessionAccountingWatermark};
 use orbit_adapter::types::{ChatMessage, EffortSetting};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,8 @@ pub struct SessionFile {
     pub output_tokens: u64,
     #[serde(default)]
     pub cost_microcents: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting_watermark: Option<SessionAccountingWatermark>,
     pub updated_at: String,
 }
 
@@ -62,6 +65,7 @@ impl SessionFile {
             input_tokens,
             output_tokens,
             cost_microcents,
+            accounting_watermark: None,
             updated_at: crate::timestamp_now(),
         }
     }
@@ -147,6 +151,8 @@ pub fn sessions_dir(home: &Path) -> PathBuf {
 /// Refusal reasons for a live session ownership claim.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionLeaseError {
+    #[error("session {session_id} already has a saved snapshot")]
+    AlreadyExists { session_id: String },
     #[error("session {session_id} is already owned by another live frontend")]
     Busy { session_id: String },
     #[error("invalid session identity: {0}")]
@@ -168,6 +174,133 @@ pub struct SessionLease {
     kind: String,
     #[cfg(unix)]
     storage: leased_storage::Storage,
+}
+
+/// Small saved-history facts; selection and transcript remain only in raw bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionRecoveryFacts {
+    pub(crate) turns: u64,
+    pub(crate) watermark_revision: Option<u64>,
+    pub(crate) watermark_full_cost_status: Option<FullCostStatus>,
+}
+
+/// Inert exact snapshot tied to the lifetime of its original ownership claim.
+pub(crate) struct SessionRecoveryCapture<'lease> {
+    lease: &'lease SessionLease,
+    #[cfg(unix)]
+    snapshot: leased_storage::RecoveryFile,
+    facts: SessionRecoveryFacts,
+}
+
+/// Optional existing root JSONL, never decoded or opened through Transcript.
+pub(crate) struct LegacyRecoveryCapture<'lease> {
+    lease: &'lease SessionLease,
+    #[cfg(unix)]
+    source: leased_storage::RecoveryLegacy,
+}
+impl LegacyRecoveryCapture<'_> {
+    pub(crate) fn bytes(&self) -> Option<&[u8]> {
+        #[cfg(unix)]
+        {
+            self.source.bytes()
+        }
+        #[cfg(not(unix))]
+        {
+            unreachable!("recovery requires Unix ownership")
+        }
+    }
+    pub(crate) fn sha256(&self) -> Option<&str> {
+        #[cfg(unix)]
+        {
+            self.source.sha256()
+        }
+        #[cfg(not(unix))]
+        {
+            unreachable!("recovery requires Unix ownership")
+        }
+    }
+    pub(crate) fn verify_unchanged(&self, lease: &SessionLease) -> Result<(), SessionLeaseError> {
+        if !std::ptr::eq(self.lease, lease) {
+            return Err(SessionLeaseError::UnsafePath(
+                "recovery requires the original held lease".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            lease
+                .storage
+                .verify_recovery_legacy(lease.session_id(), &self.source)
+                .map_err(recovery_capture_error)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SessionLeaseError::Io(
+                "recovery requires Unix ownership".into(),
+            ))
+        }
+    }
+}
+
+impl SessionRecoveryCapture<'_> {
+    pub(crate) fn owner_session_id(&self) -> &str {
+        self.lease.session_id()
+    }
+    pub(crate) fn facts(&self) -> &SessionRecoveryFacts {
+        &self.facts
+    }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        #[cfg(unix)]
+        {
+            self.snapshot.bytes()
+        }
+        #[cfg(not(unix))]
+        {
+            unreachable!("recovery requires Unix ownership")
+        }
+    }
+    pub(crate) fn sha256(&self) -> &str {
+        #[cfg(unix)]
+        {
+            self.snapshot.sha256()
+        }
+        #[cfg(not(unix))]
+        {
+            unreachable!("recovery requires Unix ownership")
+        }
+    }
+    pub(crate) fn verify_unchanged(&self, lease: &SessionLease) -> Result<(), SessionLeaseError> {
+        if !std::ptr::eq(self.lease, lease) {
+            return Err(SessionLeaseError::UnsafePath(
+                "recovery requires the original held lease".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            lease
+                .storage
+                .verify_recovery_file(lease.session_id(), &self.snapshot)
+                .map_err(recovery_capture_error)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SessionLeaseError::Io(
+                "recovery requires Unix ownership".into(),
+            ))
+        }
+    }
+}
+
+// Capture diagnostics never contain source bytes, JSON parser details or paths.
+fn recovery_capture_error(error: SessionLeaseError) -> SessionLeaseError {
+    match error {
+        SessionLeaseError::UnsafePath(_) | SessionLeaseError::InvalidIdentity(_) => {
+            SessionLeaseError::UnsafePath("recovery source identity is unsafe or changed".into())
+        }
+        SessionLeaseError::InvalidData(_) => SessionLeaseError::InvalidData(
+            "recovery snapshot is invalid, changed or exceeds its bound".into(),
+        ),
+        _ => SessionLeaseError::Io("recovery source is unavailable".into()),
+    }
 }
 
 impl std::fmt::Debug for SessionLease {
@@ -251,6 +384,85 @@ impl SessionLease {
         }
     }
 
+    /// Check held ownership without reading a snapshot or changing storage.
+    pub(crate) fn verify_for_recovery(&self) -> Result<(), SessionLeaseError> {
+        #[cfg(unix)]
+        {
+            self.storage
+                .check_recovery_lease(&self.session_id)
+                .map_err(recovery_capture_error)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SessionLeaseError::Io(
+                "recovery requires Unix ownership".into(),
+            ))
+        }
+    }
+
+    /// Preserve one existing private snapshot exactly; no chmod/save/reserialize.
+    pub(crate) fn capture_for_recovery(
+        &self,
+    ) -> Result<SessionRecoveryCapture<'_>, SessionLeaseError> {
+        #[cfg(unix)]
+        {
+            let snapshot = self
+                .storage
+                .capture_recovery_file(&self.session_id)
+                .map_err(recovery_capture_error)?;
+            let saved: SessionFile = serde_json::from_slice(snapshot.bytes())
+                .map_err(|_| SessionLeaseError::InvalidData("invalid recovery snapshot".into()))?;
+            self.validate_session(&saved)
+                .map_err(recovery_capture_error)?;
+            let facts = SessionRecoveryFacts {
+                turns: saved.turns,
+                watermark_revision: saved
+                    .accounting_watermark
+                    .as_ref()
+                    .map(|value| value.revision),
+                watermark_full_cost_status: saved
+                    .accounting_watermark
+                    .as_ref()
+                    .map(|value| value.full_cost_status),
+            };
+            drop(saved);
+            self.verify_for_recovery()?;
+            Ok(SessionRecoveryCapture {
+                lease: self,
+                snapshot,
+                facts,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SessionLeaseError::Io(
+                "recovery requires Unix ownership".into(),
+            ))
+        }
+    }
+
+    pub(crate) fn capture_legacy_for_recovery(
+        &self,
+    ) -> Result<LegacyRecoveryCapture<'_>, SessionLeaseError> {
+        #[cfg(unix)]
+        {
+            let source = self
+                .storage
+                .capture_recovery_legacy(&self.session_id)
+                .map_err(recovery_capture_error)?;
+            Ok(LegacyRecoveryCapture {
+                lease: self,
+                source,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SessionLeaseError::Io(
+                "recovery requires Unix ownership".into(),
+            ))
+        }
+    }
+
     pub fn load(&self) -> Result<SessionFile, SessionLeaseError> {
         #[cfg(unix)]
         {
@@ -259,6 +471,29 @@ impl SessionLease {
                 .map_err(|e| SessionLeaseError::InvalidData(e.to_string()))?;
             self.validate_session(&session)?;
             Ok(session)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SessionLeaseError::Io(
+                "live session ownership requires Unix".into(),
+            ))
+        }
+    }
+
+    /// Only a positively absent target below the still-verified held directory
+    /// is None. Present unsafe or invalid snapshots remain errors.
+    pub fn load_optional(&self) -> Result<Option<SessionFile>, SessionLeaseError> {
+        #[cfg(unix)]
+        {
+            self.storage
+                .load_optional(&self.session_id)?
+                .map(|raw| {
+                    let session: SessionFile = serde_json::from_slice(&raw)
+                        .map_err(|e| SessionLeaseError::InvalidData(e.to_string()))?;
+                    self.validate_session(&session)?;
+                    Ok(session)
+                })
+                .transpose()
         }
         #[cfg(not(unix))]
         {
@@ -284,6 +519,23 @@ impl SessionLease {
         }
     }
 
+    /// Publish a new snapshot without replacing any existing target.
+    pub fn save_if_absent(&self, session: &SessionFile) -> Result<(), SessionLeaseError> {
+        self.validate_session(session)?;
+        #[cfg(unix)]
+        {
+            let raw = serde_json::to_vec_pretty(session)
+                .map_err(|e| SessionLeaseError::InvalidData(e.to_string()))?;
+            self.storage.save_if_absent(&self.session_id, &raw)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SessionLeaseError::Io(
+                "live session ownership requires Unix".into(),
+            ))
+        }
+    }
+
     fn validate_session(&self, session: &SessionFile) -> Result<(), SessionLeaseError> {
         if session.session_id != self.session_id {
             return Err(SessionLeaseError::InvalidData(
@@ -295,6 +547,10 @@ impl SessionLease {
                 "unsupported session schema".into(),
             ));
         }
+        if let Some(watermark) = &session.accounting_watermark {
+            crate::session_accounting::validate_root_watermark(watermark, &self.session_id)
+                .map_err(|message| SessionLeaseError::InvalidData(message.into()))?;
+        }
         Ok(())
     }
 }
@@ -303,6 +559,7 @@ impl SessionLease {
 #[allow(unsafe_code)] // FD-relative Unix storage operations are isolated here.
 mod leased_storage {
     use super::SessionLeaseError;
+    use sha2::{Digest, Sha256};
     use std::ffi::{CString, OsStr};
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -312,6 +569,106 @@ mod leased_storage {
     use std::path::{Component, Path, PathBuf};
 
     const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_RECOVERY_LEGACY_BYTES: u64 = 32 * 1024 * 1024;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecoveryStamp {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        links: u64,
+        bytes: u64,
+        modified: (i64, i64),
+        changed: (i64, i64),
+    }
+    impl RecoveryStamp {
+        fn of(file: &File) -> Result<Self, SessionLeaseError> {
+            let value = file.metadata().map_err(io)?;
+            Ok(Self {
+                device: value.dev(),
+                inode: value.ino(),
+                mode: value.mode(),
+                uid: value.uid(),
+                gid: value.gid(),
+                links: value.nlink(),
+                bytes: value.len(),
+                modified: (value.mtime(), value.mtime_nsec()),
+                changed: (value.ctime(), value.ctime_nsec()),
+            })
+        }
+    }
+
+    pub(super) struct RecoveryFile {
+        file: File,
+        stamp: RecoveryStamp,
+        bytes: Vec<u8>,
+        sha256: String,
+    }
+    impl RecoveryFile {
+        pub(super) fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+        pub(super) fn sha256(&self) -> &str {
+            &self.sha256
+        }
+    }
+
+    pub(super) struct RecoveryLegacy {
+        directory: Option<File>,
+        directory_stamp: Option<RecoveryStamp>,
+        file: Option<RecoveryFile>,
+    }
+    impl RecoveryLegacy {
+        pub(super) fn bytes(&self) -> Option<&[u8]> {
+            self.file.as_ref().map(RecoveryFile::bytes)
+        }
+        pub(super) fn sha256(&self) -> Option<&str> {
+            self.file.as_ref().map(RecoveryFile::sha256)
+        }
+    }
+
+    fn verify_recovery_contents(
+        file: &mut File,
+        saved: &RecoveryFile,
+        maximum: u64,
+    ) -> Result<(), SessionLeaseError> {
+        if RecoveryStamp::of(&saved.file)? != saved.stamp || RecoveryStamp::of(file)? != saved.stamp
+        {
+            return Err(SessionLeaseError::UnsafePath(
+                "recovery source identity changed".into(),
+            ));
+        }
+        let mut digest = Sha256::new();
+        let mut total = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(io)?;
+            if count == 0 {
+                break;
+            }
+            total = total
+                .checked_add(count as u64)
+                .ok_or_else(|| SessionLeaseError::InvalidData("recovery source bound".into()))?;
+            if total > maximum || total > saved.stamp.bytes {
+                return Err(SessionLeaseError::InvalidData(
+                    "recovery source changed".into(),
+                ));
+            }
+            digest.update(&buffer[..count]);
+        }
+        if total != saved.stamp.bytes
+            || hex::encode(digest.finalize()) != saved.sha256
+            || RecoveryStamp::of(file)? != saved.stamp
+            || RecoveryStamp::of(&saved.file)? != saved.stamp
+        {
+            return Err(SessionLeaseError::InvalidData(
+                "recovery source changed".into(),
+            ));
+        }
+        Ok(())
+    }
 
     pub(super) struct Storage {
         path: PathBuf,
@@ -467,6 +824,253 @@ mod leased_storage {
             &self.path
         }
 
+        pub(super) fn check_recovery_lease(&self, id: &str) -> Result<(), SessionLeaseError> {
+            if self.owner_pid != std::process::id() {
+                return Err(SessionLeaseError::UnsafePath(
+                    "recovery lease belongs to another process".into(),
+                ));
+            }
+            self.verify_location(id)
+        }
+
+        fn recovery_snapshot(&self, id: &str) -> Result<File, SessionLeaseError> {
+            self.check_recovery_lease(id)?;
+            let file = open_at(
+                &self.sessions,
+                OsStr::new(&format!("{id}.json")),
+                libc::O_RDONLY,
+            )
+            .map_err(path_error)?;
+            private_file(&file, MAX_SESSION_BYTES)?;
+            Ok(file)
+        }
+
+        pub(super) fn capture_recovery_file(
+            &self,
+            id: &str,
+        ) -> Result<RecoveryFile, SessionLeaseError> {
+            let file = self.recovery_snapshot(id)?;
+            let stamp = RecoveryStamp::of(&file)?;
+            let mut bytes = Vec::new();
+            (&file)
+                .take(MAX_SESSION_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(io)?;
+            if bytes.len() as u64 != stamp.bytes || RecoveryStamp::of(&file)? != stamp {
+                return Err(SessionLeaseError::InvalidData(
+                    "recovery snapshot changed or exceeds its bound".into(),
+                ));
+            }
+            let path = self.recovery_snapshot(id)?;
+            if RecoveryStamp::of(&path)? != stamp {
+                return Err(SessionLeaseError::UnsafePath(
+                    "recovery snapshot path changed".into(),
+                ));
+            }
+            self.check_recovery_lease(id)?;
+            let sha256 = hex::encode(Sha256::digest(&bytes));
+            Ok(RecoveryFile {
+                file,
+                stamp,
+                bytes,
+                sha256,
+            })
+        }
+
+        pub(super) fn verify_recovery_file(
+            &self,
+            id: &str,
+            saved: &RecoveryFile,
+        ) -> Result<(), SessionLeaseError> {
+            let mut file = self.recovery_snapshot(id)?;
+            verify_recovery_contents(&mut file, saved, MAX_SESSION_BYTES)?;
+            if RecoveryStamp::of(&self.recovery_snapshot(id)?)? != saved.stamp {
+                return Err(SessionLeaseError::InvalidData(
+                    "recovery snapshot changed".into(),
+                ));
+            }
+            self.check_recovery_lease(id)
+        }
+
+        fn recovery_projects(&self, id: &str) -> Result<Option<File>, SessionLeaseError> {
+            self.check_recovery_lease(id)?;
+            let file = match open_at(
+                &self.home,
+                OsStr::new("projects"),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.check_recovery_lease(id)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(path_error(error)),
+            };
+            let metadata = file.metadata().map_err(io)?;
+            if !metadata.is_dir()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(SessionLeaseError::UnsafePath(
+                    "legacy source directory is not private".into(),
+                ));
+            }
+            Ok(Some(file))
+        }
+
+        pub(super) fn capture_recovery_legacy(
+            &self,
+            id: &str,
+        ) -> Result<RecoveryLegacy, SessionLeaseError> {
+            let Some(directory) = self.recovery_projects(id)? else {
+                let result = RecoveryLegacy {
+                    directory: None,
+                    directory_stamp: None,
+                    file: None,
+                };
+                self.verify_recovery_legacy(id, &result)?;
+                return Ok(result);
+            };
+            let name = format!("{id}.jsonl");
+            let file = match open_at(&directory, OsStr::new(&name), libc::O_RDONLY) {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(path_error(error)),
+            };
+            let file = file
+                .map(|file| {
+                    private_file(&file, MAX_RECOVERY_LEGACY_BYTES)?;
+                    let stamp = RecoveryStamp::of(&file)?;
+                    let mut bytes = Vec::new();
+                    (&file)
+                        .take(MAX_RECOVERY_LEGACY_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(io)?;
+                    if bytes.len() as u64 != stamp.bytes || RecoveryStamp::of(&file)? != stamp {
+                        return Err(SessionLeaseError::InvalidData(
+                            "legacy source changed or exceeds its bound".into(),
+                        ));
+                    }
+                    let path = open_at(&directory, OsStr::new(&name), libc::O_RDONLY)
+                        .map_err(path_error)?;
+                    private_file(&path, MAX_RECOVERY_LEGACY_BYTES)?;
+                    if RecoveryStamp::of(&path)? != stamp {
+                        return Err(SessionLeaseError::UnsafePath(
+                            "legacy source path changed".into(),
+                        ));
+                    }
+                    let sha256 = hex::encode(Sha256::digest(&bytes));
+                    Ok(RecoveryFile {
+                        file,
+                        stamp,
+                        bytes,
+                        sha256,
+                    })
+                })
+                .transpose()?;
+            let directory_stamp = Some(RecoveryStamp::of(&directory)?);
+            let result = RecoveryLegacy {
+                directory: Some(directory),
+                directory_stamp,
+                file,
+            };
+            // Initial capture already read the present raw file once. Identity
+            // and positive absence are rechecked without a second body read.
+            self.check_recovery_legacy_identity(id, &result)?;
+            Ok(result)
+        }
+
+        fn check_recovery_legacy_identity(
+            &self,
+            id: &str,
+            saved: &RecoveryLegacy,
+        ) -> Result<Option<File>, SessionLeaseError> {
+            let current = self.recovery_projects(id)?;
+            let directory = match (&saved.directory, current) {
+                (None, None) => return Ok(None),
+                (Some(old), Some(current)) if same_inode(old, &current)? => current,
+                _ => {
+                    return Err(SessionLeaseError::UnsafePath(
+                        "legacy source directory changed".into(),
+                    ));
+                }
+            };
+            let recorded = saved.directory_stamp.as_ref().ok_or_else(|| {
+                SessionLeaseError::UnsafePath("legacy source directory identity missing".into())
+            })?;
+            for observed in [
+                RecoveryStamp::of(&directory)?,
+                RecoveryStamp::of(saved.directory.as_ref().ok_or_else(|| {
+                    SessionLeaseError::UnsafePath("legacy source directory identity missing".into())
+                })?)?,
+            ] {
+                if (
+                    observed.device,
+                    observed.inode,
+                    observed.mode,
+                    observed.uid,
+                    observed.gid,
+                    observed.links,
+                ) != (
+                    recorded.device,
+                    recorded.inode,
+                    recorded.mode,
+                    recorded.uid,
+                    recorded.gid,
+                    recorded.links,
+                ) {
+                    return Err(SessionLeaseError::UnsafePath(
+                        "legacy source directory identity changed".into(),
+                    ));
+                }
+            }
+            let current = match open_at(
+                &directory,
+                OsStr::new(&format!("{id}.jsonl")),
+                libc::O_RDONLY,
+            ) {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(path_error(error)),
+            };
+            match (&saved.file, current) {
+                (None, None) => {
+                    self.check_recovery_lease(id)?;
+                    Ok(None)
+                }
+                (Some(old), Some(current)) => {
+                    private_file(&current, MAX_RECOVERY_LEGACY_BYTES)?;
+                    if RecoveryStamp::of(&current)? != old.stamp
+                        || RecoveryStamp::of(&old.file)? != old.stamp
+                    {
+                        return Err(SessionLeaseError::UnsafePath(
+                            "legacy source identity changed".into(),
+                        ));
+                    }
+                    self.check_recovery_lease(id)?;
+                    Ok(Some(current))
+                }
+                _ => Err(SessionLeaseError::InvalidData(
+                    "legacy source presence changed".into(),
+                )),
+            }
+        }
+
+        pub(super) fn verify_recovery_legacy(
+            &self,
+            id: &str,
+            saved: &RecoveryLegacy,
+        ) -> Result<(), SessionLeaseError> {
+            if let Some(mut file) = self.check_recovery_legacy_identity(id, saved)? {
+                let original = saved.file.as_ref().ok_or_else(|| {
+                    SessionLeaseError::InvalidData("legacy source presence changed".into())
+                })?;
+                verify_recovery_contents(&mut file, original, MAX_RECOVERY_LEGACY_BYTES)?;
+                self.check_recovery_legacy_identity(id, saved)?;
+            }
+            self.check_recovery_lease(id)
+        }
+
         pub(super) fn acquire(
             path: &Path,
             id: &str,
@@ -553,13 +1157,24 @@ mod leased_storage {
         }
 
         pub(super) fn load(&self, id: &str) -> Result<Vec<u8>, SessionLeaseError> {
+            self.load_optional(id)?
+                .ok_or_else(|| io(std::io::Error::from_raw_os_error(libc::ENOENT)))
+        }
+
+        pub(super) fn load_optional(&self, id: &str) -> Result<Option<Vec<u8>>, SessionLeaseError> {
             self.verify_location(id)?;
-            let file = open_at(
+            let file = match open_at(
                 &self.sessions,
                 OsStr::new(&format!("{id}.json")),
                 libc::O_RDONLY,
-            )
-            .map_err(path_error)?;
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.verify_location(id)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(path_error(error)),
+            };
             private_file(&file, MAX_SESSION_BYTES)?;
             let mut raw = Vec::new();
             file.take(MAX_SESSION_BYTES + 1)
@@ -570,10 +1185,24 @@ mod leased_storage {
                     "session exceeds storage byte bound".into(),
                 ));
             }
-            Ok(raw)
+            self.verify_location(id)?;
+            Ok(Some(raw))
         }
 
         pub(super) fn save(&self, id: &str, raw: &[u8]) -> Result<(), SessionLeaseError> {
+            self.publish_snapshot(id, raw, false)
+        }
+
+        pub(super) fn save_if_absent(&self, id: &str, raw: &[u8]) -> Result<(), SessionLeaseError> {
+            self.publish_snapshot(id, raw, true)
+        }
+
+        fn publish_snapshot(
+            &self,
+            id: &str,
+            raw: &[u8],
+            create_only: bool,
+        ) -> Result<(), SessionLeaseError> {
             if raw.len() as u64 > MAX_SESSION_BYTES {
                 return Err(SessionLeaseError::InvalidData(
                     "session exceeds storage byte bound".into(),
@@ -582,7 +1211,14 @@ mod leased_storage {
             self.verify_location(id)?;
             let target = format!("{id}.json");
             match open_at(&self.sessions, OsStr::new(&target), libc::O_RDONLY) {
-                Ok(file) => private_file(&file, MAX_SESSION_BYTES)?,
+                Ok(file) => {
+                    private_file(&file, MAX_SESSION_BYTES)?;
+                    if create_only {
+                        return Err(SessionLeaseError::AlreadyExists {
+                            session_id: id.into(),
+                        });
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(path_error(error)),
             }
@@ -593,6 +1229,7 @@ mod leased_storage {
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             )
             .map_err(path_error)?;
+            let mut published = false;
             let result = (|| {
                 file.write_all(raw).map_err(io)?;
                 file.sync_all().map_err(io)?;
@@ -605,17 +1242,49 @@ mod leased_storage {
                 }
                 let temporary = name(OsStr::new(&temporary))?;
                 let target = name(OsStr::new(&target))?;
-                // SAFETY: both names are bounded local names under the same held directory FD.
-                if unsafe {
-                    libc::renameat(
-                        self.sessions.as_raw_fd(),
-                        temporary.as_ptr(),
-                        self.sessions.as_raw_fd(),
-                        target.as_ptr(),
-                    )
-                } < 0
-                {
-                    return Err(io(std::io::Error::last_os_error()));
+                if create_only {
+                    // SAFETY: both terminated names use the same held directory.
+                    // linkat never replaces an existing destination.
+                    if unsafe {
+                        libc::linkat(
+                            self.sessions.as_raw_fd(),
+                            temporary.as_ptr(),
+                            self.sessions.as_raw_fd(),
+                            target.as_ptr(),
+                            0,
+                        )
+                    } < 0
+                    {
+                        let error = std::io::Error::last_os_error();
+                        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            SessionLeaseError::AlreadyExists {
+                                session_id: id.into(),
+                            }
+                        } else {
+                            path_error(error)
+                        });
+                    }
+                    published = true;
+                    // SAFETY: remove only this operation's still-owned temporary link.
+                    if unsafe { libc::unlinkat(self.sessions.as_raw_fd(), temporary.as_ptr(), 0) }
+                        < 0
+                    {
+                        return Err(io(std::io::Error::last_os_error()));
+                    }
+                } else {
+                    // SAFETY: both bounded local names use the held directory FD.
+                    if unsafe {
+                        libc::renameat(
+                            self.sessions.as_raw_fd(),
+                            temporary.as_ptr(),
+                            self.sessions.as_raw_fd(),
+                            target.as_ptr(),
+                        )
+                    } < 0
+                    {
+                        return Err(io(std::io::Error::last_os_error()));
+                    }
+                    published = true;
                 }
                 #[cfg(test)]
                 if self.fail_directory_sync.replace(false) {
@@ -625,7 +1294,8 @@ mod leased_storage {
                 }
                 self.sessions
                     .sync_all()
-                    .map_err(|e| SessionLeaseError::PublicationUncertain(e.to_string()))
+                    .map_err(|e| SessionLeaseError::PublicationUncertain(e.to_string()))?;
+                self.verify_location(id)
             })();
             if result.is_err() {
                 let temporary = name(OsStr::new(&temporary))?;
@@ -634,7 +1304,13 @@ mod leased_storage {
                     libc::unlinkat(self.sessions.as_raw_fd(), temporary.as_ptr(), 0);
                 }
             }
-            result
+            result.map_err(|error| {
+                if published && !matches!(error, SessionLeaseError::PublicationUncertain(_)) {
+                    SessionLeaseError::PublicationUncertain(error.to_string())
+                } else {
+                    error
+                }
+            })
         }
 
         #[cfg(test)]
@@ -769,6 +1445,7 @@ pub fn fork_session(home: &Path, session_id: &str) -> Result<SessionFile, String
     let mut src = load_session(home, session_id)?;
     let new_id = orbit_gateway::new_session_id();
     src.session_id = new_id.clone();
+    src.accounting_watermark = None;
     src.updated_at = crate::timestamp_now();
     // The fork's JSONL transcript (if one exists) is copied too, so
     // `--resume <fork>` and the TUI's event-sourced view agree with the
@@ -1027,5 +1704,367 @@ mod tests {
             .join(format!("{}.jsonl", fork.session_id));
         assert!(copied.exists(), "the fork's JSONL transcript is copied");
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod create_only_durability_tests {
+    use super::{SessionFile, SessionLease, SessionLeaseError};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    struct Home(std::path::PathBuf);
+    impl Home {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("orbit-create-only-fault-{}", ulid::Ulid::new()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn sample(model: &str) -> SessionFile {
+        SessionFile::from_chat(
+            "new-session",
+            model,
+            "http://127.0.0.1:1",
+            "fixture",
+            &[],
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn staged_create_only_failure_keeps_absence_and_removes_the_owned_stage() {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "new-session", "fixture").unwrap();
+        lease.storage.inject_prepublication_failure();
+        assert!(matches!(
+            lease.save_if_absent(&sample("staged")),
+            Err(SessionLeaseError::Io(_))
+        ));
+        assert!(lease.load_optional().unwrap().is_none());
+        let entries: Vec<_> = std::fs::read_dir(home.0.join("sessions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [std::ffi::OsString::from(".leases")]);
+        lease
+            .save_if_absent(&sample("retry-before-publication"))
+            .unwrap();
+        assert_eq!(lease.load().unwrap().model, "retry-before-publication");
+        assert_eq!(
+            std::fs::metadata(home.0.join("sessions/new-session.json"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+    }
+
+    #[test]
+    fn published_create_only_sync_failure_is_uncertain_and_cannot_be_overwritten_on_retry() {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "new-session", "fixture").unwrap();
+        lease.storage.inject_directory_sync_failure();
+        assert!(matches!(
+            lease.save_if_absent(&sample("published")),
+            Err(SessionLeaseError::PublicationUncertain(_))
+        ));
+        let path = home.0.join("sessions/new-session.json");
+        let visible = std::fs::read(&path).unwrap();
+        assert_eq!(lease.load().unwrap().model, "published");
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 1);
+        assert!(matches!(
+            lease.save_if_absent(&sample("replacement")),
+            Err(SessionLeaseError::AlreadyExists { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), visible);
+        assert!(
+            !std::fs::read_dir(home.0.join("sessions"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+        drop(lease);
+        let lease = SessionLease::acquire(&home.0, "new-session", "fixture").unwrap();
+        assert_eq!(lease.load().unwrap().model, "published");
+        assert!(matches!(
+            lease.save_if_absent(&sample("after-restart")),
+            Err(SessionLeaseError::AlreadyExists { .. })
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), visible);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod recovery_capture_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+
+    struct Home(PathBuf);
+    impl Home {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("orbit-recovery-snapshot-{}", ulid::Ulid::new()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+        fn snapshot(&self) -> PathBuf {
+            self.0.join("sessions/source.json")
+        }
+        fn legacy(&self) -> PathBuf {
+            self.0.join("projects/source.jsonl")
+        }
+    }
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn write(path: &Path, raw: &[u8]) {
+        std::fs::write(path, raw).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fn stamp(path: &Path) -> (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64) {
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (
+            m.dev(),
+            m.ino(),
+            m.mode(),
+            m.uid(),
+            m.gid(),
+            m.nlink(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    }
+    fn saved() -> SessionFile {
+        let mut value = SessionFile::from_chat(
+            "source",
+            "inert-model",
+            "http://127.0.0.1:1/private",
+            "inert-provider",
+            &[orbit_engine::user_message("saved original")],
+            3,
+            0,
+            0,
+            0,
+        );
+        value.accounting_watermark = Some(SessionAccountingWatermark {
+            owner_session_id: "source".into(),
+            child_id: None,
+            revision: 0,
+            known_input_tokens: 0,
+            known_output_tokens: 0,
+            known_ordinary_microcents: 0,
+            known_housekeeping_microcents: 0,
+            full_cost_status: FullCostStatus::Known,
+        });
+        value
+    }
+
+    #[test]
+    fn snapshot_capture_keeps_exact_noncanonical_raw_bytes_and_small_watermark_facts() {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "source", "recovery-fixture").unwrap();
+        lease.save(&saved()).unwrap();
+        let raw = format!(" \n{}\n ", serde_json::to_string(&saved()).unwrap()).into_bytes();
+        write(&home.snapshot(), &raw);
+        let before = stamp(&home.snapshot());
+        let lock_before = std::fs::read(home.0.join("sessions/.leases/source.lock")).unwrap();
+        let capture = lease.capture_for_recovery().unwrap();
+        assert_eq!(capture.owner_session_id(), "source");
+        assert_eq!(capture.bytes(), raw);
+        assert_eq!(capture.sha256(), hex::encode(Sha256::digest(&raw)));
+        assert_eq!(
+            capture.facts(),
+            &SessionRecoveryFacts {
+                turns: 3,
+                watermark_revision: Some(0),
+                watermark_full_cost_status: Some(FullCostStatus::Known)
+            }
+        );
+        capture.verify_unchanged(&lease).unwrap();
+        assert_eq!(stamp(&home.snapshot()), before);
+        assert_eq!(std::fs::read(home.snapshot()).unwrap(), raw);
+        assert_eq!(
+            std::fs::read(home.0.join("sessions/.leases/source.lock")).unwrap(),
+            lock_before
+        );
+    }
+
+    #[test]
+    fn snapshot_capture_missing_invalid_public_linked_and_oversize_sources_never_change_them() {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "source", "recovery-fixture").unwrap();
+        assert!(lease.capture_for_recovery().is_err());
+        assert!(!home.snapshot().exists());
+        write(
+            &home.snapshot(),
+            b"{\"schema\":\"wrong\",\"private\":\"INVALID_RECOVERY_BODY\"}",
+        );
+        let before = stamp(&home.snapshot());
+        let error = lease.capture_for_recovery().err().unwrap().to_string();
+        assert!(error.len() <= 512 && !error.contains("INVALID_RECOVERY_BODY"));
+        assert_eq!(stamp(&home.snapshot()), before);
+        lease.save(&saved()).unwrap();
+        std::fs::set_permissions(home.snapshot(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = stamp(&home.snapshot());
+        assert!(lease.capture_for_recovery().is_err());
+        assert_eq!(stamp(&home.snapshot()), before);
+        std::fs::set_permissions(home.snapshot(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(home.snapshot(), home.0.join("linked-snapshot")).unwrap();
+        assert!(lease.capture_for_recovery().is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(home.snapshot()).unwrap().nlink(),
+            2
+        );
+        std::fs::remove_file(home.0.join("linked-snapshot")).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(home.snapshot())
+            .unwrap();
+        file.set_len(64 * 1024 * 1024 + 1).unwrap();
+        let before = stamp(&home.snapshot());
+        assert!(lease.capture_for_recovery().is_err());
+        assert_eq!(stamp(&home.snapshot()), before);
+    }
+
+    #[test]
+    fn snapshot_verification_rejects_replacement_in_place_change_and_another_lease() {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "source", "recovery-fixture").unwrap();
+        lease.save(&saved()).unwrap();
+        let capture = lease.capture_for_recovery().unwrap();
+        let other = SessionLease::acquire(&home.0, "other", "recovery-fixture").unwrap();
+        assert!(capture.verify_unchanged(&other).is_err());
+        let bytes = capture.bytes().to_vec();
+        std::fs::rename(home.snapshot(), home.0.join("original-snapshot")).unwrap();
+        write(&home.snapshot(), &bytes);
+        assert!(capture.verify_unchanged(&lease).is_err());
+        assert_eq!(
+            std::fs::read(home.0.join("original-snapshot")).unwrap(),
+            bytes
+        );
+        let changed = lease.capture_for_recovery().unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.snapshot())
+            .unwrap()
+            .write_all(b" ")
+            .unwrap();
+        assert!(changed.verify_unchanged(&lease).is_err());
+    }
+
+    #[test]
+    fn legacy_capture_preserves_malformed_raw_bytes_without_decoding_or_mutation() {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "source", "recovery-fixture").unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(home.0.join("projects"))
+            .unwrap();
+        let raw = b"not json\n\xff\x00inert legacy original\n";
+        write(&home.legacy(), raw);
+        let before = stamp(&home.legacy());
+        let capture = lease.capture_legacy_for_recovery().unwrap();
+        assert_eq!(capture.bytes(), Some(raw.as_slice()));
+        assert_eq!(
+            capture.sha256(),
+            Some(hex::encode(Sha256::digest(raw)).as_str())
+        );
+        capture.verify_unchanged(&lease).unwrap();
+        assert_eq!(stamp(&home.legacy()), before);
+        assert_eq!(std::fs::read(home.legacy()).unwrap(), raw);
+    }
+
+    #[test]
+    fn legacy_positive_absence_is_noncreating_and_presence_change_is_not_absence() {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "source", "recovery-fixture").unwrap();
+        let absent = lease.capture_legacy_for_recovery().unwrap();
+        assert!(absent.bytes().is_none() && absent.sha256().is_none());
+        absent.verify_unchanged(&lease).unwrap();
+        assert!(!home.0.join("projects").exists());
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(home.0.join("projects"))
+            .unwrap();
+        assert!(absent.verify_unchanged(&lease).is_err());
+        let empty = lease.capture_legacy_for_recovery().unwrap();
+        assert!(empty.bytes().is_none());
+        empty.verify_unchanged(&lease).unwrap();
+        write(&home.legacy(), b"newly present");
+        assert!(empty.verify_unchanged(&lease).is_err());
+    }
+
+    #[test]
+    fn legacy_unsafe_sources_and_replaced_directory_are_refused_without_cleanup() {
+        let home = Home::new();
+        let lease = SessionLease::acquire(&home.0, "source", "recovery-fixture").unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(home.0.join("projects"))
+            .unwrap();
+        let target = home.0.join("absent-target");
+        symlink(&target, home.legacy()).unwrap();
+        let before = stamp(&home.legacy());
+        assert!(lease.capture_legacy_for_recovery().is_err());
+        assert_eq!(stamp(&home.legacy()), before);
+        assert!(!target.exists());
+        std::fs::remove_file(home.legacy()).unwrap();
+        write(&home.legacy(), b"old raw");
+        std::fs::set_permissions(home.legacy(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(lease.capture_legacy_for_recovery().is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(home.legacy()).unwrap().mode() & 0o777,
+            0o644
+        );
+        std::fs::set_permissions(home.legacy(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(home.legacy(), home.0.join("legacy-link")).unwrap();
+        assert!(lease.capture_legacy_for_recovery().is_err());
+        std::fs::remove_file(home.0.join("legacy-link")).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(home.legacy())
+            .unwrap();
+        file.set_len(32 * 1024 * 1024 + 1).unwrap();
+        assert!(lease.capture_legacy_for_recovery().is_err());
+        file.set_len(0).unwrap();
+        drop(file);
+        write(&home.legacy(), b"old raw");
+        let capture = lease.capture_legacy_for_recovery().unwrap();
+        std::fs::rename(home.0.join("projects"), home.0.join("original-projects")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(home.0.join("projects"))
+            .unwrap();
+        write(&home.legacy(), b"old raw");
+        assert!(capture.verify_unchanged(&lease).is_err());
+        assert_eq!(
+            std::fs::read(home.0.join("original-projects/source.jsonl")).unwrap(),
+            b"old raw"
+        );
     }
 }

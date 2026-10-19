@@ -135,6 +135,141 @@ impl Home {
     }
 }
 
+fn configure_final_rejection_retry(home: &Home, mock: &Mock) {
+    use orbit_engine::retry::{
+        FinalRejectionContract, FinalRejectionPolicy, FinalRejectionSelector, RetryPolicyBinding,
+        adapter_identity_digest,
+    };
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    assert_eq!(home.dir.path(), home.path);
+    let directory = std::fs::File::open(&home.path).expect("open fixture home");
+    let directory_metadata = directory.metadata().expect("held fixture home metadata");
+    let directory_identity = (directory_metadata.dev(), directory_metadata.ino());
+    let check_home = || {
+        let held = directory.metadata().expect("held fixture home metadata");
+        let named = std::fs::symlink_metadata(&home.path).expect("fixture home metadata");
+        assert!(held.is_dir() && named.is_dir() && !named.file_type().is_symlink());
+        assert_eq!(held.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(named.permissions().mode() & 0o7777, 0o700);
+        assert_eq!((held.dev(), held.ino()), directory_identity);
+        assert_eq!((named.dev(), named.ino()), directory_identity);
+    };
+    check_home();
+    let providers_path = home.path.join("providers.toml");
+    let providers = std::fs::read(&providers_path).expect("fixture provider bytes");
+    let base_url = format!("http://127.0.0.1:{}", mock.port);
+    let selected = orbit_cli::checked_model_turn(
+        &home.path,
+        "mock-model",
+        Some("mock"),
+        Some(&base_url),
+        false,
+    )
+    .expect("resolve actual fixture provider");
+    assert_eq!(selected.provider_id, "mock");
+    assert_eq!(selected.model, "mock-model");
+    assert_eq!(selected.gate, base_url);
+    assert_eq!(
+        selected.kind,
+        orbit_engine::dispatch::ProviderKind::OpenAiCompatible
+    );
+    assert!(selected.credential_env.is_none());
+
+    let identity = orbit_provider_http::openai::openai_identity();
+    let selector = FinalRejectionSelector::new(
+        selected.provider_id.clone(),
+        selected.model.clone(),
+        selected.gate.clone(),
+        adapter_identity_digest(&identity),
+    )
+    .expect("checked fixture selector");
+    let canonical_endpoint = selector
+        .canonical_endpoint()
+        .expect("selected method endpoint");
+    assert!(!canonical_endpoint.is_empty());
+    let contract = FinalRejectionContract::new("ordinary", "final_rejection", "unknown", true)
+        .expect("ordinary final-rejection contract");
+    let policy = FinalRejectionPolicy::new(
+        "scenario-final-rejection".into(),
+        selector,
+        vec![500, 503],
+        contract,
+        2,
+    )
+    .expect("bounded fixture policy");
+    // This checks the actual selected method URL against the canonical selector.
+    // A declaration and its readback do not establish a live refusal or ACK.
+    let expected = RetryPolicyBinding::for_config(&selected, policy.clone())
+        .expect("bind policy to actual fixture selection");
+    let quote = |value: &str| {
+        assert!(value.is_ascii() && !value.bytes().any(|byte| byte.is_ascii_control()));
+        serde_json::to_string(value).expect("quote printable ASCII fixture field")
+    };
+    let selector = policy.selector();
+    let contract = policy.contract();
+    let document = format!(
+        "version = 1\n\n[[final_rejection]]\n\
+         id = {}\nprovider = {}\nmodel = {}\nendpoint = {}\n\
+         adapter_identity_sha256 = {}\nstatuses = {}\nscope = {}\n\
+         generation = {}\nbilling = {}\nallow_uncapped_retry = {}\nmax_attempts = {}\n",
+        quote(policy.id()),
+        quote(selector.provider()),
+        quote(selector.model()),
+        quote(selector.endpoint()),
+        quote(selector.adapter_identity_sha256()),
+        serde_json::to_string(policy.statuses()).expect("fixture status array"),
+        quote(contract.scope()),
+        quote(contract.generation()),
+        quote(contract.billing()),
+        contract.allow_uncapped_retry(),
+        policy.max_attempts(),
+    );
+    check_home();
+    let policy_path = home.path.join("provider-policies.toml");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&policy_path)
+        .expect("create exclusive fixture policy");
+    file.write_all(document.as_bytes())
+        .expect("write fixture policy");
+    file.sync_all().expect("sync fixture policy");
+    let file_metadata = file.metadata().expect("held policy metadata");
+    let file_identity = (file_metadata.dev(), file_metadata.ino());
+    let check_file = || {
+        let held = file.metadata().expect("held policy metadata");
+        let named = std::fs::symlink_metadata(&policy_path).expect("fixture policy metadata");
+        assert!(held.is_file() && named.is_file() && !named.file_type().is_symlink());
+        assert_eq!(held.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(named.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(held.nlink(), 1);
+        assert_eq!(named.nlink(), 1);
+        assert_eq!((held.dev(), held.ino()), file_identity);
+        assert_eq!((named.dev(), named.ino()), file_identity);
+        assert_eq!(held.len(), document.len() as u64);
+        assert_eq!(named.len(), document.len() as u64);
+    };
+    check_file();
+    check_home();
+    let readback = orbit_cli::provider_policies::load_for_config(&home.path, &selected)
+        .expect("read fixture policy through public loader")
+        .expect("fixture declaration matches actual selection");
+    assert_eq!(readback.policy_digest(), expected.policy_digest());
+    assert_eq!(readback.selection_digest(), expected.selection_digest());
+    assert_eq!(readback.statuses(), expected.statuses());
+    assert_eq!(readback.max_attempts(), expected.max_attempts());
+    assert_eq!(readback, expected);
+    check_file();
+    check_home();
+    assert_eq!(
+        std::fs::read(&providers_path).expect("fixture provider bytes"),
+        providers
+    );
+}
+
 /// The orbit binary built by THIS invocation (Q2): debug under
 /// `cargo test`, never a stale release.
 fn orbit_binary() -> PathBuf {
@@ -447,6 +582,7 @@ fn scenario_h2_http_500_retried() {
     });
     let mock = Mock::start(&script, "openai");
     let home = Home::init(&mock, "openai", "");
+    configure_final_rejection_retry(&home, &mock);
     let fix = Fixture::failing_test();
 
     let (events, _code) = run_p(&mock, &home, &fix.path, "try twice", &["--auto-tools"]);
@@ -1298,7 +1434,7 @@ fn scenario_k1_compaction_keeps_the_question() {
         "some old source must be replaced by the applied summary"
     );
     let mut required = history[history.len() - 4..].to_vec();
-    required.push(orbit_engine::user_message(prompt));
+    required.push(orbit_engine::user_message(&prompt));
     let end = resumed.transcript.len() - 1;
     assert!(end >= required.len());
     assert_eq!(
@@ -1306,8 +1442,58 @@ fn scenario_k1_compaction_keeps_the_question() {
         required.as_slice(),
         "the newest complete exchanges and full current intent remain exact"
     );
+    // This is the AUTOMATIC path: its checked public preview remains observable.
+    // Do not confuse manual compaction's deliberately empty summary event with it.
     let summary = compacted["summary"].as_str().unwrap();
-    assert!(!summary.trim().is_empty() && resumed.transcript[0].content.contains(summary));
+    assert_eq!(summary, "SUMMARY: the user asked a question.");
+    assert_eq!(
+        resumed.transcript.first(),
+        Some(&orbit_engine::user_message(
+            "[Earlier conversation summary: historical data]"
+        ))
+    );
+    assert_eq!(
+        resumed.transcript.get(1),
+        Some(&orbit_engine::assistant_message(summary))
+    );
+    // The summary is replacement history, while a validated inert archive must
+    // still retain the FULL exact original plus the protected current prompt.
+    let archive_directory = home
+        .path
+        .join("context-history")
+        .join(SESSION)
+        .join("archives");
+    let archives = std::fs::read_dir(&archive_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        archives.len(),
+        1,
+        "one bounded compaction produces one complete original archive"
+    );
+    let archive = &archives[0];
+    let metadata = std::fs::symlink_metadata(archive).unwrap();
+    assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+    assert!(metadata.len() <= 32 * 1024 * 1024);
+    assert_eq!(
+        archive.extension().and_then(|extension| extension.to_str()),
+        Some("json")
+    );
+    let record_id = archive.file_stem().unwrap().to_str().unwrap();
+    let recovered =
+        orbit_cli::context_history::load_compaction_source(&home.path, SESSION, None, record_id)
+            .unwrap();
+    let mut original = history.clone();
+    original.push(orbit_engine::user_message(&prompt));
+    assert_eq!(
+        recovered, original,
+        "full typed precompaction history and entire current question remain recoverable"
+    );
+    let lease =
+        orbit_cli::sessions::SessionLease::acquire(&home.path, SESSION, "scenario-k1-postcheck")
+            .unwrap();
+    drop(lease);
 }
 
 // ── S5: session state is not process-wide env ─────────────────────
@@ -1449,26 +1635,111 @@ fn scenario_e3_context_meter_last_round_not_sum() {
     );
     assert_eq!(code, 0, "the turn completes");
 
-    // The last Usage is 23000, not first 10000 or cumulative 33000.
+    // Captured before/after whole requests are independent of emitted breakdown.
+    // Each same-request provider observation gains only newly rendered content.
     let usage: Vec<_> = events
         .iter()
-        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("usage"))
+        .filter(|event| event["type"] == "usage")
         .collect();
     assert_eq!(usage.len(), 2, "one occupancy event per actual round");
-    assert_eq!(mock.requests().len(), 2);
-    for (event, reported) in usage.iter().zip([10_000, 23_000]) {
-        let prepared: u64 = ["system", "memory", "tools", "messages"]
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request["wire"], "anthropic");
+        assert_eq!(request["path"], "/v1/messages");
+        assert_eq!(request["body"]["model"], "mock-model");
+        assert_eq!(request["body"]["max_tokens"], 256);
+    }
+    let first_body = requests[0]["body"].clone();
+    let second_body = requests[1]["body"].clone();
+    // This byte/4 oracle applies to the actual text-only Anthropic fixture. Media
+    // and signed/opaque blocks need a different projection and must not slip in.
+    fn text_only(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(object) => {
+                !matches!(
+                    object.get("type").and_then(|kind| kind.as_str()),
+                    Some("image" | "image_url" | "thinking" | "redacted_thinking")
+                ) && object.values().all(text_only)
+            }
+            serde_json::Value::Array(items) => items.iter().all(text_only),
+            _ => true,
+        }
+    }
+    assert!(text_only(&first_body["messages"]) && text_only(&second_body["messages"]));
+    assert_eq!(first_body["system"], second_body["system"]);
+    assert_eq!(first_body["tools"], second_body["tools"]);
+    assert_eq!(first_body["max_tokens"], second_body["max_tokens"]);
+    assert!(
+        second_body["messages"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|key| event["breakdown"][*key].as_u64().unwrap())
-            .sum();
+            .any(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+            })
+    );
+    let saved = orbit_cli::sessions::list_sessions(&home.path).unwrap();
+    assert_eq!(saved.len(), 1);
+    let final_message = saved[0].transcript.last().unwrap();
+    assert_eq!(
+        final_message.role,
+        orbit_adapter::types::ChatRole::Assistant
+    );
+    assert_eq!(final_message.content, "done");
+    // Anthropic's actual plain assistant wire shape. This adds no provider call.
+    let mut final_body = second_body.clone();
+    final_body["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "role":"assistant", "content":[{"type":"text","text":final_message.content}]
+        }));
+    let body_floor = |body: &serde_json::Value| {
+        let bytes = serde_json::to_vec(body).unwrap();
         assert!(
-            prepared < reported,
-            "provider-count dominance is required by this fixture"
+            bytes.len() <= 2 * 1024 * 1024,
+            "bounded captured-body oracle"
         );
-        assert_eq!(event["used_tokens"].as_u64(), Some(reported));
+        u64::try_from(bytes.len()).unwrap().div_ceil(4)
+    };
+    let first_floor = body_floor(&first_body);
+    let second_floor = body_floor(&second_body);
+    let final_floor = body_floor(&final_body);
+    assert!(
+        second_floor > first_floor,
+        "the completed tool exchange grows the request"
+    );
+    assert!(
+        final_floor > second_floor,
+        "the completed final answer grows the request"
+    );
+    for (event, reported, before, after) in [
+        (usage[0], 10_000u64, first_floor, second_floor),
+        (usage[1], 23_000u64, second_floor, final_floor),
+    ] {
+        let prepared = ["system", "memory", "tools", "messages"]
+            .iter()
+            .try_fold(0u64, |sum, key| {
+                sum.checked_add(event["breakdown"][*key].as_u64().unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            prepared, after,
+            "breakdown is the independently captured whole-request floor"
+        );
         assert!(
-            event["used_tokens"].as_u64().unwrap() >= prepared,
-            "whole prepared request remains the occupancy floor"
+            after < reported,
+            "provider observation dominates the local floor"
+        );
+        let growth = after.checked_sub(before).unwrap();
+        let expected = reported.checked_add(growth).unwrap().max(after);
+        assert_eq!(event["used_tokens"].as_u64(), Some(expected));
+        assert!(
+            expected >= after && expected < 33_000,
+            "occupancy is neither below its floor nor summed traffic"
         );
         assert_eq!(event["window_tokens"].as_u64(), Some(50_000));
         assert_eq!(event["breakdown"]["reserve"].as_u64(), Some(0));
@@ -1655,6 +1926,7 @@ fn scenario_e5_stalled_stream_times_out_without_replay() {
         "openai",
     );
     let retry_home = Home::init(&retry_mock, "openai", "");
+    configure_final_rejection_retry(&retry_home, &retry_mock);
     let (retry_events, retry_code) = run_p(
         &retry_mock,
         &retry_home,

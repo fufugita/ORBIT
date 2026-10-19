@@ -274,6 +274,84 @@ occupancy, output reserve and compaction threshold are separate from cumulative
 input/output traffic. Estimates are approximate, including when a provider
 advertises a limit.
 
+## Compact a conversation
+
+Use `/compact` in a live conversation, or compact an inactive saved session:
+
+```sh
+orbit compact --session SESSION_ID --json
+```
+
+Manual compaction adds no user turn. It uses the saved conversation selection
+and the configured `compaction` role for summary requests, which can incur
+provider charges. Configured integrations may initialize while preparing the
+context. Applied summaries retain the original typed history privately. A
+no-op, refusal, cancellation or uncertain publication is reported explicitly;
+check the result before continuing.
+
+On Linux, SIGINT, SIGTERM and SIGHUP end direct compaction, plain chat, headless
+commands and foreground session owners with normal 130, 143 and 129 exits when
+shutdown succeeds. Check diagnostics and saved accounting even after a mapped
+signal exit; an in-flight provider request can remain uncertain. Direct
+compaction and plain chat report storage, input or cleanup failures rather than
+claiming a clean cancellation. Ending one of these processes does not mean
+canceling a turn and continuing to read prompts in the same process. The TUI's
+`Esc` action is a separate way to cancel its active operation.
+
+## Preserve an inactive session
+
+If ORBIT reports pending or uncertain request accounting, inspect it first:
+
+```sh
+orbit recovery status --session SESSION_ID
+orbit recovery status --session SESSION_ID --json
+```
+
+This reads existing accounting metadata without contacting a provider, loading
+model configuration or reading saved conversation/archive bodies. Add
+`--child CHILD_ID` to inspect an existing child namespace. An `available`
+result includes `checkpoint_revision` and `inspection_digest`; `untracked`
+means no tracked accounting is available and is not proof of zero usage.
+Busy or invalid storage is reported explicitly.
+
+Totals cover requests recorded since the namespace was initialized. An unknown
+legacy prefix is separate, and a known priced subset is not a complete bill.
+`visible_validated` means the metadata was checked at this read; it does not
+establish the provider's outcome or prior publication durability. Inspection
+does not clear a pending request or permit replay.
+
+To preserve a top-level saved session, close its owner and create a private
+output parent. Copy `checkpoint_revision` and `inspection_digest` from an
+`available` status result for that same root session:
+
+```sh
+install -d -m 700 "$HOME/orbit-recovery"
+orbit recovery export --session SESSION_ID \
+  --expect-revision REV --expect-inspection DIGEST \
+  --to "$HOME/orbit-recovery/SESSION_ID-copy" --json
+```
+
+Replace REV and DIGEST with the observed values. The output path must be
+absolute and absent; its existing parent must be owned by you with mode 0700.
+Use ordinary paths without symlinks, `.` or `..`, outside the active session,
+history, agent and project storage. An active owner, existing target, changed
+inspection or unsafe path is refused. `--home PATH` selects another ORBIT home
+when needed; use the same home for status and export.
+
+The private directory contains a hash manifest, exact saved root snapshot,
+accounting, present typed original archives and optional legacy history. It
+contains private conversation data and is not encrypted. It preserves pending
+state and does not recover unsaved partial text, replay a request or import data
+into a live session. Child export is currently unavailable.
+
+`published` with `published_synced` qualifies this new output publication; it
+does not establish an earlier provider outcome or source durability. Preserve
+the receipt and any reported incomplete stage or uncertain destination for
+diagnosis. No automatic cleanup, pending reset or retry is implied.
+
+The separate `orbit export` and `orbit restore` commands handle age bundles;
+they do not replace this saved-session preservation workflow.
+
 ## Read readiness accurately
 
 Doctor checks local identity, ledger, configuration, integration metadata,

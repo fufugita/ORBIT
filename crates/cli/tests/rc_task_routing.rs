@@ -1028,6 +1028,127 @@ impl SavedTaskFixture {
         assert_eq!(messages.last().unwrap()["content"], SAVED_CONTEXT_PROMPT);
     }
 
+    fn assert_complete_context_compaction(
+        &self,
+        summary: &Value,
+        continuation: &Value,
+        seeded: &orbit_engine::agent_store::AgentSnapshot,
+    ) -> Vec<orbit_adapter::types::ChatMessage> {
+        use orbit_adapter::types::ChatRole;
+
+        let messages = summary["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let prompt = messages[0]["content"].as_str().unwrap();
+        let (directive, data) = prompt.split_once("\n\n").unwrap();
+        assert!(directive.starts_with("Summarize this conversation for continuation."));
+        let records: Vec<Value> = serde_json::from_str(data).unwrap();
+        let boundary = records.len();
+        assert!(boundary > 0 && boundary < seeded.transcript.len());
+        assert_eq!(
+            boundary % 2,
+            0,
+            "only complete historical exchanges may be summarized"
+        );
+        assert!(seeded.transcript.len() >= 2);
+        assert!(
+            boundary <= seeded.transcript.len() - 2,
+            "the newest complete historical exchange must remain"
+        );
+        for (index, message) in seeded.transcript.iter().enumerate() {
+            assert_eq!(
+                message.role,
+                if index % 2 == 0 {
+                    ChatRole::User
+                } else {
+                    ChatRole::Assistant
+                }
+            );
+            assert!(
+                message.blocks.is_none()
+                    && message.tool_calls.is_none()
+                    && message.tool_call_id.is_none()
+                    && message.tool_result.is_none()
+            );
+        }
+        let expected_records: Vec<_> = seeded.transcript[..boundary]
+            .iter()
+            .map(|message| json!({"role":message.role.as_str(),"text":[message.content]}))
+            .collect();
+        assert_eq!(
+            records, expected_records,
+            "the actual summary must receive the full exact contiguous source prefix without truncation or invented tool fields"
+        );
+        assert!(!prompt.contains(SAVED_CONTEXT_PROMPT) && !prompt.contains(SAVED_CONTEXT_MARKER));
+
+        let mut original = seeded.transcript.clone();
+        original.push(orbit_engine::user_message(SAVED_CONTEXT_PROMPT));
+        let retained = &original[boundary..];
+        assert!(retained.len() >= 3);
+        assert_eq!(
+            &retained[retained.len() - 3..],
+            &original[original.len() - 3..]
+        );
+        let mut candidate = vec![
+            orbit_engine::user_message("[Earlier conversation summary: historical data]"),
+            orbit_engine::assistant_message("owned fixture reply"),
+        ];
+        candidate.extend_from_slice(retained);
+        let expected_wire: Vec<_> = candidate
+            .iter()
+            .map(|message| json!({"role":message.role.as_str(),"content":message.content}))
+            .collect();
+        let actual_wire: Vec<_> = continuation["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] != "system")
+            .cloned()
+            .collect();
+        assert_eq!(
+            actual_wire, expected_wire,
+            "the closed summary exchange must precede the complete exact retained suffix and current intent"
+        );
+
+        let directory = self
+            .fixture
+            .home
+            .join("context-history")
+            .join(&seeded.owner_session_id)
+            .join("archives");
+        let metadata = std::fs::symlink_metadata(&directory).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        let records: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .take(2)
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "this operation must publish exactly one full original archive"
+        );
+        let entry = &records[0];
+        let kind = entry.file_type().unwrap();
+        assert!(kind.is_file() && !kind.is_symlink());
+        let name = entry.file_name().into_string().unwrap();
+        let record_id = name.strip_suffix(".json").unwrap();
+        let suffix = record_id.strip_prefix("compact-").unwrap();
+        assert_eq!(suffix.parse::<ulid::Ulid>().unwrap().to_string(), suffix);
+        let recovered = orbit_cli::context_history::load_compaction_source(
+            &self.fixture.home,
+            &seeded.owner_session_id,
+            Some(&seeded.agent_id),
+            record_id,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered, original,
+            "qualified inert recovery must return every full typed historical message plus the current User"
+        );
+        candidate
+    }
+
     fn assert_selected_context_parent_unchanged(&self, before: &str, result: &Value) {
         assert_eq!(
             format!(
@@ -1093,16 +1214,8 @@ fn saved_private_resumed_child_compacts_for_exact_b_window_then_continues_with_b
     let summary_prompt = summary_messages[0]["content"].as_str().unwrap();
     assert!(summary_prompt.starts_with("Summarize this conversation for continuation."));
     assert!(
-        summary_prompt.contains("OLD-CONTEXT-00-user")
-            && summary_prompt.contains("OLD-CONTEXT-09-assistant")
-    );
-    assert!(
         !summary_prompt.contains(SAVED_CONTEXT_PROMPT)
             && !summary_prompt.contains(SAVED_CONTEXT_MARKER)
-    );
-    assert!(
-        summary_prompt.len() < 10_000,
-        "summary fixture remains bounded after prefix truncation"
     );
 
     let continuation = &bodies[1];
@@ -1136,36 +1249,8 @@ fn saved_private_resumed_child_compacts_for_exact_b_window_then_continues_with_b
     assert!(continuation_bytes < (SAVED_CONTEXT_WINDOW / 10 * 9 * 4) as usize);
     assert_eq!(summary["max_tokens"], 733);
     assert_eq!(continuation["max_tokens"], 733);
-    let non_system: Vec<_> = continuation["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|message| message["role"] != "system")
-        .collect();
-    assert_eq!(
-        non_system.len(),
-        7,
-        "one summary plus all six retained messages"
-    );
-    assert!(
-        non_system[0]["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("[context compacted from 21 older messages]")
-    );
-    assert!(
-        non_system[0]["content"]
-            .as_str()
-            .unwrap()
-            .ends_with("owned fixture reply")
-    );
-    assert!(!continuation.to_string().contains("OLD-CONTEXT-"));
-    let mut expected_tail = seeded.transcript[seeded.transcript.len() - 5..].to_vec();
-    expected_tail.push(orbit_engine::user_message(SAVED_CONTEXT_PROMPT));
-    for (wire, expected) in non_system[1..].iter().zip(&expected_tail) {
-        assert_eq!(wire["role"], expected.role.as_str());
-        assert_eq!(wire["content"], expected.content);
-    }
+    let mut expected = f.assert_complete_context_compaction(summary, continuation, &seeded);
+    expected.push(orbit_engine::assistant_message("owned fixture reply"));
     // A byte-size guard keeps this particular fixture comfortably bounded; it
     // is not a tokenizer or a general whole-request/context accounting proof.
     assert!(continuation.to_string().len() < (SAVED_CONTEXT_WINDOW / 10 * 9 * 4) as usize);
@@ -1177,8 +1262,8 @@ fn saved_private_resumed_child_compacts_for_exact_b_window_then_continues_with_b
         saved.effort,
         Some(EffortSetting::Value(EffortValue::Level("high".into())))
     );
-    assert_eq!(saved.transcript.len(), 8);
-    assert_eq!(&saved.transcript[1..7], expected_tail.as_slice());
+    assert_eq!(saved.transcript.len(), expected.len());
+    assert_eq!(saved.transcript, expected);
     assert_eq!(saved.transcript.last().unwrap().role, ChatRole::Assistant);
     assert_eq!(
         saved.transcript.last().unwrap().content,
@@ -1480,9 +1565,6 @@ mod typed_task_budget_tracers {
         assert_eq!(messages[0]["role"], "user");
         let prompt = messages[0]["content"].as_str().unwrap();
         assert!(prompt.starts_with("Summarize this conversation for continuation."));
-        assert!(
-            prompt.contains("OLD-CONTEXT-00-user") && prompt.contains("OLD-CONTEXT-09-assistant")
-        );
         assert!(!prompt.contains(SAVED_CONTEXT_PROMPT) && !prompt.contains(SAVED_CONTEXT_MARKER));
         let bytes = serde_json::to_vec(body).unwrap().len();
         assert!(
@@ -1500,40 +1582,17 @@ mod typed_task_budget_tracers {
         let body = &f.fixture.b.bodies()[1];
         f.assert_selected_context_normal(body);
         assert!(serde_json::to_vec(body).unwrap().len() < (CHILD_INPUT / 10 * 9 * 4) as usize);
-        let non_system: Vec<_> = body["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|message| message["role"] != "system")
-            .collect();
-        assert_eq!(non_system.len(), 7);
-        assert!(
-            non_system[0]["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("[context compacted from 21 older messages]")
-        );
-        assert!(
-            non_system[0]["content"]
-                .as_str()
-                .unwrap()
-                .ends_with("owned fixture reply")
-        );
-        assert!(!body.to_string().contains("OLD-CONTEXT-"));
-        let mut tail = seeded.transcript[seeded.transcript.len() - 5..].to_vec();
-        tail.push(orbit_engine::user_message(SAVED_CONTEXT_PROMPT));
-        for (wire, message) in non_system[1..].iter().zip(&tail) {
-            assert_eq!(wire["role"], message.role.as_str());
-            assert_eq!(wire["content"], message.content);
-        }
+        let summary = &f.fixture.b.bodies()[0];
+        let mut expected = f.assert_complete_context_compaction(summary, body, seeded);
+        expected.push(orbit_engine::assistant_message("owned fixture reply"));
         let saved = f.fixture.store().load(&seeded.agent_id).unwrap();
         assert_eq!(saved.model, seeded.model);
         assert_eq!(saved.effort, seeded.effort);
         assert_eq!(saved.status, AgentStatus::Completed);
         assert_eq!(saved.turns, 14);
         assert!(saved.active_run_id.is_none());
-        assert_eq!(saved.transcript.len(), 8);
-        assert_eq!(&saved.transcript[1..7], tail.as_slice());
+        assert_eq!(saved.transcript.len(), expected.len());
+        assert_eq!(saved.transcript, expected);
         assert_eq!(saved.transcript.last().unwrap().role, ChatRole::Assistant);
         assert_eq!(
             saved.transcript.last().unwrap().content,
@@ -1839,5 +1898,725 @@ mod typed_task_budget_tracers {
                 .is_some_and(|s| s.starts_with("Summary context uses a harness fallback policy"))
         }));
         f.assert_no_keys_in_parent_or_durable_state(&result);
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod child_journal_activation {
+    use super::*;
+    use orbit_cli::context_history::context_journal;
+    use orbit_cli::sessions::SessionLease;
+    use orbit_engine::{AccountingBaseline, AccountingKnownness};
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    fn dispatch_isolated(exact: &str) -> bool {
+        let isolated = std::env::var_os("ORBIT_ACTIVATION_ISOLATED");
+        let depth = std::env::var_os("ORBIT_ACTIVATION_RUNNER_DEPTH");
+        if isolated.as_deref() == Some(std::ffi::OsStr::new("1")) {
+            assert_eq!(
+                depth.as_deref(),
+                Some(std::ffi::OsStr::new("1")),
+                "invalid isolated runner depth"
+            );
+            return true;
+        }
+        assert!(
+            isolated.is_none() && depth.is_none(),
+            "malformed isolation dispatch controls"
+        );
+        let required =
+            std::env::var("ORBIT_REQUIRE_CONTEXT_SESSION_ISOLATION").as_deref() == Ok("1");
+        let output = std::process::Command::new("/usr/bin/python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/fixtures/context_session_isolation.py"
+            ))
+            .arg("--binary")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", exact, "--timeout", "45"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("tracked isolation runner did not start");
+        assert!(
+            output.stdout.len() <= 512 * 1024 && output.stderr.len() <= 64 * 1024,
+            "runner receipt output bound"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+            panic!(
+                "invalid isolation runner receipt, exit {:?}",
+                output.status.code()
+            )
+        });
+        assert_eq!(report["schema"], "orbit.context-session-isolation/v1");
+        assert_eq!(report["test_filter"], exact);
+        let visible = json!({"schema":report["schema"],"test_filter":exact,"status":report["status"],
+            "test_started":report["test_started"],"reason":report["reason"],"harness":report["harness"],
+            "binary_sha256":report["binary_sha256"],"binary_metadata_and_hash_unchanged":report["binary_metadata_and_hash_unchanged"],
+            "host_managed_path_metadata_unchanged":report["host_managed_path_metadata_unchanged"],"owned_fixture_removed":report["owned_fixture_removed"]});
+        // Direct Write bypasses libtest's println capture. A returning NOTRUN
+        // wrapper must stay visible and must not count as an inner pass.
+        let line = format!("ORBIT_CONTEXT_SESSION_ISOLATION {visible}\n");
+        std::io::Write::write_all(&mut std::io::stdout().lock(), line.as_bytes()).unwrap();
+        match report["status"].as_str() {
+            Some("TEST_PASSED") => {
+                assert_eq!(output.status.code(), Some(0));
+                assert_eq!(report["test_started"], true);
+                assert_eq!(report["harness"]["passed"], 1);
+                assert_eq!(report["harness"]["failed"], 0);
+                assert_eq!(report["harness"]["ignored"], 0);
+                for field in [
+                    "binary_metadata_and_hash_unchanged",
+                    "host_managed_path_metadata_unchanged",
+                    "owned_fixture_removed",
+                    "binary_postcheck_inside",
+                ] {
+                    assert_eq!(report[field], true);
+                }
+            }
+            Some("NOTRUN") => {
+                assert_eq!(output.status.code(), Some(77));
+                assert_eq!(report["test_started"], false);
+                assert!(
+                    !required,
+                    "NOTRUN: this infrastructure-required job needs namespace capability"
+                );
+            }
+            Some("TEST_FAILED") | Some("INFRA_FAILURE") => {
+                panic!(
+                    "isolated test did not pass: {} / {} / {}",
+                    report["status"], report["stdout_excerpt"], report["stderr_excerpt"]
+                );
+            }
+            _ => panic!("unknown isolation runner status"),
+        }
+        false
+    }
+
+    fn require_private_system_fixture() {
+        // Check descriptors/namespace identity BEFORE opening managed content,
+        // creating a fixture, spawning a provider or starting any caller.
+        let descriptor = |name: &str| {
+            let value: u32 = std::env::var(name)
+                .expect("isolated runner descriptor missing")
+                .parse()
+                .unwrap();
+            assert!(value < 4096);
+            fs::metadata(format!("/proc/self/fd/{value}")).unwrap()
+        };
+        let parent_mount = descriptor("ORBIT_ACTIVATION_PARENT_MOUNT_FD");
+        let parent_user = descriptor("ORBIT_ACTIVATION_PARENT_USER_FD");
+        let own_mount = fs::metadata("/proc/self/ns/mnt").unwrap();
+        let own_user = fs::metadata("/proc/self/ns/user").unwrap();
+        assert_ne!(
+            (parent_mount.dev(), parent_mount.ino()),
+            (own_mount.dev(), own_mount.ino())
+        );
+        assert_ne!(
+            (parent_user.dev(), parent_user.ino()),
+            (own_user.dev(), own_user.ino())
+        );
+        let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(mounts.lines().any(
+            |line| line.split_whitespace().nth(4) == Some("/etc") && line.contains(" - tmpfs ")
+        ));
+        let expected = std::env::var("ORBIT_ACTIVATION_MANAGED_MARKER").unwrap();
+        assert!(expected.starts_with("ORBIT_ACTIVATION_MANAGED_") && expected.len() <= 128);
+        assert!(
+            expected
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        );
+        let path = Path::new("/etc/orbit/ORBIT.md");
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(metadata.len() <= 128);
+        assert_eq!(fs::read(path).unwrap(), expected.as_bytes());
+        assert_eq!(fs::read_dir("/etc/orbit").unwrap().count(), 1);
+        let root =
+            PathBuf::from(std::env::var_os("ORBIT_ACTIVATION_ROOT").expect("private root missing"));
+        assert!(root.is_absolute());
+        assert_eq!(root.canonicalize().unwrap(), root);
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("oc-")
+        );
+        assert_eq!(fs::symlink_metadata(&root).unwrap().mode() & 0o777, 0o700);
+        for name in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            let path = PathBuf::from(std::env::var_os(name).expect("private user path missing"));
+            assert!(path.is_absolute() && path.starts_with(&root) && path != root);
+            assert_eq!(path.canonicalize().unwrap(), path);
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+        }
+        assert!(std::env::current_dir().unwrap().starts_with(&root));
+        for name in [
+            "ORBIT_HOME",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "OPENAI_BASE_URL",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "runner did not clear an inherited provider setting"
+            );
+        }
+    }
+
+    fn price_models(f: &Fixture) {
+        let mut config = orbit_cli::config::ProvidersConfig::load(&f.home).unwrap();
+        for provider in &mut config.provider {
+            for model in &mut provider.models {
+                let value = json!({"input_per_million_microdollars":0,"output_per_million_microdollars":0,
+                    "cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,
+                    "reasoning_per_million_microdollars":0,"request_flat_microdollars":5});
+                model.pricing = serde_json::from_value(value).unwrap();
+                model.context_limits =
+                    Some(serde_json::from_value(json!({"input_tokens":64_000})).unwrap());
+            }
+        }
+        fs::write(
+            f.home.join("providers.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+    }
+    fn task_alias(f: &Fixture, name: &str, args: Value) -> Value {
+        let call = orbit_cli::PendingToolCall {
+            index: 0,
+            id: ulid::Ulid::new().to_string(),
+            name: name.into(),
+            arguments: serde_json::to_vec(&args).unwrap(),
+        };
+        let (output, _) = tool_runtime::execute_call(
+            &f.home,
+            "owner",
+            "decision",
+            &call,
+            true,
+            false,
+            &mut Approve,
+            &mut AutoGrants::new(),
+            &PermissionScope::default(),
+            &f.cx,
+        )
+        .unwrap();
+        serde_json::from_str(&output).unwrap()
+    }
+    fn child_checkpoint(f: &Fixture, child: &str) -> orbit_engine::AccountingCheckpoint {
+        context_journal(&f.home, "owner", Some(child))
+            .unwrap()
+            .accounting_checkpoint()
+            .unwrap()
+    }
+    fn assert_child_schema_unchanged(saved: &orbit_engine::agent_store::AgentSnapshot) {
+        let value = serde_json::to_value(saved).unwrap();
+        for field in [
+            "accounting_watermark",
+            "input_tokens",
+            "output_tokens",
+            "cost_microcents",
+        ] {
+            assert!(value.get(field).is_none());
+        }
+    }
+
+    #[test]
+    fn actual_task_then_agent_resume_keeps_the_same_qualified_fresh_child_and_known_bill() {
+        if !dispatch_isolated(
+            "child_journal_activation::actual_task_then_agent_resume_keeps_the_same_qualified_fresh_child_and_known_bill",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        price_models(&f);
+        let _owner_lease = SessionLease::acquire(&f.home, "owner", "activation-parent").unwrap();
+        let parent = context_journal(&f.home, "owner", None).unwrap();
+        let parent_before = parent
+            .initialize_accounting(AccountingBaseline::FreshKnownZero)
+            .unwrap();
+        let first = task_alias(
+            &f,
+            "Task",
+            json!({"agent":"Explore","model":"b/family/routed-notools","prompt":"first exact child intent"}),
+        );
+        assert_eq!(first["ok"], true, "{first}");
+        let child = id(&first);
+        let first_snapshot = f.store().load(&child).unwrap();
+        let first_checkpoint = child_checkpoint(&f, &child);
+        assert_eq!(first_checkpoint.owner_session_id, "owner");
+        assert_eq!(first_checkpoint.child_id.as_deref(), Some(child.as_str()));
+        assert_eq!(
+            first_checkpoint.baseline,
+            AccountingBaseline::FreshKnownZero
+        );
+        assert_eq!(first_checkpoint.revision.0, 2);
+        assert_eq!(
+            first_checkpoint.totals.knownness,
+            AccountingKnownness::Known
+        );
+        assert_eq!(
+            (
+                first_checkpoint.totals.ordinary.input_tokens,
+                first_checkpoint.totals.ordinary.output_tokens
+            ),
+            (2, 3)
+        );
+        assert_eq!(
+            first_checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .ordinary_microcents,
+            5
+        );
+        assert_child_schema_unchanged(&first_snapshot);
+        assert_eq!(parent.accounting_checkpoint().unwrap(), parent_before);
+        // A fresh public tool invocation and store load, using the Agent alias,
+        // must retain the existing stable child namespace rather than reset it.
+        let second = task_alias(
+            &f,
+            "Agent",
+            json!({"agent":"Explore","resume":child,"prompt":"second exact child intent"}),
+        );
+        assert_eq!(second["ok"], true, "{second}");
+        assert_eq!(id(&second), child);
+        let second_snapshot = f.store().load(&child).unwrap();
+        assert!(
+            second_snapshot
+                .transcript
+                .starts_with(&first_snapshot.transcript)
+        );
+        let checkpoint = child_checkpoint(&f, &child);
+        assert_eq!(checkpoint.revision.0, 4);
+        assert_eq!(
+            (
+                checkpoint.totals.ordinary.input_tokens,
+                checkpoint.totals.ordinary.output_tokens,
+                checkpoint.totals.ordinary.cost_microcents
+            ),
+            (4, 6, Some(10))
+        );
+        assert_eq!(
+            checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .ordinary_microcents,
+            10
+        );
+        assert!(checkpoint.pending.is_none());
+        assert_eq!(parent.accounting_checkpoint().unwrap(), parent_before);
+        assert_eq!(f.a.calls(), 0);
+        assert_eq!(f.b.calls(), 2);
+        assert_eq!(f.b.bodies()[1]["model"], "family/routed-notools");
+        assert_child_schema_unchanged(&second_snapshot);
+        let ledger = orbit_ledger::verify_ledger(&f.home.join("ledger"))
+            .unwrap()
+            .0;
+        let ids: Vec<_> = ledger
+            .into_iter()
+            .filter_map(|record| match record.record.event {
+                orbit_ledger::LedgerEvent::EgressIntent(event) => {
+                    assert_eq!(event.session_id, child);
+                    Some(event.decision_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(
+            checkpoint.last_settlement.unwrap().reference.request_id,
+            ids[1]
+        );
+    }
+
+    #[test]
+    fn actual_resumed_child_failure_keeps_the_prior_paid_bill_and_refuses_another_resume() {
+        if !dispatch_isolated(
+            "child_journal_activation::actual_resumed_child_failure_keeps_the_prior_paid_bill_and_refuses_another_resume",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        price_models(&f);
+        let _lease = SessionLease::acquire(&f.home, "owner", "activation-parent").unwrap();
+        let parent_journal = context_journal(&f.home, "owner", None).unwrap();
+        assert!(matches!(
+            parent_journal.accounting_checkpoint(),
+            Err(orbit_engine::compaction::HistoryError::Missing)
+        ));
+        let parent_config = format!(
+            "{:?}",
+            f.cx.ext::<tool_runtime::SessionTurnConfig>().unwrap().0
+        );
+        let parent_effort =
+            f.cx.ext::<tool_runtime::SessionEffortSetting>()
+                .map(|value| value.0.clone());
+        let first=f.task(json!({"agent":"Explore","model":"b/family/routed-notools","prompt":"paid child prefix"}));
+        assert_eq!(first["ok"], true, "{first}");
+        let child = id(&first);
+        let original = f.store().load(&child).unwrap();
+        fs::write(
+            f.b.directory.join("mode.json"),
+            json!({"disconnect":true}).to_string(),
+        )
+        .unwrap();
+        let failed = task_alias(
+            &f,
+            "Agent",
+            json!({"agent":"Explore","resume":child,"prompt":"retain this failed child intent"}),
+        );
+        assert_eq!(failed["ok"], false, "{failed}");
+        let checkpoint = child_checkpoint(&f, &child);
+        assert_eq!(checkpoint.revision.0, 4);
+        assert_eq!(
+            checkpoint
+                .known_priced_subtotals
+                .unwrap()
+                .ordinary_microcents,
+            5
+        );
+        assert_eq!(
+            (
+                checkpoint.totals.ordinary.input_tokens,
+                checkpoint.totals.ordinary.output_tokens
+            ),
+            (2, 3)
+        );
+        assert_eq!(checkpoint.totals.ordinary.cost_microcents, None);
+        assert_eq!(checkpoint.totals.knownness, AccountingKnownness::Uncertain);
+        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+        assert_eq!(checkpoint.owner_session_id, "owner");
+        assert_eq!(checkpoint.child_id.as_deref(), Some(child.as_str()));
+        let pending = checkpoint.pending.as_ref().unwrap();
+        assert_eq!(pending.intent.owner_session_id, "owner");
+        assert_eq!(pending.intent.child_id.as_deref(), Some(child.as_str()));
+        assert_eq!(
+            pending.intent.purpose,
+            orbit_engine::AttemptPurpose::Ordinary
+        );
+        let ledger_ids: Vec<_> = orbit_ledger::verify_ledger(&f.home.join("ledger"))
+            .unwrap()
+            .0
+            .into_iter()
+            .filter_map(|record| match record.record.event {
+                orbit_ledger::LedgerEvent::EgressIntent(event) => {
+                    assert_eq!(event.session_id, child);
+                    Some(event.decision_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ledger_ids.len(), 2);
+        assert_eq!(pending.reference.request_id, *ledger_ids.last().unwrap());
+        let accounting_path = f.home.join("context-history/owner/accounting.json");
+        let accounting_bytes = fs::read(&accounting_path).unwrap();
+        let container: Value = serde_json::from_slice(&accounting_bytes).unwrap();
+        let entries = container["entries"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "child work must not create a parent billing entry"
+        );
+        assert_eq!(entries[0]["namespace"], json!({"kind":"child","id":child}));
+        let receipt = &entries[0]["pending"]["uncertain_receipt"];
+        assert_eq!(receipt["request_id"], pending.reference.request_id);
+        assert_eq!(receipt["purpose"], "ordinary");
+        assert_eq!(receipt["knownness"], "uncertain");
+        assert_eq!(receipt["completed"], false);
+        assert_eq!(receipt["totals"]["input_tokens"], 0);
+        assert_eq!(receipt["totals"]["output_tokens"], 0);
+        assert!(receipt["totals"]["cost_microcents"].is_null());
+        assert_eq!(
+            checkpoint
+                .last_settlement
+                .as_ref()
+                .unwrap()
+                .reference
+                .request_id,
+            ledger_ids[0]
+        );
+        let saved = f.store().load(&child).unwrap();
+        let mut failed_history = original.transcript.clone();
+        failed_history.push(orbit_engine::user_message(
+            "retain this failed child intent",
+        ));
+        assert_eq!(saved.transcript, failed_history);
+        assert!(saved.transcript.starts_with(&original.transcript));
+        assert_eq!(
+            saved
+                .transcript
+                .iter()
+                .filter(|message| message.content == "retain this failed child intent")
+                .count(),
+            1
+        );
+        assert_eq!(
+            saved.status,
+            orbit_engine::agent_store::AgentStatus::Interrupted
+        );
+        assert_child_schema_unchanged(&saved);
+        let before_refusal = saved.clone();
+        let again = f.task(
+            json!({"agent":"Explore","resume":child,"prompt":"must not replay failed child work"}),
+        );
+        assert_eq!(again["ok"], false, "{again}");
+        assert_eq!(again["agent_id"], child);
+        assert_eq!(
+            again["error"],
+            "a pending uncertain request requires explicit inspection before admission"
+        );
+        assert_eq!(fs::read(&accounting_path).unwrap(), accounting_bytes);
+        assert!(matches!(
+            parent_journal.accounting_checkpoint(),
+            Err(orbit_engine::compaction::HistoryError::Missing)
+        ));
+        assert_eq!(
+            format!(
+                "{:?}",
+                f.cx.ext::<tool_runtime::SessionTurnConfig>().unwrap().0
+            ),
+            parent_config
+        );
+        assert_eq!(
+            f.cx.ext::<tool_runtime::SessionEffortSetting>()
+                .map(|value| value.0.clone()),
+            parent_effort
+        );
+        let after_refusal = f.store().load(&child).unwrap();
+        assert_eq!(
+            after_refusal.status,
+            orbit_engine::agent_store::AgentStatus::Interrupted
+        );
+        assert!(after_refusal.active_run_id.is_none());
+        assert_eq!(after_refusal.owner_session_id, "owner");
+        assert_eq!(after_refusal.agent_id, before_refusal.agent_id);
+        assert_eq!(after_refusal.model, before_refusal.model);
+        assert_eq!(after_refusal.effort, before_refusal.effort);
+        assert_eq!(
+            after_refusal.turns,
+            before_refusal.turns.checked_add(1).unwrap()
+        );
+        let mut expected = before_refusal.transcript.clone();
+        expected.push(orbit_engine::user_message(concat!(
+            "The previous run was interrupted. Inspect the actual work and tool results before continuing; do not automatically replay the previous task.\n\n",
+            "must not replay failed child work",
+        )));
+        assert_eq!(after_refusal.transcript, expected);
+        assert_eq!(
+            after_refusal
+                .transcript
+                .iter()
+                .filter(|message| message.content == "retain this failed child intent")
+                .count(),
+            1
+        );
+        assert_child_schema_unchanged(&after_refusal);
+        assert_eq!(child_checkpoint(&f, &child), checkpoint);
+        assert_eq!(f.b.calls(), 2);
+        assert_eq!(f.a.calls(), 0);
+        // A genuine new run lease is available after both failed invocations.
+        let run = f.store().begin(&child, None).unwrap();
+        drop(run);
+    }
+
+    #[test]
+    fn actual_child_cancellation_after_post_is_durable_and_blocks_later_agent_invocation() {
+        if !dispatch_isolated(
+            "child_journal_activation::actual_child_cancellation_after_post_is_durable_and_blocks_later_agent_invocation",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        price_models(&f);
+        let _lease = SessionLease::acquire(&f.home, "owner", "activation-parent").unwrap();
+        let parent_journal = context_journal(&f.home, "owner", None).unwrap();
+        assert!(matches!(
+            parent_journal.accounting_checkpoint(),
+            Err(orbit_engine::compaction::HistoryError::Missing)
+        ));
+        let parent_config = format!(
+            "{:?}",
+            f.cx.ext::<tool_runtime::SessionTurnConfig>().unwrap().0
+        );
+        let parent_effort =
+            f.cx.ext::<tool_runtime::SessionEffortSetting>()
+                .map(|value| value.0.clone());
+        fs::write(
+            f.b.directory.join("mode.json"),
+            json!({"blocked":true}).to_string(),
+        )
+        .unwrap();
+        let captured = f.b.directory.join("calls.jsonl");
+        f.cx.push_cancel_check(std::sync::Arc::new(move || captured.exists()));
+        let result=f.task(json!({"agent":"Explore","model":"b/family/routed-notools","prompt":"actual cancelled child intent"}));
+        f.cx.pop_cancel_check();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(f.b.calls(), 1);
+        assert_eq!(f.a.calls(), 0);
+        let children = f.store().list().unwrap();
+        assert_eq!(children.len(), 1);
+        let snapshot = f.store().load(&children[0].agent_id).unwrap();
+        let saved = &snapshot;
+        assert_eq!(
+            saved.transcript,
+            vec![orbit_engine::user_message("actual cancelled child intent")]
+        );
+        assert_eq!(
+            saved.status,
+            orbit_engine::agent_store::AgentStatus::Interrupted
+        );
+        assert_eq!(
+            saved
+                .transcript
+                .iter()
+                .filter(|message| message.content == "actual cancelled child intent")
+                .count(),
+            1
+        );
+        let checkpoint = child_checkpoint(&f, &saved.agent_id);
+        assert_eq!(checkpoint.revision.0, 2);
+        assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+        assert_eq!(checkpoint.totals.knownness, AccountingKnownness::Uncertain);
+        assert_eq!(checkpoint.totals.ordinary.cost_microcents, None);
+        assert_eq!(checkpoint.owner_session_id, "owner");
+        assert_eq!(
+            checkpoint.child_id.as_deref(),
+            Some(saved.agent_id.as_str())
+        );
+        let pending = checkpoint.pending.as_ref().unwrap();
+        assert_eq!(pending.intent.owner_session_id, "owner");
+        assert_eq!(
+            pending.intent.child_id.as_deref(),
+            Some(saved.agent_id.as_str())
+        );
+        assert_eq!(
+            pending.intent.purpose,
+            orbit_engine::AttemptPurpose::Ordinary
+        );
+        let ledger_ids: Vec<_> = orbit_ledger::verify_ledger(&f.home.join("ledger"))
+            .unwrap()
+            .0
+            .into_iter()
+            .filter_map(|record| match record.record.event {
+                orbit_ledger::LedgerEvent::EgressIntent(event) => {
+                    assert_eq!(event.session_id, saved.agent_id);
+                    Some(event.decision_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ledger_ids.len(), 1);
+        assert_eq!(pending.reference.request_id, *ledger_ids.last().unwrap());
+        let accounting_path = f.home.join("context-history/owner/accounting.json");
+        let accounting_bytes = fs::read(&accounting_path).unwrap();
+        let container: Value = serde_json::from_slice(&accounting_bytes).unwrap();
+        let entries = container["entries"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "child work must not create a parent billing entry"
+        );
+        assert_eq!(
+            entries[0]["namespace"],
+            json!({"kind":"child","id":saved.agent_id})
+        );
+        let receipt = &entries[0]["pending"]["uncertain_receipt"];
+        assert_eq!(receipt["request_id"], pending.reference.request_id);
+        assert_eq!(receipt["purpose"], "ordinary");
+        assert_eq!(receipt["knownness"], "uncertain");
+        assert_eq!(receipt["completed"], false);
+        assert_eq!(receipt["totals"]["input_tokens"], 0);
+        assert_eq!(receipt["totals"]["output_tokens"], 0);
+        assert!(receipt["totals"]["cost_microcents"].is_null());
+        assert!(checkpoint.last_settlement.is_none());
+        let before_refusal = f.store().load(&saved.agent_id).unwrap();
+        let again = task_alias(
+            &f,
+            "Agent",
+            json!({"agent":"Explore","resume":saved.agent_id,"prompt":"do not replay cancelled child intent"}),
+        );
+        assert_eq!(again["ok"], false, "{again}");
+        assert_eq!(again["agent_id"], saved.agent_id);
+        assert_eq!(
+            again["error"],
+            "a pending uncertain request requires explicit inspection before admission"
+        );
+        assert_eq!(fs::read(&accounting_path).unwrap(), accounting_bytes);
+        assert!(matches!(
+            parent_journal.accounting_checkpoint(),
+            Err(orbit_engine::compaction::HistoryError::Missing)
+        ));
+        assert_eq!(
+            format!(
+                "{:?}",
+                f.cx.ext::<tool_runtime::SessionTurnConfig>().unwrap().0
+            ),
+            parent_config
+        );
+        assert_eq!(
+            f.cx.ext::<tool_runtime::SessionEffortSetting>()
+                .map(|value| value.0.clone()),
+            parent_effort
+        );
+        let after_refusal = f.store().load(&saved.agent_id).unwrap();
+        assert_eq!(
+            after_refusal.status,
+            orbit_engine::agent_store::AgentStatus::Interrupted
+        );
+        assert!(after_refusal.active_run_id.is_none());
+        assert_eq!(after_refusal.owner_session_id, "owner");
+        assert_eq!(after_refusal.agent_id, before_refusal.agent_id);
+        assert_eq!(after_refusal.model, before_refusal.model);
+        assert_eq!(after_refusal.effort, before_refusal.effort);
+        assert_eq!(
+            after_refusal.turns,
+            before_refusal.turns.checked_add(1).unwrap()
+        );
+        let mut expected = before_refusal.transcript.clone();
+        expected.push(orbit_engine::user_message(concat!(
+            "The previous run was interrupted. Inspect the actual work and tool results before continuing; do not automatically replay the previous task.\n\n",
+            "do not replay cancelled child intent",
+        )));
+        assert_eq!(after_refusal.transcript, expected);
+        assert_eq!(
+            after_refusal
+                .transcript
+                .iter()
+                .filter(|message| message.content == "actual cancelled child intent")
+                .count(),
+            1
+        );
+        assert_child_schema_unchanged(&after_refusal);
+        assert_eq!(f.b.calls(), 1);
+        assert_eq!(child_checkpoint(&f, &saved.agent_id), checkpoint);
+        assert_child_schema_unchanged(saved);
     }
 }

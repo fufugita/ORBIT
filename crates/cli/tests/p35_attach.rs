@@ -2,9 +2,9 @@
 
 pub use orbit_cli::{
     apply_effort_setting, checked_model_turn, config, context_window_for_turn, effort_status,
-    model_limits, parse_effort_setting, phase_routing, resolve_selected_model, route_command,
-    sessions, tool_runtime, tools, try_engine_turn_config, try_phase_turn_config,
-    try_role_turn_config, tui_worker,
+    model_limits, parse_effort_setting, phase_routing, provider_policies, resolve_selected_model,
+    route_command, session_accounting, sessions, tool_runtime, tools, try_engine_turn_config,
+    try_phase_turn_config, try_role_turn_config, tui_worker,
 };
 #[path = "../src/attach.rs"]
 pub mod attach;
@@ -432,10 +432,10 @@ fn unix_attach_pending_headers_cancel_is_interrupted_saved_and_never_retried() {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let snapshot = client.snapshot().unwrap();
-        if snapshot.state == TurnState::Idle {
+        if snapshot.state == TurnState::Interrupted {
             assert_eq!(
                 snapshot.requests["header-cancel"].state,
-                daemon::RequestState::Interrupted
+                daemon::RequestState::Unknown
             );
             break;
         }
@@ -445,12 +445,57 @@ fn unix_attach_pending_headers_cancel_is_interrupted_saved_and_never_retried() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(client.send(action()).unwrap().duplicate);
+    let journal =
+        orbit_cli::context_history::context_journal(&fixture.root, "owned", None).unwrap();
+    let checkpoint = journal.accounting_checkpoint().unwrap();
+    assert_eq!(checkpoint.owner_session_id, "owned");
+    assert_eq!(checkpoint.child_id, None);
+    assert_eq!(checkpoint.revision.0, 2);
+    assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+    assert_eq!(
+        checkpoint.totals.knownness,
+        orbit_engine::AccountingKnownness::Uncertain
+    );
+    assert_eq!(
+        (
+            checkpoint.totals.ordinary.input_tokens,
+            checkpoint.totals.ordinary.output_tokens
+        ),
+        (0, 0)
+    );
+    assert_eq!(checkpoint.totals.ordinary.cost_microcents, None);
+    assert_eq!(
+        checkpoint.known_priced_subtotals,
+        Some(orbit_engine::KnownPricedSubtotals::known_zero())
+    );
+    let saved = sessions::load_session(&fixture.root, "owned").unwrap();
+    assert_eq!(
+        saved.transcript,
+        vec![orbit_engine::user_message("cancel before headers")]
+    );
+    assert_eq!(
+        saved
+            .accounting_watermark
+            .as_ref()
+            .unwrap()
+            .full_cost_status,
+        session_accounting::FullCostStatus::Uncertain
+    );
+    let session_path = fixture.root.join("sessions/owned.json");
+    let accounting_path = fixture.root.join("context-history/owned/accounting.json");
+    let session_bytes = fs::read(&session_path).unwrap();
+    let accounting_bytes = fs::read(&accounting_path).unwrap();
+    let duplicate = client.send(action()).unwrap();
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.state, "unknown");
+    assert_eq!(fs::read(&session_path).unwrap(), session_bytes);
+    assert_eq!(fs::read(&accounting_path).unwrap(), accounting_bytes);
+    assert_eq!(journal.accounting_checkpoint().unwrap(), checkpoint);
     let claims: serde_json::Value = serde_json::from_slice(
         &fs::read(fixture.root.join("sessions/.requests/owned.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(claims["requests"]["header-cancel"]["state"], "interrupted");
+    assert_eq!(claims["requests"]["header-cancel"]["state"], "unknown");
     assert_eq!(fixture.calls(), 1);
     assert_eq!(serving.handle().snapshot().unwrap().turns, 1);
 }
@@ -489,8 +534,9 @@ fn unix_attach_partial_stream_cancel_preserves_text_and_reports_interruption() {
     }
     assert_eq!(
         client.snapshot().unwrap().requests["partial-cancel"].state,
-        daemon::RequestState::Interrupted
+        daemon::RequestState::Unknown
     );
+    assert_eq!(client.snapshot().unwrap().state, TurnState::Interrupted);
     let recovery = client.refresh().unwrap();
     assert!(
         recovery
@@ -508,6 +554,46 @@ fn unix_attach_partial_stream_cancel_preserves_text_and_reports_interruption() {
         .unwrap();
     assert_eq!(partial.content, "visible partial reply\n");
     assert!(partial.tool_calls.is_none() && partial.blocks.is_none());
+    assert_eq!(
+        saved
+            .transcript
+            .iter()
+            .filter(
+                |message| message.role == orbit_adapter::types::ChatRole::User
+                    && message.content == "cancel partial stream"
+            )
+            .count(),
+        1
+    );
+    assert!(
+        !serde_json::to_string(&saved.transcript)
+            .unwrap()
+            .contains("unreachable suffix")
+    );
+    assert_eq!(
+        saved
+            .accounting_watermark
+            .as_ref()
+            .unwrap()
+            .full_cost_status,
+        session_accounting::FullCostStatus::Uncertain
+    );
+    let journal =
+        orbit_cli::context_history::context_journal(&fixture.root, "owned", None).unwrap();
+    let checkpoint = journal.accounting_checkpoint().unwrap();
+    assert_eq!(checkpoint.owner_session_id, "owned");
+    assert_eq!(checkpoint.child_id, None);
+    assert_eq!(checkpoint.revision.0, 2);
+    assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+    assert_eq!(
+        checkpoint.totals.knownness,
+        orbit_engine::AccountingKnownness::Uncertain
+    );
+    assert_eq!(checkpoint.totals.ordinary.cost_microcents, None);
+    assert_eq!(
+        checkpoint.known_priced_subtotals,
+        Some(orbit_engine::KnownPricedSubtotals::known_zero())
+    );
     assert_eq!(fixture.calls(), 1);
 }
 

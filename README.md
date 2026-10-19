@@ -143,8 +143,10 @@ for the complete flow and local logout.
 
 ### Where configuration lives
 
-The default home is `~/.orbit`; `--home DIR` and `ORBIT_HOME` select another home.
-See [home selection](docs/setup.md#initialize-once) for the retained workspace-home behavior.
+`--home DIR` takes precedence over `ORBIT_HOME`. Otherwise ORBIT uses an existing
+`~/.orbit`, then an existing workspace `.orbit`; new installations use `~/.orbit`.
+Providers and saved sessions belong to the selected home. See
+[home selection](docs/setup.md#initialize-once) for details.
 Providers and model defaults live in `providers.toml`. For example, an ENV-backed
 configuration has this shape:
 
@@ -181,6 +183,85 @@ is the older offline ENV-name prompt flow and requires terminal input and output
 interactive flags cannot be combined with JSON. `setup repair --dry-run` inspects
 missing identity artifacts without replacing the identity.
 
+### Optional retries after final rejection
+
+For an OpenAI-compatible provider, you can optionally declare that a complete
+HTTP rejection with one of the listed statuses means the provider finally
+refused generation. This is your explicit assumption about that provider; it
+does not establish that the request was unbilled.
+
+First read the installed adapter's current identity from the
+`retry.openai_adapter_identity` check:
+
+```sh
+orbit doctor
+orbit doctor --json
+```
+
+Create `provider-policies.toml` beside `providers.toml` in the same selected
+ORBIT home. Before saving this example, replace the hash placeholder with the
+full 64-hex SHA-256 shown by your installed doctor, and replace the provider,
+raw model ID and endpoint with your exact configured values:
+
+```toml
+version = 1
+
+[[final_rejection]]
+id = "work-final-rejection"
+provider = "work"
+model = "family/model"
+endpoint = "https://provider.example/v1"
+adapter_identity_sha256 = "COPY_THE_64_HEX_SHA256_SHOWN_BY_ORBIT_DOCTOR"
+statuses = [429, 500, 502, 503, 504, 529]
+scope = "ordinary"
+generation = "final_rejection"
+billing = "unknown"
+allow_uncapped_retry = true
+max_attempts = 2
+```
+
+Keep the file private, then inspect the saved configuration. For the default
+`~/.orbit` home:
+
+```sh
+chmod 600 ~/.orbit/provider-policies.toml
+orbit doctor --json
+```
+
+With `--home` or `ORBIT_HOME`, save and protect the file in that same custom
+home instead. For example, inspect it with
+`orbit --home /path/to/orbit-home doctor --json`.
+
+Selection must match the exact provider, raw model ID, current adapter identity
+and canonical endpoint, including its path and raw query ordering and encoding.
+A different valid selection or stale adapter identity leaves the declaration
+inactive; the whole file must still validate. The `retry.policy` check describes
+only the configured main/default model. A later routed request uses its own
+selected model.
+
+`max_attempts` counts total sends per ordinary request or round: `2` allows the
+first send and at most one retry. Declarations allow totals from `2` through `8`;
+any smaller existing caller ceiling still applies. Only managed, uncapped
+ordinary calls can use this policy. An existing monetary cap refuses this
+opt-in before another provider request. Summaries stay single-attempt, and
+neither summaries nor direct `ask` calls inherit this policy. Other adapter
+kinds do not gain these retries. An admitted or ambiguous stream, failed
+settlement or invalid acknowledgment never authorizes replay.
+
+After a settled refusal, full ordinary usage and billing remain unknown. Later
+measured successful usage and known priced subtotals are recorded once; those
+known amounts cover only part of the bill. Read the status notices,
+`full_cost_status`, and `orbit recovery status --session SESSION_ID --json`.
+`orbit compact --session SESSION_ID --json` can summarize an inactive saved
+session, but its summary request can incur provider charges and remains
+single-attempt.
+
+Policy edits take effect on the next invocation. They do not erase historical
+unknown billing or replay an old proof. Without a matching declaration, managed
+ordinary failures retain conservative handling. Doctor inspects local
+configuration offline; it does not establish account acceptance, connectivity,
+or the provider's generation or billing contract.
+
 ## Choose how to work
 
 | Use case | Start with |
@@ -188,8 +269,10 @@ missing identity artifacts without replacing the identity.
 | Understand or change a project | Run `orbit` in its directory; ask it to inspect files, propose edits, and run checks. |
 | Use the browser interface | Run `orbit web` from the project directory. |
 | Run one task from a script | `orbit -p "Summarize this project" --output-format text` |
-| Reopen work | `orbit --resume SESSION_ID`, or use `--continue` for the latest session in the directory. |
+| Reopen work | `orbit --resume SESSION_ID` chooses a saved session. `--continue` reopens the latest session in the selected ORBIT home. |
 | Keep a session owned by another terminal | Use `orbit serve` and `orbit attach`; see [owned sessions](docs/integrations.md#keep-a-session-running-with-serve-and-attach). |
+| Summarize accumulated context | Use `/compact` in chat, or `orbit compact --session SESSION_ID --json` for an inactive saved session. Summary requests can incur provider charges. |
+| Inspect interrupted work | `orbit recovery status --session SESSION_ID --json` reads tracked accounting without sending a prompt. See [session preservation](docs/setup.md#preserve-an-inactive-session). |
 | Prepare an engagement workspace | Use `orbit pentest init`; see the example below. |
 
 Headless output also supports JSON and streaming JSON. A call requiring an

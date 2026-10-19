@@ -152,3 +152,155 @@ check('context_compaction_events_render_numeric_progress_without_summary_or_acti
 });
 
 console.log(`ORBIT_CHECK_RECEIPT ${JSON.stringify({scenarios})}`);
+
+
+check('manual_compact_slash_sends_one_stable_intent_and_no_prompt',ok=>{
+  const f=fixture();f.recover(f.snapshot({accounting:{revision:0,full_cost_status:'known'}}));
+  f.nodes.get('composer').value='/compact';f.click('btn-send');
+  const action=f.current().sent[0];ok(action.type==='compact'&&typeof action.request_id==='string'&&action.request_id.length>0);
+  ok(Object.keys(action).sort().join(',')==='request_id,type');ok(f.current().sent.length===1);
+  ok(f.nodes.get('btn-send').disabled);ok(f.nodes.get('effort-select').disabled);
+  ok(/unavailable/i.test(f.nodes.get('st-cost').textContent));
+  f.nodes.get('composer').value='preserve this busy draft';f.nodes.get('btn-send').onclick();
+  ok(f.nodes.get('composer').value==='preserve this busy draft');ok(f.current().sent.length===1);
+});
+check('manual_compact_arguments_and_missing_controller_have_zero_actions',ok=>{
+  const f=fixture();f.recover(f.snapshot());f.nodes.get('composer').value='/compact extra';f.click('btn-send');
+  ok(f.current().sent.length===0);ok(f.nodes.get('composer').value==='/compact extra');ok(f.nodes.get('toast').textContent==='Usage: /compact');
+  f.current().onclose();f.runReconnect();
+  f.nodes.get('composer').value='/compact';f.nodes.get('btn-send').onclick();
+  ok(f.current().sent.length===0);ok(f.nodes.get('composer').value==='/compact');ok(f.nodes.get('btn-send').disabled);
+});
+check('manual_lost_ack_reconnect_never_resends_the_intent',ok=>{
+  const f=fixture();f.recover(f.snapshot());f.nodes.get('composer').value='/compact';f.click('btn-send');
+  const first=f.current(),id=first.sent[0].request_id;first.onclose();f.runReconnect();f.ready();
+  f.recover(f.snapshot({state:'running',current_request:id,requests:{[id]:{kind:'compact',state:'running'}},accounting:null}));
+  ok(first.closed);ok(first.sent.filter(v=>v.type==='compact').length===1);
+  ok(!f.current().sent.some(v=>v.type==='compact'||v.type==='prompt'));ok(f.nodes.get('btn-send').disabled);
+  ok(/unavailable/i.test(f.nodes.get('us-cost').textContent));
+});
+check('billing_cold_known_zero_is_distinct_from_missing_or_unknown_zero',ok=>{
+  const f=fixture();f.recover(f.snapshot({accounting:{revision:0,full_cost_status:'known'}}));
+  ok(f.nodes.get('st-cost').textContent.includes('$0.0000'));ok(/full cost known/.test(f.nodes.get('st-cost').textContent));
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:2},accounting:{revision:0,full_cost_status:'unknown_legacy'}}));
+  ok(/unknown history/.test(f.nodes.get('us-cost').textContent));
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:3}}));
+  ok(/unavailable/.test(f.nodes.get('st-cost').textContent));ok(!/full cost known/.test(f.nodes.get('st-cost').textContent));
+});
+check('billing_invalid_stale_or_unsafe_metadata_never_restores_known',ok=>{
+  const f=fixture();let sequence=1;
+  for(const accounting of [null,{}, {revision:7,full_cost_status:'invented'}, {revision:-1,full_cost_status:'known'},
+      {revision:1.5,full_cost_status:'known'}, {revision:Number.MAX_SAFE_INTEGER+1,full_cost_status:'known'},
+      {revision:6,full_cost_status:'known'}]) {
+    f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:sequence++},cost_microcents:500,accounting:{revision:7,full_cost_status:'known'}}));
+    ok(/full cost known/.test(f.nodes.get('st-cost').textContent));
+    f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:sequence++},cost_microcents:500,accounting}));
+    ok(/full cost unavailable/.test(f.nodes.get('st-cost').textContent));
+  }
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:sequence++},cost_microcents:Number.MAX_SAFE_INTEGER+1,accounting:{revision:7,full_cost_status:'known'}}));
+  ok(/subtotal unavailable/.test(f.nodes.get('us-cost').textContent));ok(/full cost unavailable/.test(f.nodes.get('us-cost').textContent));
+});
+check('billing_active_keeps_known_numeric_prefix_without_promoting_transient_cost',ok=>{
+  const f=fixture();f.recover(f.snapshot({cost_microcents:1000000,accounting:{revision:2,full_cost_status:'known'}}));
+  emitContext(f,'request_accepted',{request_id:'paid-prompt',message:{role:'user',text:'intent'}},2);
+  emitContext(f,'cost_updated',{total_microcents:9000000},3);
+  ok(f.nodes.get('st-cost').textContent.includes('$1.0000'));ok(/unavailable/.test(f.nodes.get('st-cost').textContent));
+  emitContext(f,'request_finished',{request_id:'paid-prompt',turns:1,input_tokens:11,output_tokens:7,cost_microcents:1500000,accounting:{revision:4,full_cost_status:'unpriced'}},4);
+  ok(f.nodes.get('st-cost').textContent.includes('$1.5000'));ok(/unpriced/.test(f.nodes.get('us-cost').textContent));
+  f.nodes.get('composer').value='/usage';f.click('btn-send');
+  ok(f.nodes.get('transcript').textContent.includes('full cost unpriced'));
+});
+check('manual_terminal_refreshes_full_view_without_controller_replacement_or_action_replay',ok=>{
+  const f=fixture();f.recover(f.snapshot({messages:[{role:'assistant',text:'old visible history'}],turns:7,cost_microcents:1000000,accounting:{revision:0,full_cost_status:'unknown_legacy'}}));
+  f.nodes.get('composer').value='/compact';f.click('btn-send');const socket=f.current(),id=socket.sent[0].request_id;
+  emitContext(f,'request_accepted',{request_id:id,action:'compact'},2);
+  emitContext(f,'compacted',{summary:'private-progress-secret',after_tokens:100},3);
+  const oldStream=f.streams.at(-1);
+  emitContext(f,'request_finished',{request_id:id,turns:7,input_tokens:111,output_tokens:47,cost_microcents:1500000,accounting:{revision:2,full_cost_status:'unknown_legacy'}},4);
+  ok(f.current()===socket&&!socket.closed);ok(f.sockets.length===1);ok(oldStream.closed);
+  ok(!f.streams.at(-1).url.includes('sequence='));ok(socket.sent.filter(v=>v.type==='compact').length===1);
+  ok(!socket.sent.some(v=>v.type==='prompt'));
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:5},messages:[{role:'user',text:'historical summary marker'},{role:'assistant',text:'safe installed summary'}],turns:7,input_tokens:111,output_tokens:47,cost_microcents:1500000,accounting:{revision:2,full_cost_status:'unknown_legacy'}}));
+  ok(f.nodes.get('transcript').textContent.includes('safe installed summary'));ok(!f.nodes.get('transcript').textContent.includes('old visible history'));
+  ok(!f.nodes.get('transcript').textContent.includes('private-progress-secret'));ok(f.nodes.get('st-turns').textContent==='7');
+  oldStream.emit('text_delta',{text:'obsolete stream',_cursor:{instance:'fixture-owner',sequence:100}});
+  ok(!f.nodes.get('transcript').textContent.includes('obsolete stream'));ok(/unknown history/.test(f.nodes.get('st-cost').textContent));
+});
+check('manual_read_only_event_completion_only_refreshes_sse_and_preserves_no_action_authority',ok=>{
+  const f=fixture();f.current().onclose();f.runReconnect();
+  const socket=f.current();
+  f.recover(f.snapshot({state:'running',current_request:'other-controller',accounting:null}));
+  emitContext(f,'request_accepted',{request_id:'other-controller',action:'compact'},2);
+  emitContext(f,'request_finished',{request_id:'other-controller',turns:0,input_tokens:0,output_tokens:0,cost_microcents:0,accounting:{revision:0,full_cost_status:'known'}},3);
+  ok(f.current()===socket&&f.sockets.length===2);ok(socket.sent.length===0);
+  ok(f.nodes.get('btn-send').disabled);ok(!f.streams.at(-1).url.includes('sequence='));
+  ok(/full cost unavailable/.test(f.nodes.get('st-cost').textContent));
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:4},accounting:{revision:0,full_cost_status:'known'}}));
+  ok(/full cost known/.test(f.nodes.get('st-cost').textContent));
+});
+check('billing_identity_replacement_starts_independent_revision_floor',ok=>{
+  const f=fixture();f.recover(f.snapshot({accounting:{revision:20,full_cost_status:'known'}}));
+  f.recover(f.snapshot({session_id:'new-billing-session',cursor:{instance:'fixture-owner',sequence:2},accounting:{revision:0,full_cost_status:'known'}}));
+  ok(/full cost known/.test(f.nodes.get('st-cost').textContent));
+  f.recover(f.snapshot({session_id:'new-billing-session',cursor:{instance:'fixture-owner',sequence:3},accounting:{revision:0,full_cost_status:'uncertain'}}));
+  ok(/full cost uncertain/.test(f.nodes.get('us-cost').textContent));
+  f.recover(f.snapshot({session_id:'new-billing-session',cursor:{instance:'restarted-owner',sequence:1}}));
+  ok(/full cost unavailable/.test(f.nodes.get('st-cost').textContent));
+});
+
+check('manual_pending_intent_rejects_unmatched_idle_recovery_and_stale_terminal',ok=>{
+  const f=fixture();f.recover(f.snapshot({messages:[{role:'assistant',text:'current history'}],accounting:{revision:0,full_cost_status:'known'}}));
+  f.nodes.get('composer').value='/compact';f.click('btn-send');const id=f.current().sent[0].request_id;
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:2},messages:[{role:'assistant',text:'stale overwrite'}],accounting:{revision:0,full_cost_status:'known'}}));
+  ok(f.nodes.get('btn-send').disabled);ok(f.nodes.get('transcript').textContent.includes('current history'));
+  ok(!f.nodes.get('transcript').textContent.includes('stale overwrite'));ok(/unavailable/.test(f.nodes.get('st-cost').textContent));
+  emitContext(f,'request_finished',{request_id:'other-old-intent',turns:99,input_tokens:99,output_tokens:99,cost_microcents:999,accounting:{revision:0,full_cost_status:'known'}},3);
+  ok(f.nodes.get('btn-send').disabled);ok(f.nodes.get('st-turns').textContent==='0');
+  emitContext(f,'request_accepted',{request_id:id,action:'compact'},4);
+  ok(f.current().sent.filter(v=>v.type==='compact').length===1);
+});
+check('manual_terminal_serializes_full_view_refresh_before_new_work',ok=>{
+  const f=fixture();f.recover(f.snapshot({accounting:{revision:0,full_cost_status:'known'}}));
+  f.nodes.get('composer').value='/compact';f.click('btn-send');const id=f.current().sent[0].request_id;
+  emitContext(f,'request_accepted',{request_id:id,action:'compact'},2);
+  emitContext(f,'request_finished',{request_id:id,turns:0,input_tokens:11,output_tokens:7,cost_microcents:7,accounting:{revision:2,full_cost_status:'known'}},3);
+  ok(f.nodes.get('btn-send').disabled);ok(/unavailable/.test(f.nodes.get('st-cost').textContent));
+  f.nodes.get('composer').value='new work after refresh';f.nodes.get('btn-send').onclick();
+  ok(!f.current().sent.some(v=>v.type==='prompt'));ok(f.nodes.get('composer').value==='new work after refresh');
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:4},messages:[{role:'assistant',text:'installed current summary'}],accounting:{revision:2,full_cost_status:'known'}}));
+  ok(!f.nodes.get('btn-send').disabled);f.click('btn-send');ok(f.current().sent.filter(v=>v.type==='prompt').length===1);
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:5},messages:[{role:'assistant',text:'late old summary'}],accounting:{revision:2,full_cost_status:'known'}}));
+  ok(f.nodes.get('btn-send').disabled);ok(!f.nodes.get('transcript').textContent.includes('late old summary'));
+});
+check('manual_throwing_send_retains_exact_id_across_preclaim_recovery_without_replay',ok=>{
+  const f=fixture();f.recover(f.snapshot({messages:[{role:'assistant',text:'preserved current view'}],accounting:{revision:0,full_cost_status:'known'}}));
+  let attempted;f.current().send=text=>{attempted=JSON.parse(text);throw new Error('ambiguous owned transport');};
+  f.nodes.get('composer').value='/compact';f.click('btn-send');
+  ok(attempted.type==='compact'&&typeof attempted.request_id==='string');ok(f.nodes.get('btn-send').disabled);
+  f.runReconnect();
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:2},messages:[{role:'assistant',text:'preclaim stale view'}],accounting:{revision:0,full_cost_status:'known'}}));
+  ok(f.nodes.get('btn-send').disabled);ok(!f.nodes.get('transcript').textContent.includes('preclaim stale view'));
+  f.ready();const id=attempted.request_id;
+  f.current().message({type:'action_ack',ack:{request_id:null},snapshot:f.snapshot()});
+  f.current().message({type:'action_ack',ack:{request_id:null},snapshot:f.snapshot({state:'running',current_request:id,requests:{[id]:{kind:'compact',state:'running'}},accounting:null})});
+  ok(f.nodes.get('btn-send').disabled);ok(/unavailable/.test(f.nodes.get('st-cost').textContent));
+  ok(!f.current().sent.some(v=>v.type==='compact'||v.type==='prompt'));
+});
+check('manual_postclaim_inspection_can_prove_definite_absence_without_replaying',ok=>{
+  const f=fixture();f.recover(f.snapshot({accounting:{revision:0,full_cost_status:'known'}}));
+  f.nodes.get('composer').value='/compact';f.click('btn-send');f.current().onclose();f.runReconnect();
+  f.recover(f.snapshot({cursor:{instance:'fixture-owner',sequence:2},requests:{},accounting:{revision:0,full_cost_status:'known'}}));
+  ok(f.nodes.get('btn-send').disabled);f.ready();
+  f.current().message({type:'action_ack',ack:{request_id:null},snapshot:f.snapshot({requests:{},accounting:{revision:0,full_cost_status:'known'}})});
+  ok(f.nodes.get('btn-send').disabled);
+  f.current().message({type:'action_ack',ack:{request_id:null},snapshot:f.snapshot({requests:{},accounting:{revision:0,full_cost_status:'known'}})});
+  ok(!f.nodes.get('btn-send').disabled);ok(/full cost known/.test(f.nodes.get('st-cost').textContent));
+  ok(!f.current().sent.some(v=>v.type==='compact'||v.type==='prompt'));
+});
+check('manual_stopping_owner_keeps_controls_busy_and_cost_unavailable',ok=>{
+  const f=fixture();f.recover(f.snapshot({state:'stopping',cost_microcents:1000000,accounting:{revision:2,full_cost_status:'known'}}));
+  ok(f.nodes.get('btn-send').disabled);ok(f.nodes.get('effort-select').disabled);ok(/unavailable/.test(f.nodes.get('st-cost').textContent));
+  ok(f.nodes.get('st-cost').textContent.includes('$1.0000'));
+  f.nodes.get('composer').value='/compact';f.nodes.get('btn-send').onclick();ok(f.current().sent.length===0);ok(f.nodes.get('composer').value==='/compact');
+});
+console.log(`ORBIT_MANUAL_CHECK_RECEIPT ${JSON.stringify({scenarios})}`);

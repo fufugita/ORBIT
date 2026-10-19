@@ -6,6 +6,9 @@ use orbit_engine::{
 };
 use orbit_frontend_protocol::FrontendEvent;
 use orbit_provider_http::CancelToken;
+
+#[path = "support/compaction_journal.rs"]
+pub mod compaction_journal;
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::io::{Read, Write};
@@ -749,7 +752,14 @@ fn context_budget_typed_compacting_event_uses_selected_window() {
     let config = config(&fixture);
     let budget = SelectedBudget::legacy_input(&config, 1000).unwrap();
     let mut transcript: Vec<_> = (0..12)
-        .map(|n| orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50))))
+        .map(|n| {
+            let mut message =
+                orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50)));
+            if n % 2 == 1 {
+                message.role = orbit_adapter::types::ChatRole::Assistant;
+            }
+            message
+        })
         .collect();
     let original = transcript.clone();
     let mut events = Vec::new();
@@ -761,6 +771,12 @@ fn context_budget_typed_compacting_event_uses_selected_window() {
             max_rounds: 1,
             max_attempts: 1,
             selected_budget: Some(budget),
+            compaction_config: Some(config.clone()),
+            compaction_budget: Some(SelectedBudget::legacy_input(&config, 8192).unwrap()),
+            session_id: "budget-event-owner".into(),
+            journal: Some(compaction_journal::MemoryJournal::fresh(
+                "budget-event-owner",
+            )),
             window_tokens: None,
             ..Default::default()
         },
@@ -797,32 +813,35 @@ fn context_budget_typed_compacting_event_uses_selected_window() {
                 [fixture.authority.as_str()]
             );
         }
-        assert!(serde_json::to_vec(&requests[0].body).unwrap().len() < 3600);
-        assert!(serde_json::to_vec(&requests[1].body).unwrap().len() < 3600);
+        assert!((serde_json::to_vec(&requests[0].body).unwrap().len() as u64).div_ceil(4) <= 8192);
+        assert!((serde_json::to_vec(&requests[1].body).unwrap().len() as u64).div_ceil(4) <= 1000);
         assert!(requests[0].body.get("tools").is_none());
-        let summary_messages = requests[0].body["messages"].as_array().unwrap();
-        assert_eq!(summary_messages.len(), 1);
-        assert!(
-            summary_messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("Summarize this conversation for continuation.")
+        let summary_text = requests[0].body["messages"].to_string();
+        assert!(summary_text.contains("Summarize this conversation for continuation."));
+        assert!(!summary_text.contains(PROMPT));
+        let candidate = &transcript[..transcript.len() - 1];
+        assert_eq!(
+            candidate[0],
+            orbit_engine::user_message("[Earlier conversation summary: historical data]")
+        );
+        assert_eq!(candidate[1], orbit_engine::assistant_message(ANSWER));
+        assert!(candidate.len() < original.len() + 1);
+        assert_eq!(
+            &candidate[candidate.len() - 5..candidate.len() - 1],
+            &original[8..]
+        );
+        assert_eq!(
+            candidate.last().unwrap(),
+            &orbit_engine::user_message(PROMPT)
         );
         assert!(
-            !summary_messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains(PROMPT)
+            original.iter().any(|old| !candidate.contains(old)),
+            "some complete old source must be replaced"
         );
-        let mut candidate_messages = vec![
-            json!({"role":"user","content":format!("[context compacted from 7 older messages]\n\n{ANSWER}")}),
-        ];
-        candidate_messages.extend(
-            original[7..]
-                .iter()
-                .map(|message| json!({"role":"user","content":message.content})),
-        );
-        candidate_messages.push(json!({"role":"user","content":PROMPT}));
+        let candidate_messages: Vec<_> = candidate
+            .iter()
+            .map(|message| json!({"role":message.role.as_str(),"content":message.content}))
+            .collect();
         assert_eq!(
             requests[1].body,
             json!({"model":MODEL,"stream":true,"stream_options":{"include_usage":true},"max_tokens":16,"messages":candidate_messages})
@@ -847,4 +866,851 @@ fn context_budget_typed_compacting_event_uses_selected_window() {
         [1000],
         "typed selected policy must reach the compacting event without a legacy window"
     );
+}
+
+mod complete_group_compaction_old_api {
+    use super::*;
+    use orbit_adapter::types::{ChatRole, ContentBlock, ToolCallMessage};
+
+    const WINDOW: u64 = 2000;
+    const SUMMARY_WINDOW: u64 = 12000;
+    const CURRENT: &str = "CURRENT-INTENT: continue the newest exact exchange";
+    const OLD_VISIBLE: &str = "OLD-VISIBLE-STATE-BEYOND-400: preserve the final chosen task state";
+    const OLD_RESULT: &str = "OLD-RESULT-STATE-BEYOND-PREFIX: use the complete recorded result";
+    const HIDDEN: &str = "PRIVATE-OPAQUE-REASONING-MUST-NOT-BE-PROJECTED";
+    const SYSTEM: &str = "Keep the selected continuation and its exact tool identities.";
+
+    fn tool_result(id: &str, text: String) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: "display fallback, not the raw result".into(),
+            tool_call_id: Some(id.into()),
+            tool_result: Some(text),
+            tool_calls: None,
+            blocks: None,
+            origin_model: None,
+            origin_provider: None,
+        }
+    }
+
+    fn call(id: &str, query: &str) -> ToolCallMessage {
+        ToolCallMessage {
+            id: id.into(),
+            name: "fixture_lookup".into(),
+            arguments: json!({"query":query}).to_string(),
+        }
+    }
+
+    fn old_group() -> Vec<ChatMessage> {
+        let mut requested = orbit_engine::assistant_message("old tool request");
+        requested.tool_calls = Some(vec![call("old-call", "old-query")]);
+        let visible = format!("{} {OLD_VISIBLE}", "prior visible decision ö ".repeat(30));
+        let mut completed = orbit_engine::assistant_message(visible.clone());
+        completed.blocks = Some(vec![
+            ContentBlock::Text { text: visible },
+            ContentBlock::Opaque {
+                json:
+                    json!({"type":"thinking","thinking":HIDDEN,"signature":"private-old-signature"})
+                        .to_string(),
+            },
+        ]);
+        completed.origin_provider = Some("another-exact-provider".into());
+        completed.origin_model = Some("another/raw-model".into());
+        vec![
+            orbit_engine::user_message("OLD-USER-TASK: inspect the earlier complete exchange"),
+            requested,
+            tool_result(
+                "old-call",
+                format!("{} {OLD_RESULT}", "older result λ ".repeat(1000)),
+            ),
+            completed,
+        ]
+    }
+
+    fn newest_group() -> Vec<ChatMessage> {
+        let mut requested =
+            orbit_engine::assistant_message("NEWEST-EXCHANGE: four parallel lookups");
+        requested.tool_calls = Some(
+            (0..4)
+                .map(|i| call(&format!("latest-{i}"), &format!("latest query {i} λ")))
+                .collect(),
+        );
+        requested.blocks = Some(vec![ContentBlock::Text {
+            text: requested.content.clone(),
+        }]);
+        requested.origin_provider = Some("context-budget-fixture".into());
+        requested.origin_model = Some(MODEL.into());
+        let mut completed =
+            orbit_engine::assistant_message("NEWEST-COMPLETED-STATE: retain exact typed blocks");
+        completed.blocks=Some(vec![
+            ContentBlock::Text {text:completed.content.clone()},
+            ContentBlock::Opaque {json:json!({"type":"thinking","thinking":HIDDEN,"signature":"private-latest-signature"}).to_string()},
+        ]);
+        completed.origin_provider = Some("another-exact-provider".into());
+        completed.origin_model = Some("another/raw-model".into());
+        let mut messages = vec![
+            orbit_engine::user_message("KEEP-NEWEST-USER: complete this authoritative exchange"),
+            requested,
+        ];
+        for i in [2, 0, 3, 1] {
+            messages.push(tool_result(
+                &format!("latest-{i}"),
+                format!("LATEST-RESULT-{i}: Unicode λ and exact recorded output"),
+            ));
+        }
+        messages.push(completed);
+        messages
+    }
+
+    fn current(blocks: &[ContentBlock]) -> ChatMessage {
+        let mut message = orbit_engine::user_message(CURRENT);
+        message.blocks = Some(blocks.to_vec());
+        message
+    }
+
+    fn options(config: &TurnConfig, window: u64) -> TurnOptions {
+        let mut summary = config.clone();
+        summary.provider_id = "exact-summary-provider".into();
+        summary.model = "raw-summary-model/unchanged".into();
+        summary.max_output_tokens = 37;
+        TurnOptions {
+            max_rounds: 1,
+            max_attempts: 1,
+            session_id: "complete-group-owner".into(),
+            request_stem: "complete-group-old-api".into(),
+            tools: tools("short exact query"),
+            user_blocks: Some(vec![ContentBlock::Text {
+                text: CURRENT.into(),
+            }]),
+            system_directive: Some(SYSTEM.into()),
+            selected_budget: Some(
+                orbit_engine::context_budget::SelectedBudget::legacy_input(config, window).unwrap(),
+            ),
+            compaction_budget: Some(
+                orbit_engine::context_budget::SelectedBudget::legacy_input(
+                    &summary,
+                    SUMMARY_WINDOW,
+                )
+                .unwrap(),
+            ),
+            compaction_config: Some(summary),
+            journal: Some(compaction_journal::MemoryJournal::fresh(
+                "complete-group-owner",
+            )),
+            window_tokens: None,
+            ..Default::default()
+        }
+    }
+
+    fn projected_body(
+        config: &TurnConfig,
+        messages: &[ChatMessage],
+        definitions: &[ToolDefinition],
+    ) -> Value {
+        let route=serde_json::from_value(json!({
+            "provider_id":config.provider_id,"deployment_id":"fixture","region_id":"local",
+            "adapter_kind":"OpenAiCompatibleHttpV1","adapter_implementation_digest":"implementation",
+            "adapter_profile_digest":"profile","endpoint_digest":"endpoint",
+            "expected_model":config.model,"pricing_digest":"pricing",
+            "endpoint_host":"127.0.0.1","endpoint_port":80,
+            "endpoint_scheme":"HttpLoopback","endpoint_path":""
+        })).unwrap();
+        let mut request = orbit_adapter::conformance::canonical_request(&route, CURRENT.as_bytes());
+        let mut wire = messages.to_vec();
+        orbit_engine::routing::strip_foreign_opaque_blocks_for(
+            &mut wire,
+            &config.provider_id,
+            &config.model,
+        );
+        request.messages = Some(wire);
+        request.tools = definitions.to_vec();
+        request.sampling = orbit_adapter::types::SamplingParameters {
+            temperature_milliunits: 0,
+            top_p_millionths: 0,
+            max_output_tokens: config.max_output_tokens,
+        };
+        orbit_provider_http::request::render_request_body(
+            orbit_provider_http::request::HttpDialect::OpenAiCompatible,
+            orbit_provider_http::request::RequestBodyInput::from(&request),
+        )
+        .unwrap()
+        .as_json()
+        .clone()
+    }
+
+    fn estimate(body: &Value) -> u64 {
+        let bytes = serde_json::to_vec(body).unwrap().len() as u64;
+        bytes.div_ceil(4)
+    }
+
+    fn with_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        let mut system = orbit_engine::user_message(SYSTEM);
+        system.role = ChatRole::System;
+        std::iter::once(system)
+            .chain(messages.iter().cloned())
+            .collect()
+    }
+
+    fn assert_closed_tools(messages: &[Value]) {
+        let mut calls = std::collections::BTreeSet::new();
+        let mut results = std::collections::BTreeSet::new();
+        for message in messages {
+            if let Some(items) = message.get("tool_calls").and_then(Value::as_array) {
+                for item in items {
+                    let id = item["id"].as_str().expect("retained call ID");
+                    assert!(
+                        !id.is_empty() && calls.insert(id),
+                        "retained call IDs must be unique"
+                    );
+                }
+            }
+            if message["role"] == "tool" {
+                let id = message["tool_call_id"]
+                    .as_str()
+                    .expect("retained result ID");
+                assert!(
+                    calls.contains(id),
+                    "a retained result cannot precede or outlive its call"
+                );
+                assert!(
+                    results.insert(id),
+                    "each retained result matches exactly once"
+                );
+            }
+        }
+        assert_eq!(
+            calls, results,
+            "every retained call is complete in this fixture"
+        );
+    }
+
+    fn assert_private(events: &[FrontendEvent]) {
+        for event in events {
+            if let FrontendEvent::TextDelta { text } = event {
+                assert!(!text.contains(HIDDEN));
+            }
+        }
+    }
+
+    #[test]
+    fn complete_group_compaction_keeps_fitting_newest_parallel_exchange_and_exact_typed_tail() {
+        let home = Home::new();
+        let mut fixture = Fixture::new();
+        let config = config(&fixture);
+        let options = options(&config, WINDOW);
+        let newest = newest_group();
+        let mut transcript = old_group();
+        transcript.extend(newest.clone());
+        let original = transcript.clone();
+        let intent = current(options.user_blocks.as_ref().unwrap());
+        let mut full = original.clone();
+        full.push(intent.clone());
+        let mut required = newest.clone();
+        required.push(intent);
+        assert!(
+            required.len() > 6,
+            "the newest complete group crosses the historical fixed-six cut"
+        );
+        let full_body = projected_body(&config, &with_system(&full), &options.tools);
+        assert!(estimate(&full_body) > WINDOW);
+        let mut possible = vec![
+            orbit_engine::user_message("[Earlier conversation summary: historical data]"),
+            orbit_engine::assistant_message(ANSWER),
+        ];
+        possible.extend(required.clone());
+        let possible_body = projected_body(&config, &with_system(&possible), &options.tools);
+        assert!(
+            estimate(&possible_body) + 256 < WINDOW,
+            "one bounded summary plus the complete newest group demonstrably fits"
+        );
+        let mut executor = NoEffects::default();
+        let mut events = Vec::new();
+        let result = orbit_engine::run_turn(
+            &home.0,
+            &config,
+            &options,
+            CURRENT,
+            &mut transcript,
+            &mut executor,
+            &CancelToken::new(),
+            &mut |event| events.push(event),
+        );
+        fixture.finish();
+        assert_eq!(executor.0, 0);
+        let report=result.unwrap_or_else(|error|panic!("a fitting complete newest exchange must compact successfully rather than be blanket-refused; accepted={} parsed={}; error={error}",fixture.connections.load(Ordering::SeqCst),fixture.requests.lock().unwrap().len()));
+        assert!(report.ok && !report.interrupted);
+        assert_eq!(report.final_text, ANSWER);
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one fitting older-group summary, then one ordinary continuation"
+        );
+        let summary = &requests[0].body;
+        assert_eq!(summary["model"], "raw-summary-model/unchanged");
+        assert_eq!(summary["max_tokens"], 37);
+        assert!(summary.get("tools").is_none());
+        assert!(summary.get("reasoning_effort").is_none());
+        assert!(estimate(summary) <= SUMMARY_WINDOW);
+        let summary_text = serde_json::to_string(summary).unwrap();
+        assert!(
+            summary_text.contains(OLD_VISIBLE) && summary_text.contains(OLD_RESULT),
+            "safe older visible task state must survive beyond former 400/200-byte prefixes"
+        );
+        assert!(
+            summary_text.contains("old-call")
+                && summary_text.contains("fixture_lookup")
+                && summary_text.contains("old-query")
+        );
+        assert!(
+            !summary_text.contains(HIDDEN)
+                && !summary_text.contains("private-old-signature")
+                && !summary_text.contains("private-latest-signature")
+        );
+        assert!(!summary_text.contains(CURRENT) && !summary_text.contains("KEEP-NEWEST-USER"));
+        let main = &requests[1].body;
+        assert_eq!(main["model"], MODEL);
+        assert_eq!(main["max_tokens"], 16);
+        assert!(main["tools"].is_array());
+        assert!(estimate(main) <= WINDOW);
+        let main_messages = main["messages"].as_array().unwrap();
+        assert_closed_tools(main_messages);
+        let expected = projected_body(&config, &required, &options.tools);
+        let expected = expected["messages"].as_array().unwrap();
+        assert!(main_messages.len() >= expected.len());
+        assert_eq!(
+            &main_messages[main_messages.len() - expected.len()..],
+            expected.as_slice()
+        );
+        assert!(!serde_json::to_string(main).unwrap().contains(HIDDEN));
+        assert_eq!(transcript.last().unwrap().content, ANSWER);
+        let retained_end = transcript.len() - 1;
+        assert!(retained_end >= required.len());
+        assert_eq!(
+            &transcript[retained_end - required.len()..retained_end],
+            required.as_slice(),
+            "retained blocks, raw tool results, IDs and origin fields must remain byte-for-byte equal"
+        );
+        assert!(!transcript.iter().any(|message| message == &original[0]));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, FrontendEvent::Compacted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, FrontendEvent::TextDelta { .. }))
+                .count(),
+            1,
+            "summary deltas stay private even when the fixture reply matches ordinary text"
+        );
+        assert_private(&events);
+        for request in requests.iter() {
+            assert_eq!(request.target, TARGET);
+            assert!(
+                !request
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == "authorization" || name == "x-api-key")
+            );
+        }
+    }
+
+    #[test]
+    fn complete_group_already_fits_without_compaction_and_keeps_original_typed_history() {
+        let home = Home::new();
+        let mut fixture = Fixture::new();
+        let config = config(&fixture);
+        let options = options(&config, 10000);
+        let mut transcript = newest_group();
+        let mut expected = transcript.clone();
+        expected.push(current(options.user_blocks.as_ref().unwrap()));
+        let expected_body = projected_body(&config, &with_system(&expected), &options.tools);
+        assert!(estimate(&expected_body) < 9000);
+        let mut executor = NoEffects::default();
+        let mut events = Vec::new();
+        let result = orbit_engine::run_turn(
+            &home.0,
+            &config,
+            &options,
+            CURRENT,
+            &mut transcript,
+            &mut executor,
+            &CancelToken::new(),
+            &mut |event| events.push(event),
+        );
+        fixture.finish();
+        assert!(result.unwrap().ok);
+        assert_eq!(executor.0, 0);
+        assert_eq!(&transcript[..expected.len()], expected.as_slice());
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body, expected_body);
+        assert_closed_tools(requests[0].body["messages"].as_array().unwrap());
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            FrontendEvent::Compacting { .. } | FrontendEvent::Compacted { .. }
+        )));
+        assert_private(&events);
+    }
+
+    fn refusal_control(mut newest: Vec<ChatMessage>, oversized_intent: bool, media: bool) {
+        let home = Home::new();
+        let mut fixture = Fixture::new();
+        let config = config(&fixture);
+        let mut options = options(&config, WINDOW);
+        let prompt = if oversized_intent {
+            "CURRENT-TOO-LARGE ".repeat(1000)
+        } else {
+            CURRENT.into()
+        };
+        let mut blocks = vec![ContentBlock::Text {
+            text: prompt.clone(),
+        }];
+        if media {
+            blocks.push(ContentBlock::Image {data:"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".into(),media_type:"image/png".into()});
+            options
+                .selected_budget
+                .as_mut()
+                .unwrap()
+                .policy
+                .media_policy = orbit_engine::context_budget::MediaPolicy::Refuse;
+        }
+        options.user_blocks = Some(blocks.clone());
+        let mut transcript = old_group();
+        transcript.append(&mut newest);
+        let mut expected = transcript.clone();
+        let mut intent = orbit_engine::user_message(prompt.clone());
+        intent.blocks = Some(blocks);
+        expected.push(intent);
+        let mut executor = NoEffects::default();
+        let mut events = Vec::new();
+        let result = orbit_engine::run_turn(
+            &home.0,
+            &config,
+            &options,
+            &prompt,
+            &mut transcript,
+            &mut executor,
+            &CancelToken::new(),
+            &mut |event| events.push(event),
+        );
+        fixture.finish();
+        let error =
+            result.expect_err("protected malformed or immutable history must refuse locally");
+        assert!(error.len() <= 512 && !error.contains(&fixture.url) && !error.contains(HIDDEN));
+        if media {
+            let lower = error.to_ascii_lowercase();
+            assert!(
+                lower.contains("context budget")
+                    || (lower.contains("media") && lower.contains("policy")),
+                "strict-media control requires a policy refusal, not an incidental image/render error"
+            );
+        }
+        assert_eq!(fixture.connections.load(Ordering::SeqCst), 0);
+        assert!(fixture.requests.lock().unwrap().is_empty());
+        assert_eq!(executor.0, 0);
+        assert_eq!(transcript, expected);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            FrontendEvent::Compacting { .. }
+                | FrontendEvent::Compacted { .. }
+                | FrontendEvent::TextDelta { .. }
+        )));
+    }
+
+    #[test]
+    fn complete_group_missing_tool_result_id_refuses_without_post_or_history_repair() {
+        let mut group = newest_group();
+        group[2].tool_call_id = None;
+        refusal_control(group, false, false);
+    }
+
+    #[test]
+    fn complete_group_duplicate_call_identity_refuses_without_post_or_history_repair() {
+        let mut group = newest_group();
+        group[1].tool_calls.as_mut().unwrap()[1].id = "latest-0".into();
+        refusal_control(group, false, false);
+    }
+
+    #[test]
+    fn complete_group_unmatched_result_identity_refuses_without_post_or_history_repair() {
+        let mut group = newest_group();
+        group[2].tool_call_id = Some("unmatched-result".into());
+        refusal_control(group, false, false);
+    }
+
+    #[test]
+    fn complete_group_missing_parallel_result_refuses_without_post_or_history_repair() {
+        let mut group = newest_group();
+        group.remove(2);
+        refusal_control(group, false, false);
+    }
+
+    #[test]
+    fn complete_group_immutable_current_intent_overflow_refuses_before_summary() {
+        refusal_control(newest_group(), true, false);
+    }
+
+    #[test]
+    fn complete_group_explicit_strict_media_control_refuses_without_dropping_typed_blocks() {
+        refusal_control(newest_group(), false, true);
+    }
+
+    #[test]
+    fn complete_group_missing_journal_refuses_without_provider_effect_or_history_loss() {
+        let home = Home::new();
+        let mut fixture = Fixture::new();
+        let config = config(&fixture);
+        let mut options = options(&config, WINDOW);
+        options.journal = None;
+        let mut transcript = old_group();
+        transcript.extend(newest_group());
+        let mut expected = transcript.clone();
+        expected.push(current(options.user_blocks.as_ref().unwrap()));
+        let mut executor = NoEffects::default();
+        let mut events = Vec::new();
+        let error = orbit_engine::run_turn(
+            &home.0,
+            &config,
+            &options,
+            CURRENT,
+            &mut transcript,
+            &mut executor,
+            &CancelToken::new(),
+            &mut |e| events.push(e),
+        )
+        .expect_err("compaction requires an explicit archive/accounting journal");
+        fixture.finish();
+        assert!(error.len() <= 512);
+        assert!(error.to_ascii_lowercase().contains("journal"));
+        assert_eq!(fixture.connections.load(Ordering::SeqCst), 0);
+        assert!(fixture.requests.lock().unwrap().is_empty());
+        assert_eq!(transcript, expected);
+        assert_eq!(executor.0, 0);
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            FrontendEvent::Compacting { .. }
+                | FrontendEvent::Compacted { .. }
+                | FrontendEvent::TextDelta { .. }
+        )));
+    }
+
+    mod service_old_public_api {
+        use super::*;
+
+        const SELECTED_INPUT: u64 = 1000;
+        const FULL_TEXT_SENTINEL: &str = "FULL-OLDER-TASK-STATE-AFTER-400-BYTES";
+        const CHUNK_A: &str = "WHOLE-GROUP-A-STATE-AT-END";
+        const CHUNK_B: &str = "WHOLE-GROUP-B-STATE-AT-END";
+
+        struct Observed {
+            bodies: Vec<Value>,
+            events: Vec<FrontendEvent>,
+        }
+
+        fn append_pair(source: &mut Vec<ChatMessage>, label: &str, bytes: usize, end: &str) {
+            source.push(orbit_engine::user_message(format!(
+                "{label} user: {} {end}",
+                "u".repeat(bytes)
+            )));
+            source.push(orbit_engine::assistant_message(format!(
+                "{label} assistant: {} {end}",
+                "a".repeat(bytes)
+            )));
+        }
+
+        fn append_recent(source: &mut Vec<ChatMessage>) {
+            // Three recent completed pairs also leave the current fixed-six path
+            // with an exact newest-two-pairs/current-intent suffix on the baseline.
+            for index in 0..3 {
+                append_pair(
+                    source,
+                    &format!("recent-{index}"),
+                    0,
+                    "exact recent state λ",
+                );
+            }
+        }
+
+        fn summary_witness(config: &TurnConfig, source: &[ChatMessage]) -> Value {
+            let prompt = format!(
+                "Summarize this conversation for continuation. Keep the complete visible task state, decisions and open work. Historical JSON data follows.\n{}",
+                serde_json::to_string(source).unwrap()
+            );
+            projected_body(config, &[orbit_engine::user_message(prompt)], &[])
+        }
+
+        fn run_success(source: Vec<ChatMessage>, summary_window: u64) -> Observed {
+            let home = Home::new();
+            let mut fixture = Fixture::new();
+            let config = config(&fixture);
+            let mut options = options(&config, SELECTED_INPUT);
+            let summary = options.compaction_config.as_ref().unwrap();
+            options.compaction_budget = Some(
+                orbit_engine::context_budget::SelectedBudget::legacy_input(summary, summary_window)
+                    .unwrap(),
+            );
+            let intent = current(options.user_blocks.as_ref().unwrap());
+            let mut original_with_intent = source.clone();
+            original_with_intent.push(intent.clone());
+            let before = estimate(&projected_body(
+                &config,
+                &with_system(&original_with_intent),
+                &options.tools,
+            ));
+            assert!(
+                before > SELECTED_INPUT,
+                "the real whole request must require compaction"
+            );
+            let mut required = source[source.len() - 4..].to_vec();
+            required.push(intent);
+            let mut witness = vec![
+                orbit_engine::user_message("[Earlier conversation summary: historical data]"),
+                orbit_engine::assistant_message(ANSWER),
+            ];
+            witness.extend(required.clone());
+            assert!(
+                estimate(&projected_body(
+                    &config,
+                    &with_system(&witness),
+                    &options.tools
+                )) + 256
+                    < SELECTED_INPUT,
+                "a complete required suffix plus bounded summary demonstrably fits",
+            );
+            let mut transcript = source;
+            let mut executor = NoEffects::default();
+            let mut events = Vec::new();
+            let result = orbit_engine::run_turn(
+                &home.0,
+                &config,
+                &options,
+                CURRENT,
+                &mut transcript,
+                &mut executor,
+                &CancelToken::new(),
+                &mut |event| events.push(event),
+            );
+            fixture.finish();
+            assert_eq!(executor.0, 0);
+            let report = result.unwrap_or_else(|error| panic!(
+            "the fitting text-only fixture must complete; accepted={} parsed={}; error={error}",
+            fixture.connections.load(Ordering::SeqCst), fixture.requests.lock().unwrap().len(),
+        ));
+            assert!(report.ok && !report.interrupted);
+            assert_eq!(report.final_text, ANSWER);
+            let captured = fixture.requests.lock().unwrap();
+            assert!(captured.len() >= 2 && captured.len() <= MAX_REQUESTS);
+            for (index, request) in captured.iter().enumerate() {
+                assert_eq!(request.target, TARGET);
+                for name in ["authorization", "x-api-key"] {
+                    assert!(!request.headers.iter().any(|(key, _)| key == name));
+                }
+                let hosts: Vec<_> = request
+                    .headers
+                    .iter()
+                    .filter_map(|(key, value)| (key == "host").then_some(value.as_str()))
+                    .collect();
+                assert_eq!(hosts, [fixture.authority.as_str()]);
+                assert!(
+                    request
+                        .headers
+                        .iter()
+                        .any(|(key, value)| key == "content-type" && value == "application/json")
+                );
+                if index + 1 < captured.len() {
+                    assert_eq!(request.body["model"], "raw-summary-model/unchanged");
+                    assert_eq!(request.body["max_tokens"], 37);
+                    assert!(request.body.get("tools").is_none());
+                    assert!(request.body.get("reasoning_effort").is_none());
+                    assert!(estimate(&request.body) <= summary_window);
+                    assert!(
+                        !serde_json::to_string(&request.body["messages"])
+                            .unwrap()
+                            .contains(CURRENT)
+                    );
+                }
+            }
+            let main = &captured.last().unwrap().body;
+            assert_eq!(main["model"], MODEL);
+            assert_eq!(main["max_tokens"], 16);
+            assert!(main["tools"].is_array());
+            assert!(estimate(main) <= SELECTED_INPUT);
+            let expected = projected_body(&config, &required, &options.tools);
+            let expected_messages = expected["messages"].as_array().unwrap();
+            let actual_messages = main["messages"].as_array().unwrap();
+            assert!(actual_messages.len() >= expected_messages.len());
+            assert_eq!(
+                &actual_messages[actual_messages.len() - expected_messages.len()..],
+                expected_messages.as_slice(),
+            );
+            let end = transcript.len() - 1;
+            assert_eq!(transcript[end].content, ANSWER);
+            assert!(end >= required.len());
+            assert_eq!(&transcript[end - required.len()..end], required.as_slice());
+            let compacted: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    FrontendEvent::Compacted { after_tokens, .. } => Some(*after_tokens),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                compacted.len(),
+                1,
+                "the fitting candidate must actually be applied"
+            );
+            assert!(compacted[0] > 0 && compacted[0] <= SELECTED_INPUT && compacted[0] < before);
+            let visible: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    FrontendEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                visible,
+                [ANSWER],
+                "chunk/merge summary deltas remain private"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, FrontendEvent::Usage { .. }))
+                    .count(),
+                1
+            );
+            let ended: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    FrontendEvent::TurnEnded {
+                        ok, interrupted, ..
+                    } => Some((*ok, *interrupted)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                ended,
+                [(true, false)],
+                "only the ordinary turn closes the public lifecycle"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, FrontendEvent::Retrying { .. }))
+            );
+            assert_private(&events);
+            let bodies = captured
+                .iter()
+                .map(|request| request.body.clone())
+                .collect();
+            Observed { bodies, events }
+        }
+
+        #[test]
+        fn service_old_api_summary_receives_complete_plain_task_state_after_400_bytes() {
+            let mut source = Vec::new();
+            for index in 0..3 {
+                append_pair(
+                    &mut source,
+                    &format!("old-{index}"),
+                    1800,
+                    FULL_TEXT_SENTINEL,
+                );
+            }
+            append_recent(&mut source);
+            let observed = run_success(source, SUMMARY_WINDOW);
+            assert_eq!(
+                observed.bodies.len(),
+                2,
+                "one already-fitting full summary then ordinary"
+            );
+            let summary = serde_json::to_string(&observed.bodies[0]["messages"]).unwrap();
+            assert!(
+                summary.contains(FULL_TEXT_SENTINEL),
+                "the older complete visible task state must not end at the legacy 400-byte digest prefix",
+            );
+        }
+
+        #[test]
+        fn service_old_api_independent_budget_requires_two_whole_chunks_then_merge_and_main() {
+            const SUMMARY_INPUT: u64 = 2000;
+            let mut older = Vec::new();
+            append_pair(&mut older, "group-A", 2400, CHUNK_A);
+            append_pair(&mut older, "group-B", 2400, CHUNK_B);
+            let witness_config = TurnConfig {
+                provider_id: "exact-summary-provider".into(),
+                gate: "http://127.0.0.1:9".into(),
+                model: "raw-summary-model/unchanged".into(),
+                kind: ProviderKind::OpenAiCompatible,
+                credential_env: None,
+                pricing: None,
+                max_output_tokens: 37,
+                sampling: None,
+                effort: None,
+                supported_efforts: None,
+            };
+            // The witness uses the actual public body renderer. Its route is pure,
+            // not an additional listener/provider call and has no credential input.
+            assert!(estimate(&summary_witness(&witness_config, &older)) > SUMMARY_INPUT);
+            for group in older.as_chunks::<2>().0 {
+                assert!(estimate(&summary_witness(&witness_config, group)) + 256 < SUMMARY_INPUT);
+            }
+            let mut source = older;
+            append_recent(&mut source);
+            let observed = run_success(source, SUMMARY_INPUT);
+            assert_eq!(
+                observed.bodies.len(),
+                4,
+                "two independently fitting complete-group chunks, one fitting merge, one ordinary POST",
+            );
+            let a = serde_json::to_string(&observed.bodies[0]["messages"]).unwrap();
+            let b = serde_json::to_string(&observed.bodies[1]["messages"]).unwrap();
+            assert!(a.contains(CHUNK_A) && !a.contains(CHUNK_B));
+            assert!(b.contains(CHUNK_B) && !b.contains(CHUNK_A));
+            let merge = serde_json::to_string(&observed.bodies[2]["messages"]).unwrap();
+            assert!(
+                merge.matches(ANSWER).count() >= 2,
+                "the merge receives both complete chunk replies"
+            );
+            assert!(!merge.contains(CHUNK_A) && !merge.contains(CHUNK_B));
+            assert_eq!(
+                observed
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, FrontendEvent::Compacted { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn service_old_api_short_visible_prefix_fits_one_summary_without_redundant_merge() {
+            let mut source = Vec::new();
+            for index in 0..12 {
+                append_pair(
+                    &mut source,
+                    &format!("short-old-{index}"),
+                    180,
+                    "short complete task state",
+                );
+            }
+            append_recent(&mut source);
+            let observed = run_success(source, SUMMARY_WINDOW);
+            assert_eq!(
+                observed.bodies.len(),
+                2,
+                "a single fitting summary does not need a merge"
+            );
+            assert!(
+                serde_json::to_string(&observed.bodies[0]["messages"])
+                    .unwrap()
+                    .contains("short complete task state")
+            );
+        }
+    }
 }

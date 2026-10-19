@@ -7,15 +7,43 @@ const el = (tag, cls, text) => {
   if (text !== undefined) node.textContent = text;
   return node;
 };
-const fmtCost = (cost) => cost > 0 ? `$${(cost / 1_000_000).toFixed(4)}` : "—";
+const fmtCost = (cost) => `$${(cost / 1_000_000).toFixed(4)}`;
 const S = {
   ws: null, es: null, generation: 0, reconnectTimer: null, controlling: false,
   cursor: null, model: "—", provider: "—", session: "—", sessionShort: "—",
-  cost: null, turns: 0, busy: false, streamingBody: null,
+  cost: null, accounting: null, accountingFloor: null, pendingRequest: null, manualActive: false,
+  refreshPending: false, outgoing: [],
+  turns: 0, busy: false, streamingBody: null,
   contextUsage: null, contextProgress: null,
   pendingApprovals: [], approvalModalOpen: false, effort: null,
 };
 const tokenCount = (value) => Number.isSafeInteger(value) && value >= 0;
+const costStatuses = new Map([
+  ["known","known"], ["unknown_legacy","unknown history"], ["unknown_usage","unknown usage"],
+  ["unpriced","unpriced"], ["uncertain","uncertain"],
+]);
+function applyAccounting(value) {
+  // A checked revision qualifies this session's complete bill, never its model's price.
+  if (S.busy || !tokenCount(S.cost) || !tokenCount(S.input) || !tokenCount(S.output) || !tokenCount(S.turns)
+      || !value || !tokenCount(value.revision) || !costStatuses.has(value.full_cost_status)
+      || (S.accountingFloor !== null && value.revision < S.accountingFloor)) {
+    S.accounting=null; return;
+  }
+  S.accounting={revision:value.revision,status:value.full_cost_status};
+  S.accountingFloor=value.revision;
+}
+function costText() {
+  const amount=tokenCount(S.cost) ? fmtCost(S.cost) : "unavailable";
+  const qualification=S.accounting ? costStatuses.get(S.accounting.status) : "unavailable";
+  return `full cost ${qualification} · known subtotal ${amount}`;
+}
+function applyTotals(data) {
+  S.turns=tokenCount(data.turns) ? data.turns : null;
+  S.input=tokenCount(data.input_tokens) ? data.input_tokens : null;
+  S.output=tokenCount(data.output_tokens) ? data.output_tokens : null;
+  S.cost=tokenCount(data.cost_microcents) ? data.cost_microcents : null;
+  applyAccounting(data.accounting);
+}
 function clearContext() {
   S.contextUsage=null; S.contextProgress=null;
 }
@@ -204,11 +232,11 @@ function setupCustomization() {
 }
 
 function setStatus() {
-  for (const [key, value] of Object.entries({model:S.model,provider:S.provider,session:S.sessionShort,cost:S.cost === null ? "n/a" : fmtCost(S.cost),turns:S.turns})) {
+  for (const [key, value] of Object.entries({model:S.model,provider:S.provider,session:S.sessionShort,cost:costText(),turns:S.turns ?? "—"})) {
     $(`st-${key}`).textContent = value; $(`st-${key}`).dataset.k = key;
   }
   $("us-in").textContent = S.input ?? "—"; $("us-out").textContent = S.output ?? "—";
-  $("us-cost").textContent = S.cost === null ? "n/a" : fmtCost(S.cost); $("us-turns").textContent = S.turns;
+  $("us-cost").textContent = costText(); $("us-turns").textContent = S.turns ?? "—";
   renderContext();
   $("btn-cancel").hidden = !S.busy; $("btn-cancel").disabled = !S.controlling;
   $("btn-send").disabled = S.busy || !S.controlling;
@@ -274,24 +302,43 @@ function routeDescription(route) {
 function setOwnerSession(id) {
   const changed=S.session!==id;
   S.session=id;S.sessionShort=id.slice(0,8);
-  if(changed) clearContext();
+  if(changed) { clearContext(); S.accounting=null; S.accountingFloor=null; S.pendingRequest=null; S.manualActive=false; }
   if(S.customEnabled && changed) {
     S.customEpoch++;S.visibleAgents.clear();S.changedFiles=[];S.activityRows=[];S.routeText="";
     markCustomPanesStale();customizationRead(S.generation);
   }
 }
-function applySnapshot(snapshot) {
+function applySnapshot(snapshot, evidence={}) {
+  const pending=S.pendingRequest;
+  if (pending) {
+    const record=snapshot.requests?.[pending.id];
+    const sameSession=pending.session===snapshot.session_id;
+    const matched=sameSession && (snapshot.current_request===pending.id
+      || (record && (record.kind ?? "prompt")===pending.kind
+        && ["accepted","running","completed","failed","interrupted","unknown"].includes(record.state)));
+    const inspected=sameSession && S.controlling && evidence.inspectionFor===pending.id;
+    if (!matched && !inspected) return false;
+  }
+  if (S.refreshPending && !evidence.afterManual && !evidence.inspectionFor) return false;
   // Snapshots carry cumulative traffic, not a current request-size estimate.
   clearContext();
   S.model = snapshot.model; S.provider = snapshot.provider; setOwnerSession(snapshot.session_id);
   if(S.customEnabled)S.routeText=routeDescription(snapshot.last_route);
-  S.turns = snapshot.turns; S.input = snapshot.input_tokens; S.output = snapshot.output_tokens; S.cost = snapshot.cost_microcents;
-  S.busy = snapshot.state === "running"; S.effort = snapshot;
+  S.busy = snapshot.state === "running" || snapshot.state === "stopping"; S.effort = snapshot;
+  S.refreshPending=false;
+  if (snapshot.state==="stopped") S.controlling=false;
+  applyTotals(snapshot);
+  if (!S.busy) { S.pendingRequest=null; S.manualActive=false; }
+  else {
+    S.manualActive=snapshot.current_request ? snapshot.requests?.[snapshot.current_request]?.kind==="compact" || pending?.kind==="compact" : pending?.kind==="compact";
+    if (snapshot.current_request) S.pendingRequest={id:snapshot.current_request,kind:S.manualActive ? "compact" : "prompt",session:snapshot.session_id};
+  }
   $("transcript").textContent = ""; S.streamingBody = null;
   for (const message of snapshot.messages || []) addMsg(message.role, message.text);
   if (snapshot.partial_response) ensureStreaming().textContent = snapshot.partial_response;
   S.pendingApprovals = [...(snapshot.pending_approvals || [])]; showApproval(); renderEffort(); setStatus();
   if (["interrupted","stopped"].includes(snapshot.state)) toast(`Session ${snapshot.state}; no request was resubmitted`, true);
+  return true;
 }
 function applySettings(settings) {
   if (S.model!==settings.model || S.provider!==settings.provider) clearContext();
@@ -299,10 +346,11 @@ function applySettings(settings) {
   if(S.customEnabled && Object.prototype.hasOwnProperty.call(settings,"last_route"))S.routeText=routeDescription(settings.last_route);
   S.effort=settings; renderEffort(); setStatus();
 }
-function applyRecovery(recovery) {
-  if (recovery.snapshot) { applySnapshot(recovery.snapshot); S.cursor = recovery.snapshot.cursor; }
+function applyRecovery(recovery,evidence={}) {
+  const applied=!recovery.snapshot || applySnapshot(recovery.snapshot,evidence);
+  if (recovery.snapshot && applied) S.cursor=recovery.snapshot.cursor;
   for (const event of recovery.events || []) receive(event.kind, {...event.payload,_cursor:event.cursor});
-  S.cursor = recovery.cursor;
+  if (applied) S.cursor=recovery.cursor;
 }
 function receive(kind, data) {
   if (data._cursor) {
@@ -311,13 +359,28 @@ function receive(kind, data) {
     S.cursor = cursor;
   }
   switch (kind) {
-    case "identity": if (S.model!==data.model || S.provider!==data.provider) clearContext(); S.model=data.model; S.provider=data.provider; setOwnerSession(data.session_id || data.session); setStatus(); break;
-    case "text_delta": S.busy=true; ensureStreaming().appendChild(document.createTextNode(data.text)); setStatus(); scrollDown(); break;
+    case "identity": if (S.pendingRequest || S.refreshPending) break; if (S.model!==data.model || S.provider!==data.provider) clearContext(); S.model=data.model; S.provider=data.provider; setOwnerSession(data.session_id || data.session); setStatus(); break;
+    case "text_delta": S.busy=true; S.accounting=null; ensureStreaming().appendChild(document.createTextNode(data.text)); setStatus(); scrollDown(); break;
     case "response_finished": finishStreaming(data.output || ""); break;
-    case "request_accepted": clearContext(); S.busy=true; S.turnBaseCost=S.cost || 0; if (data.message) addMsg(data.message.role,data.message.text); setStatus(); break;
-    case "request_finished": S.busy=false; S.turns=data.turns ?? S.turns; S.input=data.input_tokens ?? S.input; S.output=data.output_tokens ?? S.output; S.cost=data.cost_microcents ?? S.cost; finishStreaming(); setStatus(); send({type:"effort"}); break;
+    case "request_accepted":
+      if (S.pendingRequest && data.request_id && S.pendingRequest.id!==data.request_id) break;
+      clearContext(); S.busy=true; S.accounting=null; S.manualActive=data.action==="compact";
+      if (data.request_id) S.pendingRequest={id:data.request_id,kind:S.manualActive ? "compact" : "prompt",session:S.session};
+      if (data.message) addMsg(data.message.role,data.message.text); setStatus(); break;
+    case "request_finished": {
+      if (S.pendingRequest && S.pendingRequest.id!==data.request_id) break;
+      const manual=S.manualActive;
+      S.pendingRequest=null; S.manualActive=false; S.refreshPending=manual; S.busy=manual;
+      applyTotals(data); finishStreaming(); setStatus();
+      if (S.controlling) send({type:"effort"});
+      // The owner alone holds the installed typed working history. Get its full
+      // checked view after manual completion without replaying an action or
+      // replacing the controller; an event-stream refresh carries no request.
+      if (manual) subscribeEvents(S.generation,false,true);
+      break;
+    }
     case "turn_ended": if (data.interrupted) toast("Turn interrupted",true); setStatus(); break;
-    case "cost_updated": S.cost=(S.turnBaseCost || 0)+(data.total_microcents || 0); setStatus(); break;
+    case "cost_updated": S.accounting=null; setStatus(); break;
     case "usage": S.contextUsage=contextSample(data); S.contextProgress=null; setStatus(); break;
     case "compacting":
       S.contextUsage=null;
@@ -355,49 +418,90 @@ function receive(kind, data) {
       for (const session of data.sessions || []) { const item=el("li",session.session_id===S.session ? "active" : "",`${session.session_id.slice(0,8)} · ${session.turns}t · ${session.model}`); item.onclick=()=>send({type:"resume",session_id:session.session_id}); $("sessions-list").appendChild(item); } break;
     }
     case "status": if (data.text) addMsg("system",data.text); break;
-    case "error": toast(data.message || "Session error",true); addMsg("system",data.message || "Session error"); break;
+    case "error": S.accounting=null; toast(data.message || "Session error",true); addMsg("system",data.message || "Session error"); setStatus(); break;
     case "stopped": S.busy=false; S.controlling=false; setStatus(); toast("Session stopped"); break;
   }
 }
-function send(action) {
-  if (!S.controlling || !S.ws || S.ws.readyState !== 1) { toast("Reconnect before sending an action",true); return false; }
-  S.ws.send(JSON.stringify(action)); return true;
+function send(action, inspectionFor=null) {
+  if (!S.controlling || !S.ws || S.ws.readyState !== 1 || S.outgoing.length>=64) {
+    toast("Reconnect before sending an action",true); return false;
+  }
+  const intent=action.type==="prompt" || action.type==="compact";
+  if (intent) {
+    if (S.busy || S.pendingRequest || S.refreshPending || S.session==="—") {toast("Wait for session inspection before sending work",true);return false;}
+    // The transport may throw after accepting bytes. Retain this exact intent
+    // before entering it; reconnect can inspect but never replay this action.
+    S.pendingRequest={id:action.request_id,kind:action.type,session:S.session};
+    S.manualActive=action.type==="compact"; S.busy=true; S.accounting=null; setStatus();
+  }
+  S.outgoing.push({type:action.type,inspectionFor});
+  try { S.ws.send(JSON.stringify(action)); return true; }
+  catch (_) {
+    S.accounting=null; setStatus(); toast("Action outcome unknown; reconnect to inspect without resubmitting",true);
+    reconnect(); return false;
+  }
 }
 function connState(cls,text) { $("conn").className=cls; $("conn-text").textContent=text; }
 function disconnect() {
   if (S.es) { S.es.close(); S.es=null; }
   if (S.ws) { S.ws.onclose=null; S.ws.onerror=null; S.ws.close(); S.ws=null; }
-  S.controlling=false; setStatus(); showApproval();
+  S.controlling=false; S.accounting=null; setStatus(); showApproval();
 }
 function reconnect() {
   disconnect(); connState("err","reconnecting");
   if (S.reconnectTimer === null) S.reconnectTimer=setTimeout(()=>{S.reconnectTimer=null;connect();},2000);
 }
+function subscribeEvents(generation,withCursor=true,afterManual=false) {
+  if (S.es) S.es.close();
+  const token=new URLSearchParams(location.search).get("token");
+  const query=new URLSearchParams(); if (token) query.set("token",token);
+  if (withCursor && S.cursor) { query.set("instance",S.cursor.instance); query.set("sequence",String(S.cursor.sequence)); }
+  const es=S.es=new EventSource(`/events?${query.toString()}`);
+  const current=()=>generation===S.generation && S.es===es;
+  es.addEventListener("recovery",event=>{if (current()) applyRecovery(JSON.parse(event.data || "{}"),{afterManual});});
+  for (const kind of ["identity","transcript","text_delta","response_finished","request_accepted","request_finished","turn_ended","cost_updated","usage","compacting","compacted","routing","effort","approval_requested","approval_resolved","tool_started_full","tool_finished_full","models","sessions","status","error","stopped","activity","file_changed","subagent_started","subagent_finished"]) {
+    es.addEventListener(kind,event=>{if (current()) receive(kind,JSON.parse(event.data || "{}"));});
+  }
+  es.onerror=()=>{if (current()) reconnect();};
+}
 function connect() {
-  disconnect(); const generation=++S.generation;
+  disconnect(); const generation=++S.generation; S.outgoing=[];
   const token=new URLSearchParams(location.search).get("token");
   const query=new URLSearchParams(); if (token) query.set("token",token);
   const actionQuery=query.toString();
-  if (S.cursor) { query.set("instance",S.cursor.instance); query.set("sequence",String(S.cursor.sequence)); }
-  const es=S.es=new EventSource(`/events?${query.toString()}`);
-  es.addEventListener("recovery",event=>{if (generation===S.generation) applyRecovery(JSON.parse(event.data || "{}"));});
-  for (const kind of ["identity","transcript","text_delta","response_finished","request_accepted","request_finished","turn_ended","cost_updated","usage","compacting","compacted","routing","effort","approval_requested","approval_resolved","tool_started_full","tool_finished_full","models","sessions","status","error","stopped","activity","file_changed","subagent_started","subagent_finished"]) {
-    es.addEventListener(kind,event=>{if (generation===S.generation) receive(kind,JSON.parse(event.data || "{}"));});
-  }
-  es.onerror=()=>{if (generation===S.generation) reconnect();};
+  subscribeEvents(generation,!S.refreshPending,S.refreshPending);
   customizationRead(generation);
   const ws=S.ws=new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/actions?${actionQuery}`);
   ws.onmessage=event=>{
     if (generation!==S.generation) return;
     const data=JSON.parse(event.data || "{}");
-    if (data.type==="controller_ready") { S.controlling=true; connState("ok","live"); setStatus(); showApproval(); send({type:"list_sessions"}); send({type:"effort"}); if(S.customEnabled)send({type:"customize",command:{kind:"reload"},expected_revision:null}); }
+    if (data.type==="controller_ready") {
+      S.controlling=true; connState("ok","live"); setStatus(); showApproval();
+      send({type:"list_sessions"}); send({type:"effort"},S.pendingRequest?.id ?? null);
+      if(S.customEnabled)send({type:"customize",command:{kind:"reload"},expected_revision:null});
+    }
+    else if (data.type==="action_ack") {
+      const sent=S.outgoing.shift();
+      if (sent?.inspectionFor && S.pendingRequest?.id===sent.inspectionFor && data.snapshot) {
+        // This response is causally after exclusive controller reacquisition,
+        // unlike an already in-flight recovery. It can prove definite absence.
+        applySnapshot(data.snapshot,{inspectionFor:sent.inspectionFor});
+      }
+    }
     else if(data.type==="customization") {
+      S.outgoing.shift();
       if(!applyCustomization(data))return;
       if(data.effect?.kind==="insert_draft") {$("composer").value=String(data.effect.text || "").slice(0,8192);focusProfileConversation();}
       else if(data.effect?.kind==="focus_conversation") focusProfileConversation();
       if(S.pendingFontSize && data.applied_command?.kind==="set" && data.applied_command?.key==="browser.font_family" && data.applied_command?.value===S.pendingFontSize.font){const size=S.pendingFontSize.size;S.pendingFontSize=null;customizationCommand({kind:"set",key:"browser.font_size_px",value:size});}
     }
-    else if (data.type==="action_error") { S.pendingFontSize=null;renderEffort();customizationControls();toast(data.message || "Action rejected",true); }
+    else if (data.type==="action_error") {
+      S.outgoing.shift(); S.pendingFontSize=null; S.accounting=null; renderEffort(); setStatus();
+      toast(data.message || "Action rejected",true);
+      // Inspection may reveal a definite refusal or an accepted unknown result.
+      // Keep the intent ID; reconnect only observes it and never sends it again.
+      if (S.pendingRequest) reconnect();
+    }
   };
   ws.onclose=()=>{if (generation===S.generation) reconnect();};
   ws.onerror=()=>{if (generation===S.generation) reconnect();};
@@ -419,6 +523,15 @@ function submit() {
       if(!operation){toast("Use /customize show, set KEY VALUE, reset, import, export or reload",true);return;}
       if(customizationCommand(operation))box.value="";return;
     }
+    if (name==="compact") {
+      if (rest.trim()) {toast("Usage: /compact",true);return;}
+      const requestId=crypto.randomUUID();
+      if(send({type:"compact",request_id:requestId})) {
+        box.value="";
+      }
+      return;
+    }
+    if (name==="usage") {addMsg("system",`${S.turns ?? "Unavailable"} turns · ${S.input ?? "Unavailable"} input · ${S.output ?? "Unavailable"} output · ${costText()}`);box.value="";return;}
     if (name==="clear") {$("transcript").textContent="";box.value="";return;}
     if (name==="models" || name==="sessions") {if(send({type:`list_${name}`})) box.value="";return;}
     if (name==="route") {
@@ -436,10 +549,10 @@ function submit() {
       if (!rest) {toast(`Usage: /${name} <${name==="model" ? "model" : "session id"}>`,true);return;}
       if(send(name==="model" ? {type:"set_model",model:rest.trim(),provider:null} : {type:"resume",session_id:rest.trim()})) box.value="";return;
     }
-    toast(`Unknown command /${name} — try /route /effort /model /models /sessions /resume /clear`,true);return;
+    toast(`Unknown command /${name} — try /compact /usage /route /effort /model /models /sessions /resume /clear`,true);return;
   }
   const requestId=crypto.randomUUID();
-  if(send({type:"prompt",request_id:requestId,text})) {box.value="";S.busy=true;setStatus();}
+  if(send({type:"prompt",request_id:requestId,text})) box.value="";
 }
 $("chat-pane").addEventListener("click",event=>{if(event.target.closest("button, a, select, .tool-card")) return;const selection=window.getSelection();if(selection && !selection.isCollapsed) return;$("composer").focus();});
 $("btn-send").onclick=submit; $("btn-cancel").onclick=()=>send({type:"cancel"});

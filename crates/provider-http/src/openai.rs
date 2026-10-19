@@ -10,6 +10,7 @@
 //! - Sampling serialized as provider floats ONLY at the wire boundary.
 
 use crate::AsyncProviderAdapter;
+use crate::adapter_trait::{DetailedInvokeFailure, HttpRejectionObservation};
 use crate::cancel::CancelToken;
 use crate::error::TransportError;
 use crate::sse::SseParser;
@@ -26,7 +27,6 @@ use orbit_adapter::types::{
 pub struct OpenAiCompatibleHttpV1 {
     identity: AdapterIdentity,
     capabilities: ProviderCapabilities,
-    client: reqwest::Client,
     tls_policy: orbit_adapter::types::TlsPinPolicy,
 }
 
@@ -38,13 +38,12 @@ impl OpenAiCompatibleHttpV1 {
         capabilities: ProviderCapabilities,
         tls_policy: orbit_adapter::types::TlsPinPolicy,
     ) -> Result<Self, TransportError> {
-        // E6: draw from the shared client pool — one TLS config, one
-        // connection pool per policy, reused across every round.
-        let client = crate::shared_tls_client(&tls_policy)?;
+        // Validate the default TLS policy at construction. Each invocation
+        // selects its exact request connection budget from the shared pool.
+        let _ = crate::shared_tls_client(&tls_policy)?;
         Ok(Self {
             identity,
             capabilities,
-            client,
             tls_policy,
         })
     }
@@ -62,29 +61,41 @@ impl OpenAiCompatibleHttpV1 {
         request: &ProviderRequest,
         credential: Option<&SecretBytes>,
         cancel: &CancelToken,
-    ) -> Result<AsyncProviderEventStream, AdapterError> {
+    ) -> Result<AsyncProviderEventStream, DetailedInvokeFailure> {
         // Validate the route offline (DR-09 §3 — no I/O).
-        self.validate_route(&request.route)?;
+        self.validate_route(&request.route)
+            .map_err(DetailedInvokeFailure::unknown)?;
+        let timeouts =
+            crate::RequestTimeouts::new(request).map_err(DetailedInvokeFailure::unknown)?;
         if let Some(effort) = &request.effort {
             effort
                 .validate_for_openai()
-                .map_err(AdapterError::ProviderConfigurationInvalid)?;
+                .map_err(AdapterError::ProviderConfigurationInvalid)
+                .map_err(DetailedInvokeFailure::unknown)?;
         }
 
         // URL from the route: scheme (HttpLoopback → http, else https with
         // SPKI pinning) + host/port + the gate URL's base path (empty =
         // the historical `/v1`).
-        let url = chat_completions_url(&request.route)?;
+        let url = chat_completions_url(&request.route).map_err(DetailedInvokeFailure::unknown)?;
 
         let body = crate::request::render_request_body(
             crate::request::HttpDialect::OpenAiCompatible,
             crate::request::RequestBodyInput::from(request),
-        )?;
+        )
+        .map_err(DetailedInvokeFailure::unknown)?;
+        let body_bytes = serde_json::to_vec(body.as_json()).map_err(|_| {
+            DetailedInvokeFailure::unknown(AdapterError::RequestInvalidOrTooLarge(
+                "request JSON could not be encoded (E0406)".into(),
+            ))
+        })?;
 
-        let mut req = self
-            .client
+        let client = crate::tls_client_for_request(&self.tls_policy, &timeouts)
+            .map_err(AdapterError::from)
+            .map_err(DetailedInvokeFailure::unknown)?;
+        let mut req = client
             .post(&url)
-            .json(body.as_json())
+            .body(body_bytes.clone())
             .header("content-type", "application/json");
         if let Some(secret) = credential {
             // GW-16: the credential reaches THIS adapter only. The borrow is
@@ -93,46 +104,98 @@ impl OpenAiCompatibleHttpV1 {
             req = req.bearer_auth(token);
         }
 
-        let connect_timeout = std::time::Duration::from_millis(request.connect_timeout_ms);
+        let response_deadline = timeouts
+            .response_deadline()
+            .map_err(DetailedInvokeFailure::unknown)?;
         let Some(response) = cancel
-            .until_cancelled(tokio::time::timeout(connect_timeout, req.send()))
+            .until_cancelled(crate::response_start_wait(response_deadline, req.send()))
             .await
         else {
             return Ok(crate::cancel::cancelled_stream());
         };
-        let resp = response
-            .map_err(|_| AdapterError::ProviderTimeout("connect timeout (E0409)".into()))?
-            .map_err(|e| AdapterError::ProviderTransportFailure(format!("send: {e}")))?;
+        if cancel.is_cancelled() {
+            return Ok(crate::cancel::cancelled_stream());
+        }
+        let mut resp = response
+            .map_err(|_| AdapterError::ProviderTimeout("response headers timed out (E0409)".into()))
+            .map_err(DetailedInvokeFailure::unknown)?
+            .map_err(|error| crate::reqwest_error(error, "response headers"))
+            .map_err(DetailedInvokeFailure::unknown)?;
 
         let status = resp.status();
         if status.is_redirection() {
-            return Err(AdapterError::ProtocolOrStreamViolation(
-                "provider redirects are not permitted (E0411)".into(),
+            return Err(DetailedInvokeFailure::unknown(
+                AdapterError::ProtocolOrStreamViolation(
+                    "provider redirects are not permitted (E0411)".into(),
+                ),
             ));
         }
         if !status.is_success() {
-            // E1/E2: read the body, classify precisely, retry 5xx.
+            // One overall deadline bounds the entire error-body read, including
+            // a slow drip. Content-Length is never evidence of clean EOF.
+            let error_body_deadline = timeouts
+                .idle_deadline()
+                .map_err(DetailedInvokeFailure::unknown)?;
             let Some(body) = cancel
-                .until_cancelled(tokio::time::timeout(
-                    std::time::Duration::from_millis(request.idle_timeout_ms),
-                    resp.text(),
-                ))
+                .until_cancelled(tokio::time::timeout_at(error_body_deadline, async {
+                    let mut bytes = Vec::new();
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                let remaining = 65_537 - bytes.len();
+                                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                                if bytes.len() > 65_536 {
+                                    bytes.truncate(65_536);
+                                    break (bytes, false);
+                                }
+                            }
+                            Ok(None) => break (bytes, true),
+                            // Preserve the old empty fallback's status
+                            // class without certifying the partial body.
+                            Err(_) => break (Vec::new(), false),
+                        }
+                    }
+                }))
                 .await
             else {
                 return Ok(crate::cancel::cancelled_stream());
             };
-            let body = body
+            let (bytes, complete) = body
                 .map_err(|_| {
                     AdapterError::ProviderTimeout("error response body stalled (E0409)".into())
-                })?
-                .unwrap_or_default();
-            return Err(crate::error::status_error(status, body).await);
+                })
+                .map_err(DetailedInvokeFailure::unknown)?;
+            if cancel.is_cancelled() {
+                return Ok(crate::cancel::cancelled_stream());
+            }
+            let observation = complete
+                .then(|| {
+                    HttpRejectionObservation::new(
+                        request,
+                        &self.identity,
+                        &url,
+                        &body_bytes,
+                        status.as_u16(),
+                        bytes.len(),
+                    )
+                })
+                .flatten();
+            let error =
+                crate::error::status_error(status, String::from_utf8_lossy(&bytes).into_owned())
+                    .await;
+            if cancel.is_cancelled() {
+                return Ok(crate::cancel::cancelled_stream());
+            }
+            return Err(match observation {
+                Some(observation) => DetailedInvokeFailure::with_rejection(error, observation),
+                None => DetailedInvokeFailure::unknown(error),
+            });
         }
 
         Ok(openai_stream(
             resp.bytes_stream(),
-            request.first_byte_timeout_ms,
-            request.idle_timeout_ms,
+            response_deadline,
+            timeouts.idle,
             cancel.clone(),
         ))
     }
@@ -314,8 +377,8 @@ fn openai_stream(
     + Unpin
     + Send
     + 'static,
-    first_byte_timeout_ms: u64,
-    idle_timeout_ms: u64,
+    response_deadline: tokio::time::Instant,
+    idle_timeout: std::time::Duration,
     cancel: CancelToken,
 ) -> AsyncProviderEventStream {
     use crate::stream::{
@@ -337,24 +400,35 @@ fn openai_stream(
         // reason-only response alive indefinitely while optional usage arrives.
         let mut trailer_deadline: Option<tokio::time::Instant> = None;
         while let Some(chunk) = {
-            let idle = std::time::Duration::from_millis(if first { first_byte_timeout_ms } else { idle_timeout_ms });
-            let budget = trailer_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now())).unwrap_or(idle).min(idle);
-            if trailer_deadline.is_some() && budget.is_zero() { None } else {
-                match cancel.until_cancelled(tokio::time::timeout(budget, bytes.next())).await {
-                    None => None,
-                    Some(Ok(item)) => item,
-                    Some(Err(_)) if finish_reason.is_some() => None,
-                    Some(Err(_)) => { yield Err(AdapterError::ProviderTimeout("stream stalled (E0409)".into())); return; }
+            let waited = if first {
+                cancel.until_cancelled(crate::response_start_wait(response_deadline, bytes.next())).await
+            } else {
+                let idle_deadline = match crate::checked_deadline(tokio::time::Instant::now(), idle_timeout, "stream idle") {
+                    Ok(deadline) => deadline,
+                    Err(error) => { yield Err(error); return; }
+                };
+                if let Some(trailer) = trailer_deadline {
+                    cancel.until_cancelled(crate::response_start_wait(trailer.min(idle_deadline), bytes.next())).await
+                } else {
+                    cancel.until_cancelled(async {
+                        tokio::time::timeout_at(idle_deadline, bytes.next()).await.map_err(|_| ())
+                    }).await
                 }
+            };
+            match waited {
+                None => None,
+                Some(Ok(item)) => item,
+                Some(Err(_)) if finish_reason.is_some() => None,
+                Some(Err(_)) => { yield Err(AdapterError::ProviderTimeout("response body stalled (E0409)".into())); return; }
             }
         } {
             if cancel.is_cancelled() { break; }
-            first = false;
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) if finish_reason.is_some() && parser.is_clean() && error.is_body() => break,
-                Err(error) => { yield Err(AdapterError::ProviderTransportFailure(error.to_string())); return; }
+                Err(error) => { yield Err(crate::reqwest_error(error, "stream")); return; }
             };
+            if !chunk.is_empty() { first = false; }
             if let Err(error) = count_bytes(&mut total, chunk.len()) { yield Err(error); return; }
             let events = match parser.feed(&chunk) { Ok(events) => events, Err(error) => { yield Err(error.into()); return; } };
             for event in events {
@@ -422,7 +496,10 @@ fn openai_stream(
             }
             if saw_done { break; }
             if finish_reason.is_some() && trailer_deadline.is_none() {
-                trailer_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(idle_timeout_ms));
+                trailer_deadline = match crate::checked_deadline(tokio::time::Instant::now(), idle_timeout, "usage trailer") {
+                    Ok(deadline) => Some(deadline),
+                    Err(error) => { yield Err(error); return; }
+                };
             }
         }
         if cancel.is_cancelled() {
@@ -477,6 +554,17 @@ impl AsyncProviderAdapter for OpenAiCompatibleHttpV1 {
         credential: Option<&SecretBytes>,
         cancel: &CancelToken,
     ) -> Result<AsyncProviderEventStream, AdapterError> {
+        self.do_invoke(request, credential, cancel)
+            .await
+            .map_err(DetailedInvokeFailure::into_error)
+    }
+
+    async fn invoke_detailed(
+        &self,
+        request: &ProviderRequest,
+        credential: Option<&SecretBytes>,
+        cancel: &CancelToken,
+    ) -> Result<AsyncProviderEventStream, DetailedInvokeFailure> {
         self.do_invoke(request, credential, cancel).await
     }
 }
@@ -566,5 +654,123 @@ mod url_tests {
             .unwrap(),
             "https://generativelanguage.googleapis.com:443/v1beta/openai/chat/completions"
         );
+    }
+}
+
+#[cfg(test)]
+mod trailer_deadline_tests {
+    use super::{
+        CancelToken, ProviderEventKind, ProviderStreamEvent, ProviderUsage, openai_stream,
+    };
+    use futures::{FutureExt, StreamExt};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    // No socket, thread or clock override: the second chunk is an already
+    // buffered usage trailer once the test flips ready and explicitly repolls.
+    fn buffered_trailer(
+        ready: Arc<AtomicBool>,
+        pending: Arc<AtomicBool>,
+        usage_polls: Arc<AtomicUsize>,
+    ) -> impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin {
+        let mut first = true;
+        let mut emitted = false;
+        futures::stream::poll_fn(move |_| {
+            if first {
+                first = false;
+                return Poll::Ready(Some(Ok(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+                ))));
+            }
+            if emitted {
+                return Poll::Ready(None);
+            }
+            if !ready.load(Ordering::SeqCst) {
+                pending.store(true, Ordering::SeqCst);
+                return Poll::Pending;
+            }
+            emitted = true;
+            usage_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Some(Ok(bytes::Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\ndata: [DONE]\n\n"
+            ))))
+        })
+    }
+
+    fn assert_prefix(events: &[ProviderStreamEvent]) {
+        assert!(matches!(
+            &events[0].event,
+            ProviderEventKind::ResponseStarted {
+                upstream_request_id: None
+            }
+        ));
+        assert!(matches!(&events[1].event,
+            ProviderEventKind::TextDelta { bytes } if bytes == b"ok"));
+        assert!(
+            events
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event.sequence == index as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_usage_after_expired_trailer_is_not_consumed() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let ready = Arc::new(AtomicBool::new(false));
+            let pending = Arc::new(AtomicBool::new(false));
+            let usage_polls = Arc::new(AtomicUsize::new(0));
+            let idle = Duration::from_millis(25);
+            let mut stream = openai_stream(
+                buffered_trailer(ready.clone(), pending.clone(), usage_polls.clone()),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                idle,
+                CancelToken::new(),
+            );
+            let mut events = vec![stream.next().await.unwrap().unwrap(), stream.next().await.unwrap().unwrap()];
+            // This resumes past semantic completion, installs the absolute
+            // trailer deadline and leaves its inner wait pending on the body.
+            assert!(stream.next().now_or_never().is_none());
+            assert!(pending.load(Ordering::SeqCst));
+            let pending_at = tokio::time::Instant::now();
+            tokio::time::sleep_until(pending_at + idle + Duration::from_millis(25)).await;
+            assert!(tokio::time::Instant::now() >= pending_at + idle);
+            ready.store(true, Ordering::SeqCst);
+            while let Some(event) = stream.next().await { events.push(event.unwrap()); }
+            assert_prefix(&events);
+            assert_eq!(events.len(), 3);
+            assert_eq!(usage_polls.load(Ordering::SeqCst), 0);
+            assert!(matches!(&events[2].event,
+                ProviderEventKind::Finished { finish_reason: Some(reason), final_usage: None } if reason == "stop"));
+        }).await.expect("bounded trailer expiry test completed");
+    }
+
+    #[tokio::test]
+    async fn buffered_usage_inside_trailer_window_is_preserved() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let ready = Arc::new(AtomicBool::new(true));
+            let pending = Arc::new(AtomicBool::new(false));
+            let usage_polls = Arc::new(AtomicUsize::new(0));
+            let mut stream = openai_stream(
+                buffered_trailer(ready, pending.clone(), usage_polls.clone()),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                Duration::from_secs(5),
+                CancelToken::new(),
+            );
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await { events.push(event.unwrap()); }
+            assert_prefix(&events);
+            assert_eq!(events.len(), 4);
+            assert!(!pending.load(Ordering::SeqCst));
+            assert_eq!(usage_polls.load(Ordering::SeqCst), 1);
+            let expected = ProviderUsage { input_tokens: 11, output_tokens: 7, ..ProviderUsage::default() };
+            assert!(matches!(&events[2].event,
+                ProviderEventKind::UsageUpdate(usage) if *usage == expected));
+            assert!(matches!(&events[3].event,
+                ProviderEventKind::Finished { finish_reason: Some(reason), final_usage: Some(usage) }
+                    if reason == "stop" && *usage == expected));
+        }).await.expect("bounded healthy trailer test completed");
     }
 }

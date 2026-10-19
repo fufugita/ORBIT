@@ -418,9 +418,12 @@ pub struct ProviderRequest {
     pub output: OutputRequirements,
     pub tools: Vec<ToolDefinition>,
     pub metadata: RequestMetadata,
+    /// Connection establishment budget, enforced concurrently with response start.
+    /// This does not limit healthy waiting for response headers on an established connection.
     pub connect_timeout_ms: u64,
-    /// Time to the FIRST byte of the response body. A provider that
-    /// accepts the request but never starts answering is dead.
+    /// One absolute deadline from the actual HTTP send to the first response body byte.
+    /// Headers do not reset it; delayed stream polling consumes the same budget.
+    /// Non-success headers begin the separate bounded error-body phase.
     pub first_byte_timeout_ms: u64,
     /// Max gap between stream chunks (E5). A stream may run as long
     /// as it keeps producing bytes; a silent gap longer than this is

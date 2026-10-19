@@ -28,6 +28,7 @@ use orbit_adapter::types::{
 use orbit_egress::{BrokerVerdict, EgressAllowlist, EgressBroker, EgressTuple, SpkiPin};
 use orbit_ledger::event::{EgressDestination, EgressIntent, LedgerEvent};
 use orbit_ledger::{LedgerError, LedgerWriter, SessionId};
+use orbit_provider_http::adapter_trait::FailureObservation;
 use std::sync::Arc;
 
 /// Durable dispatch state (DR-09 §6). This is what survives a crash.
@@ -53,6 +54,51 @@ pub enum DispatchOutcome {
     AdapterRefused { code: &'static str, message: String },
     /// Dispatch was never attempted (e.g. admission denied).
     NotDispatched { reason: String },
+}
+
+/// Additive transport facts. The legacy outcome retains its original prose;
+/// Debug prints only classification and redacted observation metadata.
+pub struct DetailedDispatchOutcome {
+    outcome: DispatchOutcome,
+    observation: FailureObservation,
+}
+
+impl DetailedDispatchOutcome {
+    pub fn outcome(&self) -> &DispatchOutcome {
+        &self.outcome
+    }
+    pub fn observation(&self) -> &FailureObservation {
+        &self.observation
+    }
+    pub fn into_legacy(self) -> DispatchOutcome {
+        self.outcome
+    }
+    pub fn into_parts(self) -> (DispatchOutcome, FailureObservation) {
+        (self.outcome, self.observation)
+    }
+
+    fn unknown(outcome: DispatchOutcome) -> Self {
+        Self {
+            outcome,
+            observation: FailureObservation::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Debug for DetailedDispatchOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, code) = match &self.outcome {
+            DispatchOutcome::Completed(_) => ("Completed", None),
+            DispatchOutcome::EgressNotDurable { .. } => ("EgressNotDurable", None),
+            DispatchOutcome::AdapterRefused { code, .. } => ("AdapterRefused", Some(*code)),
+            DispatchOutcome::NotDispatched { .. } => ("NotDispatched", None),
+        };
+        f.debug_struct("DetailedDispatchOutcome")
+            .field("kind", &kind)
+            .field("code", &code)
+            .field("observation", &self.observation)
+            .finish()
+    }
 }
 
 /// The durable egress-intent reservation written before dispatch.
@@ -291,6 +337,34 @@ impl DispatchEngine {
         cancel: &orbit_provider_http::CancelToken,
         observer: orbit_provider_http::stream::StreamObserver<'o>,
     ) -> Result<(DispatchOutcome, EgressReservation), DispatchError> {
+        self.dispatch_async_detailed(
+            model,
+            session_id,
+            decision_id,
+            request,
+            credential,
+            writer,
+            cancel,
+            observer,
+        )
+        .await
+        .map(|(outcome, reservation)| (outcome.into_legacy(), reservation))
+    }
+
+    /// Preserve invoke-time rejection observations independently of the legacy
+    /// outcome. This method neither retries nor qualifies provider billing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_async_detailed<'o>(
+        &self,
+        model: &str,
+        session_id: &str,
+        decision_id: &str,
+        request: &ProviderRequest,
+        credential: Option<&SecretBytes>,
+        writer: &mut LedgerWriter,
+        cancel: &orbit_provider_http::CancelToken,
+        observer: orbit_provider_http::stream::StreamObserver<'o>,
+    ) -> Result<(DetailedDispatchOutcome, EgressReservation), DispatchError> {
         // P0-3 replay guard (same as sync).
         match self.recovery_state(session_id, decision_id) {
             Ok(DispatchState::Reserved) => {}
@@ -369,9 +443,9 @@ impl DispatchEngine {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok((
-                        DispatchOutcome::EgressNotDurable {
+                        DetailedDispatchOutcome::unknown(DispatchOutcome::EgressNotDurable {
                             reason: e.to_string(),
-                        },
+                        }),
                         EgressReservation {
                             decision_id: decision_id.into(),
                             session_id: session_id.into(),
@@ -385,13 +459,25 @@ impl DispatchEngine {
             };
 
         // Invoke the async adapter, collect the stream, validate evidence.
-        let stream = match adapter.invoke(request, credential, cancel).await {
+        let stream = match adapter.invoke_detailed(request, credential, cancel).await {
             Ok(s) => s,
             Err(e) => {
+                let observation = match e.observation() {
+                    FailureObservation::CompleteHttpRejection(observation)
+                        if observation.decision_id() == decision_id
+                            && observation.matches_request(request, &adapter.identity()) =>
+                    {
+                        FailureObservation::CompleteHttpRejection(observation.clone())
+                    }
+                    _ => FailureObservation::Unknown,
+                };
                 return Ok((
-                    DispatchOutcome::AdapterRefused {
-                        code: e.code(),
-                        message: e.to_string(),
+                    DetailedDispatchOutcome {
+                        outcome: DispatchOutcome::AdapterRefused {
+                            code: e.error().code(),
+                            message: e.error().to_string(),
+                        },
+                        observation,
                     },
                     reservation,
                 ));
@@ -430,13 +516,16 @@ impl DispatchEngine {
                     transport: Default::default(),
                     events,
                 };
-                Ok((DispatchOutcome::Completed(Box::new(result)), reservation))
+                Ok((
+                    DetailedDispatchOutcome::unknown(DispatchOutcome::Completed(Box::new(result))),
+                    reservation,
+                ))
             }
             Err(e) => Ok((
-                DispatchOutcome::AdapterRefused {
+                DetailedDispatchOutcome::unknown(DispatchOutcome::AdapterRefused {
                     code: e.code(),
                     message: e.to_string(),
-                },
+                }),
                 reservation,
             )),
         }

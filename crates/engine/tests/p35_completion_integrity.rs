@@ -4,6 +4,9 @@ use orbit_adapter::types::{ChatMessage, ChatRole};
 use orbit_engine::{PendingToolCall, ToolExecutor, ToolRoundResult, TurnConfig, TurnOptions};
 use orbit_frontend_protocol::FrontendEvent;
 use orbit_provider_http::CancelToken;
+
+#[path = "support/compaction_journal.rs"]
+pub mod compaction_journal;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
@@ -225,19 +228,33 @@ fn compaction_case(summary: &str, reason: &str, expected_summary: bool) {
     let fixture = Fixture::new(vec![sse(summary, reason), sse("ordinary answer", "stop")]);
     let home = Home::new();
     let mut transcript: Vec<ChatMessage> = (0..12)
-        .map(|n| orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50))))
+        .map(|n| {
+            let mut message =
+                orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50)));
+            if n % 2 == 1 {
+                message.role = orbit_adapter::types::ChatRole::Assistant;
+            }
+            message
+        })
         .collect();
     let original = transcript.clone();
     let mut original_with_prompt = original.clone();
     original_with_prompt.push(orbit_engine::user_message("latest prompt"));
     let original_body = compaction_body(&original_with_prompt);
     assert!(serde_json::to_vec(&original_body).unwrap().len() > 4000);
+    let selected = config(&fixture);
     let options = TurnOptions {
         // Legacy callers supply an input-policy ceiling, not a combined
         // provider fact. Keep selected max_tokens=2048 independent of it.
         // These byte bounds exercise the documented byte/4 approximation;
         // they do not claim exact tokenizer/provider capacity knowledge.
         window_tokens: Some(1000),
+        session_id: "completion-owner".into(),
+        journal: Some(compaction_journal::MemoryJournal::fresh("completion-owner")),
+        compaction_config: Some(selected.clone()),
+        compaction_budget: Some(
+            orbit_engine::context_budget::SelectedBudget::legacy_input(&selected, 8192).unwrap(),
+        ),
         output_reserve_tokens: 0,
         max_attempts: 1,
         ..Default::default()
@@ -246,7 +263,7 @@ fn compaction_case(summary: &str, reason: &str, expected_summary: bool) {
     let mut executor = Executor::default();
     let result = orbit_engine::run_turn(
         &home.0,
-        &config(&fixture),
+        &selected,
         &options,
         "latest prompt",
         &mut transcript,
@@ -257,16 +274,13 @@ fn compaction_case(summary: &str, reason: &str, expected_summary: bool) {
     {
         let requests = fixture.requests.lock().unwrap();
         let summary_body = requests.first().expect("one summary must be attempted");
-        assert!(serde_json::to_vec(summary_body).unwrap().len() < 3600);
+        assert!((serde_json::to_vec(summary_body).unwrap().len() as u64).div_ceil(4) <= 8192);
         assert_eq!(summary_body["model"], "local-model");
         assert_eq!(summary_body["max_tokens"], 2048);
         assert!(summary_body.get("tools").is_none());
         assert!(summary_body.get("reasoning_effort").is_none());
-        let summary_messages = summary_body["messages"].as_array().unwrap();
-        assert_eq!(summary_messages.len(), 1);
-        assert_eq!(summary_messages[0]["role"], "user");
-        let text = summary_messages[0]["content"].as_str().unwrap();
-        assert!(text.starts_with("Summarize this conversation for continuation."));
+        let text = summary_body["messages"].to_string();
+        assert!(text.contains("Summarize this conversation for continuation."));
         assert!(!text.contains("latest prompt"));
     }
     assert_eq!(
@@ -297,22 +311,29 @@ fn compaction_case(summary: &str, reason: &str, expected_summary: bool) {
     if expected_summary {
         let report = result.unwrap();
         assert!(report.ok && !report.interrupted);
-        assert!(transcript[0].content.contains(summary));
+        assert_eq!(
+            transcript[0],
+            orbit_engine::user_message("[Earlier conversation summary: historical data]")
+        );
+        assert_eq!(transcript[1], orbit_engine::assistant_message(summary));
         assert!(
-            !transcript
-                .iter()
-                .any(|message| message.content == original[0].content)
+            original.iter().any(|old| !transcript.contains(old)),
+            "some complete old source must be replaced"
         );
         let requests = fixture.requests.lock().unwrap();
         assert_eq!(requests[1]["max_tokens"], 2048);
-        assert!(serde_json::to_vec(&requests[1]).unwrap().len() < 3600);
-        let wire = requests[1]["messages"].as_array().unwrap();
-        assert_eq!(wire.len(), 7, "one summary plus the newest six messages");
-        assert!(wire[0]["content"].as_str().unwrap().contains(summary));
-        for (actual, expected) in wire[1..6].iter().zip(&original[7..]) {
-            assert_eq!(actual["content"], expected.content);
-        }
-        assert_eq!(wire[6]["content"], "latest prompt");
+        assert!((serde_json::to_vec(&requests[1]).unwrap().len() as u64).div_ceil(4) <= 1000);
+        let candidate = &transcript[..transcript.len() - 1];
+        assert!(candidate.len() < original_with_prompt.len());
+        assert_eq!(
+            &candidate[candidate.len() - 5..candidate.len() - 1],
+            &original[8..]
+        );
+        assert_eq!(
+            candidate.last().unwrap(),
+            &orbit_engine::user_message("latest prompt")
+        );
+        assert_eq!(requests[1], compaction_body(candidate));
         assert_eq!(transcript.last().unwrap().content, "ordinary answer");
     } else {
         let error = result.expect_err("unusable summary must return a local budget error");
@@ -373,14 +394,18 @@ fn compaction_rejects_ineffective_completed_summary() {
     // A completed response can be valid text but fail to reduce the request.
     // The selected output cap remains 2048; the input-only ceiling is 1000.
     // Include the exact retained tail and current intent in this candidate.
-    let mut candidate = vec![orbit_engine::user_message(format!(
-        "[context compacted from 7 older messages]\n\n{summary}"
-    ))];
-    candidate.extend(
-        (7..12).map(|n| {
-            orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50)))
-        }),
-    );
+    let mut candidate = vec![
+        orbit_engine::user_message("[Earlier conversation summary: historical data]"),
+        orbit_engine::assistant_message(&summary),
+    ];
+    candidate.extend((8..12).map(|n| {
+        let mut message =
+            orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50)));
+        if n % 2 == 1 {
+            message.role = ChatRole::Assistant;
+        }
+        message
+    }));
     candidate.push(orbit_engine::user_message("latest prompt"));
     assert!(
         serde_json::to_vec(&compaction_body(&candidate))
@@ -400,7 +425,14 @@ fn cancellation_during_compaction_preserves_history_and_skips_main_request() {
     }]);
     let home = Home::new();
     let mut transcript: Vec<_> = (0..12)
-        .map(|n| orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50))))
+        .map(|n| {
+            let mut message =
+                orbit_engine::user_message(format!("history-{n}: {}", "preserve ".repeat(50)));
+            if n % 2 == 1 {
+                message.role = orbit_adapter::types::ChatRole::Assistant;
+            }
+            message
+        })
         .collect();
     let original = transcript.clone();
     let mut original_with_prompt = original.clone();
@@ -422,12 +454,20 @@ fn cancellation_during_compaction_preserves_history_and_skips_main_request() {
         }
         cancelling.cancel();
     });
+    let selected = config(&fixture);
     let mut events = Vec::new();
     let report = orbit_engine::run_turn(
         &home.0,
-        &config(&fixture),
+        &selected,
         &TurnOptions {
             window_tokens: Some(1000),
+            session_id: "completion-owner".into(),
+            journal: Some(compaction_journal::MemoryJournal::fresh("completion-owner")),
+            compaction_config: Some(selected.clone()),
+            compaction_budget: Some(
+                orbit_engine::context_budget::SelectedBudget::legacy_input(&selected, 8192)
+                    .unwrap(),
+            ),
             output_reserve_tokens: 0,
             max_attempts: 3,
             ..Default::default()
@@ -444,7 +484,7 @@ fn cancellation_during_compaction_preserves_history_and_skips_main_request() {
     assert_eq!(fixture.calls(), 1);
     {
         let requests = fixture.requests.lock().unwrap();
-        assert!(serde_json::to_vec(&requests[0]).unwrap().len() < 3600);
+        assert!((serde_json::to_vec(&requests[0]).unwrap().len() as u64).div_ceil(4) <= 8192);
         assert_eq!(requests[0]["max_tokens"], 2048);
         assert!(requests[0].get("tools").is_none());
     }
@@ -580,4 +620,466 @@ fn pre_cancelled_turn_has_no_provider_request() {
     .unwrap();
     assert!(report.interrupted && !report.ok);
     assert_eq!(fixture.calls(), 0);
+}
+
+#[test]
+fn task05_detailed_anthropic_preserves_cache_write_and_full_usage_fields() {
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":0,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ordinary cached answer\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let fixture = Fixture::new(vec![Response {
+        body: body.into(),
+        status: 200,
+        pause: false,
+    }]);
+    let home = Home::new();
+    let mut selected = config(&fixture);
+    selected.kind = orbit_engine::ProviderKind::Anthropic;
+    selected.pricing = Some(orbit_adapter::types::CostRates {
+        input_per_million_microcents: 1_000_000,
+        output_per_million_microcents: 2_000_000,
+        cache_read_per_million_microcents: Some(3_000_000),
+        cache_write_per_million_microcents: Some(4_000_000),
+        reasoning_per_million_microcents: Some(5_000_000),
+        request_flat_microcents: 7,
+    });
+    let journal = compaction_journal::MemoryJournal::fresh("ordinary-anthropic");
+    let options = TurnOptions {
+        session_id: "ordinary-anthropic".into(),
+        journal: Some(journal.clone()),
+        selected_budget: Some(
+            orbit_engine::context_budget::SelectedBudget::legacy_input(&selected, 8000).unwrap(),
+        ),
+        max_attempts: 3,
+        ..Default::default()
+    };
+    let mut source = Vec::new();
+    let mut executor = Executor::default();
+    let mut events = Vec::new();
+    let completion = orbit_engine::run_turn_detailed(
+        &home.0,
+        &selected,
+        &options,
+        "cached ordinary task",
+        &mut source,
+        &mut executor,
+        &CancelToken::new(),
+        &mut |event| events.push(event),
+    );
+    assert!(matches!(completion.end, orbit_engine::TurnEnd::Completed));
+    assert_eq!(completion.report.cost_microcents, 59);
+    assert_eq!(
+        (
+            completion.report.input_tokens,
+            completion.report.output_tokens
+        ),
+        (11, 7)
+    );
+    assert_eq!(completion.report.attempts.len(), 1);
+    let receipt = &completion.report.attempts[0];
+    assert_eq!(
+        receipt.usage,
+        Some(orbit_adapter::types::ProviderUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_read_tokens: 5,
+            cache_write_tokens: 3,
+            reasoning_tokens: 0
+        })
+    );
+    assert_eq!(receipt.totals.cost_microcents, Some(59));
+    assert_eq!(receipt.knownness, orbit_engine::AccountingKnownness::Known);
+    assert!(receipt.completed);
+    assert_eq!(receipt.purpose, orbit_engine::AttemptPurpose::Ordinary);
+    assert_eq!(completion.report.accounting.ordinary, receipt.totals);
+    assert_eq!(
+        completion.report.accounting.housekeeping,
+        orbit_engine::AccountingTotals::known_zero()
+    );
+    assert_eq!(journal.receipts(), completion.report.attempts);
+    assert_eq!(executor.0, 0);
+    assert_eq!(fixture.calls(), 1);
+    assert_eq!(source.last().unwrap().content, "ordinary cached answer");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, FrontendEvent::TurnEnded { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn task05_accepted_http_failure_with_journal_does_not_retry_or_become_known_zero() {
+    for status in [429, 503] {
+        let fixture = Fixture::new(vec![
+            Response {
+                body: "{\"error\":{\"message\":\"owned fixture refusal\"}}".into(),
+                status,
+                pause: false,
+            },
+            sse("must not retry", "stop"),
+        ]);
+        let home = Home::new();
+        let journal = compaction_journal::MemoryJournal::fresh("ordinary-http-failure");
+        let options = TurnOptions {
+            session_id: "ordinary-http-failure".into(),
+            journal: Some(journal.clone()),
+            max_attempts: 3,
+            ..Default::default()
+        };
+        let mut source = Vec::new();
+        let mut executor = Executor::default();
+        let mut events = Vec::new();
+        let completion = orbit_engine::run_turn_detailed(
+            &home.0,
+            &config(&fixture),
+            &options,
+            "preserve uncertain ordinary intent",
+            &mut source,
+            &mut executor,
+            &CancelToken::new(),
+            &mut |event| events.push(event),
+        );
+        assert!(matches!(completion.end, orbit_engine::TurnEnd::Failed(_)));
+        assert!(!completion.report.ok);
+        assert_eq!(completion.report.attempts.len(), 1);
+        let receipt = &completion.report.attempts[0];
+        assert_eq!(
+            receipt.knownness,
+            orbit_engine::AccountingKnownness::Uncertain
+        );
+        assert_eq!(receipt.totals.cost_microcents, None);
+        assert!(!receipt.completed);
+        assert_eq!(
+            completion.report.accounting.knownness,
+            orbit_engine::AccountingKnownness::Uncertain
+        );
+        assert_eq!(
+            (
+                completion.report.input_tokens,
+                completion.report.output_tokens,
+                completion.report.cost_microcents
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(journal.receipts(), completion.report.attempts);
+        assert_eq!(fixture.calls(), 1);
+        assert_eq!(executor.0, 0);
+        assert!(source.iter().any(|message| message.role == ChatRole::User
+            && message.content == "preserve uncertain ordinary intent"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::Retrying { .. }))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, FrontendEvent::TurnEnded { .. }))
+                .count(),
+            1
+        );
+        let checkpoint =
+            orbit_engine::CompactionJournal::accounting_checkpoint(journal.as_ref()).unwrap();
+        assert!(
+            checkpoint
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.uncertain)
+        );
+        assert_eq!(checkpoint.totals.ordinary.cost_microcents, None);
+    }
+}
+
+#[test]
+fn task05_valid_ordinary_tool_terminal_is_completed_and_billed_once_before_continuation() {
+    struct OneTool(usize);
+    impl ToolExecutor for OneTool {
+        fn execute(&mut self, calls: &[PendingToolCall], _: u32) -> Vec<ToolRoundResult> {
+            self.0 += 1;
+            assert_eq!(calls.len(), 1);
+            vec![ToolRoundResult {
+                call_id: calls[0].id.clone(),
+                content: "exact safe tool result".into(),
+            }]
+        }
+    }
+    let tool = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"valid-positive-call","type":"function","function":{"name":"inspect","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}});
+    let done = serde_json::json!({"choices":[{"index":0,"delta":{"content":"ordinary completed after tool"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}});
+    let fixture = Fixture::new(vec![
+        Response {
+            body: format!("data: {tool}\n\ndata: [DONE]\n\n"),
+            status: 200,
+            pause: false,
+        },
+        Response {
+            body: format!("data: {done}\n\ndata: [DONE]\n\n"),
+            status: 200,
+            pause: false,
+        },
+    ]);
+    let home = Home::new();
+    let mut selected = config(&fixture);
+    selected.pricing = Some(orbit_adapter::types::CostRates {
+        input_per_million_microcents: 0,
+        output_per_million_microcents: 0,
+        cache_read_per_million_microcents: Some(0),
+        cache_write_per_million_microcents: Some(0),
+        reasoning_per_million_microcents: Some(0),
+        request_flat_microcents: 3,
+    });
+    let journal = compaction_journal::MemoryJournal::fresh("ordinary-tool-positive");
+    let options = TurnOptions {
+        session_id: "ordinary-tool-positive".into(),
+        journal: Some(journal.clone()),
+        max_rounds: 3,
+        max_attempts: 3,
+        tools: vec![orbit_adapter::types::ToolDefinition {
+            name: "inspect".into(),
+            description: "owned fixture operation".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            schema_digest: orbit_adapter::types::Sha256Digest("fixture".into()),
+        }],
+        ..Default::default()
+    };
+    let mut source = Vec::new();
+    let mut executor = OneTool(0);
+    let mut events = Vec::new();
+    let completion = orbit_engine::run_turn_detailed(
+        &home.0,
+        &selected,
+        &options,
+        "complete the exact tool task",
+        &mut source,
+        &mut executor,
+        &CancelToken::new(),
+        &mut |event| events.push(event),
+    );
+    assert!(matches!(completion.end, orbit_engine::TurnEnd::Completed));
+    assert_eq!(executor.0, 1);
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(
+        (
+            completion.report.input_tokens,
+            completion.report.output_tokens,
+            completion.report.cost_microcents
+        ),
+        (22, 14, 6)
+    );
+    assert_eq!(completion.report.attempts.len(), 2);
+    for receipt in &completion.report.attempts {
+        assert_eq!(receipt.purpose, orbit_engine::AttemptPurpose::Ordinary);
+        assert_eq!(receipt.knownness, orbit_engine::AccountingKnownness::Known);
+        assert!(receipt.completed);
+        assert_eq!(receipt.totals.cost_microcents, Some(3));
+    }
+    assert_eq!(
+        completion.report.accounting.ordinary.cost_microcents,
+        Some(6)
+    );
+    assert_eq!(
+        completion.report.accounting.housekeeping,
+        orbit_engine::AccountingTotals::known_zero()
+    );
+    assert_eq!(journal.receipts(), completion.report.attempts);
+    assert_eq!(
+        source.last().unwrap().content,
+        "ordinary completed after tool"
+    );
+    assert!(source.iter().any(|message| message.role == ChatRole::Tool
+        && message.tool_call_id.as_deref() == Some("valid-positive-call")
+        && message.tool_result.as_deref() == Some("exact safe tool result")));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, FrontendEvent::TurnEnded { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn task05_unmanaged_legacy_retry_retains_uncertain_prefix_and_known_success_once() {
+    let done = serde_json::json!({"choices":[{"index":0,"delta":{"content":"completed after bounded legacy retry"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}});
+    let fixture = Fixture::new(vec![
+        Response {
+            body: "{\"error\":{\"message\":\"owned fixture capacity\"}}".into(),
+            status: 503,
+            pause: false,
+        },
+        Response {
+            body: format!("data: {done}\n\ndata: [DONE]\n\n"),
+            status: 200,
+            pause: false,
+        },
+    ]);
+    let home = Home::new();
+    let mut selected = config(&fixture);
+    selected.pricing = Some(orbit_adapter::types::CostRates {
+        input_per_million_microcents: 0,
+        output_per_million_microcents: 0,
+        cache_read_per_million_microcents: Some(0),
+        cache_write_per_million_microcents: Some(0),
+        reasoning_per_million_microcents: Some(0),
+        request_flat_microcents: 4,
+    });
+    let options = TurnOptions {
+        session_id: "unmanaged-legacy-retry".into(),
+        request_stem: "unmanaged-legacy-retry".into(),
+        max_attempts: 2,
+        journal: None,
+        spend_allowance: None,
+        ..Default::default()
+    };
+    let mut source = Vec::new();
+    let mut executor = Executor::default();
+    let mut events = Vec::new();
+    let completion = orbit_engine::run_turn_detailed(
+        &home.0,
+        &selected,
+        &options,
+        "preserve original legacy retry intent",
+        &mut source,
+        &mut executor,
+        &CancelToken::new(),
+        &mut |event| events.push(event),
+    );
+    assert!(matches!(completion.end, orbit_engine::TurnEnd::Completed));
+    assert!(completion.report.ok && !completion.report.interrupted);
+    assert_eq!(
+        completion.report.final_text,
+        "completed after bounded legacy retry"
+    );
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(executor.0, 0);
+    assert_eq!(completion.report.attempts.len(), 2);
+    let first = &completion.report.attempts[0];
+    let second = &completion.report.attempts[1];
+    assert_eq!(first.purpose, orbit_engine::AttemptPurpose::Ordinary);
+    assert_eq!(
+        first.knownness,
+        orbit_engine::AccountingKnownness::Uncertain
+    );
+    assert!(!first.completed);
+    assert!(first.usage.is_none());
+    assert_eq!(
+        (
+            first.totals.input_tokens,
+            first.totals.output_tokens,
+            first.totals.cost_microcents
+        ),
+        (0, 0, None)
+    );
+    assert_eq!(second.purpose, orbit_engine::AttemptPurpose::Ordinary);
+    assert_eq!(second.knownness, orbit_engine::AccountingKnownness::Known);
+    assert!(second.completed);
+    assert_eq!(
+        second.usage,
+        Some(orbit_adapter::types::ProviderUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        (
+            second.totals.input_tokens,
+            second.totals.output_tokens,
+            second.totals.cost_microcents
+        ),
+        (11, 7, Some(4))
+    );
+    assert_eq!(
+        completion.report.accounting.knownness,
+        orbit_engine::AccountingKnownness::Uncertain
+    );
+    assert_eq!(
+        (
+            completion.report.accounting.ordinary.input_tokens,
+            completion.report.accounting.ordinary.output_tokens,
+            completion.report.accounting.ordinary.cost_microcents
+        ),
+        (11, 7, None)
+    );
+    assert_eq!(
+        completion.report.accounting.housekeeping,
+        orbit_engine::AccountingTotals::known_zero()
+    );
+    assert_eq!(
+        (
+            completion.report.input_tokens,
+            completion.report.output_tokens,
+            completion.report.cost_microcents
+        ),
+        (11, 7, 4)
+    );
+    let records = orbit_ledger::verify_ledger(&home.0.join("ledger"))
+        .unwrap()
+        .0;
+    let actual_ids: Vec<_> = records
+        .into_iter()
+        .filter_map(|record| {
+            if let orbit_ledger::LedgerEvent::EgressIntent(event) = record.record.event {
+                assert_eq!(event.session_id, options.session_id);
+                Some(event.decision_id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(actual_ids.len(), 2);
+    assert_ne!(actual_ids[0], actual_ids[1]);
+    assert_eq!(
+        actual_ids,
+        [first.request_id.clone(), second.request_id.clone()]
+    );
+    assert_eq!(
+        source,
+        [
+            orbit_engine::user_message("preserve original legacy retry intent"),
+            orbit_engine::assistant_message("completed after bounded legacy retry")
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, FrontendEvent::Retrying { .. }))
+            .count(),
+        1
+    );
+    let terminal: Vec<_> = events
+        .iter()
+        .filter_map(|event| {
+            if let FrontendEvent::TurnEnded {
+                ok,
+                interrupted,
+                rounds,
+                input_tokens,
+                output_tokens,
+                cost_microcents,
+            } = event
+            {
+                Some((
+                    *ok,
+                    *interrupted,
+                    *rounds,
+                    *input_tokens,
+                    *output_tokens,
+                    *cost_microcents,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        terminal,
+        [(true, false, completion.report.rounds, 11, 7, 4)]
+    );
 }

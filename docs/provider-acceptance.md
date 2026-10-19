@@ -23,8 +23,9 @@ accepts, including any slash characters.
 4. Query `/effort`, select a supported value, then use `/effort default`. Check
    that the model accepts both requests. An unsupported choice should fail
    visibly before a request.
-5. Interrupt a response, then resume the session. Confirm the partial reply is
-   visibly interrupted and the old prompt is not automatically sent again.
+5. Interrupt a response and inspect its saved state. Resume only when accounting
+   permits admission. Pending uncertain work should refuse a new request; preserve
+   it with recovery status/export rather than resubmitting the old prompt.
 
 ## Compare two providers
 
@@ -78,6 +79,15 @@ To test draft insertion, add or import the notes pane example from
 Use that pane's draft action and confirm it does not submit the prompt. Folder
 trust, tool permissions, scans, and external requests remain separate explicit
 actions.
+
+## Try compaction and session preservation
+
+Use `/compact` after a few harmless exchanges. Confirm the summary uses no extra
+user turn and its usage is accounted for. Use `orbit recovery status --session
+SESSION_ID --json` to inspect tracked accounting. In a disposable session, try
+[preserving an inactive session](setup.md#preserve-an-inactive-session) and check
+that the original conversation and pending evidence remain unchanged. This
+private directory is not encrypted and is not an input to `orbit restore`.
 
 ## Record the outcome
 

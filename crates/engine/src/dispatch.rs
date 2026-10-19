@@ -135,6 +135,61 @@ impl TurnConfig {
 
 pub(crate) type DispatchFailure = (&'static str, String);
 
+/// Transport evidence is retained only beside the exact consumed request.
+/// Legacy projections intentionally retain the existing error message behavior.
+pub(crate) struct DetailedDispatchFailure {
+    legacy: DispatchFailure,
+    evidence: Box<DispatchFailureEvidence>,
+}
+struct DispatchFailureEvidence {
+    prepared: PreparedProviderRequest,
+    observation: orbit_provider_http::adapter_trait::FailureObservation,
+}
+impl std::fmt::Debug for DispatchFailureEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DispatchFailureEvidence { redacted }")
+    }
+}
+impl std::fmt::Debug for DetailedDispatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DetailedDispatchFailure")
+            .field("code", &self.legacy.0)
+            .finish_non_exhaustive()
+    }
+}
+impl DetailedDispatchFailure {
+    pub(crate) fn legacy(&self) -> &DispatchFailure {
+        &self.legacy
+    }
+    pub(crate) fn into_legacy(self) -> DispatchFailure {
+        self.legacy
+    }
+    pub(crate) fn qualify_final_refusal(
+        &self,
+        intent: &crate::compaction::AttemptIntent,
+        attempt: &crate::compaction::AttemptRef,
+        binding: &crate::retry::OrdinaryAttemptBinding,
+        policy: &crate::retry::RetryPolicyBinding,
+        eligibility: &crate::retry::RefusalEligibility,
+    ) -> Result<crate::retry::RefusedOrdinarySettlement, crate::compaction::HistoryError> {
+        let orbit_provider_http::adapter_trait::FailureObservation::CompleteHttpRejection(
+            observation,
+        ) = &self.evidence.observation
+        else {
+            return Err(crate::compaction::HistoryError::InvalidRecord);
+        };
+        crate::retry::RefusedOrdinarySettlement::for_rejection(
+            intent,
+            attempt,
+            binding,
+            policy,
+            &self.evidence.prepared.request,
+            observation,
+            eligibility,
+        )
+    }
+}
+
 // These construction types intentionally have no content-bearing Debug/Serialize.
 #[derive(Clone)]
 pub(crate) struct RequestPreparationContext {
@@ -146,12 +201,42 @@ pub(crate) struct RequestPreparationContext {
     binding_digest: String,
 }
 
+impl RequestPreparationContext {
+    pub(crate) fn route(&self) -> &orbit_adapter::types::ProviderRouteBinding {
+        &self.route
+    }
+}
+
 pub(crate) struct PreparedProviderRequest {
     context: RequestPreparationContext,
     request: orbit_adapter::types::ProviderRequest,
     session_id: String,
 }
 impl PreparedProviderRequest {
+    pub(crate) fn ordinary_attempt_binding(
+        &self,
+        policy: &crate::retry::RetryPolicyBinding,
+    ) -> Result<crate::retry::OrdinaryAttemptBinding, crate::compaction::HistoryError> {
+        use orbit_adapter::types::AdapterKind;
+        if self.context.config.kind != ProviderKind::OpenAiCompatible
+            || self.context.dialect != orbit_provider_http::request::HttpDialect::OpenAiCompatible
+            || self.request.route != self.context.route
+        {
+            return Err(crate::compaction::HistoryError::InvalidRecord);
+        }
+        let identity = orbit_provider_http::openai::openai_identity();
+        if self.request.route.adapter_kind != AdapterKind::OpenAiCompatibleHttpV1
+            || self.request.route.adapter_kind != identity.kind
+            || self.request.route.adapter_implementation_digest != identity.implementation_digest
+            || self.request.route.adapter_profile_digest != identity.profile_digest
+        {
+            return Err(crate::compaction::HistoryError::InvalidRecord);
+        }
+        crate::retry::OrdinaryAttemptBinding::for_request(&self.request, &identity, policy)
+    }
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request.request_id.0
+    }
     pub(crate) fn binding_digest(&self) -> &str {
         &self.context.binding_digest
     }
@@ -374,6 +459,20 @@ pub(crate) fn prepare_provider_request(
     request_stem: &str,
     session_id: &str,
 ) -> Result<PreparedProviderRequest, DispatchFailure> {
+    // One identity per real prospective attempt; hypothetical probes use the
+    // private builder below with a fixed, non-dispatchable identity instead.
+    let identity = format!("{request_stem}-{}", ulid::Ulid::new());
+    build_prepared_request(context, prompt, messages, &identity, session_id, None)
+}
+
+fn build_prepared_request(
+    context: &RequestPreparationContext,
+    prompt: &str,
+    messages: Option<Vec<ChatMessage>>,
+    identity: &str,
+    session_id: &str,
+    measurement_timeouts: Option<(u64, u64)>,
+) -> Result<PreparedProviderRequest, DispatchFailure> {
     let config = &context.config;
     let messages = project_messages(context, prompt, messages);
     let input = orbit_adapter::credential::SecretBytes::new(prompt.as_bytes().to_vec());
@@ -384,12 +483,11 @@ pub(crate) fn prepare_provider_request(
     // round, turn and retry — the old "{stem}-{pid}" was identical
     // for the whole process life, so the ledger could not tie rounds
     // to turns or sessions).
-    let request_ulid = ulid::Ulid::new();
     let request = orbit_adapter::types::ProviderRequest {
         schema_version: 1,
-        request_id: orbit_adapter::types::RequestId(format!("{request_stem}-{request_ulid}")),
-        decision_id: orbit_adapter::types::DecisionId(format!("{request_stem}-{request_ulid}")),
-        attempt_id: orbit_adapter::types::AttemptId(format!("{request_stem}-{request_ulid}")),
+        request_id: orbit_adapter::types::RequestId(identity.into()),
+        decision_id: orbit_adapter::types::DecisionId(identity.into()),
+        attempt_id: orbit_adapter::types::AttemptId(identity.into()),
         route: context.route.clone(),
         input,
         messages,
@@ -422,14 +520,18 @@ pub(crate) fn prepare_provider_request(
         // production configs — the scenarios use them to keep the
         // suite fast while proving the timeout fires).
         connect_timeout_ms: 10_000,
-        first_byte_timeout_ms: std::env::var("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30_000),
-        idle_timeout_ms: std::env::var("ORBIT_TEST_IDLE_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(90_000),
+        first_byte_timeout_ms: measurement_timeouts.map(|t| t.0).unwrap_or_else(|| {
+            std::env::var("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30_000)
+        }),
+        idle_timeout_ms: measurement_timeouts.map(|t| t.1).unwrap_or_else(|| {
+            std::env::var("ORBIT_TEST_IDLE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90_000)
+        }),
     };
 
     let prepared = PreparedProviderRequest {
@@ -441,6 +543,60 @@ pub(crate) fn prepare_provider_request(
         .rendered_body()
         .map_err(|error| (error.code(), error.to_string()))?;
     Ok(prepared)
+}
+
+// No public request accessor or conversion: this seed cannot be dispatched by
+// a planner. Repeated estimates keep identities/timeouts fixed and read no ENV.
+pub(crate) struct MeasurementProbe {
+    seed: PreparedProviderRequest,
+}
+
+pub(crate) fn measurement_probe(
+    context: &RequestPreparationContext,
+) -> Result<MeasurementProbe, DispatchFailure> {
+    Ok(MeasurementProbe {
+        seed: build_prepared_request(
+            context,
+            "",
+            Some(Vec::new()),
+            "orbit-measurement",
+            "orbit-measurement",
+            Some((30_000, 90_000)),
+        )?,
+    })
+}
+
+impl MeasurementProbe {
+    /// Normalize only an owned historical copy, preserving message indices.
+    /// Unlike request projection this never inserts the current directive.
+    pub(crate) fn historical_projection(&self, source: &[ChatMessage]) -> Vec<ChatMessage> {
+        let mut messages = source.to_vec();
+        crate::routing::strip_foreign_opaque_blocks_for(
+            &mut messages,
+            &self.seed.context.config.provider_id,
+            &self.seed.context.config.model,
+        );
+        messages
+    }
+
+    pub(crate) fn estimate_messages(
+        &self,
+        messages: &[ChatMessage],
+        budget: &crate::context_budget::SelectedBudget,
+    ) -> Result<crate::context_budget::RequestEstimate, crate::context_budget::BudgetError> {
+        crate::context_budget::estimate_prepared_request(
+            &self.seed.with_messages_for_measurement(messages.to_vec()),
+            budget,
+        )
+    }
+
+    pub(crate) fn dialect(&self) -> orbit_provider_http::request::HttpDialect {
+        self.seed.context.dialect
+    }
+
+    pub(crate) fn has_tools(&self) -> bool {
+        !self.seed.context.tools.is_empty()
+    }
 }
 
 /// Run one provider round through the four-gate async dispatch
@@ -542,317 +698,347 @@ pub(crate) fn run_prepared_dispatch(
     cancel: orbit_provider_http::CancelToken,
     session_id: &str,
 ) -> Result<TurnOutcome, DispatchFailure> {
-    let current = request_preparation_context(config, None, &[])?;
-    if current.binding_digest != prepared.context.binding_digest
-        || current.route != prepared.request.route
-        || config.pricing != prepared.context.config.pricing
-        || session_id != prepared.session_id
-    {
-        return Err(("ORBIT-E0413", "prepared provider binding changed".into()));
-    }
-    let request = prepared.request;
-    let route = request.route.clone();
-    let port = route.endpoint_port;
-    let endpoint_path = route.endpoint_path.clone();
-    let url = orbit_provider_http::endpoint::validate_provider_url(&config.gate)
-        .map_err(|_| ("ORBIT-E0401", "provider endpoint binding is invalid".into()))?;
-    type RegisterAdapter =
-        Box<dyn FnOnce(&mut orbit_gateway::ProviderRegistry) -> Result<(), (&'static str, String)>>;
-    let (_adapter_kind, _adapter_identity, register): (
-        orbit_adapter::types::AdapterKind,
-        orbit_adapter::types::AdapterIdentity,
-        RegisterAdapter,
-    ) = match config.kind {
-        ProviderKind::Anthropic => {
-            let identity = orbit_provider_http::anthropic::anthropic_identity();
-            let kind = orbit_adapter::types::AdapterKind::DeclarativeHttpJsonV1;
-            let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
-                let adapter = orbit_provider_http::AnthropicMessagesV1::new(
-                    identity,
-                    orbit_provider_http::anthropic::anthropic_capabilities(),
+    run_prepared_dispatch_detailed(home, config, prepared, observer, cancel, session_id)
+        .map_err(DetailedDispatchFailure::into_legacy)
+}
+
+pub(crate) fn run_prepared_dispatch_detailed(
+    home: &Path,
+    config: &TurnConfig,
+    prepared: PreparedProviderRequest,
+    observer: orbit_provider_http::stream::StreamObserver<'_>,
+    cancel: orbit_provider_http::CancelToken,
+    session_id: &str,
+) -> Result<TurnOutcome, DetailedDispatchFailure> {
+    let mut observation = orbit_provider_http::adapter_trait::FailureObservation::Unknown;
+    let result = (|| -> Result<TurnOutcome, DispatchFailure> {
+        let current = request_preparation_context(config, None, &[])?;
+        if current.binding_digest != prepared.context.binding_digest
+            || current.route != prepared.request.route
+            || config.pricing != prepared.context.config.pricing
+            || session_id != prepared.session_id
+        {
+            return Err(("ORBIT-E0413", "prepared provider binding changed".into()));
+        }
+        let request = &prepared.request;
+        let route = request.route.clone();
+        let port = route.endpoint_port;
+        let endpoint_path = route.endpoint_path.clone();
+        let url = orbit_provider_http::endpoint::validate_provider_url(&config.gate)
+            .map_err(|_| ("ORBIT-E0401", "provider endpoint binding is invalid".into()))?;
+        type RegisterAdapter = Box<
+            dyn FnOnce(&mut orbit_gateway::ProviderRegistry) -> Result<(), (&'static str, String)>,
+        >;
+        let (_adapter_kind, _adapter_identity, register): (
+            orbit_adapter::types::AdapterKind,
+            orbit_adapter::types::AdapterIdentity,
+            RegisterAdapter,
+        ) = match config.kind {
+            ProviderKind::Anthropic => {
+                let identity = orbit_provider_http::anthropic::anthropic_identity();
+                let kind = orbit_adapter::types::AdapterKind::DeclarativeHttpJsonV1;
+                let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
+                    let adapter = orbit_provider_http::AnthropicMessagesV1::new(
+                        identity,
+                        orbit_provider_http::anthropic::anthropic_capabilities(),
+                    )
+                    .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
+                    registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
+                    Ok(())
+                };
+                (
+                    kind,
+                    orbit_provider_http::anthropic::anthropic_identity(),
+                    Box::new(register),
                 )
-                .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
-                registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
-                Ok(())
-            };
-            (
-                kind,
-                orbit_provider_http::anthropic::anthropic_identity(),
-                Box::new(register),
-            )
-        }
-        ProviderKind::Ollama => {
-            let identity = orbit_adapter::types::AdapterIdentity {
-                kind: orbit_adapter::types::AdapterKind::LocalProcessV1,
-                implementation_digest: orbit_adapter::types::Sha256Digest("o".repeat(64)),
-                profile_digest: orbit_adapter::types::Sha256Digest(
-                    "ollama-profile".repeat(8).chars().take(64).collect(),
-                ),
-            };
-            let kind = orbit_adapter::types::AdapterKind::LocalProcessV1;
-            let closure_identity = identity.clone();
-            let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
-                let adapter =
-                    orbit_provider_http::OllamaHttpV1::new(closure_identity, ollama_capabilities())
-                        .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
-                registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
-                Ok(())
-            };
-            (kind, identity, Box::new(register))
-        }
-        ProviderKind::OpenAiCompatible => {
-            let identity = orbit_provider_http::openai::openai_identity();
-            let kind = orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1;
-            let tls = orbit_adapter::types::TlsPinPolicy {
-                webpki: true,
-                spki_sha256: None,
-            };
-            let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
-                let adapter = orbit_provider_http::OpenAiCompatibleHttpV1::new(
-                    identity,
-                    orbit_provider_http::openai::openai_capabilities(),
-                    tls,
+            }
+            ProviderKind::Ollama => {
+                let identity = orbit_adapter::types::AdapterIdentity {
+                    kind: orbit_adapter::types::AdapterKind::LocalProcessV1,
+                    implementation_digest: orbit_adapter::types::Sha256Digest("o".repeat(64)),
+                    profile_digest: orbit_adapter::types::Sha256Digest(
+                        "ollama-profile".repeat(8).chars().take(64).collect(),
+                    ),
+                };
+                let kind = orbit_adapter::types::AdapterKind::LocalProcessV1;
+                let closure_identity = identity.clone();
+                let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
+                    let adapter = orbit_provider_http::OllamaHttpV1::new(
+                        closure_identity,
+                        ollama_capabilities(),
+                    )
+                    .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
+                    registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
+                    Ok(())
+                };
+                (kind, identity, Box::new(register))
+            }
+            ProviderKind::OpenAiCompatible => {
+                let identity = orbit_provider_http::openai::openai_identity();
+                let kind = orbit_adapter::types::AdapterKind::OpenAiCompatibleHttpV1;
+                let tls = orbit_adapter::types::TlsPinPolicy {
+                    webpki: true,
+                    spki_sha256: None,
+                };
+                let register = move |registry: &mut orbit_gateway::ProviderRegistry| {
+                    let adapter = orbit_provider_http::OpenAiCompatibleHttpV1::new(
+                        identity,
+                        orbit_provider_http::openai::openai_capabilities(),
+                        tls,
+                    )
+                    .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
+                    registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
+                    Ok(())
+                };
+                (
+                    kind,
+                    orbit_provider_http::openai::openai_identity(),
+                    Box::new(register),
                 )
-                .map_err(|e| ("ORBIT-E0410", e.to_string()))?;
-                registry.register_async_adapter(kind, std::sync::Arc::new(adapter));
-                Ok(())
+            }
+        };
+
+        // Register the model + async adapter in a fresh registry.
+        let mut registry = orbit_gateway::ProviderRegistry::new();
+        register(&mut registry)?;
+        registry.register_model(orbit_gateway::ModelRef(config.model.clone()), route.clone());
+
+        // Egress allowlist: exactly this one gate tuple.
+        let tuple = orbit_egress::EgressTuple {
+            scheme: if url.scheme() == "https" {
+                "https".into()
+            } else {
+                "http".into()
+            },
+            host: route.endpoint_host.clone(),
+            port,
+            path_prefix: if endpoint_path.is_empty() {
+                "/v1".into()
+            } else {
+                endpoint_path.clone()
+            },
+            provider_id: config.provider_id.clone(),
+            region_id: "local".into(),
+        };
+        let engine = orbit_gateway::DispatchEngine::new(
+            registry,
+            home.join("ledger"),
+            orbit_egress::EgressAllowlist::new(vec![tuple.clone()]),
+            vec![tuple],
+            vec![],
+        );
+
+        // Authentication follows the exact selected provider binding. No declaration
+        // means no auth; legacy gate authentication is made explicit by its caller.
+        use orbit_adapter::provider_credentials::{ProviderAuthIdentity, ProviderCredentialStore};
+        let credential_error =
+            |error: orbit_adapter::provider_credentials::ProviderCredentialError| {
+                ("ORBIT-E0401", error.to_string())
             };
-            (
-                kind,
-                orbit_provider_http::openai::openai_identity(),
-                Box::new(register),
-            )
-        }
-    };
-
-    // Register the model + async adapter in a fresh registry.
-    let mut registry = orbit_gateway::ProviderRegistry::new();
-    register(&mut registry)?;
-    registry.register_model(orbit_gateway::ModelRef(config.model.clone()), route.clone());
-
-    // Egress allowlist: exactly this one gate tuple.
-    let tuple = orbit_egress::EgressTuple {
-        scheme: if url.scheme() == "https" {
-            "https".into()
-        } else {
-            "http".into()
-        },
-        host: route.endpoint_host.clone(),
-        port,
-        path_prefix: if endpoint_path.is_empty() {
-            "/v1".into()
-        } else {
-            endpoint_path.clone()
-        },
-        provider_id: config.provider_id.clone(),
-        region_id: "local".into(),
-    };
-    let engine = orbit_gateway::DispatchEngine::new(
-        registry,
-        home.join("ledger"),
-        orbit_egress::EgressAllowlist::new(vec![tuple.clone()]),
-        vec![tuple],
-        vec![],
-    );
-
-    // Authentication follows the exact selected provider binding. No declaration
-    // means no auth; legacy gate authentication is made explicit by its caller.
-    use orbit_adapter::provider_credentials::{ProviderAuthIdentity, ProviderCredentialStore};
-    let credential_error = |error: orbit_adapter::provider_credentials::ProviderCredentialError| {
-        ("ORBIT-E0401", error.to_string())
-    };
-    let kind = match config.kind {
-        ProviderKind::OpenAiCompatible => "openai-compatible",
-        ProviderKind::Anthropic => "anthropic",
-        ProviderKind::Ollama => "ollama",
-    };
-    let identity = ProviderAuthIdentity::new(
-        &config.provider_id,
-        kind,
-        url.as_str(),
-        config.credential_env.as_deref(),
-    )
-    .map_err(credential_error)?;
-    // Absolute lexical paths retain no-follow checks, including for --home .orbit.
-    let credential_home = std::path::absolute(home).map_err(|_| {
-        (
-            "ORBIT-E0401",
-            "provider credential home could not be resolved".into(),
+        let kind = match config.kind {
+            ProviderKind::OpenAiCompatible => "openai-compatible",
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::Ollama => "ollama",
+        };
+        let identity = ProviderAuthIdentity::new(
+            &config.provider_id,
+            kind,
+            url.as_str(),
+            config.credential_env.as_deref(),
         )
-    })?;
-    let credential = ProviderCredentialStore::new(&credential_home)
-        .map_err(credential_error)?
-        .resolve_with(&identity, |name| {
-            Ok(std::env::var_os(name)
-                .map(|value| orbit_adapter::SecretBytes::new(value.into_encoded_bytes())))
-        })
-        .map_err(credential_error)?
-        .into_secret();
-
-    // E7: the session id comes from the front-end (one per chat
-    // session, stable across rounds and turns) — not minted per
-    // round, which made the ledger unable to tie rounds to sessions.
-    let session: orbit_ledger::SessionId = session_id.to_string();
-    let decision = request.decision_id.clone();
-
-    // Run the full pipeline via tokio.
-    // E6: one shared runtime for the process — a round used to spawn
-    // its own thread pool every time.
-    let result = orbit_provider_http::shared_runtime()
-        .block_on(async {
-            let mut writer = orbit_ledger::LedgerWriter::open(
-                &home.join("ledger"),
-                "orbit-engine".into(),
-                "0.1.0",
+        .map_err(credential_error)?;
+        // Absolute lexical paths retain no-follow checks, including for --home .orbit.
+        let credential_home = std::path::absolute(home).map_err(|_| {
+            (
+                "ORBIT-E0401",
+                "provider credential home could not be resolved".into(),
             )
-            .map_err(|e| orbit_gateway::DispatchError {
-                code: "E0719",
-                phase: "ledger",
-                message: e.to_string(),
-                session_id: session.clone(),
-                decision_id: decision.0.clone(),
-            })?;
-            engine
-                .dispatch_async(
-                    &config.model,
-                    &session,
-                    &decision.0,
-                    &request,
-                    credential.as_ref(),
-                    &mut writer,
-                    &cancel,
-                    observer,
-                )
-                .await
-        })
-        .map_err(|e| (e.code, e.message))?;
+        })?;
+        let credential = ProviderCredentialStore::new(&credential_home)
+            .map_err(credential_error)?
+            .resolve_with(&identity, |name| {
+                Ok(std::env::var_os(name)
+                    .map(|value| orbit_adapter::SecretBytes::new(value.into_encoded_bytes())))
+            })
+            .map_err(credential_error)?
+            .into_secret();
 
-    let (outcome, reservation) = result;
-    let egress_digest = Some(reservation.intent_digest).filter(|d| !d.is_empty());
-    match outcome {
-        orbit_gateway::DispatchOutcome::Completed(r) => {
-            let output: String = r
-                .events
-                .iter()
-                .filter_map(|e| match &e.event {
-                    orbit_adapter::types::ProviderEventKind::TextDelta { bytes } => {
-                        Some(String::from_utf8_lossy(bytes).into_owned())
-                    }
-                    _ => None,
-                })
-                .collect();
-            // Assemble thinking deltas into one opaque string (replay-only).
-            let thinking: Option<String> = {
-                let t: String = r
+        // E7: the session id comes from the front-end (one per chat
+        // session, stable across rounds and turns) — not minted per
+        // round, which made the ledger unable to tie rounds to sessions.
+        let session: orbit_ledger::SessionId = session_id.to_string();
+        let decision = request.decision_id.clone();
+
+        // Run the full pipeline via tokio.
+        // E6: one shared runtime for the process — a round used to spawn
+        // its own thread pool every time.
+        let result = orbit_provider_http::shared_runtime()
+            .block_on(async {
+                let mut writer = orbit_ledger::LedgerWriter::open(
+                    &home.join("ledger"),
+                    "orbit-engine".into(),
+                    "0.1.0",
+                )
+                .map_err(|e| orbit_gateway::DispatchError {
+                    code: "E0719",
+                    phase: "ledger",
+                    message: e.to_string(),
+                    session_id: session.clone(),
+                    decision_id: decision.0.clone(),
+                })?;
+                engine
+                    .dispatch_async_detailed(
+                        &config.model,
+                        &session,
+                        &decision.0,
+                        request,
+                        credential.as_ref(),
+                        &mut writer,
+                        &cancel,
+                        observer,
+                    )
+                    .await
+            })
+            .map_err(|e| (e.code, e.message))?;
+
+        let (detailed, reservation) = result;
+        let (outcome, observed_failure) = detailed.into_parts();
+        observation = observed_failure;
+        let egress_digest = Some(reservation.intent_digest).filter(|d| !d.is_empty());
+        match outcome {
+            orbit_gateway::DispatchOutcome::Completed(r) => {
+                let output: String = r
                     .events
                     .iter()
                     .filter_map(|e| match &e.event {
-                        orbit_adapter::types::ProviderEventKind::ThinkingDelta { bytes } => {
+                        orbit_adapter::types::ProviderEventKind::TextDelta { bytes } => {
                             Some(String::from_utf8_lossy(bytes).into_owned())
                         }
                         _ => None,
                     })
                     .collect();
-                (!t.is_empty()).then_some(t)
-            };
-            // Assemble the thinking signature the same way (replay-only).
-            let thinking_signature: Option<String> = {
-                let s: String = r
-                    .events
-                    .iter()
-                    .filter_map(|e| match &e.event {
-                        orbit_adapter::types::ProviderEventKind::ThinkingSignatureDelta {
-                            bytes,
-                        } => Some(String::from_utf8_lossy(bytes).into_owned()),
-                        _ => None,
-                    })
-                    .collect();
-                (!s.is_empty()).then_some(s)
-            };
-            // Assemble tool calls from the streamed events.
-            let mut tool_calls: std::collections::BTreeMap<u32, PendingToolCall> =
-                std::collections::BTreeMap::new();
-            for e in &r.events {
-                match &e.event {
-                    orbit_adapter::types::ProviderEventKind::ToolCallStarted {
-                        call_index,
-                        provider_call_id,
-                        name,
-                    } => {
-                        tool_calls
-                            .entry(*call_index)
-                            .or_insert_with(|| PendingToolCall {
-                                index: *call_index,
-                                id: provider_call_id
-                                    .clone()
-                                    .unwrap_or_else(|| format!("call-{call_index}")),
-                                name: name.clone(),
-                                arguments: Vec::new(),
-                            });
-                    }
-                    orbit_adapter::types::ProviderEventKind::ToolCallArgumentsDelta {
-                        call_index,
-                        bytes,
-                    } => {
-                        if let Some(tc) = tool_calls.get_mut(call_index) {
-                            tc.arguments.extend_from_slice(bytes);
+                // Assemble thinking deltas into one opaque string (replay-only).
+                let thinking: Option<String> = {
+                    let t: String = r
+                        .events
+                        .iter()
+                        .filter_map(|e| match &e.event {
+                            orbit_adapter::types::ProviderEventKind::ThinkingDelta { bytes } => {
+                                Some(String::from_utf8_lossy(bytes).into_owned())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    (!t.is_empty()).then_some(t)
+                };
+                // Assemble the thinking signature the same way (replay-only).
+                let thinking_signature: Option<String> = {
+                    let s: String = r
+                        .events
+                        .iter()
+                        .filter_map(|e| match &e.event {
+                            orbit_adapter::types::ProviderEventKind::ThinkingSignatureDelta {
+                                bytes,
+                            } => Some(String::from_utf8_lossy(bytes).into_owned()),
+                            _ => None,
+                        })
+                        .collect();
+                    (!s.is_empty()).then_some(s)
+                };
+                // Assemble tool calls from the streamed events.
+                let mut tool_calls: std::collections::BTreeMap<u32, PendingToolCall> =
+                    std::collections::BTreeMap::new();
+                for e in &r.events {
+                    match &e.event {
+                        orbit_adapter::types::ProviderEventKind::ToolCallStarted {
+                            call_index,
+                            provider_call_id,
+                            name,
+                        } => {
+                            tool_calls
+                                .entry(*call_index)
+                                .or_insert_with(|| PendingToolCall {
+                                    index: *call_index,
+                                    id: provider_call_id
+                                        .clone()
+                                        .unwrap_or_else(|| format!("call-{call_index}")),
+                                    name: name.clone(),
+                                    arguments: Vec::new(),
+                                });
                         }
+                        orbit_adapter::types::ProviderEventKind::ToolCallArgumentsDelta {
+                            call_index,
+                            bytes,
+                        } => {
+                            if let Some(tc) = tool_calls.get_mut(call_index) {
+                                tc.arguments.extend_from_slice(bytes);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                let finish_reason = r.events.iter().rev().find_map(|e| match &e.event {
+                    orbit_adapter::types::ProviderEventKind::Finished { finish_reason, .. } => {
+                        finish_reason.clone()
+                    }
+                    _ => None,
+                });
+                let usage = r.accounting.usage;
+                let context_tokens = usage
+                    .input_tokens
+                    .checked_add(usage.cache_read_tokens)
+                    .and_then(|total| total.checked_add(usage.cache_write_tokens))
+                    .ok_or_else(|| {
+                        (
+                            "ORBIT-E0411",
+                            "provider context accounting overflow".to_owned(),
+                        )
+                    })?;
+                // Cost in microcents from the pricing config (zero if unpriced).
+                let cost_microcents = config
+                    .pricing
+                    .and_then(|p| p.cost_microcents(&usage))
+                    .unwrap_or(0);
+                Ok(TurnOutcome {
+                    output,
+                    thinking,
+                    thinking_signature,
+                    tool_calls: tool_calls.into_values().collect(),
+                    finish_reason,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cost_microcents,
+                    context_tokens,
+                    egress_digest,
+                })
             }
-            let finish_reason = r.events.iter().rev().find_map(|e| match &e.event {
-                orbit_adapter::types::ProviderEventKind::Finished { finish_reason, .. } => {
-                    finish_reason.clone()
-                }
-                _ => None,
-            });
-            let usage = r.accounting.usage;
-            let context_tokens = usage
-                .input_tokens
-                .checked_add(usage.cache_read_tokens)
-                .and_then(|total| total.checked_add(usage.cache_write_tokens))
-                .ok_or_else(|| {
-                    (
-                        "ORBIT-E0411",
-                        "provider context accounting overflow".to_owned(),
-                    )
-                })?;
-            // Cost in microcents from the pricing config (zero if unpriced).
-            let cost_microcents = config
-                .pricing
-                .and_then(|p| p.cost_microcents(&usage))
-                .unwrap_or(0);
-            Ok(TurnOutcome {
-                output,
-                thinking,
-                thinking_signature,
-                tool_calls: tool_calls.into_values().collect(),
-                finish_reason,
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cost_microcents,
-                context_tokens,
-                egress_digest,
-            })
+            // E1: a refusal without a usable message and without a
+            // credential is genuinely an unauthenticated gateway; anything
+            // else keeps the provider's own words (a 400's "prompt is too
+            // long" must not become "requires authentication").
+            orbit_gateway::DispatchOutcome::AdapterRefused {
+                code: "E0404",
+                message,
+            } if credential.is_none() && message.trim() == "status 400" => Err((
+                "ORBIT-E0402",
+                format!(
+                    "gateway at {} requires authentication; set ORBIT_GATE_TOKEN",
+                    config.gate
+                ),
+            )),
+            orbit_gateway::DispatchOutcome::AdapterRefused { code, message } => {
+                Err((code, message))
+            }
+            other => Err(("ORBIT-E0406", format!("ask failed: {other:?}"))),
         }
-        // E1: a refusal without a usable message and without a
-        // credential is genuinely an unauthenticated gateway; anything
-        // else keeps the provider's own words (a 400's "prompt is too
-        // long" must not become "requires authentication").
-        orbit_gateway::DispatchOutcome::AdapterRefused {
-            code: "E0404",
-            message,
-        } if credential.is_none() && message.trim() == "status 400" => Err((
-            "ORBIT-E0402",
-            format!(
-                "gateway at {} requires authentication; set ORBIT_GATE_TOKEN",
-                config.gate
-            ),
-        )),
-        orbit_gateway::DispatchOutcome::AdapterRefused { code, message } => Err((code, message)),
-        other => Err(("ORBIT-E0406", format!("ask failed: {other:?}"))),
-    }
+    })();
+    result.map_err(|legacy| DetailedDispatchFailure {
+        legacy,
+        evidence: Box::new(DispatchFailureEvidence {
+            prepared,
+            observation,
+        }),
+    })
 }
 
 /// Ollama capabilities: loopback, streaming, tools; no JSON-schema output.
@@ -883,6 +1069,182 @@ mod preparation_tests {
             effort: None,
             supported_efforts: None,
         }
+    }
+
+    fn retry_policy(config: &TurnConfig) -> crate::retry::RetryPolicyBinding {
+        use crate::retry::{
+            FinalRejectionContract, FinalRejectionPolicy, FinalRejectionSelector,
+            RetryPolicyBinding,
+        };
+        let selector = FinalRejectionSelector::new(
+            config.provider_id.clone(),
+            config.model.clone(),
+            config.gate.clone(),
+            crate::retry::adapter_identity_digest(&orbit_provider_http::openai::openai_identity()),
+        )
+        .unwrap();
+        RetryPolicyBinding::for_config(
+            config,
+            FinalRejectionPolicy::new(
+                "fixture-final-rejection".into(),
+                selector,
+                vec![429, 503],
+                FinalRejectionContract::new("ordinary", "final_rejection", "unknown", true)
+                    .unwrap(),
+                2,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ordinary_issuer_requires_actual_kind_dialect_route_and_adapter_profile() {
+        let config = config();
+        let policy = retry_policy(&config);
+        let context = request_preparation_context(&config, None, &[]).unwrap();
+        for mutation in 0..8 {
+            let mut prepared =
+                prepare_provider_request(&context, "question", None, "fixture", "session").unwrap();
+            match mutation {
+                0 => prepared.context.config.kind = ProviderKind::Anthropic,
+                1 => {
+                    prepared.context.dialect =
+                        orbit_provider_http::request::HttpDialect::AnthropicMessages
+                }
+                2 => {
+                    prepared.request.route.adapter_kind =
+                        orbit_adapter::types::AdapterKind::LocalProcessV1
+                }
+                3 => {
+                    prepared.request.route.adapter_implementation_digest =
+                        orbit_adapter::types::Sha256Digest("a".repeat(64))
+                }
+                4 => {
+                    prepared.request.route.adapter_profile_digest =
+                        orbit_adapter::types::Sha256Digest("b".repeat(64))
+                }
+                5 => prepared.request.route.expected_model = "another-model".into(),
+                6 => prepared.request.route.endpoint_path = "/different/v1".into(),
+                _ => {
+                    prepared.request.route.provider_id =
+                        orbit_adapter::types::ProviderId("another-provider".into())
+                }
+            }
+            if mutation >= 2 {
+                // Keep request/context coherent so the concrete identity and
+                // frozen policy checks themselves must reject these changes.
+                prepared.context.route = prepared.request.route.clone();
+            }
+            assert!(
+                prepared.ordinary_attempt_binding(&policy).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let first =
+            prepare_provider_request(&context, "first body", None, "fixture", "session").unwrap();
+        let second =
+            prepare_provider_request(&context, "second body", None, "fixture", "session").unwrap();
+        let a = first.ordinary_attempt_binding(&policy).unwrap().to_record();
+        let b = second
+            .ordinary_attempt_binding(&policy)
+            .unwrap()
+            .to_record();
+        assert_eq!(a.request_id(), first.request_id());
+        assert_eq!(a.request_id(), a.decision_id());
+        assert_eq!(a.request_id(), a.attempt_id());
+        assert_ne!(a.request_id(), b.request_id());
+        assert_ne!(a.body_digest(), b.body_digest());
+        assert_ne!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn detailed_failure_debug_redacts_retained_request_and_raw_error() {
+        let config = config();
+        let context =
+            request_preparation_context(&config, Some("private-directive-marker"), &[]).unwrap();
+        let prepared = prepare_provider_request(
+            &context,
+            "private-prompt-marker",
+            None,
+            "fixture",
+            "session",
+        )
+        .unwrap();
+        let failure = DetailedDispatchFailure {
+            legacy: ("E0407", "private-provider-body-marker".into()),
+            evidence: Box::new(DispatchFailureEvidence {
+                prepared,
+                observation: orbit_provider_http::adapter_trait::FailureObservation::Unknown,
+            }),
+        };
+        let debug = format!("{failure:?} {:?}", failure.evidence);
+        for marker in [
+            "private-directive-marker",
+            "private-prompt-marker",
+            "private-provider-body-marker",
+            "127.0.0.1",
+            "raw-model",
+        ] {
+            assert!(!debug.contains(marker));
+        }
+        assert_eq!(
+            failure.legacy(),
+            &("E0407", "private-provider-body-marker".into())
+        );
+        assert_eq!(
+            failure.into_legacy(),
+            ("E0407", "private-provider-body-marker".into())
+        );
+    }
+
+    #[test]
+    fn changed_prepared_dispatch_retains_unknown_evidence_without_qualification() {
+        let config = config();
+        let policy = retry_policy(&config);
+        let context = request_preparation_context(&config, None, &[]).unwrap();
+        let prepared =
+            prepare_provider_request(&context, "question", None, "fixture", "session").unwrap();
+        let binding = prepared.ordinary_attempt_binding(&policy).unwrap();
+        let intent = crate::compaction::AttemptIntent {
+            owner_session_id: "session".into(),
+            child_id: None,
+            request_id: prepared.request_id().into(),
+            purpose: crate::compaction::AttemptPurpose::Ordinary,
+            budget: crate::context_budget::BudgetIdentity::for_config(
+                &config, "fixture", "fixture",
+            )
+            .unwrap(),
+        };
+        let reference = crate::compaction::AttemptRef {
+            request_id: intent.request_id.clone(),
+            intent_digest: intent.digest().unwrap(),
+            revision: crate::compaction::AccountingRevision(1),
+        };
+        let mut changed = config.clone();
+        changed.model = "changed-model".into();
+        let failure = run_prepared_dispatch_detailed(
+            Path::new("/nonexistent-context-budget-fixture"),
+            &changed,
+            prepared,
+            None,
+            orbit_provider_http::CancelToken::new(),
+            "session",
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.legacy(),
+            &("ORBIT-E0413", "prepared provider binding changed".into())
+        );
+        assert!(matches!(
+            &failure.evidence.observation,
+            orbit_provider_http::adapter_trait::FailureObservation::Unknown
+        ));
+        assert!(
+            failure
+                .qualify_final_refusal(&intent, &reference, &binding, &policy, &Default::default())
+                .is_err()
+        );
     }
 
     #[test]

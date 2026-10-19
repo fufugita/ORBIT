@@ -12,9 +12,295 @@ use crate::approval::ApprovalRegistry;
 use crate::bus::BusSender;
 use std::sync::mpsc;
 
+/// A worker's committed session identity. Generations change only on a real swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBinding {
+    pub session_id: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualAction {
+    Compact,
+    Clear,
+}
+
+#[derive(Clone)]
+pub struct ManualOperation {
+    inner: std::sync::Arc<ManualOperationInner>,
+}
+
+struct ManualOperationInner {
+    source: SessionBinding,
+    action: ManualAction,
+    id: u64,
+    state: std::sync::Mutex<ManualCancelState>,
+}
+
+#[derive(Default)]
+struct ManualCancelState {
+    installed: bool,
+    closed: bool,
+    requested: bool,
+    callback: Option<CancelHandle>,
+}
+
+impl std::fmt::Debug for ManualOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManualOperation")
+            .field("source", self.source())
+            .field("action", &self.action())
+            .field("id", &self.id())
+            .finish()
+    }
+}
+
+impl PartialEq for ManualOperation {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+impl Eq for ManualOperation {}
+
+/// Closes only its captured operation; dropping it performs no I/O.
+pub struct ManualCancelRegistration {
+    operation: ManualOperation,
+}
+
+impl Drop for ManualCancelRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.operation.inner.state.lock() {
+            state.closed = true;
+            state.callback = None;
+        }
+    }
+}
+
+impl ManualOperation {
+    pub fn new(
+        source: SessionBinding,
+        action: ManualAction,
+        id: u64,
+    ) -> Result<Self, &'static str> {
+        if id == 0
+            || source.generation == 0
+            || source.session_id.is_empty()
+            || source.session_id.len() > 128
+            || !source
+                .session_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err("invalid manual operation identity");
+        }
+        Ok(Self {
+            inner: std::sync::Arc::new(ManualOperationInner {
+                source,
+                action,
+                id,
+                state: std::sync::Mutex::new(ManualCancelState::default()),
+            }),
+        })
+    }
+
+    pub fn source(&self) -> &SessionBinding {
+        &self.inner.source
+    }
+    pub fn action(&self) -> ManualAction {
+        self.inner.action
+    }
+    pub fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    pub fn cancel(&self) -> Result<bool, &'static str> {
+        let callback = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| "manual cancellation unavailable")?;
+            if state.closed {
+                return Ok(false);
+            }
+            state.requested = true;
+            state.callback.clone()
+        };
+        if let Some(callback) = callback {
+            callback();
+        }
+        Ok(true)
+    }
+
+    pub fn install_cancel(
+        &self,
+        callback: CancelHandle,
+    ) -> Result<ManualCancelRegistration, &'static str> {
+        let requested = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| "manual cancellation unavailable")?;
+            if state.closed || state.installed {
+                return Err("manual operation already consumed");
+            }
+            state.installed = true;
+            state.callback = Some(callback.clone());
+            state.requested
+        };
+        if requested {
+            callback();
+        }
+        Ok(ManualCancelRegistration {
+            operation: self.clone(),
+        })
+    }
+
+    pub fn finish_unstarted(&self) -> Result<(), &'static str> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "manual cancellation unavailable")?;
+        if state.installed {
+            return Err("manual operation already installed");
+        }
+        state.closed = true;
+        state.callback = None;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundKind {
+    Prompt,
+    PlanPrompt,
+    Control,
+    Resume,
+}
+
+impl ForegroundKind {
+    pub fn is_ordinary(self) -> bool {
+        matches!(self, Self::Prompt | Self::PlanPrompt)
+    }
+}
+
+/// One source-bound foreground admission, retained until its checked projection.
+#[derive(Clone)]
+pub struct ForegroundOperation {
+    inner: std::sync::Arc<ForegroundOperationInner>,
+}
+
+struct ForegroundOperationInner {
+    source: SessionBinding,
+    kind: ForegroundKind,
+    id: u64,
+    state: std::sync::atomic::AtomicU8,
+}
+
+impl std::fmt::Debug for ForegroundOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForegroundOperation")
+            .field("source", self.source())
+            .field("kind", &self.kind())
+            .field("id", &self.id())
+            .finish()
+    }
+}
+impl PartialEq for ForegroundOperation {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+impl Eq for ForegroundOperation {}
+
+pub struct ForegroundRegistration {
+    operation: ForegroundOperation,
+}
+impl Drop for ForegroundRegistration {
+    fn drop(&mut self) {
+        self.operation
+            .inner
+            .state
+            .store(2, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl ForegroundOperation {
+    pub fn new(
+        source: SessionBinding,
+        kind: ForegroundKind,
+        id: u64,
+    ) -> Result<Self, &'static str> {
+        if id == 0
+            || source.generation == 0
+            || source.session_id.is_empty()
+            || source.session_id.len() > 128
+            || !source
+                .session_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err("invalid foreground operation identity");
+        }
+        Ok(Self {
+            inner: std::sync::Arc::new(ForegroundOperationInner {
+                source,
+                kind,
+                id,
+                state: std::sync::atomic::AtomicU8::new(0),
+            }),
+        })
+    }
+    pub fn source(&self) -> &SessionBinding {
+        &self.inner.source
+    }
+    pub fn kind(&self) -> ForegroundKind {
+        self.inner.kind
+    }
+    pub fn id(&self) -> u64 {
+        self.inner.id
+    }
+    pub fn start(&self, command: &WorkerCommand) -> Result<ForegroundRegistration, &'static str> {
+        if command.foreground_kind() != Some(self.kind()) {
+            return Err("foreground operation kind differs from its command");
+        }
+        self.inner
+            .state
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| "foreground operation already consumed")?;
+        Ok(ForegroundRegistration {
+            operation: self.clone(),
+        })
+    }
+    pub fn finish_unstarted(&self) -> Result<(), &'static str> {
+        self.inner
+            .state
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| "foreground operation already consumed")?;
+        Ok(())
+    }
+}
+
 /// A typed command sent from the TUI to the worker thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerCommand {
+    /// Official managed UI admission; legacy constructors remain available.
+    Bound {
+        operation: ForegroundOperation,
+        command: Box<WorkerCommand>,
+    },
     /// Run a normal user prompt as a turn.
     Prompt(String),
     /// Run a prompt in PLAN MODE (Claude Code parity): read-only posture
@@ -37,7 +323,9 @@ pub enum WorkerCommand {
     /// `/compact` — Claude Code parity: summarize the transcript into one
     /// message via the provider, then REPLACE the working transcript with
     /// that summary. Fresh context window, same session.
-    Compact,
+    Compact(ManualOperation),
+    /// Preserve this source and start a positively fresh session.
+    ClearSession(ManualOperation),
     /// `/rewind` — restore code and/or conversation to a checkpoint
     /// (phase 4). No argument: list checkpoints. With an id: restore.
     Rewind(String),
@@ -71,6 +359,32 @@ pub enum WorkerCommand {
     /// stays responsive: the command runs on the worker thread, and
     /// Esc kills it like any tool.
     ShellBang(String),
+}
+
+impl WorkerCommand {
+    pub fn foreground_kind(&self) -> Option<ForegroundKind> {
+        match self {
+            Self::Prompt(_) | Self::ModCommand(_, _) => Some(ForegroundKind::Prompt),
+            Self::PlanPrompt(_) => Some(ForegroundKind::PlanPrompt),
+            Self::ResumeSession(_) => Some(ForegroundKind::Resume),
+            Self::SetModel(_)
+            | Self::Effort(_)
+            | Self::Route(_)
+            | Self::Rewind(_)
+            | Self::ToggleMod(_)
+            | Self::RefreshMods
+            | Self::Undo
+            | Self::Permissions(_)
+            | Self::SetMode(_)
+            | Self::ShellBang(_) => Some(ForegroundKind::Control),
+            Self::Bound { .. }
+            | Self::Compact(_)
+            | Self::ClearSession(_)
+            | Self::ListModels
+            | Self::ListSessions
+            | Self::ListInstalledMods => None,
+        }
+    }
 }
 
 /// The sender end of the worker-command channel — held by the TUI's event
