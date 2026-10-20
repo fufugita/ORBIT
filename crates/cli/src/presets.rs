@@ -182,6 +182,8 @@ pub fn preset_model_entry(preset: &ProviderPreset, model_id: &str) -> ModelEntry
     ModelEntry {
         context_limits: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
         default_effort: None,
         id: model_id.to_string(),
         label: fact.map(|f| f.label.to_string()),

@@ -3026,6 +3026,9 @@ fn handle_mouse(
                 crate::selection::osc52_sequence(&text).as_bytes(),
             );
             let _ = std::io::Write::flush(&mut std::io::stdout());
+            // OSC 52 covers remote sessions; a local X display needs the
+            // helper, or the terminal silently drops the sequence.
+            crate::selection::set_x_clipboard(&text);
             MouseOutcome::Toast(format!("copied {} characters", text.chars().count()))
         }
         MouseEventKind::ScrollUp => {
@@ -3888,6 +3891,83 @@ mod click_tests {
     }
 
     /// A key hint is the key it names: clicking `⏎ send` presses Enter.
+    #[test]
+    fn mouse_up_of_a_real_drag_copies_the_selected_text() {
+        // The runtime's mouse-up path (OSC 52 + X clipboard fallback) rides
+        // on a selection started by Down inside the content rect and
+        // extended by Drag. Drive Down/Drag/Up over the user line of a
+        // rendered frame and expect the copy toast.
+        let (w, h) = (100, 30);
+        let mut tui = fresh_tui();
+        let mut s = Scenario::new();
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::User,
+            text: "make the tests pass".into(),
+            time: Some("16:46".into()),
+            ..Default::default()
+        });
+        // Draw once so tui.hits is populated, then keep the buffer.
+        tui.reduced = true;
+        tui.tick_ms = tui.tick_ms.max(5_000);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut hits = Vec::new();
+        let done = term
+            .draw(|f| {
+                hits = draw_with_hits(f, &tui, &s, "", None, "", 0, None, false, 0);
+            })
+            .unwrap();
+        tui.hits = hits;
+        let buf = done.buffer.clone();
+        let area = Rect::new(0, 0, w, h);
+        // Where the user line sits.
+        let rows: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let (col, row) = at(&rows, "make the tests");
+        let mk = |kind: crossterm::event::MouseEventKind, c: u16| crossterm::event::MouseEvent {
+            kind,
+            column: c,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // Down on the first word starts the selection.
+        assert_eq!(
+            handle_mouse(
+                mk(MouseEventKind::Down(MouseButton::Left), col),
+                &mut tui,
+                area,
+                None,
+                false
+            ),
+            MouseOutcome::None
+        );
+        assert!(tui.selection.is_some(), "Down over the user line selects");
+        // Drag across the line.
+        assert_eq!(
+            handle_mouse(
+                mk(MouseEventKind::Drag(MouseButton::Left), col + 8),
+                &mut tui,
+                area,
+                None,
+                false
+            ),
+            MouseOutcome::None
+        );
+        // Up copies: the toast carries the character count.
+        let out = handle_mouse(
+            mk(MouseEventKind::Up(MouseButton::Left), col + 8),
+            &mut tui,
+            area,
+            Some(&buf),
+            false,
+        );
+        assert!(
+            matches!(out, MouseOutcome::Toast(ref t) if t.starts_with("copied ")),
+            "mouse-up must copy the drag, got {out:?}"
+        );
+    }
+
     #[test]
     fn a_clicked_hint_presses_the_key_it_names() {
         let (w, h) = (164, 48);

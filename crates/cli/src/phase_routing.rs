@@ -70,6 +70,8 @@ impl ResolvedModel {
                 None => self.caps.default_effort.clone(),
             },
             supported_efforts: self.caps.supported_efforts.clone(),
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         out.validate_effort()?;
         Ok(out)

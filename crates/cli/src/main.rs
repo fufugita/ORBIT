@@ -599,6 +599,8 @@ fn add_configured_provider_kind(
                     .unwrap_or_default(),
                 max_output_tokens: None,
                 context_window: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
             })
             .collect()
     });

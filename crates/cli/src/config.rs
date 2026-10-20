@@ -189,6 +189,15 @@ pub struct ModelEntry {
     /// Omitted by default, preserving the provider's existing request behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_effort: Option<EffortValue>,
+    /// Per-model response-start deadline in milliseconds (E5). Absent
+    /// keeps the harness default (30 s); slow upstreams declare a
+    /// larger budget here instead of every request timing out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_byte_timeout_ms: Option<u64>,
+    /// Per-model stream-gap deadline in milliseconds (E5). Absent keeps
+    /// the harness default (90 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
 }
 
 impl ModelEntry {
@@ -920,6 +929,8 @@ output_per_million_microcents = 600000
                 context_limits: None,
                 supported_efforts: None,
                 default_effort: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
                 sampling: None,
                 id: "fixture-model".into(),
                 label: None,

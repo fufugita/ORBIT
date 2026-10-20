@@ -103,6 +103,8 @@ impl FinalRejectionSelector {
             sampling: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         let context = request_preparation_context(&config, None, &[])
             .map_err(|_| RetryPolicyError::InvalidDeclaration)?;
@@ -1383,6 +1385,8 @@ mod tests {
             sampling: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
     #[test]

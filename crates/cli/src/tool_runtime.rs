@@ -3745,6 +3745,8 @@ pub fn subagent_turn_config(_home: &Path) -> orbit_engine::TurnConfig {
         sampling: None, // E8: subagents inherit no sampling
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
         kind: orbit_engine::dispatch::ProviderKind::OpenAiCompatible,
         credential_env: std::env::var("ORBIT_CREDENTIAL_ENV")
             .ok()
@@ -3879,6 +3881,8 @@ mod tests {
             pricing: None,
             max_output_tokens: 4096,
             sampling: Some((Some(0.2), None)),
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
             effort: None,
             supported_efforts: None,
         }
@@ -5426,6 +5430,8 @@ mod agent_lifecycle_tests {
                 kind: orbit_engine::ProviderKind::OpenAiCompatible,
                 credential_env: None,
                 pricing: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
                 max_output_tokens: 32_000,
                 sampling: None,
                 effort: None,

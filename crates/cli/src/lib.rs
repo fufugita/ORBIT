@@ -759,6 +759,8 @@ fn engine_turn_config_from(
         sampling,
         effort: entry.and_then(|m| m.default_effort.clone()),
         supported_efforts: entry.and_then(|m| m.supported_efforts.clone()),
+        first_byte_timeout_ms: entry.and_then(|m| m.first_byte_timeout_ms),
+        idle_timeout_ms: entry.and_then(|m| m.idle_timeout_ms),
     }
 }
 

@@ -356,6 +356,8 @@ mod resolver_tests {
             sampling: None,
             effort: model.default_effort.clone(),
             supported_efforts: model.supported_efforts.clone(),
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
     fn binding(provider: &ProviderConfig) -> String {

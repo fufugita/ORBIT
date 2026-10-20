@@ -2126,6 +2126,8 @@ mod tests {
             sampling: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
     fn pair(history: &mut Vec<ChatMessage>, label: &str, bytes: usize) {
@@ -3051,6 +3053,8 @@ mod accounting_tests {
             sampling: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
     fn usage() -> ProviderUsage {

@@ -68,6 +68,8 @@ impl Fixture {
                 context_window: Some(32000),
                 sampling: None,
                 supported_efforts: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
                 default_effort: None,
             }],
         };

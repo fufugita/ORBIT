@@ -95,6 +95,12 @@ pub struct TurnConfig {
     pub effort: Option<EffortValue>,
     /// None is unknown, an empty list is unsupported, otherwise exact choices.
     pub supported_efforts: Option<Vec<EffortValue>>,
+    /// Per-model response-start deadline from providers.toml (E5). None
+    /// keeps the 30 s default; slow upstreams declare a larger budget.
+    pub first_byte_timeout_ms: Option<u64>,
+    /// Per-model stream-gap deadline from providers.toml (E5). None keeps
+    /// the 90 s default.
+    pub idle_timeout_ms: Option<u64>,
 }
 
 impl TurnConfig {
@@ -520,18 +526,28 @@ fn build_prepared_request(
         // production configs — the scenarios use them to keep the
         // suite fast while proving the timeout fires).
         connect_timeout_ms: 10_000,
-        first_byte_timeout_ms: measurement_timeouts.map(|t| t.0).unwrap_or_else(|| {
-            std::env::var("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30_000)
-        }),
-        idle_timeout_ms: measurement_timeouts.map(|t| t.1).unwrap_or_else(|| {
-            std::env::var("ORBIT_TEST_IDLE_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(90_000)
-        }),
+        // E5: the per-model providers.toml values raise the ceiling for
+        // slow upstreams; the ORBIT_TEST_* env overrides never ship in
+        // production configs — the scenarios use them to keep the suite
+        // fast while proving the timeout fires.
+        first_byte_timeout_ms: measurement_timeouts
+            .map(|t| t.0)
+            .or(context.config.first_byte_timeout_ms)
+            .unwrap_or_else(|| {
+                std::env::var("ORBIT_TEST_FIRST_BYTE_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30_000)
+            }),
+        idle_timeout_ms: measurement_timeouts
+            .map(|t| t.1)
+            .or(context.config.idle_timeout_ms)
+            .unwrap_or_else(|| {
+                std::env::var("ORBIT_TEST_IDLE_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(90_000)
+            }),
     };
 
     let prepared = PreparedProviderRequest {
@@ -1068,6 +1084,8 @@ mod preparation_tests {
             sampling: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
 
@@ -1096,6 +1114,29 @@ mod preparation_tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn per_model_deadlines_raise_the_harness_defaults() {
+        // A slow upstream declares its own budget in providers.toml; the
+        // request must carry it instead of the 30 s/90 s defaults, or every
+        // turn dies as E0409 before the provider answers.
+        let mut slow = config();
+        slow.first_byte_timeout_ms = Some(180_000);
+        slow.idle_timeout_ms = Some(300_000);
+        let context = request_preparation_context(&slow, None, &[]).unwrap();
+        let prepared =
+            prepare_provider_request(&context, "question", None, "fixture", "session").unwrap();
+        assert_eq!(prepared.request.first_byte_timeout_ms, 180_000);
+        assert_eq!(prepared.request.idle_timeout_ms, 300_000);
+
+        // Absent config keeps the harness defaults.
+        let defaults = config();
+        let context = request_preparation_context(&defaults, None, &[]).unwrap();
+        let prepared =
+            prepare_provider_request(&context, "question", None, "fixture", "session").unwrap();
+        assert_eq!(prepared.request.first_byte_timeout_ms, 30_000);
+        assert_eq!(prepared.request.idle_timeout_ms, 90_000);
     }
 
     #[test]

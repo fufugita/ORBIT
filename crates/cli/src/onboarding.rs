@@ -178,6 +178,8 @@ pub fn parse_manual_models(value: &str) -> Result<Vec<ModelEntry>, OnboardingErr
             context_window: None,
             sampling: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
             default_effort: None,
         });
         if models.len() > 128 {
@@ -1650,6 +1652,8 @@ fn collect_models<T: SetupTerminal>(
                 context_window: None,
                 sampling: None,
                 supported_efforts: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
                 default_effort: None,
             });
         let previous = provenance

@@ -826,6 +826,8 @@ mod recovery_baselines {
             sampling: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         let main = config(false);
         let summary = config(true);
