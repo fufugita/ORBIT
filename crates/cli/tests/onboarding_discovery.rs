@@ -243,6 +243,8 @@ fn declared(id: &str) -> ModelEntry {
         max_output_tokens: None,
         sampling: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
         default_effort: None,
     }
 }

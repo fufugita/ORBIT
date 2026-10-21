@@ -13,6 +13,8 @@ fn config() -> TurnConfig {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     }
 }
 

@@ -82,6 +82,8 @@ fn run_session(
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
         provider_id: "mock".into(),
         gate: format!("http://127.0.0.1:{}", addr.port()),
         model: "test-model".into(),

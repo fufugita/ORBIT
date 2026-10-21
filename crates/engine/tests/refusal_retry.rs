@@ -926,6 +926,8 @@ fn config(wire: &Wire) -> TurnConfig {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     }
 }
 fn policy(config: &TurnConfig, ceiling: u32) -> RetryPolicyBinding {

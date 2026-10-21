@@ -376,6 +376,8 @@ mod accounting_inspection {
             sampling: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         AttemptIntent {
             owner_session_id: owner.into(),

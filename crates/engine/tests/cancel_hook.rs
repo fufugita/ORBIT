@@ -103,6 +103,8 @@ fn the_engine_scopes_the_turn_token_around_each_rounds_tools() {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
         provider_id: "mock".into(),
         gate: format!("http://127.0.0.1:{}", addr.port()),
         model: "test-model".into(),

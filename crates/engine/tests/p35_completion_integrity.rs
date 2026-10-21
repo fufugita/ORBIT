@@ -177,6 +177,8 @@ fn config(fixture: &Fixture) -> TurnConfig {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
         provider_id: "fixture".into(),
         gate: fixture.url.clone(),
         model: "local-model".into(),

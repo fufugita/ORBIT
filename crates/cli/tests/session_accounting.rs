@@ -90,6 +90,8 @@ fn config(gate: &str, price: Option<u64>) -> TurnConfig {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     }
 }
 fn request(id: &str, child: Option<&str>, purpose: AttemptPurpose) -> AttemptIntent {

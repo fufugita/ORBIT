@@ -324,6 +324,8 @@ fn config(fixture: &Fixture, summary: bool) -> TurnConfig {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     }
 }
 
@@ -1087,6 +1089,8 @@ fn journal_fixture_revisions_scope_idempotence_and_stale_references_are_real() {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     };
     let budget =
         orbit_engine::context_budget::BudgetIdentity::for_config(&c, "metadata", "policy").unwrap();

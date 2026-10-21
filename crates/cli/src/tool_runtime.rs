@@ -3881,10 +3881,10 @@ mod tests {
             pricing: None,
             max_output_tokens: 4096,
             sampling: Some((Some(0.2), None)),
-            first_byte_timeout_ms: None,
-            idle_timeout_ms: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
 

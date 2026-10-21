@@ -590,6 +590,8 @@ fn add_configured_provider_kind(
                 context_limits: None,
                 sampling: None,
                 supported_efforts: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
                 default_effort: None,
                 id,
                 label: None,
@@ -599,8 +601,6 @@ fn add_configured_provider_kind(
                     .unwrap_or_default(),
                 max_output_tokens: None,
                 context_window: None,
-                first_byte_timeout_ms: None,
-                idle_timeout_ms: None,
             })
             .collect()
     });
@@ -733,6 +733,8 @@ fn validate_discovery_input(
             context_window: None,
             sampling: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
             default_effort: None,
         }],
     })
@@ -6710,6 +6712,8 @@ mod provider_wizard_tests {
                 "high".into(),
             )]),
             default_effort: Some(orbit_adapter::types::EffortValue::Level("high".into())),
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         add_configured_provider_kind(
             &f.0,

@@ -337,6 +337,8 @@ fn config(fixture: &Fixture, summary: bool) -> TurnConfig {
             serde_json::from_value(json!("low")).unwrap(),
             serde_json::from_value(json!("high")).unwrap(),
         ]),
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     }
 }
 

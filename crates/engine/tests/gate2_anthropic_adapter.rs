@@ -87,6 +87,8 @@ fn gate2_anthropic_tool_round_and_replay() {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
         provider_id: "mock-anthropic".into(),
         // The adapter builds https://host:port/v1/messages from the
         // route; the mock listens on plain http loopback. The adapter

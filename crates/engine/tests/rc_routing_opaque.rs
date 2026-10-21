@@ -111,6 +111,8 @@ impl Provider {
             sampling: None,
             effort: None,
             supported_efforts: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
     fn port(&self) -> u16 {

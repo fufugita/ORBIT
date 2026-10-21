@@ -88,6 +88,8 @@ fn configured(gate: &str, summary: bool) -> TurnConfig {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     }
 }
 fn intent(id: &str, child: Option<&str>) -> AttemptIntent {

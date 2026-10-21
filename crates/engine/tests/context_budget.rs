@@ -280,6 +280,8 @@ fn config(fixture: &Fixture) -> TurnConfig {
         sampling: None,
         effort: None,
         supported_efforts: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     }
 }
 
@@ -1653,6 +1655,8 @@ mod complete_group_compaction_old_api {
                 sampling: None,
                 effort: None,
                 supported_efforts: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
             };
             // The witness uses the actual public body renderer. Its route is pure,
             // not an additional listener/provider call and has no credential input.
