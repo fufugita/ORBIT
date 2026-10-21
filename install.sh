@@ -99,7 +99,11 @@ def regular_bytes(parent, name, limit, executable=False, source=False):
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     try:
         before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_uid != UID or before.st_nlink != 1 or before.st_size > limit:
+        # Cargo hardlinks release binaries to deps/, so a built component
+        # legitimately carries more than one link. Symlinks and non-regular
+        # files stay rejected; the extra link is just a second name for the
+        # same inode we are already reading.
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != UID or before.st_nlink < 1 or before.st_size > limit:
             fail("unsafe or oversized managed file")
         if executable and not before.st_mode & 0o111: fail("installed component is not executable")
         if before.st_mode & (0o002 if source else 0o022): fail("file is writable outside its allowed ownership boundary")
