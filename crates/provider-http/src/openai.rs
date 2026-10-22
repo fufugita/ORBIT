@@ -355,7 +355,9 @@ fn openai_usage(value: &serde_json::Value) -> Result<ProviderUsage, AdapterError
         .transpose()?
         .flatten()
         .unwrap_or(0);
-    if cached > prompt || reasoning > output {
+    // Cache reads are part of prompt_tokens. Compatible APIs may report
+    // reasoning separately from completion_tokens; preserve both counters.
+    if cached > prompt {
         return Err(protocol("OpenAI usage detail exceeds its total"));
     }
     if let Some(total) = optional_counter(value, "total_tokens")?

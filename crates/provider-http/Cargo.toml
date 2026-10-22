@@ -32,3 +32,5 @@ orbit-adapter = { path = "../adapter" }
 
 [dev-dependencies]
 orbit-mock-provider = { path = "../mock-provider" }
+rcgen.workspace = true
+tokio-rustls.workspace = true

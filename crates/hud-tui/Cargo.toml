@@ -22,6 +22,7 @@ toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+unicode-segmentation.workspace = true
 unicode-width.workspace = true
 ignore.workspace = true
 # The terminal watchdog polls the input fd for POLLHUP/POLLERR without

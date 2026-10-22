@@ -15,6 +15,7 @@ use orbit_hud_tui::bus::BusSender;
 use orbit_hud_tui::model::TranscriptLine;
 use orbit_hud_tui::msg::{
     ContextProjection, CostQualification, ManualOutcome, Msg, ProjectionReason, SessionProjection,
+    SessionsRow as MsgSessionRow,
 };
 use orbit_hud_tui::worker::{CommandSink, ManualAction, SessionBinding, WorkerCommand, WorkerCtx};
 use orbit_hud_tui::{ApprovalRegistry, ApprovalResponse};
@@ -274,8 +275,14 @@ fn save_turn(
 /// Returns a `CancelHandle` that cancels the turn currently in flight.
 pub fn make_spawner(config: TuiTurnConfig) -> orbit_hud_tui::WorkerSpawner {
     Box::new(move |ctx, sink| {
-        let lease = crate::sessions::SessionLease::acquire(&config.home, &config.session_id, "tui")
-            .map_err(|error| error.to_string())?;
+        let workspace = crate::sessions::current_workspace().map_err(|error| error.to_string())?;
+        let lease = crate::sessions::SessionLease::acquire_new_or_for_workspace(
+            &config.home,
+            &config.session_id,
+            "tui",
+            &workspace,
+        )
+        .map_err(|error| error.to_string())?;
         make_spawner_owned(config, lease)(ctx, sink)
     })
 }
@@ -288,6 +295,12 @@ pub fn make_spawner_owned(
     Box::new(move |ctx: WorkerCtx, _command_sink: CommandSink| {
         if lease.session_id() != config.session_id {
             return Err("TUI session identity differs from its held lease".into());
+        }
+        let workspace = crate::sessions::current_workspace().map_err(|error| error.to_string())?;
+        if let Some(saved) = lease.load_optional().map_err(|error| error.to_string())? {
+            saved
+                .require_workspace(&workspace)
+                .map_err(|error| error.to_string())?;
         }
         // Shared slot: worker_main installs the CURRENT turn's CancelToken;
         // the handle fires it. None when no turn is running.
@@ -454,7 +467,9 @@ fn worker_main_owned(
                 return;
             }
         };
-    let mut seed = match lease.load_optional() {
+    let existing = lease.load_optional();
+    let was_saved = matches!(&existing, Ok(Some(_)));
+    let mut seed = match existing {
         Ok(Some(saved)) => saved,
         Ok(None) => crate::sessions::SessionFile::from_chat(
             &config.session_id,
@@ -474,6 +489,22 @@ fn worker_main_owned(
             return;
         }
     };
+    let workspace = match crate::sessions::current_workspace() {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            orbit_hud_tui::emit_error(&ctx.sender, &error.to_string());
+            return;
+        }
+    };
+    let admission = if was_saved {
+        seed.require_workspace(&workspace)
+    } else {
+        seed.bind_workspace(&workspace)
+    };
+    if let Err(error) = admission {
+        orbit_hud_tui::emit_error(&ctx.sender, &error.to_string());
+        return;
+    }
     let mut accounting =
         match session_accounting::prepare_root(&lease, &mut seed, RootOrigin::RestoredOrLegacy) {
             Ok(accounting) => accounting,
@@ -494,6 +525,7 @@ fn worker_main_owned(
     let mut transcript: Vec<ChatMessage> = config.initial_transcript.clone();
     let mut turns: u64 = config.initial_turns;
     let mut tool_cx = session_tool_context(&config, &ctx.sender);
+    tool_cx.working_dir = workspace.clone();
     // The ledger chip's total: the records already in the chain.
     orbit_hud_tui::emit_ledger_appended(
         &ctx.sender,
@@ -514,7 +546,7 @@ fn worker_main_owned(
     let mut session_tool_cx = orbit_tools::ToolContext::new(
         config.home.clone(),
         config.session_id.clone(),
-        std::env::current_dir().unwrap_or_else(|_| std::path::Path::new(".").to_path_buf()),
+        workspace.clone(),
     );
     // Mods (Claude-Mods parity): loaded once at boot, toggleable at
     // runtime. The directive is rebuilt whenever the enabled set changes.
@@ -1057,47 +1089,56 @@ fn worker_main_owned(
                     }
                 }
                 WorkerCommand::ListModels => {
-                    let cfg =
-                        crate::config::ProvidersConfig::load(&config.home).unwrap_or_default();
-                    let entries = cfg.all_models();
-                    let text = if entries.is_empty() {
-                        "(no providers configured)".into()
-                    } else {
-                        entries
-                            .iter()
-                            .map(|(p, m)| format!("{p} \t{m}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                    match crate::config::ProvidersConfig::load(&config.home) {
+                        Ok(cfg) => ctx.sender.send(Msg::ModelsListed(cfg.all_models())),
+                        Err(error) => ctx.sender.send(Msg::ModelsListFailed(format!(
+                            "Cannot list models: {error}. Repair providers.toml or run orbit setup."
+                        ))),
                     };
-                    ctx.sender.send(Msg::SystemMessage(text));
                 }
                 WorkerCommand::ListSessions => {
-                    let text = match crate::sessions::list_sessions(&config.home) {
-                        Ok(list) if list.is_empty() => "(no saved sessions)".into(),
+                    let rows = match crate::sessions::list_sessions(&config.home) {
                         Ok(list) => list
                             .iter()
-                            .map(|s| {
-                                format!(
-                                    "{} \tmodel={} \tturns={} \tupdated={}",
-                                    s.session_id, s.model, s.turns, s.updated_at
-                                )
+                            .map(|s| MsgSessionRow {
+                                id: s.session_id.clone(),
+                                model: s.model.clone(),
+                                turns: s.turns,
+                                updated_at: s.updated_at.clone(),
+                                current: s.session_id == binding.session_id,
                             })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        Err(e) => format!("error listing sessions: {e}"),
+                            .collect(),
+                        Err(e) => {
+                            ctx.sender.send(Msg::SessionsListFailed(format!(
+                                "Cannot list sessions: {e}"
+                            )));
+                            break 'command;
+                        }
                     };
-                    ctx.sender.send(Msg::SystemMessage(text));
+                    ctx.sender.send(Msg::SessionsListed(rows));
                 }
                 WorkerCommand::ResumeSession(id) => {
                     let same_id = id.strip_suffix(".json").unwrap_or(&id) == lease.session_id();
                     let target = if same_id {
                         lease.load().map(|saved| (None, saved))
                     } else {
-                        crate::sessions::SessionLease::acquire_and_load(&config.home, &id, "tui")
-                            .map(|(guard, saved)| (Some(guard), saved))
+                        crate::sessions::SessionLease::acquire_for_workspace(
+                            &config.home,
+                            &id,
+                            "tui",
+                            &tool_cx.working_dir,
+                        )
+                        .map(|(guard, saved)| (Some(guard), saved))
                     };
                     match target {
                         Ok((candidate_lease, mut saved)) => {
+                            if let Err(error) = saved.require_workspace(&tool_cx.working_dir) {
+                                orbit_hud_tui::emit_status(
+                                    &ctx.sender,
+                                    &format!("resume refused: {error}"),
+                                );
+                                break 'command;
+                            }
                             let mut candidate = config.clone();
                             candidate.session_id = saved.session_id.clone();
                             candidate.model = saved.model.clone();
@@ -1198,18 +1239,46 @@ fn worker_main_owned(
                             }
                             binding = candidate_binding;
                         }
-                        Err(_) => {
+                        Err(error) => {
                             if same_id {
                                 qualification = CostQualification::Unavailable;
                             }
                             orbit_hud_tui::emit_status(
                                 &ctx.sender,
-                                "resume refused: saved session unavailable or busy",
+                                &format!("resume refused: {error}"),
                             );
                         }
                     }
                 }
                 WorkerCommand::Compact(operation) | WorkerCommand::ClearSession(operation) => {
+                    if let Err(error) = lease
+                        .load()
+                        .and_then(|saved| saved.require_workspace(&tool_cx.working_dir))
+                    {
+                        orbit_hud_tui::emit_status(
+                            &ctx.sender,
+                            &format!("operation refused: {error}"),
+                        );
+                        let _ = operation.finish_unstarted();
+                        emit_session_projection(
+                            &ctx.sender,
+                            &config,
+                            &binding,
+                            &transcript,
+                            turns,
+                            cum_input,
+                            cum_output,
+                            cum_cost,
+                            qualification,
+                            ProjectionReason::Manual {
+                                operation,
+                                outcome: ManualOutcome::Failed,
+                                applied: false,
+                            },
+                            ContextProjection::PreserveUnchanged,
+                        );
+                        break 'command;
+                    }
                     let expected = manual_action.unwrap_or(ManualAction::Compact);
                     let valid = operation.source() == &binding && operation.action() == expected;
                     let token = orbit_provider_http::CancelToken::new();
@@ -1899,6 +1968,7 @@ fn source_covered(
 ) -> bool {
     saved.session_id == working.session_id
         && saved.schema == working.schema
+        && saved.workspace == working.workspace
         && saved.model == working.model
         && saved.provider == working.provider
         && saved.gate == working.gate
@@ -2024,6 +2094,16 @@ fn stage_clear(
     )
     .with_effort(config.effort.clone())
     .with_selection_origin(origin);
+    let saved_workspace = lease
+        .load()
+        .map_err(|_| refuse("clear refused; saved workspace unavailable"))?;
+    saved_workspace
+        .require_workspace(
+            &crate::sessions::current_workspace()
+                .map_err(|_| refuse("clear refused; workspace unavailable"))?,
+        )
+        .map_err(|_| refuse("clear refused; current session workspace changed"))?;
+    source.workspace = saved_workspace.workspace;
     accounting
         .reconcile(&mut source)
         .map_err(|_| refuse("clear refused; current accounting cannot be verified"))?;
@@ -2086,6 +2166,12 @@ fn stage_clear(
         )
         .with_effort(config.effort.clone())
         .with_selection_origin(origin);
+        fresh.workspace = saved.workspace.clone();
+        fresh
+            .require_workspace(
+                &crate::sessions::current_workspace().map_err(|_| "workspace unavailable")?,
+            )
+            .map_err(|_| "current workspace changed")?;
         let candidate_accounting = session_accounting::prepare_root(
             &candidate_lease,
             &mut fresh,
@@ -3197,17 +3283,11 @@ mod session_tests {
         let initial = config(&home);
         let target = SessionLease::acquire(&home, "target", "fixture").unwrap();
         target
-            .save(&SessionFile::from_chat(
-                "target",
-                "m",
-                "http://127.0.0.1:1",
-                "p",
-                &[],
-                0,
-                0,
-                0,
-                0,
-            ))
+            .save(
+                &SessionFile::from_chat("target", "m", "http://127.0.0.1:1", "p", &[], 0, 0, 0, 0)
+                    .in_workspace(&crate::sessions::current_workspace().unwrap())
+                    .unwrap(),
+            )
             .unwrap();
         drop(target);
         let restored_file = home.join("restored.txt");
@@ -3349,17 +3429,11 @@ mod session_tests {
         let initial = config(&home);
         let target = SessionLease::acquire(&home, "target", "fixture").unwrap();
         target
-            .save(&SessionFile::from_chat(
-                "target",
-                "m",
-                "http://127.0.0.1:1",
-                "p",
-                &[],
-                0,
-                0,
-                0,
-                0,
-            ))
+            .save(
+                &SessionFile::from_chat("target", "m", "http://127.0.0.1:1", "p", &[], 0, 0, 0, 0)
+                    .in_workspace(&crate::sessions::current_workspace().unwrap())
+                    .unwrap(),
+            )
             .unwrap();
         drop(target);
         std::fs::create_dir_all(home.join("projects/target.jsonl")).unwrap();
@@ -3471,17 +3545,11 @@ default_effort = "low"
         .unwrap();
         let initial = config(&home);
         let busy = SessionLease::acquire(&home, "busy", "test").unwrap();
-        busy.save(&SessionFile::from_chat(
-            "busy",
-            "m",
-            "http://127.0.0.1:1",
-            "p",
-            &[],
-            9,
-            0,
-            0,
-            0,
-        ))
+        busy.save(
+            &SessionFile::from_chat("busy", "m", "http://127.0.0.1:1", "p", &[], 9, 0, 0, 0)
+                .in_workspace(&crate::sessions::current_workspace().unwrap())
+                .unwrap(),
+        )
         .unwrap();
         let before = std::fs::read(home.join("sessions/busy.json")).unwrap();
         let current = SessionLease::acquire(&home, "session-test", "tui").unwrap();
@@ -3504,6 +3572,12 @@ default_effort = "low"
             .send(WorkerCommand::ResumeSession("busy".into()))
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let expected_refusal = format!(
+            "resume refused: {}",
+            SessionLeaseError::Busy {
+                session_id: "busy".into()
+            }
+        );
         let mut refused = false;
         let mut source: Option<SessionProjection> = None;
         let mut refusal_notice = false;
@@ -3518,9 +3592,7 @@ default_effort = "low"
                         assert_eq!(view.cost, CostQualification::UnknownHistory { revision: 0 });
                         source = Some(view);
                     }
-                    Msg::Status(text)
-                        if text == "resume refused: saved session unavailable or busy" =>
-                    {
+                    Msg::Status(text) if text == expected_refusal => {
                         refusal_notice = true;
                     }
                     Msg::SessionProjection(view)
@@ -3621,6 +3693,7 @@ default_effort = "medium"
 "#,
         )
         .unwrap();
+        let initial = config(&home);
         let bad = crate::sessions::SessionFile::from_chat(
             "bad",
             "other",
@@ -3635,6 +3708,9 @@ default_effort = "medium"
         .with_effort(Some(EffortSetting::Value(EffortValue::Level(
             "high".into(),
         ))));
+        let bad = bad
+            .in_workspace(&crate::sessions::current_workspace().unwrap())
+            .unwrap();
         crate::sessions::save_session(&home, &bad).unwrap();
         let (bus, sender) = orbit_hud_tui::bus::Bus::new();
         let (commands, command_rx) = mpsc::channel();
@@ -3652,7 +3728,7 @@ default_effort = "medium"
                 approvals: ApprovalRegistry::new(),
                 command_rx,
             },
-            config(&home),
+            initial,
             Default::default(),
         );
         let saved = crate::sessions::load_session(&home, "session-test").unwrap();
@@ -3723,6 +3799,7 @@ default_effort = "medium"
 "#,
         )
         .unwrap();
+        let initial = config(&home);
         let saved = crate::sessions::SessionFile::from_chat(
             "owner",
             "shared",
@@ -3737,6 +3814,9 @@ default_effort = "medium"
         .with_effort(Some(EffortSetting::Value(EffortValue::Level(
             "medium".into(),
         ))));
+        let saved = saved
+            .in_workspace(&crate::sessions::current_workspace().unwrap())
+            .unwrap();
         crate::sessions::save_session(&home, &saved).unwrap();
         let (bus, sender) = orbit_hud_tui::bus::Bus::new();
         let (commands, command_rx) = mpsc::channel();
@@ -3753,7 +3833,7 @@ default_effort = "medium"
                 approvals: ApprovalRegistry::new(),
                 command_rx,
             },
-            config(&home),
+            initial,
             Default::default(),
         );
         let after = crate::sessions::load_session(&home, "owner").unwrap();

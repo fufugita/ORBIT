@@ -1114,6 +1114,7 @@ fn resume_acquires_candidate_before_swapping_and_preserves_saved_identity() {
         source.cost_microcents,
     )
     .with_effort(Some(orbit_cli::parse_effort_setting("high").unwrap()));
+    saved.workspace = source.workspace.clone();
     saved.selection_origin = source.selection_origin;
     assert!(saved.accounting_watermark.is_none());
     let candidate = SessionLease::acquire(&fixture.root, "candidate", "test").unwrap();
@@ -1740,6 +1741,7 @@ mod manual_baseline_support {
             40,
             60,
         );
+        saved.bind_workspace(&config.working_dir).unwrap();
         lease.save(&saved).unwrap();
         let accounting = prepare_root(&lease, &mut saved, RootOrigin::RestoredOrLegacy).unwrap();
         let journal = context_journal(home, id, None).unwrap();
@@ -2187,6 +2189,7 @@ mod manual_owner_capability {
         )
         .with_effort(f.config.turn.effort.clone())
         .with_selection_origin(orbit_cli::phase_routing::SelectionOrigin::Flag);
+        seed.bind_workspace(&f.config.working_dir).unwrap();
         let accounting = orbit_cli::session_accounting::prepare_root(
             &lease,
             &mut seed,
@@ -3430,6 +3433,7 @@ mod refusal_policy_owner {
                     0,
                 )
                 .with_selection_origin(phase_routing::SelectionOrigin::Default);
+                saved.bind_workspace(&config.working_dir).unwrap();
                 let accounting = session_accounting::prepare_root(
                     &lease,
                     &mut saved,

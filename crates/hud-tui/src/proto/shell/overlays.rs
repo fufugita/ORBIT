@@ -36,6 +36,13 @@ pub enum Overlay<'a> {
         hunks: &'a Option<Vec<orbit_frontend_protocol::DiffHunk>>,
         opened_ms: u64,
     },
+    /// The model/session picker: one selection bar over plain rows.
+    Picker {
+        title: &'static str,
+        rows: &'a [super::super::scenario::PickerRow],
+        sel: usize,
+        opened_ms: u64,
+    },
 }
 
 /// A framed, shadowed box in the prototype's `┏━┓` magenta style with
@@ -114,7 +121,96 @@ pub fn draw(cv: &mut Cv, w: i32, h: i32, ov: &Overlay, now_ms: u64, reduced: boo
         } => diff(
             cv, w, h, path, *added, *removed, hunks, *opened_ms, now_ms, reduced,
         ),
+        Overlay::Picker {
+            title,
+            rows,
+            sel,
+            opened_ms,
+        } => choice_picker(cv, w, h, title, rows, *sel, *opened_ms, now_ms, reduced),
     }
+}
+
+/// The model/session picker: the palette's frame and selection bar,
+/// over plain rows (no typing, no matching).
+#[allow(clippy::too_many_arguments)]
+fn choice_picker(
+    cv: &mut Cv,
+    sw: i32,
+    sh: i32,
+    title: &str,
+    rows: &[super::super::scenario::PickerRow],
+    sel: usize,
+    opened_ms: u64,
+    now_ms: u64,
+    reduced: bool,
+) {
+    // A frame needs two borders, one spacer and at least one row. Clamp
+    // before converting dimensions to unsigned buffer coordinates.
+    let sw = sw.clamp(0, i32::from(u16::MAX));
+    let sh = sh.clamp(0, i32::from(u16::MAX));
+    if sw < 8 || sh < 4 {
+        return;
+    }
+    let colors = cv.palette;
+    let w = 76.min((sw - 8).max(8)).min(sw);
+    let y = 4.min(sh - 4);
+    let x = (sw - w) / 2;
+    let capacity = (sh - y - 3).clamp(1, 12) as usize;
+    let selected = sel.min(rows.len().saturating_sub(1));
+    let first = selected.saturating_sub(capacity - 1);
+    let shown = rows.len().min(capacity) as i32;
+    let h = shown.max(1) + 3;
+    let reveal = if reduced {
+        h
+    } else {
+        (now_ms.saturating_sub(opened_ms) / 12).min(h as u64) as i32 + 2
+    };
+    let reveal = reveal.min(h);
+    frame_box(cv, x, y, w, h, reveal, title);
+    cv.clipped(
+        Rect {
+            x: x.max(0) as u16,
+            y: y.max(0) as u16,
+            width: w as u16,
+            height: reveal.max(0) as u16,
+        },
+        |cv| {
+            cv.hit(x, y, w, h, super::hits::Click::Inert);
+            if rows.is_empty() {
+                cv.text(x + 4, y + 2, "no entries", colors.muted, Some(colors.raise));
+            }
+            for (i, row) in rows.iter().enumerate().skip(first).take(capacity) {
+                let ry = y + 2 + (i - first) as i32;
+                cv.hit(x + 1, ry, w - 2, 1, super::hits::Click::Picker(i));
+                let on = i == selected;
+                if on {
+                    cv.fill(x + 1, ry, w - 2, 1, colors.magenta);
+                }
+                let fg = if on { colors.on_accent } else { colors.ink };
+                if on {
+                    cv.text(x + 1, ry, "▌", colors.on_accent, Some(colors.magenta));
+                }
+                let content_width = w - 6;
+                let detail_width = if content_width >= 30 {
+                    content_width / 3
+                } else {
+                    0
+                };
+                let label_width = content_width - detail_width;
+                let label = clip_text(&crate::bridge::safe_text(&row.label), label_width);
+                let bg = Some(if on { colors.magenta } else { colors.raise });
+                cv.text(x + 3, ry, &label, fg, bg);
+                let detail = clip_text(&crate::bridge::safe_text(&row.detail), detail_width);
+                cv.text(
+                    x + 3 + label_width,
+                    ry,
+                    &detail,
+                    if on { colors.on_accent } else { colors.muted },
+                    bg,
+                );
+            }
+        },
+    );
 }
 
 /// The diff overlay (M11): `@@` headers, `-`/`+` lines in red/green,
@@ -768,4 +864,149 @@ pub fn nav_badge(cv: &mut Cv, r: Rect, num: usize, col: Rgb, a: f32, label: &str
         );
     }
     let _ = hints_width;
+}
+
+#[cfg(test)]
+mod choice_picker_tests {
+    use super::super::hits::{Click, Hit};
+    use super::*;
+    use crate::proto::scenario::PickerRow;
+    use ratatui::buffer::Buffer;
+
+    fn rows(count: usize) -> Vec<PickerRow> {
+        (0..count)
+            .map(|i| PickerRow {
+                label: format!("model-{i}"),
+                value: format!("value-{i}"),
+                detail: "configured".into(),
+            })
+            .collect()
+    }
+
+    fn render(width: u16, height: u16, rows: &[PickerRow], sel: usize) -> (Buffer, Vec<Hit>) {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let hits = {
+            let mut cv = Cv::new(&mut buffer);
+            draw(
+                &mut cv,
+                i32::from(width),
+                i32::from(height),
+                &Overlay::Picker {
+                    title: "MODELS",
+                    rows,
+                    sel,
+                    opened_ms: 0,
+                },
+                u64::MAX,
+                false,
+            );
+            cv.take_hits()
+        };
+        (buffer, hits)
+    }
+
+    fn line(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn selected_picker_row_stays_visible_and_clickable_after_long_list_navigation_and_resize() {
+        let rows = rows(40);
+        for (width, height) in [(100, 24), (80, 10), (24, 4)] {
+            let (buffer, hits) = render(width, height, &rows, 27);
+            let selected = hits
+                .iter()
+                .find(|hit| hit.click == Click::Picker(27))
+                .unwrap();
+            assert!(line(&buffer, selected.rect.y).contains("model-27"));
+            assert_eq!(
+                super::super::hits::at(&hits, selected.rect.x, selected.rect.y),
+                Some(Click::Picker(27))
+            );
+            assert!(
+                hits.iter()
+                    .filter(|hit| matches!(hit.click, Click::Picker(_)))
+                    .count()
+                    <= 12
+            );
+            assert!(!hits.iter().any(|hit| hit.click == Click::Picker(0)));
+            assert!(
+                hits.iter()
+                    .all(|hit| hit.rect.right() <= width && hit.rect.bottom() <= height)
+            );
+        }
+    }
+
+    #[test]
+    fn picker_zero_tiny_empty_and_out_of_range_geometry_remains_bounded() {
+        for width in 0..=12 {
+            for height in 0..=8 {
+                for rows in [Vec::new(), rows(20)] {
+                    let (_, hits) = render(width, height, &rows, usize::MAX);
+                    assert!(
+                        hits.iter()
+                            .all(|hit| hit.rect.right() <= width && hit.rect.bottom() <= height)
+                    );
+                    if width < 8 || height < 4 {
+                        assert!(
+                            hits.is_empty(),
+                            "no usable picker frame at {width}x{height}"
+                        );
+                    }
+                }
+            }
+        }
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 8));
+        let mut cv = Cv::new(&mut buffer);
+        choice_picker(
+            &mut cv,
+            i32::MIN,
+            i32::MIN,
+            "MODELS",
+            &rows(1),
+            0,
+            0,
+            0,
+            true,
+        );
+        assert!(cv.take_hits().is_empty());
+    }
+
+    #[test]
+    fn picker_wide_labels_respect_detail_cells_and_untrusted_text_cannot_escape() {
+        let rows = vec![
+            PickerRow {
+                label: "界".repeat(60),
+                value: "wide".into(),
+                detail: "DETAIL".into(),
+            },
+            PickerRow {
+                label: "unsafe\u{1b}]52;c;YQ==\u{7}".into(),
+                value: "untouched".into(),
+                detail: "safe".into(),
+            },
+        ];
+        let (buffer, hits) = render(80, 12, &rows, 0);
+        let wide = hits
+            .iter()
+            .find(|hit| hit.click == Click::Picker(0))
+            .unwrap();
+        let detail_cells: Vec<_> = (wide.rect.x..wide.rect.right())
+            .filter(|&x| buffer[(x, wide.rect.y)].symbol() == "D")
+            .collect();
+        assert_eq!(
+            detail_cells.len(),
+            1,
+            "detail survives a label with double-width glyphs"
+        );
+        assert!(
+            (detail_cells[0] + 6..wide.rect.right())
+                .all(|x| buffer[(x, wide.rect.y)].symbol() != "界"),
+            "wide label cannot spill through the detail column"
+        );
+        assert_eq!(buffer[(wide.rect.right(), wide.rect.y)].symbol(), "┃");
+        assert!((0..buffer.area.height).all(|y| !line(&buffer, y).chars().any(|c| c.is_control())));
+    }
 }

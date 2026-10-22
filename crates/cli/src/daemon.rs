@@ -922,6 +922,11 @@ impl OwnerRuntime {
                 "configuration identity exceeds protocol limits".into(),
             ));
         }
+        config.working_dir = crate::sessions::canonical_workspace(&config.working_dir)?;
+        let saved = lease.load_optional()?;
+        if let Some(saved) = &saved {
+            saved.require_workspace(&config.working_dir)?;
+        }
         let turn = configured_turn(&config.turn)?;
         let mut masks = vec![config.turn.gate.clone(), turn.gate.clone()];
         if let Some(value) = turn
@@ -932,7 +937,6 @@ impl OwnerRuntime {
         {
             masks.push(value);
         }
-        let saved = lease.load_optional()?;
         let origin = crate::sessions::model_origin(saved.as_ref());
         if let Some(saved) = &saved {
             config.turn.initial_transcript = saved.transcript.clone();
@@ -954,6 +958,7 @@ impl OwnerRuntime {
         )
         .with_effort(config.turn.effort.clone())
         .with_selection_origin(origin);
+        file.bind_workspace(&config.working_dir)?;
         // Normal startup has already anchored its precise origin. A standalone
         // owner cannot infer a fresh namespace from an empty initial transcript.
         let adapter = prepare_root(&lease, &mut file, RootOrigin::RestoredOrLegacy)?;
@@ -1451,6 +1456,7 @@ fn save_live(
     )
     .with_effort(config.effort.clone())
     .with_selection_origin(snapshot.selection_origin);
+    candidate.workspace = accounting.file.workspace.clone();
     candidate.accounting_watermark = accounting.file.accounting_watermark.clone();
     let saved = accounting.adapter.persist(lease, &mut candidate);
     accounting.summary = if saved.is_ok() || matches!(&saved, Err(AccountingError::Session(_))) {
@@ -1517,6 +1523,7 @@ fn configure_owned(
 ) -> Result<ActionAck, OwnerError> {
     let (store, accounting) = persistence;
     if let OwnerAction::Resume { session_id } = action {
+        lease.load()?.require_workspace(&config.working_dir)?;
         if session_id.strip_suffix(".json").unwrap_or(&session_id) == lease.session_id() {
             return Ok(ActionAck {
                 request_id: None,
@@ -1524,8 +1531,12 @@ fn configure_owned(
                 duplicate: false,
             });
         }
-        let (candidate_lease, mut saved) =
-            SessionLease::acquire_and_load(lease.home(), &session_id, "daemon")?;
+        let (candidate_lease, mut saved) = SessionLease::acquire_for_workspace(
+            lease.home(),
+            &session_id,
+            "daemon",
+            &config.working_dir,
+        )?;
         let saved_origin = crate::sessions::model_origin(Some(&saved));
         let mut candidate = config.clone();
         candidate.turn.session_id = saved.session_id.clone();

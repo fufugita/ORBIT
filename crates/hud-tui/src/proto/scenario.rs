@@ -13,6 +13,9 @@ pub struct SessionViewState {
     pub(super) cost: crate::msg::CostQualification,
     pub(super) revision_floor: Option<u64>,
     pub(super) dirty: bool,
+    /// Retained through cancellation until the one outstanding FIFO
+    /// list request receives its terminal reply.
+    picker_request: Option<PickerRequest>,
     next_manual_id: u64,
 }
 
@@ -166,6 +169,10 @@ pub struct Scenario {
     /// The reactor phase (§6.10): 0 orient … 4 respond — the
     /// workspace stepper.
     pub phase: usize,
+    /// The open selection picker (`/models`, `/sessions`), if any.
+    /// Set by the reducer from ModelsListed/SessionsListed, driven by
+    /// the input handler, rendered as an overlay.
+    pub picker: Option<Picker>,
 }
 
 /// One row of the Activity panel: something that happened, in order. The
@@ -199,6 +206,38 @@ pub struct CompactionRow {
 /// How many lines one tape keeps, and how many tapes the panel keeps.
 pub const TAPE_MAX_LINES: usize = 400;
 pub const TAPE_MAX: usize = 20;
+
+/// What a picker (`/models`, `/sessions`) selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    Models,
+    Sessions,
+}
+
+#[derive(Debug, Clone)]
+struct PickerRequest {
+    kind: PickerKind,
+    binding: Option<crate::worker::SessionBinding>,
+    cancelled: bool,
+}
+
+/// One selectable row of a picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerRow {
+    pub label: String,
+    /// The value sent when the row is chosen (the model id or session id).
+    pub value: String,
+    pub detail: String,
+}
+
+/// The selection overlay behind `/models` and `/sessions`: arrow keys
+/// move, Enter picks, Esc closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    pub kind: PickerKind,
+    pub rows: Vec<PickerRow>,
+    pub sel: usize,
+}
 
 /// One command's output in the Terminal panel. Only the lines live here;
 /// the command, its state and its duration are the transcript card's
@@ -357,6 +396,57 @@ impl Scenario {
 
     pub fn session_binding(&self) -> Option<&crate::worker::SessionBinding> {
         self.frontend.binding.as_ref()
+    }
+
+    /// Show the selection picker (`/models`, `/sessions`).
+    pub fn open_picker(&mut self, picker: Picker) {
+        self.picker = Some(picker);
+    }
+
+    /// Whether a picker overlay is open.
+    pub fn picker_open(&self) -> bool {
+        self.picker.is_some()
+    }
+
+    pub fn begin_picker_request(&mut self, kind: PickerKind) -> Result<(), &'static str> {
+        if self.frontend.picker_request.is_some() {
+            return Err("wait for the previous list request to finish");
+        }
+        self.picker = None;
+        self.frontend.picker_request = Some(PickerRequest {
+            kind,
+            binding: self.frontend.binding.clone(),
+            cancelled: false,
+        });
+        Ok(())
+    }
+
+    pub fn pending_picker_kind(&self) -> Option<PickerKind> {
+        self.frontend
+            .picker_request
+            .as_ref()
+            .map(|request| request.kind)
+    }
+
+    /// Consume only the expected terminal reply. A canceled request is
+    /// still a tombstone until this point; no request ID is inferred.
+    pub fn finish_picker_request(&mut self, kind: PickerKind) -> bool {
+        if self.pending_picker_kind() != Some(kind) {
+            return false;
+        }
+        self.frontend
+            .picker_request
+            .take()
+            .is_some_and(|request| !request.cancelled && request.binding == self.frontend.binding)
+    }
+
+    pub fn dismiss_picker(&mut self) {
+        if self.picker.take().is_some() {
+            self.frontend.dirty = true;
+        }
+        if let Some(request) = self.frontend.picker_request.as_mut() {
+            request.cancelled = true;
+        }
     }
 
     pub fn pending_manual(&self) -> Option<&crate::worker::ManualOperation> {

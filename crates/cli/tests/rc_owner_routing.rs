@@ -211,6 +211,7 @@ hard='provider_b/vendor/model-b'
         if let Some(origin) = origin {
             saved = saved.with_selection_origin(origin);
         }
+        saved.bind_workspace(&self.workspace).unwrap();
         lease.save(&saved).unwrap();
         let config = OwnerConfig::new(self.turn(&saved, scope), self.workspace.clone());
         Owned::new(OwnerRuntime::start(config, lease).unwrap())
@@ -912,6 +913,7 @@ impl SavedOwnerFixture {
         )
         .with_effort(effort)
         .with_selection_origin(origin);
+        let saved = saved.in_workspace(&f.workspace).unwrap();
         let lease = SessionLease::acquire(&f.home, SESSION, "saved-auth-test").unwrap();
         lease.save(&saved).unwrap();
         Owned::new(
@@ -1268,6 +1270,7 @@ mod context_frontend_tests {
                 0,
             )
             .with_selection_origin(SelectionOrigin::SavedExplicit);
+            let saved = saved.in_workspace(&self.fixture.workspace).unwrap();
             let lease = SessionLease::acquire(&self.fixture.home, SESSION, "context-seed").unwrap();
             lease.save(&saved).unwrap();
         }
@@ -2861,6 +2864,7 @@ mod caller_journal_activation {
             prefix.2,
         )
         .with_selection_origin(SelectionOrigin::SavedExplicit);
+        let saved = saved.in_workspace(&f.workspace).unwrap();
         let lease = SessionLease::acquire(&f.home, session, "activation-seed").unwrap();
         lease.save(&saved).unwrap();
     }

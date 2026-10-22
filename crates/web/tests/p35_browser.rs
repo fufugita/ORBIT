@@ -14,7 +14,7 @@ use orbit_web::{BridgeState, router};
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -53,6 +53,11 @@ impl Fixture {
         };
         let gate = ready["gate"].as_str().unwrap().to_owned();
         fs::write(root.join("providers.toml"),format!("[[provider]]\nname=\"fixture\"\nurl={gate:?}\n[[provider.models]]\nid=\"vendor/model-a\"\nsupported_efforts=[\"low\",\"high\",\"false\"]\ndefault_effort=\"low\"\n[[provider.models]]\nid=\"model-b\"\nsupported_efforts=[\"high\"]\ndefault_effort=\"high\"\n[[provider.models]]\nid=\"unknown\"\n[[provider.models]]\nid=\"unsupported\"\nsupported_efforts=[]\n")).unwrap();
+        fs::set_permissions(
+            root.join("providers.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let turn = TuiTurnConfig {
             home: root.clone(),
             session_id: "browser-owned".into(),
@@ -1081,6 +1086,7 @@ mod manual_baseline_support {
             40,
             60,
         );
+        saved.bind_workspace(&config.working_dir).unwrap();
         lease.save(&saved).unwrap();
         let accounting = prepare_root(&lease, &mut saved, RootOrigin::RestoredOrLegacy).unwrap();
         let journal = context_journal(home, id, None).unwrap();
@@ -1519,6 +1525,7 @@ mod manual_browser_capability {
         )
         .with_effort(f.config.turn.effort.clone())
         .with_selection_origin(orbit_cli::phase_routing::SelectionOrigin::Flag);
+        seed.bind_workspace(&f.config.working_dir).unwrap();
         let accounting = orbit_cli::session_accounting::prepare_root(
             &lease,
             &mut seed,

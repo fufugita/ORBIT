@@ -287,6 +287,17 @@ pub enum Msg {
     /// A display-safe system line appended to the transcript (e.g. command
     /// results such as `/help`, `/usage`, `/models`, `/sessions`).
     SystemMessage(String),
+    /// The model picker's rows (`/models`): `(provider, model)` in
+    /// configured order. Rendered as a selectable overlay, not text.
+    ModelsListed(Vec<(String, String)>),
+    /// Terminal failure of the outstanding model-list request.
+    ModelsListFailed(String),
+    /// The session picker's rows (`/sessions`): id, model, turns,
+    /// last-updated, and whether the row is the session this TUI is
+    /// already on.
+    SessionsListed(Vec<SessionsRow>),
+    /// Terminal failure of the outstanding session-list request.
+    SessionsListFailed(String),
     /// The worker restored a session on boot or via `/resume <id>` — replaces
     /// the transcript and counters in one reduce.
     TranscriptLoaded {
@@ -296,4 +307,14 @@ pub enum Msg {
         cost_microcents: u64,
         turns: u64,
     },
+}
+
+/// One row of the session picker (`/sessions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionsRow {
+    pub id: String,
+    pub model: String,
+    pub turns: u64,
+    pub updated_at: String,
+    pub current: bool,
 }

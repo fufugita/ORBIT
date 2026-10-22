@@ -483,6 +483,17 @@ impl ProvidersConfig {
     pub fn validate_efforts(&self) -> Result<(), String> {
         for provider in &self.provider {
             for model in &provider.models {
+                for (field, value) in [
+                    ("first_byte_timeout_ms", model.first_byte_timeout_ms),
+                    ("idle_timeout_ms", model.idle_timeout_ms),
+                ] {
+                    if value == Some(0) {
+                        return Err(format!(
+                            "provider '{}' model '{}': {field} must be positive",
+                            provider.name, model.id
+                        ));
+                    }
+                }
                 model
                     .validate_effort(orbit_engine::ProviderKind::from_config(&provider.kind))
                     .map_err(|error| format!("provider '{}': {error}", provider.name))?;
@@ -651,31 +662,86 @@ impl ProvidersConfig {
         Ok(())
     }
 
-    /// Atomic save: serialize, write to a temp file in the same directory,
-    /// validate by reloading, then rename into place. On Unix the file is
-    /// created 0600 — the config may reference env-var names but never holds
-    /// credential values; 0600 is defense-in-depth for the provider list.
+    /// Validate before writing, then publish under the shared configuration lock.
+    /// Missing home components are created privately; existing unsafe storage
+    /// is refused. Provider files are published atomically with mode 0600.
     pub fn save_atomic(&self, home: &Path) -> Result<(), String> {
-        self.validate_efforts()?;
-        let dir = home;
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
-        let path = dir.join("providers.toml");
-        let serialized = toml::to_string(self).map_err(|e| format!("serialize providers: {e}"))?;
-        let tmp = dir.join(".providers.toml.tmp");
-        std::fs::write(&tmp, &serialized).map_err(|e| format!("write {tmp:?}: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        use crate::customization::{Directory, Lock, publish, read_regular};
+
+        fn private_home(home: &Path) -> Result<Directory, String> {
+            use std::path::Component;
+            let path = if home.is_absolute() {
+                home.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| error.to_string())?
+                    .join(home)
+            };
+            if path
+                .components()
+                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+            {
+                return Err("provider home must use normal path components".into());
+            }
+            let mut ancestor = path.clone();
+            let mut missing = Vec::new();
+            loop {
+                match std::fs::symlink_metadata(&ancestor) {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let name = ancestor
+                            .file_name()
+                            .ok_or("provider home has no existing ancestor")?
+                            .to_os_string();
+                        missing.push(name);
+                        if !ancestor.pop() {
+                            return Err("provider home has no existing ancestor".into());
+                        }
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            if missing.is_empty() {
+                return Directory::open(&path, true).map_err(|error| error.to_string());
+            }
+            let mut parent =
+                Directory::open(&ancestor, false).map_err(|error| error.to_string())?;
+            for name in missing.into_iter().rev() {
+                parent.check().map_err(|error| error.to_string())?;
+                let child = Directory::create(&parent.path().join(name))
+                    .map_err(|error| error.to_string())?;
+                parent.check().map_err(|error| error.to_string())?;
+                parent = child;
+            }
+            parent.check().map_err(|error| error.to_string())?;
+            Ok(parent)
         }
-        // Roundtrip validate before rename.
+
+        self.validate_efforts()?;
+        let serialized = toml::to_string(self).map_err(|e| format!("serialize providers: {e}"))?;
+        if serialized.len() > 128 * 1024 {
+            return Err("providers configuration exceeds 128 KiB".into());
+        }
         let back: ProvidersConfig =
             toml::from_str(&serialized).map_err(|e| format!("validate roundtrip: {e}"))?;
         if back.provider.len() != self.provider.len() {
             return Err("roundtrip provider count mismatch".into());
         }
-        std::fs::rename(&tmp, &path).map_err(|e| format!("rename -> {path:?}: {e}"))?;
-        Ok(())
+        let directory = private_home(home)?;
+        let _lock = Lock::acquire(&directory, ".config.lock").map_err(|error| error.to_string())?;
+        let path = directory
+            .io()
+            .map_err(|error| error.to_string())?
+            .join("providers.toml");
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                read_regular(&path, 128 * 1024, true).map_err(|error| error.to_string())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        publish(&directory, "providers.toml", serialized.as_bytes(), false)
+            .map_err(|error| error.to_string())
     }
 
     /// The config path for a home dir.
@@ -918,7 +984,13 @@ output_per_million_microcents = 600000
     fn save_atomic_roundtrips_and_preserves() {
         let home = std::env::temp_dir().join("orbit-config-save");
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&home).unwrap();
         let mut cfg = ProvidersConfig::default();
         cfg.add_provider(ProviderConfig {
             name: "local".into(),
@@ -1048,7 +1120,13 @@ explore = "local/claude-haiku-4-5"
     #[test]
     fn roles_survive_the_save_roundtrip() {
         let home = std::env::temp_dir().join(format!("orbit-roles-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&home);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&home).unwrap();
         let mut cfg = roles_cfg();
         cfg.set_role("subagent", "claude-opus-5-5").unwrap();
         cfg.save_atomic(&home).unwrap();
@@ -1069,6 +1147,116 @@ id = "m1"
 "#;
         let cfg = ProvidersConfig::load_from_str(raw).unwrap();
         assert!(cfg.roles.entries().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod model_timeout_tests {
+    use super::*;
+
+    const BASE: &str = "[[provider]]\nname='configured-provider'\nurl='https://example.test'\n[[provider.models]]\nid='configured-model'\n";
+
+    struct Home(std::path::PathBuf);
+
+    impl Home {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("orbit-model-timeouts-{}", ulid::Ulid::new())))
+        }
+    }
+
+    impl Drop for Home {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                std::fs::remove_dir_all(&self.0).expect("remove owned config home");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_model_timeouts_are_rejected_with_provider_and_model() {
+        for field in ["first_byte_timeout_ms", "idle_timeout_ms"] {
+            let error = ProvidersConfig::load_from_str(&format!("{BASE}{field}=0\n"))
+                .expect_err("zero timeout must fail at config load");
+            for expected in ["configured-provider", "configured-model", field, "positive"] {
+                assert!(error.contains(expected), "missing {expected}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_timeout_save_keeps_existing_file_and_creates_no_partial_file() {
+        let home = Home::new();
+        let cfg = ProvidersConfig::load_from_str(BASE).unwrap();
+        cfg.save_atomic(&home.0).unwrap();
+        let original = std::fs::read(home.0.join("providers.toml")).unwrap();
+        for field in ["first_byte_timeout_ms", "idle_timeout_ms"] {
+            let mut invalid = cfg.clone();
+            if field == "first_byte_timeout_ms" {
+                invalid.provider[0].models[0].first_byte_timeout_ms = Some(0);
+            } else {
+                invalid.provider[0].models[0].idle_timeout_ms = Some(0);
+            }
+            let error = invalid.save_atomic(&home.0).unwrap_err();
+            assert!(error.contains(field));
+            assert!(error.contains("configured-provider"));
+            assert!(error.contains("configured-model"));
+            assert_eq!(
+                std::fs::read(home.0.join("providers.toml")).unwrap(),
+                original
+            );
+            assert!(!home.0.join(".providers.toml.tmp").exists());
+            let missing_home = Home::new();
+            assert!(invalid.save_atomic(&missing_home.0).is_err());
+            assert!(
+                !missing_home.0.exists(),
+                "invalid save must perform no writes"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_and_large_positive_timeouts_roundtrip() {
+        for suffix in [
+            String::new(),
+            format!(
+                "first_byte_timeout_ms={}\nidle_timeout_ms={}\n",
+                i64::MAX,
+                i64::MAX - 1
+            ),
+        ] {
+            let cfg = ProvidersConfig::load_from_str(&format!("{BASE}{suffix}")).unwrap();
+            let model = &cfg.provider[0].models[0];
+            if suffix.is_empty() {
+                assert_eq!(model.first_byte_timeout_ms, None);
+                assert_eq!(model.idle_timeout_ms, None);
+            } else {
+                assert_eq!(model.first_byte_timeout_ms, Some(i64::MAX as u64));
+                assert_eq!(model.idle_timeout_ms, Some((i64::MAX - 1) as u64));
+            }
+            let home = Home::new();
+            cfg.save_atomic(&home.0).unwrap();
+            assert_eq!(ProvidersConfig::load(&home.0).unwrap(), cfg);
+        }
+    }
+
+    #[test]
+    fn zero_timeout_update_preserves_the_existing_document() {
+        let home = Home::new();
+        ProvidersConfig::load_from_str(BASE)
+            .unwrap()
+            .save_atomic(&home.0)
+            .unwrap();
+        let original = std::fs::read(home.0.join("providers.toml")).unwrap();
+        for field in ["first_byte_timeout_ms", "idle_timeout_ms"] {
+            let error =
+                ProvidersConfig::update_atomic(&home.0, |_| Ok(format!("{BASE}{field}=0\n")))
+                    .unwrap_err();
+            assert!(error.contains(field));
+            assert_eq!(
+                std::fs::read(home.0.join("providers.toml")).unwrap(),
+                original
+            );
+        }
     }
 }
 
@@ -1157,5 +1345,241 @@ mod effort_metadata_tests {
                 .id,
             "p/incidental-prefix"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod storage_save_tests {
+    use super::*;
+    use crate::customization::{Directory, Lock};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
+
+    const BASE: &str = "[[provider]]\nname='fixture'\nurl='https://example.test'\n[[provider.models]]\nid='model-a'\n";
+
+    struct Tree(std::path::PathBuf);
+    impl Tree {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("orbit-provider-save-{}", ulid::Ulid::new()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+        fn home(&self) -> std::path::PathBuf {
+            self.0.join("home")
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn config() -> ProvidersConfig {
+        ProvidersConfig::load_from_str(BASE).unwrap()
+    }
+    fn write(path: &Path, raw: &[u8]) {
+        std::fs::write(path, raw).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fn stamp(path: &Path) -> (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64) {
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (
+            m.dev(),
+            m.ino(),
+            m.mode(),
+            m.uid(),
+            m.gid(),
+            m.nlink(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    }
+    fn no_stage(home: &Path) {
+        assert!(std::fs::read_dir(home).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".stage-")
+        }));
+    }
+
+    #[test]
+    fn save_creates_private_nested_home_and_joins_load_and_update() {
+        let tree = Tree::new();
+        let home = tree.0.join("new-parent/nested/home");
+        let cfg = config();
+        cfg.save_atomic(&home).unwrap();
+        for path in [
+            tree.0.join("new-parent"),
+            tree.0.join("new-parent/nested"),
+            home.clone(),
+        ] {
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+        }
+        assert_eq!(
+            std::fs::metadata(home.join("providers.toml"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(ProvidersConfig::load(&home).unwrap(), cfg);
+        let updated = ProvidersConfig::update_atomic(&home, |raw| {
+            let mut candidate = ProvidersConfig::load_from_str(raw)?;
+            candidate.provider[0].models[0].idle_timeout_ms = Some(123);
+            toml::to_string(&candidate).map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(updated.provider[0].models[0].idle_timeout_ms, Some(123));
+        assert_eq!(ProvidersConfig::load(&home).unwrap(), updated);
+        assert!(!home.join(".providers.toml.tmp").exists());
+        no_stage(&home);
+    }
+
+    #[test]
+    fn unsafe_home_and_symlink_ancestor_are_refused_without_changes() {
+        let tree = Tree::new();
+        let home = tree.home();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
+        let path = home.join("providers.toml");
+        write(&path, BASE.as_bytes());
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let before_home = stamp(&home);
+        let before_file = stamp(&path);
+        assert!(config().save_atomic(&home).is_err());
+        assert_eq!(stamp(&home), before_home);
+        assert_eq!(stamp(&path), before_file);
+        assert_eq!(std::fs::read(path).unwrap(), BASE.as_bytes());
+        assert!(!home.join(".config.lock").exists());
+        let real = tree.0.join("real");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .unwrap();
+        let alias = tree.0.join("alias");
+        symlink(&real, &alias).unwrap();
+        let before_alias = stamp(&alias);
+        assert!(config().save_atomic(&alias.join("missing-home")).is_err());
+        assert_eq!(stamp(&alias), before_alias);
+        assert_eq!(std::fs::read_link(&alias).unwrap(), real);
+        assert!(!real.join("missing-home").exists());
+    }
+
+    #[test]
+    fn existing_unsafe_provider_entries_preserve_their_identity_and_contents() {
+        for kind in ["symlink", "dangling", "hardlink", "public"] {
+            let tree = Tree::new();
+            let home = tree.home();
+            let cfg = config();
+            cfg.save_atomic(&home).unwrap();
+            let path = home.join("providers.toml");
+            let original = std::fs::read(&path).unwrap();
+            let sentinel = tree.0.join("sentinel");
+            write(&sentinel, b"owned sentinel unchanged");
+            let absent = tree.0.join("absent");
+            match kind {
+                "symlink" => {
+                    std::fs::remove_file(&path).unwrap();
+                    symlink(&sentinel, &path).unwrap();
+                }
+                "dangling" => {
+                    std::fs::remove_file(&path).unwrap();
+                    symlink(&absent, &path).unwrap();
+                }
+                "hardlink" => std::fs::hard_link(&path, tree.0.join("linked-provider")).unwrap(),
+                "public" => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                _ => unreachable!(),
+            }
+            let before = stamp(&path);
+            let before_sentinel = stamp(&sentinel);
+            assert!(cfg.save_atomic(&home).is_err(), "{kind}");
+            assert_eq!(stamp(&path), before, "{kind}");
+            assert_eq!(stamp(&sentinel), before_sentinel, "{kind}");
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"owned sentinel unchanged"
+            );
+            assert!(!absent.exists());
+            if kind == "symlink" {
+                assert_eq!(std::fs::read_link(&path).unwrap(), sentinel);
+            } else if kind == "dangling" {
+                assert_eq!(std::fs::read_link(&path).unwrap(), absent);
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                if kind == "hardlink" {
+                    assert_eq!(
+                        std::fs::read(tree.0.join("linked-provider")).unwrap(),
+                        original
+                    );
+                }
+            }
+            no_stage(&home);
+        }
+    }
+
+    #[test]
+    fn obsolete_fixed_temp_symlink_is_never_followed_or_changed() {
+        let tree = Tree::new();
+        let home = tree.home();
+        let mut cfg = config();
+        cfg.save_atomic(&home).unwrap();
+        let sentinel = tree.0.join("sentinel");
+        write(&sentinel, b"never truncate this sentinel");
+        let stale = home.join(".providers.toml.tmp");
+        symlink(&sentinel, &stale).unwrap();
+        let before_stale = stamp(&stale);
+        let before_sentinel = stamp(&sentinel);
+        cfg.provider[0].models[0].idle_timeout_ms = Some(321);
+        cfg.save_atomic(&home).unwrap();
+        assert_eq!(ProvidersConfig::load(&home).unwrap(), cfg);
+        assert_eq!(stamp(&stale), before_stale);
+        assert_eq!(std::fs::read_link(&stale).unwrap(), sentinel);
+        assert_eq!(stamp(&sentinel), before_sentinel);
+        assert_eq!(
+            std::fs::read(sentinel).unwrap(),
+            b"never truncate this sentinel"
+        );
+        no_stage(&home);
+    }
+
+    #[test]
+    fn save_and_update_share_the_same_nonblocking_writer_lock() {
+        let tree = Tree::new();
+        let home = tree.home();
+        let cfg = config();
+        cfg.save_atomic(&home).unwrap();
+        let original = std::fs::read(home.join("providers.toml")).unwrap();
+        let directory = Directory::open(&home, true).unwrap();
+        let lock = Lock::acquire(&directory, ".config.lock").unwrap();
+        assert!(cfg.save_atomic(&home).is_err());
+        let called = std::cell::Cell::new(false);
+        assert!(
+            ProvidersConfig::update_atomic(&home, |raw| {
+                called.set(true);
+                Ok(raw.to_owned())
+            })
+            .is_err()
+        );
+        assert!(!called.get());
+        assert_eq!(
+            std::fs::read(home.join("providers.toml")).unwrap(),
+            original
+        );
+        no_stage(&home);
+        drop(lock);
+        cfg.save_atomic(&home).unwrap();
+        assert_eq!(ProvidersConfig::load(&home).unwrap(), cfg);
+        no_stage(&home);
     }
 }

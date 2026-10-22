@@ -67,7 +67,7 @@ pub fn render_panel(
     let inner = block.inner(area);
     f.render_widget(block, area);
     let lines = match view {
-        View::Conversation => conversation(scenario, tick_ms, reduced),
+        View::Conversation => conversation(scenario, tick_ms, reduced, inner.width),
         View::Changes => changes(scenario),
         View::Terminal => terminal(scenario),
         View::Plan => plan(scenario),
@@ -82,8 +82,7 @@ pub fn render_panel(
 
 /// Conversation: the transcript tail + the thinking line while the
 /// model works (M05) + the caret while streaming (M06).
-fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
+fn conversation(s: &Scenario, tick: u64, reduced: bool, width: u16) -> Vec<Line<'static>> {
     // The welcome block (§9.22): shown while the transcript is
     // empty, replaced by the first output with no transition.
     if s.transcript.is_empty() {
@@ -94,42 +93,66 @@ fn conversation(s: &Scenario, tick: u64, reduced: bool) -> Vec<Line<'static>> {
         return w.lines(tick);
     }
     // The transcript tail: every visible line of the session — user
-    // prompts, model replies, tool lines — rendered with the kind's
-    // chrome. The thinking/streaming indicators ride on top.
+    // prompts, model replies, tool lines — wrapped to the pane's own
+    // width (§7.4: line breaks always fit the current window; a
+    // pane squeezed by the layout must wrap, not truncate).
+    let text_w = width.saturating_sub(4) as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
     let tail = s.transcript.iter().rev().take(200).collect::<Vec<_>>();
     for l in tail.iter().rev() {
-        match l.kind {
-            LineKind::User => out.push(Line::from(vec![
-                Span::styled("❯ ", Style::default().fg(comps::colour(Token::Cyan))),
-                Span::styled(
-                    l.text.clone(),
-                    Style::default().fg(comps::colour(Token::Ink)),
-                ),
-            ])),
-            LineKind::Model => out.push(Line::from(Span::styled(
-                l.text.clone(),
-                Style::default().fg(comps::colour(Token::Ink)),
-            ))),
-            LineKind::Tool => out.push(Line::from(vec![
-                Span::styled("◆ ", Style::default().fg(comps::colour(Token::Magenta))),
-                Span::styled(
-                    l.text.clone(),
-                    Style::default().fg(comps::colour(Token::Muted)),
-                ),
-            ])),
-            LineKind::System => out.push(Line::from(Span::styled(
-                l.text.clone(),
-                Style::default().fg(comps::colour(Token::Muted)),
-            ))),
-            // The queued row (§9.12): ◌ + the prompt, muted — it
-            // becomes a user turn at its TurnStarted.
-            LineKind::Queued => out.push(Line::from(vec![
-                Span::styled("◌ ", Style::default().fg(comps::colour(Token::Rule))),
-                Span::styled(
-                    l.text.clone(),
-                    Style::default().fg(comps::colour(Token::Muted)),
-                ),
-            ])),
+        let wrapped = super::view::wrap(&l.text, text_w);
+        let rows = if wrapped.is_empty() {
+            vec![String::new()]
+        } else {
+            wrapped
+        };
+        for (i, row) in rows.into_iter().enumerate() {
+            let spans = match l.kind {
+                LineKind::User => vec![
+                    Span::styled(
+                        if i == 0 { "❯ " } else { "  " },
+                        Style::default().fg(comps::colour(Token::Cyan)),
+                    ),
+                    Span::styled(row, Style::default().fg(comps::colour(Token::Ink))),
+                ],
+                LineKind::Model => vec![
+                    Span::styled(
+                        if i == 0 { "✦ " } else { "  " },
+                        Style::default().fg(comps::colour(if s.turn_live {
+                            Token::Cyan
+                        } else {
+                            Token::Magenta
+                        })),
+                    ),
+                    Span::styled(row, Style::default().fg(comps::colour(Token::Ink))),
+                ],
+                LineKind::Tool => vec![
+                    Span::styled(
+                        if i == 0 { "◆ " } else { "  " },
+                        Style::default().fg(comps::colour(Token::Magenta)),
+                    ),
+                    Span::styled(row, Style::default().fg(comps::colour(Token::Muted))),
+                ],
+                LineKind::System => vec![
+                    Span::raw("  "),
+                    Span::styled(row, Style::default().fg(comps::colour(Token::Muted))),
+                ],
+                // The queued row (§9.12): ◌ + the prompt, muted — it
+                // becomes a user turn at its TurnStarted.
+                LineKind::Queued => vec![
+                    Span::styled(
+                        if i == 0 { "◌ " } else { "  " },
+                        Style::default().fg(comps::colour(Token::Rule)),
+                    ),
+                    Span::styled(row, Style::default().fg(comps::colour(Token::Muted))),
+                ],
+            };
+            out.push(Line::from(spans));
+        }
+        // A blank row separates blocks the way the wrapped renderer does:
+        // between turns and after a tool group.
+        if l.kind == LineKind::Tool || l.kind == LineKind::User || l.kind == LineKind::Model {
+            out.push(Line::from(""));
         }
     }
     // The live indicators: thinking (no visible output yet) or
@@ -440,6 +463,43 @@ mod tests {
             );
         }
         assert!(text.contains("waiting for fixture-model"));
+    }
+
+    #[test]
+    fn narrow_conversation_panel_wraps_unicode_without_losing_text_or_escaping_its_area() {
+        let mut scenario = Scenario::new();
+        scenario.transcript.push(TranscriptLine {
+            kind: LineKind::System,
+            text: "界界界👩‍💻e\u{301}".into(),
+            ..Default::default()
+        });
+        // The border and conversation inset leave text widths 1/3/4/10.
+        for columns in [7u16, 9, 10, 16] {
+            let mut term = Terminal::new(TestBackend::new(columns + 4, 18)).unwrap();
+            term.draw(|f| {
+                render_panel(
+                    f,
+                    Rect::new(2, 1, columns, 16),
+                    1,
+                    View::Conversation,
+                    false,
+                    &scenario,
+                    0,
+                    true,
+                );
+            })
+            .unwrap();
+            let buffer = term.backend().buffer();
+            let text = buffer_text(buffer);
+            assert_eq!(text.matches('界').count(), 3, "width {columns}");
+            assert!(text.contains("👩‍💻"), "width {columns}");
+            assert!(text.contains("e\u{301}"), "width {columns}");
+            for y in 0..18 {
+                for x in [0, 1, columns + 2, columns + 3] {
+                    assert_eq!(buffer.cell((x, y)).unwrap().symbol(), " ");
+                }
+            }
+        }
     }
 
     #[test]

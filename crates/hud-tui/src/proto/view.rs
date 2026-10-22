@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::comps;
@@ -308,7 +309,9 @@ fn queued_row(l: &TranscriptLine, cl: u16, cw: u16) -> Vec<Line<'static>> {
     vec![Line::from(spans)]
 }
 
-/// Greedy word wrap (§7.4).
+/// Greedy word wrap (§7.4). Hard breaks preserve grapheme boundaries.
+/// A grapheme wider than the viewport stays intact on its own row;
+/// the renderer clips it without losing text or preventing progress.
 pub fn wrap(s: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -319,36 +322,15 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
         let mut line_w = 0usize;
         for word in para.split(' ') {
             let ww = word.width();
-            if line_w == 0 {
-                // A word longer than the line hard-breaks.
-                let mut w = word;
-                while w.width() > width {
-                    let mut cut = width;
-                    while cut > 0 && (w[..cut].width() > width || !w.is_char_boundary(cut)) {
-                        cut -= 1;
-                    }
-                    out.push(w[..cut].to_string());
-                    w = &w[cut..];
-                }
-                line = w.to_string();
-                line_w = line.width();
-            } else if line_w + 1 + ww <= width {
+            if line.is_empty() {
+                (line, line_w) = hard_break_word(word, width, &mut out);
+            } else if line_w.saturating_add(1).saturating_add(ww) <= width {
                 line.push(' ');
                 line.push_str(word);
                 line_w += 1 + ww;
             } else {
                 out.push(std::mem::take(&mut line));
-                let mut w = word;
-                while w.width() > width {
-                    let mut cut = width;
-                    while cut > 0 && (w[..cut].width() > width || !w.is_char_boundary(cut)) {
-                        cut -= 1;
-                    }
-                    out.push(w[..cut].to_string());
-                    w = &w[cut..];
-                }
-                line = w.to_string();
-                line_w = line.width();
+                (line, line_w) = hard_break_word(word, width, &mut out);
             }
         }
         out.push(line);
@@ -357,6 +339,22 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+/// Emit complete rows while scanning a word once, retaining its final row.
+fn hard_break_word(word: &str, width: usize, out: &mut Vec<String>) -> (String, usize) {
+    let mut start = 0;
+    let mut cells = 0usize;
+    for (offset, grapheme) in word.grapheme_indices(true) {
+        let grapheme_cells = grapheme.width();
+        if cells > 0 && grapheme_cells > 0 && cells.saturating_add(grapheme_cells) > width {
+            out.push(word[start..offset].to_string());
+            start = offset;
+            cells = 0;
+        }
+        cells = cells.saturating_add(grapheme_cells);
+    }
+    (word[start..].to_string(), cells)
 }
 
 // ── The approval card (§9.14) ─────────────────────────────────────
@@ -551,4 +549,58 @@ fn keys_line(scenario: &Scenario, now_ms: u64) -> Line<'static> {
         Span::raw(" "),
         label("deny"),
     ])
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    #[test]
+    fn greedy_wrap_preserves_ascii_spacing_paragraphs_and_empty_input() {
+        assert_eq!(wrap("alpha beta", 7), ["alpha", "beta"]);
+        assert_eq!(wrap("abcdefghijk", 3), ["abc", "def", "ghi", "jk"]);
+        assert_eq!(wrap("one  two", 8), ["one  two"]);
+        assert_eq!(wrap("a\n\nb\n", 4), ["a", "", "b", ""]);
+        assert_eq!(wrap("", 4), [""]);
+        assert_eq!(wrap("retained source", 0), [""]);
+    }
+
+    #[test]
+    fn narrow_wrap_preserves_unicode_graphemes_and_always_consumes_input() {
+        for text in [
+            "界界界界界界",
+            "🙂🙂🙂🙂🙂",
+            "e\u{301}e\u{301}e\u{301}",
+            "👩‍💻👩‍💻👩‍💻",
+        ] {
+            for width in [1, 3, 4, 10] {
+                let rows = wrap(text, width);
+                assert!(
+                    rows.iter().all(|row| !row.is_empty()),
+                    "{text:?} at {width}"
+                );
+                assert_eq!(rows.concat(), text, "{text:?} at {width}");
+                let actual: Vec<_> = rows.iter().flat_map(|row| row.graphemes(true)).collect();
+                assert_eq!(actual, text.graphemes(true).collect::<Vec<_>>());
+                assert!(
+                    rows.iter()
+                        .all(|row| row.width() <= width || row.graphemes(true).count() == 1)
+                );
+            }
+        }
+        assert_eq!(wrap("界界界", 3), ["界", "界", "界"]);
+        assert_eq!(wrap("界界界", 4), ["界界", "界"]);
+        assert_eq!(wrap("a 界界界 z", 4), ["a", "界界", "界 z"]);
+        assert_eq!(wrap("e\u{301}e\u{301}", 1), ["e\u{301}", "e\u{301}"]);
+        assert_eq!(wrap("👩‍💻👩‍💻", 1), ["👩‍💻", "👩‍💻"]);
+    }
+
+    #[test]
+    fn long_joined_emoji_word_advances_without_splitting_or_empty_rows() {
+        let text = "👩‍💻".repeat(4096);
+        let rows = wrap(&text, 1);
+        assert_eq!(rows.len(), 4096);
+        assert_eq!(rows.concat(), text);
+        assert!(rows.iter().all(|row| row == "👩‍💻"));
+    }
 }

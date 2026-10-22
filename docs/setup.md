@@ -170,6 +170,29 @@ the result reports that source. This removes ORBIT's local key copy; use the
 provider's own account controls to revoke an issued API key. Older unselected
 credential bindings are not automatically pruned.
 
+## Resume in the right project
+
+New sessions record the canonical directory where their tools run. Start
+`orbit --continue` in that directory to reopen its latest session, or use
+`orbit --resume SESSION_ID`. Sessions from other directories remain visible in
+the session list; resuming them requires opening their original directory.
+ORBIT does not change directories or carry project permissions across a resume.
+
+Older sessions without workspace metadata remain visible and can be inspected.
+Recovery export is available when tracked accounting provides a revision and digest.
+After checking the history and opening the directory where you intend to use it,
+bind one explicitly:
+
+```sh
+orbit --resume SESSION_ID --adopt-workspace
+```
+
+Adoption preserves the saved conversation, identity and accounting. It cannot
+move a session that already belongs to another directory or bypass unresolved
+accounting. The flag requires an explicit `--resume`; it cannot accompany
+`--continue` or `--fork-session`. Adopt through ordinary startup before using
+that legacy session in the TUI or daemon.
+
 ## Discover models and refresh limits
 
 In the setup wizard, choose `discover` at **Model source**. ORBIT fetches the

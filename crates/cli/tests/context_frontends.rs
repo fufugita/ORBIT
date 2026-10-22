@@ -714,6 +714,7 @@ mod frontend_manual_baselines {
                 60,
             )
             .with_selection_origin(SelectionOrigin::SavedExplicit);
+            saved.bind_workspace(&self.workspace).unwrap();
             let lease =
                 SessionLease::acquire(&self.home, SESSION, "frontend-baseline-seed").unwrap();
             lease.save(&saved).unwrap();
@@ -1961,6 +1962,11 @@ mod frontend_manual_baselines {
             ),
             (0, 0, 0, 0)
         );
+        assert_eq!(
+            fresh.workspace,
+            Some(fs::canonicalize(&f.workspace).unwrap())
+        );
+        assert_eq!(f.saved().workspace, fresh.workspace);
         assert_eq!(fresh.provider, "provider_a");
         assert_eq!(fresh.model, RAW_A);
         assert_eq!(fresh.gate, wire.url);
@@ -2429,6 +2435,11 @@ mod frontend_manual_baselines {
             ),
             (0, 0, 0, 0)
         );
+        assert_eq!(
+            fresh.workspace,
+            Some(fs::canonicalize(&f.workspace).unwrap())
+        );
+        assert_eq!(f.saved().workspace, fresh.workspace);
         assert_eq!(fresh.provider, "provider_a");
         assert_eq!(fresh.model, RAW_A);
         assert_eq!(fresh.gate, wire.url);
@@ -3520,6 +3531,7 @@ mod frontend_manual_baselines {
                     60,
                 )
                 .with_selection_origin(SelectionOrigin::SavedExplicit);
+                saved.bind_workspace(&f.workspace).unwrap();
                 let lease =
                     SessionLease::acquire(&f.home, SESSION, "ordinary-signal-seed").unwrap();
                 lease.save(&saved).unwrap();
@@ -4047,6 +4059,7 @@ mod frontend_manual_baselines {
                     0,
                 )
                 .with_selection_origin(SelectionOrigin::SavedExplicit);
+                fresh.bind_workspace(&f.workspace).unwrap();
                 let lease = SessionLease::acquire(&f.home, SESSION, "approval-pty-seed").unwrap();
                 prepare_root(&lease, &mut fresh, RootOrigin::FreshCandidate).unwrap();
                 assert_eq!(lease.load().unwrap().transcript, Vec::<ChatMessage>::new());
@@ -4452,6 +4465,7 @@ mod frontend_manual_baselines {
             let mut saved =
                 SessionFile::from_chat(SESSION, RAW_A, &wire.url, "provider_a", &[], 0, 0, 0, 0)
                     .with_selection_origin(SelectionOrigin::Default);
+            saved.bind_workspace(&f.workspace).unwrap();
             let accounting = prepare_root(&lease, &mut saved, RootOrigin::FreshCandidate).unwrap();
             assert_eq!(
                 accounting

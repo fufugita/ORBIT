@@ -289,7 +289,14 @@ fn print_human_help() {
             "--fork-session",
             "copy the resumed (or latest) session into a new id and continue there",
         ),
-        ("--resume <ID>", "resume a specific session"),
+        (
+            "--resume <ID>",
+            "resume a session in its original workspace",
+        ),
+        (
+            "--resume <ID> --adopt-workspace",
+            "explicitly bind an inspected legacy session to this directory",
+        ),
         ("--no-tui", "plain REPL instead of the TUI"),
         (
             "--safe-customization",
@@ -1386,6 +1393,23 @@ fn compact_local_session(
     Result<session_accounting::AccountingView, session_accounting::AccountingError>,
 ) {
     let (lease, accounting) = owner;
+    let admitted = sessions::current_workspace().and_then(|workspace| {
+        let saved = lease.load()?;
+        saved.require_workspace(&workspace)?;
+        Ok(saved)
+    });
+    let saved = match admitted {
+        Ok(saved) => saved,
+        Err(_) => {
+            return (
+                Err("workspace_admission_refused"),
+                Err(session_accounting::AccountingError::InvalidState(
+                    "session workspace admission refused",
+                )),
+            );
+        }
+    };
+    working.workspace = saved.workspace;
     let result = (|| {
         if cancel.is_cancelled() {
             return Err("cancelled");
@@ -1637,14 +1661,21 @@ fn cmd_compact(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let (lease, mut working) = match sessions::SessionLease::acquire_and_load(&home, &id, "compact")
-    {
-        Ok(owned) => owned,
-        Err(_) => {
-            eprintln!("ORBIT-E0400: saved session unavailable or busy");
+    let workspace = match sessions::current_workspace() {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            eprintln!("ORBIT-E0400: {error}");
             return 2;
         }
     };
+    let (lease, mut working) =
+        match sessions::SessionLease::acquire_for_workspace(&home, &id, "compact", &workspace) {
+            Ok(owned) => owned,
+            Err(error) => {
+                eprintln!("ORBIT-E0400: saved session unavailable or busy: {error}");
+                return 2;
+            }
+        };
     let accounting = match session_accounting::prepare_root(
         &lease,
         &mut working,
@@ -1775,6 +1806,7 @@ fn owned_startup_session_with_origin(
     ),
     String,
 > {
+    let workspace = sessions::current_workspace().map_err(|error| error.to_string())?;
     let requested = if args.iter().any(|arg| arg == "--resume") {
         Some(
             value_after(args, "--resume")
@@ -1786,10 +1818,25 @@ fn owned_startup_session_with_origin(
     };
     let continuing = args.iter().any(|arg| arg == "--continue");
     let forking = args.iter().any(|arg| arg == "--fork-session");
+    let adopting = args
+        .iter()
+        .filter(|arg| arg.as_str() == "--adopt-workspace")
+        .count();
+    if adopting > 0
+        && (adopting != 1
+            || requested.is_none()
+            || continuing
+            || forking
+            || args.iter().filter(|arg| arg.as_str() == "--resume").count() != 1)
+    {
+        return Err("--adopt-workspace requires one explicit --resume ID and cannot be combined with --continue or --fork-session".into());
+    }
     let source_id = if continuing || (forking && requested.is_none()) {
-        sessions::list_sessions(home)?
-            .first()
-            .map(|saved| saved.session_id.clone())
+        let local = sessions::latest_for_workspace(home, &workspace)?;
+        if continuing && local.is_none() {
+            eprintln!("No saved session in this workspace; starting a new session.");
+        }
+        local.map(|saved| saved.session_id)
     } else {
         requested
     };
@@ -1805,9 +1852,17 @@ fn owned_startup_session_with_origin(
         }
         return Ok((lease, None, RootOrigin::FreshCandidate));
     };
-    let (source_lease, mut saved) =
-        sessions::SessionLease::acquire_and_load(home, &source_id, kind)
+    let (source_lease, mut saved) = if adopting == 1 {
+        let (lease, saved) = sessions::SessionLease::acquire_for_adoption(home, &source_id, kind)
             .map_err(|error| error.to_string())?;
+        let saved = lease
+            .adopt_workspace(&saved, &workspace)
+            .map_err(|error| error.to_string())?;
+        (lease, saved)
+    } else {
+        sessions::SessionLease::acquire_for_workspace(home, &source_id, kind, &workspace)
+            .map_err(|error| error.to_string())?
+    };
     if !forking {
         return Ok((source_lease, Some(saved), RootOrigin::RestoredOrLegacy));
     }
@@ -1919,6 +1974,9 @@ mod owned_startup_tests {
         let mut session =
             SessionFile::from_chat(id, "m", "http://127.0.0.1:1", "p", &[], 7, 2, 3, 4)
                 .with_effort(Some(EffortSetting::Default));
+        session
+            .bind_workspace(&sessions::current_workspace().unwrap())
+            .unwrap();
         session.updated_at = updated.into();
         lease.save(&session).unwrap();
         session
@@ -2341,6 +2399,12 @@ fn cmd_headless(args: &[String]) -> i32 {
     )
     .with_effort(selected_effort.clone())
     .with_selection_origin(selection_origin);
+    if let Err(error) =
+        sessions::current_workspace().and_then(|workspace| initial.bind_workspace(&workspace))
+    {
+        eprintln!("cannot bind session workspace: {error}");
+        return 1;
+    }
     let accounting =
         match session_accounting::prepare_root(&live_lease, &mut initial, startup_origin) {
             Ok(accounting) => accounting,
@@ -3143,6 +3207,7 @@ fn validate_chat_arguments(args: &[String]) -> Result<(), String> {
     let toggles = [
         "--continue",
         "--fork-session",
+        "--adopt-workspace",
         "--bare",
         "--tui",
         "--no-tui",
@@ -3341,6 +3406,12 @@ fn cmd_chat(args: &[String]) -> i32 {
     )
     .with_effort(selected_effort.clone())
     .with_selection_origin(selection_origin);
+    if let Err(error) =
+        sessions::current_workspace().and_then(|workspace| initial.bind_workspace(&workspace))
+    {
+        eprintln!("cannot bind session workspace: {error}");
+        return 2;
+    }
     let mut accounting =
         match session_accounting::prepare_root(&live_lease, &mut initial, startup_origin) {
             Ok(accounting) => accounting,
@@ -3547,11 +3618,22 @@ fn cmd_chat(args: &[String]) -> i32 {
                 let target = if same_session {
                     live_lease.load().map(|saved| (None, saved))
                 } else {
-                    sessions::SessionLease::acquire_and_load(&home, id, "chat")
+                    sessions::current_workspace()
+                        .and_then(|workspace| {
+                            sessions::SessionLease::acquire_for_workspace(
+                                &home, id, "chat", &workspace,
+                            )
+                        })
                         .map(|(lease, saved)| (Some(lease), saved))
                 };
                 match target {
                     Ok((candidate_lease, mut s)) => {
+                        if let Err(error) = sessions::current_workspace()
+                            .and_then(|workspace| s.require_workspace(&workspace))
+                        {
+                            eprintln!("cannot resume {id}: {error}");
+                            continue;
+                        }
                         let resolved = match chat_effort_config(
                             &home,
                             &s.model,
@@ -5570,7 +5652,8 @@ fn validate_headless_arguments(args: &[String]) -> Result<(), String> {
                     .filter(|value| !value.is_empty() && !value.starts_with("--"))
                     .ok_or_else(|| format!("{argument} requires a value"))?;
             }
-            "--continue" | "--fork-session" | "--bare" | "--auto-tools" | "--spoken-rules" => {}
+            "--continue" | "--fork-session" | "--adopt-workspace" | "--bare" | "--auto-tools"
+            | "--spoken-rules" => {}
             _ => return Err(format!("unknown headless argument {argument}")),
         }
         index += 1;
@@ -5884,6 +5967,8 @@ fn cmd_serve(args: &[String]) -> i32 {
         )
         .with_effort(turn.effort.clone())
         .with_selection_origin(origin);
+        seed.bind_workspace(&sessions::current_workspace().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
         session_accounting::prepare_root(&lease, &mut seed, startup_origin)
             .map_err(|error| error.to_string())?;
         turn.initial_transcript = seed.to_transcript();

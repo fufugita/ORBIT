@@ -2,7 +2,7 @@ use futures::StreamExt;
 use orbit_adapter::conformance::canonical_request;
 use orbit_adapter::error::AdapterError;
 use orbit_adapter::types::{
-    AdapterIdentity, AdapterKind, ChatMessage, ChatRole, ContentBlock, DeploymentId,
+    AdapterIdentity, AdapterKind, ChatMessage, ChatRole, ContentBlock, CostRates, DeploymentId,
     EndpointScheme, ProviderEventKind, ProviderId, ProviderRequest, ProviderRouteBinding,
     ProviderStreamEvent, RegionId, Sha256Digest, TlsPinPolicy, ToolCallMessage,
 };
@@ -619,6 +619,56 @@ async fn openai_terminal_reason_only_preserves_delayed_usage_trailer() {
     mock.captured().await.unwrap();
 }
 
+// Compatible APIs may report reasoning separately from completion_tokens.
+#[tokio::test]
+async fn openai_usage_accepts_reasoning_exceeding_completion() {
+    let adapter = adapter(Family::OpenAi);
+    let trailer = sse(
+        json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":12,"completion_tokens_details":{"reasoning_tokens":540}}}),
+    );
+    let mut mock = Mock::held(
+        format!(
+            "{}{}",
+            openai_delta(json!({"content":"ok"})),
+            openai_reason("stop")
+        ),
+        Some(trailer),
+    )
+    .await;
+    let mut request = request(adapter.as_ref(), mock.port);
+    request.idle_timeout_ms = 80;
+    let events = tokio::time::timeout(
+        Duration::from_millis(400),
+        drain(adapter.as_ref(), &request),
+    )
+    .await
+    .expect("stream must complete")
+    .expect("usage trailer must not be rejected");
+    let usage = final_usage(&events).expect("reported usage must be preserved");
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.reasoning_tokens
+        ),
+        (100, 12, 540)
+    );
+    let rates = CostRates {
+        input_per_million_microcents: 1_000_000,
+        output_per_million_microcents: 2_000_000,
+        cache_read_per_million_microcents: None,
+        cache_write_per_million_microcents: None,
+        reasoning_per_million_microcents: None,
+        request_flat_microcents: 0,
+    };
+    assert_eq!(
+        rates.cost_microcents(&usage),
+        None,
+        "missing reasoning pricing must not produce a partial billed cost"
+    );
+    mock.captured().await.unwrap();
+}
+
 #[tokio::test]
 async fn openai_usage_rejects_malformed_empty_partial_and_inconsistent_totals() {
     for usage in [
@@ -630,6 +680,10 @@ async fn openai_usage_rejects_malformed_empty_partial_and_inconsistent_totals() 
         json!({"prompt_tokens":"1","completion_tokens":1}),
         json!({"prompt_tokens":1,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":2}}),
         json!({"prompt_tokens":1,"completion_tokens":1,"completion_tokens_details":{"reasoning_tokens":"bad"}}),
+        json!({"prompt_tokens":1,"completion_tokens":1,"completion_tokens_details":{"reasoning_tokens":-1}}),
+        json!({"prompt_tokens":1,"completion_tokens":1,"completion_tokens_details":{"reasoning_tokens":1.5}}),
+        json!({"prompt_tokens":1,"completion_tokens":1,"total_tokens":3}),
+        json!({"prompt_tokens":1,"completion_tokens":1,"total_tokens":"2"}),
     ] {
         let adapter = adapter(Family::OpenAi);
         let body = format!(

@@ -1444,7 +1444,7 @@ fn dispatch_with_retry(
             {
                 mark_ordinary_uncertain(report);
                 return Err(OrdinaryDispatchError::accounting(
-                    "context accounting has a pending uncertain request; inspect before continuing",
+                    "context accounting has a pending uncertain request; run: orbit recovery status --session <session-id>",
                 ));
             }
             if let Some(allowance) = allowance
@@ -1681,7 +1681,13 @@ fn dispatch_with_retry(
                     },
                 });
             }
-            Err(_) if cancel.is_cancelled() => return Err(OrdinaryDispatchError::Cancelled),
+            Err(_) if cancel.is_cancelled() => {
+                // The observation receipt above records any usage and
+                // settles incomplete dispatch conservatively. Preserve
+                // that uncertainty in the report when cancellation wins.
+                mark_ordinary_uncertain(report);
+                return Err(OrdinaryDispatchError::Cancelled);
+            }
             Err((code, message))
                 if options.journal.is_none()
                     && options.spend_allowance.is_none()

@@ -14,7 +14,9 @@ use ratatui::widgets::Paragraph;
 
 use super::comps;
 use super::core::Token;
-use super::scenario::{LineKind, Scenario, ToolState, TranscriptLine, TurnReport};
+use super::scenario::{
+    LineKind, Picker, PickerKind, PickerRow, Scenario, ToolState, TranscriptLine, TurnReport,
+};
 use super::screen::Focus;
 use crate::worker::WorkerCtx;
 
@@ -42,6 +44,10 @@ pub enum Overlay {
     Quit,
     /// The full diff of the Changes panel's selected file (M11).
     Diff,
+    /// The model picker (`/models`): rows ride on `scenario.picker`.
+    ModelPicker,
+    /// The session picker (`/sessions`).
+    SessionPicker,
 }
 
 /// A toast (§9.13): muted text, optional green ✓, 3 s.
@@ -361,6 +367,7 @@ fn run_proto_inner(
     // A key a click stands for, handled on the next turn of the loop as
     // if it had been typed.
     let mut injected: Option<Event> = None;
+    let mut pending_picker_click: Option<PickerClick> = None;
     // The last frame drawn: a selection copies its text from here.
     let mut last_buf: Option<ratatui::buffer::Buffer> = None;
 
@@ -375,17 +382,21 @@ fn run_proto_inner(
         // fail with EIO — swallow nothing: treat any input error as
         // "terminal gone" and quit at once (the same rule as SIGHUP).
         // unwrap_or(false) here would busy-loop the EIO at 100% CPU.
-        let ev = match injected.take() {
-            Some(e) => Some(e),
-            None => match event::poll(timeout) {
-                Ok(true) => event::read().ok(),
-                Ok(false) => None,
-                Err(_) => {
-                    exit_code = crate::terminal::take_pending_signal()
-                        .map_or(1, crate::terminal::ShutdownSignal::exit_code);
-                    break;
-                }
-            },
+        let ev = if let Some(click) = pending_picker_click.take() {
+            picker_click_key(click, &mut scenario, overlay, now_ms).map(Event::Key)
+        } else {
+            match injected.take() {
+                Some(e) => Some(e),
+                None => match event::poll(timeout) {
+                    Ok(true) => event::read().ok(),
+                    Ok(false) => None,
+                    Err(_) => {
+                        exit_code = crate::terminal::take_pending_signal()
+                            .map_or(1, crate::terminal::ShutdownSignal::exit_code);
+                        break;
+                    }
+                },
+            }
         };
         if let Some(ev) = ev {
             match ev {
@@ -488,6 +499,9 @@ fn run_proto_inner(
                                 KeyModifiers::NONE,
                             )));
                         }
+                        MouseOutcome::Picker(i) => {
+                            pending_picker_click = capture_picker_click(&scenario, overlay, i);
+                        }
                         MouseOutcome::CustomAction { panel, action } => {
                             run_pane_action(
                                 panel,
@@ -544,7 +558,9 @@ fn run_proto_inner(
             // Drain the bus into the scenario.
             let msgs_before = scenario.state_version();
             while let Some(msg) = bus.try_recv() {
-                if let Some(text) = reduce_frontend_message(msg, &mut tui, &mut scenario, now_ms) {
+                if let Some(text) =
+                    reduce_runtime_message(msg, &mut tui, &mut scenario, &mut overlay, now_ms)
+                {
                     // The agent-done toast (§9.13): replaces any current
                     // toast — the newest event wins.
                     toast = Some(Toast {
@@ -716,10 +732,19 @@ fn handle_key(
 ) -> bool {
     let prev_key_ms = scenario.last_key_ms;
     scenario.last_key_ms = now_ms;
+    if k.code == KeyCode::Esc
+        || (overlay.is_some()
+            && !matches!(overlay, Some(Overlay::ModelPicker | Overlay::SessionPicker)))
+        || tui.app.arranging
+        || tui.app.picker.is_some()
+    {
+        scenario.dismiss_picker();
+    }
     // Ctrl+C / Ctrl+D (§11.7): the quit card, from anywhere.
     if k.modifiers.contains(KeyModifiers::CONTROL)
         && (k.code == KeyCode::Char('c') || k.code == KeyCode::Char('d'))
     {
+        scenario.dismiss_picker();
         *overlay = Some(Overlay::Quit);
         return false;
     }
@@ -787,6 +812,85 @@ fn handle_key(
                 KeyCode::Char('y') | KeyCode::Enter => return true,
                 KeyCode::Esc | KeyCode::Char('n') => *overlay = None,
                 _ => {}
+            }
+            return false;
+        }
+        Some(Overlay::ModelPicker | Overlay::SessionPicker) => {
+            // The picker owns the keyboard: arrows move, Enter commits,
+            // Esc closes. The variant is copied out so the arm can
+            // clear `overlay` while matching on it.
+            let kind = match overlay {
+                Some(Overlay::ModelPicker) => PickerKind::Models,
+                _ => PickerKind::Sessions,
+            };
+            if scenario.approval_call_id.is_some()
+                || scenario
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.kind != kind)
+            {
+                scenario.dismiss_picker();
+                *overlay = None;
+                return false;
+            }
+            if let Some(picker) = scenario.picker.as_mut() {
+                match k.code {
+                    KeyCode::Esc => {
+                        scenario.picker = None;
+                        *overlay = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        picker.sel = picker
+                            .sel
+                            .min(picker.rows.len().saturating_sub(1))
+                            .saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        picker.sel = picker
+                            .sel
+                            .saturating_add(1)
+                            .min(picker.rows.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        let selected = picker.rows.get(picker.sel).cloned();
+                        let picker_kind = picker.kind;
+                        scenario.picker = None;
+                        *overlay = None;
+                        let Some(row) = selected else {
+                            return false;
+                        };
+                        let current_id = scenario
+                            .session_binding()
+                            .map(|b| b.session_id.clone())
+                            .unwrap_or_default();
+                        let command = match (picker_kind, kind) {
+                            (PickerKind::Models, PickerKind::Models) => {
+                                Some(WorkerCommand::SetModel(row.value.clone()))
+                            }
+                            (PickerKind::Sessions, PickerKind::Sessions) => {
+                                // Resuming the session we're already on
+                                // is a no-op: just close.
+                                (row.value != current_id)
+                                    .then_some(WorkerCommand::ResumeSession(row.value.clone()))
+                            }
+                            _ => None,
+                        };
+                        if let Some(command) = command
+                            && let Err(message) = submit_foreground(scenario, command_sink, command)
+                        {
+                            *toast = Some(Toast {
+                                text: message.into(),
+                                ok: false,
+                                shown_ms: now_ms,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // The rows vanished (worker restart): close.
+                scenario.picker = None;
+                *overlay = None;
             }
             return false;
         }
@@ -879,6 +983,11 @@ fn handle_key(
         tui.sync_focus();
         return false;
     }
+    // Canceling a loading picker spends Escape while its old reply is pending.
+    if k.code == KeyCode::Esc && scenario.pending_picker_kind().is_some() {
+        return false;
+    }
+
     // esc on an idle, empty composer starts arranging.
     if k.code == KeyCode::Esc
         && composer.is_empty()
@@ -1453,6 +1562,32 @@ fn copy_mode(guard: &mut crate::terminal::TerminalGuard, scenario: &Scenario) {
     guard.terminal.clear().ok();
 }
 
+fn request_picker(
+    scenario: &mut Scenario,
+    sink: &CommandSink,
+    kind: PickerKind,
+    toast: &mut Option<Toast>,
+    now_ms: u64,
+) {
+    let result = scenario.begin_picker_request(kind).and_then(|()| {
+        let command = match kind {
+            PickerKind::Models => WorkerCommand::ListModels,
+            PickerKind::Sessions => WorkerCommand::ListSessions,
+        };
+        sink.send(command).map_err(|_| {
+            scenario.finish_picker_request(kind);
+            "worker is unavailable"
+        })
+    });
+    if let Err(message) = result {
+        *toast = Some(Toast {
+            text: message.into(),
+            ok: false,
+            shown_ms: now_ms,
+        });
+    }
+}
+
 fn submit_foreground(
     scenario: &mut Scenario,
     sink: &CommandSink,
@@ -1475,6 +1610,7 @@ fn submit_foreground(
     // The event loop cannot consume a worker message between this send and
     // admission, even if the worker has already produced its terminal frame.
     scenario.admit_foreground(operation);
+    scenario.dismiss_picker();
     Ok(())
 }
 
@@ -1494,8 +1630,9 @@ fn run_command(
     history_idx: &mut Option<usize>,
     focus_sessions: &mut bool,
 ) -> Option<Overlay> {
-    let _ = (composer, history, history_idx, sender);
+    let _ = (composer, history, history_idx, sender, focus_sessions);
     if text == "quit" || text == "exit" {
+        scenario.dismiss_picker();
         return Some(Overlay::Quit);
     }
     let (cmd, arg) = match text.split_once(' ') {
@@ -1534,10 +1671,9 @@ fn run_command(
         }
         "/help" => Some(Overlay::Help),
         "/sessions" => {
-            // List the saved sessions in the transcript and open the
-            // sidebar (its SESSIONS section) where there is room.
-            let _ = command_sink.send(WorkerCommand::ListSessions);
-            *focus_sessions = true;
+            // The session picker: the worker's SessionsListed opens it.
+            // The sidebar stays closed; the picker is the navigation.
+            request_picker(scenario, command_sink, PickerKind::Sessions, toast, now_ms);
             None
         }
         "/usage" => {
@@ -1558,7 +1694,7 @@ fn run_command(
             None
         }
         "/models" => {
-            let _ = command_sink.send(WorkerCommand::ListModels);
+            request_picker(scenario, command_sink, PickerKind::Models, toast, now_ms);
             None
         }
         "/model" => {
@@ -1998,6 +2134,9 @@ pub fn apply_session_projection(
         scenario.compactions.clear();
         scenario.frontend.revision_floor = None;
     }
+    if scenario.model_id != projection.model || scenario.provider != projection.provider {
+        scenario.dismiss_picker();
+    }
     if !switching
         && matches!(&projection.reason, ProjectionReason::Operation { operation }
         if operation.kind().is_ordinary())
@@ -2060,6 +2199,7 @@ pub fn apply_session_projection(
 }
 
 fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Option<String> {
+    let clean = |text: String| crate::bridge::safe_text(&crate::bridge::terminal_safe(&text));
     use crate::msg::Msg;
     if let Msg::SessionProjection(projection) = msg {
         apply_session_projection(projection, scenario, now_ms);
@@ -2089,6 +2229,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             cost_microcents,
             turns,
         } => {
+            scenario.dismiss_picker();
             scenario.invalidate_cost_qualification();
             scenario.invalidate_context_sample();
             scenario.frontend.dirty = true;
@@ -2443,6 +2584,63 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 });
             }
         }
+        Msg::ModelsListed(rows) => {
+            if rows.is_empty() {
+                scenario.transcript.push(TranscriptLine {
+                    kind: LineKind::System,
+                    text: "(no providers configured)".to_string(),
+                    ..Default::default()
+                });
+            } else {
+                scenario.open_picker(Picker {
+                    kind: PickerKind::Models,
+                    rows: rows
+                        .into_iter()
+                        .map(|(p, m)| PickerRow {
+                            label: clean(format!("{p}/{m}")),
+                            value: format!("{p}/{m}"),
+                            detail: clean(format!("provider {p}")),
+                        })
+                        .collect(),
+                    sel: 0,
+                });
+            }
+        }
+        Msg::SessionsListed(rows) => {
+            if rows.is_empty() {
+                scenario.transcript.push(TranscriptLine {
+                    kind: LineKind::System,
+                    text: "(no saved sessions)".to_string(),
+                    ..Default::default()
+                });
+            } else {
+                scenario.open_picker(Picker {
+                    kind: PickerKind::Sessions,
+                    rows: rows
+                        .into_iter()
+                        .map(|r| PickerRow {
+                            label: clean(format!(
+                                "{}  ·  {}  ·  {} turns{}",
+                                r.id,
+                                r.model,
+                                r.turns,
+                                if r.current { "  (this session)" } else { "" }
+                            )),
+                            value: r.id,
+                            detail: clean(format!("updated {}", r.updated_at)),
+                        })
+                        .collect(),
+                    sel: 0,
+                });
+            }
+        }
+        Msg::ModelsListFailed(error) | Msg::SessionsListFailed(error) => {
+            scenario.transcript.push(TranscriptLine {
+                kind: LineKind::System,
+                text: clean(error),
+                ..Default::default()
+            });
+        }
         Msg::Status(text) if text.starts_with("┃ ") => {
             // Streamed tool output (no call id): the newest tape.
             scenario.push_tape_line("", text.trim_start_matches("┃ ").to_string());
@@ -2623,6 +2821,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.ledger_ms = Some(now_ms);
         }
         Msg::ModelChanged(m) => {
+            scenario.dismiss_picker();
             scenario.model = m.clone();
             scenario.model_id = m;
         }
@@ -2642,6 +2841,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             session_id,
             priced,
         } => {
+            scenario.dismiss_picker();
             scenario.invalidate_cost_qualification();
             scenario.invalidate_context_sample();
             if scenario.session_id != session_id {
@@ -2774,6 +2974,18 @@ pub fn draw_with_hits(
                     opened_ms: tui.fx.overlay_ms,
                 })
         }
+        Some(Overlay::ModelPicker) | Some(Overlay::SessionPicker) => {
+            // The rows the reducer loaded; no rows, no overlay.
+            scenario.picker.as_ref().map(|p| Ov::Picker {
+                title: match p.kind {
+                    PickerKind::Models => "MODELS",
+                    PickerKind::Sessions => "SESSIONS",
+                },
+                rows: &p.rows,
+                sel: p.sel,
+                opened_ms: tui.fx.overlay_ms,
+            })
+        }
         None => None,
     };
     super::shell::draw_with_profile(
@@ -2861,8 +3073,59 @@ enum MouseOutcome {
     Completion(usize),
     /// A click on row `i` of the command palette.
     Palette(usize),
+    /// A click on the actual row of the model/session picker.
+    Picker(usize),
     /// A click on the tab of the Terminal's tape `i`.
     Tape(usize),
+}
+
+#[derive(Debug, Clone)]
+struct PickerClick {
+    binding: Option<crate::worker::SessionBinding>,
+    kind: PickerKind,
+    index: usize,
+}
+
+fn capture_picker_click(
+    scenario: &Scenario,
+    overlay: Option<Overlay>,
+    index: usize,
+) -> Option<PickerClick> {
+    let kind = match overlay {
+        Some(Overlay::ModelPicker) => PickerKind::Models,
+        Some(Overlay::SessionPicker) => PickerKind::Sessions,
+        _ => return None,
+    };
+    let picker = scenario.picker.as_ref()?;
+    if picker.kind != kind || index >= picker.rows.len() || scenario.approval_call_id.is_some() {
+        return None;
+    }
+    Some(PickerClick {
+        binding: scenario.session_binding().cloned(),
+        kind,
+        index,
+    })
+}
+
+fn picker_click_key(
+    click: PickerClick,
+    scenario: &mut Scenario,
+    overlay: Option<Overlay>,
+    now_ms: u64,
+) -> Option<crossterm::event::KeyEvent> {
+    // A bus update can close the picker between the click and the next
+    // input iteration. Never let that deferred Enter reach the composer.
+    if scenario.session_binding() != click.binding.as_ref()
+        || card_just_appeared(scenario, now_ms)
+        || capture_picker_click(scenario, overlay, click.index)?.kind != click.kind
+    {
+        return None;
+    }
+    scenario.picker.as_mut()?.sel = click.index;
+    Some(crossterm::event::KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ))
 }
 
 /// The mouse, with every gesture bound to the panel under the pointer
@@ -2901,6 +3164,7 @@ fn handle_mouse(
                     }
                     Some(Click::Key(code, mods)) => MouseOutcome::Key(KeyEvent::new(code, mods)),
                     Some(Click::Palette(i)) => MouseOutcome::Palette(i),
+                    Some(Click::Picker(i)) => MouseOutcome::Picker(i),
                     _ => MouseOutcome::None,
                 };
             }
@@ -2971,7 +3235,7 @@ fn handle_mouse(
                     return MouseOutcome::None;
                 }
                 // Modal-only regions: nothing is open, nothing to do.
-                Some(Click::Dismiss | Click::Inert | Click::Palette(_)) => {
+                Some(Click::Dismiss | Click::Inert | Click::Palette(_) | Click::Picker(_)) => {
                     return MouseOutcome::None;
                 }
                 // `at` never returns a text span; matched for completeness.
@@ -3220,6 +3484,8 @@ fn overlay_code(o: Option<Overlay>) -> u8 {
         Some(Overlay::Help) => 2,
         Some(Overlay::Quit) => 3,
         Some(Overlay::Diff) => 4,
+        Some(Overlay::ModelPicker) => 5,
+        Some(Overlay::SessionPicker) => 6,
     }
 }
 
@@ -5060,6 +5326,33 @@ mod composer_key_tests {
             assert!(self.rx.try_recv().is_err());
         }
 
+        fn list(&mut self, kind: PickerKind) {
+            self.type_text(match kind {
+                PickerKind::Models => "/models",
+                PickerKind::Sessions => "/sessions",
+            });
+            self.plain(KeyCode::Enter);
+            assert!(matches!(
+                (kind, self.rx.try_recv().unwrap()),
+                (PickerKind::Models, WorkerCommand::ListModels)
+                    | (PickerKind::Sessions, WorkerCommand::ListSessions)
+            ));
+        }
+
+        fn receive(&mut self, msg: crate::msg::Msg) {
+            let (bus, sender) = Bus::new();
+            sender.send(msg);
+            while let Some(msg) = bus.try_recv() {
+                reduce_runtime_message(
+                    msg,
+                    &mut self.tui,
+                    &mut self.scenario,
+                    &mut self.overlay,
+                    5_000,
+                );
+            }
+        }
+
         fn received_command(&self) -> WorkerCommand {
             let WorkerCommand::Bound { operation, command } = self.rx.try_recv().unwrap() else {
                 panic!("managed keyboard admission must be bound");
@@ -5106,6 +5399,309 @@ mod composer_key_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn listed_models(count: usize) -> crate::msg::Msg {
+        crate::msg::Msg::ModelsListed(
+            (0..count)
+                .map(|i| ("fixture".into(), format!("m{i}")))
+                .collect(),
+        )
+    }
+
+    fn requested_approval() -> crate::msg::Msg {
+        crate::msg::Msg::ApprovalRequested {
+            call_id: "picker-approval".into(),
+            tool_name: "Read".into(),
+            summary: "read fixture".into(),
+            risk: 0,
+            working_dir: ".".into(),
+        }
+    }
+
+    #[test]
+    fn model_list_bus_opens_visible_picker_and_keyboard_selects_beyond_first_page() {
+        let mut k = Keyboard::new();
+        k.list(PickerKind::Models);
+        k.receive(listed_models(30));
+        assert_eq!(k.overlay, Some(Overlay::ModelPicker));
+        assert!(
+            k.scenario.take_view_dirty(),
+            "bus activation requests a settled redraw"
+        );
+        for _ in 0..17 {
+            k.plain(KeyCode::Down);
+        }
+        for (width, height) in [(100, 24), (40, 10)] {
+            let frame = k.frame(width, height);
+            assert!(
+                frame.contains("fixture/m17"),
+                "selection stays visible at {width}x{height}"
+            );
+            assert!(
+                k.tui
+                    .hits
+                    .iter()
+                    .any(|hit| hit.click == super::super::shell::hits::Click::Picker(17))
+            );
+            assert!(
+                k.tui
+                    .hits
+                    .iter()
+                    .all(|hit| hit.rect.right() <= width && hit.rect.bottom() <= height)
+            );
+        }
+        k.no_send();
+        k.plain(KeyCode::Enter);
+        assert!(
+            matches!(k.received_command(), WorkerCommand::SetModel(value) if value == "fixture/m17")
+        );
+        assert!(k.overlay.is_none());
+        assert!(k.scenario.picker.is_none());
+    }
+
+    #[test]
+    fn session_picker_current_row_is_noop_and_mouse_resumes_the_actual_row() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut k = Keyboard::new();
+        let current = k.scenario.session_id.clone();
+        let rows = vec![
+            crate::msg::SessionsRow {
+                id: current,
+                model: "m0".into(),
+                turns: 0,
+                updated_at: "today".into(),
+                current: true,
+            },
+            crate::msg::SessionsRow {
+                id: "session-other-fixture".into(),
+                model: "m1".into(),
+                turns: 4,
+                updated_at: "yesterday".into(),
+                current: false,
+            },
+        ];
+        k.list(PickerKind::Sessions);
+        k.receive(crate::msg::Msg::SessionsListed(rows.clone()));
+        k.plain(KeyCode::Enter);
+        k.no_send();
+        assert!(k.overlay.is_none());
+        k.list(PickerKind::Sessions);
+        k.receive(crate::msg::Msg::SessionsListed(rows));
+        k.frame(100, 24);
+        let hit = k
+            .tui
+            .hits
+            .iter()
+            .find(|hit| hit.click == super::super::shell::hits::Click::Picker(1))
+            .copied()
+            .unwrap();
+        let outcome = handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.rect.x,
+                row: hit.rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut k.tui,
+            Rect::new(0, 0, 100, 24),
+            None,
+            true,
+        );
+        let MouseOutcome::Picker(index) = outcome else {
+            panic!("drawn row must be actionable");
+        };
+        let click = capture_picker_click(&k.scenario, k.overlay, index).unwrap();
+        let key = picker_click_key(click, &mut k.scenario, k.overlay, 10_000).unwrap();
+        k.key(key.code, key.modifiers);
+        assert!(
+            matches!(k.received_command(), WorkerCommand::ResumeSession(id) if id == "session-other-fixture")
+        );
+    }
+
+    #[test]
+    fn canceled_list_request_blocks_reopen_until_its_old_terminal_reply() {
+        let mut k = Keyboard::new();
+        k.list(PickerKind::Models);
+        k.plain(KeyCode::Esc);
+        assert!(!k.tui.app.arranging, "canceling the list spends Escape");
+        assert!(k.draft.is_empty());
+        k.type_text("/models");
+        k.plain(KeyCode::Enter);
+        k.no_send();
+        assert_eq!(k.scenario.pending_picker_kind(), Some(PickerKind::Models));
+        k.receive(listed_models(1));
+        assert!(k.overlay.is_none());
+        assert!(k.scenario.picker.is_none());
+        assert_eq!(k.scenario.pending_picker_kind(), None);
+        k.list(PickerKind::Models);
+        k.receive(crate::msg::Msg::ModelsListed(vec![(
+            "new".into(),
+            "fresh".into(),
+        )]));
+        assert_eq!(k.overlay, Some(Overlay::ModelPicker));
+        assert_eq!(
+            k.scenario.picker.as_ref().unwrap().rows[0].value,
+            "new/fresh"
+        );
+        k.no_send();
+    }
+
+    #[test]
+    fn late_list_cannot_replace_quit_help_approval_or_changed_identity() {
+        for blocker in ["quit", "help", "help-closed", "approval", "identity"] {
+            let mut k = Keyboard::new();
+            k.list(PickerKind::Models);
+            match blocker {
+                "quit" => k.key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                "help" => k.overlay = Some(Overlay::Help),
+                "help-closed" => {
+                    k.overlay = Some(Overlay::Help);
+                    k.plain(KeyCode::Enter);
+                }
+                "approval" => k.receive(requested_approval()),
+                "identity" => k.receive(crate::msg::Msg::Identity {
+                    model: "new-model".into(),
+                    provider: "new-provider".into(),
+                    session_prefix: "new".into(),
+                    session_id: "session-new-fixture".into(),
+                    priced: false,
+                }),
+                _ => unreachable!(),
+            }
+            let expected_overlay = k.overlay;
+            k.receive(listed_models(2));
+            assert_eq!(
+                k.overlay, expected_overlay,
+                "{blocker} has priority over an old list"
+            );
+            assert!(k.scenario.picker.is_none(), "{blocker}");
+            assert_eq!(
+                k.scenario.pending_picker_kind(),
+                None,
+                "old reply settles even when ignored"
+            );
+            k.no_send();
+        }
+    }
+
+    #[test]
+    fn list_failures_settle_requests_without_replacing_modals_or_hiding_errors() {
+        let mut k = Keyboard::new();
+        k.receive(listed_models(1));
+        assert!(k.overlay.is_none(), "unsolicited lists never open a picker");
+        k.list(PickerKind::Models);
+        k.receive(crate::msg::Msg::SessionsListed(Vec::new()));
+        k.receive(crate::msg::Msg::SessionsListFailed("unrelated".into()));
+        assert_eq!(k.scenario.pending_picker_kind(), Some(PickerKind::Models));
+        assert!(
+            !k.scenario
+                .transcript
+                .iter()
+                .any(|line| line.text == "unrelated")
+        );
+        k.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        k.receive(crate::msg::Msg::ModelsListFailed(
+            "invalid providers.toml".into(),
+        ));
+        assert_eq!(k.overlay, Some(Overlay::Quit));
+        assert_eq!(k.scenario.pending_picker_kind(), None);
+        assert!(
+            k.scenario
+                .transcript
+                .iter()
+                .any(|line| line.text == "invalid providers.toml")
+        );
+        k.plain(KeyCode::Esc);
+        k.list(PickerKind::Sessions);
+        k.receive(crate::msg::Msg::SessionsListFailed(
+            "session directory unavailable".into(),
+        ));
+        assert_eq!(k.scenario.pending_picker_kind(), None);
+        assert!(k.overlay.is_none());
+        assert!(
+            k.scenario
+                .transcript
+                .iter()
+                .any(|line| line.text == "session directory unavailable")
+        );
+        k.list(PickerKind::Models);
+        k.receive(listed_models(1));
+        assert_eq!(k.overlay, Some(Overlay::ModelPicker));
+    }
+
+    #[test]
+    fn picker_empty_stale_busy_and_approval_states_never_admit_a_selection() {
+        for state in [
+            "empty-reply",
+            "empty-rows",
+            "stale-selection",
+            "busy",
+            "approval",
+        ] {
+            let mut k = Keyboard::new();
+            k.list(PickerKind::Models);
+            k.receive(listed_models(if state == "empty-reply" { 0 } else { 2 }));
+            match state {
+                "empty-rows" => k.scenario.picker.as_mut().unwrap().rows.clear(),
+                "stale-selection" => k.scenario.picker.as_mut().unwrap().sel = usize::MAX,
+                "busy" => k.scenario.turn_live = true,
+                "approval" => k.receive(requested_approval()),
+                _ => {}
+            }
+            k.plain(KeyCode::Enter);
+            k.no_send();
+            assert!(k.scenario.pending_foreground().is_none(), "{state}");
+            assert!(k.scenario.picker.is_none(), "{state}");
+            assert!(k.overlay.is_none(), "{state}");
+            if state == "approval" {
+                assert!(k.scenario.approval_call_id.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_picker_click_cannot_submit_a_draft_after_modal_or_identity_change() {
+        for blocker in ["quit", "approval", "identity"] {
+            let mut k = Keyboard::new();
+            k.list(PickerKind::Models);
+            k.receive(listed_models(2));
+            k.draft = "unfinished prompt".into();
+            let click = capture_picker_click(&k.scenario, k.overlay, 1).unwrap();
+            match blocker {
+                "quit" => k.key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                "approval" => k.receive(requested_approval()),
+                "identity" => k.receive(crate::msg::Msg::Identity {
+                    model: "new".into(),
+                    provider: "fixture".into(),
+                    session_prefix: "new".into(),
+                    session_id: "session-new-fixture".into(),
+                    priced: false,
+                }),
+                _ => unreachable!(),
+            }
+            assert!(
+                picker_click_key(click, &mut k.scenario, k.overlay, 10_000).is_none(),
+                "{blocker}"
+            );
+            assert_eq!(k.draft, "unfinished prompt");
+            k.no_send();
+        }
+    }
+
+    #[test]
+    fn unavailable_worker_does_not_leave_a_list_request_stuck() {
+        let mut k = Keyboard::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let mut toast = None;
+        request_picker(&mut k.scenario, &tx, PickerKind::Models, &mut toast, 0);
+        assert_eq!(k.scenario.pending_picker_kind(), None);
+        assert!(k.scenario.picker.is_none());
+        assert_eq!(toast.unwrap().text, "worker is unavailable");
+        k.list(PickerKind::Models);
+        k.receive(listed_models(1));
+        assert_eq!(k.overlay, Some(Overlay::ModelPicker));
     }
 
     #[test]
@@ -5560,6 +6156,63 @@ fn apply_profile_preferences(
     };
     tui.profile = profile;
 }
+fn reduce_runtime_message(
+    msg: crate::msg::Msg,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    overlay: &mut Option<Overlay>,
+    now: u64,
+) -> Option<String> {
+    use crate::msg::Msg;
+    let previous_overlay = *overlay;
+    let picker_overlay = matches!(overlay, Some(Overlay::ModelPicker | Overlay::SessionPicker));
+    if (overlay.is_some() && !picker_overlay)
+        || tui.app.picker.is_some()
+        || tui.app.arranging
+        || s.approval_call_id.is_some()
+    {
+        s.dismiss_picker();
+    }
+    if picker_overlay && s.picker.is_none() {
+        *overlay = None;
+        s.frontend.dirty = true;
+    }
+    let reply = match &msg {
+        Msg::ModelsListed(_) => Some((PickerKind::Models, true)),
+        Msg::SessionsListed(_) => Some((PickerKind::Sessions, true)),
+        Msg::ModelsListFailed(_) => Some((PickerKind::Models, false)),
+        Msg::SessionsListFailed(_) => Some((PickerKind::Sessions, false)),
+        _ => None,
+    };
+    if let Some((kind, success)) = reply {
+        let expected = s.pending_picker_kind() == Some(kind);
+        let eligible = s.finish_picker_request(kind);
+        if !expected || (success && !eligible) {
+            return None;
+        }
+    }
+    let result = reduce_frontend_message(msg, tui, s, now);
+    if s.approval_call_id.is_some() {
+        s.dismiss_picker();
+    }
+    if let Some((kind, true)) = reply
+        && s.picker.is_some()
+    {
+        *overlay = Some(match kind {
+            PickerKind::Models => Overlay::ModelPicker,
+            PickerKind::Sessions => Overlay::SessionPicker,
+        });
+        tui.fx.overlay_ms = now;
+    }
+    if picker_overlay && s.picker.is_none() {
+        *overlay = None;
+    }
+    if previous_overlay != *overlay {
+        s.frontend.dirty = true;
+    }
+    result
+}
+
 fn reduce_frontend_message(
     msg: crate::msg::Msg,
     tui: &mut Tui,

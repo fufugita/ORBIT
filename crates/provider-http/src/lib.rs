@@ -100,16 +100,22 @@ fn shared_client(key: ClientKey) -> Result<reqwest::Client, TransportError> {
         .map_err(|_| TransportError::Transport("provider client pool lock poisoned".into()))?;
     pool.get_or_build(key.clone(), || {
         tls::ensure_crypto_provider();
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_millis(key.connect_timeout_ms));
-        if let ClientMode::Tls(policy) = &key.mode {
-            let config = tls::client_config(policy)?;
-            let config = std::sync::Arc::try_unwrap(config).unwrap_or_else(|arc| (*arc).clone());
-            builder = builder.use_preconfigured_tls(config);
-        }
+        let default_policy = orbit_adapter::types::TlsPinPolicy {
+            webpki: true,
+            spki_sha256: None,
+        };
+        let policy = match &key.mode {
+            ClientMode::Plain => &default_policy,
+            ClientMode::Tls(policy) => policy,
+        };
+        let config = tls::client_config(policy)?;
+        let config = std::sync::Arc::try_unwrap(config).unwrap_or_else(|arc| (*arc).clone());
         builder
+            .use_preconfigured_tls(config)
             .build()
             .map_err(|error| TransportError::Transport(format!("client build: {error}")))
     })
@@ -127,7 +133,7 @@ pub fn shared_tls_client(
 }
 
 /// Shared default-policy client with the normal ten-second connection budget.
-/// Certificate/root behavior is unchanged; this helper also serves Anthropic HTTPS.
+/// Uses native certificate roots, including for Anthropic HTTPS.
 pub fn shared_plain_client() -> Result<reqwest::Client, TransportError> {
     shared_client(ClientKey {
         mode: ClientMode::Plain,

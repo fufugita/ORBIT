@@ -19,6 +19,9 @@ pub struct SessionFile {
     pub model: String,
     pub gate: String,
     pub provider: String,
+    /// Canonical tool workspace. Missing metadata is an unbound legacy session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<EffortSetting>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,6 +61,7 @@ impl SessionFile {
             model: model.into(),
             gate: gate.into(),
             provider: provider.into(),
+            workspace: None,
             effort: None,
             selection_origin: None,
             transcript: transcript.to_vec(),
@@ -67,6 +71,43 @@ impl SessionFile {
             cost_microcents,
             accounting_watermark: None,
             updated_at: crate::timestamp_now(),
+        }
+    }
+
+    /// Bind a newly constructed snapshot. Persisted legacy adoption is separate.
+    pub fn bind_workspace(&mut self, workspace: &Path) -> Result<(), SessionLeaseError> {
+        let workspace = canonical_workspace(workspace)?;
+        if self
+            .workspace
+            .as_ref()
+            .is_some_and(|saved| saved != &workspace)
+        {
+            return Err(SessionLeaseError::InvalidData(
+                "session workspace cannot be rebound".into(),
+            ));
+        }
+        self.workspace = Some(workspace);
+        Ok(())
+    }
+
+    pub fn in_workspace(mut self, workspace: &Path) -> Result<Self, SessionLeaseError> {
+        self.bind_workspace(workspace)?;
+        Ok(self)
+    }
+
+    /// Admit execution only in the directory whose tools own this history.
+    pub fn require_workspace(&self, workspace: &Path) -> Result<(), SessionLeaseError> {
+        let workspace = canonical_workspace(workspace)?;
+        match &self.workspace {
+            Some(saved) if saved == &workspace => Ok(()),
+            Some(_) => Err(SessionLeaseError::InvalidData(
+                "session belongs to another workspace; open its original directory to resume"
+                    .into(),
+            )),
+            None => Err(SessionLeaseError::InvalidData(format!(
+                "session workspace is unknown; inspect it first, then run orbit --resume {} --adopt-workspace in the intended directory",
+                self.session_id,
+            ))),
         }
     }
 
@@ -80,6 +121,63 @@ impl SessionFile {
         self.selection_origin = Some(origin);
         self
     }
+}
+
+/// Resolve an existing directory once; never change the process working directory.
+pub fn canonical_workspace(workspace: &Path) -> Result<PathBuf, SessionLeaseError> {
+    let canonical = std::fs::canonicalize(workspace)
+        .map_err(|_| SessionLeaseError::InvalidData("workspace directory is unavailable".into()))?;
+    if !canonical.is_dir() {
+        return Err(SessionLeaseError::InvalidData(
+            "workspace must be an existing directory".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+pub fn current_workspace() -> Result<PathBuf, SessionLeaseError> {
+    canonical_workspace(
+        &std::env::current_dir().map_err(|_| {
+            SessionLeaseError::InvalidData("workspace directory is unavailable".into())
+        })?,
+    )
+}
+
+/// Checked read-only preflight, before creating a candidate lease or changing live state.
+fn read_workspace_session(home: &Path, id: &str) -> Result<SessionFile, SessionLeaseError> {
+    let id = id.strip_suffix(".json").unwrap_or(id);
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(SessionLeaseError::InvalidIdentity(
+            "invalid session identity".into(),
+        ));
+    }
+    let directory = crate::customization::Directory::open(&sessions_dir(home), true)
+        .map_err(|error| SessionLeaseError::UnsafePath(error.to_string()))?;
+    let bytes = crate::customization::read_regular(
+        &directory
+            .io()
+            .map_err(|error| SessionLeaseError::UnsafePath(error.to_string()))?
+            .join(format!("{id}.json")),
+        64 * 1024 * 1024,
+        true,
+    )
+    .map_err(|error| SessionLeaseError::Io(error.to_string()))?;
+    let saved: SessionFile = serde_json::from_slice(&bytes)
+        .map_err(|_| SessionLeaseError::InvalidData("invalid saved session".into()))?;
+    if saved.session_id != id || saved.schema != "orbit.session/v1" {
+        return Err(SessionLeaseError::InvalidData(
+            "saved session identity or schema mismatch".into(),
+        ));
+    }
+    directory
+        .check()
+        .map_err(|error| SessionLeaseError::UnsafePath(error.to_string()))?;
+    Ok(saved)
 }
 
 /// Unknown legacy or external provenance retains the saved identity as a pin.
@@ -172,6 +270,7 @@ pub enum SessionLeaseError {
 pub struct SessionLease {
     session_id: String,
     kind: String,
+    workspace_binding: std::sync::Mutex<Option<Option<PathBuf>>>,
     #[cfg(unix)]
     storage: leased_storage::Storage,
 }
@@ -340,6 +439,7 @@ impl SessionLease {
             Ok(Self {
                 session_id: id.to_owned(),
                 kind: kind.to_owned(),
+                workspace_binding: std::sync::Mutex::new(None),
                 storage: leased_storage::Storage::acquire(home, id, kind)?,
             })
         }
@@ -362,6 +462,150 @@ impl SessionLease {
         let lease = Self::acquire(home, id, kind)?;
         let saved = lease.load()?;
         Ok((lease, saved))
+    }
+
+    /// Preflight before lease acquisition, then recheck under exclusive ownership.
+    pub fn acquire_for_workspace(
+        home: &Path,
+        id: &str,
+        kind: &str,
+        workspace: &Path,
+    ) -> Result<(Self, SessionFile), SessionLeaseError> {
+        read_workspace_session(home, id)?.require_workspace(workspace)?;
+        let (lease, saved) = Self::acquire_and_load(home, id, kind)?;
+        saved.require_workspace(workspace)?;
+        Ok((lease, saved))
+    }
+
+    /// A standalone frontend may create an absent ID, but never adopt existing history.
+    pub fn acquire_new_or_for_workspace(
+        home: &Path,
+        id: &str,
+        kind: &str,
+        workspace: &Path,
+    ) -> Result<Self, SessionLeaseError> {
+        let workspace = canonical_workspace(workspace)?;
+        let id = id.strip_suffix(".json").unwrap_or(id);
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(SessionLeaseError::InvalidIdentity(
+                "invalid session identity".into(),
+            ));
+        }
+        let path =
+            sessions_dir(home).join(format!("{}.json", id.strip_suffix(".json").unwrap_or(id)));
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Self::acquire_for_workspace(home, id, kind, &workspace)
+                    .map(|(lease, _)| lease);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SessionLeaseError::Io(error.to_string())),
+        }
+        let lease = Self::acquire(home, id, kind)?;
+        if let Some(saved) = lease.load_optional()? {
+            saved.require_workspace(&workspace)?;
+        }
+        Ok(lease)
+    }
+
+    /// Only explicit startup adoption may acquire an unbound legacy snapshot.
+    pub fn acquire_for_adoption(
+        home: &Path,
+        id: &str,
+        kind: &str,
+    ) -> Result<(Self, SessionFile), SessionLeaseError> {
+        let check = |saved: &SessionFile| {
+            if saved.workspace.is_some() {
+                Err(SessionLeaseError::InvalidData("only an unbound legacy session can be adopted; bound sessions cannot be rebound".into()))
+            } else {
+                Ok(())
+            }
+        };
+        check(&read_workspace_session(home, id)?)?;
+        let (lease, saved) = Self::acquire_and_load(home, id, kind)?;
+        check(&saved)?;
+        Ok((lease, saved))
+    }
+
+    /// Explicit, stable-source legacy binding. Ordinary saves cannot adopt.
+    pub fn adopt_workspace(
+        &self,
+        expected: &SessionFile,
+        workspace: &Path,
+    ) -> Result<SessionFile, SessionLeaseError> {
+        let workspace = canonical_workspace(workspace)?;
+        self.validate_session(expected)?;
+        self.remember_workspace(&expected.workspace)?;
+        if expected.workspace.is_some() {
+            return Err(SessionLeaseError::InvalidData(
+                "only an unbound legacy session can be adopted".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let captured = self.capture_for_recovery()?;
+            let current: SessionFile = serde_json::from_slice(captured.bytes())
+                .map_err(|_| SessionLeaseError::InvalidData("invalid saved session".into()))?;
+            let current_value = serde_json::to_value(&current)
+                .map_err(|error| SessionLeaseError::InvalidData(error.to_string()))?;
+            let expected_value = serde_json::to_value(expected)
+                .map_err(|error| SessionLeaseError::InvalidData(error.to_string()))?;
+            if current_value != expected_value {
+                return Err(SessionLeaseError::InvalidData(
+                    "session changed before workspace adoption".into(),
+                ));
+            }
+            let mut value: serde_json::Value = serde_json::from_slice(captured.bytes())
+                .map_err(|_| SessionLeaseError::InvalidData("invalid saved session".into()))?;
+            value
+                .as_object_mut()
+                .ok_or_else(|| SessionLeaseError::InvalidData("invalid saved session".into()))?
+                .insert(
+                    "workspace".into(),
+                    serde_json::to_value(&workspace)
+                        .map_err(|error| SessionLeaseError::InvalidData(error.to_string()))?,
+                );
+            let raw = serde_json::to_vec_pretty(&value)
+                .map_err(|error| SessionLeaseError::InvalidData(error.to_string()))?;
+            self.storage
+                .save_matching_snapshot(&self.session_id, &raw, &captured.snapshot)?;
+            let adopted: SessionFile = serde_json::from_value(value)
+                .map_err(|error| SessionLeaseError::InvalidData(error.to_string()))?;
+            adopted.require_workspace(&workspace)?;
+            *self.workspace_binding.lock().map_err(|_| {
+                SessionLeaseError::PublicationUncertain(
+                    "workspace binding state unavailable".into(),
+                )
+            })? = Some(adopted.workspace.clone());
+            Ok(adopted)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(SessionLeaseError::Io(
+                "workspace adoption requires Unix ownership".into(),
+            ))
+        }
+    }
+
+    fn remember_workspace(&self, workspace: &Option<PathBuf>) -> Result<(), SessionLeaseError> {
+        let mut binding = self.workspace_binding.lock().map_err(|_| {
+            SessionLeaseError::InvalidData("session workspace state unavailable".into())
+        })?;
+        if binding
+            .as_ref()
+            .is_some_and(|original| original != workspace)
+        {
+            return Err(SessionLeaseError::InvalidData(
+                "session workspace changed while owned".into(),
+            ));
+        }
+        *binding = Some(workspace.clone());
+        Ok(())
     }
 
     pub fn session_id(&self) -> &str {
@@ -470,6 +714,7 @@ impl SessionLease {
             let session: SessionFile = serde_json::from_slice(&raw)
                 .map_err(|e| SessionLeaseError::InvalidData(e.to_string()))?;
             self.validate_session(&session)?;
+            self.remember_workspace(&session.workspace)?;
             Ok(session)
         }
         #[cfg(not(unix))]
@@ -491,6 +736,7 @@ impl SessionLease {
                     let session: SessionFile = serde_json::from_slice(&raw)
                         .map_err(|e| SessionLeaseError::InvalidData(e.to_string()))?;
                     self.validate_session(&session)?;
+                    self.remember_workspace(&session.workspace)?;
                     Ok(session)
                 })
                 .transpose()
@@ -507,7 +753,34 @@ impl SessionLease {
         self.validate_session(session)?;
         #[cfg(unix)]
         {
-            let raw = serde_json::to_vec_pretty(session)
+            let mut candidate = session.clone();
+            self.load_optional()?;
+            let original = self
+                .workspace_binding
+                .lock()
+                .map_err(|_| {
+                    SessionLeaseError::InvalidData("session workspace state unavailable".into())
+                })?
+                .clone();
+            if let Some(original) = original {
+                match (&original, &candidate.workspace) {
+                    (Some(original), Some(next)) if original != next => {
+                        return Err(SessionLeaseError::InvalidData(
+                            "session workspace cannot be rebound".into(),
+                        ));
+                    }
+                    (Some(original), None) => candidate.workspace = Some(original.clone()),
+                    (None, Some(_)) => {
+                        return Err(SessionLeaseError::InvalidData(
+                            "legacy workspace requires explicit adoption".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            self.validate_session(&candidate)?;
+            self.remember_workspace(&candidate.workspace)?;
+            let raw = serde_json::to_vec_pretty(&candidate)
                 .map_err(|e| SessionLeaseError::InvalidData(e.to_string()))?;
             self.storage.save(&self.session_id, &raw)
         }
@@ -522,6 +795,7 @@ impl SessionLease {
     /// Publish a new snapshot without replacing any existing target.
     pub fn save_if_absent(&self, session: &SessionFile) -> Result<(), SessionLeaseError> {
         self.validate_session(session)?;
+        self.remember_workspace(&session.workspace)?;
         #[cfg(unix)]
         {
             let raw = serde_json::to_vec_pretty(session)
@@ -545,6 +819,19 @@ impl SessionLease {
         if session.schema != "orbit.session/v1" {
             return Err(SessionLeaseError::InvalidData(
                 "unsupported session schema".into(),
+            ));
+        }
+        if session.workspace.as_ref().is_some_and(|workspace| {
+            !workspace.is_absolute()
+                || workspace.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                })
+        }) {
+            return Err(SessionLeaseError::InvalidData(
+                "saved workspace is not canonical".into(),
             ));
         }
         if let Some(watermark) = &session.accounting_watermark {
@@ -1190,11 +1477,20 @@ mod leased_storage {
         }
 
         pub(super) fn save(&self, id: &str, raw: &[u8]) -> Result<(), SessionLeaseError> {
-            self.publish_snapshot(id, raw, false)
+            self.publish_snapshot(id, raw, false, None)
         }
 
         pub(super) fn save_if_absent(&self, id: &str, raw: &[u8]) -> Result<(), SessionLeaseError> {
-            self.publish_snapshot(id, raw, true)
+            self.publish_snapshot(id, raw, true, None)
+        }
+
+        pub(super) fn save_matching_snapshot(
+            &self,
+            id: &str,
+            raw: &[u8],
+            expected: &RecoveryFile,
+        ) -> Result<(), SessionLeaseError> {
+            self.publish_snapshot(id, raw, false, Some(expected))
         }
 
         fn publish_snapshot(
@@ -1202,6 +1498,7 @@ mod leased_storage {
             id: &str,
             raw: &[u8],
             create_only: bool,
+            expected: Option<&RecoveryFile>,
         ) -> Result<(), SessionLeaseError> {
             if raw.len() as u64 > MAX_SESSION_BYTES {
                 return Err(SessionLeaseError::InvalidData(
@@ -1239,6 +1536,9 @@ mod leased_storage {
                     return Err(SessionLeaseError::Io(
                         "injected pre-publication failure".into(),
                     ));
+                }
+                if let Some(expected) = expected {
+                    self.verify_recovery_file(id, expected)?;
                 }
                 let temporary = name(OsStr::new(&temporary))?;
                 let target = name(OsStr::new(&target))?;
@@ -1400,34 +1700,11 @@ mod lease_durability_tests {
     }
 }
 
-/// Save a session (rewrite the JSON file; append-safe by write-temp+rename).
-///
-/// Security posture (DR-06 §1.2, same as the ledger writer): sessions dir
-/// 0700, session files 0600. A session JSON carries the full transcript —
-/// prompts, tool results, pasted text — and must not leak to local users
-/// through the default umask. The modes are re-forced on every save so a
-/// tree left loose by an older build is corrected on first touch.
-pub fn save_session(home: &Path, s: &SessionFile) -> Result<(), String> {
-    let dir = sessions_dir(home);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {dir:?}: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("chmod 0700 {dir:?}: {e}"))?;
-    }
-    let json = serde_json::to_string_pretty(s).map_err(|e| format!("serialize: {e}"))?;
-    let path = dir.join(format!("{}.json", s.session_id));
-    let tmp = dir.join(format!(".{}.tmp", s.session_id));
-    std::fs::write(&tmp, json).map_err(|e| format!("write {tmp:?}: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename -> {path:?}: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod 0600 {path:?}: {e}"))?;
-    }
-    Ok(())
+/// Save through the same owned storage and immutable workspace policy as live sessions.
+pub fn save_session(home: &Path, session: &SessionFile) -> Result<(), String> {
+    SessionLease::acquire(home, &session.session_id, "session-save")
+        .and_then(|lease| lease.save(session))
+        .map_err(|error| error.to_string())
 }
 
 /// Load a session by id (without the `.json` suffix, or with).
@@ -1442,7 +1719,10 @@ pub fn load_session(home: &Path, session_id: &str) -> Result<SessionFile, String
 /// (roadmap §Sessions: `--fork-session` / `/branch`). The original is
 /// untouched; the fork carries its own identity and a fresh updated_at.
 pub fn fork_session(home: &Path, session_id: &str) -> Result<SessionFile, String> {
-    let mut src = load_session(home, session_id)?;
+    let workspace = current_workspace().map_err(|error| error.to_string())?;
+    let (source_lease, mut src) =
+        SessionLease::acquire_for_workspace(home, session_id, "session-fork", &workspace)
+            .map_err(|error| error.to_string())?;
     let new_id = orbit_gateway::new_session_id();
     src.session_id = new_id.clone();
     src.accounting_watermark = None;
@@ -1450,13 +1730,23 @@ pub fn fork_session(home: &Path, session_id: &str) -> Result<SessionFile, String
     // The fork's JSONL transcript (if one exists) is copied too, so
     // `--resume <fork>` and the TUI's event-sourced view agree with the
     // JSON file.
-    let jsonl_src = home.join("projects").join(format!("{session_id}.jsonl"));
+    let jsonl_src = home
+        .join("projects")
+        .join(format!("{}.jsonl", source_lease.session_id()));
     if jsonl_src.exists() {
         let jsonl_dst = home.join("projects").join(format!("{new_id}.jsonl"));
         std::fs::copy(&jsonl_src, &jsonl_dst).map_err(|e| format!("copy transcript: {e}"))?;
     }
     save_session(home, &src)?;
     Ok(src)
+}
+
+/// The latest eligible history, excluding foreign and unbound legacy sessions.
+pub fn latest_for_workspace(home: &Path, workspace: &Path) -> Result<Option<SessionFile>, String> {
+    let workspace = canonical_workspace(workspace).map_err(|error| error.to_string())?;
+    Ok(list_sessions(home)?
+        .into_iter()
+        .find(|saved| saved.require_workspace(&workspace).is_ok()))
 }
 
 /// List persisted sessions, most-recently-updated first.
@@ -1493,7 +1783,13 @@ mod tests {
     fn test_home(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("orbit-sessions-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir).unwrap();
         dir
     }
 
@@ -1530,6 +1826,8 @@ mod tests {
             3,
             42,
         )
+        .in_workspace(&current_workspace().unwrap())
+        .unwrap()
     }
 
     #[test]
@@ -1630,8 +1928,7 @@ mod tests {
 
     #[test]
     fn fork_copies_history_under_a_new_id_and_leaves_the_original() {
-        let home = std::env::temp_dir().join(format!("orbit-fork-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&home);
+        let home = test_home("fork-history");
         let src = sample("session-src");
         save_session(&home, &src).unwrap();
 
@@ -1639,6 +1936,11 @@ mod tests {
         assert_ne!(fork.session_id, "session-src");
         assert_eq!(fork.transcript.len(), src.transcript.len());
         assert_eq!(fork.model, src.model);
+        assert_eq!(fork.workspace, src.workspace);
+        assert_eq!(
+            load_session(&home, &fork.session_id).unwrap().workspace,
+            src.workspace
+        );
 
         // The original is untouched and both load independently.
         let back = load_session(&home, "session-src").unwrap();
@@ -1686,8 +1988,8 @@ mod tests {
 
     #[test]
     fn fork_copies_the_jsonl_transcript_when_one_exists() {
-        let home = std::env::temp_dir().join(format!("orbit-fork2-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(home.join("projects"));
+        let home = test_home("fork-jsonl");
+        std::fs::create_dir_all(home.join("projects")).unwrap();
         // No JSON session file: fork reports the failure honestly.
         assert!(fork_session(&home, "session-jsonl").is_err());
         // With one, the JSONL sidecar is copied alongside.
@@ -1927,7 +2229,11 @@ mod recovery_capture_tests {
         let error = lease.capture_for_recovery().err().unwrap().to_string();
         assert!(error.len() <= 512 && !error.contains("INVALID_RECOVERY_BODY"));
         assert_eq!(stamp(&home.snapshot()), before);
-        lease.save(&saved()).unwrap();
+        let malformed = std::fs::read(home.snapshot()).unwrap();
+        assert!(lease.save(&saved()).is_err());
+        assert_eq!(stamp(&home.snapshot()), before);
+        assert_eq!(std::fs::read(home.snapshot()).unwrap(), malformed);
+        write(&home.snapshot(), &serde_json::to_vec(&saved()).unwrap());
         std::fs::set_permissions(home.snapshot(), std::fs::Permissions::from_mode(0o644)).unwrap();
         let before = stamp(&home.snapshot());
         assert!(lease.capture_for_recovery().is_err());

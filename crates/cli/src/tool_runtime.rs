@@ -5442,6 +5442,15 @@ mod agent_lifecycle_tests {
             std::fs::write(home.join("providers.toml"), format!(
                 "[[provider]]\nname='mock'\nurl='{}'\n[[provider.models]]\nid='mock-notools'\n[[provider.models]]\nid='override-notools'\n[[provider.models]]\nid='role-notools'\n[[provider.models]]\nid='mock-bash'\n", self.gate
             )).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    home.join("providers.toml"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
         }
     }
 

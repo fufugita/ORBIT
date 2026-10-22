@@ -804,6 +804,7 @@ mod recovery_baselines {
             60,
         )
         .with_selection_origin(SelectionOrigin::SavedExplicit);
+        saved.bind_workspace(&f.workspace).unwrap();
         let lease = SessionLease::acquire(&f.home, SESSION, "recovery-seed").unwrap();
         lease.save(&saved).unwrap();
         let accounting = prepare_root(&lease, &mut saved, RootOrigin::RestoredOrLegacy).unwrap();

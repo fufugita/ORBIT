@@ -16,7 +16,7 @@ use daemon::{OwnerAction, OwnerConfig, OwnerRuntime, TurnState, UnixServer};
 use sessions::SessionLease;
 use std::fs;
 use std::io::{Cursor, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -54,6 +54,11 @@ impl Fixture {
             serde_json::from_slice(&fs::read(root.join("ready.json")).unwrap()).unwrap();
         let gate = ready["gate"].as_str().unwrap().to_owned();
         fs::write(root.join("providers.toml"),format!("[[provider]]\nname=\"fixture\"\nurl={gate:?}\n[[provider.models]]\nid=\"model-a\"\nsupported_efforts=[\"low\"]\ndefault_effort=\"low\"\n")).unwrap();
+        fs::set_permissions(
+            root.join("providers.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let turn = tui_worker::TuiTurnConfig {
             home: root.clone(),
             session_id: "owned".into(),

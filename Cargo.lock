@@ -2666,6 +2666,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "toml 0.8.23",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
@@ -2818,6 +2819,7 @@ dependencies = [
  "orbit-adapter",
  "orbit-mock-provider",
  "orbit-tools",
+ "rcgen",
  "reqwest",
  "rustls",
  "rustls-native-certs",
@@ -2826,6 +2828,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "x509-parser",
 ]
 
