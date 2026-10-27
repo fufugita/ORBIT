@@ -172,6 +172,7 @@ impl ToolExecutor for Executor {
 
 fn config(provider: &Provider, kind: ProviderKind) -> TurnConfig {
     TurnConfig {
+        billing: None,
         provider_id: "fixture".into(),
         gate: provider.url.clone(),
         model: "fixture-model".into(),

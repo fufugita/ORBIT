@@ -451,18 +451,21 @@ impl AsyncProviderAdapter for LegacyOnly {
         }
         Ok(Box::pin(futures::stream::iter([
             Ok(ProviderStreamEvent {
+                usage_observation: None,
                 sequence: 0,
                 event: ProviderEventKind::ResponseStarted {
                     upstream_request_id: None,
                 },
             }),
             Ok(ProviderStreamEvent {
+                usage_observation: None,
                 sequence: 1,
                 event: ProviderEventKind::TextDelta {
                     bytes: CANARY.as_bytes().to_vec(),
                 },
             }),
             Ok(ProviderStreamEvent {
+                usage_observation: None,
                 sequence: 2,
                 event: ProviderEventKind::Finished {
                     finish_reason: Some("stop".into()),

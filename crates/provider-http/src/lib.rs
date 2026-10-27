@@ -271,6 +271,30 @@ pub(crate) fn reqwest_error(
     }
 }
 
+/// Classify an error while sending a request and awaiting its response headers.
+/// Once a request may have reached the provider, an automatic retry could
+/// repeat its work; only a proven connection-establishment failure is safe to
+/// keep in the retryable transport class.
+pub(crate) fn reqwest_dispatch_error(
+    error: reqwest::Error,
+    phase: &str,
+) -> orbit_adapter::error::AdapterError {
+    use orbit_adapter::error::AdapterError;
+    if error.is_connect() {
+        reqwest_error(error, phase)
+    } else {
+        AdapterError::DispatchAmbiguous(format!(
+            "{phase} failed after request delivery may have begun (E0412)"
+        ))
+    }
+}
+
+pub(crate) fn dispatch_deadline_error(phase: &str) -> orbit_adapter::error::AdapterError {
+    orbit_adapter::error::AdapterError::DispatchAmbiguous(format!(
+        "{phase} deadline expired after request delivery may have begun (E0412)"
+    ))
+}
+
 #[cfg(test)]
 mod e6_pool_tests {
     use super::*;

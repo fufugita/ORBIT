@@ -2,7 +2,7 @@
 #[path = "provider_login.rs"]
 pub mod provider_login;
 
-use crate::config::{ModelEntry, Pricing, ProviderConfig, ProvidersConfig};
+use crate::config::{ModelEntry, ProviderConfig, ProvidersConfig};
 use crate::customization::{Directory, Error as SetupError, Lock};
 use crate::provider_discovery::{
     DiscoveredCatalog, DiscoveredDetails, DiscoveredModel, DiscoveryCompleteness,
@@ -13,7 +13,8 @@ use crate::setup::{self, SetupPlan, SetupReceipt, SetupRequest};
 use orbit_adapter::SecretBytes;
 use orbit_adapter::provider_credentials::{
     ExpectedRevision, MAX_PROVIDER_KEY_BYTES, ProviderAuthIdentity, ProviderCredentialError,
-    ProviderCredentialSource, ProviderCredentialStatus, ProviderCredentialStore,
+    ProviderCredentialRevision, ProviderCredentialSource, ProviderCredentialStatus,
+    ProviderCredentialStore,
 };
 use orbit_provider_http::CancelToken;
 use serde::Serialize;
@@ -44,6 +45,10 @@ pub enum OnboardingError {
         "Publication may have committed; private recovery state was retained. Inspect setup status before retrying"
     )]
     PublicationUncertain,
+    #[error(
+        "Setup did not complete; a new private credential remains referenced or cleanup could not be verified, so it was retained. Inspect provider configuration before retrying"
+    )]
+    CredentialCleanupPending,
     #[error(transparent)]
     Login(#[from] provider_login::LoginError),
 }
@@ -53,6 +58,7 @@ impl OnboardingError {
         match self {
             Self::Canceled => "ORBIT-E1104",
             Self::Stale => "ORBIT-E1103",
+            Self::CredentialCleanupPending => "ORBIT-E1106",
             Self::PublicationUncertain
             | Self::Credential(ProviderCredentialError::PublicationUncertain)
             | Self::Setup(SetupError::PublicationUncertain(_)) => "ORBIT-E1105",
@@ -61,11 +67,138 @@ impl OnboardingError {
     }
 }
 
+/// A display label is never used as an execution identity.
+#[derive(Clone, Copy)]
+pub struct SetupChoice<'a> {
+    pub id: &'a str,
+    pub label: &'a str,
+    pub detail: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupSelection {
+    Chosen(String),
+    Back,
+    Canceled,
+}
+
+fn validate_choices(
+    choices: &[SetupChoice<'_>],
+    current: Option<&str>,
+) -> Result<(), OnboardingError> {
+    let mut ids = BTreeSet::new();
+    let mut bytes = 0usize;
+    if choices.is_empty() || choices.len() > crate::setup_terminal_ui::MAX_CHOICES {
+        return Err(OnboardingError::Invalid(
+            "Choose from a bounded, nonempty menu",
+        ));
+    }
+    for choice in choices {
+        bytes = bytes
+            .saturating_add(choice.id.len())
+            .saturating_add(choice.label.len())
+            .saturating_add(choice.detail.map_or(0, str::len));
+        if choice.id.is_empty()
+            || choice.id.len() > crate::setup_terminal_ui::MAX_TYPED_BYTES
+            || choice.id.chars().any(char::is_control)
+            || !ids.insert(choice.id)
+            || choice.label.len() > 32 * 1024
+            || choice.detail.is_some_and(|d| d.len() > 32 * 1024)
+            || bytes > crate::setup_terminal_ui::MAX_MENU_TEXT_BYTES
+        {
+            return Err(OnboardingError::Invalid(
+                "Menu identities or labels exceed their bounds",
+            ));
+        }
+    }
+    if current.is_some_and(|id| !ids.contains(id)) {
+        return Err(OnboardingError::Invalid("Current choice is not offered"));
+    }
+    Ok(())
+}
+
+fn selected_answer(
+    value: &str,
+    choices: &[SetupChoice<'_>],
+    current: Option<&str>,
+    allow_back: bool,
+) -> Option<SetupSelection> {
+    // Exact identities win over numeric aliases and displayed navigation words.
+    if let Some(choice) = choices.iter().find(|choice| choice.id == value) {
+        return Some(SetupSelection::Chosen(choice.id.to_owned()));
+    }
+    if value.is_empty() {
+        return current.map(|id| SetupSelection::Chosen(id.to_owned()));
+    }
+    if let Some(choice) = value
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| choices.get(n))
+    {
+        return Some(SetupSelection::Chosen(choice.id.to_owned()));
+    }
+    match value {
+        "back" if allow_back => Some(SetupSelection::Back),
+        "cancel" => Some(SetupSelection::Canceled),
+        _ => None,
+    }
+}
+
+fn plain_select<T: SetupTerminal + ?Sized>(
+    terminal: &mut T,
+    prompt: &str,
+    choices: &[SetupChoice<'_>],
+    current: Option<&str>,
+    allow_back: bool,
+) -> Result<SetupSelection, OnboardingError> {
+    validate_choices(choices, current)?;
+    for (index, choice) in choices.iter().enumerate() {
+        terminal.message(&format!(
+            "  {}. {}{}{}",
+            index + 1,
+            crate::setup_terminal_ui::safe(choice.label),
+            if current == Some(choice.id) {
+                " [current]"
+            } else {
+                ""
+            },
+            choice
+                .detail
+                .map(|detail| format!(" — {}", crate::setup_terminal_ui::safe(detail)))
+                .unwrap_or_default()
+        ))?;
+    }
+    terminal.message(if allow_back { "Enter a number or exact choice; back goes to the previous step, cancel discards this draft." } else { "Enter a number or exact choice; cancel discards this draft." })?;
+    loop {
+        let value = terminal.line(
+            &format!("{prompt}: "),
+            crate::setup_terminal_ui::MAX_TYPED_BYTES,
+        )?;
+        if let Some(selection) = selected_answer(&value, choices, current, allow_back) {
+            return Ok(selection);
+        }
+        terminal.message("Choose an offered number or exact identity. Nothing was changed.")?;
+    }
+}
+
 /// Implementations must return Canceled on EOF, and must never echo hidden input.
 pub trait SetupTerminal {
     fn message(&mut self, message: &str) -> Result<(), OnboardingError>;
     fn line(&mut self, prompt: &str, max_bytes: usize) -> Result<String, OnboardingError>;
     fn hidden(&mut self, prompt: &str, max_bytes: usize) -> Result<SecretBytes, OnboardingError>;
+    fn rich_choices_available(&self) -> bool {
+        false
+    }
+    fn select(
+        &mut self,
+        prompt: &str,
+        choices: &[SetupChoice<'_>],
+        current: Option<&str>,
+        allow_back: bool,
+    ) -> Result<SetupSelection, OnboardingError> {
+        plain_select(self, prompt, choices, current, allow_back)
+    }
     fn hidden_until(
         &mut self,
         _prompt: &str,
@@ -85,6 +218,7 @@ pub struct OnboardingDraft {
     home: PathBuf,
     plan: SetupPlan,
     expected_provider: Option<ProviderConfig>,
+    expected_credential_revision: Option<ProviderCredentialRevision>,
     expected_main: String,
     private_key: Option<SecretBytes>,
     confirmed: bool,
@@ -173,7 +307,8 @@ pub fn parse_manual_models(value: &str) -> Result<Vec<ModelEntry>, OnboardingErr
             context_limits: None,
             id: id.to_owned(),
             label: None,
-            pricing: Pricing::default(),
+            pricing: None,
+            billing: None,
             max_output_tokens: None,
             context_window: None,
             sampling: None,
@@ -260,6 +395,456 @@ pub fn collect_onboarding_with_discovery<T: SetupTerminal>(
     )
 }
 
+#[derive(Clone, Copy)]
+enum SetupStage {
+    Provider,
+    Identity,
+    Authentication,
+    Models,
+    Default,
+    Review,
+}
+struct IdentityDraft {
+    provider: ProviderConfig,
+    previous: Option<ProviderConfig>,
+    previous_credential_revision: Option<ProviderCredentialRevision>,
+}
+struct AuthenticationDraft {
+    env: Option<String>,
+    key: Option<SecretBytes>,
+    online: bool,
+}
+enum StepValue<T> {
+    Complete(T),
+    Back,
+}
+
+fn stage<T: SetupTerminal>(
+    terminal: &mut T,
+    number: usize,
+    title: &str,
+    detail: &str,
+) -> Result<(), OnboardingError> {
+    terminal.message(&format!("\nORBIT SETUP  {number}/6  {title}"))?;
+    terminal.message(detail)
+}
+
+enum FieldRecovery {
+    Retry,
+    Back,
+}
+
+fn recover_field<T: SetupTerminal>(
+    terminal: &mut T,
+    message: &'static str,
+) -> Result<FieldRecovery, OnboardingError> {
+    terminal.message(message)?;
+    match terminal.select(
+        "Correct this field",
+        &[SetupChoice {
+            id: "retry",
+            label: "Try this field again",
+            detail: Some("Repeat only this local input; nothing has been saved"),
+        }],
+        Some("retry"),
+        true,
+    )? {
+        SetupSelection::Chosen(id) if id == "retry" => Ok(FieldRecovery::Retry),
+        SetupSelection::Back => Ok(FieldRecovery::Back),
+        SetupSelection::Canceled => Err(OnboardingError::Canceled),
+        _ => Err(OnboardingError::Invalid(
+            "Choose an offered correction action",
+        )),
+    }
+}
+
+fn retry_field<T: SetupTerminal, V>(
+    terminal: &mut T,
+    mut field: impl FnMut(&mut T) -> Result<V, OnboardingError>,
+) -> Result<StepValue<V>, OnboardingError> {
+    loop {
+        match field(terminal) {
+            Err(OnboardingError::Invalid(message)) => match recover_field(terminal, message)? {
+                FieldRecovery::Retry => {}
+                FieldRecovery::Back => return Ok(StepValue::Back),
+            },
+            Ok(value) => return Ok(StepValue::Complete(value)),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+// This propagates a typed local navigation result, never a public failure or data sentinel.
+macro_rules! setup_field {
+    ($terminal:expr, $field:expr) => {
+        match retry_field($terminal, $field)? {
+            StepValue::Complete(value) => value,
+            StepValue::Back => return Ok(StepValue::Back),
+        }
+    };
+}
+
+fn cached_action<T: SetupTerminal>(
+    terminal: &mut T,
+    title: &str,
+    allow_back: bool,
+) -> Result<SetupSelection, OnboardingError> {
+    terminal.select(
+        title,
+        &[
+            SetupChoice {
+                id: "keep",
+                label: "Keep this draft",
+                detail: Some("Continue without repeating a login, discovery request, or write"),
+            },
+            SetupChoice {
+                id: "edit",
+                label: "Edit this step",
+                detail: Some("Dependent unpublished choices will be collected again"),
+            },
+        ],
+        Some("keep"),
+        allow_back,
+    )
+}
+
+fn collect_identity<T: SetupTerminal>(
+    home: &Path,
+    terminal: &mut T,
+    preset: &crate::presets::ProviderPreset,
+    existing: &ProvidersConfig,
+) -> Result<StepValue<IdentityDraft>, OnboardingError> {
+    let custom = preset.id == "custom";
+    let name = setup_field!(terminal, |terminal| {
+        let name = answer(
+            terminal,
+            "Provider name",
+            (!custom).then_some(preset.id),
+            128,
+        )?;
+        // Validate the name before asking about replacement or collecting a key.
+        ProviderAuthIdentity::new(
+            &name,
+            "openai-compatible",
+            "https://provider.example/",
+            None,
+        )
+        .map_err(|_| OnboardingError::Invalid("Use a valid bounded provider name"))?;
+        Ok(name)
+    });
+    let previous = existing
+        .provider
+        .iter()
+        .find(|provider| provider.name == name)
+        .cloned();
+    let previous_credential_revision = previous
+        .as_ref()
+        .map(|provider| saved_revision(home, provider))
+        .transpose()?
+        .flatten();
+    if previous.is_some()
+        && !setup_field!(terminal, |terminal| yes(
+            terminal,
+            "Replace this existing provider? Type yes to continue"
+        ))
+    {
+        return Err(OnboardingError::Canceled);
+    }
+    let kind = if custom {
+        setup_field!(terminal, |terminal| {
+            let kind = answer(
+                terminal,
+                "Adapter kind (openai-compatible/anthropic/ollama)",
+                Some("openai-compatible"),
+                64,
+            )?;
+            if !["openai-compatible", "anthropic", "ollama"].contains(&kind.as_str()) {
+                return Err(OnboardingError::Invalid(
+                    "Choose openai-compatible, anthropic or ollama",
+                ));
+            }
+            Ok(kind)
+        })
+    } else {
+        preset.kind.to_owned()
+    };
+    let url = setup_field!(terminal, |terminal| {
+        let url = answer(terminal, "Base URL", (!custom).then_some(preset.url), 2048)?;
+        crate::config::validate_provider_endpoint(&url)
+            .map(|url| url.to_string())
+            .map_err(|_| {
+                OnboardingError::Invalid(
+                    "Use an absolute HTTP(S) provider URL without credentials or a fragment",
+                )
+            })
+    });
+    ProviderAuthIdentity::new(&name, &kind, &url, None)?;
+    Ok(StepValue::Complete(IdentityDraft {
+        provider: ProviderConfig {
+            name,
+            kind,
+            url,
+            env: None,
+            models: Vec::new(),
+        },
+        previous,
+        previous_credential_revision,
+    }))
+}
+
+fn collect_authentication<T: SetupTerminal>(
+    terminal: &mut T,
+    base: &ProviderConfig,
+    preset: &crate::presets::ProviderPreset,
+    previous_saved_identity: Option<&ProviderAuthIdentity>,
+    login: &mut impl LoginServiceFactory,
+) -> Result<StepValue<AuthenticationDraft>, OnboardingError> {
+    loop {
+        let browser_supported = provider_login::supports_browser_login(base);
+        let mut choices = vec![
+            SetupChoice {
+                id: "env",
+                label: "Environment variable",
+                detail: Some("Read the key from an ENV variable at request time"),
+            },
+            SetupChoice {
+                id: "key",
+                label: "API key",
+                detail: Some("Hidden entry; saved privately only after confirmation"),
+            },
+            SetupChoice {
+                id: "key-env",
+                label: "API key with ENV override",
+                detail: Some("A nonempty declared ENV value takes precedence"),
+            },
+        ];
+        if browser_supported {
+            choices.push(SetupChoice {
+                id: "browser",
+                label: "Browser sign-in",
+                detail: Some("Supported official OpenRouter authorization flow"),
+            });
+        }
+        let no_auth_supported = preset.id == "custom" || base.kind == "ollama";
+        if no_auth_supported {
+            choices.push(SetupChoice {
+                id: "none",
+                label: "No authentication",
+                detail: Some("For custom or local providers only"),
+            });
+        }
+        let auth = match terminal.select("Authentication method", &choices, None, true)? {
+            SetupSelection::Chosen(auth) => auth,
+            SetupSelection::Back => return Ok(StepValue::Back),
+            SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+        };
+        let (env, key) = match auth.as_str() {
+            "env" => {
+                let name = setup_field!(terminal, |terminal| {
+                    let name = answer(
+                        terminal,
+                        "Credential ENV name",
+                        (!preset.env.is_empty()).then_some(preset.env),
+                        128,
+                    )?;
+                    ProviderAuthIdentity::new(&base.name, &base.kind, &base.url, Some(&name))
+                        .map_err(|_| {
+                            OnboardingError::Invalid("Use a valid credential ENV variable name")
+                        })?;
+                    Ok(name)
+                });
+                (Some(name), None)
+            }
+            "key" | "key-env" => {
+                let reference = if auth == "key-env" {
+                    let name = setup_field!(terminal, |terminal| {
+                        let name = answer(terminal, "Credential ENV name", None, 128)?;
+                        let candidate = ProviderAuthIdentity::new(
+                            &base.name,
+                            &base.kind,
+                            &base.url,
+                            Some(&name),
+                        )
+                        .map_err(|_| {
+                            OnboardingError::Invalid("Use a valid credential ENV variable name")
+                        })?;
+                        if previous_saved_identity.is_some_and(|previous| previous == &candidate) {
+                            return Err(OnboardingError::Invalid(
+                                "Choose a new private credential ENV name to rotate a saved key",
+                            ));
+                        }
+                        Ok(name)
+                    });
+                    terminal.message("A nonempty value in this ENV takes precedence over the private key, including during model discovery.")?;
+                    name
+                } else {
+                    format!("ORBIT_AUTH_{}", ulid::Ulid::new())
+                };
+                terminal.message(
+                    "The key is hidden and will be saved privately only after confirmation.",
+                )?;
+                let key = setup_field!(terminal, |terminal| {
+                    let key = terminal.hidden("API key (hidden): ", MAX_PROVIDER_KEY_BYTES)?;
+                    if key.is_empty() || key.len() > MAX_PROVIDER_KEY_BYTES {
+                        return Err(OnboardingError::Invalid(
+                            "API key must be nonempty and bounded",
+                        ));
+                    }
+                    let text = std::str::from_utf8(key.expose())
+                        .map_err(|_| OnboardingError::Invalid("API key must be UTF-8"))?;
+                    if text.trim().is_empty() || text.chars().any(char::is_control) {
+                        return Err(OnboardingError::Invalid(
+                            "API key contains invalid characters",
+                        ));
+                    }
+                    Ok(key)
+                });
+                (Some(reference), Some(key))
+            }
+            "browser" if browser_supported => {
+                let mode = setup_field!(terminal, |terminal| match answer(
+                    terminal,
+                    "Browser mode (loopback/headless)",
+                    Some("loopback"),
+                    16
+                )?
+                .as_str()
+                {
+                    "loopback" => Ok(provider_login::LoginMode::Loopback),
+                    "headless" => Ok(provider_login::LoginMode::Headless),
+                    _ => Err(OnboardingError::Invalid("Choose loopback or headless")),
+                });
+                let reference = format!("ORBIT_AUTH_{}", ulid::Ulid::new());
+                let mut provider = base.clone();
+                provider.env = Some(reference.clone());
+                // This effect runs only after an explicit authentication choice; Back/Keep never calls it.
+                let key = browser_key(
+                    &provider,
+                    &ProviderLoginRequest {
+                        method: Some(ProviderLoginMethod::Browser),
+                        mode,
+                        open_browser: mode == provider_login::LoginMode::Loopback,
+                    },
+                    terminal,
+                    login,
+                )?;
+                (Some(reference), Some(key))
+            }
+            "none" if no_auth_supported => (None, None),
+            "none" => match recover_field(
+                terminal,
+                "No-auth is available for custom or local providers",
+            )? {
+                FieldRecovery::Retry => continue,
+                FieldRecovery::Back => return Ok(StepValue::Back),
+            },
+            _ => {
+                return Err(OnboardingError::Invalid(
+                    "Choose an offered authentication method",
+                ));
+            }
+        };
+        return Ok(StepValue::Complete(AuthenticationDraft {
+            env,
+            key,
+            online: auth == "browser",
+        }));
+    }
+}
+
+fn selected_provider(
+    identity: &IdentityDraft,
+    auth: &AuthenticationDraft,
+    selection: &ModelSelection,
+) -> Result<ProviderConfig, OnboardingError> {
+    let mut provider = identity.provider.clone();
+    provider.env = auth.env.clone();
+    provider.models = identity
+        .previous
+        .as_ref()
+        .map(|provider| provider.models.clone())
+        .unwrap_or_default();
+    for model in &selection.models {
+        if let Some(old) = provider.models.iter_mut().find(|old| old.id == model.id) {
+            if selection.provenance.is_some() {
+                *old = model.clone();
+            }
+        } else {
+            provider.models.push(model.clone());
+        }
+    }
+    setup::validate_provider(&provider)?;
+    Ok(provider)
+}
+
+enum DefaultIntent {
+    Select,
+    Unchanged,
+    Back,
+}
+enum ReviewIntent {
+    Save,
+    Back,
+}
+
+fn collect_default<T: SetupTerminal>(
+    terminal: &mut T,
+    provider: &ProviderConfig,
+    existing_main: &str,
+) -> Result<StepValue<Option<String>>, OnboardingError> {
+    let intent = setup_field!(terminal, |terminal| match answer(
+        terminal,
+        "Set main default? (yes/no)",
+        None,
+        16
+    )?
+    .to_ascii_lowercase()
+    .as_str()
+    {
+        "yes" => Ok(DefaultIntent::Select),
+        "" | "no" => Ok(DefaultIntent::Unchanged),
+        "back" => Ok(DefaultIntent::Back),
+        "cancel" => Err(OnboardingError::Canceled),
+        _ => Err(OnboardingError::Invalid(
+            "Enter yes, no, back or cancel. Nothing was saved."
+        )),
+    });
+    match intent {
+        DefaultIntent::Unchanged => return Ok(StepValue::Complete(None)),
+        DefaultIntent::Back => return Ok(StepValue::Back),
+        DefaultIntent::Select => {}
+    }
+    let choices: Vec<_> = provider
+        .models
+        .iter()
+        .map(|model| SetupChoice {
+            id: &model.id,
+            label: &model.id,
+            detail: model.label.as_deref(),
+        })
+        .collect();
+    let prefix = format!("{}/", provider.name);
+    let current = existing_main
+        .strip_prefix(&prefix)
+        .filter(|id| provider.models.iter().any(|model| model.id == *id));
+    let id = match terminal.select("Main model ID", &choices, current, true)? {
+        SetupSelection::Chosen(id) => id,
+        SetupSelection::Back => return Ok(StepValue::Back),
+        SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+    };
+    let qualified = format!("{}/{}", provider.name, id);
+    if !existing_main.is_empty()
+        && existing_main != qualified
+        && !setup_field!(terminal, |terminal| yes(
+            terminal,
+            "Replace main default? Type yes to continue"
+        ))
+    {
+        return Err(OnboardingError::Canceled);
+    }
+    Ok(StepValue::Complete(Some(qualified)))
+}
+
 pub fn collect_onboarding_with_services<T: SetupTerminal>(
     home: &Path,
     preset_id: Option<&str>,
@@ -267,264 +852,415 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
     discovery: &mut impl ModelDiscoveryFactory,
     login: &mut impl LoginServiceFactory,
 ) -> Result<OnboardingDraft, OnboardingError> {
-    // Lexical absolutization keeps supported relative --home paths without
-    // canonicalizing or following a symlink. Store validation still rejects '..'.
     let absolute_home = std::path::absolute(home).map_err(crate::customization::io_error)?;
     let home = absolute_home.as_path();
-    // Construction only validates the path; it does not create or read storage.
     let _ = ProviderCredentialStore::new(home)?;
     let baseline = setup::plan_setup(home, &SetupRequest::default())?;
     let existing = config_snapshot(home)?;
-    terminal.message(
-        "Provider setup. Type Ctrl-C to cancel. Manual model entry makes no provider request.",
-    )?;
+    terminal.message("ORBIT\nProvider setup. Type Ctrl-C to cancel. Manual model entry makes no provider request.")?;
     let offered = crate::presets::presets();
-    let selection = match preset_id {
-        Some(id) => id.to_owned(),
-        None => {
-            for (index, preset) in offered.iter().enumerate() {
+    let mut preset = preset_id
+        .map(|id| {
+            crate::presets::preset_by_id(id).ok_or(OnboardingError::Invalid(
+                "Choose an offered provider name or number",
+            ))
+        })
+        .transpose()?;
+    let mut state = if preset.is_some() {
+        SetupStage::Identity
+    } else {
+        SetupStage::Provider
+    };
+    let mut identity_draft: Option<IdentityDraft> = None;
+    let mut authentication: Option<AuthenticationDraft> = None;
+    let mut models: Option<ModelSelection> = None;
+    let mut main: Option<Option<String>> = None;
+    let mut revisiting = false;
+    loop {
+        match state {
+            SetupStage::Provider => {
+                stage(
+                    terminal,
+                    1,
+                    "Provider",
+                    "Choose a preset or a custom compatible endpoint.",
+                )?;
+                let choices: Vec<_> = offered
+                    .iter()
+                    .map(|preset| SetupChoice {
+                        id: preset.id,
+                        label: preset.id,
+                        detail: Some(preset.blurb),
+                    })
+                    .collect();
+                let selected = match terminal.select(
+                    "Provider (name or number)",
+                    &choices,
+                    preset.as_ref().map(|preset| preset.id),
+                    false,
+                )? {
+                    SetupSelection::Chosen(id) => id,
+                    SetupSelection::Back | SetupSelection::Canceled => {
+                        return Err(OnboardingError::Canceled);
+                    }
+                };
+                let next = crate::presets::preset_by_id(&selected).ok_or(
+                    OnboardingError::Invalid("Choose an offered provider name or number"),
+                )?;
+                if preset.as_ref().is_none_or(|old| old.id != next.id) {
+                    identity_draft = None;
+                    authentication = None;
+                    models = None;
+                    main = None;
+                    revisiting = false;
+                }
+                preset = Some(next);
+                state = SetupStage::Identity;
+            }
+            SetupStage::Identity => {
+                stage(
+                    terminal,
+                    2,
+                    "Identity",
+                    "Name and endpoint bind the unpublished credential to this provider.",
+                )?;
+                let selected_preset = preset
+                    .as_ref()
+                    .ok_or(OnboardingError::Invalid("Provider selection is missing"))?;
+                if revisiting && identity_draft.is_some() {
+                    match cached_action(terminal, "Provider identity draft", true)? {
+                        SetupSelection::Chosen(action) if action == "keep" => {
+                            state = SetupStage::Authentication;
+                            continue;
+                        }
+                        SetupSelection::Chosen(_) => {}
+                        SetupSelection::Back => {
+                            state = SetupStage::Provider;
+                            continue;
+                        }
+                        SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+                    }
+                }
+                let next = match collect_identity(home, terminal, selected_preset, &existing)? {
+                    StepValue::Complete(next) => next,
+                    StepValue::Back => {
+                        revisiting = true;
+                        state = SetupStage::Provider;
+                        continue;
+                    }
+                };
+                if identity_draft
+                    .as_ref()
+                    .is_none_or(|old| old.provider != next.provider)
+                {
+                    authentication = None;
+                    models = None;
+                    main = None;
+                }
+                identity_draft = Some(next);
+                revisiting = authentication.is_some();
+                state = SetupStage::Authentication;
+            }
+            SetupStage::Authentication => {
+                stage(
+                    terminal,
+                    3,
+                    "Authentication",
+                    "Keys stay hidden and unpublished until the final confirmation.",
+                )?;
+                if revisiting && authentication.is_some() {
+                    match cached_action(terminal, "Authentication draft", true)? {
+                        SetupSelection::Chosen(action) if action == "keep" => {
+                            state = SetupStage::Models;
+                            continue;
+                        }
+                        SetupSelection::Chosen(_) => {
+                            authentication = None;
+                            models = None;
+                            main = None;
+                        }
+                        SetupSelection::Back => {
+                            state = SetupStage::Identity;
+                            continue;
+                        }
+                        SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+                    }
+                }
+                let identity_draft = identity_draft
+                    .as_ref()
+                    .ok_or(OnboardingError::Invalid("Provider identity is missing"))?;
+                let previous_saved_identity =
+                    if identity_draft.previous_credential_revision.is_some() {
+                        identity_draft.previous.as_ref().map(identity).transpose()?
+                    } else {
+                        None
+                    };
+                let base = &identity_draft.provider;
+                match collect_authentication(
+                    terminal,
+                    base,
+                    preset
+                        .as_ref()
+                        .ok_or(OnboardingError::Invalid("Provider selection is missing"))?,
+                    previous_saved_identity.as_ref(),
+                    login,
+                ) {
+                    Ok(StepValue::Back) => {
+                        revisiting = true;
+                        state = SetupStage::Identity;
+                    }
+                    Ok(StepValue::Complete(auth)) => {
+                        authentication = Some(auth);
+                        revisiting = false;
+                        state = SetupStage::Models;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            SetupStage::Models => {
+                stage(
+                    terminal,
+                    4,
+                    "Models",
+                    "Enter raw IDs offline, or explicitly request the provider catalog.",
+                )?;
+                if revisiting && models.is_some() {
+                    match cached_action(terminal, "Model selection draft", true)? {
+                        SetupSelection::Chosen(action) if action == "keep" => {
+                            state = SetupStage::Default;
+                            continue;
+                        }
+                        SetupSelection::Chosen(_) => {
+                            models = None;
+                            main = None;
+                        }
+                        SetupSelection::Back => {
+                            state = SetupStage::Authentication;
+                            continue;
+                        }
+                        SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+                    }
+                }
+                let source = match terminal.select(
+                    "Model source (manual/discover) [manual]",
+                    &[
+                        SetupChoice {
+                            id: "manual",
+                            label: "Enter model IDs",
+                            detail: Some("Offline; no provider request"),
+                        },
+                        SetupChoice {
+                            id: "discover",
+                            label: "Discover models",
+                            detail: Some("Explicitly fetch this provider's catalog"),
+                        },
+                    ],
+                    Some("manual"),
+                    true,
+                )? {
+                    SetupSelection::Chosen(source) => source,
+                    SetupSelection::Back => {
+                        revisiting = true;
+                        state = SetupStage::Authentication;
+                        continue;
+                    }
+                    SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+                };
+                let draft = identity_draft
+                    .as_ref()
+                    .ok_or(OnboardingError::Invalid("Provider identity is missing"))?;
+                let auth = authentication
+                    .as_ref()
+                    .ok_or(OnboardingError::Invalid("Authentication is missing"))?;
+                let mut provider = draft.provider.clone();
+                provider.env = auth.env.clone();
+                provider.models = draft
+                    .previous
+                    .as_ref()
+                    .map(|provider| provider.models.clone())
+                    .unwrap_or_default();
+                match collect_models(
+                    home,
+                    &provider,
+                    auth.key.as_ref(),
+                    preset
+                        .as_ref()
+                        .ok_or(OnboardingError::Invalid("Provider selection is missing"))?,
+                    terminal,
+                    discovery,
+                    &source,
+                )? {
+                    StepValue::Complete(selection) => {
+                        models = Some(selection);
+                        main = None;
+                        revisiting = false;
+                        state = SetupStage::Default;
+                    }
+                    StepValue::Back => {
+                        revisiting = true;
+                        state = SetupStage::Authentication;
+                    }
+                }
+            }
+            SetupStage::Default => {
+                stage(
+                    terminal,
+                    5,
+                    "Default model",
+                    "Choose the model a new plain orbit session will use. Type back to revisit models.",
+                )?;
+                if revisiting && main.is_some() {
+                    match cached_action(terminal, "Default model draft", true)? {
+                        SetupSelection::Chosen(action) if action == "keep" => {
+                            state = SetupStage::Review;
+                            continue;
+                        }
+                        SetupSelection::Chosen(_) => {
+                            main = None;
+                        }
+                        SetupSelection::Back => {
+                            state = SetupStage::Models;
+                            continue;
+                        }
+                        SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+                    }
+                }
+                let provider = selected_provider(
+                    identity_draft
+                        .as_ref()
+                        .ok_or(OnboardingError::Invalid("Provider identity is missing"))?,
+                    authentication
+                        .as_ref()
+                        .ok_or(OnboardingError::Invalid("Authentication is missing"))?,
+                    models
+                        .as_ref()
+                        .ok_or(OnboardingError::Invalid("Model selection is missing"))?,
+                )?;
+                match collect_default(terminal, &provider, &existing.roles.main)? {
+                    StepValue::Back => {
+                        revisiting = true;
+                        state = SetupStage::Models;
+                    }
+                    StepValue::Complete(selected) => {
+                        main = Some(selected);
+                        revisiting = false;
+                        state = SetupStage::Review;
+                    }
+                }
+            }
+            SetupStage::Review => {
+                stage(
+                    terminal,
+                    6,
+                    "Review and save",
+                    "Type yes to publish this draft once, back to revisit it, or no/cancel to discard.",
+                )?;
+                let identity_draft = identity_draft
+                    .as_ref()
+                    .ok_or(OnboardingError::Invalid("Provider identity is missing"))?;
+                let auth = authentication
+                    .as_mut()
+                    .ok_or(OnboardingError::Invalid("Authentication is missing"))?;
+                let selection = models
+                    .as_ref()
+                    .ok_or(OnboardingError::Invalid("Model selection is missing"))?;
+                let provider = selected_provider(identity_draft, auth, selection)?;
+                let selected_main = main
+                    .as_ref()
+                    .ok_or(OnboardingError::Invalid("Default choice is missing"))?
+                    .clone();
+                let request = SetupRequest {
+                    provider: Some(provider.clone()),
+                    ..Default::default()
+                };
+                let plan = setup::plan_setup_with_main(home, &request, selected_main.as_deref())?;
+                if plan.revision != baseline.revision {
+                    return Err(OnboardingError::Stale);
+                }
+                let mut draft = OnboardingDraft {
+                    provider,
+                    main: selected_main,
+                    home: home.to_path_buf(),
+                    plan,
+                    expected_provider: identity_draft.previous.clone(),
+                    expected_credential_revision: identity_draft.previous_credential_revision,
+                    expected_main: existing.roles.main.clone(),
+                    private_key: auth.key.take(),
+                    confirmed: false,
+                    catalog_status: selection.catalog_status,
+                    provenance: selection.provenance.clone(),
+                    metadata_warning: selection.metadata_warning,
+                    authentication_online: auth.online,
+                };
+                let (source, ready) = credential_status(&draft)?;
+                let model_ids = draft
+                    .provider
+                    .models
+                    .iter()
+                    .map(|model| format!("  - {}", safe_display(&model.id)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let model_ids = if model_ids.is_empty() {
+                    "  (none)".to_owned()
+                } else {
+                    model_ids
+                };
+                let credential_env = draft
+                    .provider
+                    .env
+                    .as_deref()
+                    .map(safe_display)
+                    .unwrap_or_else(|| "(none)".to_owned());
+                let main_default = match draft.main.as_deref() {
+                    Some(main) => main,
+                    None if draft.expected_main.is_empty() => "not set",
+                    None => &draft.expected_main,
+                };
                 terminal.message(&format!(
-                    "  {}. {} - {}",
-                    index + 1,
-                    preset.id,
-                    preset.blurb
+                    "Provider: {} ({})\nEndpoint: {}\nModels ({}):\n{}\nMain default: {}\nCredential: {}{}\nCredential ENV name: {}\nCatalog: {}\nCompletion connectivity: not tested",
+                    safe_display(&draft.provider.name),
+                    draft.provider.kind,
+                    safe_display(&draft.provider.url),
+                    draft.provider.models.len(),
+                    model_ids,
+                    safe_display(main_default),
+                    source,
+                    if ready { "" } else { " (missing; set the declared ENV before running)" },
+                    credential_env,
+                    draft.catalog_status
                 ))?;
+                let action = retry_field(terminal, |terminal| {
+                    match answer(
+                        terminal,
+                        "Save provider configuration? Type yes to confirm",
+                        None,
+                        16,
+                    )?
+                    .to_ascii_lowercase()
+                    .as_str()
+                    {
+                        "yes" => Ok(ReviewIntent::Save),
+                        "back" => Ok(ReviewIntent::Back),
+                        "" | "no" | "cancel" => Err(OnboardingError::Canceled),
+                        _ => Err(OnboardingError::Invalid(
+                            "Enter yes to save, back to edit, or no/cancel to discard. Nothing was saved.",
+                        )),
+                    }
+                })?;
+                match action {
+                    StepValue::Complete(ReviewIntent::Save) => {
+                        draft.confirmed = true;
+                        return Ok(draft);
+                    }
+                    StepValue::Back | StepValue::Complete(ReviewIntent::Back) => {
+                        auth.key = draft.private_key.take();
+                        revisiting = true;
+                        state = SetupStage::Default;
+                    }
+                }
             }
-            answer(terminal, "Provider (name or number)", None, 128)?
-        }
-    };
-    let preset = if let Ok(index) = selection.parse::<usize>() {
-        index.checked_sub(1).and_then(|n| offered.get(n)).cloned()
-    } else {
-        crate::presets::preset_by_id(&selection)
-    }
-    .ok_or(OnboardingError::Invalid(
-        "Choose an offered provider name or number",
-    ))?;
-    let custom = preset.id == "custom";
-    let name = answer(
-        terminal,
-        "Provider name",
-        (!custom).then_some(preset.id),
-        128,
-    )?;
-    let expected_provider = existing.provider.iter().find(|p| p.name == name).cloned();
-    if expected_provider.is_some()
-        && !yes(
-            terminal,
-            "Replace this existing provider? Type yes to continue",
-        )?
-    {
-        return Err(OnboardingError::Canceled);
-    }
-    let kind = if custom {
-        answer(
-            terminal,
-            "Adapter kind (openai-compatible/anthropic/ollama)",
-            Some("openai-compatible"),
-            64,
-        )?
-    } else {
-        preset.kind.to_owned()
-    };
-    let url = answer(terminal, "Base URL", (!custom).then_some(preset.url), 2048)?;
-    let endpoint = crate::config::validate_provider_endpoint(&url).map_err(|_| {
-        OnboardingError::Invalid(
-            "Use an absolute HTTP(S) provider URL without credentials or a fragment",
-        )
-    })?;
-    // Validate identity before reading any credential, including custom names/kinds.
-    let _ = ProviderAuthIdentity::new(&name, &kind, endpoint.as_str(), None)?;
-    if !["openai-compatible", "anthropic", "ollama"].contains(&kind.as_str()) {
-        return Err(OnboardingError::Invalid(
-            "Choose openai-compatible, anthropic or ollama",
-        ));
-    }
-    let browser_provider = ProviderConfig {
-        name: name.clone(),
-        kind: kind.clone(),
-        url: endpoint.to_string(),
-        env: None,
-        models: Vec::new(),
-    };
-    let browser_supported = provider_login::supports_browser_login(&browser_provider);
-    let auth = answer(
-        terminal,
-        if browser_supported {
-            "Authentication (env/key/key-env/browser/none)"
-        } else {
-            "Authentication (env/key/key-env/none)"
-        },
-        None,
-        16,
-    )?;
-    let (env, private_key) = match auth.as_str() {
-        "env" => {
-            let env_name = answer(
-                terminal,
-                "Credential ENV name",
-                (!preset.env.is_empty()).then_some(preset.env),
-                128,
-            )?;
-            let _ = ProviderAuthIdentity::new(&name, &kind, endpoint.as_str(), Some(&env_name))?;
-            (Some(env_name), None)
-        }
-        "key" | "key-env" => {
-            let reference = if auth == "key-env" {
-                let reference = answer(terminal, "Credential ENV name", None, 128)?;
-                let _ =
-                    ProviderAuthIdentity::new(&name, &kind, endpoint.as_str(), Some(&reference))?;
-                terminal.message("A nonempty value in this ENV takes precedence over the private key, including during model discovery.")?;
-                reference
-            } else {
-                format!("ORBIT_AUTH_{}", ulid::Ulid::new())
-            };
-            terminal.message(
-                "The key is hidden and will be saved privately only after confirmation.",
-            )?;
-            let key = terminal.hidden("API key (hidden): ", MAX_PROVIDER_KEY_BYTES)?;
-            if key.is_empty() || key.len() > MAX_PROVIDER_KEY_BYTES {
-                return Err(OnboardingError::Invalid(
-                    "API key must be nonempty and bounded",
-                ));
-            }
-            let text = std::str::from_utf8(key.expose())
-                .map_err(|_| OnboardingError::Invalid("API key must be UTF-8"))?;
-            if text.trim().is_empty() || text.chars().any(char::is_control) {
-                return Err(OnboardingError::Invalid(
-                    "API key contains invalid characters",
-                ));
-            }
-            (Some(reference), Some(key))
-        }
-        "browser" if browser_supported => {
-            let mode = match answer(
-                terminal,
-                "Browser mode (loopback/headless)",
-                Some("loopback"),
-                16,
-            )?
-            .as_str()
-            {
-                "loopback" => provider_login::LoginMode::Loopback,
-                "headless" => provider_login::LoginMode::Headless,
-                _ => return Err(OnboardingError::Invalid("Choose loopback or headless")),
-            };
-            let reference = format!("ORBIT_AUTH_{}", ulid::Ulid::new());
-            let mut candidate = browser_provider.clone();
-            candidate.env = Some(reference.clone());
-            let key = browser_key(
-                &candidate,
-                &ProviderLoginRequest {
-                    method: Some(ProviderLoginMethod::Browser),
-                    mode,
-                    open_browser: mode == provider_login::LoginMode::Loopback,
-                },
-                terminal,
-                login,
-            )?;
-            (Some(reference), Some(key))
-        }
-        "browser" => return Err(provider_login::LoginError::UnsupportedProvider.into()),
-        "none" if custom || kind == "ollama" => (None, None),
-        "none" => {
-            return Err(OnboardingError::Invalid(
-                "No-auth is available for custom or local providers",
-            ));
-        }
-        _ => {
-            return Err(OnboardingError::Invalid(if browser_supported {
-                "Choose env, key, key-env, browser or none"
-            } else {
-                "Choose env, key, key-env or none"
-            }));
-        }
-    };
-    let mut provider = ProviderConfig {
-        name,
-        kind,
-        url: endpoint.to_string(),
-        env,
-        models: Vec::new(),
-    };
-    let _ = identity(&provider)?;
-    provider.models = expected_provider
-        .as_ref()
-        .map(|p| p.models.clone())
-        .unwrap_or_default();
-    let selection = collect_models(
-        home,
-        &provider,
-        private_key.as_ref(),
-        custom,
-        preset.id,
-        terminal,
-        discovery,
-    )?;
-    for model in selection.models {
-        if let Some(old) = provider.models.iter_mut().find(|old| old.id == model.id) {
-            // Discovered models are already a provenance-aware merge. Manual
-            // entry retains the prior exact-ID declaration unchanged.
-            if selection.provenance.is_some() {
-                *old = model;
-            }
-        } else {
-            provider.models.push(model);
         }
     }
-    setup::validate_provider(&provider)?;
-    let main = if yes(terminal, "Set main default? (yes/no)")? {
-        let id = answer(terminal, "Main model ID", None, 256)?;
-        if !provider.models.iter().any(|model| model.id == id) {
-            return Err(OnboardingError::Invalid(
-                "Main model must be among this provider's configured raw IDs",
-            ));
-        }
-        let qualified = format!("{}/{}", provider.name, id);
-        if !existing.roles.main.is_empty()
-            && existing.roles.main != qualified
-            && !yes(terminal, "Replace main default? Type yes to continue")?
-        {
-            return Err(OnboardingError::Canceled);
-        }
-        Some(qualified)
-    } else {
-        None
-    };
-    let request = SetupRequest {
-        provider: Some(provider.clone()),
-        ..Default::default()
-    };
-    let plan = setup::plan_setup_with_main(home, &request, main.as_deref())?;
-    if plan.revision != baseline.revision {
-        return Err(OnboardingError::Stale);
-    }
-    let mut draft = OnboardingDraft {
-        provider,
-        main,
-        home: home.to_path_buf(),
-        plan,
-        expected_provider,
-        expected_main: existing.roles.main,
-        private_key,
-        confirmed: false,
-        catalog_status: selection.catalog_status,
-        provenance: selection.provenance,
-        metadata_warning: selection.metadata_warning,
-        authentication_online: auth == "browser",
-    };
-    let (source, ready) = credential_status(&draft)?;
-    terminal.message(&format!("Provider: {} ({})\nEndpoint: {}\nModels: {}\nMain default: {}\nCredential: {}{}\nCatalog: {}\nCompletion connectivity: not tested",
-        draft.provider.name, draft.provider.kind, draft.provider.url, draft.provider.models.len(),
-        draft.main.as_deref().unwrap_or(if draft.expected_main.is_empty() { "not set" } else { &draft.expected_main }),
-        source, if ready { "" } else { " (missing; set the declared ENV before running)" },
-        draft.catalog_status,
-    ))?;
-    if !yes(terminal, "Save provider configuration? Type yes to confirm")? {
-        return Err(OnboardingError::Canceled);
-    }
-    draft.confirmed = true;
-    Ok(draft)
 }
 
 fn credential_status(draft: &OnboardingDraft) -> Result<(&'static str, bool), OnboardingError> {
@@ -581,6 +1317,16 @@ pub fn commit_onboarding(mut draft: OnboardingDraft) -> Result<OnboardingReceipt
     {
         return Err(OnboardingError::Stale);
     }
+    let old_credential = draft
+        .expected_provider
+        .as_ref()
+        .map(|provider| identity(provider).map(|id| (id, draft.expected_credential_revision)))
+        .transpose()?;
+    if let Some(previous) = &draft.expected_provider
+        && saved_revision(&draft.home, previous)? != draft.expected_credential_revision
+    {
+        return Err(OnboardingError::Stale);
+    }
     let request = SetupRequest {
         provider: Some(draft.provider.clone()),
         ..Default::default()
@@ -591,6 +1337,15 @@ pub fn commit_onboarding(mut draft: OnboardingDraft) -> Result<OnboardingReceipt
     }
     let (source, ready) = credential_status(&draft)?;
     let id = draft.auth_identity()?;
+    if draft.private_key.is_some()
+        && old_credential
+            .as_ref()
+            .is_some_and(|(old_id, revision)| old_id == &id && revision.is_some())
+    {
+        return Err(OnboardingError::Invalid(
+            "Choose a new private credential ENV name to rotate a saved key",
+        ));
+    }
     let store = ProviderCredentialStore::new(&draft.home)?;
     let saved = if let Some(secret) = draft.private_key.take() {
         // Publication begins only after all choices and the complete config validate.
@@ -602,30 +1357,38 @@ pub fn commit_onboarding(mut draft: OnboardingDraft) -> Result<OnboardingReceipt
     let receipt = match setup::apply_setup(&draft.plan) {
         Ok(receipt) => receipt,
         Err(SetupError::PublicationUncertain(_)) => {
+            // Config may already reference the new identity. Preserve both records.
             return Err(OnboardingError::PublicationUncertain);
         }
         Err(error) => {
-            // apply_setup's publication contract classifies every error after
-            // identity/config publication as PublicationUncertain. Only its
-            // definite pre-publication errors authorize this exact-new-key cleanup.
-            if let Some(saved) = saved
-                && store
-                    .remove(&id, ExpectedRevision::Exact(saved.revision))
-                    .is_err()
-            {
-                return Err(OnboardingError::PublicationUncertain);
+            // A definite pre-publication failure permits cleanup only if a fresh,
+            // locked config read proves the newly saved identity is unreferenced.
+            if let Some(saved) = saved {
+                match remove_credential_if_unreferenced(&draft.home, &id, saved.revision) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => return Err(OnboardingError::CredentialCleanupPending),
+                }
             }
             return Err(error.into());
         }
     };
+
+    let mut warnings = Vec::new();
+    if let Some((old_id, Some(old_revision))) = old_credential
+        && old_id != id
+        && remove_credential_if_unreferenced(&draft.home, &old_id, old_revision).is_err()
+    {
+        warnings.push("Provider configuration was saved, but the previous private credential could not be safely retired. Review the credential store before rotating again.");
+    }
     // The authoritative provider config is published and its locks released.
     // Optional metadata failure must never roll back this successful setup.
-    let (metadata_saved, warnings) = publish_optional_metadata(
+    let (metadata_saved, metadata_warnings) = publish_optional_metadata(
         &draft.home,
         &draft.provider,
         draft.provenance.as_deref(),
         draft.metadata_warning,
     );
+    warnings.extend(metadata_warnings);
     let main = draft
         .main
         .or_else(|| (!draft.expected_main.is_empty()).then_some(draft.expected_main));
@@ -1161,6 +1924,8 @@ pub fn collect_provider_login_with_services(
         .find(|provider| provider.name == name)
         .cloned()
         .ok_or(OnboardingError::Invalid("Unknown configured provider"))?;
+    // Pin the old saved record before login input or browser flow begins.
+    let expected_credential_revision = saved_revision(&home, &expected)?;
     let method = match request.method {
         Some(method) => method,
         None => {
@@ -1230,6 +1995,7 @@ pub fn collect_provider_login_with_services(
         home,
         plan,
         expected_provider: Some(expected),
+        expected_credential_revision,
         expected_main: existing.roles.main,
         private_key,
         confirmed: false,
@@ -1239,8 +2005,9 @@ pub fn collect_provider_login_with_services(
         authentication_online: method == ProviderLoginMethod::Browser,
     };
     let (source, ready) = credential_status(&draft)?;
+    let credential_reference = draft.provider.env.as_deref().unwrap_or("none");
     terminal.message(&format!("Provider: {}\nEndpoint: {}\nCredential reference: {}\nCredential: {}{}\nModels and defaults are preserved. Completion connectivity: not tested.",
-        draft.provider.name, draft.provider.url, draft.provider.env.as_deref().unwrap_or("none"),
+        safe_display(&draft.provider.name), safe_display(&draft.provider.url), safe_display(credential_reference),
         source, if ready { "" } else { " (missing)" }))?;
     if draft.provider.env
         != draft
@@ -1282,6 +2049,27 @@ fn saved_revision(
         ProviderCredentialStatus::NoAuth | ProviderCredentialStatus::Missing => Ok(None),
         ProviderCredentialStatus::Invalid(error) => Err(error.into()),
     }
+}
+
+/// Remove a saved credential only while holding the config publication locks and
+/// only when a fresh read confirms no provider still references its exact identity.
+fn remove_credential_if_unreferenced(
+    home: &Path,
+    credential_identity: &ProviderAuthIdentity,
+    revision: ProviderCredentialRevision,
+) -> Result<bool, OnboardingError> {
+    let directory = Directory::open(home, true)?;
+    let _setup = Lock::acquire(&directory, ".setup.lock")?;
+    let _config = Lock::acquire(&directory, ".config.lock")?;
+    let config = config_snapshot(home)?;
+    for provider in &config.provider {
+        if &identity(provider)? == credential_identity {
+            return Ok(false);
+        }
+    }
+    ProviderCredentialStore::new(home)?
+        .remove(credential_identity, ExpectedRevision::Exact(revision))?;
+    Ok(true)
 }
 pub fn plan_provider_logout(
     home: &Path,
@@ -1372,7 +2160,7 @@ pub fn confirm_provider_logout(
     plan: ProviderLogoutPlan,
     terminal: &mut impl SetupTerminal,
 ) -> Result<ProviderLogoutReceipt, OnboardingError> {
-    terminal.message(&format!("Remove the current saved local key for {}? Provider configuration, models, defaults and ENV values are preserved. This does not revoke a key at the provider.", plan.provider.name))?;
+    terminal.message(&format!("Remove the current saved local key for {}? Provider configuration, models, defaults and ENV values are preserved. This does not revoke a key at the provider.", safe_display(&plan.provider.name)))?;
     if !yes(terminal, "Log out locally? Type yes to confirm")? {
         return Err(OnboardingError::Canceled);
     }
@@ -1389,18 +2177,19 @@ struct ModelSelection {
 fn manual_selection<T: SetupTerminal>(
     terminal: &mut T,
     status: &'static str,
-) -> Result<ModelSelection, OnboardingError> {
-    Ok(ModelSelection {
-        models: parse_manual_models(&answer(
-            terminal,
-            "Raw model IDs (comma-separated)",
-            None,
-            33 * 1024,
-        )?)?,
+) -> Result<StepValue<ModelSelection>, OnboardingError> {
+    let models = setup_field!(terminal, |terminal| parse_manual_models(&answer(
+        terminal,
+        "Raw model IDs (comma-separated)",
+        None,
+        33 * 1024,
+    )?));
+    Ok(StepValue::Complete(ModelSelection {
+        models,
         provenance: None,
         catalog_status: status,
         metadata_warning: false,
-    })
+    }))
 }
 
 fn profile_for(
@@ -1436,10 +2225,203 @@ fn safe_display(value: &str) -> String {
     value.chars().flat_map(char::escape_default).collect()
 }
 
+fn choose_catalog_rich<T: SetupTerminal>(
+    terminal: &mut T,
+    catalog: &[DiscoveredModel],
+) -> Result<StepValue<Option<Vec<DiscoveredModel>>>, OnboardingError> {
+    const PAGE_SIZE: usize = 20;
+    const FILTER: &str = "catalog:filter";
+    const MANUAL: &str = "catalog:manual";
+    const PREVIOUS: &str = "catalog:previous";
+    const NEXT: &str = "catalog:next";
+    const FINISH: &str = "catalog:finish";
+
+    let mut filter = String::new();
+    let mut page = 0usize;
+    let mut selected = Vec::<usize>::new();
+    let mut focus = None::<String>;
+    loop {
+        let filtered: Vec<usize> = catalog
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| {
+                filter.is_empty()
+                    || model.id.to_lowercase().contains(&filter)
+                    || model
+                        .label
+                        .as_ref()
+                        .is_some_and(|label| label.to_lowercase().contains(&filter))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let pages = filtered.len().div_ceil(PAGE_SIZE).max(1);
+        page = page.min(pages - 1);
+        let start = page * PAGE_SIZE;
+        let mut owned = Vec::<(String, String, Option<String>)>::new();
+        for index in filtered.iter().copied().skip(start).take(PAGE_SIZE) {
+            let model = &catalog[index];
+            let marker = if selected.contains(&index) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let label = format!(
+                "{} {}{}",
+                marker,
+                safe_display(&model.id),
+                model
+                    .label
+                    .as_ref()
+                    .map(|label| format!(" - {}", safe_display(label)))
+                    .unwrap_or_default()
+            );
+            let context = model
+                .context_window
+                .filter(|_| model.metadata_valid)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let output = model
+                .max_output_tokens
+                .filter(|_| model.metadata_valid)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            owned.push((
+                format!("catalog:model:{index}"),
+                label,
+                Some(format!("Context: {context}; max output: {output}")),
+            ));
+        }
+        owned.push((
+            FILTER.to_owned(),
+            "Filter by model ID or label".to_owned(),
+            None,
+        ));
+        if page > 0 {
+            owned.push((PREVIOUS.to_owned(), "Previous page".to_owned(), None));
+        }
+        if page + 1 < pages {
+            owned.push((NEXT.to_owned(), "Next page".to_owned(), None));
+        }
+        owned.push((
+            MANUAL.to_owned(),
+            "Use manual entry instead".to_owned(),
+            None,
+        ));
+        owned.push((
+            FINISH.to_owned(),
+            format!("Finish selection ({} selected)", selected.len()),
+            None,
+        ));
+        let choices: Vec<_> = owned
+            .iter()
+            .map(|(id, label, detail)| SetupChoice {
+                id,
+                label,
+                detail: detail.as_deref(),
+            })
+            .collect();
+        let title = format!(
+            "Discovered models (page {}/{}, {} selected; Enter toggles, Finish continues)",
+            page + 1,
+            pages,
+            selected.len()
+        );
+        let choice = match terminal.select(&title, &choices, focus.as_deref(), true)? {
+            SetupSelection::Chosen(id) => id,
+            SetupSelection::Back => return Ok(StepValue::Back),
+            SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+        };
+        if let Some(index) = choice
+            .strip_prefix("catalog:model:")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|index| {
+                filtered
+                    .iter()
+                    .copied()
+                    .skip(start)
+                    .take(PAGE_SIZE)
+                    .any(|visible| visible == *index)
+            })
+        {
+            if let Some(position) = selected.iter().position(|selected| *selected == index) {
+                selected.remove(position);
+            } else if selected.len() < 128 {
+                selected.push(index);
+            } else {
+                terminal.message(
+                    "You can select at most 128 models. Remove one before adding another.",
+                )?;
+            }
+            focus = Some(choice);
+            continue;
+        }
+        match choice.as_str() {
+            FILTER => {
+                let query = terminal.line("Filter models (blank shows all)", 128)?;
+                filter = query.trim().to_lowercase();
+                page = 0;
+                focus = filtered
+                    .iter()
+                    .copied()
+                    .find(|index| catalog[*index].id.to_lowercase().contains(&filter))
+                    .map(|index| format!("catalog:model:{index}"));
+            }
+            PREVIOUS => {
+                page = page.saturating_sub(1);
+                focus = filtered
+                    .iter()
+                    .copied()
+                    .skip(page * PAGE_SIZE)
+                    .take(PAGE_SIZE)
+                    .next()
+                    .map(|index| format!("catalog:model:{index}"));
+            }
+            NEXT => {
+                page = (page + 1).min(pages - 1);
+                focus = filtered
+                    .iter()
+                    .copied()
+                    .skip(page * PAGE_SIZE)
+                    .take(PAGE_SIZE)
+                    .next()
+                    .map(|index| format!("catalog:model:{index}"));
+            }
+            MANUAL => {
+                if selected.is_empty()
+                    || yes(
+                        terminal,
+                        "Discard selected catalog models and enter them manually?",
+                    )?
+                {
+                    return Ok(StepValue::Complete(None));
+                }
+            }
+            FINISH => {
+                if selected.is_empty() {
+                    terminal.message("Select at least one model, or choose manual entry.")?;
+                    continue;
+                }
+                return Ok(StepValue::Complete(Some(
+                    selected
+                        .iter()
+                        .map(|index| catalog[*index].clone())
+                        .collect(),
+                )));
+            }
+            _ => {
+                terminal.message("Choose a visible model or catalog action.")?;
+            }
+        }
+    }
+}
+
 fn choose_catalog<T: SetupTerminal>(
     terminal: &mut T,
     catalog: &[DiscoveredModel],
-) -> Result<Option<Vec<DiscoveredModel>>, OnboardingError> {
+) -> Result<StepValue<Option<Vec<DiscoveredModel>>>, OnboardingError> {
+    if terminal.rich_choices_available() {
+        return choose_catalog_rich(terminal, catalog);
+    }
     const PAGE_SIZE: usize = 20;
     let mut filter = String::new();
     let mut page: usize = 0;
@@ -1490,12 +2472,12 @@ fn choose_catalog<T: SetupTerminal>(
                     .unwrap_or_else(|| "unknown".into())
             ))?;
         }
-        let choice = answer(
+        let choice = setup_field!(terminal, |terminal| answer(
             terminal,
             "Select model numbers (comma-separated), next, prev, filter TEXT, manual, or cancel",
             None,
             2048,
-        )?;
+        ));
         match choice.as_str() {
             "next" => {
                 page = (page + 1).min(pages - 1);
@@ -1510,7 +2492,7 @@ fn choose_catalog<T: SetupTerminal>(
                 page = 0;
                 continue;
             }
-            "manual" => return Ok(None),
+            "manual" => return Ok(StepValue::Complete(None)),
             "cancel" => return Err(OnboardingError::Canceled),
             _ => {}
         }
@@ -1519,30 +2501,40 @@ fn choose_catalog<T: SetupTerminal>(
             page = 0;
             continue;
         }
-        let mut seen = BTreeSet::new();
-        let mut selected = Vec::new();
-        for part in choice.split(',').map(str::trim) {
-            let index = part
-                .parse::<usize>()
-                .ok()
-                .and_then(|index| index.checked_sub(1))
-                .filter(|index| *index < filtered.len())
-                .ok_or(OnboardingError::Invalid("Select valid catalog numbers"))?;
-            if !seen.insert(index) || selected.len() >= 128 {
-                return Err(OnboardingError::Invalid(
-                    "Select 1..128 distinct catalog numbers",
-                ));
+        let parsed = (|| {
+            let mut seen = BTreeSet::new();
+            let mut selected = Vec::new();
+            for part in choice.split(',').map(str::trim) {
+                let index = part
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .filter(|index| *index < filtered.len())
+                    .ok_or(OnboardingError::Invalid("Select valid catalog numbers"))?;
+                if !seen.insert(index) || selected.len() >= 128 {
+                    return Err(OnboardingError::Invalid(
+                        "Select 1..128 distinct catalog numbers",
+                    ));
+                }
+                selected.push((*filtered[index]).clone());
             }
-            selected.push((*filtered[index]).clone());
+            Ok(selected)
+        })();
+        match parsed {
+            Ok(selected) => return Ok(StepValue::Complete(Some(selected))),
+            Err(OnboardingError::Invalid(message)) => match recover_field(terminal, message)? {
+                FieldRecovery::Retry => {}
+                FieldRecovery::Back => return Ok(StepValue::Back),
+            },
+            Err(error) => return Err(error),
         }
-        return Ok(Some(selected));
     }
 }
 
 fn fallback_after_error<T: SetupTerminal>(
     terminal: &mut T,
     error: OnboardingError,
-) -> Result<ModelSelection, OnboardingError> {
+) -> Result<StepValue<ModelSelection>, OnboardingError> {
     match error {
         OnboardingError::Canceled
         | OnboardingError::TerminalIo
@@ -1563,24 +2555,22 @@ fn collect_models<T: SetupTerminal>(
     home: &Path,
     provider: &ProviderConfig,
     private_key: Option<&SecretBytes>,
-    custom: bool,
-    preset: &str,
+    preset: &crate::presets::ProviderPreset,
     terminal: &mut T,
     discovery: &mut impl ModelDiscoveryFactory,
-) -> Result<ModelSelection, OnboardingError> {
-    match answer(
-        terminal,
-        "Model source (manual/discover)",
-        Some("manual"),
-        16,
-    )?
-    .as_str()
-    {
+    source: &str,
+) -> Result<StepValue<ModelSelection>, OnboardingError> {
+    match source {
         "manual" => return manual_selection(terminal, "not_requested"),
         "discover" => {}
         _ => return Err(OnboardingError::Invalid("Choose manual or discover")),
     }
-    let profile = profile_for(&provider.kind, custom, preset, terminal)?;
+    let profile = setup_field!(terminal, |terminal| profile_for(
+        &provider.kind,
+        preset.id == "custom",
+        preset.id,
+        terminal
+    ));
     let id = identity(provider)?;
     let mut session =
         match discovery.open(home, provider, profile, private_key.map(|key| (&id, key))) {
@@ -1607,15 +2597,17 @@ fn collect_models<T: SetupTerminal>(
         return manual_selection(terminal, "manual_fallback");
     }
     if catalog.completeness == DiscoveryCompleteness::Incomplete
-        && !yes(
+        && !setup_field!(terminal, |terminal| yes(
             terminal,
             "Catalog is incomplete. Use partial results? (yes/no)",
-        )?
+        ))
     {
         return manual_selection(terminal, "manual_fallback");
     }
-    let Some(selected) = choose_catalog(terminal, &catalog.models)? else {
-        return manual_selection(terminal, "manual_fallback");
+    let selected = match choose_catalog(terminal, &catalog.models)? {
+        StepValue::Complete(Some(selected)) => selected,
+        StepValue::Complete(None) => return manual_selection(terminal, "manual_fallback"),
+        StepValue::Back => return Ok(StepValue::Back),
     };
     // The same session/deadline/credential serves every selected detail. This
     // includes all unknown Anthropic selections, not just the first one.
@@ -1647,7 +2639,8 @@ fn collect_models<T: SetupTerminal>(
                 context_limits: None,
                 id: observed.id.clone(),
                 label: None,
-                pricing: Pricing::default(),
+                pricing: None,
+                billing: None,
                 max_output_tokens: None,
                 context_window: None,
                 sampling: None,
@@ -1666,12 +2659,12 @@ fn collect_models<T: SetupTerminal>(
         }
         models.push(merged.model);
     }
-    Ok(ModelSelection {
+    Ok(StepValue::Complete(ModelSelection {
         models,
         provenance: Some(provenance),
         catalog_status: status,
         metadata_warning,
-    })
+    }))
 }
 
 const METADATA_WARNING: &str = "Provider saved. Optional metadata history is unavailable or uncertain; review model limits before refresh.";
@@ -1940,6 +2933,217 @@ impl StdSetupTerminal {
         Ok(Self)
     }
 
+    #[allow(unsafe_code)] // Choice input borrows stdin using the existing terminal guards.
+    fn read_choice(
+        &mut self,
+        prompt: &str,
+        choices: &[SetupChoice<'_>],
+        current: Option<&str>,
+        allow_back: bool,
+    ) -> Result<Option<SetupSelection>, OnboardingError> {
+        use crate::setup_terminal_ui::{self as ui, Key};
+        validate_choices(choices, current)?;
+        let dimensions = terminal_dimensions()?;
+        if dimensions.0 < 24 || dimensions.1 < 8 {
+            return Ok(None);
+        }
+        let _serial = TERMINAL_LOCK
+            .lock()
+            .map_err(|_| OnboardingError::TerminalIo)?;
+        let signals = SignalGuard::new()?;
+        let guard = EchoGuard::new(libc::STDIN_FILENO)?;
+        let mut out = std::io::stdout().lock();
+        let mut screen = ChoiceScreen::new(&mut out)?;
+        let mut menu = ui::Menu::new(
+            choices.len(),
+            current.and_then(|id| choices.iter().position(|choice| choice.id == id)),
+        );
+        let mut typed = Vec::new();
+        let mut escaped = Vec::new();
+        let mut escape_started = None;
+        let mut error = "";
+        let mut redraw = true;
+        let mut last_dimensions = None;
+        let result = (|| {
+            loop {
+                if CANCELED.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(OnboardingError::Canceled);
+                }
+                let (columns, rows) = terminal_dimensions()?;
+                if columns < 24 || rows < 8 {
+                    return Ok(None);
+                }
+                let mut frame =
+                    ui::frame(prompt, choices, &menu, &typed, columns, rows, allow_back);
+                frame.lines[2] = ui::clip(error, columns.saturating_sub(1));
+                if redraw || last_dimensions != Some((columns, rows)) {
+                    out.write_all(b"\x1b[H\x1b[2J")
+                        .map_err(|_| OnboardingError::TerminalIo)?;
+                    for (index, line) in frame.lines.iter().enumerate() {
+                        if index > 0 {
+                            out.write_all(b"\r\n")
+                                .map_err(|_| OnboardingError::TerminalIo)?;
+                        }
+                        let style: &[u8] = if index == 0 {
+                            b"\x1b[1;35m"
+                        } else if index == frame.selected_line {
+                            b"\x1b[1;36m"
+                        } else if index == 2 && !error.is_empty() {
+                            b"\x1b[33m"
+                        } else {
+                            b"\x1b[0m"
+                        };
+                        out.write_all(style)
+                            .and_then(|()| out.write_all(line.as_bytes()))
+                            .and_then(|()| out.write_all(b"\x1b[0m"))
+                            .map_err(|_| OnboardingError::TerminalIo)?;
+                    }
+                    out.flush().map_err(|_| OnboardingError::TerminalIo)?;
+                    redraw = false;
+                    last_dimensions = Some((columns, rows));
+                }
+                let mut ready = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: ready is one initialized writable pollfd borrowed for this call.
+                let polled =
+                    unsafe { libc::poll(&mut ready, 1, if escaped.is_empty() { 100 } else { 30 }) };
+                let event = if polled == 0 {
+                    if escape_started.is_some_and(|at: std::time::Instant| {
+                        at.elapsed() >= std::time::Duration::from_millis(90)
+                    }) {
+                        escaped.clear();
+                        escape_started = None;
+                        Key::Back
+                    } else {
+                        continue;
+                    }
+                } else {
+                    if polled < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        return Err(OnboardingError::TerminalIo);
+                    }
+                    if ready.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                        return Err(OnboardingError::TerminalIo);
+                    }
+                    if ready.revents & libc::POLLIN == 0 {
+                        if ready.revents & libc::POLLHUP != 0 {
+                            return Err(OnboardingError::Canceled);
+                        }
+                        continue;
+                    }
+                    let mut byte = [0u8; 1];
+                    // SAFETY: byte is an initialized, live writable one-byte buffer; stdin is borrowed.
+                    let count =
+                        unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+                    if count == 0 {
+                        return Err(OnboardingError::Canceled);
+                    }
+                    if count < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        return Err(OnboardingError::TerminalIo);
+                    }
+                    if byte[0] == 27 && escaped.is_empty() {
+                        escaped.push(27);
+                        escape_started = Some(std::time::Instant::now());
+                        continue;
+                    }
+                    if escaped.is_empty() {
+                        ui::key(&byte).unwrap_or(Key::Ignore)
+                    } else {
+                        escaped.push(byte[0]);
+                        match ui::key(&escaped) {
+                            Some(event) => {
+                                escaped.clear();
+                                escape_started = None;
+                                event
+                            }
+                            None => continue,
+                        }
+                    }
+                };
+                redraw = true;
+                match event {
+                    Key::Cancel => return Err(OnboardingError::Canceled),
+                    Key::Back => {
+                        return Ok(Some(if allow_back {
+                            SetupSelection::Back
+                        } else {
+                            SetupSelection::Canceled
+                        }));
+                    }
+                    Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown => {
+                        typed.clear();
+                        error = "";
+                        menu.navigate(event, frame.page);
+                    }
+                    Key::Erase => {
+                        if !typed.is_empty() {
+                            let mut start = typed.len() - 1;
+                            while start > 0 && typed[start] & 0xc0 == 0x80 {
+                                start -= 1;
+                            }
+                            typed.truncate(start);
+                        }
+                        error = "";
+                    }
+                    Key::Text(byte) => {
+                        if typed.len() < ui::MAX_TYPED_BYTES {
+                            typed.push(byte);
+                            error = "";
+                        } else {
+                            error = "Choice exceeds its byte limit; erase or choose a row.";
+                        }
+                    }
+                    Key::Enter => {
+                        let selected = if typed.is_empty() && menu.armed {
+                            Some(SetupSelection::Chosen(choices[menu.selected].id.to_owned()))
+                        } else {
+                            std::str::from_utf8(&typed).ok().and_then(|value| {
+                                selected_answer(value, choices, current, allow_back)
+                            })
+                        };
+                        if let Some(selected) = selected {
+                            return Ok(Some(selected));
+                        }
+                        typed.clear();
+                        error = "Choose an offered number, identity, or arrow-selected row.";
+                    }
+                    Key::Ignore => {}
+                }
+            }
+        })();
+        if result.is_err()
+            || matches!(
+                &result,
+                Ok(Some(SetupSelection::Back | SetupSelection::Canceled))
+            )
+        {
+            // SAFETY: tcflush operates only on the borrowed terminal fd and retains no pointer.
+            unsafe {
+                libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+            }
+        }
+        let screen_restored = screen.restore(&mut out);
+        let restored = guard.restore();
+        let signals_restored = signals.restore();
+        restored?;
+        signals_restored?;
+        screen_restored?;
+        if CANCELED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(OnboardingError::Canceled);
+        }
+        result
+    }
+
     fn read(
         &mut self,
         prompt: &str,
@@ -2090,6 +3294,25 @@ impl StdSetupTerminal {
 }
 
 impl SetupTerminal for StdSetupTerminal {
+    fn rich_choices_available(&self) -> bool {
+        std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM").is_ok_and(|term| !term.is_empty() && term != "dumb")
+    }
+
+    fn select(
+        &mut self,
+        prompt: &str,
+        choices: &[SetupChoice<'_>],
+        current: Option<&str>,
+        allow_back: bool,
+    ) -> Result<SetupSelection, OnboardingError> {
+        if self.rich_choices_available()
+            && let Some(selected) = self.read_choice(prompt, choices, current, allow_back)?
+        {
+            return Ok(selected);
+        }
+        plain_select(self, prompt, choices, current, allow_back)
+    }
     fn message(&mut self, message: &str) -> Result<(), OnboardingError> {
         let mut out = std::io::stdout().lock();
         out.write_all(message.as_bytes())
@@ -2119,6 +3342,44 @@ impl SetupTerminal for StdSetupTerminal {
             .map_err(|_| OnboardingError::Invalid("Hidden input must be UTF-8"))?;
         Ok(SecretBytes::new(std::mem::take(&mut *bytes)))
     }
+}
+
+struct ChoiceScreen {
+    restored: bool,
+}
+impl ChoiceScreen {
+    fn new(out: &mut impl Write) -> Result<Self, OnboardingError> {
+        let screen = Self { restored: false };
+        out.write_all(b"\x1b[?1049h\x1b[?25l")
+            .and_then(|()| out.flush())
+            .map_err(|_| OnboardingError::TerminalIo)?;
+        Ok(screen)
+    }
+    fn restore(&mut self, out: &mut impl Write) -> Result<(), OnboardingError> {
+        out.write_all(b"\x1b[?25h\x1b[0m\x1b[?1049l")
+            .and_then(|()| out.flush())
+            .map_err(|_| OnboardingError::TerminalIo)?;
+        self.restored = true;
+        Ok(())
+    }
+}
+impl Drop for ChoiceScreen {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = std::io::stdout().write_all(b"\x1b[?25h\x1b[0m\x1b[?1049l");
+        }
+    }
+}
+
+#[allow(unsafe_code)] // A read-only terminal-size ioctl on borrowed stdout.
+fn terminal_dimensions() -> Result<(usize, usize), OnboardingError> {
+    // SAFETY: winsize is a zero-valid C aggregate used as an initialized writable output.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: size is live and correctly aligned for TIOCGWINSZ; the fd is borrowed.
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return Err(OnboardingError::TerminalIo);
+    }
+    Ok((usize::from(size.ws_col), usize::from(size.ws_row)))
 }
 
 static TERMINAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2314,5 +3575,63 @@ mod tests {
         }
         assert!(input_buffer(0).is_err());
         assert!(input_buffer(64 * 1024 + 1).is_err());
+    }
+
+    #[test]
+    fn safe_display_escapes_bidi_formatting_without_changing_stored_identity() {
+        let raw = "provider\u{202e}model";
+        let rendered = safe_display(raw);
+        assert_eq!(rendered, "provider\\u{202e}model");
+        assert!(!rendered.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn back_from_default_model_selector_returns_to_models_stage() {
+        struct ScriptedTerminal {
+            answers: std::collections::VecDeque<&'static str>,
+        }
+
+        impl SetupTerminal for ScriptedTerminal {
+            fn message(&mut self, _message: &str) -> Result<(), OnboardingError> {
+                Ok(())
+            }
+
+            fn line(
+                &mut self,
+                _prompt: &str,
+                _max_bytes: usize,
+            ) -> Result<String, OnboardingError> {
+                self.answers
+                    .pop_front()
+                    .map(str::to_owned)
+                    .ok_or(OnboardingError::Canceled)
+            }
+
+            fn hidden(
+                &mut self,
+                _prompt: &str,
+                _max_bytes: usize,
+            ) -> Result<SecretBytes, OnboardingError> {
+                Ok(SecretBytes::new(Vec::new()))
+            }
+        }
+
+        let provider: ProviderConfig = toml::from_str(
+            r#"
+name = "fixture"
+url = "http://127.0.0.1:9/v1"
+[[models]]
+id = "family/raw"
+"#,
+        )
+        .unwrap();
+        let mut terminal = ScriptedTerminal {
+            answers: std::collections::VecDeque::from(["yes", "back", "cancel"]),
+        };
+
+        let result = collect_default(&mut terminal, &provider, "").unwrap();
+
+        assert!(matches!(result, StepValue::Back));
+        assert_eq!(terminal.answers.front(), Some(&"cancel"));
     }
 }

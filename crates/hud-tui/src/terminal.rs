@@ -42,7 +42,7 @@
 //! so cleanup does not try to report the failure through an already-dead stderr.
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -206,6 +206,20 @@ const WATCHDOG_POLL_MS: i64 = 500;
 /// final render or a busy provider round finishing up.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(3);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollFailureAction {
+    Retry,
+    TerminalDeath,
+}
+
+fn poll_failure_action(error: rustix::io::Errno) -> PollFailureAction {
+    if error == rustix::io::Errno::INTR {
+        PollFailureAction::Retry
+    } else {
+        PollFailureAction::TerminalDeath
+    }
+}
+
 impl TerminalWatchdog {
     /// Spawn the watchdog for the input fd crossterm reads (stdin — the
     /// guard is only entered when stdin is a TTY; crossterm's `tty_fd()`
@@ -229,13 +243,17 @@ impl TerminalWatchdog {
             };
             let n = match poll(&mut fds, Some(&timeout)) {
                 Ok(n) => n,
-                Err(_) => {
-                    // A transient poll failure (EINTR-class) — retry. A
-                    // permanent one means the fd is unusable; treat that
-                    // as terminal death rather than spinning.
-                    std::thread::sleep(Duration::from_millis(WATCHDOG_POLL_MS as u64));
-                    continue;
-                }
+                Err(error) => match poll_failure_action(error) {
+                    PollFailureAction::Retry => {
+                        // Preserve the normal poll cadence after interruption.
+                        std::thread::sleep(Duration::from_millis(WATCHDOG_POLL_MS as u64));
+                        continue;
+                    }
+                    PollFailureAction::TerminalDeath => {
+                        Self::terminal_died();
+                        return;
+                    }
+                },
             };
             if n == 0 {
                 continue;
@@ -265,6 +283,75 @@ impl TerminalWatchdog {
         // process the grace period, then take the conventional exit.
         std::thread::sleep(WATCHDOG_GRACE);
         std::process::exit(ShutdownSignal::Hangup.exit_code());
+    }
+}
+
+fn enter_startup_screen<W: Write>(writer: &mut W, mouse_capture: bool) -> io::Result<()> {
+    if mouse_capture {
+        execute!(
+            writer,
+            EnterAlternateScreen,
+            Hide,
+            EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
+        )
+    } else {
+        execute!(
+            writer,
+            EnterAlternateScreen,
+            Hide,
+            crossterm::event::EnableBracketedPaste
+        )
+    }
+}
+
+fn restore_startup_screen<W: Write>(writer: &mut W, mouse_capture: bool) {
+    // Attempt each reset independently: a partially failed write must not
+    // prevent later terminal modes from being restored.
+    execute!(writer, Show).ok();
+    if mouse_capture {
+        execute!(writer, DisableMouseCapture).ok();
+    }
+    execute!(writer, DisableBracketedPaste).ok();
+    execute!(writer, LeaveAlternateScreen).ok();
+}
+
+struct StartupRestore<W: Write, F: FnMut()> {
+    writer: Option<W>,
+    mouse_capture: bool,
+    disable_raw_mode: F,
+    armed: bool,
+}
+
+impl<W: Write, F: FnMut()> StartupRestore<W, F> {
+    fn new(writer: W, mouse_capture: bool, disable_raw_mode: F) -> Self {
+        Self {
+            writer: Some(writer),
+            mouse_capture,
+            disable_raw_mode,
+            armed: true,
+        }
+    }
+
+    fn writer(&mut self) -> &mut W {
+        self.writer.as_mut().expect("startup writer is present")
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+        self.writer.take();
+    }
+}
+
+impl<W: Write, F: FnMut()> Drop for StartupRestore<W, F> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(writer) = self.writer.as_mut() {
+            restore_startup_screen(writer, self.mouse_capture);
+        }
+        (self.disable_raw_mode)();
     }
 }
 
@@ -299,7 +386,9 @@ impl TerminalGuard {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, SIGINT_FLAG.clone());
 
         enable_raw_mode().map_err(|e| format!("enable_raw_mode: {e}"))?;
-        let mut stdout = std::io::stdout();
+        let mut startup_restore = StartupRestore::new(std::io::stdout(), mouse_capture, || {
+            disable_raw_mode().ok();
+        });
         // Mouse capture (SGR mode): the app owns the mouse so selection is
         // per-pane — the host terminal's native selection grabs rectangular
         // regions across pane borders because it doesn't know the panes
@@ -307,26 +396,13 @@ impl TerminalGuard {
         // Bracketed paste (D12): without it, a pasted multi-line block
         // arrives as individual keystrokes — every line's first Enter
         // submits a partial prompt.
-        if mouse_capture {
-            execute!(
-                stdout,
-                EnterAlternateScreen,
-                Hide,
-                EnableMouseCapture,
-                crossterm::event::EnableBracketedPaste
-            )
+        enter_startup_screen(startup_restore.writer(), mouse_capture)
             .map_err(|e| format!("enter alt screen: {e}"))?;
-        } else {
-            execute!(
-                stdout,
-                EnterAlternateScreen,
-                Hide,
-                crossterm::event::EnableBracketedPaste
-            )
-            .map_err(|e| format!("enter alt screen: {e}"))?;
-        }
-        let backend = CrosstermBackend::new(TerminalWriter::new(stdout));
+        // A second handle targets the same stdout stream. Keeping the first
+        // handle in the guard lets every setup failure restore the terminal.
+        let backend = CrosstermBackend::new(TerminalWriter::new(std::io::stdout()));
         let terminal = Terminal::new(backend).map_err(|e| format!("create terminal: {e}"))?;
+        startup_restore.disarm();
         // The watchdog watches the same fd crossterm reads (stdin — we are
         // only here when stdin is a TTY). Spawned AFTER raw mode + alt
         // screen so a probe failure never leaves a watchdog behind.
@@ -380,6 +456,38 @@ mod tests {
 
     struct FakeWriter(Rc<RefCell<WriterState>>);
 
+    #[derive(Default)]
+    struct StartupWriterState {
+        bytes: Vec<u8>,
+        fail_after_bytes: Option<usize>,
+        failed: bool,
+    }
+
+    struct StartupWriter(Rc<RefCell<StartupWriterState>>);
+
+    impl Write for StartupWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut state = self.0.borrow_mut();
+            if let Some(limit) = state.fail_after_bytes
+                && !state.failed
+            {
+                if state.bytes.len() < limit {
+                    let written = (limit - state.bytes.len()).min(buf.len());
+                    state.bytes.extend_from_slice(&buf[..written]);
+                    return Ok(written);
+                }
+                state.failed = true;
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            state.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn copy_error(error: &io::Error) -> io::Error {
         error
             .raw_os_error()
@@ -430,6 +538,71 @@ mod tests {
     /// The signal flags are process-global; tests that mutate them must not
     /// interleave (cargo runs tests in parallel threads).
     static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn watchdog_retries_only_interrupted_poll_errors() {
+        assert_eq!(
+            poll_failure_action(rustix::io::Errno::INTR),
+            PollFailureAction::Retry
+        );
+        assert_eq!(
+            poll_failure_action(rustix::io::Errno::BADF),
+            PollFailureAction::TerminalDeath
+        );
+    }
+
+    #[test]
+    fn partial_startup_write_attempts_every_terminal_restore() {
+        use std::cell::Cell;
+
+        let state = Rc::new(RefCell::new(StartupWriterState {
+            fail_after_bytes: Some(3),
+            ..StartupWriterState::default()
+        }));
+        let raw_mode_disabled = Rc::new(Cell::new(0));
+        let raw_mode_disabled_on_drop = raw_mode_disabled.clone();
+        let mut restore = StartupRestore::new(StartupWriter(state.clone()), true, move || {
+            raw_mode_disabled_on_drop.set(raw_mode_disabled_on_drop.get() + 1);
+        });
+
+        assert!(enter_startup_screen(restore.writer(), true).is_err());
+        drop(restore);
+
+        let state = state.borrow();
+        assert!(
+            state.failed,
+            "startup output did not fail partway through a command"
+        );
+        assert!(state.bytes.len() > 3, "restore output was not attempted");
+        let mut expected_restore = Vec::new();
+        execute!(expected_restore, Show).unwrap();
+        execute!(expected_restore, DisableMouseCapture).unwrap();
+        execute!(expected_restore, DisableBracketedPaste).unwrap();
+        execute!(expected_restore, LeaveAlternateScreen).unwrap();
+        assert!(
+            state.bytes.ends_with(&expected_restore),
+            "cleanup did not attempt all independent terminal resets"
+        );
+        assert_eq!(raw_mode_disabled.get(), 1);
+    }
+
+    #[test]
+    fn successful_startup_disarm_does_not_restore_terminal() {
+        use std::cell::Cell;
+
+        let state = Rc::new(RefCell::new(StartupWriterState::default()));
+        let raw_mode_disabled = Rc::new(Cell::new(0));
+        let raw_mode_disabled_on_drop = raw_mode_disabled.clone();
+        let mut restore = StartupRestore::new(StartupWriter(state.clone()), true, move || {
+            raw_mode_disabled_on_drop.set(raw_mode_disabled_on_drop.get() + 1);
+        });
+        enter_startup_screen(restore.writer(), true).unwrap();
+        let bytes_before_disarm = state.borrow().bytes.clone();
+        restore.disarm();
+
+        assert_eq!(raw_mode_disabled.get(), 0);
+        assert_eq!(state.borrow().bytes, bytes_before_disarm);
+    }
 
     #[test]
     fn terminal_writer_forwards_healthy_output() {

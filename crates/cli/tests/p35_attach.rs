@@ -3,8 +3,8 @@
 pub use orbit_cli::{
     apply_effort_setting, checked_model_turn, config, context_window_for_turn, effort_status,
     model_limits, parse_effort_setting, phase_routing, provider_policies, resolve_selected_model,
-    route_command, session_accounting, sessions, tool_runtime, tools, try_engine_turn_config,
-    try_phase_turn_config, try_role_turn_config, tui_worker,
+    route_command, session_accounting, session_config, sessions, tool_runtime, tools,
+    try_engine_turn_config, try_phase_turn_config, try_role_turn_config,
 };
 #[path = "../src/attach.rs"]
 pub mod attach;
@@ -59,7 +59,7 @@ impl Fixture {
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        let turn = tui_worker::TuiTurnConfig {
+        let turn = session_config::SessionTurnConfig {
             home: root.clone(),
             session_id: "owned".into(),
             gate,

@@ -68,13 +68,14 @@ pub fn hint_row_themed(
     let mut line = Line::from(spans);
     // The toast rides the right end, ending at the last column.
     if let Some(t) = toast {
-        let used: u16 = line.width() as u16;
-        let tw = t.chars().count() as u16 + 2;
-        if used + tw <= width {
+        let used = line.width();
+        let rendered_toast = format!("✓ {t}");
+        let tw = super::shell::canvas::text_width(&rendered_toast).max(0) as usize;
+        if used.saturating_add(tw) <= width as usize {
             let mut spans: Vec<Span> = line.spans;
-            spans.push(Span::raw(" ".repeat((width - used - tw) as usize)));
+            spans.push(Span::raw(" ".repeat(width as usize - used - tw)));
             spans.push(Span::styled(
-                format!("✓ {t}"),
+                rendered_toast,
                 Style::default().fg(comps::colour_themed(colors, Token::Green)),
             ));
             line = Line::from(spans);
@@ -484,7 +485,7 @@ fn quit_keys_themed(colors: crate::proto::shell::pal::Palette) -> Line<'static> 
     ])
 }
 
-/// The size notice (§9.23): below 40 × 10 this is the whole screen.
+/// The size notice (§9.23): below 40 × 11 this is the whole screen.
 pub fn size_notice_lines_themed(
     colors: crate::proto::shell::pal::Palette,
     w: u16,
@@ -492,7 +493,7 @@ pub fn size_notice_lines_themed(
 ) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(
-            "ORBIT needs at least 40 × 10",
+            "ORBIT needs at least 40 × 11",
             Style::default()
                 .fg(comps::colour_themed(colors, Token::Ink))
                 .add_modifier(Modifier::BOLD),
@@ -632,6 +633,49 @@ mod tests {
         let l = hint_row(false, false, Some("resent your last prompt"), 100);
         let txt: String = l.spans.iter().map(|s| s.content.to_string()).collect();
         assert!(txt.contains("✓ resent your last prompt"));
+    }
+
+    #[test]
+    fn toast_reservation_uses_the_rendered_cell_width() {
+        let colors = crate::proto::shell::pal::Palette::default();
+        let base = hint_row_themed(colors, false, false, None, 120);
+        let base_width = base.width() as u16;
+        let cjk_width = super::super::shell::canvas::text_width("✓ 界") as u16;
+        let cjk = hint_row_themed(colors, false, false, Some("界"), base_width + cjk_width);
+        let cjk_text = cjk.spans.iter().fold(String::new(), |mut text, span| {
+            text.push_str(&span.content);
+            text
+        });
+        assert!(cjk_text.contains("✓ 界"));
+        assert_eq!(cjk.width(), (base_width + cjk_width) as usize);
+
+        let too_narrow =
+            hint_row_themed(colors, false, false, Some("界"), base_width + cjk_width - 1);
+        let narrow_text = too_narrow
+            .spans
+            .iter()
+            .fold(String::new(), |mut text, span| {
+                text.push_str(&span.content);
+                text
+            });
+        assert!(!narrow_text.contains("✓ 界"));
+        assert!(too_narrow.width() <= (base_width + cjk_width - 1) as usize);
+
+        let combining_width = super::super::shell::canvas::text_width("✓ e\u{301}") as u16;
+        let combining = hint_row_themed(
+            colors,
+            false,
+            false,
+            Some("e\u{301}"),
+            base_width + combining_width,
+        );
+        assert!(
+            combining
+                .spans
+                .iter()
+                .any(|span| span.content.contains("✓ e\u{301}"))
+        );
+        assert_eq!(combining.width(), (base_width + combining_width) as usize);
     }
 
     #[test]

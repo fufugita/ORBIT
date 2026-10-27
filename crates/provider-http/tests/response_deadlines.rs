@@ -775,22 +775,36 @@ async fn actual_defaults_case(delay: Duration) {
         outcome.events,
         vec![
             ProviderStreamEvent {
+                usage_observation: None,
                 sequence: 0,
                 event: ProviderEventKind::ResponseStarted {
                     upstream_request_id: None
                 }
             },
             ProviderStreamEvent {
+                usage_observation: None,
                 sequence: 1,
                 event: ProviderEventKind::TextDelta {
                     bytes: ANSWER.as_bytes().to_vec()
                 }
             },
             ProviderStreamEvent {
+                usage_observation: Some(orbit_adapter::types::UsageObservationMetaV1 {
+                    version: 1,
+                    reasoning_reporting:
+                        orbit_adapter::types::UsageReasoningReportingV1::NotReported,
+                    snapshot_origin: orbit_adapter::types::UsageSnapshotOriginV1::ProviderReported,
+                }),
                 sequence: 2,
                 event: ProviderEventKind::UsageUpdate(usage)
             },
             ProviderStreamEvent {
+                usage_observation: Some(orbit_adapter::types::UsageObservationMetaV1 {
+                    version: 1,
+                    reasoning_reporting:
+                        orbit_adapter::types::UsageReasoningReportingV1::NotReported,
+                    snapshot_origin: orbit_adapter::types::UsageSnapshotOriginV1::ProviderReported,
+                }),
                 sequence: 3,
                 event: ProviderEventKind::Finished {
                     finish_reason: Some("stop".into()),
@@ -935,6 +949,8 @@ mod response_phase_tests {
     #[derive(Clone, Copy, Debug)]
     enum Case {
         Headers,
+        AmbiguousHeaders,
+        AmbiguousPeerClose,
         AbsoluteStart,
         Buffered,
         Idle,
@@ -944,6 +960,7 @@ mod response_phase_tests {
     struct Plan {
         headers: Duration,
         writes: Vec<(Duration, Vec<u8>)>,
+        close_without_headers: bool,
     }
     impl Plan {
         fn for_case(family: Family, case: Case) -> Self {
@@ -952,14 +969,27 @@ mod response_phase_tests {
                 Case::Headers => Self {
                     headers: ms(300),
                     writes: vec![(ms(300), response_parts(family, &[ANSWER]).concat())],
+                    close_without_headers: false,
+                },
+                Case::AmbiguousHeaders => Self {
+                    headers: ms(300),
+                    writes: vec![(ms(300), response_parts(family, &[ANSWER]).concat())],
+                    close_without_headers: false,
+                },
+                Case::AmbiguousPeerClose => Self {
+                    headers: Duration::ZERO,
+                    writes: Vec::new(),
+                    close_without_headers: true,
                 },
                 Case::AbsoluteStart => Self {
                     headers: ms(600),
                     writes: vec![(ms(1200), response_parts(family, &[ANSWER]).concat())],
+                    close_without_headers: false,
                 },
                 Case::Buffered => Self {
                     headers: Duration::ZERO,
                     writes: vec![(Duration::ZERO, response_parts(family, &[ANSWER]).concat())],
+                    close_without_headers: false,
                 },
                 Case::Idle => {
                     let mut parts = response_parts(family, &[ANSWER]).into_iter();
@@ -969,6 +999,7 @@ mod response_phase_tests {
                             (Duration::ZERO, parts.next().unwrap()),
                             (ms(600), parts.next().unwrap()),
                         ],
+                        close_without_headers: false,
                     }
                 }
                 Case::LongStream => Self {
@@ -978,6 +1009,7 @@ mod response_phase_tests {
                         .enumerate()
                         .map(|(index, part)| (ms(index as u64 * 150), part))
                         .collect(),
+                    close_without_headers: false,
                 },
             }
         }
@@ -1191,6 +1223,10 @@ mod response_phase_tests {
             .send(())
             .map_err(|_| "phase capture owner disappeared")?;
         let captured = evidence.captured.ok_or("phase capture timestamp")?;
+        if plan.close_without_headers {
+            let _ = socket.shutdown(Shutdown::Write);
+            return finish_socket(&owner, &socket, evidence);
+        }
         wait_until(&owner, &socket, evidence, captured + plan.headers)?;
         let body_len: usize = plan.writes.iter().map(|(_, bytes)| bytes.len()).sum();
         let content_type = if matches!(family, Family::Ollama) {
@@ -1487,12 +1523,22 @@ mod response_phase_tests {
         let adapter = family.adapter();
         let (fixture, trace) = start_phase(family, Some(Plan::for_case(family, case))).unwrap();
         let mut request = family.request(adapter.as_ref(), fixture.port);
-        request.connect_timeout_ms = if matches!(case, Case::AbsoluteStart | Case::Buffered) {
+        request.connect_timeout_ms = if matches!(
+            case,
+            Case::AbsoluteStart
+                | Case::Buffered
+                | Case::AmbiguousHeaders
+                | Case::AmbiguousPeerClose
+        ) {
             2000
         } else {
             100
         };
-        request.first_byte_timeout_ms = 1000;
+        request.first_byte_timeout_ms = if matches!(case, Case::AmbiguousHeaders) {
+            100
+        } else {
+            1000
+        };
         request.idle_timeout_ms = if matches!(case, Case::Idle) { 250 } else { 400 };
         let secret = SecretBytes::new(KEY.as_bytes().to_vec());
         let cancel = CancelToken::new();
@@ -1548,15 +1594,35 @@ mod response_phase_tests {
             "phase infrastructure: {outcome:?}"
         );
         let captured = evidence.captured.unwrap();
-        let header = evidence.header_attempt.unwrap();
+        let header = evidence.header_attempt;
         match case {
             Case::Headers => {
+                let header = header.expect("successful case publishes response headers");
                 assert!(header >= captured + Duration::from_millis(300));
                 assert!(header - sent_at < Duration::from_millis(900));
                 assert!(evidence.publication_error.is_none() && trace.all_body_published);
                 assert_success(family, &outcome, ANSWER);
             }
+            Case::AmbiguousHeaders => {
+                let header = header.expect("delayed-header case attempts response headers");
+                assert!(header >= captured + Duration::from_millis(300));
+                assert!(returned < header, "deadline must beat delayed headers");
+                assert!(outcome.events.is_empty());
+                assert!(matches!(
+                    &outcome.error,
+                    Some(AdapterError::DispatchAmbiguous(_))
+                ));
+            }
+            Case::AmbiguousPeerClose => {
+                assert!(header.is_none());
+                assert!(outcome.events.is_empty());
+                assert!(matches!(
+                    &outcome.error,
+                    Some(AdapterError::DispatchAmbiguous(_))
+                ));
+            }
             Case::AbsoluteStart | Case::Buffered | Case::Idle => {
+                let header = header.expect("response-phase case attempts response headers");
                 assert!(
                     matches!(outcome.error, Some(AdapterError::ProviderTimeout(_))),
                     "desired phase timeout: {outcome:?}"
@@ -1741,6 +1807,14 @@ mod response_phase_tests {
                 #[tokio::test]
                 async fn connected_headers_outlive_connect_budget() {
                     phase_case($family, Case::Headers).await;
+                }
+                #[tokio::test]
+                async fn delayed_headers_after_full_post_are_ambiguous() {
+                    phase_case($family, Case::AmbiguousHeaders).await;
+                }
+                #[tokio::test]
+                async fn peer_close_after_full_post_is_ambiguous() {
+                    phase_case($family, Case::AmbiguousPeerClose).await;
                 }
                 #[tokio::test]
                 async fn headers_and_first_body_share_one_deadline() {

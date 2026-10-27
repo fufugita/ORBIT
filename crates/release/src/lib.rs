@@ -1,8 +1,12 @@
-//! ORBIT release evidence — Phase G (M7).
+//! Release metadata and layout helpers.
 //!
-//! `orbit version --evidence` per DR-13 §9: version, build metadata, SBOM hash,
-//! provenance, reproducibility, audit state. The evidence bundle (DR-03 §11)
-//! is hash-linked so `orbit verify` can check it.
+//! This crate does not produce verified release evidence, and no verified
+//! evidence is currently bound to the executable bytes reported by the CLI.
+//! `VersionEvidence` only serializes caller-supplied assertions; it does not
+//! verify them. `generate_sbom` serializes caller-supplied entries without
+//! discovering dependencies, validating licenses, or computing their hashes.
+//! `validate_evidence_bundle` checks required paths only; it does not inspect
+//! contents or verify provenance, signatures, reproducibility, or audits.
 
 #![forbid(unsafe_code)]
 
@@ -34,25 +38,45 @@ pub struct VersionEvidence {
 }
 
 impl VersionEvidence {
-    /// Build the evidence record from the release facts.
-    pub fn build(version: &str, commit_sha: &str, sbom: &[u8], reproducibility_hash: &str) -> Self {
+    /// Serialize explicitly supplied release facts.
+    ///
+    /// This constructor computes hashes of the supplied SBOM and notice bytes,
+    /// but it does not verify any other field or assertion.
+    pub fn from_facts(facts: VersionEvidenceFacts<'_>) -> Self {
         Self {
-            version: version.into(),
-            commit_sha: commit_sha.into(),
-            built_at: chrono_now(),
-            toolchain: "rustc-pinned".into(), // pinned via rust-toolchain.toml (DR-13 §4.3)
-            target: "x86_64-unknown-linux-musl".into(),
-            profile: "release".into(),
-            sbom_sha256: hex::encode(Sha256::digest(sbom)),
-            provenance_uri: format!(
-                "https://releases.orbit/{version}/evidence/provenance.intoto.jsonl"
-            ),
-            signature_key_id: "orbit-release-v0.1".into(),
-            reproducible_hash: reproducibility_hash.into(),
-            audit_status: "cargo-audit clean; cargo-deny clean".into(),
-            notice_sha256: hex::encode(Sha256::digest(b"NOTICE")),
+            version: facts.version.into(),
+            commit_sha: facts.commit_sha.into(),
+            built_at: facts.built_at.into(),
+            toolchain: facts.toolchain.into(),
+            target: facts.target.into(),
+            profile: facts.profile.into(),
+            sbom_sha256: hex::encode(Sha256::digest(facts.sbom_bytes)),
+            provenance_uri: facts.provenance_uri.into(),
+            signature_key_id: facts.signature_key_id.into(),
+            reproducible_hash: facts.reproducible_hash.into(),
+            audit_status: facts.audit_status.into(),
+            notice_sha256: hex::encode(Sha256::digest(facts.notice_bytes)),
         }
     }
+}
+
+/// Caller-provided metadata for [`VersionEvidence::from_facts`].
+///
+/// Values other than the two byte-slice hashes are copied as assertions; this
+/// type does not establish that they are true.
+pub struct VersionEvidenceFacts<'a> {
+    pub version: &'a str,
+    pub commit_sha: &'a str,
+    pub built_at: &'a str,
+    pub toolchain: &'a str,
+    pub target: &'a str,
+    pub profile: &'a str,
+    pub sbom_bytes: &'a [u8],
+    pub provenance_uri: &'a str,
+    pub signature_key_id: &'a str,
+    pub reproducible_hash: &'a str,
+    pub audit_status: &'a str,
+    pub notice_bytes: &'a [u8],
 }
 
 /// A minimal SBOM entry (SPDX 2.3 shape, DR-13 §8): one per dependency.
@@ -65,14 +89,16 @@ pub struct SbomEntry {
     pub supplier: String,
 }
 
-/// Generate an SPDX-style SBOM from the resolved dependency list.
-/// (The real tool is cargo-sbom/syft at release time; this produces the
-/// contract-shaped JSON the evidence bundle requires.)
-pub fn generate_sbom(entries: &[SbomEntry]) -> Vec<u8> {
+/// Serialize caller-supplied entries into an SPDX-shaped document.
+///
+/// This does not discover dependencies, validate license expressions, or
+/// compute package hashes. The caller must provide a unique valid SPDX
+/// document namespace and independently verify every entry.
+pub fn generate_sbom(document_namespace: &str, entries: &[SbomEntry]) -> Vec<u8> {
     let doc = serde_json::json!({
         "spdxVersion": "SPDX-2.3",
         "dataLicense": "CC0-1.0",
-        "documentNamespace": "https://releases.orbit/orbit/0.1.0/sbom",
+        "documentNamespace": document_namespace,
         "packages": entries.iter().map(|e| serde_json::json!({
             "name": e.name,
             "versionInfo": e.version,
@@ -103,7 +129,9 @@ pub const EVIDENCE_LAYOUT: &[&str] = &[
     "demo-transcript.md",
 ];
 
-/// Validate the evidence bundle has every required file (DR-03 §11).
+/// Check that required evidence-layout paths exist.
+///
+/// This is a presence-only check and does not verify content or authenticity.
 pub fn validate_evidence_bundle(dir: &std::path::Path) -> Result<(), ReleaseError> {
     for required in EVIDENCE_LAYOUT {
         let p = dir.join(required);
@@ -116,26 +144,44 @@ pub fn validate_evidence_bundle(dir: &std::path::Path) -> Result<(), ReleaseErro
     Ok(())
 }
 
-fn chrono_now() -> String {
-    // ISO-8601 UTC (no chrono dep needed for the release crate).
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| format!("1970-01-01T00:00:00+00:00+{}s", d.as_secs()))
-        .unwrap_or_else(|_| "unknown".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn version_evidence_is_json_stable() {
-        let e = VersionEvidence::build("0.1.0", "abc123", b"sbom-bytes", "repro-hash");
+        let e = VersionEvidence::from_facts(VersionEvidenceFacts {
+            version: "0.1.0",
+            commit_sha: "abc123",
+            built_at: "test-fixture-time",
+            toolchain: "test-fixture-toolchain",
+            target: "test-fixture-target",
+            profile: "test-fixture-profile",
+            sbom_bytes: b"sbom-bytes",
+            provenance_uri: "test-fixture-provenance",
+            signature_key_id: "test-fixture-key",
+            reproducible_hash: "test-fixture-repro-hash",
+            audit_status: "test-fixture-audit-status",
+            notice_bytes: b"notice-bytes",
+        });
         let a = serde_json::to_string(&e).unwrap();
         let b = serde_json::to_string(&e).unwrap();
         assert_eq!(a, b);
         assert_eq!(e.version, "0.1.0");
-        assert_eq!(e.sbom_sha256.len(), 64);
+        assert_eq!(e.commit_sha, "abc123");
+        assert_eq!(e.built_at, "test-fixture-time");
+        assert_eq!(e.toolchain, "test-fixture-toolchain");
+        assert_eq!(e.target, "test-fixture-target");
+        assert_eq!(e.profile, "test-fixture-profile");
+        assert_eq!(e.sbom_sha256, hex::encode(Sha256::digest(b"sbom-bytes")));
+        assert_eq!(e.provenance_uri, "test-fixture-provenance");
+        assert_eq!(e.signature_key_id, "test-fixture-key");
+        assert_eq!(e.reproducible_hash, "test-fixture-repro-hash");
+        assert_eq!(e.audit_status, "test-fixture-audit-status");
+        assert_eq!(
+            e.notice_sha256,
+            hex::encode(Sha256::digest(b"notice-bytes"))
+        );
     }
 
     #[test]
@@ -147,47 +193,37 @@ mod tests {
             sha256: "a".repeat(64),
             supplier: "crates.io".into(),
         }];
-        let sbom = generate_sbom(&entries);
+        let sbom = generate_sbom("https://example.invalid/test/sbom", &entries);
         let v: serde_json::Value = serde_json::from_slice(&sbom).unwrap();
         assert_eq!(v["spdxVersion"], "SPDX-2.3");
+        assert_eq!(v["documentNamespace"], "https://example.invalid/test/sbom");
         assert_eq!(v["packages"][0]["name"], "serde");
     }
 
     #[test]
     fn evidence_bundle_missing_file_rejected() {
-        let dir = std::env::temp_dir().join("orbit-evidence-nonexistent");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(validate_evidence_bundle(&dir).is_err());
-    }
-
-    #[test]
-    fn evidence_bundle_has_all_required_files() {
-        // The real evidence bundle must pass validation — every §11 file
-        // present and non-placeholder. Generated by scripts/build-release-evidence.sh.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .parent()
-            .unwrap()
-            .join("evidence/v0.1");
-        let result = validate_evidence_bundle(&dir);
-        match result {
-            Ok(_) => {}
-            Err(e) => panic!("evidence bundle incomplete: {e}"),
+            .as_nanos();
+        let mut owned_dir = None;
+        for attempt in 0..100 {
+            let candidate = std::env::temp_dir().join(format!(
+                "orbit-evidence-layout-test-{}-{timestamp}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => {
+                    owned_dir = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create isolated evidence-test directory: {error}"),
+            }
         }
-        // Spot-check the SBOM is a real SPDX doc with packages.
-        let sbom_raw = std::fs::read_to_string(dir.join("sbom.spdx.json")).unwrap();
-        let sbom: serde_json::Value = serde_json::from_str(&sbom_raw).unwrap();
-        assert_eq!(sbom["spdxVersion"], "SPDX-2.3");
-        assert!(
-            sbom["packages"]
-                .as_array()
-                .map(|a| !a.is_empty())
-                .unwrap_or(false)
-        );
-        // Spot-check reproducibility: the binary built twice is byte-identical.
-        let repro_raw = std::fs::read_to_string(dir.join("reproducibility.json")).unwrap();
-        let repro: serde_json::Value = serde_json::from_str(&repro_raw).unwrap();
-        assert_eq!(repro["result"], "identical");
+        let owned_dir = owned_dir.expect("find unused evidence-test directory name");
+        let missing_bundle = owned_dir.join("bundle");
+        assert!(validate_evidence_bundle(&missing_bundle).is_err());
+        std::fs::remove_dir(&owned_dir).expect("remove empty evidence-test directory");
     }
 }

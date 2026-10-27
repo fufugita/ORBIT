@@ -1082,6 +1082,15 @@ cache_read_per_million_microdollars = 10000
 cache_write_per_million_microdollars = 10000
 reasoning_per_million_microdollars = 10000
 request_flat_microdollars = 1
+[provider.models.billing]
+version = 2
+input_per_million_microdollars = 10000
+output_per_million_microdollars = 10000
+cache_read_per_million_microdollars = 10000
+cache_write_per_million_microdollars = 10000
+request_flat_microdollars = 1
+reasoning_counter_basis = "included_in_output"
+reasoning_rate_policy = "output_rate"
 "#
         ),
     )

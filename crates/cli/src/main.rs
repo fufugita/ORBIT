@@ -15,7 +15,9 @@ use orbit_reactor::{CancelOrigin, CancelTarget, CancellationToken, Reactor};
 use std::path::{Path, PathBuf};
 
 use orbit_cli::session_accounting::{self, FullCostStatus, NamespaceSpendPolicy, RootOrigin};
-use orbit_cli::{config, sessions, tool_runtime, tools, tui_worker};
+#[cfg(feature = "tui")]
+use orbit_cli::tui_worker;
+use orbit_cli::{config, sessions, tool_runtime, tools};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -106,9 +108,13 @@ fn main() {
     match result {
         Ok(v) => {
             let command = positionals(&args).first().copied().unwrap_or("");
-            let human = ["setup", "doctor", "pentest"].contains(&command)
+            let human = (["setup", "doctor", "pentest"].contains(&command)
+                || (command == "init"
+                    && v.get("interactive").and_then(serde_json::Value::as_bool) == Some(true)))
                 && !args.iter().any(|arg| arg == "--json");
-            if command == "plugin" && !args.iter().any(|arg| arg == "--json") {
+            if command == "config" && !args.iter().any(|arg| arg == "--json") {
+                print!("{}", orbit_cli::configuration_ui::human_report(&v));
+            } else if command == "plugin" && !args.iter().any(|arg| arg == "--json") {
                 print!("{}", orbit_cli::plugin_commands::human_report(&v));
             } else if human {
                 print!("{}", orbit_cli::cli_release_commands::human_report(&v));
@@ -163,7 +169,14 @@ fn print_human_help() {
             "setup",
             "terminal provider wizard; manual/JSON modes remain offline",
         ),
-        ("init", "initialize once (setup compatibility alias)"),
+        (
+            "init",
+            "interactive setup; --no-provider keeps initialization offline",
+        ),
+        (
+            "config [show] [--json]",
+            "choose defaults, routing and appearance",
+        ),
         (
             "doctor [--json]",
             "offline readiness; never starts configured servers",
@@ -225,7 +238,10 @@ fn print_human_help() {
         ("replay --dry", "verify + emit a no-dispatch replay plan"),
         ("export --to", "encrypt an age bundle"),
         ("restore", "restore into a fresh namespace"),
-        ("version", "release evidence (claims + hashes)"),
+        (
+            "version",
+            "version metadata (release evidence may be unavailable)",
+        ),
         (
             "mod install/list/search/status",
             "durable signed package catalog",
@@ -362,6 +378,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
     match verb.as_str() {
         "init" => cmd_init(&home, args),
         "setup" => cmd_setup(&home, args, false),
+        "config" => cmd_config(&home, args),
         "doctor" => orbit_cli::cli_release_commands::doctor(&home, &command_tail(args)?),
         "pentest" => orbit_cli::cli_release_commands::pentest(&home, &command_tail(args)?),
         "customize" | "theme" => {
@@ -415,7 +432,8 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "(bare)        start the interactive harness",
                 "chat          start the interactive harness (explicit alias)",
                 "setup         terminal provider wizard; explicit manual/JSON/offline flags supported",
-                "init          setup compatibility alias",
+                "init          terminal setup wizard; --no-provider initializes offline",
+                "config [show] [--json]  interactive defaults, routing and appearance; show is read-only",
                 "doctor [--json] offline readiness without server startup",
                 "pentest init|status|templates|readiness local engagement workflows",
                 "customize show|capabilities|set|theme|reset|validate|import|export portable customization",
@@ -433,7 +451,7 @@ fn dispatch(args: &[String]) -> Result<serde_json::Value, (&'static str, String)
                 "replay --dry  verify + emit a no-dispatch replay plan",
                 "export --to   encrypt an age bundle",
                 "restore       restore into a fresh namespace",
-                "version       release evidence (claims + hashes)",
+                "version       version metadata (release evidence may be unavailable)",
                 "mod install <pkg> --manifest <m> --yes  store a verified signed package",
                 "mod list|search|status           verified installed package catalog",
                 "mod issuers                     trusted package issuers",
@@ -498,16 +516,43 @@ fn command_tail(args: &[String]) -> Result<Vec<String>, (&'static str, String)> 
     Ok(tail)
 }
 
+fn cmd_config(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static str, String)> {
+    let tail = command_tail(args)?;
+    let words: Vec<&str> = tail.iter().map(String::as_str).collect();
+    let interactive = match words.as_slice() {
+        [] => {
+            std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        }
+        ["show"] | ["--json"] | ["show", "--json"] => false,
+        _ => return Err(("ORBIT-E1101", "usage: config [show] [--json]".into())),
+    };
+    let workspace = std::env::current_dir().map_err(ioe)?;
+    if interactive {
+        let mut terminal = orbit_cli::onboarding::StdSetupTerminal::new()
+            .map_err(|error| (error.code(), error.to_string()))?;
+        orbit_cli::configuration_ui::run(home, &workspace, &mut terminal)
+            .map_err(|error| (error.code(), error.to_string()))
+    } else {
+        orbit_cli::configuration_ui::show(home, &workspace)
+            .map_err(|error| (error.code(), error.to_string()))
+    }
+}
+
 fn cmd_setup(
     home: &Path,
     args: &[String],
     initialize: bool,
 ) -> Result<serde_json::Value, (&'static str, String)> {
-    let tail = command_tail(args)?;
+    let tail = if args.is_empty() {
+        Vec::new()
+    } else {
+        command_tail(args)?
+    };
     let parsed = orbit_cli::cli_release_commands::parse_setup(&tail)?;
     let terminal = std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let interactive = parsed.interactive_provider || (!initialize && tail.is_empty() && terminal);
+    let interactive = parsed.interactive_provider || (tail.is_empty() && terminal);
     if interactive {
         if tail.iter().any(|arg| arg == "--json") || !parsed.request.routing.is_empty() {
             return Err((
@@ -543,6 +588,7 @@ fn run_onboarding_command(
     result["command"] = serde_json::json!(command);
     result["status"] = serde_json::json!("ok");
     result["offline"] = serde_json::json!(offline);
+    result["interactive"] = serde_json::json!(true);
     Ok(result)
 }
 
@@ -602,10 +648,8 @@ fn add_configured_provider_kind(
                 default_effort: None,
                 id,
                 label: None,
-                pricing: pricing
-                    .as_ref()
-                    .and_then(|p| p.get(i).copied())
-                    .unwrap_or_default(),
+                pricing: pricing.as_ref().and_then(|p| p.get(i).copied()),
+                billing: None,
                 max_output_tokens: None,
                 context_window: None,
             })
@@ -736,6 +780,7 @@ fn validate_discovery_input(
             id: "discovery-validation".into(),
             label: None,
             pricing: Default::default(),
+            billing: None,
             max_output_tokens: None,
             context_window: None,
             sampling: None,
@@ -1247,7 +1292,7 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
     let resolved_gate = turn.gate.as_str();
     let model = turn.model.clone();
     let credential_env = turn.credential_env.as_deref();
-    let pricing = cfg.pricing_for_model(&model);
+    let pricing = cfg.pricing_for_provider_model(provider_id, &model);
 
     let detailed = match orbit_cli::run_turn_detailed(
         home,
@@ -1264,13 +1309,13 @@ fn cmd_ask(home: &Path, args: &[String]) -> Result<serde_json::Value, (&'static 
         Ok(result) => result,
         Err(error) => {
             for notice in &error.context_notices {
-                eprintln!("{}", orbit_hud_tui::safe_text(notice));
+                eprintln!("{}", orbit_hud::safe_text(notice));
             }
             return Err((error.code, error.message));
         }
     };
     for notice in &detailed.context_notices {
-        eprintln!("{}", orbit_hud_tui::safe_text(notice));
+        eprintln!("{}", orbit_hud::safe_text(notice));
     }
     let estimate_status = match detailed.estimate.status {
         orbit_engine::context_budget::EstimateStatus::Approximate => "approximate",
@@ -2525,7 +2570,7 @@ fn cmd_headless(args: &[String]) -> i32 {
         }
         match &ev {
             orbit_frontend_protocol::FrontendEvent::Status { text } => {
-                let text = orbit_hud_tui::safe_text(text);
+                let text = orbit_hud::safe_text(text);
                 if !stream_json {
                     eprintln!("{text}");
                 }
@@ -3992,23 +4037,12 @@ fn cmd_chat(args: &[String]) -> i32 {
             continue;
         };
 
-        // Resolve the provider for the current model (config overrides the
-        // default gate). `credential_env` names the env var holding the token.
-        let provider = cfg
-            .provider
-            .iter()
-            .find(|p| p.name == active_provider)
-            .or_else(|| cfg.provider_for_model(&model));
-        let provider_id = provider
-            .map(|p| p.name.as_str())
-            .unwrap_or("configured-gateway")
-            .to_string();
-        let resolved_gate = provider
-            .map(|p| p.url.as_str())
-            .unwrap_or(gate.as_str())
-            .to_string();
-        let credential_env = provider.and_then(|p| p.env.as_deref());
-        let pricing = cfg.pricing_for_model(&model);
+        // Re-resolve the saved provider/model pair from the current config at
+        // every turn boundary. A raw model ID alone is ambiguous when two
+        // providers declare the same ID, so a stale startup snapshot must
+        // never fall back to whichever provider happens to match first.
+        let provider_id = active_provider.clone();
+        let gate_override = cfg.provider.is_empty().then_some(gate.as_str());
         let auto_tools = args.iter().any(|a| a == "--auto-tools");
         let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
@@ -4022,13 +4056,12 @@ fn cmd_chat(args: &[String]) -> i32 {
         // Phase 2: the loop is the ENGINE's — the REPL supplies only the
         // event adapter (stdout) and the tool executor (StdApprovalChannel,
         // session grants). The old 8-round copy of the loop is gone.
-        let mut base_turn_config = match orbit_cli::try_engine_turn_config(
+        let mut base_turn_config = match orbit_cli::checked_model_turn(
             &home,
-            &provider_id,
-            &resolved_gate,
             &model,
-            credential_env,
-            pricing,
+            Some(&provider_id),
+            gate_override,
+            true,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -4056,6 +4089,7 @@ fn cmd_chat(args: &[String]) -> i32 {
             eprintln!("ORBIT-E0401: {error}");
             continue;
         }
+        let resolved_gate = base_turn_config.gate.clone();
         let (turn_config, routing_decision) = match orbit_cli::try_phase_turn_config(
             &home,
             &base_turn_config,
@@ -4155,7 +4189,7 @@ fn cmd_chat(args: &[String]) -> i32 {
                     eprintln!("{message}");
                 }
                 E::Status { text } => {
-                    eprintln!("{}", orbit_hud_tui::safe_text(&text));
+                    eprintln!("{}", orbit_hud::safe_text(&text));
                 }
                 E::Usage {
                     used_tokens,
@@ -5917,7 +5951,7 @@ fn cmd_serve(args: &[String]) -> i32 {
         {
             return Err(format!("unknown permission mode {mode}"));
         }
-        let mut turn = tui_worker::TuiTurnConfig {
+        let mut turn = orbit_cli::session_config::SessionTurnConfig {
             home: home.clone(),
             session_id: lease.session_id().into(),
             gate: checked.gate.clone(),
@@ -6549,6 +6583,49 @@ default_effort = "medium"
         );
         let _ = std::fs::remove_dir_all(home);
     }
+
+    #[test]
+    fn repl_model_switch_binds_duplicate_raw_id_to_the_selected_provider() {
+        let home = crate::billing_test_support::TemporaryHome::new("orbit-repl-billing");
+        std::fs::write(
+            home.join("providers.toml"),
+            crate::billing_test_support::duplicate_provider_config(
+                "http://127.0.0.1:1",
+                "http://127.0.0.1:2",
+            ),
+        )
+        .unwrap();
+
+        let mut model = "shared-notools".to_string();
+        let mut provider = "first".to_string();
+        let mut effort = None;
+        let mut transcript = Vec::new();
+        let gate = "http://127.0.0.1:1";
+        let usage = (0, 0, 0, 0);
+        let _ = handle_chat_command(
+            "/model second/shared-notools",
+            &home,
+            &mut model,
+            &mut effort,
+            gate,
+            &mut provider,
+            &mut transcript,
+            (&usage.0, &usage.1, &usage.2, &usage.3),
+        );
+
+        let turn = chat_effort_config(&home, &model, gate, Some(&provider), None).unwrap();
+        assert_eq!(provider, "second");
+        assert_eq!(turn.model, "shared-notools");
+        assert_eq!(turn.gate, "http://127.0.0.1:2");
+        let billing = turn.billing.as_ref().unwrap();
+        assert_eq!(billing.provider_id().0, "second");
+        assert_eq!(billing.raw_model_id().0, "shared-notools");
+        assert_eq!(
+            billing.rates().input_per_million_microdollars,
+            Some(2_000_000)
+        );
+        assert_eq!(billing.rates().request_flat_microdollars, Some(20));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -6785,11 +6862,12 @@ mod provider_wizard_tests {
             context_limits: None,
             id: "vendor/raw".into(),
             label: Some("Exact".into()),
-            pricing: config::Pricing {
-                input_per_million_microdollars: 123,
-                output_per_million_microdollars: 456,
+            pricing: Some(config::Pricing {
+                input_per_million_microdollars: Some(123),
+                output_per_million_microdollars: Some(456),
                 ..Default::default()
-            },
+            }),
+            billing: None,
             max_output_tokens: Some(12345),
             context_window: Some(200000),
             sampling: None,
@@ -7554,5 +7632,209 @@ mod plain_signal_result_tests {
             &failed,
             Some(view)
         ));
+    }
+}
+
+#[cfg(test)]
+mod configuration_command_tests {
+    use super::*;
+
+    fn arguments(home: &Path, tail: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "--home".into(),
+            home.to_string_lossy().into_owned(),
+            "config".into(),
+        ];
+        args.extend(tail.iter().map(|word| (*word).to_owned()));
+        args
+    }
+
+    #[test]
+    fn config_rejects_invalid_grammar_before_creating_a_home() {
+        let home = std::env::temp_dir().join(format!("orbit-config-grammar-{}", ulid::Ulid::new()));
+        for tail in [
+            vec!["show", "--json", "--json"],
+            vec!["--json", "--json"],
+            vec!["--json", "show"],
+            vec!["show", "extra"],
+            vec!["set"],
+            vec!["--interactive"],
+        ] {
+            let error = dispatch(&arguments(&home, &tail)).unwrap_err();
+            assert_eq!(error.0, "ORBIT-E1101");
+            assert_eq!(error.1, "usage: config [show] [--json]");
+            assert!(
+                !home.exists(),
+                "invalid grammar must not create configuration storage"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_config_show_forms_remain_read_only_without_initialization() {
+        let home =
+            std::env::temp_dir().join(format!("orbit-config-readonly-{}", ulid::Ulid::new()));
+        for tail in [vec!["show"], vec!["--json"], vec!["show", "--json"]] {
+            let value = dispatch(&arguments(&home, &tail)).unwrap();
+            assert!(value.is_object());
+            assert!(
+                !home.exists(),
+                "read-only configuration cannot initialize the home"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod billing_test_support {
+    use std::sync::atomic::Ordering;
+
+    pub(crate) struct TemporaryHome(std::path::PathBuf);
+
+    impl TemporaryHome {
+        pub(crate) fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("{label}-{}", ulid::Ulid::new()));
+            std::fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self(path)
+        }
+    }
+
+    impl std::ops::Deref for TemporaryHome {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub(crate) fn duplicate_provider_config(first_url: &str, second_url: &str) -> String {
+        format!(
+            r#"
+[[provider]]
+name = "first"
+url = "{first_url}"
+[[provider.models]]
+id = "shared-notools"
+supported_efforts = ["low", "high"]
+default_effort = "low"
+[provider.models.billing]
+version = 2
+input_per_million_microdollars = 1000000
+output_per_million_microdollars = 1000000
+request_flat_microdollars = 10
+reasoning_counter_basis = "included_in_output"
+reasoning_rate_policy = "output_rate"
+[[provider]]
+name = "second"
+url = "{second_url}"
+[[provider.models]]
+id = "shared-notools"
+supported_efforts = ["medium"]
+default_effort = "medium"
+[provider.models.billing]
+version = 2
+input_per_million_microdollars = 2000000
+output_per_million_microdollars = 3000000
+request_flat_microdollars = 20
+reasoning_counter_basis = "included_in_output"
+reasoning_rate_policy = "output_rate"
+"#
+        )
+    }
+
+    pub(crate) struct MockProvider {
+        pub(crate) endpoint: String,
+        pub(crate) state: orbit_mock_provider::ServerState,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockProvider {
+        pub(crate) fn start() -> Self {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async move {
+                    let (addr, state, server) = orbit_mock_provider::spawn().await.unwrap();
+                    ready_tx.send((addr, state)).unwrap();
+                    let _ = stop_rx.await;
+                    server.abort();
+                });
+            });
+            let (addr, state) = ready_rx.recv().unwrap();
+            Self {
+                endpoint: format!("http://{addr}"),
+                state,
+                stop: Some(stop_tx),
+                thread: Some(thread),
+            }
+        }
+
+        pub(crate) fn request_count(&self) -> u64 {
+            self.state.requests.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn last_request(&self) -> serde_json::Value {
+            self.state.last_body.lock().unwrap().clone().unwrap()
+        }
+    }
+
+    impl Drop for MockProvider {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_shot_billing_selection_tests {
+    use super::*;
+
+    #[test]
+    fn ask_uses_selected_provider_billing_for_duplicate_raw_model_ids() {
+        let server = billing_test_support::MockProvider::start();
+        let home = billing_test_support::TemporaryHome::new("orbit-ask-billing");
+        cmd_init(&home, &[]).unwrap();
+        std::fs::write(
+            home.join("providers.toml"),
+            billing_test_support::duplicate_provider_config("http://127.0.0.1:1", &server.endpoint),
+        )
+        .unwrap();
+
+        let result = cmd_ask(
+            &home,
+            &[
+                "ask".into(),
+                "hello".into(),
+                "--provider".into(),
+                "second".into(),
+                "--model".into(),
+                "shared-notools".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(server.last_request()["model"], "shared-notools");
+        assert_eq!(result["usage"]["input_tokens"], 3);
+        assert_eq!(result["usage"]["output_tokens"], 2);
+        assert_eq!(result["usage"]["cost_microcents"], 32);
     }
 }

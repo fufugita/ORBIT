@@ -389,98 +389,18 @@ fn dist_landlock_probe_fail_refuses() {
 }
 
 #[test]
-fn dist_license_apache2_core() {
-    // DR-13 §4: core is Apache-2.0; the workspace declares it.
-    let m = orbit_release::VersionEvidence::build("0.1.0", "c", b"sbom", "r");
-    assert_eq!(m.version, "0.1.0");
-}
-
-#[test]
-fn dist_shim_dual_mit_apache2() {
-    // SDK shims are (MIT OR Apache-2.0); the release SBOM records SPDX.
-    let entries = vec![orbit_release::SbomEntry {
-        name: "shim".into(),
-        version: "0.1.0".into(),
-        license: "(MIT OR Apache-2.0)".into(),
-        sha256: "a".repeat(64),
-        supplier: "npm".into(),
-    }];
-    let sbom = orbit_release::generate_sbom(&entries);
-    assert!(String::from_utf8_lossy(&sbom).contains("(MIT OR Apache-2.0)"));
-}
-
-#[test]
 fn dist_no_outbound_telemetry() {
     assert!(check_telemetry("off").is_ok());
     assert_eq!(check_telemetry("on").unwrap_err().code(), "E110B");
 }
 
 #[test]
-fn dist_release_gate_9_item_ci() {
-    // The release evidence bundle validates (DR-03 §11 layout).
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../evidence/v0.1");
-    if dir.exists() {
-        assert!(orbit_release::validate_evidence_bundle(&dir).is_ok());
-    }
-}
-
-#[test]
-fn dist_artifact_signed() {
-    // GPG/Sigstore signing is v0.1-required; the PIB signed artifact verifies.
-    use ed25519_dalek::{Signer, SigningKey};
-    use rand_core::OsRng;
-    let sk = SigningKey::generate(&mut OsRng);
-    let pk: [u8; 32] = sk.verifying_key().to_bytes();
-    let art = orbit_pib::SignedBySourcePib::sign(&sk, "s".into(), "d".into(), b"payload");
-    assert!(art.verify(&pk, b"payload").is_ok());
-}
-
-#[test]
-fn dist_sbom_spdx_generated() {
-    let sbom = orbit_release::generate_sbom(&[]);
-    let v: serde_json::Value = serde_json::from_slice(&sbom).unwrap();
-    assert_eq!(v["spdxVersion"], "SPDX-2.3");
-}
-
-#[test]
-fn dist_reproducible_twin_build_byte_identical() {
-    // The IR deterministic encoder is the reproducibility seed.
-    let req = orbit_ir::SubagentSpawnRequest {
-        model: orbit_ir::ModelRef::Id("gpt-4".into()),
-        prompt_hash: "a".repeat(64),
-        context: vec![],
-    };
-    assert_eq!(
-        orbit_ir::cbor::encode(&req).unwrap(),
-        orbit_ir::cbor::encode(&req).unwrap()
-    );
-}
-
-#[test]
-fn dist_static_musl_binary() {
-    // Build target is documented; the evidence record carries it.
-    let m = orbit_release::VersionEvidence::build("0.1.0", "c", b"s", "r");
-    assert_eq!(m.target, "x86_64-unknown-linux-musl");
-}
-
-#[test]
-fn dist_wasi_runtime_vendored() {
-    // WASI runtime is vendored (DR-13 §2); the plugin host is the only entry.
+fn wasi_host_allowlist_accepts_supported_import() {
+    // This checks the allowlist only; it does not assert a runtime is vendored.
     assert!(
         orbit_plugin::WasiHostAllowlist::canonical()
             .validate(&["wasi:http/proxy".into()])
             .is_ok()
-    );
-}
-
-#[test]
-fn dist_clean_machine_install_verify() {
-    // Proven separately by scripts/e2e-clean-machine.sh (row 9); this records
-    // the evidence file exists.
-    assert!(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../evidence/v0.1/demo-transcript.md")
-            .exists()
     );
 }
 
@@ -507,20 +427,6 @@ fn dist_ledger_format_forward_backward() {
     w.close().unwrap();
     assert!(orbit_ledger::verify_ledger(&d).is_ok());
     let _ = std::fs::remove_dir_all(&d);
-}
-
-#[test]
-fn dist_dependency_license_allowlist() {
-    // Permissive-only SBOM (DR-13 §5).
-    let entries = vec![orbit_release::SbomEntry {
-        name: "d".into(),
-        version: "1".into(),
-        license: "MIT".into(),
-        sha256: "a".repeat(64),
-        supplier: "crates.io".into(),
-    }];
-    let sbom = orbit_release::generate_sbom(&entries);
-    assert!(String::from_utf8_lossy(&sbom).contains("\"MIT\""));
 }
 
 #[test]

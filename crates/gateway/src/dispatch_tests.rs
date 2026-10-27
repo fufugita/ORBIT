@@ -100,6 +100,7 @@ fn usage_events(
         .into_iter()
         .enumerate()
         .map(|(sequence, event)| ProviderStreamEvent {
+            usage_observation: None,
             sequence: sequence as u64,
             event,
         })
@@ -294,9 +295,10 @@ async fn gateway_usage_accounting_explicit_final_zero_is_complete() {
 }
 
 #[tokio::test]
-async fn gateway_usage_accounting_final_zero_overrides_incremental_snapshot() {
+async fn gateway_usage_accounting_explicit_final_zero_after_zero_incremental_snapshot_is_complete()
+{
     scripted_usage_case(
-        &[usage_snapshot(2)],
+        &[ProviderUsage::default()],
         Some(ProviderUsage::default()),
         ProviderUsage::default(),
         UsageSource::Final,
@@ -916,6 +918,7 @@ fn gateway_dispatch_completes_and_writes_egress_intent() {
                 r.status,
                 orbit_adapter::types::ProviderTerminalStatus::Completed
             );
+            assert!(r.accounting.usage_observation.is_none());
         }
         other => panic!("expected Completed, got {other:?}"),
     }
@@ -1399,4 +1402,550 @@ async fn gateway_endpoint_query_async_ambiguous_values_refuse_before_credential_
         assert!(!received);
         assert_eq!(calls, 0);
     }
+}
+
+#[tokio::test]
+async fn gateway_observation_reported_zero_joins_exact_collected_events() {
+    use orbit_adapter::types::{
+        UsageObservationDispositionV1, UsageObservationMetaV1, UsageObservationOriginV1,
+        UsageObservationQualificationV1, UsageObservationSnapshotV1, UsageReasoningReportingV1,
+        UsageReportingPresenceV1, UsageSnapshotOriginV1,
+    };
+    let metadata = UsageObservationMetaV1 {
+        version: 1,
+        reasoning_reporting: UsageReasoningReportingV1::Reported,
+        snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+    };
+    let events = vec![
+        ProviderStreamEvent {
+            sequence: 0,
+            event: ProviderEventKind::ResponseStarted {
+                upstream_request_id: None,
+            },
+            usage_observation: None,
+        },
+        ProviderStreamEvent {
+            sequence: 1,
+            event: ProviderEventKind::UsageUpdate(ProviderUsage::default()),
+            usage_observation: Some(metadata),
+        },
+        ProviderStreamEvent {
+            sequence: 2,
+            event: ProviderEventKind::Finished {
+                finish_reason: Some("stop".into()),
+                final_usage: Some(ProviderUsage::default()),
+            },
+            usage_observation: Some(metadata),
+        },
+    ];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = UsageScript {
+        events: events.clone(),
+        calls: calls.clone(),
+        capabilities: text_capabilities(),
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(adapter), test_binding()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let result = assert_usage_result(outcome, ProviderUsage::default(), UsageSource::Final, true);
+    assert_eq!(result.events, events);
+    assert_eq!(observed, events);
+    assert_eq!(result.output.observed_bytes, 0);
+    assert_eq!(result.output.delivered_bytes, 0);
+    // Independent reported_zero fixture constants; no product encoder builds these expectations.
+    assert_eq!(
+        result.output.raw_stream_sha256.as_str(),
+        "5024c3060c4e5eb4d2005990b09e54cb6fce81631aba527b22ce57ae98bdfc06"
+    );
+    assert_eq!(
+        result.output.canonical_output_sha256.as_str(),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    let observation = result
+        .accounting
+        .usage_observation
+        .as_deref()
+        .expect("successful collected events must carry their exact observation");
+    assert_eq!(observation.encoding_version, 1);
+    assert_eq!(
+        observation.digest.as_str(),
+        "5b6043b3ffb7de55346fb4f6893c9d9791d546c5f5cc100c2fc323b7db83fd20"
+    );
+    assert_eq!(
+        observation.selected,
+        Some(UsageObservationSnapshotV1 {
+            sequence: 2,
+            raw_usage: ProviderUsage::default(),
+            source: UsageSource::Final,
+            reasoning_reporting: UsageReportingPresenceV1::Reported,
+            snapshot_origin: UsageObservationOriginV1::ProviderReported,
+        })
+    );
+    assert_eq!(
+        observation.qualification,
+        UsageObservationQualificationV1::ProviderReportedTerminalSnapshot
+    );
+    assert_eq!(
+        observation.disposition,
+        UsageObservationDispositionV1::CompleteText
+    );
+}
+
+#[tokio::test]
+async fn gateway_wire_observation_keeps_the_latest_absent_detail_pair() {
+    use orbit_adapter::types::{
+        UsageObservationDispositionV1, UsageObservationMetaV1, UsageObservationOriginV1,
+        UsageObservationQualificationV1, UsageObservationSnapshotV1, UsageReasoningReportingV1,
+        UsageReportingPresenceV1, UsageSnapshotOriginV1,
+    };
+    let body = [
+        usage_sse(serde_json::json!({"choices":[{"index":0,
+            "delta":{"content":"wire answer"},"finish_reason":null}]})),
+        usage_sse(serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+        usage_sse(serde_json::json!({"choices":[],"usage":{
+            "prompt_tokens":20,"completion_tokens":9,
+            "prompt_tokens_details":{"cached_tokens":3},
+            "completion_tokens_details":{"reasoning_tokens":0}
+        }})),
+        usage_sse(serde_json::json!({"choices":[],"usage":{
+            "prompt_tokens":22,"completion_tokens":10,
+            "prompt_tokens_details":{"cached_tokens":3}
+        }})),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let (outcome, observed) = wire_usage_case(false, body).await;
+    let latest = ProviderUsage {
+        input_tokens: 19,
+        output_tokens: 10,
+        cache_read_tokens: 3,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+    };
+    let result = assert_usage_result(outcome, latest, UsageSource::Final, true);
+    assert_wire_text(&result, &observed);
+    assert_eq!(result.events.len(), 5);
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    assert_eq!(
+        result.events[2].usage_observation,
+        Some(UsageObservationMetaV1 {
+            version: 1,
+            reasoning_reporting: UsageReasoningReportingV1::Reported,
+            snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+        })
+    );
+    for event in [&result.events[3], &result.events[4]] {
+        assert_eq!(
+            event.usage_observation,
+            Some(UsageObservationMetaV1 {
+                version: 1,
+                reasoning_reporting: UsageReasoningReportingV1::NotReported,
+                snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+            })
+        );
+    }
+    let observation = result
+        .accounting
+        .usage_observation
+        .as_deref()
+        .expect("gateway must join the successful wire observation");
+    assert_eq!(
+        observation.selected,
+        Some(UsageObservationSnapshotV1 {
+            sequence: 4,
+            raw_usage: latest,
+            source: UsageSource::Final,
+            reasoning_reporting: UsageReportingPresenceV1::NotReported,
+            snapshot_origin: UsageObservationOriginV1::ProviderReported,
+        })
+    );
+    assert_eq!(
+        observation.qualification,
+        UsageObservationQualificationV1::ProviderReportedTerminalSnapshot
+    );
+    assert_eq!(
+        observation.disposition,
+        UsageObservationDispositionV1::CompleteText
+    );
+    // This checks the handoff to the already-golden-tested shared fold, not a new hash oracle.
+    let from_returned_events =
+        orbit_adapter::stream::usage_observation_evidence_v1(&result.events).unwrap();
+    assert_eq!(observation, &from_returned_events);
+}
+
+#[tokio::test]
+async fn gateway_observation_origin_cancellation_and_missing_matrix() {
+    use orbit_adapter::types::{
+        UsageObservationDispositionV1, UsageObservationMetaV1, UsageObservationOriginV1,
+        UsageObservationQualificationV1, UsageObservationSnapshotV1, UsageReasoningReportingV1,
+        UsageReportingPresenceV1, UsageSnapshotOriginV1,
+    };
+    struct Case {
+        events: Vec<ProviderStreamEvent>,
+        usage: ProviderUsage,
+        source: UsageSource,
+        complete: bool,
+        selected: Option<UsageObservationSnapshotV1>,
+        qualification: UsageObservationQualificationV1,
+        disposition: UsageObservationDispositionV1,
+    }
+    let zero = ProviderUsage::default();
+    let raw = ProviderUsage {
+        input_tokens: 11,
+        output_tokens: 7,
+        reasoning_tokens: 2,
+        ..Default::default()
+    };
+    let provider = UsageObservationMetaV1 {
+        version: 1,
+        reasoning_reporting: UsageReasoningReportingV1::NotReported,
+        snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+    };
+    let reported = UsageObservationMetaV1 {
+        reasoning_reporting: UsageReasoningReportingV1::Reported,
+        ..provider
+    };
+    let synthetic = UsageObservationMetaV1 {
+        snapshot_origin: UsageSnapshotOriginV1::Synthetic,
+        ..provider
+    };
+    let events = |update: Option<(ProviderUsage, Option<UsageObservationMetaV1>)>,
+                  final_usage: Option<(ProviderUsage, Option<UsageObservationMetaV1>)>,
+                  reason: &str| {
+        let mut events = vec![ProviderStreamEvent {
+            sequence: 0,
+            event: ProviderEventKind::ResponseStarted {
+                upstream_request_id: None,
+            },
+            usage_observation: None,
+        }];
+        if let Some((raw, metadata)) = update {
+            events.push(ProviderStreamEvent {
+                sequence: 1,
+                event: ProviderEventKind::UsageUpdate(raw),
+                usage_observation: metadata,
+            });
+        }
+        events.push(ProviderStreamEvent {
+            sequence: events.len() as u64,
+            event: ProviderEventKind::Finished {
+                finish_reason: Some(reason.into()),
+                final_usage: final_usage.map(|(raw, _)| raw),
+            },
+            usage_observation: final_usage.and_then(|(_, metadata)| metadata),
+        });
+        events
+    };
+    let selected = |sequence, raw_usage, source, reasoning_reporting, snapshot_origin| {
+        Some(UsageObservationSnapshotV1 {
+            sequence,
+            raw_usage,
+            source,
+            reasoning_reporting,
+            snapshot_origin,
+        })
+    };
+    let cases = vec![
+        Case {
+            events: events(None, Some((zero, None)), "stop"),
+            usage: zero,
+            source: UsageSource::Final,
+            complete: true,
+            selected: selected(
+                1,
+                zero,
+                UsageSource::Final,
+                UsageReportingPresenceV1::LegacyUnknown,
+                UsageObservationOriginV1::LegacyUnknown,
+            ),
+            qualification: UsageObservationQualificationV1::LegacyTerminalSnapshot,
+            disposition: UsageObservationDispositionV1::CompleteText,
+        },
+        Case {
+            events: events(None, Some((zero, Some(synthetic))), "cancelled"),
+            usage: zero,
+            source: UsageSource::Final,
+            complete: true,
+            selected: selected(
+                1,
+                zero,
+                UsageSource::Final,
+                UsageReportingPresenceV1::NotReported,
+                UsageObservationOriginV1::Synthetic,
+            ),
+            qualification: UsageObservationQualificationV1::CancelledTerminalSnapshot,
+            disposition: UsageObservationDispositionV1::Cancelled,
+        },
+        Case {
+            events: events(None, Some((zero, Some(provider))), "cancelled"),
+            usage: zero,
+            source: UsageSource::Final,
+            complete: true,
+            selected: selected(
+                1,
+                zero,
+                UsageSource::Final,
+                UsageReportingPresenceV1::NotReported,
+                UsageObservationOriginV1::ProviderReported,
+            ),
+            qualification: UsageObservationQualificationV1::CancelledTerminalSnapshot,
+            disposition: UsageObservationDispositionV1::Cancelled,
+        },
+        Case {
+            events: events(Some((raw, Some(reported))), None, "cancelled"),
+            usage: raw,
+            source: UsageSource::Incremental,
+            complete: false,
+            selected: selected(
+                1,
+                raw,
+                UsageSource::Incremental,
+                UsageReportingPresenceV1::Reported,
+                UsageObservationOriginV1::ProviderReported,
+            ),
+            qualification: UsageObservationQualificationV1::ProvisionalSnapshot,
+            disposition: UsageObservationDispositionV1::Cancelled,
+        },
+        Case {
+            events: events(None, None, "cancelled"),
+            usage: zero,
+            source: UsageSource::Missing,
+            complete: false,
+            selected: None,
+            qualification: UsageObservationQualificationV1::MissingSnapshot,
+            disposition: UsageObservationDispositionV1::Cancelled,
+        },
+        Case {
+            events: events(None, None, "stop"),
+            usage: zero,
+            source: UsageSource::Missing,
+            complete: false,
+            selected: None,
+            qualification: UsageObservationQualificationV1::MissingSnapshot,
+            disposition: UsageObservationDispositionV1::CompleteText,
+        },
+        Case {
+            events: events(Some((raw, None)), None, "stop"),
+            usage: raw,
+            source: UsageSource::Incremental,
+            complete: false,
+            selected: selected(
+                1,
+                raw,
+                UsageSource::Incremental,
+                UsageReportingPresenceV1::LegacyUnknown,
+                UsageObservationOriginV1::LegacyUnknown,
+            ),
+            qualification: UsageObservationQualificationV1::ProvisionalSnapshot,
+            disposition: UsageObservationDispositionV1::CompleteText,
+        },
+    ];
+    let mut identities = Vec::new();
+    for case in cases {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = UsageScript {
+            events: case.events.clone(),
+            calls: calls.clone(),
+            capabilities: text_capabilities(),
+        };
+        let (outcome, observed) = dispatch_usage_fixture(Arc::new(adapter), test_binding()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let result = assert_usage_result(outcome, case.usage, case.source, case.complete);
+        assert_eq!(result.events, case.events);
+        assert_eq!(observed, case.events);
+        let observation = result
+            .accounting
+            .usage_observation
+            .as_deref()
+            .expect("successful gateway matrix sidecar");
+        assert_eq!(observation.encoding_version, 1);
+        assert_eq!(observation.selected, case.selected);
+        assert_eq!(observation.qualification, case.qualification);
+        assert_eq!(observation.disposition, case.disposition);
+        identities.push((
+            result.output.raw_stream_sha256.clone(),
+            observation.digest.clone(),
+        ));
+    }
+    assert_eq!(
+        identities[1].0, identities[2].0,
+        "numeric raw cancellation stream is unchanged"
+    );
+    assert_ne!(
+        identities[1].1, identities[2].1,
+        "synthetic/provider origin stays distinguishable"
+    );
+}
+
+struct UsageThenTransportError {
+    script: UsageScript,
+    error: orbit_adapter::error::AdapterError,
+}
+
+#[async_trait::async_trait]
+impl AsyncProviderAdapter for UsageThenTransportError {
+    fn identity(&self) -> orbit_adapter::types::AdapterIdentity {
+        self.script.identity()
+    }
+
+    fn capabilities(&self) -> &orbit_adapter::types::ProviderCapabilities {
+        self.script.capabilities()
+    }
+
+    fn validate_route(
+        &self,
+        route: &ProviderRouteBinding,
+    ) -> Result<(), orbit_adapter::error::AdapterError> {
+        self.script.validate_route(route)
+    }
+
+    async fn invoke(
+        &self,
+        request: &orbit_adapter::types::ProviderRequest,
+        credential: Option<&SecretBytes>,
+        cancel: &CancelToken,
+    ) -> Result<orbit_provider_http::AsyncProviderEventStream, orbit_adapter::error::AdapterError>
+    {
+        use futures::StreamExt;
+        let stream = self.script.invoke(request, credential, cancel).await?;
+        let error = self.error.clone();
+        Ok(Box::pin(
+            stream.chain(futures::stream::once(async move { Err(error) })),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn gateway_terminal_callback_then_error_never_returns_successful_observation() {
+    let events = usage_events(&[ProviderUsage::default()], Some(ProviderUsage::default()));
+    let control_calls = Arc::new(AtomicUsize::new(0));
+    let control = UsageScript {
+        events: events.clone(),
+        calls: control_calls.clone(),
+        capabilities: text_capabilities(),
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(control), test_binding()).await;
+    let result = assert_usage_result(outcome, ProviderUsage::default(), UsageSource::Final, true);
+    assert_eq!(result.events, events);
+    assert_eq!(observed, events);
+    assert_eq!(control_calls.load(Ordering::SeqCst), 1);
+    assert!(result.accounting.usage_observation.is_some());
+
+    let error = orbit_adapter::error::AdapterError::ProviderTimeout(
+        "after-terminal gateway sentinel".into(),
+    );
+    let expected_message = error.to_string();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = UsageThenTransportError {
+        script: UsageScript {
+            events: events.clone(),
+            calls: calls.clone(),
+            capabilities: text_capabilities(),
+        },
+        error,
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(adapter), test_binding()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        observed, events,
+        "real terminal callback ran before the transport error"
+    );
+    match outcome {
+        DispatchOutcome::AdapterRefused { code, message } => {
+            assert_eq!(code, "E0409");
+            assert_eq!(message, expected_message);
+        }
+        other => panic!("late transport failure minted a success: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn gateway_post_terminal_callback_cannot_mint_successful_observation() {
+    let control_events = usage_events(&[ProviderUsage::default()], Some(ProviderUsage::default()));
+    let control_calls = Arc::new(AtomicUsize::new(0));
+    let control = UsageScript {
+        events: control_events.clone(),
+        calls: control_calls.clone(),
+        capabilities: text_capabilities(),
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(control), test_binding()).await;
+    let result = assert_usage_result(outcome, ProviderUsage::default(), UsageSource::Final, true);
+    assert_eq!(result.events, control_events);
+    assert_eq!(observed, control_events);
+    assert_eq!(control_calls.load(Ordering::SeqCst), 1);
+    assert!(result.accounting.usage_observation.is_some());
+
+    let mut events = control_events;
+    events.push(ProviderStreamEvent {
+        sequence: events.len() as u64,
+        event: ProviderEventKind::TextDelta {
+            bytes: b"post-terminal".to_vec(),
+        },
+        usage_observation: None,
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = UsageScript {
+        events: events.clone(),
+        calls: calls.clone(),
+        capabilities: text_capabilities(),
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(adapter), test_binding()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        observed, events,
+        "provisional callbacks remain before validation"
+    );
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::AdapterRefused { code: "E0411", .. }
+    ));
+}
+
+#[tokio::test]
+async fn gateway_usage_accounting_final_zero_after_positive_snapshot_is_refused() {
+    let positive = usage_snapshot(2);
+    let control = usage_events(&[positive], Some(positive));
+    let control_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = UsageScript {
+        events: control.clone(),
+        calls: control_calls.clone(),
+        capabilities: text_capabilities(),
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(adapter), test_binding()).await;
+    assert_eq!(control_calls.load(Ordering::SeqCst), 1);
+    let result = assert_usage_result(outcome, positive, UsageSource::Final, true);
+    assert_eq!(result.events, control);
+    assert_eq!(observed, control);
+
+    let regressed = usage_events(&[positive], Some(ProviderUsage::default()));
+    let mut restored = regressed.clone();
+    match &mut restored.last_mut().unwrap().event {
+        ProviderEventKind::Finished { final_usage, .. } => *final_usage = Some(positive),
+        _ => panic!("real terminal snapshot required"),
+    }
+    assert_eq!(restored, control, "only the final raw counters differ");
+    assert!(matches!(regressed.last().map(|event| &event.event),
+        Some(ProviderEventKind::Finished { final_usage: Some(raw), .. })
+            if *raw == ProviderUsage::default()));
+    let error = orbit_adapter::stream::validate_stream(&regressed).unwrap_err();
+    assert_eq!(error.code(), "E0416");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = UsageScript {
+        events: regressed.clone(),
+        calls: calls.clone(),
+        capabilities: text_capabilities(),
+    };
+    let (outcome, observed) = dispatch_usage_fixture(Arc::new(adapter), test_binding()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(observed, regressed);
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::AdapterRefused { code: "E0416", .. }
+    ));
 }

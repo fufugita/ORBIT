@@ -7,7 +7,7 @@ use orbit_adapter::provider_credentials::ProviderCredentialSource;
 use orbit_adapter::provider_credentials::{
     ExpectedRevision, ProviderAuthIdentity, ProviderCredentialError, ProviderCredentialStore,
 };
-use orbit_cli::config::{ModelEntry, Pricing, ProviderConfig, ProvidersConfig};
+use orbit_cli::config::{ModelEntry, ProviderConfig, ProvidersConfig};
 use orbit_cli::onboarding::provider_login::{
     BrowserOpenOutcome, LoopbackTestTransport, OPENROUTER_PROVIDER_URL,
 };
@@ -63,7 +63,8 @@ impl Fixture {
                 context_limits: None,
                 id: "family/raw".into(),
                 label: None,
-                pricing: Pricing::default(),
+                pricing: None,
+                billing: None,
                 max_output_tokens: Some(4000),
                 context_window: Some(32000),
                 sampling: None,

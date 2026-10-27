@@ -25,6 +25,9 @@ conversation:
         respond with tool calls, stop reason "tool_use"
   {"text": "done"}
         respond with text, stop reason "end_turn"
+  {"text": "partial", "finish_reason": "length"}
+        (OpenAI text only) optional "stop", "length" or "content_filter"; omission keeps "stop"
+        invalid explicit values fail before streaming; tool/Anthropic steps unchanged
   {"thinking": true, "ptok": 100, "tools": [...]}
         (anthropic) emit a signed thinking block first; report <ptok>
         input tokens in message_start
@@ -170,12 +173,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- OpenAI wire -----------------------------------------------------
 
-    def _openai_step(self, step: dict):
+    def _openai_step(self, step: dict, include_usage: bool = False):
         """Stream one assistant response in the OpenAI chat-completions
         SSE shape. Tool calls stream as incremental function arguments."""
-        self._sse_headers()
         tool_calls = step.get("tools")
+        finish_reason = step.get("finish_reason", "stop") if not tool_calls else "stop"
+        if not tool_calls and (
+                not isinstance(finish_reason, str) or finish_reason not in ("stop", "length", "content_filter")):
+            self._fail(400, '{"error":{"message":"invalid OpenAI text finish_reason: expected stop, length or content_filter"}}')
+            return
         text = step.get("text")
+        self._sse_headers()
         if tool_calls:
             for i, call in enumerate(tool_calls):
                 args = json.dumps(call.get("args", {}), ensure_ascii=False)
@@ -206,7 +214,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._chunk(_sse({"choices": [{"index": 0, "delta": {
                     "content": text}}]}))
             self._chunk(_sse({"choices": [{"index": 0, "delta": {},
-                                           "finish_reason": "stop"}]}))
+                                           "finish_reason": finish_reason}]}))
+        if include_usage:
+            # Test-only terminal evidence. These fixed synthetic counters
+            # exercise clients that require a final usage snapshot without
+            # claiming live-provider or reasoning-token semantics.
+            self._chunk(_sse({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 5,
+                    "total_tokens": 22,
+                },
+            }))
         self._chunk(b"data: [DONE]\n\n")
         self._end_chunks()
 
@@ -309,7 +329,12 @@ class Handler(BaseHTTPRequestHandler):
         if Handler.wire == "anthropic" or self.path.endswith("/v1/messages"):
             self._anthropic_step(step)
         else:
-            self._openai_step(step)
+            stream_options = body.get("stream_options")
+            include_usage = (
+                isinstance(stream_options, dict)
+                and stream_options.get("include_usage") is True
+            )
+            self._openai_step(step, include_usage=include_usage)
 
 
 def main():

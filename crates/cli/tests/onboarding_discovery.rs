@@ -238,7 +238,8 @@ fn declared(id: &str) -> ModelEntry {
         context_limits: None,
         id: id.into(),
         label: None,
-        pricing: Pricing::default(),
+        pricing: None,
+        billing: None,
         context_window: None,
         max_output_tokens: None,
         sampling: None,
@@ -696,8 +697,13 @@ fn refresh_preserves_explicit_effort_pricing_sampling_and_unfamiliar_raw_fields(
         high.clone(),
     ]);
     model.default_effort = Some(high);
-    model.pricing.input_per_million_microdollars = 123456;
-    model.pricing.output_per_million_microdollars = 654321;
+    model.pricing = Some(Pricing::default());
+    let pricing = model
+        .pricing
+        .as_mut()
+        .expect("declared model carries legacy pricing");
+    pricing.input_per_million_microdollars = Some(123456);
+    pricing.output_per_million_microdollars = Some(654321);
     model.sampling = Some(orbit_cli::config::SamplingOverride {
         temperature: Some(0.4),
         top_p: Some(0.8),
@@ -894,12 +900,24 @@ fn catalog_selection_refuses_duplicate_or_over_128_numbers_before_publication() 
         .map(str::to_owned)
         .collect();
         values.push(selection);
+        values.push("cancel".to_owned());
         let refs: Vec<_> = values.iter().map(String::as_str).collect();
         let mut terminal = Terminal::new(&refs);
         assert!(matches!(
             collect_onboarding_with_discovery(&fixture.home, None, &mut terminal, &mut factory),
-            Err(OnboardingError::Invalid(_))
+            Err(OnboardingError::Canceled)
         ));
+        assert!(terminal.input.is_empty());
+        assert!(
+            terminal
+                .output
+                .contains("Select 1..128 distinct catalog numbers")
+        );
+        assert!(terminal.output.contains("Correct this field: "));
+        let capture = factory.capture.lock().unwrap();
+        assert_eq!(capture.opened.len(), 1);
+        assert!(capture.detail_ids.is_empty());
+        assert_eq!(capture.dropped, 1);
         assert!(!fixture.home.exists());
     }
 }

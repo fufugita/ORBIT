@@ -13,6 +13,9 @@ mod onboarding;
 #[path = "../src/setup.rs"]
 #[allow(dead_code)]
 mod setup;
+#[path = "../src/setup_terminal_ui.rs"]
+#[allow(dead_code)]
+mod setup_terminal_ui;
 
 use customization::{Error, PublicationPoint, with_test_hook};
 use orbit_adapter::SecretBytes;
@@ -324,7 +327,11 @@ fn setup_main_replacement_preserves_unknown_model_and_nested_pricing_metadata() 
     let f = metadata_fixture();
     let mut incoming = f.config().provider.remove(0);
     incoming.models[0].label = Some("New label".into());
-    incoming.models[0].pricing.input_per_million_microdollars = 777;
+    incoming.models[0]
+        .pricing
+        .as_mut()
+        .expect("fixture has a declared pricing table")
+        .input_per_million_microdollars = Some(777);
     let request = request(incoming);
     apply_setup(
         &plan_setup_with_main(&f.home, &request, Some("fixture/owner/family/raw")).unwrap(),
@@ -355,6 +362,34 @@ fn setup_main_replacement_preserves_unknown_model_and_nested_pricing_metadata() 
 }
 
 #[test]
+fn setup_main_preserves_an_explicit_empty_pricing_table() {
+    let f = configured();
+    f.write_config(
+        r#"
+[[provider]]
+name = "fixture"
+kind = "openai-compatible"
+url = "https://provider.invalid/v1/"
+[[provider.models]]
+id = "owner/family/raw"
+[provider.models.pricing]
+[[provider.models]]
+id = "second/raw"
+"#,
+    );
+
+    let incoming = f.config().provider.remove(0);
+    apply_setup(&plan_setup(&f.home, &request(incoming)).unwrap()).unwrap();
+
+    let value = f.value();
+    assert!(
+        value["provider"][0]["models"][0]["pricing"]
+            .as_table()
+            .is_some_and(toml::map::Map::is_empty)
+    );
+}
+
+#[test]
 fn setup_main_incoming_known_optional_fields_and_pricing_aliases_replace_old_values() {
     let f = metadata_fixture();
     let mut incoming = f.config().provider.remove(0);
@@ -365,7 +400,7 @@ fn setup_main_incoming_known_optional_fields_and_pricing_aliases_replace_old_val
     model.sampling = None;
     model.supported_efforts = None;
     model.default_effort = None;
-    model.pricing = config::Pricing::default();
+    model.pricing = Some(config::Pricing::default());
     apply_setup(&plan_setup(&f.home, &request(incoming)).unwrap()).unwrap();
     let value = f.value();
     let model = value["provider"][0]["models"][0].as_table().unwrap();

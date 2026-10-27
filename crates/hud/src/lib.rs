@@ -12,6 +12,10 @@
 
 #![forbid(unsafe_code)]
 
+mod text;
+
+pub use text::{CotStripper, safe_text, strip_cot};
+
 use serde::{Deserialize, Serialize};
 
 /// HUD error family.
@@ -176,17 +180,249 @@ impl Hud {
 /// and URLs pass untouched — the old keyword rejection is gone.
 pub fn redact_secret_values(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    let mut private_blocks = Vec::new();
     for line in text.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = line.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (line, "")
+        };
+        if let Some((start, label, end)) = private_key_begin(body) {
+            let remainder = &body[end..];
+            if remainder.contains("-----BEGIN") || malformed_private_key_start(remainder).is_some()
+            {
+                if private_blocks.is_empty() {
+                    append_private_key_marker(&mut out, &body[..start], ending);
+                }
+                break;
+            }
+            if private_blocks.is_empty() {
+                let end_marker = format!("-----END {label}-----");
+                let close = remainder
+                    .match_indices(&end_marker)
+                    .find(|(close_start, _)| {
+                        let close_end = close_start + end_marker.len();
+                        !remainder[..*close_start].ends_with('-')
+                            && !remainder[close_end..].starts_with('-')
+                    });
+                if let Some((close_start, _)) = close {
+                    let close_end = end + close_start + end_marker.len();
+                    let line = format!(
+                        "{}[redacted:private key]{}{}",
+                        &body[..start],
+                        &body[close_end..],
+                        ending
+                    );
+                    out.push_str(&redact_line(&line));
+                    continue;
+                }
+                append_private_key_marker(&mut out, &body[..start], ending);
+            }
+            private_blocks.push(label);
+            continue;
+        }
+        if let Some(start) = malformed_private_key_start(body) {
+            if private_blocks.is_empty() {
+                append_private_key_marker(&mut out, &body[..start], ending);
+            }
+            break;
+        }
+        if let Some(label) = private_blocks.last() {
+            if private_key_end(body, label) {
+                let _ = private_blocks.pop();
+            }
+            continue;
+        }
         out.push_str(&redact_line(line));
     }
     out
 }
 
-fn redact_line(line: &str) -> String {
-    // PEM block lines: redact the whole block content.
-    if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
-        return "[redacted:private key]\n".into();
+fn malformed_private_key_start(line: &str) -> Option<usize> {
+    let folded = line.to_ascii_lowercase();
+    let bytes = folded.as_bytes();
+
+    // The close marker can be separated from `key` by an arbitrarily long
+    // ASCII-whitespace suffix. Precompute its next non-whitespace byte once so
+    // many key-like words cannot repeatedly scan that same suffix.
+    let mut next_non_whitespace = vec![bytes.len(); bytes.len() + 1];
+    for index in (0..bytes.len()).rev() {
+        next_non_whitespace[index] = if bytes[index].is_ascii_whitespace() {
+            next_non_whitespace[index + 1]
+        } else {
+            index
+        };
     }
+    let first_non_unicode_whitespace = line
+        .char_indices()
+        .find_map(|(index, character)| (!character.is_whitespace()).then_some(index));
+
+    let mut hyphen_run_start = 0usize;
+    let mut hyphen_run_len = 0usize;
+    let mut token_start = None;
+    let mut last_token = None;
+    let mut earliest_complete_begin = None;
+    let mut begin_without_following_delimiter = None;
+
+    for index in 0..bytes.len() {
+        let byte = bytes[index];
+        let preceding_hyphens = hyphen_run_len;
+        let preceding_hyphen_start = hyphen_run_start;
+
+        if byte.is_ascii_alphanumeric() {
+            token_start.get_or_insert(index);
+        } else {
+            if let Some(start) = token_start.take() {
+                last_token = Some((start, index));
+            }
+            if let Some((after_begin, delimiter_start, delimiter_hyphens)) =
+                begin_without_following_delimiter
+                && index >= after_begin
+            {
+                if index == after_begin && earliest_complete_begin.is_none() {
+                    earliest_complete_begin =
+                        Some((after_begin, delimiter_start, delimiter_hyphens));
+                }
+                // `beginning` is ordinary prose, not a `begin` token. Keep
+                // the no-delimiter candidate only for the exact compact
+                // form handled by `direct_candidate` below.
+                begin_without_following_delimiter = None;
+            }
+        }
+
+        if bytes[index..].starts_with(b"key")
+            && !bytes
+                .get(index + b"key".len())
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            let after_key = index + b"key".len();
+            let first_boundary_byte = next_non_whitespace[after_key];
+            let has_closing_hyphens = first_boundary_byte + 3 <= bytes.len()
+                && bytes[first_boundary_byte..first_boundary_byte + 3] == *b"---";
+
+            let previous_token_is_private = |after_begin: usize| {
+                let token_before_key = token_start
+                    .filter(|start| *start < index)
+                    .map(|start| (start, index))
+                    .or(last_token);
+                token_before_key.is_some_and(|(start, end)| {
+                    start >= after_begin && bytes[start..end] == *b"private"
+                })
+            };
+
+            let complete_candidate = earliest_complete_begin
+                .filter(|(after_begin, _, _)| previous_token_is_private(*after_begin));
+            let direct_candidate = begin_without_following_delimiter
+                .filter(|(after_begin, _, _)| bytes.get(*after_begin..index) == Some(b"private"));
+
+            if let Some((_, delimiter_start, delimiter_hyphens)) =
+                complete_candidate.or(direct_candidate)
+            {
+                let public_prefix_precedes_delimiter = first_non_unicode_whitespace
+                    .is_some_and(|first_non_whitespace| first_non_whitespace < delimiter_start);
+                let missing_close_is_unambiguous = first_boundary_byte == bytes.len()
+                    && (!public_prefix_precedes_delimiter
+                        || (public_prefix_precedes_delimiter && delimiter_hyphens == 5));
+                if has_closing_hyphens || missing_close_is_unambiguous {
+                    return Some(delimiter_start);
+                }
+            }
+        }
+
+        if bytes[index..].starts_with(b"begin") && preceding_hyphens >= 3 {
+            let after_begin = index + b"begin".len();
+            begin_without_following_delimiter =
+                Some((after_begin, preceding_hyphen_start, preceding_hyphens));
+        }
+
+        if byte == b'-' {
+            if hyphen_run_len == 0 {
+                hyphen_run_start = index;
+            }
+            hyphen_run_len += 1;
+        } else {
+            hyphen_run_len = 0;
+        }
+    }
+
+    None
+}
+
+fn append_private_key_marker(out: &mut String, prefix: &str, ending: &str) {
+    let mut line = String::with_capacity(prefix.len() + 22 + ending.len());
+    line.push_str(prefix);
+    line.push_str("[redacted:private key]");
+    line.push_str(ending);
+    out.push_str(&redact_line(&line));
+}
+
+fn private_key_begin(line: &str) -> Option<(usize, &str, usize)> {
+    const BEGIN: &str = "-----BEGIN ";
+    let start = line.find("-----BEGIN")?;
+    if (start > 0 && line.as_bytes()[start - 1] == b'-') || !line[start..].starts_with(BEGIN) {
+        return None;
+    }
+    let label_start = start + BEGIN.len();
+    let label_end = label_start + line[label_start..].find("-----")?;
+    let end = label_end + 5;
+    let label = &line[label_start..label_end];
+    if line.as_bytes().get(end) == Some(&b'-')
+        || !(label == "PRIVATE KEY" || label.ends_with(" PRIVATE KEY"))
+    {
+        return None;
+    }
+    let valid = label.split(' ').all(|word| {
+        let bytes = word.as_bytes();
+        bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            && bytes
+                .last()
+                .is_some_and(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'-')
+    });
+    valid.then_some((start, label, end))
+}
+
+fn private_key_end(line: &str, label: &str) -> bool {
+    let line = line.trim_matches([' ', '\t']);
+    let Some(rest) = line.strip_prefix("-----END ") else {
+        return false;
+    };
+    rest.strip_suffix("-----") == Some(label)
+}
+
+fn redact_known_format(line: &str, prefix: &str, kind: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut search = 0;
+    let mut copied = 0;
+    // Search only the immutable input for this pass, never inserted markers.
+    while let Some(relative) = line[search..].find(prefix) {
+        let start = search + relative;
+        let end = line[start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .map(|offset| start + offset)
+            .unwrap_or(line.len());
+        if end - start >= prefix.len() + 16 {
+            out.push_str(&line[copied..start]);
+            out.push_str("[redacted:");
+            out.push_str(kind);
+            out.push(']');
+            copied = end;
+            search = end;
+        } else {
+            search = start + prefix.len();
+        }
+    }
+    out.push_str(&line[copied..]);
+    out
+}
+
+fn redact_line(line: &str) -> String {
     let mut line = line.to_string();
     for (prefix, what) in [
         ("sk-", "api token"),
@@ -197,16 +433,7 @@ fn redact_line(line: &str) -> String {
         ("xoxb-", "slack token"),
         ("xoxp-", "slack token"),
     ] {
-        // One redaction per format per line is enough.
-        if let Some(pos) = line.find(prefix) {
-            let end = line[pos..]
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-                .map(|i| pos + i)
-                .unwrap_or(line.len());
-            if end - pos >= prefix.len() + 16 {
-                line = format!("{}[redacted:{}]{}", &line[..pos], what, &line[end..]);
-            }
-        }
+        line = redact_known_format(&line, prefix, what);
     }
     // High-entropy assignments: KEY = <long value> → KEY = [redacted]
     if let Some(eq) = line.find('=') {
@@ -358,5 +585,493 @@ mod tests {
         let _ = &mut hud.downgrade_brand(BrandTier::Anim);
         // Anim > Off, so downgrade refuses (already Off).
         assert_eq!(hud.brand_tier(), BrandTier::Off);
+    }
+
+    #[test]
+    fn repeated_known_tokens_after_short_decoys_preserve_unicode_public_context() {
+        for (prefix, kind) in [
+            ("sk-", "api token"),
+            ("ghp_", "github token"),
+            ("gho_", "github token"),
+            ("github_pat_", "github token"),
+            ("AKIA", "aws access key"),
+            ("xoxb-", "slack token"),
+            ("xoxp-", "slack token"),
+        ] {
+            let first = format!("{prefix}a1B2c3D4e5F6g7H8i9J0");
+            let second = format!("{prefix}z9Y8x7W6v5U4t3S2r1Q0");
+            for with_decoy in [false, true] {
+                let before = if with_decoy {
+                    format!("public café {prefix}short 中 ")
+                } else {
+                    "public café 中 ".to_owned()
+                };
+                let input = format!("{before}{first} 🦀 {second} public after");
+                let expected =
+                    format!("{before}[redacted:{kind}] 🦀 [redacted:{kind}] public after");
+                let clean = redact_secret_values(&input);
+                assert!(!clean.contains(first.as_str()));
+                assert!(!clean.contains(second.as_str()));
+                assert_eq!(clean, expected);
+                assert_eq!(display_safe(&input).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn complete_and_unclosed_multiline_private_keys_hide_body_and_keep_line_boundaries() {
+        let body_a = "U1lOVEhFVElDX09OTFlfUEVNX0JPRFlfQQ==";
+        let body_b = "U1lOVEhFVElDX09OTFlfUEVNX0JPRFlfQg==";
+        for newline in ["\n", "\r\n"] {
+            for label in [
+                "PRIVATE KEY",
+                "RSA PRIVATE KEY",
+                "DSA PRIVATE KEY",
+                "EC PRIVATE KEY",
+                "OPENSSH PRIVATE KEY",
+                "ENCRYPTED PRIVATE KEY",
+            ] {
+                let complete = format!(
+                    "public before{newline}-----BEGIN {label}-----{newline}{body_a}{newline}{body_b}{newline}-----END {label}-----{newline}public after{newline}"
+                );
+                let expected = format!(
+                    "public before{newline}[redacted:private key]{newline}public after{newline}"
+                );
+                let clean = redact_secret_values(&complete);
+                assert!(!clean.contains(body_a));
+                assert!(!clean.contains(body_b));
+                assert!(!clean.contains("-----END"));
+                assert_eq!(clean, expected);
+                assert_eq!(display_safe(&complete).unwrap(), expected.replace('\r', ""));
+
+                let unclosed = format!(
+                    "public before{newline}-----BEGIN {label}-----{newline}{body_a}{newline}{body_b}{newline}public-looking tail still inside the private block"
+                );
+                let expected = format!("public before{newline}[redacted:private key]{newline}");
+                let clean = redact_secret_values(&unclosed);
+                assert!(!clean.contains(body_a));
+                assert!(!clean.contains(body_b));
+                assert!(!clean.contains("public-looking tail"));
+                assert_eq!(clean, expected);
+                assert_eq!(display_safe(&unclosed).unwrap(), expected.replace('\r', ""));
+            }
+
+            let mismatched = format!(
+                "public before{newline}-----BEGIN RSA PRIVATE KEY-----{newline}{body_a}{newline}-----END PRIVATE KEY-----{newline}{body_b}{newline}-----END RSA PRIVATE KEY-----{newline}public after{newline}"
+            );
+            let expected = format!(
+                "public before{newline}[redacted:private key]{newline}public after{newline}"
+            );
+            let clean = redact_secret_values(&mismatched);
+            assert!(!clean.contains(body_a));
+            assert!(!clean.contains(body_b));
+            assert!(!clean.contains("-----END"));
+            assert_eq!(clean, expected);
+            assert_eq!(
+                display_safe(&mismatched).unwrap(),
+                expected.replace('\r', "")
+            );
+
+            let unmatched = format!(
+                "public before{newline}-----BEGIN RSA PRIVATE KEY-----{newline}{body_a}{newline}-----END PRIVATE KEY-----{newline}{body_b}{newline}public-looking tail still inside the private block"
+            );
+            let expected = format!("public before{newline}[redacted:private key]{newline}");
+            let clean = redact_secret_values(&unmatched);
+            assert!(!clean.contains(body_a));
+            assert!(!clean.contains(body_b));
+            assert!(!clean.contains("-----END"));
+            assert!(!clean.contains("public-looking tail"));
+            assert_eq!(clean, expected);
+            assert_eq!(
+                display_safe(&unmatched).unwrap(),
+                expected.replace('\r', "")
+            );
+        }
+    }
+
+    #[test]
+    fn inline_private_key_redaction_preserves_text_after_matching_end() {
+        let secret = "SYNTHETIC_INLINE_PRIVATE_KEY_SECRET";
+        let input =
+            format!("before -----BEGIN PRIVATE KEY-----{secret}-----END PRIVATE KEY----- after\n");
+        let expected = "before [redacted:private key] after\n";
+
+        let clean = redact_secret_values(&input);
+        assert!(!clean.contains(secret));
+        assert_eq!(clean, expected);
+        assert_eq!(display_safe(&input).unwrap(), expected);
+    }
+
+    #[test]
+    fn inline_private_key_redaction_fails_closed_on_mixed_case_suffix_header() {
+        let input = "before -----BEGIN PRIVATE KEY-----SYNTHETIC_FIRST-----END PRIVATE KEY----- -----begin private key-----SYNTHETIC_SECOND\npublic-looking tail\n";
+        let expected = "before [redacted:private key]\n";
+
+        let clean = redact_secret_values(input);
+        assert!(!clean.contains("SYNTHETIC_FIRST"));
+        assert!(!clean.contains("SYNTHETIC_SECOND"));
+        assert!(!clean.contains("public-looking tail"));
+        assert_eq!(clean, expected);
+        assert_eq!(display_safe(input).unwrap(), expected);
+
+        for opener in ["---", "----", "------"] {
+            let prose =
+                format!("public prefix {opener}begin private key\nSYNTHETIC_BODY\npublic tail\n");
+            assert_eq!(redact_secret_values(&prose), prose);
+            assert_eq!(display_safe(&prose).unwrap(), prose);
+        }
+    }
+
+    #[test]
+    fn malformed_inline_private_key_opener_after_public_prefix_fails_closed() {
+        let input = "public prefix -----BEGIN PRIVATE KEY\nSYNTHETIC_PRIVATE_BODY\n-----END PRIVATE KEY-----\npublic-looking tail\n";
+        let expected = "public prefix [redacted:private key]\n";
+
+        let clean = redact_secret_values(input);
+        assert!(!clean.contains("SYNTHETIC_PRIVATE_BODY"));
+        assert!(!clean.contains("-----END PRIVATE KEY-----"));
+        assert!(!clean.contains("public-looking tail"));
+        assert_eq!(clean, expected);
+        assert_eq!(display_safe(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn malformed_mixed_case_private_key_intent_fails_closed() {
+        for opener in [
+            "-----BEGIN rsa private key-----",
+            "-----BEGIN Rsa Private Key-----",
+            "-----begin RSA PRIVATE KEY-----",
+            "----BEGIN PRIVATE KEY-----",
+            "------BEGIN PRIVATE KEY-----",
+            "---BEGIN PRIVATE KEY-----",
+            "--------BEGIN PRIVATE KEY-----",
+        ] {
+            let input = format!(
+                "public before\n{opener}\nSYNTHETIC_PRIVATE_BODY\npublic-looking tail still private"
+            );
+            let expected = "public before\n[redacted:private key]\n";
+            let clean = redact_secret_values(&input);
+            assert!(!clean.contains("SYNTHETIC_PRIVATE_BODY"));
+            assert!(!clean.contains("public-looking tail"));
+            assert_eq!(clean, expected);
+            assert_eq!(display_safe(&input).unwrap(), expected);
+        }
+
+        let inline = "public prefix ----BEGIN PRIVATE KEY-----SYNTHETIC_PRIVATE_BODY-----END PRIVATE KEY----- after";
+        assert_eq!(
+            redact_secret_values(inline),
+            "public prefix [redacted:private key]"
+        );
+
+        for ordinary in [
+            "please begin private key migration after review",
+            "Use --begin private key mode for migration",
+            "Use -begin private key mode for migration",
+            "Use ---begin private key mode for migration",
+            "please ---begin private key",
+        ] {
+            assert_eq!(redact_secret_values(ordinary), ordinary);
+        }
+
+        let public = "public before\n-----BEGIN PUBLIC KEY-----\nPUBLIC_KEY_BODY\n-----END PUBLIC KEY-----\npublic after\n";
+        assert_eq!(redact_secret_values(public), public);
+    }
+
+    #[test]
+    fn malformed_private_key_scanner_preserves_ascii_token_and_whitespace_rules() {
+        for opener in [
+            "---begin privatekey---",
+            "---begin private/key---",
+            "---begin private-key---",
+            "---beginéprivate-key---",
+        ] {
+            assert_eq!(malformed_private_key_start(opener), Some(0), "{opener:?}");
+        }
+
+        for prose in ["---beginning private key---", "---beginner private key---"] {
+            assert_eq!(malformed_private_key_start(prose), None, "{prose:?}");
+            assert_eq!(redact_secret_values(prose), prose, "{prose:?}");
+        }
+
+        assert_eq!(
+            malformed_private_key_start("\u{2003}---begin private key"),
+            Some(3)
+        );
+        assert_eq!(
+            malformed_private_key_start("---begin private key\u{2003}"),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_private_key_scanner_handles_many_public_key_like_phrases() {
+        let line = "---begin public key ---".repeat(1_024);
+        assert_eq!(malformed_private_key_start(&line), None);
+    }
+
+    #[test]
+    fn forged_redaction_markers_do_not_bypass_high_entropy_assignment_redaction() {
+        let secret = "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9_2-4+6/8=";
+        for marker in [
+            "[redacted:api token]",
+            "[redacted:private key]",
+            "[redacted:secret]",
+        ] {
+            let input = format!("public café {marker} API_KEY = \"{secret}\"\r\npublic after\n");
+            let expected =
+                format!("public café {marker} API_KEY = [redacted:secret]\r\npublic after\n");
+            let clean = redact_secret_values(&input);
+            assert!(!clean.contains(secret));
+            assert_eq!(clean, expected);
+            assert_eq!(display_safe(&input).unwrap(), expected.replace('\r', ""));
+        }
+    }
+
+    #[test]
+    fn known_token_suffix_threshold_is_exact_at_unicode_edges() {
+        for (prefix, kind) in [
+            ("sk-", "api token"),
+            ("ghp_", "github token"),
+            ("gho_", "github token"),
+            ("github_pat_", "github token"),
+            ("AKIA", "aws access key"),
+            ("xoxb-", "slack token"),
+            ("xoxp-", "slack token"),
+        ] {
+            let short = format!("{prefix}{}", "a".repeat(15));
+            let secret = format!("{prefix}{}", "b".repeat(16));
+            let input = format!("公開{short}é{secret}🦀public after");
+            let expected = format!("公開{short}é[redacted:{kind}]🦀public after");
+            let clean = redact_secret_values(&input);
+            assert!(clean.contains(short.as_str()));
+            assert!(!clean.contains(secret.as_str()));
+            assert_eq!(clean, expected);
+            assert_eq!(display_safe(&input).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn mixed_known_formats_and_repeated_short_decoys_preserve_public_context() {
+        let formats = [
+            ("sk-", "api token"),
+            ("ghp_", "github token"),
+            ("gho_", "github token"),
+            ("github_pat_", "github token"),
+            ("AKIA", "aws access key"),
+            ("xoxb-", "slack token"),
+            ("xoxp-", "slack token"),
+        ];
+        for (index, &(prefix, kind)) in formats.iter().enumerate() {
+            let (other_prefix, other_kind) = formats[(index + 1) % formats.len()];
+            let first = format!("{prefix}a1B2c3D4e5F6g7H8");
+            let second = format!("{other_prefix}z9Y8x7W6v5U4t3S2");
+            let decoys = format!("{prefix}short/{prefix}tiny");
+            for separator in [" 🦀 ", "/", "\r\n"] {
+                let input = format!(
+                    "café {decoys} 中 {first}{separator}{second}{separator}{first} public after"
+                );
+                let expected = format!(
+                    "café {decoys} 中 [redacted:{kind}]{separator}[redacted:{other_kind}]{separator}[redacted:{kind}] public after"
+                );
+                let clean = redact_secret_values(&input);
+                assert!(!clean.contains(first.as_str()));
+                assert!(!clean.contains(second.as_str()));
+                assert!(clean.contains(decoys.as_str()));
+                assert_eq!(clean, expected);
+                assert_eq!(display_safe(&input).unwrap(), expected.replace('\r', ""));
+            }
+        }
+    }
+
+    #[test]
+    fn private_header_at_eof_keeps_only_its_actual_line_ending() {
+        for label in [
+            "PRIVATE KEY",
+            "EXPERIMENTAL-7 PRIVATE KEY",
+            "7-X V2 PRIVATE KEY",
+        ] {
+            for prefix in ["", "public café "] {
+                for ending in ["", "\n", "\r\n"] {
+                    for suffix in ["", " INLINE_SYNTHETIC_BODY"] {
+                        let input = format!("{prefix}-----BEGIN {label}-----{suffix}{ending}");
+                        let expected = format!("{prefix}[redacted:private key]{ending}");
+                        let clean = redact_secret_values(&input);
+                        assert!(!clean.contains("INLINE_SYNTHETIC_BODY"));
+                        assert!(!clean.contains("-----BEGIN"));
+                        assert_eq!(clean, expected);
+                        assert_eq!(display_safe(&input).unwrap(), expected.replace('\r', ""));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_private_blocks_preserve_opening_endings_and_future_labels() {
+        for (open_a, close_a, open_b, close_b) in [
+            ("\n", "\n", "\n", "\n"),
+            ("\r\n", "\n", "\n", "\r\n"),
+            ("\n", "\r\n", "\r\n", "\n"),
+            ("\r\n", "\r\n", "\r\n", "\r\n"),
+        ] {
+            let input = format!(
+                "public before\n-----BEGIN PRIVATE KEY-----{open_a}SYNTHETIC_BODY_A\n-----END PRIVATE KEY-----{close_a}-----BEGIN EXPERIMENTAL-7 PRIVATE KEY-----{open_b}SYNTHETIC_BODY_B\r\n-----END EXPERIMENTAL-7 PRIVATE KEY-----{close_b}public after\n"
+            );
+            let expected = format!(
+                "public before\n[redacted:private key]{open_a}[redacted:private key]{open_b}public after\n"
+            );
+            let clean = redact_secret_values(&input);
+            assert!(!clean.contains("SYNTHETIC_BODY_A"));
+            assert!(!clean.contains("SYNTHETIC_BODY_B"));
+            assert!(!clean.contains("-----END"));
+            assert_eq!(clean, expected);
+            assert_eq!(display_safe(&input).unwrap(), expected.replace('\r', ""));
+        }
+    }
+
+    #[test]
+    fn nested_private_blocks_require_the_top_label_before_public_output_resumes() {
+        for newline in ["\n", "\r\n"] {
+            let closed = format!(
+                "public before{newline}[redacted:private key]{newline}public after{newline}"
+            );
+            let unclosed = format!("public before{newline}[redacted:private key]{newline}");
+            let cases = [
+                (
+                    format!(
+                        "public before{newline}-----BEGIN PRIVATE KEY-----{newline}SYNTHETIC_OUTER{newline}-----BEGIN PRIVATE KEY-----{newline}SYNTHETIC_INNER{newline}-----END PRIVATE KEY-----{newline}SYNTHETIC_OUTER_TAIL{newline}-----END PRIVATE KEY-----{newline}public after{newline}"
+                    ),
+                    closed.as_str(),
+                ),
+                (
+                    format!(
+                        "public before{newline}-----BEGIN RSA PRIVATE KEY-----{newline}SYNTHETIC_OUTER{newline}-----BEGIN EC PRIVATE KEY-----{newline}SYNTHETIC_INNER{newline}-----END RSA PRIVATE KEY-----{newline}SYNTHETIC_AFTER_EARLY_OUTER_END{newline}-----END EC PRIVATE KEY-----{newline}SYNTHETIC_OUTER_TAIL{newline}-----END RSA PRIVATE KEY-----{newline}public after{newline}"
+                    ),
+                    closed.as_str(),
+                ),
+                (
+                    format!(
+                        "public before{newline}-----BEGIN RSA PRIVATE KEY-----{newline}SYNTHETIC_OUTER{newline}-----BEGIN EC PRIVATE KEY-----{newline}SYNTHETIC_INNER{newline}-----END RSA PRIVATE KEY-----{newline}public-looking tail still private"
+                    ),
+                    unclosed.as_str(),
+                ),
+            ];
+            for (input, expected) in cases {
+                let clean = redact_secret_values(&input);
+                assert!(!clean.contains("SYNTHETIC_"));
+                assert!(!clean.contains("-----END"));
+                assert!(!clean.contains("public-looking tail"));
+                assert_eq!(clean, expected);
+                assert_eq!(display_safe(&input).unwrap(), expected.replace('\r', ""));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_private_openers_poison_outer_closure_until_eof() {
+        for opener in [
+            "-----BEGIN RSA  PRIVATE KEY-----",
+            "-----BEGIN  PRIVATE KEY-----",
+            "-----BEGIN RSA_PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY----",
+            "-----BEGIN RSA PRIVATE KEY------",
+            "------BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY",
+            "-----BEGIN RSA PRIVATE KEY---- SYNTHETIC_PREFIX_BODY -----BEGIN PRIVATE KEY-----",
+            "-----BEGIN PUBLIC KEY----- SYNTHETIC_PREFIX_BODY -----BEGIN PRIVATE KEY-----",
+        ] {
+            for newline in ["\n", "\r\n"] {
+                for inside_outer in [false, true] {
+                    let outer = if inside_outer {
+                        format!("-----BEGIN PRIVATE KEY-----{newline}SYNTHETIC_OUTER{newline}")
+                    } else {
+                        String::new()
+                    };
+                    let input = format!(
+                        "public before{newline}{outer}{opener}{newline}SYNTHETIC_PRIVATE_BODY{newline}-----END RSA PRIVATE KEY-----{newline}-----END PRIVATE KEY-----{newline}public-looking tail must stay private"
+                    );
+                    let expected = format!("public before{newline}[redacted:private key]{newline}");
+                    let clean = redact_secret_values(&input);
+                    assert!(!clean.contains("SYNTHETIC_"));
+                    assert!(!clean.contains("-----END"));
+                    assert!(!clean.contains("public-looking tail"));
+                    assert_eq!(clean, expected);
+                    assert_eq!(display_safe(&input).unwrap(), expected.replace('\r', ""));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_ends_and_extra_begin_suffixes_cannot_release_private_tail() {
+        let cases = [
+            (
+                "public before\n-----BEGIN PUBLIC KEY-----SOMETHING PRIVATE KEY-----\nSYNTHETIC_BODY\n-----END PUBLIC KEY-----SOMETHING PRIVATE KEY-----\npublic-looking tail\n",
+                "public before\n[redacted:private key]\n",
+            ),
+            (
+                "public before\n-----BEGIN PUBLIC KEY-----BEGIN PRIVATE KEY-----\nSYNTHETIC_BODY\n-----END PUBLIC KEY-----BEGIN PRIVATE KEY-----\npublic-looking tail\n",
+                "public before\n[redacted:private key]\n",
+            ),
+            (
+                "public before\nprefix -----BEGIN PRIVATE KEY----- SYNTHETIC_BODY -----END PRIVATE KEY----- public suffix\npublic-looking tail\n",
+                "public before\nprefix [redacted:private key] public suffix\npublic-looking tail\n",
+            ),
+            (
+                "public before\nprefix -----BEGIN PRIVATE KEY----- SYNTHETIC_BODY -----END PRIVATE KEY------SYNTHETIC_PRIVATE_TAIL\npublic-looking tail\n",
+                "public before\nprefix [redacted:private key]\n",
+            ),
+            (
+                "public before\n-----BEGIN PRIVATE KEY-----\nSYNTHETIC_BODY -----END PRIVATE KEY----- inline suffix\npublic-looking tail\n",
+                "public before\n[redacted:private key]\n",
+            ),
+            (
+                "public before\n-----BEGIN PRIVATE KEY-----\nSYNTHETIC_BODY -----END PRIVATE KEY----- inline suffix\n \t-----END PRIVATE KEY-----\t \r\npublic after\n",
+                "public before\n[redacted:private key]\npublic after\n",
+            ),
+            (
+                "public before\n-----BEGIN PRIVATE KEY----- -----BEGIN RSA PRIVATE KEY-----\nSYNTHETIC_BODY\n-----END RSA PRIVATE KEY-----\n-----END PRIVATE KEY-----\npublic-looking tail\n",
+                "public before\n[redacted:private key]\n",
+            ),
+            (
+                "public before\n-----BEGIN PRIVATE KEY----- -----BEGIN PUBLIC KEY-----\nSYNTHETIC_BODY\n-----END PRIVATE KEY-----\npublic-looking tail\n",
+                "public before\n[redacted:private key]\n",
+            ),
+            (
+                "public before\n-----BEGIN PRIVATE KEY-----\nSYNTHETIC_OUTER\n-----BEGIN RSA PRIVATE KEY----- -----BEGIN PUBLIC KEY-----\nSYNTHETIC_BODY\n-----END RSA PRIVATE KEY-----\n-----END PRIVATE KEY-----\npublic-looking tail\n",
+                "public before\n[redacted:private key]\n",
+            ),
+        ];
+        for (input, expected) in cases {
+            let clean = redact_secret_values(input);
+            assert!(!clean.contains("SYNTHETIC_"));
+            assert!(!clean.contains("-----END"));
+            assert!(!clean.contains("inline suffix"));
+            assert_eq!(clean, expected, "input: {input:?}");
+            assert_eq!(display_safe(input).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn non_private_pem_and_end_markers_outside_a_block_remain_ordinary_text() {
+        for newline in ["\n", "\r\n"] {
+            for label in ["PUBLIC KEY", "CERTIFICATE", "EXPERIMENTAL DATA"] {
+                let input = format!(
+                    "public before{newline}-----BEGIN {label}-----{newline}PUBLIC_SYNTHETIC_BODY{newline}-----END {label}-----{newline}-----END PRIVATE KEY-----{newline}public after{newline}"
+                );
+                assert_eq!(redact_secret_values(&input), input);
+                assert_eq!(display_safe(&input).unwrap(), input.replace('\r', ""));
+            }
+            let token = "sk-a1B2c3D4e5F6g7H8";
+            let input = format!(
+                "-----BEGIN PUBLIC KEY-----{newline}{token}{newline}-----END PUBLIC KEY-----{newline}"
+            );
+            let expected = format!(
+                "-----BEGIN PUBLIC KEY-----{newline}[redacted:api token]{newline}-----END PUBLIC KEY-----{newline}"
+            );
+            assert!(!redact_secret_values(&input).contains(token));
+            assert_eq!(redact_secret_values(&input), expected);
+            assert_eq!(display_safe(&input).unwrap(), expected.replace('\r', ""));
+        }
     }
 }

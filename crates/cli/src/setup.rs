@@ -343,11 +343,10 @@ fn merge_model_metadata(old: &toml::Value, new: &mut toml::Value) -> Result<(), 
     ] {
         merged.remove(key);
     }
-    let mut pricing = old
-        .get("pricing")
-        .and_then(toml::Value::as_table)
-        .cloned()
-        .unwrap_or_default();
+    let old_pricing = old.get("pricing").and_then(toml::Value::as_table);
+    let incoming_pricing = new.get("pricing").and_then(toml::Value::as_table);
+    let preserve_pricing_table = old_pricing.is_some() || incoming_pricing.is_some();
+    let mut pricing = old_pricing.cloned().unwrap_or_default();
     for key in [
         "input_per_million_microdollars",
         "output_per_million_microdollars",
@@ -364,10 +363,10 @@ fn merge_model_metadata(old: &toml::Value, new: &mut toml::Value) -> Result<(), 
     ] {
         pricing.remove(key);
     }
-    if let Some(incoming) = new.get("pricing").and_then(toml::Value::as_table) {
+    if let Some(incoming) = incoming_pricing {
         pricing.extend(incoming.clone());
     }
-    if !pricing.is_empty() {
+    if preserve_pricing_table {
         new.insert("pricing".into(), toml::Value::Table(pricing));
     }
     if let Some(incoming) = new.get("sampling").and_then(toml::Value::as_table) {

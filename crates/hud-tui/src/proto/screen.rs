@@ -17,13 +17,13 @@ pub enum WidthClass {
     Compact,
     /// 40–59: one view, no hint row
     Tight,
-    /// W < 40 or H < 10: the size notice only
+    /// W < 40 or H < 11: the size notice only
     TooSmall,
 }
 
 impl WidthClass {
     pub fn of(w: u16, h: u16) -> Self {
-        if w < 40 || h < 10 {
+        if w < 40 || h < 11 {
             WidthClass::TooSmall
         } else if w >= 140 {
             WidthClass::Wide

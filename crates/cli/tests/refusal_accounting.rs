@@ -497,6 +497,7 @@ fn config(wire: &Wire) -> TurnConfig {
             reasoning_per_million_microcents: Some(0),
             request_flat_microcents: 13,
         }),
+        billing: Some(test_billing("fixture-provider", "fixture/raw", 13)),
         max_output_tokens: 73,
         sampling: None,
         effort: None,
@@ -504,6 +505,32 @@ fn config(wire: &Wire) -> TurnConfig {
         first_byte_timeout_ms: None,
         idle_timeout_ms: None,
     }
+}
+fn test_billing(
+    provider: &str,
+    model: &str,
+    flat_fee: u64,
+) -> orbit_adapter::types::BillingQuoteContractV1 {
+    use orbit_adapter::types::{
+        BillingQuoteContractV1, BillingRatesV1, ModelId, PricingDeclarationState, ProviderId,
+        ReasoningCounterBasis, ReasoningRatePolicy,
+    };
+    BillingQuoteContractV1::try_new(
+        ProviderId(provider.into()),
+        ModelId(model.into()),
+        PricingDeclarationState::DeclaredV2,
+        BillingRatesV1 {
+            input_per_million_microdollars: Some(0),
+            output_per_million_microdollars: Some(0),
+            cache_read_per_million_microdollars: Some(0),
+            cache_write_per_million_microdollars: Some(0),
+            reasoning_per_million_microdollars: None,
+            request_flat_microdollars: Some(flat_fee),
+        },
+        ReasoningCounterBasis::IncludedInOutput,
+        ReasoningRatePolicy::OutputRate,
+    )
+    .unwrap()
 }
 fn policy(config: &TurnConfig, ceiling: u32) -> RetryPolicyBinding {
     let selector = FinalRejectionSelector::new(
@@ -1814,6 +1841,11 @@ fn explicit_new_invocations_use_current_policy_without_replaying_refused_intent(
         let mut next_config = selected.clone();
         next_config.provider_id = "fixture-provider-changed".into();
         next_config.model = "fixture/changed".into();
+        next_config.billing = Some(test_billing(
+            &next_config.provider_id,
+            &next_config.model,
+            13,
+        ));
         let next_policy = qualified_again.then(|| policy(&next_config, 2));
         if let Some(value) = &next_policy {
             assert_ne!(value.policy_digest(), first_policy.policy_digest());
@@ -2451,19 +2483,16 @@ fn unqualified_wire_failures_retain_actual_uncertainty_and_never_retry() {
         assert!(visible.checkpoint.last_settlement().is_none());
         let trace = fixture.journal.observations.lock().unwrap();
         if kind == "admitted-with-usage" {
-            assert_eq!(trace.receipts[0].usage, Some(usage()));
-            assert_eq!(
-                visible.pending_receipt.as_ref().unwrap().usage,
-                Some(usage())
-            );
+            assert!(trace.receipts[0].usage.is_none());
+            assert!(visible.pending_receipt.as_ref().unwrap().usage.is_none());
             assert!(
                 transcript
                     .iter()
                     .any(|message| message.role == ChatRole::Assistant
                         && message.content == "kept partial text")
             );
-            // These counters are provisional evidence, not validated numeric
-            // subtotals. They survive in the actual receipt/pending metadata.
+            // Raw counters and provenance remain only in the invalid-marked
+            // in-memory accumulator, not in receipt or pending metadata.
             let report = &result.completion().report;
             assert_eq!(
                 (

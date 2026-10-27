@@ -40,12 +40,134 @@ fn base_scenario() -> Scenario {
 
 #[test]
 fn golden_min_size_notice() {
-    // §9.23: below 40 × 10 the size notice is the whole screen.
+    // §9.23: below 40 × 11 the size notice is the whole screen.
     let tui = Tui::new();
     let s = base_scenario();
-    let out = render(&tui, &s, 38, 9);
-    assert!(out.contains("ORBIT needs at least 40"), "{out}");
-    assert!(out.contains("38 × 9"), "{out}");
+    for (width, height) in [(38, 9), (40, 10), (39, 11), (40, 9)] {
+        let out = render(&tui, &s, width, height);
+        assert!(out.contains("ORBIT needs at least 40 × 11"), "{out}");
+        assert!(
+            out.contains(&format!("this terminal is {width} × {height}")),
+            "{out}"
+        );
+        assert!(
+            !out.contains("Ask ORBIT") && !out.contains("⏎ send"),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn minimum_usable_height_keeps_reply_report_badge_and_composer_visible() {
+    let tui = Tui::new();
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::Model,
+        text: "latest completed reply".into(),
+        ..Default::default()
+    });
+    s.turn_report = Some(orbit_hud_tui::proto::scenario::TurnReport {
+        duration_ms: 7000,
+        tools: 2,
+        cost_microcents: 0,
+        priced: false,
+    });
+    let out = render(&tui, &s, 40, 11);
+    let rows: Vec<_> = out.lines().collect();
+    let reply = rows
+        .iter()
+        .position(|row| row.contains("✦") && row.contains("latest completed reply"))
+        .unwrap_or_else(|| panic!("latest reply must fit at the minimum usable height: {out}"));
+    let report = rows
+        .iter()
+        .position(|row| row.contains("✓ done · 7s · 2 tools"))
+        .unwrap_or_else(|| panic!("the transcript completion report must remain visible: {out}"));
+    let badge = rows
+        .iter()
+        .position(|row| row.contains("Conversation") && row.contains("✓ done"))
+        .unwrap_or_else(|| panic!("the header completion badge must remain visible: {out}"));
+    let composer = rows
+        .iter()
+        .position(|row| row.contains("Ask ORBIT"))
+        .unwrap_or_else(|| panic!("the composer must remain visible: {out}"));
+    assert_ne!(badge, report, "{out}");
+    assert!(!rows[badge].contains("7s"), "{out}");
+    assert!(reply < report && report < composer, "{out}");
+    assert!(!out.contains("ORBIT needs at least"), "{out}");
+}
+
+#[test]
+fn checked_clear_notice_coexists_with_welcome_and_readiness() {
+    let mut tui = Tui::new();
+    tui.reduced = true;
+    tui.tick_ms = 10_000;
+    let mut s = base_scenario();
+    let old_id = "session-01J8ZK4QX2M7C9RT5VWEHN3B6E";
+    s.cleared_from = Some(old_id.into());
+    s.welcome_chips = vec![
+        (true, "provider ready".into()),
+        (true, "tools ready".into()),
+    ];
+    let expected = format!("new session started; previous session {old_id} retained");
+    let out = render(&tui, &s, 110, 30);
+    assert!(
+        out.contains(&expected) && out.contains("the harness that orbits"),
+        "{out}"
+    );
+    assert!(
+        out.contains("New session") && out.contains("provider ready"),
+        "{out}"
+    );
+    assert_eq!(out.matches(&expected).count(), 1);
+    let rows: Vec<_> = out.lines().collect();
+    let hero = rows
+        .iter()
+        .position(|row| row.contains("the harness that orbits"))
+        .unwrap();
+    let notice = rows.iter().position(|row| row.contains(&expected)).unwrap();
+    let composer = rows
+        .iter()
+        .position(|row| row.contains("Ask ORBIT"))
+        .unwrap();
+    assert!(hero < notice && notice < composer, "{out}");
+    assert!(s.transcript.is_empty());
+}
+
+#[test]
+fn checked_clear_notice_wraps_and_scrolls_at_minimum_height() {
+    let mut tui = Tui::new();
+    tui.reduced = true;
+    tui.tick_ms = 10_000;
+    let mut s = base_scenario();
+    s.cleared_from = Some("session-01J8ZK4QX2M7C9RT5VWEHN3B6E".into());
+    let before = format!("{s:?}");
+    let tail = render(&tui, &s, 40, 11);
+    let mut frames = Vec::new();
+    for _ in 0..6 {
+        let out = render(&tui, &s, 40, 11);
+        assert!(out.contains("Ask ORBIT") && out.contains("⏎ send"), "{out}");
+        assert!(
+            out.contains("New session") && !out.contains("ORBIT needs at least"),
+            "{out}"
+        );
+        assert!(!out.contains("the harness that orbits"), "{out}");
+        frames.push(out);
+        tui.scroll_by(1);
+    }
+    let visible = frames.join("\n");
+    for fragment in [
+        "new session started;",
+        "previous session",
+        "01J8ZK4Q",
+        "HN3B6E",
+        "retained",
+    ] {
+        assert!(visible.contains(fragment), "missing {fragment}: {visible}");
+    }
+    tui.scroll_follow();
+    assert_eq!(render(&tui, &s, 40, 11), tail);
+    assert_eq!(format!("{s:?}"), before);
+    assert!(s.transcript.is_empty());
 }
 
 #[test]
@@ -234,6 +356,9 @@ fn layout_breakpoints() {
     // §16.3: the class boundaries.
     use orbit_hud_tui::proto::screen::{Screen, WidthClass};
     let r = |w, h| WidthClass::of(w, h);
+    assert_eq!(r(39, 11), WidthClass::TooSmall);
+    assert_eq!(r(40, 10), WidthClass::TooSmall);
+    assert_eq!(r(40, 11), WidthClass::Tight);
     assert_eq!(r(39, 44), WidthClass::TooSmall);
     assert_eq!(r(40, 44), WidthClass::Tight);
     assert_eq!(r(59, 44), WidthClass::Tight);
@@ -246,6 +371,7 @@ fn layout_breakpoints() {
     assert_eq!(r(140, 44), WidthClass::Wide);
     assert_eq!(r(150, 44), WidthClass::Wide);
     assert_eq!(r(150, 9), WidthClass::TooSmall);
+    assert_eq!(r(150, 10), WidthClass::TooSmall);
     let _ = Screen::resolve;
 }
 
@@ -1048,4 +1174,169 @@ fn the_card_with_a_rule_keeps_its_parts_apart_at_every_width() {
             );
         }
     }
+}
+
+#[test]
+fn failed_turn_report_never_uses_success_presentation() {
+    let mut tui = Tui::new();
+    tui.reduced = true;
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::Model,
+        text: "earlier reply".into(),
+        ..Default::default()
+    });
+    s.turn_report = Some(orbit_hud_tui::proto::scenario::TurnReport {
+        duration_ms: 7000,
+        tools: 2,
+        cost_microcents: 3100,
+        priced: true,
+    });
+    s.apply("turn_failed", 0);
+    let out = render(&tui, &s, 100, 24);
+    let header = out
+        .lines()
+        .skip(1)
+        .find(|line| {
+            line.trim_start().starts_with('┃')
+                && line.trim_start_matches([' ', '┃']).starts_with("2 ")
+                && line.contains("Conversation")
+        })
+        .unwrap();
+    assert!(
+        header.contains("failed") && !header.contains("done"),
+        "{out}"
+    );
+    assert!(out.contains("✕ failed · 7s · 2 tools · +$0.003"), "{out}");
+    assert!(!out.contains("✓ done ·"), "{out}");
+    assert!(out.lines().last().unwrap().contains("failed"), "{out}");
+    assert!(out.contains("Ask ORBIT") && out.contains("⏎ send"), "{out}");
+}
+
+#[test]
+fn minimum_failed_turn_keeps_reason_badge_and_composer_visible() {
+    let mut tui = Tui::new();
+    tui.reduced = true;
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "failed prompt".into(),
+        ..Default::default()
+    });
+    s.turn_report = Some(orbit_hud_tui::proto::scenario::TurnReport {
+        duration_ms: 7000,
+        tools: 2,
+        cost_microcents: 3100,
+        priced: true,
+    });
+    s.failure_reason = Some("ERR_SHORT".into());
+    s.apply("turn_failed", 0);
+    let out = render(&tui, &s, 40, 11);
+    let header = out
+        .lines()
+        .skip(1)
+        .find(|line| {
+            line.trim_start().starts_with('┃')
+                && line.trim_start_matches([' ', '┃']).starts_with("2 ")
+                && line.contains("Conversation")
+        })
+        .unwrap();
+    assert!(
+        header.contains("failed") && !header.contains("done"),
+        "{out}"
+    );
+    assert!(out.lines().last().unwrap().contains("failed"), "{out}");
+    assert!(out.contains("ERR_SHORT") && out.contains("failed"), "{out}");
+    assert!(out.contains("Ask ORBIT") && out.contains("⏎ send"), "{out}");
+    assert!(
+        !out.contains("ORBIT needs at least") && !out.contains("✓ done"),
+        "{out}"
+    );
+}
+
+#[test]
+fn wrapped_failure_unicode_remains_readable_through_real_scroll_state() {
+    for (width, height) in [(40, 11), (40, 24), (164, 48)] {
+        let mut tui = Tui::new();
+        tui.reduced = true;
+        let mut s = base_scenario();
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::User,
+            text: "EARLIER_HISTORY".into(),
+            ..Default::default()
+        });
+        s.failure_reason = Some(format!(
+            "ERR_BEGIN {}ERR_TAIL",
+            "界 e\u{301} 👩‍💻 long reason ".repeat(6)
+        ));
+        s.apply("turn_failed", 0);
+        let before = format!("{s:?}");
+        let tail = render(&tui, &s, width, height);
+        let mut all = String::new();
+        for offset in 0..64 {
+            tui.scroll_follow();
+            tui.scroll_by(offset);
+            let out = render(&tui, &s, width, height);
+            assert!(out.contains("Ask ORBIT") && out.contains("⏎ send"), "{out}");
+            assert!(!out.contains('�'), "{out}");
+            all.push_str(&out);
+        }
+        for marker in [
+            "ERR_BEGIN",
+            "ERR_TAIL",
+            "EARLIER_HISTORY",
+            "界",
+            "e\u{301}",
+            "👩‍💻",
+        ] {
+            assert!(
+                all.contains(marker),
+                "missing {marker:?} at {width}x{height}"
+            );
+        }
+        tui.scroll_follow();
+        assert_eq!(render(&tui, &s, width, height), tail);
+        assert_eq!(format!("{s:?}"), before);
+    }
+}
+
+#[test]
+fn failed_report_uses_the_failure_accent_and_retains_its_charged_facts() {
+    let mut tui = Tui::new();
+    tui.reduced = true;
+    let mut s = base_scenario();
+    s.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "prompt".into(),
+        ..Default::default()
+    });
+    s.turn_report = Some(orbit_hud_tui::proto::scenario::TurnReport {
+        duration_ms: 7000,
+        tools: 2,
+        cost_microcents: 3100,
+        priced: true,
+    });
+    s.failure_reason = Some("ERR_PRICED".into());
+    s.apply("turn_failed", 0);
+    let mut term = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| draw(f, &tui, &s, "", None, "", 0, None, false, 0))
+        .unwrap();
+    let buffer = term.backend().buffer();
+    let report_y = (0..30)
+        .find(|&y| {
+            let row = (0..100)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            row.contains("✕ failed · 7s · 2 tools · +$0.003")
+        })
+        .expect("failed report must retain actual duration, tools and charged amount");
+    let report_x = (0..100)
+        .find(|&x| buffer[(x, report_y)].symbol() == "✕")
+        .unwrap();
+    let red = orbit_hud_tui::proto::shell::pal::Palette::from_profile(&tui.profile).red;
+    assert_eq!(
+        buffer[(report_x, report_y)].fg,
+        ratatui::style::Color::Rgb(red.0, red.1, red.2)
+    );
+    assert_eq!(s.turn_report.as_ref().unwrap().cost_microcents, 3100);
 }

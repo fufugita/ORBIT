@@ -42,18 +42,25 @@ then check `orbit --version` and `orbit --help` from outside the checkout.
 ## Initialize once
 
 ```sh
-orbit setup
+orbit init
 orbit doctor
+orbit
 ```
 
-Plain `orbit setup` opens a provider wizard when both input and output are
-terminals. Choose a preset or custom provider name, adapter and base URL, then
+Plain `orbit init` and `orbit setup` open the same provider wizard when both input
+and output are terminals. Use the arrow keys and Enter for choices; plain
+terminals offer numbered input. Back revisits completed stages without repeating
+login or model discovery. Ctrl-C cancels an unpublished draft. Choose a preset or custom provider name, adapter and base URL, then
 choose a hidden API key, a credential ENV reference, supported browser sign-in,
 or explicit no-auth for a custom/local provider. Choose manual model IDs or online discovery, optionally
 choose the main default, review the summary and type `yes` to save.
 `orbit provider add` opens the same wizard for another provider. Manual model
 entry with API-key/ENV/no-auth authentication sends no provider requests. Browser
 sign-in and online model discovery contact their selected provider.
+
+For a sequential numbered menu, set `NO_COLOR=1` or `TERM=dumb` before running
+`orbit init`. This avoids the alternate-screen picker while keeping the same
+provider choices and save confirmation.
 
 Hidden keys are stored in owned private files under the selected home's
 `auth/providers` directory. Public provider configuration contains a generated
@@ -70,9 +77,9 @@ Partial or inconsistent identity files produce a diagnosis rather than a new
 signing key. Use `orbit setup repair --dry-run` to inspect missing artifacts.
 Canceling before confirmation preserves existing configuration and credentials.
 
-For prompt-free automation, use explicit provider flags below, `setup --json`,
-`setup --no-provider`, or `setup --dry-run`. Redirected plain setup also stays
-offline. `orbit setup --guided` retains the older offline ENV-name prompt flow
+For prompt-free automation, use explicit provider flags below, `init --json`,
+`init --no-provider`, or `setup --dry-run`. The corresponding setup flags and
+redirected plain init/setup also stay offline. `orbit setup --guided` retains the older offline ENV-name prompt flow
 and requires terminal input and output. Interactive flags cannot use JSON.
 
 The configuration directory is selected by `--home`, then nonempty `ORBIT_HOME`.
@@ -81,6 +88,39 @@ and finally `~/.orbit` as the creation default. Set `--home` explicitly when
 comparing disposable workspaces, so their existing `.orbit` directory cannot
 select a different home. Do not copy a signing key into an example or portable
 profile.
+
+## Configure without editing files
+
+```sh
+orbit config
+```
+
+With terminal input and output, this opens a settings menu:
+
+| Section | What it changes |
+| --- | --- |
+| Defaults | The main model and models used for delegated work, exploration, and compaction; automatic selection is also available. |
+| Routing | Easy and hard fallback models. Existing phase-specific targets keep priority. |
+| Appearance | Built-in theme, layout preset, density, glyphs, color mode, and reduced motion. |
+| Add provider | The same reviewed provider/authentication/model setup flow. |
+
+Choose a setting, review the change, then confirm saving. Each edit is saved
+separately. Back or Cancel leaves the current edit unchanged; leaving the menu
+preserves previously confirmed edits. If another process changes configuration
+while you review it, reload the settings before making a new confirmed edit.
+
+A new session reads saved defaults. Explicitly selected or resumed models keep
+their selection; changing a default does not redirect a running pinned session.
+Appearance is stored in the existing shared profile used by the terminal and
+browser. Terminal font choice belongs to your terminal emulator; browser font
+settings and advanced pane/tree edits remain available through the existing
+customization commands.
+
+For a read-only summary, use `orbit config show`. Add `--json` for structured
+output. Bare `orbit config` with redirected input or output also shows settings
+without opening a menu. These views do not contact providers, start tools, or
+read out credential values. A configured model still needs a successful real
+request before connectivity is established.
 
 ## Declare providers and routing
 
@@ -409,7 +449,7 @@ including musl Linux, receive an explicit unsupported-platform message. Enable
 optional dependencies; `--omit=optional` omits the native executable package.
 No lifecycle script downloads code or modifies your configuration.
 
-After publication, install the candidate with:
+Install the current prerelease from the `next` tag with:
 
 ```sh
 npm install --global --include=optional @fufugita/orbit@next

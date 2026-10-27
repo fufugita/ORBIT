@@ -17,6 +17,7 @@
 //! that merely contains `|` is left alone.
 
 use super::canvas::text_width;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// What one displayed character is, beyond its glyph.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -152,26 +153,40 @@ fn rule_aligns(line: &str) -> Option<Vec<Align>> {
 
 /// Clip a styled cell to `w` cells, ending in `…` when it had to be cut.
 fn clip_cell(cell: &Styled, w: usize) -> Vec<(char, Sty)> {
-    let chars: Vec<(char, Sty)> = cell
-        .plain
-        .iter()
-        .copied()
-        .zip(cell.sty.iter().copied())
-        .collect();
-    let width = |cs: &[(char, Sty)]| {
-        cs.iter()
-            .map(|(c, _)| text_width(&c.to_string()) as usize)
-            .sum::<usize>()
-    };
-    if width(&chars) <= w {
-        return chars;
+    let text: String = cell.plain.iter().collect();
+    if text_width(&text).max(0) as usize <= w {
+        return cell
+            .plain
+            .iter()
+            .copied()
+            .zip(cell.sty.iter().copied())
+            .collect();
     }
+
+    if w == 0 {
+        return Vec::new();
+    }
+
     let mut out: Vec<(char, Sty)> = Vec::new();
-    for (c, st) in &chars {
-        if width(&out) + text_width(&c.to_string()) as usize > w.saturating_sub(1) {
+    let mut char_offset = 0usize;
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        let width = text_width(grapheme).max(0) as usize;
+        if used.saturating_add(width) > w.saturating_sub(1) {
             break;
         }
-        out.push((*c, *st));
+        let printable = grapheme
+            .chars()
+            .position(|ch| text_width(&ch.to_string()) > 0)
+            .unwrap_or(0);
+        let style = cell
+            .sty
+            .get(char_offset + printable)
+            .copied()
+            .unwrap_or_default();
+        out.extend(grapheme.chars().map(|ch| (ch, style)));
+        char_offset += grapheme.chars().count();
+        used = used.saturating_add(width);
     }
     let st = out.last().map_or_else(Sty::default, |(_, st)| *st);
     out.push(('…', st));
@@ -205,10 +220,8 @@ fn table_at(lines: &[&str], at: usize, max_width: usize) -> Option<Table> {
         rows.push(cells.iter().map(|c| rich_styled(c)).collect());
     }
     let cell_w = |c: &Styled| {
-        c.plain
-            .iter()
-            .map(|ch| text_width(&ch.to_string()) as usize)
-            .sum::<usize>()
+        let text: String = c.plain.iter().collect();
+        text_width(&text).max(0) as usize
     };
     let mut widths: Vec<usize> = (0..n)
         .map(|c| rows.iter().map(|r| cell_w(&r[c])).max().unwrap_or(0).max(1))
@@ -240,10 +253,8 @@ fn table_at(lines: &[&str], at: usize, max_width: usize) -> Option<Table> {
                     st.bold = true;
                 }
             }
-            let used: usize = cell
-                .iter()
-                .map(|(ch, _)| text_width(&ch.to_string()) as usize)
-                .sum();
+            let cell_text: String = cell.iter().map(|(ch, _)| *ch).collect();
+            let used = text_width(&cell_text).max(0) as usize;
             let pad = w.saturating_sub(used);
             let (left, right) = match aligns[c] {
                 Align::Left => (0, pad),
@@ -290,10 +301,14 @@ fn emit_table(
 ) -> usize {
     for (k, line) in raw.iter().enumerate() {
         let shown = &table.shown[k];
-        let len = line.chars().count();
+        let raw_chars: Vec<char> = line.chars().collect();
+        let len = raw_chars.len();
+        let has_newline = k + 1 < raw.len() || more_after;
+        let crlf = has_newline && raw_chars.last() == Some(&'\r');
+        let content_len = len - usize::from(crlf);
         let start = out.plain.len();
-        for r in 0..=len {
-            let at = start + (r * shown.len()) / len.max(1);
+        for r in 0..=content_len {
+            let at = start + (r * shown.len()) / content_len.max(1);
             if ri + r < out.raw_to_plain.len() {
                 out.raw_to_plain[ri + r] = at;
             }
@@ -302,8 +317,12 @@ fn emit_table(
             out.plain.push(*c);
             out.sty.push(*st);
         }
-        let last = k + 1 == raw.len();
-        if !last || more_after {
+        if has_newline {
+            if crlf {
+                // The CR source index equals the post-content boundary;
+                // the LF index below maps to that same rendered boundary.
+                out.raw_to_plain[ri + content_len] = out.plain.len();
+            }
             out.raw_to_plain[ri + len] = out.plain.len();
             out.plain.push('\n');
             out.sty.push(Sty::default());
@@ -325,6 +344,19 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
     let raw_len = text.chars().count();
     let all_lines: Vec<&str> = text.split('\n').collect();
     let nlines = all_lines.len();
+    // Remove CR only when it is paired with the following LF. Keep raw lines
+    // separately so arrival/style offsets still refer to the original text.
+    let display_lines: Vec<&str> = all_lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index + 1 < nlines {
+                line.strip_suffix('\r').unwrap_or(line)
+            } else {
+                line
+            }
+        })
+        .collect();
     let mut out = Styled {
         raw_to_plain: vec![0; raw_len + 1],
         ..Default::default()
@@ -338,7 +370,7 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
         if li < skip_to {
             continue;
         }
-        if !fence && let Some(table) = table_at(&all_lines, li, max_width) {
+        if !fence && let Some(table) = table_at(&display_lines, li, max_width) {
             ri = emit_table(
                 &mut out,
                 &table,
@@ -349,8 +381,15 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
             skip_to = li + table.lines;
             continue;
         }
-        let line: Vec<char> = line_str.chars().collect();
+        let raw_line: Vec<char> = line_str.chars().collect();
         let has_newline = li + 1 < nlines;
+        let crlf = has_newline && raw_line.last() == Some(&'\r');
+        let line: Vec<char> = if crlf {
+            raw_line[..raw_line.len() - 1].to_vec()
+        } else {
+            raw_line.clone()
+        };
+        let raw_line_len = raw_line.len();
         // Emit one displayed char; `$r` is its raw index, or None for a
         // char with no raw origin (the bullet that replaces a dash).
         macro_rules! emit {
@@ -519,7 +558,12 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
             }
         }
         if has_newline {
-            out.raw_to_plain[ri + line.len()] = out.plain.len();
+            // A CRLF pair is a single structural break. Both source offsets
+            // map to the same rendered boundary, while a lone CR stays visible.
+            if crlf {
+                out.raw_to_plain[ri + line.len()] = out.plain.len();
+            }
+            out.raw_to_plain[ri + raw_line_len] = out.plain.len();
             // A fence line leaves no row of its own. The newline of a code
             // line stays part of the block, so a blank line inside it is
             // still a row of the band.
@@ -531,7 +575,7 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
                 });
             }
         }
-        ri += line.len() + 1;
+        ri += raw_line_len + 1;
     }
     let end = out.plain.len();
     *out.raw_to_plain.last_mut().expect("one past the end") = end;
@@ -540,6 +584,7 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
 
 #[cfg(test)]
 mod tests {
+    use super::super::canvas::clip_text;
     use super::*;
 
     fn text(s: &Styled) -> String {
@@ -650,6 +695,73 @@ mod tests {
     }
 
     #[test]
+    fn crlf_is_one_structural_break_and_keeps_raw_offset_mapping() {
+        for (raw, expected) in [
+            ("first\r\nsecond", "first\nsecond"),
+            ("```\nfirst\r\nsecond\n```", "first\nsecond\n"),
+            ("```\r\nfirst\r\nsecond\r\n```", "first\nsecond\n"),
+            (
+                "|a|b|\r\n|---|---|\r\n|x|y|\r\nafter",
+                "a │ b\n──┼──\nx │ y\nafter",
+            ),
+        ] {
+            let styled = rich_styled(raw);
+            let shown = text(&styled);
+            assert_eq!(shown, expected, "raw={raw:?}");
+            assert!(!shown.contains('\r'), "raw={raw:?}, shown={shown:?}");
+            assert_eq!(styled.raw_to_plain.len(), raw.chars().count() + 1);
+            assert!(
+                styled
+                    .raw_to_plain
+                    .windows(2)
+                    .all(|pair| pair[0] <= pair[1])
+            );
+            assert!(
+                styled
+                    .raw_to_plain
+                    .iter()
+                    .all(|index| *index <= styled.plain.len())
+            );
+            let chars: Vec<char> = raw.chars().collect();
+            for (index, pair) in chars.windows(2).enumerate() {
+                if pair == ['\r', '\n'] {
+                    assert_eq!(
+                        styled.raw_to_plain[index],
+                        styled.raw_to_plain[index + 1],
+                        "CRLF offsets differ for {raw:?}"
+                    );
+                }
+            }
+        }
+
+        let standalone = rich_styled("first\rsecond");
+        assert_eq!(text(&standalone), "first\rsecond");
+        assert_eq!(clip_text(&text(&standalone), 32), "first␍second");
+
+        fn assert_crlf_map(raw: &str, cr: usize, boundary: usize, after_lf: usize) {
+            let styled = rich_styled(raw);
+            assert_eq!(styled.raw_to_plain[cr], boundary, "CR: {raw:?}");
+            assert_eq!(styled.raw_to_plain[cr + 1], boundary, "LF: {raw:?}");
+            assert_eq!(
+                styled.raw_to_plain[cr + 2],
+                after_lf,
+                "source after LF: {raw:?}"
+            );
+        }
+
+        assert_crlf_map("first\r\nsecond", 5, 5, 6);
+        assert_crlf_map("```\nfirst\r\nsecond\n```", 9, 5, 6);
+        let fenced_crlf = "```\r\nfirst\r\nsecond\r\n```";
+        assert_crlf_map(fenced_crlf, 3, 0, 0);
+        assert_crlf_map(fenced_crlf, 10, 5, 6);
+        assert_crlf_map(fenced_crlf, 18, 12, 13);
+        let table = "|a|b|\r\n|---|---|\r\n|x|y|\r\nafter";
+        assert_crlf_map(table, 5, 5, 6);
+        assert_crlf_map(table, 16, 11, 12);
+        assert_crlf_map(table, 23, 17, 18);
+    }
+
+    #[test]
     fn columns_follow_the_alignment_row() {
         let s = rich_styled("| name | n |\n|:----:|--:|\n| x | 12345 |");
         assert_eq!(text(&s), "name │     n\n─────┼──────\n x   │ 12345");
@@ -695,6 +807,29 @@ mod tests {
         assert!(shown.contains("short"), "the narrow column keeps its text");
         // So narrow that three cells per column do not fit: literal.
         assert_eq!(text(&rich_styled_fit(t, 8)), t);
+    }
+
+    #[test]
+    fn table_cell_width_and_clipping_keep_unicode_graphemes_whole() {
+        let text = "| value |\n|---|\n| e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦 |";
+        let clipped = rich_styled_fit(text, 8);
+        let shown = self::text(&clipped);
+        assert!(shown.contains("e\u{301}"), "{shown:?}");
+        assert!(shown.contains('界'), "{shown:?}");
+        assert!(shown.contains("🇧🇷"), "{shown:?}");
+        assert!(shown.contains("☀️"), "{shown:?}");
+        assert!(
+            !shown.contains('\u{200d}'),
+            "partial joined cluster: {shown:?}"
+        );
+        assert!(shown.ends_with('…'), "{shown:?}");
+        assert!(shown.lines().all(|line| text_width(line) <= 8), "{shown:?}");
+
+        let exact = rich_styled_fit(text, 9);
+        let shown = self::text(&exact);
+        assert!(shown.contains("👨‍👩‍👧‍👦"), "{shown:?}");
+        assert!(shown.lines().all(|line| text_width(line) <= 9), "{shown:?}");
+        assert_eq!(clipped.plain.len(), clipped.sty.len());
     }
 
     /// A table streams in line by line, and every prefix must parse, map

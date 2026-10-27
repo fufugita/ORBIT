@@ -8,6 +8,7 @@ use orbit_adapter::credential::SecretBytes;
 use orbit_adapter::error::AdapterError;
 use orbit_adapter::types::{
     AdapterIdentity, AdapterKind, ProviderCapabilities, ProviderRequest, ProviderRouteBinding,
+    UsageObservationMetaV1, UsageReasoningReportingV1, UsageSnapshotOriginV1,
 };
 
 pub struct OllamaHttpV1 {
@@ -91,10 +92,8 @@ impl AsyncProviderAdapter for OllamaHttpV1 {
             return Ok(crate::cancel::cancelled_stream());
         }
         let resp = response
-            .map_err(|_| {
-                AdapterError::ProviderTimeout("response headers timed out (E0409)".into())
-            })?
-            .map_err(|error| crate::reqwest_error(error, "response headers"))?;
+            .map_err(|_| crate::dispatch_deadline_error("response headers"))?
+            .map_err(|error| crate::reqwest_dispatch_error(error, "response headers"))?;
         if resp.status().is_redirection() {
             return Err(AdapterError::ProtocolOrStreamViolation(
                 "provider redirects are not permitted (E0411)".into(),
@@ -384,7 +383,7 @@ fn ollama_stream(
         let mut state = OllamaState::default();
         let mut seq = 0u64;
         let mut total = 0usize;
-        yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ResponseStarted { upstream_request_id:None } }); seq += 1;
+        yield Ok(ProviderStreamEvent { usage_observation: None, sequence:seq, event:ProviderEventKind::ResponseStarted { upstream_request_id:None } }); seq += 1;
         let mut first = true;
         while let Some(chunk) = {
             let waited = if first {
@@ -412,7 +411,7 @@ fn ollama_stream(
                 if byte == b'\n' {
                     match state.line(&line) {
                         Ok(Some(text)) if !text.is_empty() => {
-                            yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::TextDelta { bytes:text.into_bytes() } }); seq += 1;
+                            yield Ok(ProviderStreamEvent { usage_observation: None, sequence:seq, event:ProviderEventKind::TextDelta { bytes:text.into_bytes() } }); seq += 1;
                         }
                         Ok(_) => {},
                         Err(error) => { yield Err(error); return; }
@@ -426,13 +425,13 @@ fn ollama_stream(
             if state.done { break; }
         }
         if cancel.is_cancelled() {
-            yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::Finished { finish_reason:Some("cancelled".into()), final_usage:None } });
+            yield Ok(ProviderStreamEvent { usage_observation: None, sequence:seq, event:ProviderEventKind::Finished { finish_reason:Some("cancelled".into()), final_usage:None } });
             return;
         }
         if !line.is_empty() {
             match state.line(&line) {
                 Ok(Some(text)) if !text.is_empty() => {
-                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::TextDelta { bytes:text.into_bytes() } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { usage_observation: None, sequence:seq, event:ProviderEventKind::TextDelta { bytes:text.into_bytes() } }); seq += 1;
                 }
                 Ok(_) => {},
                 Err(error) => { yield Err(error); return; }
@@ -445,12 +444,12 @@ fn ollama_stream(
             if !state.calls.is_empty() {
                 reason = "tool_calls".into();
                 for (index, call) in state.calls {
-                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallStarted { call_index:index, provider_call_id:Some(call.id), name:call.name } }); seq += 1;
-                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallArgumentsDelta { call_index:index, bytes:call.arguments.into_bytes() } }); seq += 1;
-                    yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::ToolCallFinished { call_index:index } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { usage_observation: None, sequence:seq, event:ProviderEventKind::ToolCallStarted { call_index:index, provider_call_id:Some(call.id), name:call.name } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { usage_observation: None, sequence:seq, event:ProviderEventKind::ToolCallArgumentsDelta { call_index:index, bytes:call.arguments.into_bytes() } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { usage_observation: None, sequence:seq, event:ProviderEventKind::ToolCallFinished { call_index:index } }); seq += 1;
                 }
             }
         }
-        yield Ok(ProviderStreamEvent { sequence:seq, event:ProviderEventKind::Finished { finish_reason:Some(reason), final_usage:state.usage } });
+        yield Ok(ProviderStreamEvent { usage_observation: state.usage.map(|_| UsageObservationMetaV1 { version: 1, reasoning_reporting: UsageReasoningReportingV1::NotReported, snapshot_origin: UsageSnapshotOriginV1::ProviderReported }), sequence:seq, event:ProviderEventKind::Finished { finish_reason:Some(reason), final_usage:state.usage } });
     })
 }

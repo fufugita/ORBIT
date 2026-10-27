@@ -38,7 +38,7 @@ pub struct ResolvedModel {
     pub kind: ProviderKind,
     pub url: String,
     pub credential_env: Option<String>,
-    pub pricing: Pricing,
+    pub pricing: Option<Pricing>,
     pub caps: ModelEntry,
 }
 impl ResolvedModel {
@@ -58,7 +58,13 @@ impl ResolvedModel {
             model: self.raw_model.clone(),
             kind: self.kind,
             credential_env: self.credential_env.clone(),
-            pricing: Some(self.pricing.into()),
+            pricing: self.pricing.and_then(Pricing::complete_legacy_cost_rates),
+            billing: self
+                .caps
+                .billing
+                .as_ref()
+                .map(|billing| billing.contract(&self.provider_id, &self.raw_model))
+                .transpose()?,
             max_output_tokens: self.caps.max_output_tokens.unwrap_or(32_000).into(),
             sampling: self
                 .caps
@@ -521,6 +527,48 @@ pub enum RouteMutation {
         phase: Option<TaskPhase>,
     },
 }
+/// Preserve the original document outside one explicitly editable section.
+/// The complete intended value is checked after encoding, including unknown data.
+pub fn encode_candidate_section(
+    raw: &str,
+    intended: &toml::Value,
+    section: &str,
+) -> Result<String, String> {
+    if !matches!(section, "roles" | "routing") {
+        return Err("unsupported provider configuration section".into());
+    }
+    if raw.len() > MAX_CONFIG_BYTES {
+        return Err("providers configuration exceeds 128 KiB".into());
+    }
+    let mut original = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| "invalid providers TOML")?;
+    // Canonical serialization is a semantic comparison rather than float
+    // PartialEq: valid unknown NaN values must remain editable and preserved.
+    let canonical =
+        toml::to_string(intended).map_err(|_| "could not serialize providers candidate")?;
+    let replacement = canonical
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| "invalid providers candidate")?;
+    if let Some(item) = replacement.as_table().get(section) {
+        original.as_table_mut().insert(section, item.clone());
+    } else {
+        original.as_table_mut().remove(section);
+    }
+    let candidate = original.to_string();
+    if candidate.len() > MAX_CONFIG_BYTES {
+        return Err("providers configuration exceeds 128 KiB".into());
+    }
+    let encoded: toml::Value =
+        toml::from_str(&candidate).map_err(|_| "invalid providers candidate")?;
+    let encoded =
+        toml::to_string(&encoded).map_err(|_| "could not serialize providers candidate")?;
+    if encoded != canonical {
+        return Err("providers candidate did not preserve intended values".into());
+    }
+    Ok(candidate)
+}
+
 /// Construct and validate the entire candidate. Caller alone owns atomic persistence.
 pub fn config_candidate(raw: &str, mutation: RouteMutation) -> Result<String, String> {
     if raw.len() > MAX_CONFIG_BYTES {
@@ -659,11 +707,7 @@ pub fn config_candidate(raw: &str, mutation: RouteMutation) -> Result<String, St
             }
         }
     }
-    let candidate =
-        toml::to_string(&value).map_err(|_| "could not serialize providers candidate")?;
-    if candidate.len() > MAX_CONFIG_BYTES {
-        return Err("providers configuration exceeds 128 KiB".into());
-    }
+    let candidate = encode_candidate_section(raw, &value, "routing")?;
     let config: ProvidersConfig =
         toml::from_str(&candidate).map_err(|_| "invalid providers candidate")?;
     validate_settings(&config, &parse_settings(&candidate)?)?;

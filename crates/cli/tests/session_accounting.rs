@@ -86,6 +86,28 @@ fn config(gate: &str, price: Option<u64>) -> TurnConfig {
             reasoning_per_million_microcents: Some(0),
             request_flat_microcents: flat,
         }),
+        billing: price.map(|flat_fee| {
+            use orbit_adapter::types::{
+                BillingQuoteContractV1, BillingRatesV1, ModelId, PricingDeclarationState,
+                ProviderId, ReasoningCounterBasis, ReasoningRatePolicy,
+            };
+            BillingQuoteContractV1::try_new(
+                ProviderId("main-provider".into()),
+                ModelId("main/raw".into()),
+                PricingDeclarationState::DeclaredV2,
+                BillingRatesV1 {
+                    input_per_million_microdollars: Some(0),
+                    output_per_million_microdollars: Some(0),
+                    cache_read_per_million_microdollars: Some(0),
+                    cache_write_per_million_microdollars: Some(0),
+                    reasoning_per_million_microdollars: None,
+                    request_flat_microdollars: Some(flat_fee),
+                },
+                ReasoningCounterBasis::IncludedInOutput,
+                ReasoningRatePolicy::OutputRate,
+            )
+            .unwrap()
+        }),
         max_output_tokens: 73,
         sampling: None,
         effort: None,

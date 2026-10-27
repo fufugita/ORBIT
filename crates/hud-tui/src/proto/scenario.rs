@@ -3,6 +3,71 @@
 //! tied to an event, never a guess.
 
 use super::anim::StarState;
+use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+use crate::worker::{ForegroundKind, ForegroundOperation, SessionBinding, WorkerCommand};
+
+/// Original unbound UI intent. Debug deliberately excludes real prompt text.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum OrdinaryIntent {
+    Prompt(String),
+    PlanPrompt(String),
+    ModCommand(String, String),
+}
+
+impl std::fmt::Debug for OrdinaryIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Prompt(_) => "Prompt(..)",
+            Self::PlanPrompt(_) => "PlanPrompt(..)",
+            Self::ModCommand(_, _) => "ModCommand(..)",
+        })
+    }
+}
+
+impl OrdinaryIntent {
+    pub(super) fn from_command(command: &WorkerCommand) -> Option<Self> {
+        match command {
+            WorkerCommand::Prompt(text) => Some(Self::Prompt(text.clone())),
+            WorkerCommand::PlanPrompt(text) => Some(Self::PlanPrompt(text.clone())),
+            WorkerCommand::ModCommand(module, command) => {
+                Some(Self::ModCommand(module.clone(), command.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn kind(&self) -> ForegroundKind {
+        match self {
+            Self::PlanPrompt(_) => ForegroundKind::PlanPrompt,
+            Self::Prompt(_) | Self::ModCommand(_, _) => ForegroundKind::Prompt,
+        }
+    }
+
+    pub(super) fn command(&self) -> WorkerCommand {
+        match self {
+            Self::Prompt(text) => WorkerCommand::Prompt(text.clone()),
+            Self::PlanPrompt(text) => WorkerCommand::PlanPrompt(text.clone()),
+            Self::ModCommand(module, command) => {
+                WorkerCommand::ModCommand(module.clone(), command.clone())
+            }
+        }
+    }
+
+    pub(super) fn display_text(&self) -> String {
+        match self {
+            Self::Prompt(text) | Self::PlanPrompt(text) => text.clone(),
+            Self::ModCommand(module, command) => format!("/{module}:{command}"),
+        }
+    }
+}
+
+/// Pure local view data: no operation, registration, Bound command or grant.
+#[derive(Debug, Clone)]
+struct OrdinaryView {
+    intent: OrdinaryIntent,
+    source: SessionBinding,
+    terminal: Option<(OrdinaryEnd, OrdinaryPublication)>,
+}
 
 /// Local display ownership; kept opaque so callers cannot forge accepted state.
 #[derive(Debug, Clone, Default)]
@@ -17,6 +82,8 @@ pub struct SessionViewState {
     /// list request receives its terminal reply.
     picker_request: Option<PickerRequest>,
     next_manual_id: u64,
+    ordinary: Option<OrdinaryView>,
+    notice: Option<String>,
 }
 
 /// What a panel of the scenario knows. The reducer is total: every
@@ -46,6 +113,10 @@ pub struct Scenario {
     pub approval_call_id: Option<String>,
     /// The last turn failed (until the next TurnStarted).
     pub last_failed: bool,
+    /// Latest display-safe failure for this view; never part of saved history.
+    pub failure_reason: Option<String>,
+    /// Previous session retained by the last checked clear; view state only.
+    pub cleared_from: Option<String>,
     /// Compaction in flight (M18's amber shimmer).
     pub compacting: bool,
     /// Agents (M15): id → (name, current action, done).
@@ -323,6 +394,8 @@ pub enum ToolState {
     Blocked,
     /// Stopped by Esc, or cut off when the turn ended.
     Cancelled,
+    /// The saved result could not be validated; keep the status neutral.
+    Unavailable,
 }
 
 impl ToolState {
@@ -338,6 +411,7 @@ impl ToolState {
             ToolState::Denied => ("⊘", Token::Muted),
             ToolState::Blocked => ("⊖", Token::Amber),
             ToolState::Cancelled => ("⊘", Token::Muted),
+            ToolState::Unavailable => ("?", Token::Muted),
         }
     }
 }
@@ -464,6 +538,103 @@ impl Scenario {
         self.frontend.foreground.as_ref()
     }
 
+    pub(super) fn remember_ordinary_intent(
+        &mut self,
+        intent: OrdinaryIntent,
+        source: SessionBinding,
+    ) {
+        if self.frontend.binding.as_ref() == Some(&source)
+            && self
+                .pending_foreground()
+                .is_some_and(|operation| operation.kind() == intent.kind())
+        {
+            self.frontend.ordinary = Some(OrdinaryView {
+                intent,
+                source,
+                terminal: None,
+            });
+            self.frontend.dirty = true;
+        }
+    }
+
+    pub(super) fn ordinary_end(&self) -> Option<&OrdinaryEnd> {
+        let view = self.frontend.ordinary.as_ref()?;
+        if self.session_binding() != Some(&view.source) {
+            return None;
+        }
+        view.terminal.as_ref().map(|(end, _)| end)
+    }
+
+    pub(super) fn ordinary_cancelled(&self) -> bool {
+        matches!(self.ordinary_end(), Some(OrdinaryEnd::Cancelled))
+    }
+
+    pub(super) fn can_resend_ordinary(&self) -> bool {
+        self.eligible_ordinary_intent().is_some()
+    }
+
+    pub(super) fn eligible_ordinary_intent(&self) -> Option<&OrdinaryIntent> {
+        if self.is_busy() {
+            return None;
+        }
+        let view = self.frontend.ordinary.as_ref()?;
+        (self.session_binding() == Some(&view.source)
+            && matches!(
+                &view.terminal,
+                Some((OrdinaryEnd::Failed(_), OrdinaryPublication::Saved))
+            ))
+        .then_some(&view.intent)
+    }
+
+    pub(super) fn accept_ordinary_end(
+        &mut self,
+        operation: &ForegroundOperation,
+        end: OrdinaryEnd,
+        publication: OrdinaryPublication,
+    ) -> bool {
+        let Some(view) = self.frontend.ordinary.as_ref() else {
+            return false;
+        };
+        if !operation.kind().is_ordinary()
+            || self.pending_foreground() != Some(operation)
+            || self.session_binding() != Some(operation.source())
+            || view.source != *operation.source()
+            || view.intent.kind() != operation.kind()
+            || view.terminal.is_some()
+        {
+            return false;
+        }
+        self.last_failed = matches!(&end, OrdinaryEnd::Failed(_));
+        match &end {
+            OrdinaryEnd::Failed(reason) => {
+                if self.failure_reason.as_deref().is_none_or(str::is_empty) {
+                    self.failure_reason = Some(reason.clone());
+                }
+            }
+            OrdinaryEnd::Completed | OrdinaryEnd::Cancelled => self.failure_reason = None,
+        }
+        self.turn_live = false;
+        self.visible_output = false;
+        self.first_prompt_waiting = false;
+        self.frontend.ordinary.as_mut().unwrap().terminal = Some((end, publication));
+        self.frontend.dirty = true;
+        true
+    }
+
+    pub(super) fn backend_notice(&self) -> Option<&str> {
+        self.frontend.notice.as_deref()
+    }
+
+    pub(super) fn set_backend_notice(&mut self, text: String) {
+        self.frontend.notice = Some(text);
+        self.frontend.dirty = true;
+    }
+
+    pub(super) fn clear_namespace_view(&mut self) {
+        self.frontend.ordinary = None;
+        self.frontend.notice = None;
+    }
+
     pub fn ordinary_pending(&self) -> bool {
         self.frontend
             .foreground
@@ -508,6 +679,11 @@ impl Scenario {
         if self.is_busy() || self.frontend.binding.as_ref() != Some(operation.source()) {
             return false;
         }
+        self.frontend.notice = None;
+        if operation.kind().is_ordinary() {
+            self.cleared_from = None;
+            self.frontend.ordinary = None;
+        }
         self.frontend.foreground = Some(operation);
         self.invalidate_cost_qualification();
         self.frontend.dirty = true;
@@ -540,6 +716,8 @@ impl Scenario {
         if self.is_busy() || self.frontend.binding.as_ref() != Some(operation.source()) {
             return false;
         }
+        self.cleared_from = None;
+        self.frontend.notice = None;
         self.frontend.pending = Some(operation);
         self.invalidate_cost_qualification();
         self.frontend.dirty = true;
@@ -849,6 +1027,13 @@ impl Scenario {
                 self.turn_live = true;
                 self.visible_output = false;
                 self.last_failed = false;
+                self.failure_reason = None;
+                self.cleared_from = None;
+                self.frontend.notice = None;
+                if let Some(view) = self.frontend.ordinary.as_mut() {
+                    view.terminal = None;
+                }
+                self.frontend.dirty = true;
                 self.turn_report = None;
                 self.turn_tools = 0;
             }
@@ -890,6 +1075,7 @@ impl Scenario {
             }
             "turn_failed" => {
                 self.turn_live = false;
+                self.first_prompt_waiting = false;
                 self.last_failed = true;
             }
             _ => {}
@@ -967,6 +1153,14 @@ mod tests {
 
     fn star_glyph_reduced() -> StarState {
         StarState::StillCyan
+    }
+
+    #[test]
+    fn unavailable_tool_status_uses_neutral_question_glyph() {
+        assert_eq!(
+            ToolState::Unavailable.glyph_parts(),
+            ("?", crate::proto::core::Token::Muted)
+        );
     }
 
     #[test]

@@ -415,6 +415,7 @@ pub fn validate_owner_arguments(command: &str, args: &[String]) -> Result<(), Cl
 pub mod attach;
 pub mod cli_release_commands;
 pub mod config;
+pub mod configuration_ui;
 pub mod context_history;
 #[allow(unsafe_code)]
 pub mod customization;
@@ -441,13 +442,16 @@ pub mod presets;
 pub mod provider_discovery;
 pub mod provider_policies;
 pub mod session_accounting;
+pub mod session_config;
 pub mod sessions;
 #[allow(unsafe_code)]
 pub mod setup;
+pub mod setup_terminal_ui;
 #[allow(unsafe_code)]
 pub mod signed_packages;
 pub mod tool_runtime;
 pub mod tools;
+#[cfg(feature = "tui")]
 pub mod tui_worker;
 
 use std::path::Path;
@@ -754,7 +758,10 @@ fn engine_turn_config_from(
                 .then(legacy_gate_credential_env)
                 .flatten()
         }),
-        pricing: pricing.map(std::convert::From::from),
+        pricing: pricing.and_then(crate::config::Pricing::complete_legacy_cost_rates),
+        billing: entry
+            .and_then(|model| model.billing)
+            .and_then(|billing| billing.contract(provider_id, model).ok()),
         max_output_tokens,
         sampling,
         effort: entry.and_then(|m| m.default_effort.clone()),
@@ -939,7 +946,12 @@ fn routed_turn_config_from(
     out.model = model.clone();
     out.kind = orbit_engine::dispatch::ProviderKind::from_config(&provider.kind);
     out.credential_env = provider.env.clone().filter(|s| !s.trim().is_empty());
-    out.pricing = Some(entry.pricing.into());
+    out.pricing = entry
+        .pricing
+        .and_then(crate::config::Pricing::complete_legacy_cost_rates);
+    out.billing = entry
+        .billing
+        .and_then(|billing| billing.contract(&provider.name, &entry.id).ok());
     out.max_output_tokens = entry.max_output_tokens.unwrap_or(32_000) as u64;
     out.sampling = entry.sampling.as_ref().map(|s| (s.temperature, s.top_p));
     if out.provider_id != base.provider_id || out.model != base.model {
@@ -1395,13 +1407,56 @@ mod effort_resolution_tests {
     #[test]
     fn exact_owner_metadata_and_reset_validate_before_mutation() {
         let home = Home::new(
-            "[[provider]]\nname='one'\nurl='https://one.example'\n[[provider.models]]\nid='shared'\nsupported_efforts=['low','high']\ndefault_effort='low'\n[[provider.models]]\nid='unknown'\n[[provider.models]]\nid='unsupported'\nsupported_efforts=[]\n[[provider]]\nname='two'\nkind='ollama'\nurl='https://two.example'\n[[provider.models]]\nid='shared'\nsupported_efforts=[false,'false']\ndefault_effort=false\n",
+            "[[provider]]\nname='one'\nurl='https://one.example'\n[[provider.models]]\nid='shared'\nsupported_efforts=['low','high']\ndefault_effort='low'\n[provider.models.billing]\nversion=2\ninput_per_million_microdollars=100\noutput_per_million_microdollars=200\nrequest_flat_microdollars=10\nreasoning_counter_basis='included_in_output'\nreasoning_rate_policy='output_rate'\n[[provider.models]]\nid='unknown'\n[[provider.models]]\nid='unsupported'\nsupported_efforts=[]\n[[provider]]\nname='two'\nkind='ollama'\nurl='https://two.example'\n[[provider.models]]\nid='shared'\nsupported_efforts=[false,'false']\ndefault_effort=false\n[provider.models.billing]\nversion=2\ninput_per_million_microdollars=700\noutput_per_million_microdollars=900\nreasoning_per_million_microdollars=1100\nrequest_flat_microdollars=20\nreasoning_counter_basis='separate_from_output'\nreasoning_rate_policy='dedicated_rate'\nmax_reasoning_tokens=50\n",
         );
         let mut config =
             try_engine_turn_config(&home.0, "two", "https://two.example", "shared", None, None)
                 .unwrap();
         assert_eq!(config.kind, orbit_engine::ProviderKind::Ollama);
         assert_eq!(config.effort, Some(EffortValue::Bool(false)));
+        let second_billing = config.billing.as_ref().unwrap();
+        assert_eq!(second_billing.provider_id().0, "two");
+        assert_eq!(second_billing.raw_model_id().0, "shared");
+        assert_eq!(
+            second_billing.reasoning_counter_basis(),
+            orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput
+        );
+        assert_eq!(
+            second_billing.reasoning_rate_policy(),
+            orbit_adapter::types::ReasoningRatePolicy::DedicatedRate
+        );
+        assert_eq!(
+            second_billing.rates().input_per_million_microdollars,
+            Some(700)
+        );
+        assert_eq!(
+            second_billing.rates().reasoning_per_million_microdollars,
+            Some(1100)
+        );
+        let checked_first = checked_model_turn(
+            &home.0,
+            "one/shared",
+            Some("one"),
+            Some("https://one.example"),
+            false,
+        )
+        .unwrap();
+        let first_billing = checked_first.billing.as_ref().unwrap();
+        assert_eq!(first_billing.provider_id().0, "one");
+        assert_eq!(first_billing.raw_model_id().0, "shared");
+        assert_eq!(
+            first_billing.reasoning_counter_basis(),
+            orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput
+        );
+        assert_eq!(
+            first_billing.reasoning_rate_policy(),
+            orbit_adapter::types::ReasoningRatePolicy::OutputRate
+        );
+        assert_eq!(
+            first_billing.rates().input_per_million_microdollars,
+            Some(100)
+        );
+        assert_eq!(first_billing.rates().request_flat_microdollars, Some(10));
         let boolean_status = effort_status(&home.0, &config);
         assert!(boolean_status.starts_with("Configured effort for two/shared: false\n"));
         assert!(boolean_status.contains("Supported: false, \"false\".\n"));

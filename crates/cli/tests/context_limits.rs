@@ -352,6 +352,7 @@ mod resolver_tests {
             kind: ProviderKind::from_config(&provider.kind),
             credential_env: provider.env.clone(),
             pricing: None,
+            billing: None,
             max_output_tokens: u64::from(model.max_output_tokens.unwrap_or(32_000)),
             sampling: None,
             effort: model.default_effort.clone(),

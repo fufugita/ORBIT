@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn config(endpoint: &str) -> TurnConfig {
     TurnConfig {
+        billing: None,
         provider_id: "fixture".into(),
         gate: endpoint.into(),
         model: "fixture-model".into(),

@@ -51,8 +51,13 @@ pub enum ManualOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextProjection {
+    /// Invalidate any older sample; this projection has no usable measurement.
     Unavailable,
+    /// Keep the old sample only after a failed manual compaction that changed nothing.
     PreserveUnchanged,
+    /// Keep the nonzero-window sample emitted by the current same-model/provider turn.
+    /// The reducer validates its session binding, refresh or exact active ordinary-operation reason, sample, and identity.
+    PreserveMeasured,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +94,21 @@ pub struct SessionProjection {
     pub reason: ProjectionReason,
 }
 
+/// Execution facts for an ordinary UI turn; never an execution capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrdinaryEnd {
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
+/// Conservative view of snapshot publication, independent of execution outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrdinaryPublication {
+    Saved,
+    BlockedOrUncertain,
+}
+
 /// The rule an approval card offers to remember (`s` for the session, `a`
 /// for good), as the backend derived it from the call: shown as written,
 /// so what the key grants is what the card says.
@@ -104,6 +124,14 @@ pub struct ApprovalGrant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
     SessionProjection(SessionProjection),
+    /// Transient owning identity only; the reducer never retains this operation.
+    OrdinaryTurnEnded {
+        operation: ForegroundOperation,
+        end: OrdinaryEnd,
+        publication: OrdinaryPublication,
+    },
+    /// Display-only startup/settings/storage diagnostic, outside ordinary failure.
+    BackendNotice(String),
     // ── Data (from the worker thread / backend bridge) ──────────────────────
     /// A chunk of streamed text from the model. Already passed through
     /// `display_safe` by the bridge before it reaches the reducer.

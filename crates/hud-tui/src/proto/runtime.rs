@@ -11,13 +11,17 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
 
 use super::comps;
 use super::core::Token;
 use super::scenario::{
-    LineKind, Picker, PickerKind, PickerRow, Scenario, ToolState, TranscriptLine, TurnReport,
+    LineKind, OrdinaryIntent, Picker, PickerKind, PickerRow, Scenario, ToolState, TranscriptLine,
+    TurnReport,
 };
 use super::screen::Focus;
+use super::shell::printable_text;
 use crate::worker::WorkerCtx;
 
 use crate::ApprovalRegistry;
@@ -81,6 +85,8 @@ pub struct Tui {
     pub selection: Option<super::shell::Selection>,
     /// The highlighted row of the `/` command list.
     pub completion_sel: usize,
+    /// Insertion point in the composer, measured in grapheme clusters.
+    pub composer_cursor: usize,
     /// Workspace file suggestions; accepting one changes only the draft.
     pub file_completion: super::composer::FileCompletion,
     /// An active reverse search, including the draft to restore on Escape.
@@ -114,6 +120,7 @@ impl Tui {
             scrolls: Vec::new(),
             selection: None,
             completion_sel: 0,
+            composer_cursor: 0,
             file_completion: super::composer::FileCompletion::default(),
             history_search: None,
             hits: Vec::new(),
@@ -290,6 +297,7 @@ fn run_proto_inner(
         scrolls: Vec::new(),
         selection: None,
         completion_sel: 0,
+        composer_cursor: 0,
         file_completion: super::composer::FileCompletion::default(),
         history_search: None,
         hits: Vec::new(),
@@ -338,9 +346,6 @@ fn run_proto_inner(
     let mut want_copy_mode = false;
     // The Sessions push (§8.2 Medium): Shift-Tab from Conversation.
     let mut sessions_pushed = false;
-    // The last sent prompt (§11.3): ⏎ on an empty composer resends
-    // it after a failed turn.
-    let mut last_prompt: Option<String> = None;
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let command_sink = cmd_tx.clone();
@@ -368,6 +373,8 @@ fn run_proto_inner(
     // if it had been typed.
     let mut injected: Option<Event> = None;
     let mut pending_picker_click: Option<PickerClick> = None;
+    let mut pending_palette_click: Option<PaletteClick> = None;
+    let mut last_palette_frame: Option<PaletteFrame> = None;
     // The last frame drawn: a selection copies its text from here.
     let mut last_buf: Option<ratatui::buffer::Buffer> = None;
 
@@ -384,6 +391,9 @@ fn run_proto_inner(
         // unwrap_or(false) here would busy-loop the EIO at 100% CPU.
         let ev = if let Some(click) = pending_picker_click.take() {
             picker_click_key(click, &mut scenario, overlay, now_ms).map(Event::Key)
+        } else if let Some(click) = pending_palette_click.take() {
+            palette_click_key(click, &scenario, overlay, &palette_query, &mut palette_sel)
+                .map(Event::Key)
         } else {
             match injected.take() {
                 Some(e) => Some(e),
@@ -438,7 +448,6 @@ fn run_proto_inner(
                             &mut pending_leader,
                             &mut want_copy_mode,
                             &mut sessions_pushed,
-                            &mut last_prompt,
                         )
                     };
                     let snap_after =
@@ -454,6 +463,20 @@ fn run_proto_inner(
                     }
                     if quit {
                         break;
+                    }
+                }
+                Event::Paste(text) => {
+                    if handle_paste(
+                        &text,
+                        &mut tui,
+                        &mut scenario,
+                        &mut composer,
+                        &history,
+                        &mut history_idx,
+                        overlay.is_some(),
+                    ) {
+                        scenario.last_key_ms = now_ms;
+                        overlay_dirty = true;
                     }
                 }
                 Event::Mouse(m) => {
@@ -520,11 +543,13 @@ fn run_proto_inner(
                         }
                         // The palette is a menu: a click runs the row (⏎).
                         MouseOutcome::Palette(i) => {
-                            palette_sel = i;
-                            injected = Some(Event::Key(crossterm::event::KeyEvent::new(
-                                crossterm::event::KeyCode::Enter,
-                                crossterm::event::KeyModifiers::NONE,
-                            )));
+                            pending_palette_click = capture_palette_click(
+                                &scenario,
+                                overlay,
+                                &palette_query,
+                                last_palette_frame.as_ref(),
+                                i,
+                            );
                         }
                     }
                     let snap_after =
@@ -548,7 +573,6 @@ fn run_proto_inner(
             copy_mode(&mut guard, &scenario);
         }
         if last_tick.elapsed() >= UI_TICK {
-            last_tick = Instant::now();
             // Signals (SIGHUP/SIGTERM/SIGINT): exit at once — a
             // closed terminal must not leak the process.
             if let Some(sig) = crate::terminal::take_pending_signal() {
@@ -596,6 +620,13 @@ fn run_proto_inner(
             }
             let view_dirty = scenario.take_view_dirty();
             bus_dirty |= view_dirty;
+            if toast
+                .as_ref()
+                .is_some_and(|t| now_ms.saturating_sub(t.shown_ms) >= 3000)
+            {
+                toast = None;
+                overlay_dirty = true;
+            }
             // Anything that moves keeps the 16 ms redraw alive: the
             // startup window, a live turn, the first-prompt orbit, a
             // fresh message, a breathing approval card.
@@ -660,14 +691,11 @@ fn run_proto_inner(
                     break;
                 };
                 last_buf = Some(done.buffer.clone());
+                last_palette_frame =
+                    capture_palette_frame(&scenario, overlay, &palette_query, &frame_hits);
                 tui.hits = frame_hits;
             }
-            // Toast expiry (§9.13): 3 s.
-            if let Some(t) = &toast
-                && now_ms.saturating_sub(t.shown_ms) >= 3000
-            {
-                toast = None;
-            }
+            last_tick = Instant::now();
         }
     }
 
@@ -728,7 +756,6 @@ fn handle_key(
     pending_leader: &mut Option<char>,
     want_copy_mode: &mut bool,
     sessions_pushed: &mut bool,
-    last_prompt: &mut Option<String>,
 ) -> bool {
     let prev_key_ms = scenario.last_key_ms;
     scenario.last_key_ms = now_ms;
@@ -742,11 +769,29 @@ fn handle_key(
     }
     // Ctrl+C / Ctrl+D (§11.7): the quit card, from anywhere.
     if k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::ALT)
         && (k.code == KeyCode::Char('c') || k.code == KeyCode::Char('d'))
     {
         scenario.dismiss_picker();
         *overlay = Some(Overlay::Quit);
         return false;
+    }
+    if let KeyCode::Char(c) = k.code
+        && k.modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        let control_only =
+            k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT);
+        let composer_control = control_only
+            && matches!(c, 'r' | 'w')
+            && tui.focus == Focus::Conversation
+            && overlay.is_none()
+            && !tui.app.arranging
+            && tui.app.picker.is_none()
+            && scenario.approval_call_id.is_none();
+        if !composer_control {
+            return false;
+        }
     }
     // Overlays own the keyboard (§9.19–9.21): the key that closes one
     // is spent — it must not also start arranging.
@@ -754,23 +799,27 @@ fn handle_key(
     match overlay {
         Some(Overlay::Palette) => match k.code {
             KeyCode::Esc => *overlay = None,
-            KeyCode::Up => *palette_sel = palette_sel.saturating_sub(1),
-            KeyCode::Down => *palette_sel += 1,
+            KeyCode::Up => {
+                let last = super::shell::overlays::palette_items(palette_query)
+                    .len()
+                    .saturating_sub(1);
+                *palette_sel = palette_sel.saturating_sub(1).min(last);
+            }
+            KeyCode::Down => {
+                let last = super::shell::overlays::palette_items(palette_query)
+                    .len()
+                    .saturating_sub(1);
+                *palette_sel = palette_sel.saturating_add(1).min(last);
+            }
             KeyCode::Enter => {
-                let commands: Vec<&'static str> =
-                    super::chrome::COMMANDS.iter().map(|(c, _)| *c).collect();
-                let _ = commands;
-                let matches: Vec<String> = super::chrome::COMMANDS
-                    .iter()
-                    .filter(|(c, _)| c.contains(palette_query.trim_start_matches('/')))
-                    .map(|(c, _)| c.to_string())
-                    .collect();
-                if let Some(cmd) = matches.get(*palette_sel).cloned() {
+                let matches = super::shell::overlays::palette_items(palette_query);
+                if let Some((cmd, _)) = matches.get(*palette_sel).copied() {
                     *overlay = None;
                     palette_query.clear();
                     let mut fs = false;
                     if let Some(o) = run_command(
-                        &cmd,
+                        tui,
+                        cmd,
                         scenario,
                         composer,
                         command_sink,
@@ -923,9 +972,10 @@ fn handle_key(
     // per-context meaning (close completion, defocus…).
     if k.code == KeyCode::Esc && scenario.is_busy() {
         if let Some(search) = tui.history_search.take() {
-            search.restore(composer);
+            tui.composer_cursor = search.restore(composer);
         }
-        tui.file_completion.sync(composer);
+        tui.file_completion
+            .sync_at_cursor(composer, tui.composer_cursor);
         tui.file_completion.dismiss();
         if let Some(operation) = scenario.pending_manual() {
             let _ = operation.cancel();
@@ -1044,6 +1094,8 @@ fn handle_key(
                     composer.clear();
                     composer.push_str(cmd);
                     composer.push(' ');
+                    tui.composer_cursor = super::composer::grapheme_count(composer);
+                    *history_idx = None;
                     *completion_sel = 0;
                     return false;
                 }
@@ -1109,6 +1161,8 @@ fn handle_key(
             }
             KeyCode::Char('/') if composer.is_empty() => {
                 composer.push('/');
+                tui.composer_cursor = 1;
+                *history_idx = None;
                 *completion_sel = 0;
                 return false;
             }
@@ -1117,7 +1171,12 @@ fn handle_key(
                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
                 // §11.3: Alt+⏎ (and terminals reporting Shift+⏎) inserts a newline.
-                composer.push('\n');
+                super::composer::insert_at_cursor(
+                    composer,
+                    &mut tui.composer_cursor,
+                    "\n",
+                );
+                *history_idx = None;
             }
             KeyCode::Enter => {
                 // The shell bang (gate 1): `!command` runs one command
@@ -1135,6 +1194,7 @@ fn handle_key(
                 if composer.starts_with('!') && composer.trim().len() > 1 {
                     let command = composer.trim()[1..].trim().to_string();
                     composer.clear();
+                    tui.composer_cursor = 0;
                     history.insert(0, format!("!{command}"));
                     *history_idx = None;
                     if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::ShellBang(command)) {
@@ -1152,8 +1212,10 @@ fn handle_key(
                         text = list[(*completion_sel).min(list.len() - 1)].0.to_string();
                     }
                     composer.clear();
+                    tui.composer_cursor = 0;
                     let mut fs = false;
                     if let Some(o) = run_command(
+                        tui,
                         &text,
                         scenario,
                         composer,
@@ -1175,8 +1237,9 @@ fn handle_key(
                     }
                 } else if !composer.trim().is_empty() && !composer.starts_with('/') {
                     tui.scroll_follow();
-                    let text = composer.trim().to_string();
+                    let text = composer.clone();
                     composer.clear();
+                    tui.composer_cursor = 0;
                     history.insert(0, text.clone());
                     *history_idx = None;
                     if scenario.ordinary_pending() {
@@ -1189,6 +1252,7 @@ fn handle_key(
                     } else {
                         if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::Prompt(text.clone())) {
                             *composer = text;
+                            tui.composer_cursor = super::composer::grapheme_count(composer);
                             *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
                             return false;
                         }
@@ -1198,41 +1262,39 @@ fn handle_key(
                             time: Some(now_hhmm()),
                             ..Default::default()
                         });
-                        *last_prompt = Some(text.clone());
                         scenario.turn_started_ms = now_ms;
                         scenario.apply("round_started", 0);
                         if scenario.transcript.len() == 1 {
                             scenario.first_prompt_waiting = true;
                         }
                     }
-                } else if composer.is_empty() && scenario.last_failed && !scenario.is_busy() {
-                    // §11.3: an empty ⏎ after a failed turn resends
-                    // it, with the toast.
-                    if let Some(p) = last_prompt.clone() {
-                        if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::Prompt(p.clone())) {
-                            *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
-                            return false;
-                        }
-                        scenario.transcript.push(TranscriptLine {
-                            kind: LineKind::User,
-                            text: p.clone(),
-                            time: Some(now_hhmm()),
-                            ..Default::default()
-                        });
-                        scenario.turn_started_ms = now_ms;
-                        scenario.apply("round_started", 0);
-                        *toast = Some(Toast {
-                            text: "resent your last prompt".into(),
-                            ok: true,
-                            shown_ms: now_ms,
-                        });
+                } else if composer.is_empty() && scenario.can_resend_ordinary()
+                    && let Some(intent) = scenario.eligible_ordinary_intent().cloned() {
+                    let p = intent.display_text();
+                    if let Err(message) = submit_foreground(scenario, command_sink, intent.command()) {
+                        *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
+                        return false;
                     }
+                    scenario.transcript.push(TranscriptLine {
+                        kind: LineKind::User,
+                        text: p.clone(),
+                        time: Some(now_hhmm()),
+                        ..Default::default()
+                    });
+                    scenario.turn_started_ms = now_ms;
+                    scenario.apply("round_started", 0);
+                    *toast = Some(Toast {
+                        text: "resent your last prompt".into(),
+                        ok: true,
+                        shown_ms: now_ms,
+                    });
                 }
             }
             KeyCode::Up if history_idx.is_none() && !history.is_empty() => {
                 *history_idx = Some(0);
                 composer.clear();
                 composer.push_str(&history[0]);
+                tui.composer_cursor = super::composer::grapheme_count(composer);
             }
             KeyCode::Up => {
                 if let Some(i) = *history_idx
@@ -1240,6 +1302,7 @@ fn handle_key(
                         *history_idx = Some(i + 1);
                         composer.clear();
                         composer.push_str(&history[i + 1]);
+                        tui.composer_cursor = super::composer::grapheme_count(composer);
                     }
             }
             KeyCode::Down => {
@@ -1247,46 +1310,83 @@ fn handle_key(
                     if i == 0 {
                         *history_idx = None;
                         composer.clear();
+                        tui.composer_cursor = 0;
                     } else {
                         *history_idx = Some(i - 1);
                         composer.clear();
                         composer.push_str(&history[i - 1]);
+                        tui.composer_cursor = super::composer::grapheme_count(composer);
                     }
                 }
             }
             KeyCode::Backspace => {
-                composer.pop();
+                if super::composer::delete_before_cursor(composer, &mut tui.composer_cursor) {
+                    *history_idx = None;
+                }
                 *completion_sel = 0;
+            }
+            KeyCode::Delete if k.modifiers.is_empty() => {
+                if super::composer::delete_at_cursor(composer, &mut tui.composer_cursor) {
+                    *history_idx = None;
+                }
+                *completion_sel = 0;
+            }
+            KeyCode::Left if k.modifiers.is_empty() => {
+                super::composer::move_left(composer, &mut tui.composer_cursor);
+            }
+            KeyCode::Right if k.modifiers.is_empty() => {
+                super::composer::move_right(composer, &mut tui.composer_cursor);
+            }
+            KeyCode::Home if k.modifiers.is_empty() => {
+                super::composer::move_home(composer, &mut tui.composer_cursor);
+            }
+            KeyCode::End if k.modifiers.is_empty() => {
+                super::composer::move_end(composer, &mut tui.composer_cursor);
             }
             KeyCode::Esc
                 // §11.3: Esc closes the completion list; otherwise
                 // nothing (the draft is kept).
                 if composer == "/" => {
                     composer.clear();
+                    tui.composer_cursor = 0;
                 }
 
             _ => {}
         }
         if let KeyCode::Char(c) = k.code {
-            if k.modifiers.contains(KeyModifiers::CONTROL) && c == 'w' {
-                // Ctrl+W: delete the previous word.
-                let trimmed = composer.trim_end_matches(' ');
-                if let Some(pos) = trimmed.rfind(' ') {
-                    composer.truncate(pos);
-                } else {
-                    composer.clear();
+            if k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                && c == 'w'
+            {
+                if super::composer::delete_previous_word(composer, &mut tui.composer_cursor) {
+                    *history_idx = None;
                 }
+            } else if k
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                // Ignore unsupported printable chords instead of leaking
+                // their character into the user's prompt.
             } else {
                 let ch = if k.modifiers.contains(KeyModifiers::SHIFT) {
                     c.to_uppercase().next().unwrap_or(c)
                 } else {
                     c
                 };
-                composer.push(ch);
+                super::composer::insert_at_cursor(
+                    composer,
+                    &mut tui.composer_cursor,
+                    &ch.to_string(),
+                );
+                *history_idx = None;
                 *completion_sel = 0;
             }
         }
-        tui.file_completion.sync(composer);
+        tui.composer_cursor = super::composer::clamp_cursor(composer, tui.composer_cursor);
+        tui.file_completion
+            .sync_at_cursor(composer, tui.composer_cursor);
         return false;
     }
 
@@ -1383,6 +1483,41 @@ fn handle_key(
     false
 }
 
+fn handle_paste(
+    text: &str,
+    tui: &mut Tui,
+    scenario: &mut Scenario,
+    draft: &mut String,
+    history: &[String],
+    history_idx: &mut Option<usize>,
+    modal_open: bool,
+) -> bool {
+    if text.is_empty() || modal_open || tui.app.arranging || tui.app.picker.is_some() {
+        return false;
+    }
+    if scenario.approval_call_id.is_some() {
+        if let Some(note) = scenario.approval_note.as_mut() {
+            note.push_str(text);
+            return true;
+        }
+        return false;
+    }
+    if tui.focus != Focus::Conversation {
+        return false;
+    }
+    if let Some(search) = tui.history_search.as_mut() {
+        search.query.push_str(text);
+        search.update(history);
+        tui.composer_cursor = search.preview(history, draft);
+    } else {
+        super::composer::insert_at_cursor(draft, &mut tui.composer_cursor, text);
+        *history_idx = None;
+        tui.file_completion
+            .sync_at_cursor(draft, tui.composer_cursor);
+    }
+    true
+}
+
 /// Draft modes own their keys before send, history navigation or panel focus.
 /// Approval cards and overlays are handled before this function is called.
 fn composer_key(
@@ -1392,11 +1527,16 @@ fn composer_key(
     history: &[String],
     history_idx: &mut Option<usize>,
 ) -> bool {
-    let reverse = k.code == KeyCode::Char('r') && k.modifiers.contains(KeyModifiers::CONTROL);
+    let reverse = k.code == KeyCode::Char('r')
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
     if reverse && tui.history_search.is_none() {
         tui.file_completion.dismiss();
-        let search = super::composer::HistorySearch::new(draft, history);
-        search.preview(history, draft);
+        let search =
+            super::composer::HistorySearch::new_with_cursor(draft, tui.composer_cursor, history);
+        tui.composer_cursor = search.preview(history, draft);
         tui.history_search = Some(search);
         *history_idx = None;
         return true;
@@ -1404,18 +1544,22 @@ fn composer_key(
     if let Some(search) = tui.history_search.as_mut() {
         match k.code {
             KeyCode::Esc => {
-                tui.history_search.take().unwrap().restore(draft);
-                tui.file_completion.sync(draft);
+                tui.composer_cursor = tui.history_search.take().unwrap().restore(draft);
+                tui.file_completion
+                    .sync_at_cursor(draft, tui.composer_cursor);
                 return true;
             }
             KeyCode::Enter => {
                 tui.history_search = None;
-                tui.file_completion.sync(draft);
+                tui.composer_cursor = super::composer::clamp_cursor(draft, tui.composer_cursor);
+                tui.file_completion
+                    .sync_at_cursor(draft, tui.composer_cursor);
                 return true;
             }
             _ if reverse => search.older(history),
             KeyCode::Backspace => {
-                search.query.pop();
+                let mut cursor = super::composer::grapheme_count(&search.query);
+                super::composer::delete_before_cursor(&mut search.query, &mut cursor);
                 search.update(history);
             }
             KeyCode::Char(c)
@@ -1428,11 +1572,12 @@ fn composer_key(
             }
             _ => {}
         }
-        search.preview(history, draft);
+        tui.composer_cursor = search.preview(history, draft);
         return true;
     }
 
-    tui.file_completion.sync(draft);
+    tui.file_completion
+        .sync_at_cursor(draft, tui.composer_cursor);
     if tui.file_completion.is_open() {
         let picker = &mut tui.file_completion;
         match k.code {
@@ -1441,7 +1586,7 @@ fn composer_key(
                 picker.selected = (picker.selected + 1).min(picker.candidates.len() - 1)
             }
             KeyCode::Tab => {
-                picker.accept(draft);
+                picker.accept_at_cursor(draft, &mut tui.composer_cursor);
                 *history_idx = None;
             }
             KeyCode::Enter
@@ -1449,7 +1594,7 @@ fn composer_key(
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
-                picker.accept(draft);
+                picker.accept_at_cursor(draft, &mut tui.composer_cursor);
                 *history_idx = None;
             }
             KeyCode::Esc => picker.dismiss(),
@@ -1506,6 +1651,318 @@ pub(crate) fn format_duration(ms: u64) -> (String, f64) {
     }
 }
 
+/// Render the copy-mode transcript through the same terminal-safe converter
+/// as the canvas. This pure formatter is also the unit-test seam for every
+/// dynamic value printed after leaving the alternate screen.
+fn copy_mode_rows(scenario: &Scenario) -> Vec<String> {
+    let sid = if scenario.session_id.is_empty() {
+        "—"
+    } else {
+        scenario.session_id.as_str()
+    };
+    let mut rows = vec![format!(
+        "ORBIT transcript · session {} · select and copy, then press any key to return",
+        copy_mode_metadata(sid)
+    )];
+
+    for line in &scenario.transcript {
+        let time = copy_mode_metadata(line.time.as_deref().unwrap_or_default());
+        let text = copy_mode_message(&line.text);
+        match line.kind {
+            LineKind::User => rows.push(if time.is_empty() {
+                format!("you: {text}")
+            } else {
+                format!("{time} you: {text}")
+            }),
+            LineKind::Model => rows.push(if time.is_empty() {
+                format!("orbit: {text}")
+            } else {
+                format!("{time} orbit: {text}")
+            }),
+            LineKind::Tool => {
+                let tool_name = copy_mode_metadata(&line.tool_name);
+                let state = match line.tool_state {
+                    ToolState::Done => ": done",
+                    ToolState::Denied => ": denied by you",
+                    ToolState::Failed => ": failed",
+                    ToolState::Running => ": running",
+                    ToolState::AwaitingYou => ": awaiting you",
+                    ToolState::Queued => ": queued",
+                    ToolState::Blocked => ": blocked",
+                    ToolState::Cancelled => ": cancelled",
+                    ToolState::Unavailable => ": result unavailable",
+                };
+                rows.push(if time.is_empty() {
+                    format!("tool {tool_name} {text}{state}")
+                } else {
+                    format!("{time} tool {tool_name} {text}{state}")
+                });
+            }
+            LineKind::System => rows.push(format!("status: {text}")),
+            LineKind::Queued => rows.push(format!("queued: {text}")),
+        }
+    }
+    rows
+}
+
+/// Keep transcript LF and CRLF as one structural row break. The CR in CRLF
+/// is a terminator, while an independent CR remains a visible control picture.
+fn copy_mode_message(text: &str) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    for piece in text.split_inclusive('\n') {
+        let has_lf = piece.ends_with('\n');
+        let body = if has_lf {
+            let body = &piece[..piece.len() - 1];
+            body.strip_suffix('\r').unwrap_or(body)
+        } else {
+            piece
+        };
+        rendered.push_str(&printable_text(body));
+        if has_lf {
+            rendered.push('\n');
+        }
+    }
+    rendered
+}
+
+/// Metadata is one logical field: render line separators visibly instead of
+/// allowing untrusted values to add headers or fields to the copied output.
+fn copy_mode_metadata(text: &str) -> String {
+    let mut visible = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                visible.push('␊');
+            }
+            '\r' => visible.push('␍'),
+            '\n' => visible.push('␊'),
+            other => visible.push(other),
+        }
+    }
+    printable_text(&visible)
+}
+
+const RESTORED_TRANSCRIPT_REDACTED: &str = "[redacted]";
+const MAX_RESTORED_CSI_BYTES: usize = 4096;
+const MAX_RESTORED_STRING_CONTROL_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoredStringControl {
+    Osc,
+    Dcs,
+    Pm,
+    Apc,
+    Sos,
+}
+
+/// A 7-bit string-control designator is meaningful only after ESC. These
+/// printable characters must remain ordinary transcript text everywhere else.
+fn restored_7bit_string_control(ch: char) -> Option<RestoredStringControl> {
+    match ch {
+        ']' => Some(RestoredStringControl::Osc),
+        'P' => Some(RestoredStringControl::Dcs),
+        '^' => Some(RestoredStringControl::Pm),
+        '_' => Some(RestoredStringControl::Apc),
+        'X' => Some(RestoredStringControl::Sos),
+        _ => None,
+    }
+}
+
+/// C1 string-control introducers are controls in their own right and may
+/// appear without a preceding ESC.
+fn restored_c1_string_control(ch: char) -> Option<RestoredStringControl> {
+    match ch {
+        '\u{009d}' => Some(RestoredStringControl::Osc),
+        '\u{0090}' => Some(RestoredStringControl::Dcs),
+        '\u{009e}' => Some(RestoredStringControl::Pm),
+        '\u{009f}' => Some(RestoredStringControl::Apc),
+        '\u{0098}' => Some(RestoredStringControl::Sos),
+        _ => None,
+    }
+}
+
+fn restored_default_ignorable(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x00ad
+            | 0x034f
+            | 0x061c
+            | 0x115f..=0x1160
+            | 0x17b4..=0x17b5
+            | 0x180b..=0x180f
+            | 0x200b..=0x200f
+            | 0x202a..=0x202e
+            | 0x2060..=0x206f
+            | 0x3164
+            | 0xfe00..=0xfe0f
+            | 0xfeff
+            | 0xffa0
+            | 0xfff0..=0xfff8
+            | 0x13430..=0x1343f
+            | 0x1bca0..=0x1bca3
+            | 0x1d173..=0x1d17a
+            | 0xe0000..=0xe0fff
+    )
+}
+
+fn restored_scan_separator(ch: char) -> bool {
+    ch.is_control() || UnicodeWidthChar::width(ch) == Some(0) || restored_default_ignorable(ch)
+}
+
+fn restored_next_char(text: &str, offset: usize) -> Option<(char, usize)> {
+    let ch = text.get(offset..)?.chars().next()?;
+    Some((ch, offset + ch.len_utf8()))
+}
+
+/// Return the byte after a complete 7-bit or C1 CSI. The parameter and
+/// intermediate byte order follows ECMA-48; malformed or unbounded CSI is
+/// deliberately ambiguous to the caller.
+fn restored_csi_end(text: &str, start: usize) -> Result<usize, ()> {
+    let (introducer, mut cursor) = restored_next_char(text, start).ok_or(())?;
+    if introducer == '\u{001b}' {
+        let (bracket, after_bracket) = restored_next_char(text, cursor).ok_or(())?;
+        if bracket != '[' {
+            return Err(());
+        }
+        cursor = after_bracket;
+    } else if introducer != '\u{009b}' {
+        return Err(());
+    }
+
+    let mut saw_intermediate = false;
+    loop {
+        let (ch, next) = restored_next_char(text, cursor).ok_or(())?;
+        if next.saturating_sub(start) > MAX_RESTORED_CSI_BYTES {
+            return Err(());
+        }
+        match ch as u32 {
+            0x30..=0x3f if !saw_intermediate => cursor = next,
+            0x20..=0x2f => {
+                saw_intermediate = true;
+                cursor = next;
+            }
+            0x40..=0x7e => return Ok(next),
+            _ => return Err(()),
+        }
+    }
+}
+
+/// Scan one OSC/DCS/PM/APC/SOS body. Printable payload stays visible to H-3;
+/// CSI syntax is removed even when nested in a string body. A nested string
+/// introducer or unknown ESC form is ambiguous and fails closed.
+fn restored_string_control_body(
+    text: &str,
+    mut cursor: usize,
+    kind: RestoredStringControl,
+) -> Result<(String, usize), ()> {
+    let body_start = cursor;
+    let mut payload = String::new();
+    loop {
+        if cursor.saturating_sub(body_start) > MAX_RESTORED_STRING_CONTROL_BYTES {
+            return Err(());
+        }
+        let (ch, next) = restored_next_char(text, cursor).ok_or(())?;
+        if next.saturating_sub(body_start) > MAX_RESTORED_STRING_CONTROL_BYTES {
+            return Err(());
+        }
+
+        match ch {
+            '\u{0007}' if kind == RestoredStringControl::Osc => return Ok((payload, next)),
+            '\u{009c}' => return Ok((payload, next)),
+            '\u{001b}' => {
+                let (following, after_following) = restored_next_char(text, next).ok_or(())?;
+                match following {
+                    '\\' => {
+                        if after_following.saturating_sub(body_start)
+                            > MAX_RESTORED_STRING_CONTROL_BYTES
+                        {
+                            return Err(());
+                        }
+                        return Ok((payload, after_following));
+                    }
+                    '[' => cursor = restored_csi_end(text, cursor)?,
+                    _ => return Err(()),
+                }
+            }
+            '\u{009b}' => cursor = restored_csi_end(text, cursor)?,
+            _ if restored_c1_string_control(ch).is_some() => return Err(()),
+            _ if restored_scan_separator(ch) => cursor = next,
+            _ => {
+                payload.push(ch);
+                cursor = next;
+            }
+        }
+        if cursor.saturating_sub(body_start) > MAX_RESTORED_STRING_CONTROL_BYTES {
+            return Err(());
+        }
+    }
+}
+
+/// A scan-only view for the restored transcript display gate. It is not a
+/// renderer: controls and invisible separators join adjacent text so H-3 sees
+/// tokens and role markers split across terminal syntax.
+fn restored_transcript_scan(text: &str) -> Result<String, ()> {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let (ch, next) = restored_next_char(text, cursor).ok_or(())?;
+        match ch {
+            '\u{001b}' => {
+                let (following, after_introducer) = restored_next_char(text, next).ok_or(())?;
+                match following {
+                    '[' => cursor = restored_csi_end(text, cursor)?,
+                    '\\' => cursor = after_introducer,
+                    _ => {
+                        let Some(kind) = restored_7bit_string_control(following) else {
+                            return Err(());
+                        };
+                        let (payload, end) =
+                            restored_string_control_body(text, after_introducer, kind)?;
+                        output.push_str(&payload);
+                        cursor = end;
+                    }
+                }
+            }
+            '\u{009b}' => cursor = restored_csi_end(text, cursor)?,
+            '\u{009c}' => cursor = next,
+            _ => {
+                if let Some(kind) = restored_c1_string_control(ch) {
+                    let (payload, end) = restored_string_control_body(text, next, kind)?;
+                    output.push_str(&payload);
+                    cursor = end;
+                } else if restored_scan_separator(ch) {
+                    cursor = next;
+                } else {
+                    output.push(ch);
+                    cursor = next;
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Gate the printable restored transcript against both its visible form and
+/// a control-free scan. A scan redaction cannot be mapped safely back to
+/// visible spans, so any such change withholds the whole message.
+fn project_restored_transcript_text(text: &str) -> String {
+    let visible = copy_mode_message(text);
+    let visible = match orbit_hud::display_safe(&visible) {
+        Ok(visible) => visible,
+        Err(_) => return RESTORED_TRANSCRIPT_REDACTED.to_string(),
+    };
+    let scan = match restored_transcript_scan(text) {
+        Ok(scan) => scan,
+        Err(()) => return RESTORED_TRANSCRIPT_REDACTED.to_string(),
+    };
+    match orbit_hud::display_safe(&scan) {
+        Ok(checked) if checked == scan => visible,
+        Ok(_) | Err(_) => RESTORED_TRANSCRIPT_REDACTED.to_string(),
+    }
+}
+
 /// Copy mode (§9.25): leave the alt screen, print the transcript,
 /// wait for a key, return.
 fn copy_mode(guard: &mut crate::terminal::TerminalGuard, scenario: &Scenario) {
@@ -1513,53 +1970,262 @@ fn copy_mode(guard: &mut crate::terminal::TerminalGuard, scenario: &Scenario) {
     let mut stdout = std::io::stdout();
     let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
     // §9.25: one event per line, no box drawing or colour.
-    let sid = if scenario.session_id.is_empty() {
-        "—".to_string()
-    } else {
-        scenario.session_id.clone()
-    };
-    println!("ORBIT transcript · session {sid} · select and copy, then press any key to return");
-    for l in &scenario.transcript {
-        let t = l.time.clone().unwrap_or_default();
-        match l.kind {
-            LineKind::User => {
-                if t.is_empty() {
-                    println!("you: {}", l.text);
-                } else {
-                    println!("{t} you: {}", l.text);
-                }
-            }
-            LineKind::Model => {
-                if t.is_empty() {
-                    println!("orbit: {}", l.text);
-                } else {
-                    println!("{t} orbit: {}", l.text);
-                }
-            }
-            LineKind::Tool => {
-                let state = match l.tool_state {
-                    ToolState::Done => ": done".to_string(),
-                    ToolState::Denied => ": denied by you".into(),
-                    ToolState::Failed => ": failed".into(),
-                    ToolState::Running => ": running".into(),
-                    ToolState::AwaitingYou => ": awaiting you".into(),
-                    ToolState::Queued => ": queued".into(),
-                    ToolState::Blocked => ": blocked".into(),
-                    ToolState::Cancelled => ": cancelled".into(),
-                };
-                if t.is_empty() {
-                    println!("tool {} {}{}", l.tool_name, l.text, state);
-                } else {
-                    println!("{t} tool {} {}{}", l.tool_name, l.text, state);
-                }
-            }
-            LineKind::System => println!("status: {}", l.text),
-            LineKind::Queued => println!("queued: {}", l.text),
-        }
+    for row in copy_mode_rows(scenario) {
+        println!("{row}");
     }
     let _ = event::read();
     let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
     guard.terminal.clear().ok();
+}
+
+#[cfg(test)]
+mod copy_mode_tests {
+    use super::*;
+
+    fn line(kind: LineKind, time: &str, tool_name: &str, text: &str) -> TranscriptLine {
+        TranscriptLine {
+            kind,
+            time: Some(time.to_string()),
+            tool_name: tool_name.to_string(),
+            text: text.to_string(),
+            tool_state: ToolState::Done,
+            ..TranscriptLine::default()
+        }
+    }
+
+    #[test]
+    fn production_copy_mode_formatter_sanitizes_dynamic_fields_and_keeps_message_breaks() {
+        let mut scenario = Scenario::new();
+        scenario.session_id = "SID\x1b[2J\r\nAFTER".into();
+        scenario.transcript = vec![
+            line(
+                LineKind::User,
+                "UT\x1b]0;user\x07\r\nFIELD",
+                "",
+                "U-CSI\x1b[2J\nU-LF\r\nU-CRLF-END\r\nU-CR-START\rU-CR-END",
+            ),
+            line(
+                LineKind::Model,
+                "MT\nFIELD",
+                "",
+                "MODEL-OSC\x1b]0;model\x07",
+            ),
+            line(
+                LineKind::Tool,
+                "TT\rFIELD",
+                "TOOL-NAME\r\nFIELD",
+                "TOOL-TEXT\x1b[2J",
+            ),
+            line(LineKind::System, "", "", "SYSTEM-BEL\x07"),
+            line(LineKind::Queued, "", "", "QUEUED-ESC\x1b[2J"),
+        ];
+        let original_session_id = scenario.session_id.clone();
+        let original_transcript = scenario.transcript.clone();
+
+        // Exercise the exact pure formatter called by copy_mode, not just
+        // the lower-level printable-text helper.
+        let rows = copy_mode_rows(&scenario);
+        assert_eq!(rows.len(), 6, "metadata must not add transcript fields");
+        assert_eq!(scenario.session_id, original_session_id);
+        assert_eq!(scenario.transcript, original_transcript);
+
+        let output = rows.join("\n");
+        assert!(
+            output.chars().all(|ch| ch == '\n' || !ch.is_control()),
+            "raw terminal control reached copy-mode output: {output:?}"
+        );
+        for safe in [
+            "SID␛[2J␊AFTER",
+            "UT␛]0;user␇␊FIELD you:",
+            "U-CSI␛[2J\nU-LF\nU-CRLF-END\nU-CR-START␍U-CR-END",
+            "MT␊FIELD orbit:",
+            "MODEL-OSC␛]0;model␇",
+            "TT␍FIELD tool TOOL-NAME␊FIELD",
+            "TOOL-TEXT␛[2J",
+            "SYSTEM-BEL␇",
+            "QUEUED-ESC␛[2J",
+        ] {
+            assert!(
+                output.contains(safe),
+                "missing safe display {safe:?}: {output:?}"
+            );
+        }
+        assert!(
+            !rows[1].contains("U-CRLF-END␍"),
+            "CRLF message boundary must not display its CR half"
+        );
+        assert_eq!(
+            rows[0].matches('␊').count(),
+            1,
+            "CRLF in session metadata must become exactly one marker"
+        );
+        let user_body = rows[1]
+            .split_once(" you:")
+            .expect("user label remains present")
+            .1;
+        assert_eq!(
+            user_body.matches('␊').count(),
+            0,
+            "message LF/CRLF must stay structural, not become markers"
+        );
+    }
+
+    #[test]
+    fn copy_mode_preserves_final_standalone_cr_but_consumes_crlf() {
+        assert_eq!(copy_mode_message("status\r"), "status␍");
+        assert_eq!(copy_mode_message("line\r\n"), "line\n");
+    }
+}
+
+#[cfg(test)]
+mod restored_transcript_projection_tests {
+    use super::*;
+
+    const API_TOKEN: &str = "sk-abc123def456ghi789jkl012mno";
+    const ENTROPY_VALUE: &str = "éAbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+
+    fn assert_withheld(text: &str) {
+        assert_eq!(
+            project_restored_transcript_text(text),
+            RESTORED_TRANSCRIPT_REDACTED,
+            "unsafe restored transcript was not withheld: {text:?}"
+        );
+    }
+
+    #[test]
+    fn direct_api_tokens_and_high_entropy_assignments_withhold_the_whole_message() {
+        assert_withheld(&format!("before token = {API_TOKEN} after"));
+        assert_withheld(&format!("secret note = \"{ENTROPY_VALUE}\""));
+    }
+
+    #[test]
+    fn csi_and_invisible_separators_cannot_split_a_secret() {
+        assert_withheld("token = sk-abc123\u{001b}[31mdef456ghi789jkl012mno");
+        assert_withheld("token = sk-abc123\u{009b}31mdef456ghi789jkl012mno");
+        assert_withheld("token = sk-abc\u{0007}123\rdef\n456\u{200b}ghi789jkl012mno");
+    }
+
+    #[test]
+    fn string_payloads_preserve_text_for_secret_and_h3_scanning() {
+        assert_withheld(&format!("\u{001b}]0;token={API_TOKEN}\u{0007}"));
+        assert_withheld("\u{001b}]0;token=sk-abc123\u{001b}[31mdef456ghi789jkl012mno\u{0007}");
+        assert_withheld("\u{001b}]0;pro\u{001b}[31mmpt: hidden\u{0007}");
+        assert_withheld("\u{001b}]0;chain_of_\u{001b}[31mthought: hidden\u{0007}");
+        assert_withheld(&format!("\u{009d}0;token={API_TOKEN}\u{0007}"));
+        assert_withheld("\u{009d}0;token=sk-abc123\u{009b}31mdef456ghi789jkl012mno\u{009c}");
+    }
+
+    #[test]
+    fn every_supported_string_control_payload_is_scanned() {
+        for (start, end) in [
+            ("\u{001b}P", "\u{001b}\\"),
+            ("\u{001b}_", "\u{001b}\\"),
+            ("\u{001b}^", "\u{001b}\\"),
+            ("\u{001b}X", "\u{001b}\\"),
+            ("\u{0090}", "\u{009c}"),
+            ("\u{009f}", "\u{009c}"),
+            ("\u{009e}", "\u{009c}"),
+            ("\u{0098}", "\u{009c}"),
+        ] {
+            assert_withheld(&format!(
+                "{start}payload sk-abc123\u{001b}[31mdef456ghi789jkl012mno{end}"
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_or_unsupported_escape_syntax_is_ambiguous() {
+        for text in [
+            "prefix\u{001b}[31",
+            "prefix\u{001b}[31\u{0001}m",
+            "prefix\u{001b}]unterminated",
+            "prefix\u{001b}Punterminated",
+            "prefix\u{009d}unterminated",
+            "prefix\u{0090}unterminated",
+            "prefix\u{001b}",
+            "prefix\u{001b}c",
+            "prefix\u{001b}(B",
+            "prefix\u{001b}\u{0090}nested\u{009c}",
+            "prefix\u{001b}]outer\u{001b}_nested\u{001b}\\\u{0007}",
+            "\u{001b}]outer\u{0090}nested\u{009c}\u{0007}",
+        ] {
+            assert!(restored_transcript_scan(text).is_err(), "{text:?}");
+            assert_withheld(text);
+        }
+    }
+
+    #[test]
+    fn printable_string_control_designators_remain_ordinary_text() {
+        for text in [
+            "Please give me a short greeting.",
+            "ESC_RECOVERY_OK",
+            "COPY_SEED_RESPONSE",
+            "Literal ] P ^ _ X designators",
+        ] {
+            assert_eq!(restored_transcript_scan(text).unwrap(), text, "{text:?}");
+            assert_eq!(project_restored_transcript_text(text), text, "{text:?}");
+        }
+
+        let payload = "\u{001b}]title: COPY_SEED_RESPONSE P^_X\u{0007}";
+        assert_eq!(
+            restored_transcript_scan(payload).unwrap(),
+            "title: COPY_SEED_RESPONSE P^_X"
+        );
+        let visible = project_restored_transcript_text(payload);
+        assert_ne!(visible, RESTORED_TRANSCRIPT_REDACTED);
+        assert!(visible.contains("COPY_SEED_RESPONSE P^_X"));
+    }
+
+    #[test]
+    fn safe_terminal_markers_and_message_line_structure_remain_visible() {
+        assert_eq!(
+            project_restored_transcript_text("\u{001b}[31mred\u{001b}[0m\tfirst\r\nsecond\rend"),
+            "␛[31mred␛[0m⇥first\nsecond␍end"
+        );
+        assert_eq!(
+            project_restored_transcript_text("\u{001b}]0;window title\u{0007}\n"),
+            "␛]0;window title␇\n"
+        );
+        assert_eq!(
+            restored_transcript_scan("\u{001b}]0;window title\u{0007}").unwrap(),
+            "0;window title"
+        );
+        assert_eq!(
+            project_restored_transcript_text("plain\nline\r\nend\r"),
+            "plain\nline\nend␍"
+        );
+    }
+
+    #[test]
+    fn visible_redaction_does_not_hide_a_second_scan_only_secret() {
+        let text = format!(
+            "visible token={API_TOKEN}\nhidden: sk-abc123\u{001b}[31mdef456ghi789jkl012mno"
+        );
+        let visible = copy_mode_message(&text);
+        let checked_visible = orbit_hud::display_safe(&visible).unwrap();
+        assert!(checked_visible.contains("[redacted:api token]"));
+        assert!(checked_visible.contains("sk-abc123"));
+        let scan = restored_transcript_scan(&text).unwrap();
+        assert_ne!(orbit_hud::display_safe(&scan).unwrap(), scan);
+        assert_withheld(&text);
+    }
+
+    #[test]
+    fn restored_projection_does_not_mutate_the_saved_transcript_bytes() {
+        let text = format!("saved token={API_TOKEN}\u{001b}[31m");
+        let saved = crate::model::TranscriptLine::User {
+            text: text.clone(),
+            time: Some("09:30".into()),
+        };
+        let original = saved.clone();
+        let projected = restored_transcript_line(saved);
+        assert_eq!(projected.text, RESTORED_TRANSCRIPT_REDACTED);
+        let expected = crate::model::TranscriptLine::User {
+            text,
+            time: Some("09:30".into()),
+        };
+        assert_eq!(original, expected);
+    }
 }
 
 fn request_picker(
@@ -1597,6 +2263,8 @@ fn submit_foreground(
         .foreground_kind()
         .ok_or("command cannot own foreground work")?;
     let operation = scenario.new_foreground_operation(kind)?;
+    let intent = OrdinaryIntent::from_command(&command);
+    let source = operation.source().clone();
     if sink
         .send(WorkerCommand::Bound {
             operation: operation.clone(),
@@ -1609,7 +2277,12 @@ fn submit_foreground(
     }
     // The event loop cannot consume a worker message between this send and
     // admission, even if the worker has already produced its terminal frame.
-    scenario.admit_foreground(operation);
+    if !scenario.admit_foreground(operation) {
+        return Err("foreground admission changed");
+    }
+    if let Some(intent) = intent {
+        scenario.remember_ordinary_intent(intent, source);
+    }
     scenario.dismiss_picker();
     Ok(())
 }
@@ -1618,6 +2291,7 @@ fn submit_foreground(
 /// run at once; the rest go to the worker in order.
 #[allow(clippy::too_many_arguments)]
 fn run_command(
+    tui: &mut Tui,
     text: &str,
     scenario: &mut Scenario,
     composer: &mut String,
@@ -1639,7 +2313,12 @@ fn run_command(
         Some((c, a)) => (c, a.trim()),
         None => (text, ""),
     };
-    if scenario.is_busy() && !matches!(cmd, "/help" | "/usage" | "/sessions" | "/models") {
+    if scenario.is_busy()
+        && !matches!(
+            cmd,
+            "/help" | "/usage" | "/sessions" | "/models" | "/theme" | "/customize"
+        )
+    {
         *toast = Some(Toast {
             text: "wait for the active work to finish".into(),
             ok: false,
@@ -1882,6 +2561,10 @@ fn run_command(
             }
             None
         }
+        "/theme" | "/customize" => {
+            *toast = Some(profile_command_toast(tui, scenario, text, now_ms));
+            None
+        }
         _ => {
             notice(scenario, format!("unknown command: {cmd} · try /help"));
             None
@@ -1917,52 +2600,59 @@ fn set_plan(scenario: &mut Scenario, rows: Vec<super::panels::TaskRow>, now_ms: 
     scenario.tasks = rows;
 }
 
-/// FrontendEvent-shaped Msgs → the scenario reducer. Returns a toast
-/// to show (the agent-done note, §9.13) — the event loop owns toasts.
 fn restored_transcript_line(line: crate::model::TranscriptLine) -> TranscriptLine {
     use crate::model::TranscriptLine as Saved;
-    let clean = |text: &str| crate::bridge::safe_text(&crate::bridge::terminal_safe(text));
     match line {
         Saved::User { text, time } => TranscriptLine {
             kind: LineKind::User,
-            text: clean(&text),
-            time,
+            text: project_restored_transcript_text(&text),
+            time: time.map(|time| project_restored_transcript_text(&time)),
             ..Default::default()
         },
         Saved::Assistant { text, time } => TranscriptLine {
             kind: LineKind::Model,
-            text: clean(&text),
-            time,
+            text: project_restored_transcript_text(&text),
+            time: time.map(|time| project_restored_transcript_text(&time)),
             ..Default::default()
         },
         Saved::System(text) => TranscriptLine {
             kind: LineKind::System,
-            text: clean(&text),
+            text: project_restored_transcript_text(&text),
             ..Default::default()
         },
         Saved::Stripped {
             tool_name,
+            call_id,
             summary,
             outcome,
             meta,
             ..
-        } => TranscriptLine {
-            kind: LineKind::Tool,
-            tool_name: clean(&tool_name),
-            text: clean(&summary),
-            meta: clean(&meta),
-            tool_state: match outcome {
+        } => {
+            let tool_state = match outcome {
+                Some(crate::model::ToolOutcome::Ok) => ToolState::Done,
                 Some(crate::model::ToolOutcome::Failed) => ToolState::Failed,
                 Some(crate::model::ToolOutcome::Denied) => ToolState::Denied,
                 Some(crate::model::ToolOutcome::Blocked) => ToolState::Blocked,
                 Some(crate::model::ToolOutcome::Cancelled) => ToolState::Cancelled,
-                _ => ToolState::Done,
-            },
-            ..Default::default()
-        },
+                Some(crate::model::ToolOutcome::Unavailable) | None => ToolState::Unavailable,
+            };
+            TranscriptLine {
+                kind: LineKind::Tool,
+                tool_name: project_restored_transcript_text(&tool_name),
+                text: project_restored_transcript_text(&summary),
+                meta: if tool_state == ToolState::Unavailable {
+                    String::new()
+                } else {
+                    project_restored_transcript_text(&meta)
+                },
+                call_id,
+                tool_state,
+                ..Default::default()
+            }
+        }
         Saved::Evidence { checks, note, rows } => TranscriptLine {
             kind: LineKind::System,
-            text: clean(&format!(
+            text: project_restored_transcript_text(&format!(
                 "{checks} · {note}\n{}",
                 rows.into_iter()
                     .map(|(a, b)| format!("{a}: {b}"))
@@ -1973,7 +2663,7 @@ fn restored_transcript_line(line: crate::model::TranscriptLine) -> TranscriptLin
         },
         Saved::Sources(rows) => TranscriptLine {
             kind: LineKind::System,
-            text: clean(
+            text: project_restored_transcript_text(
                 &rows
                     .into_iter()
                     .map(|(a, b)| format!("{a}: {b}"))
@@ -2118,6 +2808,32 @@ pub fn apply_session_projection(
     {
         return false;
     }
+    // The Operation arm above already checked pointer identity with the active
+    // foreground token and its source binding; this only narrows its kind.
+    let preserves_measured_context_reason = matches!(&projection.reason, ProjectionReason::Refresh)
+        || matches!(
+            &projection.reason,
+            ProjectionReason::Operation { operation } if operation.kind().is_ordinary()
+        );
+    if projection.context == ContextProjection::PreserveMeasured
+        && (switching
+            || !preserves_measured_context_reason
+            || scenario.window_tokens == 0
+            || scenario.model_id != projection.model
+            || scenario.provider != projection.provider)
+    {
+        return false;
+    }
+    let cleared_from = match &projection.reason {
+        ProjectionReason::Manual {
+            operation,
+            outcome: ManualOutcome::Completed,
+            applied: true,
+        } if operation.action() == ManualAction::Clear => {
+            Some(operation.source().session_id.clone())
+        }
+        _ => None,
+    };
     if switching {
         // Reuse the established identity-transition reset, once.
         apply_msg(
@@ -2166,6 +2882,23 @@ pub fn apply_session_projection(
     scenario.priced = projection.priced;
     scenario.frontend.binding = Some(projection.binding);
     scenario.transcript = lines;
+    if let Some(source) = cleared_from {
+        scenario.cleared_from = Some(source);
+    }
+    // Restored Bash rows get empty Terminal tapes. Never replay saved tool
+    // output into the interactive tape; reuse live admission for tab limits
+    // and selection behavior.
+    let restored_bash_calls: Vec<String> = scenario
+        .transcript
+        .iter()
+        .filter(|line| {
+            line.kind == LineKind::Tool && line.tool_name == "Bash" && !line.call_id.is_empty()
+        })
+        .map(|line| line.call_id.clone())
+        .collect();
+    for call_id in restored_bash_calls {
+        scenario.start_tape(&call_id);
+    }
     scenario.turns = projection.turns;
     scenario.input_tokens = projection.input_tokens;
     scenario.output_tokens = projection.output_tokens;
@@ -2205,6 +2938,23 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
         apply_session_projection(projection, scenario, now_ms);
         return None;
     }
+    if let Msg::OrdinaryTurnEnded {
+        operation,
+        end,
+        publication,
+    } = msg
+    {
+        let end = match end {
+            crate::msg::OrdinaryEnd::Failed(reason) => {
+                crate::msg::OrdinaryEnd::Failed(clean(reason))
+            }
+            other => other,
+        };
+        if scenario.accept_ordinary_end(&operation, end, publication) {
+            scenario.motion_until_ms = now_ms + 1000;
+        }
+        return None;
+    }
     // Every message may start a motion: keep redrawing for a second.
     scenario.motion_until_ms = now_ms + 1000;
     match msg {
@@ -2214,9 +2964,13 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 .take(32)
                 .map(|line| {
                     let clean = crate::bridge::safe_text(&crate::bridge::terminal_safe(&line));
-                    let mut end = clean.len().min(256);
-                    while !clean.is_char_boundary(end) {
-                        end -= 1;
+                    let mut end = 0;
+                    for (start, grapheme) in clean.grapheme_indices(true) {
+                        let grapheme_end = start + grapheme.len();
+                        if grapheme_end > 256 {
+                            break;
+                        }
+                        end = grapheme_end;
                     }
                     clean[..end].to_string()
                 })
@@ -2234,6 +2988,7 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.invalidate_context_sample();
             scenario.frontend.dirty = true;
             scenario.routing_lines.clear();
+            scenario.clear_namespace_view();
             scenario.transcript = lines.into_iter().map(restored_transcript_line).collect();
             scenario.input_tokens = input_tokens;
             scenario.output_tokens = output_tokens;
@@ -2242,6 +2997,9 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.turn_live = false;
             scenario.visible_output = false;
             scenario.last_failed = false;
+            scenario.failure_reason = None;
+            scenario.cleared_from = None;
+            scenario.first_prompt_waiting = false;
             scenario.compacting = false;
             scenario.running.clear();
             scenario.approval_pending = None;
@@ -2419,6 +3177,10 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                         crate::model::ToolOutcome::Cancelled => {
                             l.tool_state = super::scenario::ToolState::Cancelled;
                             l.meta = ds.clone();
+                        }
+                        crate::model::ToolOutcome::Unavailable => {
+                            l.tool_state = super::scenario::ToolState::Unavailable;
+                            l.meta = String::new();
                         }
                     }
                 }
@@ -2619,15 +3381,20 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                     rows: rows
                         .into_iter()
                         .map(|r| PickerRow {
-                            label: clean(format!(
-                                "{}  ·  {}  ·  {} turns{}",
-                                r.id,
-                                r.model,
-                                r.turns,
-                                if r.current { "  (this session)" } else { "" }
-                            )),
+                            label: clean(if r.current {
+                                format!("{}  (this session)", r.id)
+                            } else {
+                                r.id.clone()
+                            }),
                             value: r.id,
-                            detail: clean(format!("updated {}", r.updated_at)),
+                            detail: clean(if r.current {
+                                format!("{} turns · {}", r.turns, r.model)
+                            } else {
+                                format!(
+                                    "{} turns · {} · updated {}",
+                                    r.turns, r.model, r.updated_at
+                                )
+                            }),
                         })
                         .collect(),
                     sel: 0,
@@ -2845,7 +3612,13 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.invalidate_cost_qualification();
             scenario.invalidate_context_sample();
             if scenario.session_id != session_id {
+                scenario.clear_namespace_view();
                 scenario.frontend.binding = None;
+                scenario.failure_reason = None;
+                scenario.cleared_from = None;
+                scenario.last_failed = false;
+                scenario.turn_report = None;
+                scenario.first_prompt_waiting = false;
             }
             scenario.frontend.dirty = true;
             scenario.model = model.clone();
@@ -2855,20 +3628,18 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.session_id = session_id;
             scenario.priced = priced;
         }
-        Msg::BackendError(err) => {
-            // The turn error card (§9.11): ✕ This turn failed + the
-            // gated message + the resend hint.
-            scenario.transcript.push(TranscriptLine {
-                kind: LineKind::System,
-                text: format!("✕ This turn failed · {err}"),
-                ..Default::default()
-            });
-            scenario.transcript.push(TranscriptLine {
-                kind: LineKind::System,
-                text: "⏎ on an empty composer resends it".into(),
-                ..Default::default()
-            });
+        Msg::BackendNotice(text) => scenario.set_backend_notice(clean(text)),
+        // Callback errors can explain a failure, but never mint eligibility
+        // or turn an already typed completion/cancellation into failure.
+        Msg::BackendError(err)
+            if !matches!(
+                scenario.ordinary_end(),
+                Some(crate::msg::OrdinaryEnd::Completed | crate::msg::OrdinaryEnd::Cancelled)
+            ) =>
+        {
+            scenario.failure_reason = Some(clean(err));
             scenario.apply("turn_failed", 0);
+            scenario.frontend.dirty = true;
         }
         _ => {}
     }
@@ -2922,8 +3693,8 @@ pub fn draw_with_hits(
 ) -> Vec<super::shell::hits::Hit> {
     let _ = sessions_pushed;
     let area = f.area();
-    // The size notice (§9.23): below 40 × 10 it is the whole screen.
-    if area.width < 40 || area.height < 10 {
+    // The size notice (§9.23): below 40 × 11 it is the whole screen.
+    if area.width < 40 || area.height < 11 {
         let lines = super::chrome::size_notice_lines_themed(
             super::shell::pal::Palette::from_profile(&tui.profile),
             area.width,
@@ -2995,6 +3766,7 @@ pub fn draw_with_hits(
             fx: &tui.fx,
             scenario,
             composer,
+            composer_cursor: tui.composer_cursor,
             completion_sel: tui.completion_sel,
             file_completion: Some(&tui.file_completion),
             history_search: tui.history_search.as_ref(),
@@ -3077,6 +3849,92 @@ enum MouseOutcome {
     Picker(usize),
     /// A click on the tab of the Terminal's tape `i`.
     Tape(usize),
+}
+
+#[derive(Debug, Clone)]
+struct PaletteFrame {
+    binding: Option<crate::worker::SessionBinding>,
+    query: String,
+    rows: Vec<(usize, &'static str)>,
+}
+
+#[derive(Debug, Clone)]
+struct PaletteClick {
+    binding: Option<crate::worker::SessionBinding>,
+    query: String,
+    command: &'static str,
+}
+
+fn capture_palette_frame(
+    scenario: &Scenario,
+    overlay: Option<Overlay>,
+    query: &str,
+    hits: &[super::shell::hits::Hit],
+) -> Option<PaletteFrame> {
+    if overlay != Some(Overlay::Palette) {
+        return None;
+    }
+    let items = super::shell::overlays::palette_items(query);
+    let rows = hits
+        .iter()
+        .filter_map(|hit| match hit.click {
+            super::shell::hits::Click::Palette(index) => {
+                items.get(index).map(|(command, _)| (index, *command))
+            }
+            _ => None,
+        })
+        .collect();
+    Some(PaletteFrame {
+        binding: scenario.session_binding().cloned(),
+        query: query.into(),
+        rows,
+    })
+}
+
+fn capture_palette_click(
+    scenario: &Scenario,
+    overlay: Option<Overlay>,
+    query: &str,
+    frame: Option<&PaletteFrame>,
+    index: usize,
+) -> Option<PaletteClick> {
+    let frame = frame?;
+    if overlay != Some(Overlay::Palette)
+        || frame.query != query
+        || scenario.session_binding() != frame.binding.as_ref()
+        || scenario.approval_call_id.is_some()
+    {
+        return None;
+    }
+    let command = frame.rows.iter().find(|(row, _)| *row == index)?.1;
+    Some(PaletteClick {
+        binding: frame.binding.clone(),
+        query: frame.query.clone(),
+        command,
+    })
+}
+
+fn palette_click_key(
+    click: PaletteClick,
+    scenario: &Scenario,
+    overlay: Option<Overlay>,
+    query: &str,
+    selection: &mut usize,
+) -> Option<crossterm::event::KeyEvent> {
+    if overlay != Some(Overlay::Palette)
+        || click.query != query
+        || scenario.session_binding() != click.binding.as_ref()
+        || scenario.approval_call_id.is_some()
+    {
+        return None;
+    }
+    *selection = super::shell::overlays::palette_items(query)
+        .iter()
+        .position(|(command, _)| *command == click.command)?;
+    Some(crossterm::event::KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -3343,7 +4201,7 @@ fn selected_text(
 }
 
 /// The keys of the approval card while a request is pending: `y` once, `s`
-/// this session, `a` always, `R` the whole tool, `n` a denial with a note,
+/// this session, `a` saves the offered rule, `n` a denial with a note,
 /// esc a denial without. The decision keys are disabled for a second after
 /// the last keypress so typing cannot answer the card (§9.14).
 fn approval_key(
@@ -3363,7 +4221,8 @@ fn approval_key(
             KeyCode::Enter => Some(Some(std::mem::take(note))),
             KeyCode::Esc => Some(None),
             KeyCode::Backspace => {
-                note.pop();
+                let mut cursor = super::composer::grapheme_count(note);
+                super::composer::delete_before_cursor(note, &mut cursor);
                 None
             }
             KeyCode::Char(c)
@@ -4393,6 +5252,23 @@ mod click_tests {
         );
     }
 
+    #[test]
+    fn approval_note_backspace_removes_one_unicode_grapheme() {
+        let (mut scenario, registry, response) = parked(true, true);
+        press(&mut scenario, &registry, KeyCode::Char('n'), 10_000);
+        for ch in "reason 🧑🏽‍💻".chars() {
+            press(&mut scenario, &registry, KeyCode::Char(ch), 10_100);
+        }
+        press(&mut scenario, &registry, KeyCode::Backspace, 10_200);
+        assert_eq!(scenario.approval_note.as_deref(), Some("reason "));
+        press(&mut scenario, &registry, KeyCode::Enter, 10_300);
+        assert_eq!(
+            response.try_recv().ok(),
+            Some(crate::ApprovalResponse::Deny)
+        );
+        assert_eq!(registry.take_note("c1").as_deref(), Some("reason"));
+    }
+
     /// `s` and `a` answer for the rule the card showed; without one, or
     /// where it cannot be saved, they do nothing.
     #[test]
@@ -4477,11 +5353,14 @@ mod click_tests {
         let mut tui = fresh_tui();
         for (w, h) in [(120u16, 40u16), (164, 48), (94, 40)] {
             let text = frame(&mut tui, &Scenario::new(), "", Some(Overlay::Help), w, h).join("\n");
+            assert!(
+                !text.contains("whole tool"),
+                "unsupported whole-tool grant: {text}"
+            );
             for line in [
                 "allow once",
                 "this kind of call, session",
                 "same, saved in this folder",
-                "the whole tool, session",
                 "deny, with a word on why",
             ] {
                 assert!(
@@ -5307,7 +6186,6 @@ mod composer_key_tests {
                 &mut None,
                 &mut false,
                 &mut false,
-                &mut None
             ));
         }
 
@@ -5420,6 +6298,82 @@ mod composer_key_tests {
     }
 
     #[test]
+    fn history_query_backspace_and_escape_keep_graphemes_and_cursor() {
+        let mut k = Keyboard::new();
+        k.draft = "a🇧🇷b".into();
+        k.tui.composer_cursor = 2;
+        k.reverse();
+        assert_eq!(k.tui.composer_cursor, 2);
+        k.type_text("🧑🏽‍💻");
+        assert_eq!(k.tui.history_search.as_ref().unwrap().query, "🧑🏽‍💻");
+        k.plain(KeyCode::Backspace);
+        assert_eq!(k.tui.history_search.as_ref().unwrap().query, "");
+        k.plain(KeyCode::Esc);
+        assert_eq!(k.draft, "a🇧🇷b");
+        assert_eq!(k.tui.composer_cursor, 2);
+    }
+
+    #[test]
+    fn composer_edits_move_and_delete_complete_graphemes() {
+        let mut k = Keyboard::new();
+        k.type_text("a🇧🇷b");
+        assert_eq!(k.tui.composer_cursor, 3);
+        k.plain(KeyCode::Left);
+        k.type_text("猫");
+        assert_eq!(k.draft, "a🇧🇷猫b");
+        assert_eq!(k.tui.composer_cursor, 3);
+        k.plain(KeyCode::Backspace);
+        assert_eq!(k.draft, "a🇧🇷b");
+        assert_eq!(k.tui.composer_cursor, 2);
+        k.plain(KeyCode::Backspace);
+        assert_eq!(k.draft, "ab");
+        assert_eq!(k.tui.composer_cursor, 1);
+
+        k.key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        k.key(KeyCode::Char('y'), KeyModifiers::ALT);
+        assert_eq!(
+            k.draft, "ab",
+            "unsupported chords must not type into the draft"
+        );
+        k.plain(KeyCode::Home);
+        k.plain(KeyCode::Delete);
+        assert_eq!(k.draft, "b");
+        assert_eq!(k.tui.composer_cursor, 0);
+        k.plain(KeyCode::End);
+        assert_eq!(k.tui.composer_cursor, 1);
+    }
+
+    #[test]
+    fn paste_is_literal_at_the_caret_and_submission_keeps_edge_whitespace() {
+        let mut k = Keyboard::new();
+        k.type_text("leftright");
+        for _ in 0..5 {
+            k.plain(KeyCode::Left);
+        }
+        assert!(handle_paste(
+            " \n日本語\n ",
+            &mut k.tui,
+            &mut k.scenario,
+            &mut k.draft,
+            &k.history,
+            &mut k.history_idx,
+            false,
+        ));
+        assert_eq!(k.draft, "left \n日本語\n right");
+        k.plain(KeyCode::Enter);
+        assert!(matches!(
+            k.received_command(),
+            WorkerCommand::Prompt(text) if text == "left \n日本語\n right"
+        ));
+
+        let mut blank = Keyboard::new();
+        blank.type_text("   ");
+        blank.plain(KeyCode::Enter);
+        assert_eq!(blank.draft, "   ");
+        blank.no_send();
+    }
+
+    #[test]
     fn model_list_bus_opens_visible_picker_and_keyboard_selects_beyond_first_page() {
         let mut k = Keyboard::new();
         k.list(PickerKind::Models);
@@ -5432,7 +6386,7 @@ mod composer_key_tests {
         for _ in 0..17 {
             k.plain(KeyCode::Down);
         }
-        for (width, height) in [(100, 24), (40, 10)] {
+        for (width, height) in [(100, 24), (40, 11)] {
             let frame = k.frame(width, height);
             assert!(
                 frame.contains("fixture/m17"),
@@ -5464,12 +6418,19 @@ mod composer_key_tests {
     fn session_picker_current_row_is_noop_and_mouse_resumes_the_actual_row() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut k = Keyboard::new();
-        let current = k.scenario.session_id.clone();
+        let current = "session-01JAB12CD34EF56GH78JK90MNP".to_string();
+        k.scenario.session_id = current.clone();
+        k.scenario
+            .frontend
+            .binding
+            .as_mut()
+            .expect("keyboard fixture starts with a committed session")
+            .session_id = current.clone();
         let rows = vec![
             crate::msg::SessionsRow {
-                id: current,
+                id: current.clone(),
                 model: "m0".into(),
-                turns: 0,
+                turns: 12,
                 updated_at: "today".into(),
                 current: true,
             },
@@ -5483,6 +6444,21 @@ mod composer_key_tests {
         ];
         k.list(PickerKind::Sessions);
         k.receive(crate::msg::Msg::SessionsListed(rows.clone()));
+        let frame = k.frame(80, 24);
+        let lines: Vec<_> = frame.lines().collect();
+        let current_rows = lines
+            .windows(2)
+            .filter(|pair| {
+                pair[0].contains(&current)
+                    && pair[0].contains("(this session)")
+                    && pair[1].contains("12 turns")
+                    && pair[1].contains("m0")
+            })
+            .count();
+        assert_eq!(
+            current_rows, 1,
+            "current session identity and count must fit at 80 columns: {frame}"
+        );
         k.plain(KeyCode::Enter);
         k.no_send();
         assert!(k.overlay.is_none());
@@ -5496,22 +6472,23 @@ mod composer_key_tests {
             .find(|hit| hit.click == super::super::shell::hits::Click::Picker(1))
             .copied()
             .unwrap();
-        let outcome = handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: hit.rect.x,
-                row: hit.rect.y,
-                modifiers: KeyModifiers::NONE,
-            },
-            &mut k.tui,
-            Rect::new(0, 0, 100, 24),
-            None,
-            true,
-        );
-        let MouseOutcome::Picker(index) = outcome else {
-            panic!("drawn row must be actionable");
-        };
-        let click = capture_picker_click(&k.scenario, k.overlay, index).unwrap();
+        assert_eq!(hit.rect.height, 2, "session hit target covers both lines");
+        for row in [hit.rect.y, hit.rect.y + hit.rect.height - 1] {
+            let outcome = handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.rect.x,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut k.tui,
+                Rect::new(0, 0, 100, 24),
+                None,
+                true,
+            );
+            assert!(matches!(outcome, MouseOutcome::Picker(1)));
+        }
+        let click = capture_picker_click(&k.scenario, k.overlay, 1).unwrap();
         let key = picker_click_key(click, &mut k.scenario, k.overlay, 10_000).unwrap();
         k.key(key.code, key.modifiers);
         assert!(
@@ -5721,7 +6698,7 @@ mod composer_key_tests {
         k.no_send();
         k.plain(KeyCode::Enter);
         assert!(
-            matches!(k.received_command(), WorkerCommand::Prompt(text) if text == "Read @\"docs/a b\\\"c.rs\"")
+            matches!(k.received_command(), WorkerCommand::Prompt(text) if text == "Read @\"docs/a b\\\"c.rs\" ")
         );
     }
 
@@ -5745,6 +6722,9 @@ mod composer_key_tests {
             "dismissed picker stays closed until draft changes"
         );
         k.type_text("b");
+        let frame = k.frame(164, 48);
+        assert!(frame.contains("⇥/⏎ accept file"));
+        assert!(!frame.contains("accept draft"));
         k.plain(KeyCode::Enter);
         assert_eq!(k.draft, "@\"beta.rs\" ");
         k.no_send();
@@ -5810,6 +6790,36 @@ mod composer_key_tests {
         k.key(KeyCode::Enter, KeyModifiers::ALT);
         k.type_text("second");
         assert_eq!(k.draft, "first\nsecond");
+        k.no_send();
+    }
+
+    #[test]
+    fn question_mark_opens_and_closes_help_over_pending_approval() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let mut k = Keyboard::new();
+            k.receive(requested_approval());
+
+            k.key(KeyCode::Char('?'), modifiers);
+            assert_eq!(k.overlay, Some(Overlay::Help));
+            assert!(k.scenario.approval_call_id.is_some());
+            let frame = k.frame(164, 30);
+            assert!(frame.contains("KEYS"), "{frame}");
+            assert!(frame.contains("APPROVALS"), "{frame}");
+
+            k.plain(KeyCode::Esc);
+            assert_eq!(k.overlay, None);
+            assert!(k.scenario.approval_call_id.is_some());
+        }
+    }
+
+    #[test]
+    fn usage_command_adds_counter_notices_to_the_visible_transcript() {
+        let mut k = Keyboard::new();
+        k.type_text("/usage");
+        k.plain(KeyCode::Enter);
+        let frame = k.frame(164, 30);
+        assert!(frame.contains("turns 0"), "{frame}");
+        assert!(frame.contains("context unknown"), "{frame}");
         k.no_send();
     }
 
@@ -6260,6 +7270,9 @@ fn run_pane_action(
     match result {
         Ok(crate::customization::ActionEffect::InsertDraft(text)) => {
             *composer = text;
+            tui.composer_cursor = super::composer::grapheme_count(composer);
+            tui.file_completion
+                .sync_at_cursor(composer, tui.composer_cursor);
             crate::customization::focus_conversation(&mut tui.app);
             tui.sync_focus();
         }
@@ -6327,6 +7340,20 @@ fn apply_profile_command(
     )))
 }
 
+fn profile_command_toast(tui: &mut Tui, s: &mut Scenario, text: &str, now: u64) -> Toast {
+    let result =
+        parse_profile_command(text).and_then(|command| apply_profile_command(tui, s, command));
+    let (text, ok) = match result {
+        Ok(text) => (text, true),
+        Err(error) => (error.to_string(), false),
+    };
+    Toast {
+        text,
+        ok,
+        shown_ms: now,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn handle_custom_key(
     k: crossterm::event::KeyEvent,
@@ -6342,20 +7369,24 @@ pub fn handle_custom_key(
         return false;
     }
     if k.code == KeyCode::Enter
+        && k.modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+    {
+        return false;
+    }
+    if matches!(k.code, KeyCode::Char(_))
+        && k.modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+    if k.code == KeyCode::Enter
         && (composer.starts_with("/theme") || composer.starts_with("/customize"))
     {
-        let result = parse_profile_command(composer)
-            .and_then(|command| apply_profile_command(tui, s, command));
-        let (text, ok) = match result {
-            Ok(text) => (text, true),
-            Err(error) => (error.to_string(), false),
-        };
-        *toast = Some(Toast {
-            text,
-            ok,
-            shown_ms: now,
-        });
+        *toast = Some(profile_command_toast(tui, s, composer, now));
         composer.clear();
+        tui.composer_cursor = 0;
+        tui.file_completion.sync_at_cursor(composer, 0);
         return true;
     }
     if tui.app.focused_view() == super::layout::View::Custom {
@@ -6519,6 +7550,14 @@ mod routing_projection_tests {
         assert!(context.routing[3].len() <= 256);
         assert!(context.controller);
         assert!(scenario.transcript.is_empty());
+    }
+    #[test]
+    fn routing_projection_byte_cap_never_splits_a_grapheme() {
+        let mut scenario = Scenario::new();
+        let routing = format!("{}e\u{301}", "a".repeat(255));
+        apply_msg(crate::msg::Msg::Routing(vec![routing]), &mut scenario, 5000);
+        assert_eq!(scenario.routing_lines[0], "a".repeat(255));
+        assert!(scenario.routing_lines[0].len() <= 256);
     }
     #[test]
     fn resumed_transcript_replaces_old_chat_and_clears_route_and_working_state() {
@@ -6747,7 +7786,6 @@ mod customization_review_tests {
                 &mut None,
                 &mut false,
                 &mut false,
-                &mut None,
             );
         }
         assert_eq!(tui.app.tree, Node::profile_preset(Preset::Review));
@@ -7000,7 +8038,9 @@ mod customization_review_tests {
 #[cfg(test)]
 mod bound_projection_tests {
     use super::*;
-    use crate::msg::{ContextProjection, CostQualification, ProjectionReason, SessionProjection};
+    use crate::msg::{
+        ContextProjection, CostQualification, ManualOutcome, ProjectionReason, SessionProjection,
+    };
     use crate::worker::{ForegroundKind, ForegroundOperation, ManualAction, SessionBinding};
     use orbit_frontend_protocol::customization::*;
     use std::{collections::BTreeMap, sync::Arc};
@@ -7039,6 +8079,1048 @@ mod bound_projection_tests {
             1
         ));
         assert!(s.take_view_dirty());
+    }
+
+    fn active_ordinary_operation(
+        command: WorkerCommand,
+    ) -> (
+        Scenario,
+        ForegroundOperation,
+        crate::worker::ForegroundRegistration,
+    ) {
+        let mut s = Scenario::new();
+        establish(&mut s);
+        let (sink, receiver) = std::sync::mpsc::channel();
+        submit_foreground(&mut s, &sink, command).unwrap();
+        let WorkerCommand::Bound { operation, command } = receiver.recv().unwrap() else {
+            panic!("ordinary command was not bound");
+        };
+        let registration = operation.start(&command).unwrap();
+        (s, operation, registration)
+    }
+
+    fn record_measured_context_sample(s: &mut Scenario) {
+        apply_msg(
+            crate::msg::Msg::Usage {
+                used_tokens: 48_000,
+                window_tokens: 200_000,
+                breakdown: Some(orbit_frontend_protocol::ContextBreakdown {
+                    system: 100,
+                    tools: 200,
+                    memory: 50,
+                    messages: 47_650,
+                    compact_at: 180_000,
+                    reserve: 10_000,
+                }),
+            },
+            s,
+            2,
+        );
+    }
+
+    fn assert_measured_context_rejected_atomically(s: &mut Scenario, reason: ProjectionReason) {
+        let before = format!("{s:?}");
+        let mut invalid = projection(reason);
+        invalid.context = ContextProjection::PreserveMeasured;
+        assert!(!apply_session_projection(invalid, s, 3));
+        assert_eq!(format!("{s:?}"), before);
+    }
+
+    fn saved_bash(call_id: &str) -> crate::model::TranscriptLine {
+        crate::model::TranscriptLine::Stripped {
+            tool_name: "Bash".into(),
+            call_id: call_id.into(),
+            summary: String::new(),
+            outcome: Some(crate::model::ToolOutcome::Ok),
+            meta: "exit 0".into(),
+            started_at: None,
+        }
+    }
+
+    fn bash_history(count: usize) -> Vec<crate::model::TranscriptLine> {
+        (0..count)
+            .map(|index| saved_bash(&format!("call-{index}")))
+            .collect()
+    }
+
+    #[test]
+    fn initial_projection_restores_empty_tapes_in_transcript_order() {
+        let mut s = Scenario::new();
+        let mut p = projection(ProjectionReason::Initial);
+        p.lines = vec![
+            saved_bash("call-a"),
+            crate::model::TranscriptLine::User {
+                text: "between".into(),
+                time: None,
+            },
+            saved_bash("call-b"),
+        ];
+
+        assert!(apply_session_projection(p, &mut s, 1));
+        assert_eq!(
+            s.tapes
+                .iter()
+                .map(|t| t.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["call-a", "call-b"]
+        );
+        assert!(s.tapes.iter().all(|t| t.lines.is_empty()));
+    }
+
+    #[test]
+    fn refresh_preserves_existing_tapes_and_selection_and_adds_only_new_empty_tapes() {
+        let mut s = Scenario::new();
+        let mut initial = projection(ProjectionReason::Initial);
+        initial.lines = vec![saved_bash("call-a"), saved_bash("call-b")];
+        assert!(apply_session_projection(initial, &mut s, 1));
+        s.push_tape_line("call-a", "kept first output".into());
+        s.push_tape_line("call-b", "kept second output".into());
+        s.pick_tape(0);
+
+        let mut refresh = projection(ProjectionReason::Refresh);
+        refresh.lines = vec![
+            saved_bash("call-a"),
+            saved_bash("call-b"),
+            saved_bash("call-c"),
+        ];
+        assert!(apply_session_projection(refresh, &mut s, 2));
+
+        assert_eq!(s.tapes.len(), 3);
+        assert_eq!(s.tapes[0].lines, ["kept first output"]);
+        assert_eq!(s.tapes[1].lines, ["kept second output"]);
+        assert!(s.tapes[2].lines.is_empty());
+        assert_eq!(
+            s.selected_tape().map(|i| s.tapes[i].call_id.as_str()),
+            Some("call-a")
+        );
+    }
+
+    #[test]
+    fn restored_tapes_obey_capacity_and_keep_a_surviving_selection() {
+        let mut s = Scenario::new();
+        let mut initial = projection(ProjectionReason::Initial);
+        initial.lines = bash_history(super::super::scenario::TAPE_MAX);
+        assert!(apply_session_projection(initial, &mut s, 1));
+        s.pick_tape(7);
+
+        let mut refresh = projection(ProjectionReason::Refresh);
+        refresh.lines = bash_history(super::super::scenario::TAPE_MAX + 1);
+        assert!(apply_session_projection(refresh, &mut s, 2));
+
+        assert_eq!(s.tapes.len(), super::super::scenario::TAPE_MAX);
+        assert_eq!(s.tapes.first().unwrap().call_id, "call-1");
+        assert_eq!(s.tapes.last().unwrap().call_id, "call-20");
+        assert_eq!(
+            s.selected_tape().map(|i| s.tapes[i].call_id.as_str()),
+            Some("call-7")
+        );
+        assert!(s.tapes.iter().all(|t| t.lines.is_empty()));
+    }
+
+    #[test]
+    fn evicting_the_selected_oldest_tape_returns_to_following_newest() {
+        let mut s = Scenario::new();
+        let mut initial = projection(ProjectionReason::Initial);
+        initial.lines = bash_history(super::super::scenario::TAPE_MAX);
+        assert!(apply_session_projection(initial, &mut s, 1));
+        s.pick_tape(0);
+
+        let mut refresh = projection(ProjectionReason::Refresh);
+        refresh.lines = bash_history(super::super::scenario::TAPE_MAX + 1);
+        assert!(apply_session_projection(refresh, &mut s, 2));
+
+        assert!(s.tape_sel.is_none());
+        assert_eq!(
+            s.selected_tape().map(|i| s.tapes[i].call_id.as_str()),
+            Some("call-20")
+        );
+    }
+
+    #[test]
+    fn switching_sessions_replaces_old_tapes_with_empty_new_session_tapes() {
+        let mut s = Scenario::new();
+        let mut initial = projection(ProjectionReason::Initial);
+        initial.lines = vec![saved_bash("old-call")];
+        assert!(apply_session_projection(initial, &mut s, 1));
+
+        let previous = binding();
+        let mut resumed = projection(ProjectionReason::Resume {
+            previous: previous.clone(),
+        });
+        resumed.binding = SessionBinding {
+            session_id: "session-resumed-test".into(),
+            generation: previous.generation + 1,
+        };
+        resumed.lines = vec![saved_bash("new-call")];
+
+        assert!(apply_session_projection(resumed, &mut s, 2));
+        assert_eq!(s.session_id, "session-resumed-test");
+        assert_eq!(
+            s.tapes
+                .iter()
+                .map(|t| t.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new-call"]
+        );
+        assert!(s.tapes[0].lines.is_empty());
+    }
+
+    #[test]
+    fn measured_context_sample_survives_matching_refresh_and_unavailable_clears_it() {
+        let mut s = Scenario::new();
+        establish(&mut s);
+        apply_msg(
+            crate::msg::Msg::Usage {
+                used_tokens: 48_000,
+                window_tokens: 200_000,
+                breakdown: Some(orbit_frontend_protocol::ContextBreakdown {
+                    system: 100,
+                    tools: 200,
+                    memory: 50,
+                    messages: 47_650,
+                    compact_at: 180_000,
+                    reserve: 10_000,
+                }),
+            },
+            &mut s,
+            2,
+        );
+
+        let mut measured = projection(ProjectionReason::Refresh);
+        measured.context = ContextProjection::PreserveMeasured;
+        assert!(apply_session_projection(measured, &mut s, 3));
+        assert_eq!(s.used_tokens, 48_000);
+        assert_eq!(s.window_tokens, 200_000);
+        assert_eq!(s.usage_shown_ms, 2);
+        assert_eq!(
+            s.ctx_breakdown,
+            Some(orbit_frontend_protocol::ContextBreakdown {
+                system: 100,
+                tools: 200,
+                memory: 50,
+                messages: 47_650,
+                compact_at: 180_000,
+                reserve: 10_000,
+            })
+        );
+
+        s.compacting_from = Some(48_000);
+        let mut unavailable = projection(ProjectionReason::Refresh);
+        unavailable.context = ContextProjection::Unavailable;
+        assert!(apply_session_projection(unavailable, &mut s, 4));
+        assert_eq!(s.used_tokens, 0);
+        assert_eq!(s.window_tokens, 0);
+        assert_eq!(s.usage_shown_ms, 0);
+        assert_eq!(s.ctx_breakdown, None);
+        assert_eq!(s.ctx_from, 0.0);
+        assert_eq!(s.ctx_to, 0.0);
+        assert_eq!(s.ctx_ms, 0);
+        assert_eq!(s.compacting_from, None);
+    }
+
+    #[test]
+    fn measured_context_survives_exact_active_prompt_and_plan_prompt_operations() {
+        for command in [
+            WorkerCommand::Prompt("prompt".into()),
+            WorkerCommand::PlanPrompt("plan".into()),
+        ] {
+            let (mut s, operation, registration) = active_ordinary_operation(command);
+            record_measured_context_sample(&mut s);
+            drop(registration);
+
+            let mut terminal = projection(ProjectionReason::Operation { operation });
+            terminal.context = ContextProjection::PreserveMeasured;
+            assert!(apply_session_projection(terminal, &mut s, 3));
+            assert_eq!(s.used_tokens, 48_000);
+            assert_eq!(s.window_tokens, 200_000);
+            assert_eq!(s.usage_shown_ms, 2);
+            assert_eq!(
+                s.ctx_breakdown,
+                Some(orbit_frontend_protocol::ContextBreakdown {
+                    system: 100,
+                    tools: 200,
+                    memory: 50,
+                    messages: 47_650,
+                    compact_at: 180_000,
+                    reserve: 10_000,
+                })
+            );
+            assert!(s.frontend.foreground.is_none());
+        }
+    }
+
+    #[test]
+    fn measured_context_rejects_nonordinary_foreground_operation_atomically() {
+        let mut s = Scenario::new();
+        establish(&mut s);
+        record_measured_context_sample(&mut s);
+        let operation = s.new_foreground_operation(ForegroundKind::Control).unwrap();
+        assert!(s.admit_foreground(operation.clone()));
+        let registration = operation.start(&WorkerCommand::Undo).unwrap();
+        drop(registration);
+
+        assert_measured_context_rejected_atomically(
+            &mut s,
+            ProjectionReason::Operation { operation },
+        );
+    }
+
+    #[test]
+    fn measured_context_rejects_nonactive_ordinary_operation_id_atomically() {
+        let (mut s, active, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("prompt".into()));
+        record_measured_context_sample(&mut s);
+        drop(registration);
+        let impostor =
+            ForegroundOperation::new(active.source().clone(), ForegroundKind::Prompt, 99).unwrap();
+
+        assert_measured_context_rejected_atomically(
+            &mut s,
+            ProjectionReason::Operation {
+                operation: impostor,
+            },
+        );
+    }
+
+    #[test]
+    fn measured_context_rejects_ordinary_operation_with_wrong_source_binding_atomically() {
+        let (mut s, _, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("prompt".into()));
+        record_measured_context_sample(&mut s);
+        drop(registration);
+        let wrong_source = SessionBinding {
+            session_id: "session-other".into(),
+            generation: 1,
+        };
+        let operation = ForegroundOperation::new(wrong_source, ForegroundKind::Prompt, 99).unwrap();
+
+        assert_measured_context_rejected_atomically(
+            &mut s,
+            ProjectionReason::Operation { operation },
+        );
+    }
+
+    #[test]
+    fn measured_context_operation_requires_an_existing_nonzero_sample() {
+        let (mut s, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("prompt".into()));
+        drop(registration);
+        assert_eq!(s.window_tokens, 0);
+
+        assert_measured_context_rejected_atomically(
+            &mut s,
+            ProjectionReason::Operation { operation },
+        );
+    }
+
+    #[test]
+    fn measured_context_rejects_wrong_identity_atomically() {
+        for mismatch in ["model", "provider"] {
+            let mut s = Scenario::new();
+            establish(&mut s);
+            apply_msg(
+                crate::msg::Msg::Usage {
+                    used_tokens: 48_000,
+                    window_tokens: 200_000,
+                    breakdown: None,
+                },
+                &mut s,
+                2,
+            );
+            let before = format!("{s:?}");
+
+            let mut invalid = projection(ProjectionReason::Refresh);
+            invalid.context = ContextProjection::PreserveMeasured;
+            if mismatch == "model" {
+                invalid.model = "other-model".into();
+            } else {
+                invalid.provider = "other-provider".into();
+            }
+            assert!(!apply_session_projection(invalid, &mut s, 3));
+            assert_eq!(
+                format!("{s:?}"),
+                before,
+                "a {mismatch} mismatch must leave all session state unchanged",
+            );
+        }
+    }
+
+    #[test]
+    fn measured_context_rejects_manual_reason_without_mutating_state() {
+        let mut s = Scenario::new();
+        establish(&mut s);
+        apply_msg(
+            crate::msg::Msg::Usage {
+                used_tokens: 48_000,
+                window_tokens: 200_000,
+                breakdown: Some(orbit_frontend_protocol::ContextBreakdown {
+                    system: 100,
+                    tools: 200,
+                    memory: 50,
+                    messages: 47_650,
+                    compact_at: 180_000,
+                    reserve: 10_000,
+                }),
+            },
+            &mut s,
+            2,
+        );
+        let operation = s.new_manual_operation(ManualAction::Compact).unwrap();
+        assert!(s.admit_manual(operation.clone()));
+        let before = format!("{s:?}");
+
+        let mut non_refresh = projection(ProjectionReason::Manual {
+            operation,
+            outcome: ManualOutcome::Failed,
+            applied: false,
+        });
+        non_refresh.context = ContextProjection::PreserveMeasured;
+        assert!(!apply_session_projection(non_refresh, &mut s, 3));
+        assert_eq!(format!("{s:?}"), before);
+    }
+
+    #[test]
+    fn measured_context_requires_an_existing_nonzero_sample_and_rejects_switches() {
+        let mut s = Scenario::new();
+        establish(&mut s);
+        let mut missing = projection(ProjectionReason::Refresh);
+        missing.context = ContextProjection::PreserveMeasured;
+        assert!(!apply_session_projection(missing, &mut s, 2));
+
+        apply_msg(
+            crate::msg::Msg::Usage {
+                used_tokens: 48_000,
+                window_tokens: 200_000,
+                breakdown: None,
+            },
+            &mut s,
+            3,
+        );
+        let previous = binding();
+        let mut resume = projection(ProjectionReason::Resume { previous });
+        resume.binding = crate::worker::SessionBinding {
+            session_id: "session-measured-next".into(),
+            generation: 2,
+        };
+        resume.context = ContextProjection::PreserveMeasured;
+        assert!(!apply_session_projection(resume, &mut s, 4));
+        assert_eq!(s.used_tokens, 48_000);
+        assert_eq!(s.window_tokens, 200_000);
+
+        s.window_tokens = 0;
+        let mut zero_window = projection(ProjectionReason::Refresh);
+        zero_window.context = ContextProjection::PreserveMeasured;
+        assert!(!apply_session_projection(zero_window, &mut s, 5));
+        assert_eq!(s.used_tokens, 48_000);
+        assert_eq!(s.window_tokens, 0);
+    }
+
+    fn failure_test_frame(s: &Scenario, width: u16, height: u16, scroll: usize) -> String {
+        let mut tui = Tui::new();
+        tui.reduced = true;
+        tui.tick_ms = 10_000;
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        term.draw(|f| draw(f, &tui, s, "", None, "", 0, None, false, scroll))
+            .unwrap();
+        let buffer = term.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn checked_clear_acknowledgement_survives_first_draw_and_refresh() {
+        let old_id = "session-01J8ZK4QX2M7C9RT5VWEHN3B6D";
+        let mut s = Scenario::new();
+        let mut initial = projection(ProjectionReason::Initial);
+        initial.binding.session_id = old_id.into();
+        assert!(apply_session_projection(initial, &mut s, 1));
+        let operation = s.new_manual_operation(ManualAction::Clear).unwrap();
+        assert!(s.admit_manual(operation.clone()));
+        let acknowledgement = format!("new session started; previous session {old_id} retained");
+        assert_eq!(old_id.len(), 34);
+        assert_eq!(acknowledgement.len(), 81);
+        apply_msg(crate::msg::Msg::Status(acknowledgement.clone()), &mut s, 2);
+        let mut cleared = projection(ProjectionReason::Manual {
+            operation,
+            outcome: ManualOutcome::Completed,
+            applied: true,
+        });
+        cleared.binding = SessionBinding {
+            session_id: "session-01J8ZK4QX2M7C9RT5VWEHN3B6E".into(),
+            generation: 2,
+        };
+        cleared.lines.clear();
+        cleared.turns = 0;
+        cleared.input_tokens = 0;
+        cleared.output_tokens = 0;
+        cleared.cost_microcents = 0;
+        cleared.cost = CostQualification::Known { revision: 0 };
+        let mut refresh = cleared.clone();
+        refresh.reason = ProjectionReason::Refresh;
+        assert!(apply_session_projection(cleared, &mut s, 3));
+        assert_eq!(s.session_id, refresh.binding.session_id);
+        assert_eq!(s.session_binding(), Some(&refresh.binding));
+        assert!(s.transcript.is_empty() && !s.is_busy());
+        assert_eq!(
+            (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+            (0, 0, 0, 0)
+        );
+        let first = failure_test_frame(&s, 110, 30, 0);
+        assert!(first.contains(&acknowledgement), "{first}");
+        assert!(
+            first.contains("New session") && first.contains("the harness that orbits"),
+            "{first}"
+        );
+        assert_eq!(first.matches(&acknowledgement).count(), 1);
+        assert!(apply_session_projection(refresh, &mut s, 4));
+        let refreshed = failure_test_frame(&s, 110, 30, 0);
+        assert!(refreshed.contains(&acknowledgement), "{refreshed}");
+        assert_eq!(refreshed.matches(&acknowledgement).count(), 1);
+        assert!(s.transcript.is_empty());
+    }
+
+    fn acknowledged_clear() -> (Scenario, SessionProjection) {
+        let mut s = Scenario::new();
+        let mut initial = projection(ProjectionReason::Initial);
+        initial.binding.session_id = "session-01J8ZK4QX2M7C9RT5VWEHN3B6D".into();
+        assert!(apply_session_projection(initial, &mut s, 1));
+        let operation = s.new_manual_operation(ManualAction::Clear).unwrap();
+        assert!(s.admit_manual(operation.clone()));
+        let mut cleared = projection(ProjectionReason::Manual {
+            operation,
+            outcome: ManualOutcome::Completed,
+            applied: true,
+        });
+        cleared.binding = SessionBinding {
+            session_id: "session-01J8ZK4QX2M7C9RT5VWEHN3B6E".into(),
+            generation: 2,
+        };
+        cleared.lines.clear();
+        cleared.turns = 0;
+        cleared.input_tokens = 0;
+        cleared.output_tokens = 0;
+        cleared.cost_microcents = 0;
+        cleared.cost = CostQualification::Known { revision: 0 };
+        assert!(apply_session_projection(cleared.clone(), &mut s, 2));
+        assert_eq!(
+            s.cleared_from.as_deref(),
+            Some("session-01J8ZK4QX2M7C9RT5VWEHN3B6D")
+        );
+        (s, cleared)
+    }
+
+    #[test]
+    fn clear_acknowledgement_follows_valid_admission_only() {
+        for kind in [
+            ForegroundKind::Prompt,
+            ForegroundKind::PlanPrompt,
+            ForegroundKind::Control,
+        ] {
+            let (mut s, _) = acknowledged_clear();
+            let source = s.cleared_from.clone();
+            let rejected = ForegroundOperation::new(
+                SessionBinding {
+                    session_id: "session-wrong".into(),
+                    generation: 2,
+                },
+                kind,
+                99,
+            )
+            .unwrap();
+            let before = format!("{s:?}");
+            assert!(!s.admit_foreground(rejected));
+            assert_eq!(format!("{s:?}"), before);
+            let operation = s.new_foreground_operation(kind).unwrap();
+            assert!(s.admit_foreground(operation));
+            assert_eq!(
+                s.cleared_from,
+                if kind.is_ordinary() { None } else { source }
+            );
+        }
+        for action in [ManualAction::Compact, ManualAction::Clear] {
+            let (mut s, _) = acknowledged_clear();
+            let rejected = crate::worker::ManualOperation::new(
+                SessionBinding {
+                    session_id: "session-wrong".into(),
+                    generation: 2,
+                },
+                action,
+                99,
+            )
+            .unwrap();
+            let before = format!("{s:?}");
+            assert!(!s.admit_manual(rejected));
+            assert_eq!(format!("{s:?}"), before);
+            let operation = s.new_manual_operation(action).unwrap();
+            assert!(s.admit_manual(operation));
+            assert!(s.cleared_from.is_none());
+        }
+    }
+
+    #[test]
+    fn clear_acknowledgement_resets_on_round_restore_and_real_identity_change() {
+        let (mut s, _) = acknowledged_clear();
+        let source = s.cleared_from.clone();
+        let identity = |session_id: String| crate::msg::Msg::Identity {
+            model: "model".into(),
+            provider: "provider".into(),
+            session_prefix: "prefix".into(),
+            session_id,
+            priced: true,
+        };
+        apply_msg(identity(s.session_id.clone()), &mut s, 3);
+        assert_eq!(s.cleared_from, source);
+        apply_msg(identity("session-another".into()), &mut s, 4);
+        assert!(s.cleared_from.is_none());
+        let (mut s, _) = acknowledged_clear();
+        s.apply("round_started", 5);
+        assert!(s.cleared_from.is_none());
+        let (mut s, _) = acknowledged_clear();
+        apply_msg(
+            crate::msg::Msg::TranscriptLoaded {
+                lines: vec![],
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: 0,
+                turns: 0,
+            },
+            &mut s,
+            6,
+        );
+        assert!(s.cleared_from.is_none());
+        let (mut s, mut next) = acknowledged_clear();
+        next.reason = ProjectionReason::Resume {
+            previous: s.session_binding().unwrap().clone(),
+        };
+        next.binding.session_id = "session-resumed".into();
+        next.binding.generation = 3;
+        assert!(apply_session_projection(next, &mut s, 7));
+        assert!(s.cleared_from.is_none() && s.transcript.is_empty());
+    }
+
+    #[test]
+    fn clear_acknowledgement_requires_completed_applied_result() {
+        for outcome in [
+            ManualOutcome::Completed,
+            ManualOutcome::Failed,
+            ManualOutcome::Cancelled,
+            ManualOutcome::Unknown,
+        ] {
+            for applied in [false, true] {
+                let mut s = Scenario::new();
+                establish(&mut s);
+                let operation = s.new_manual_operation(ManualAction::Clear).unwrap();
+                assert!(s.admit_manual(operation.clone()));
+                let mut result = projection(ProjectionReason::Manual {
+                    operation,
+                    outcome,
+                    applied,
+                });
+                let successful = outcome == ManualOutcome::Completed && applied;
+                if successful {
+                    result.binding.session_id = "session-next".into();
+                    result.binding.generation = 2;
+                    result.lines.clear();
+                    result.turns = 0;
+                }
+                let before = format!("{s:?}");
+                assert_eq!(
+                    apply_session_projection(result, &mut s, 3),
+                    !applied || successful
+                );
+                assert_eq!(
+                    s.cleared_from.as_deref(),
+                    successful.then_some("session-bound-test")
+                );
+                if applied && !successful {
+                    assert_eq!(format!("{s:?}"), before);
+                }
+            }
+        }
+        let mut s = Scenario::new();
+        establish(&mut s);
+        let operation = s.new_manual_operation(ManualAction::Compact).unwrap();
+        assert!(s.admit_manual(operation.clone()));
+        assert!(apply_session_projection(
+            projection(ProjectionReason::Manual {
+                operation,
+                outcome: ManualOutcome::Completed,
+                applied: true,
+            }),
+            &mut s,
+            3
+        ));
+        assert!(s.cleared_from.is_none());
+    }
+
+    #[test]
+    fn rejected_clear_acknowledgements_are_atomic_and_replay_safe() {
+        let (mut s, replay) = acknowledged_clear();
+        let mut refresh = replay.clone();
+        refresh.reason = ProjectionReason::Refresh;
+        refresh.cost = CostQualification::Known { revision: 7 };
+        assert!(apply_session_projection(refresh.clone(), &mut s, 3));
+        let mut stale = refresh;
+        stale.cost = CostQualification::Known { revision: 6 };
+        for rejected in [stale, replay.clone()] {
+            s.take_view_dirty();
+            let before = format!("{s:?}");
+            let frame = failure_test_frame(&s, 110, 30, 0);
+            assert!(!apply_session_projection(rejected, &mut s, 4));
+            assert_eq!(format!("{s:?}"), before);
+            assert!(!s.take_view_dirty());
+            assert_eq!(failure_test_frame(&s, 110, 30, 0), frame);
+        }
+        let operation = s.new_manual_operation(ManualAction::Clear).unwrap();
+        assert!(s.admit_manual(operation.clone()));
+        let mut next = replay;
+        next.reason = ProjectionReason::Manual {
+            operation: operation.clone(),
+            outcome: ManualOutcome::Completed,
+            applied: true,
+        };
+        next.binding.session_id = "session-third".into();
+        next.binding.generation = 3;
+        let mut wrong_owner = next.clone();
+        wrong_owner.reason = ProjectionReason::Manual {
+            operation: crate::worker::ManualOperation::new(
+                operation.source().clone(),
+                ManualAction::Clear,
+                operation.id(),
+            )
+            .unwrap(),
+            outcome: ManualOutcome::Completed,
+            applied: true,
+        };
+        let mut wrong_generation = next.clone();
+        wrong_generation.binding.generation = 4;
+        let mut invalid_id = next.clone();
+        invalid_id.binding.session_id = "bad\u{1b}id".into();
+        let mut invalid_context = next.clone();
+        invalid_context.context = ContextProjection::PreserveMeasured;
+        for rejected in [wrong_owner, wrong_generation, invalid_id, invalid_context] {
+            s.take_view_dirty();
+            let before = format!("{s:?}");
+            assert!(!apply_session_projection(rejected, &mut s, 5));
+            assert_eq!(format!("{s:?}"), before);
+            assert!(!s.take_view_dirty());
+        }
+        let source = s.session_id.clone();
+        assert!(apply_session_projection(next, &mut s, 6));
+        assert_eq!(s.cleared_from.as_ref(), Some(&source));
+        assert!(s.transcript.is_empty() && !s.is_busy());
+    }
+
+    #[test]
+    fn failed_bound_turn_survives_checked_terminal_before_first_draw() {
+        for command in [
+            WorkerCommand::Prompt("prompt".into()),
+            WorkerCommand::PlanPrompt("plan".into()),
+        ] {
+            let (mut s, operation, registration) = active_ordinary_operation(command);
+            s.apply("round_started", 0);
+            s.turn_started_ms = 1_000;
+            apply_msg(
+                crate::msg::Msg::BackendError("ERR_TERMINAL".into()),
+                &mut s,
+                2_000,
+            );
+            assert!(s.last_failed && s.is_busy());
+            assert_eq!(s.pending_foreground(), Some(&operation));
+            apply_msg(
+                crate::msg::Msg::ResponseFinished {
+                    output: String::new(),
+                    input_tokens: 110,
+                    output_tokens: 220,
+                    cost_microcents: 330,
+                },
+                &mut s,
+                3_000,
+            );
+            assert!(s.is_busy());
+            assert_eq!(
+                (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+                (2, 10, 20, 30)
+            );
+            let mut terminal = projection(ProjectionReason::Operation {
+                operation: operation.clone(),
+            });
+            terminal.turns = 3;
+            terminal.input_tokens = 110;
+            terminal.output_tokens = 220;
+            terminal.cost_microcents = 330;
+            terminal.cost = CostQualification::Known { revision: 5 };
+            drop(registration);
+            assert!(apply_session_projection(terminal, &mut s, 4_000));
+            assert!(!s.is_busy() && s.pending_foreground().is_none());
+            assert_eq!(
+                (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+                (3, 110, 220, 330)
+            );
+            assert_eq!(s.session_binding(), Some(&binding()));
+            assert_eq!(
+                s.cost_qualification(),
+                CostQualification::Known { revision: 5 }
+            );
+            assert_eq!(s.qualified_revision_floor(), Some(5));
+            let report = s.turn_report.as_ref().unwrap();
+            assert!(!report.priced && report.cost_microcents == 0);
+            assert_eq!(report.duration_ms, 2_000);
+            let frame = failure_test_frame(&s, 110, 30, 0);
+            assert!(
+                frame.contains("ERR_TERMINAL"),
+                "settled failure reason disappeared before first draw:\n{frame}"
+            );
+            assert!(s.last_failed);
+            assert_eq!(s.activity(), super::super::scenario::Activity::Failed);
+            let header = frame
+                .lines()
+                .skip(1)
+                .find(|line| {
+                    line.trim_start().starts_with('┃')
+                        && line.trim_start_matches([' ', '┃']).starts_with("2 ")
+                        && line.contains("Conversation")
+                })
+                .unwrap();
+            assert!(
+                header.contains("failed") && !header.contains("done"),
+                "{frame}"
+            );
+            assert!(frame.contains("✕ failed · 2s · 0 tools"), "{frame}");
+            assert!(!frame.contains("✓ done ·"), "{frame}");
+            assert!(frame.lines().last().unwrap().contains("failed"), "{frame}");
+        }
+    }
+
+    fn settled_failure(reason: &str) -> (Scenario, SessionProjection) {
+        let (mut s, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("prompt".into()));
+        s.apply("round_started", 0);
+        s.first_prompt_waiting = true;
+        apply_msg(crate::msg::Msg::BackendError(reason.into()), &mut s, 2);
+        apply_msg(
+            crate::msg::Msg::OrdinaryTurnEnded {
+                operation: operation.clone(),
+                end: crate::msg::OrdinaryEnd::Failed(reason.into()),
+                publication: crate::msg::OrdinaryPublication::Saved,
+            },
+            &mut s,
+            2,
+        );
+        assert!(!s.first_prompt_waiting && s.is_busy());
+        apply_msg(
+            crate::msg::Msg::ResponseFinished {
+                output: String::new(),
+                input_tokens: 10,
+                output_tokens: 20,
+                cost_microcents: 30,
+            },
+            &mut s,
+            3,
+        );
+        let terminal = projection(ProjectionReason::Operation { operation });
+        drop(registration);
+        assert!(apply_session_projection(terminal.clone(), &mut s, 4));
+        assert!(s.take_view_dirty());
+        (s, terminal)
+    }
+
+    #[test]
+    fn failed_reason_survives_same_session_refresh_and_manual_no_change() {
+        let (mut s, terminal) = settled_failure("ERR_PRESERVED");
+        let history = s.transcript.clone();
+        let report = s.turn_report.clone();
+        let mut refresh = terminal.clone();
+        refresh.reason = ProjectionReason::Refresh;
+        assert!(apply_session_projection(refresh, &mut s, 5));
+        assert_eq!(s.failure_reason.as_deref(), Some("ERR_PRESERVED"));
+        assert_eq!(s.turn_report, report);
+        let operation = s.new_manual_operation(ManualAction::Compact).unwrap();
+        assert!(s.admit_manual(operation.clone()));
+        let mut unchanged = terminal;
+        unchanged.reason = ProjectionReason::Manual {
+            operation,
+            outcome: ManualOutcome::Failed,
+            applied: false,
+        };
+        assert!(apply_session_projection(unchanged, &mut s, 6));
+        assert_eq!(s.transcript, history);
+        assert_eq!(s.failure_reason.as_deref(), Some("ERR_PRESERVED"));
+        assert_eq!(s.turn_report, report);
+        assert!(s.last_failed && !s.is_busy());
+        assert!(failure_test_frame(&s, 110, 30, 0).contains("ERR_PRESERVED"));
+    }
+
+    #[test]
+    fn repeated_failure_replaces_one_visible_group_and_requests_redraw() {
+        let (mut s, _) = settled_failure("ERR_ALPHA");
+        let history = s.transcript.clone();
+        let report = s.turn_report.clone();
+        for reason in ["ERR_ALPHA", "ERR_BRAVO"] {
+            s.take_view_dirty();
+            apply_msg(crate::msg::Msg::BackendError(reason.into()), &mut s, 5);
+            assert!(s.take_view_dirty());
+            assert_eq!(s.transcript, history);
+            assert_eq!(s.turn_report, report);
+            let frame = failure_test_frame(&s, 110, 30, 0);
+            assert_eq!(frame.matches("This turn failed").count(), 1, "{frame}");
+            assert_eq!(
+                frame.matches("empty composer resends it").count(),
+                1,
+                "{frame}"
+            );
+            assert!(frame.contains(reason), "{frame}");
+            if reason == "ERR_BRAVO" {
+                assert!(!frame.contains("ERR_ALPHA"), "{frame}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_failure_projections_have_no_view_or_accounting_effect() {
+        let (mut s, terminal) = settled_failure("ERR_RETAINED");
+        let mut wrong_binding = terminal.clone();
+        wrong_binding.reason = ProjectionReason::Refresh;
+        wrong_binding.binding.session_id = "session-wrong".into();
+        let mut stale = terminal.clone();
+        stale.reason = ProjectionReason::Refresh;
+        stale.cost = CostQualification::Known { revision: 2 };
+        let (_, wrong_operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("other".into()));
+        drop(registration);
+        let mut wrong_owner = terminal.clone();
+        wrong_owner.reason = ProjectionReason::Operation {
+            operation: wrong_operation,
+        };
+        let mut rejected_switch = terminal.clone();
+        rejected_switch.reason = ProjectionReason::Resume {
+            previous: binding(),
+        };
+        rejected_switch.binding.session_id = "session-next".into();
+        rejected_switch.binding.generation = 3;
+        for rejected in [wrong_binding, stale, wrong_owner, rejected_switch, terminal] {
+            s.take_view_dirty();
+            let before = format!("{s:?}");
+            let frame = failure_test_frame(&s, 110, 30, 0);
+            assert!(!apply_session_projection(rejected, &mut s, 6));
+            assert_eq!(format!("{s:?}"), before);
+            assert!(!s.take_view_dirty());
+            assert_eq!(failure_test_frame(&s, 110, 30, 0), frame);
+        }
+    }
+
+    #[test]
+    fn new_round_and_real_identity_changes_clear_failure_presentation() {
+        let (mut s, _) = settled_failure("ERR_OLD");
+        s.apply("round_started", 0);
+        assert!(!s.last_failed && s.failure_reason.is_none() && s.turn_report.is_none());
+        assert!(!failure_test_frame(&s, 110, 30, 0).contains("ERR_OLD"));
+        let (mut s, _) = settled_failure("ERR_OLD");
+        for session_id in [binding().session_id, "session-new".into()] {
+            let same = s.session_id == session_id;
+            apply_msg(
+                crate::msg::Msg::Identity {
+                    model: "model".into(),
+                    provider: "provider".into(),
+                    session_prefix: "prefix".into(),
+                    session_id,
+                    priced: true,
+                },
+                &mut s,
+                8,
+            );
+            if same {
+                assert_eq!(s.failure_reason.as_deref(), Some("ERR_OLD"));
+            } else {
+                assert!(!s.last_failed && s.failure_reason.is_none() && s.turn_report.is_none());
+            }
+        }
+        let (mut s, _) = settled_failure("ERR_OLD");
+        s.first_prompt_waiting = true;
+        apply_msg(
+            crate::msg::Msg::TranscriptLoaded {
+                lines: vec![],
+                turns: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: 0,
+            },
+            &mut s,
+            9,
+        );
+        assert!(
+            !s.last_failed
+                && !s.first_prompt_waiting
+                && s.failure_reason.is_none()
+                && s.turn_report.is_none()
+        );
+    }
+
+    #[test]
+    fn accepted_clear_and_resume_drop_only_the_old_failure_view() {
+        for clear in [false, true] {
+            let (mut s, terminal) = settled_failure("ERR_OLD_SESSION");
+            let reason = if clear {
+                let operation = s.new_manual_operation(ManualAction::Clear).unwrap();
+                assert!(s.admit_manual(operation.clone()));
+                ProjectionReason::Manual {
+                    operation,
+                    outcome: ManualOutcome::Completed,
+                    applied: true,
+                }
+            } else {
+                ProjectionReason::Resume {
+                    previous: binding(),
+                }
+            };
+            let mut next = projection(reason);
+            next.binding = SessionBinding {
+                session_id: "session-next".into(),
+                generation: 2,
+            };
+            next.lines = vec![crate::model::TranscriptLine::User {
+                text: "new namespace".into(),
+                time: None,
+            }];
+            next.turns = 0;
+            assert!(apply_session_projection(next, &mut s, 10));
+            assert!(!s.last_failed && s.failure_reason.is_none() && s.turn_report.is_none());
+            assert_eq!(s.session_id, "session-next");
+            assert!(failure_test_frame(&s, 110, 30, 0).contains("new namespace"));
+            assert!(!failure_test_frame(&s, 110, 30, 0).contains("ERR_OLD_SESSION"));
+            s.take_view_dirty();
+            let before = format!("{s:?}");
+            assert!(!apply_session_projection(terminal, &mut s, 11));
+            assert_eq!(format!("{s:?}"), before);
+            assert!(!s.take_view_dirty());
+        }
+    }
+
+    #[test]
+    fn empty_history_failure_stops_welcome_and_displays_safe_reason() {
+        let mut s = Scenario::new();
+        s.first_prompt_waiting = true;
+        apply_msg(
+            crate::msg::Msg::BackendError("\u{1b}[31mERR_EMPTY\u{1b}[0m".into()),
+            &mut s,
+            1,
+        );
+        assert!(!s.first_prompt_waiting && s.last_failed);
+        assert_eq!(s.failure_reason.as_deref(), Some("ERR_EMPTY"));
+        let frame = failure_test_frame(&s, 40, 24, 0);
+        assert!(
+            frame.contains("ERR_EMPTY") && frame.contains("Ask ORBIT"),
+            "{frame}"
+        );
+        assert!(!frame.contains('\u{1b}'), "{frame}");
+        assert!(!frame.contains("the harness that orbits"), "{frame}");
     }
 
     #[test]
@@ -7379,5 +9461,1428 @@ mod bound_projection_tests {
             ),
             (3, 8, 10, 12)
         );
+    }
+
+    fn finish_owned_view(
+        s: &mut Scenario,
+        operation: ForegroundOperation,
+        registration: crate::worker::ForegroundRegistration,
+        end: crate::msg::OrdinaryEnd,
+        publication: crate::msg::OrdinaryPublication,
+    ) {
+        apply_msg(
+            crate::msg::Msg::OrdinaryTurnEnded {
+                operation: operation.clone(),
+                end,
+                publication,
+            },
+            s,
+            2,
+        );
+        assert!(s.is_busy() && s.pending_foreground() == Some(&operation));
+        apply_msg(
+            crate::msg::Msg::ResponseFinished {
+                output: String::new(),
+                input_tokens: 10,
+                output_tokens: 20,
+                cost_microcents: 30,
+            },
+            s,
+            3,
+        );
+        drop(registration);
+        assert!(apply_session_projection(
+            projection(ProjectionReason::Operation { operation }),
+            s,
+            4
+        ));
+        assert!(!s.is_busy());
+    }
+
+    fn press_enter_in_context(
+        s: &mut Scenario,
+        sink: &CommandSink,
+        tui: &mut Tui,
+        composer: &mut String,
+        overlay: &mut Option<Overlay>,
+        queued: &mut Vec<String>,
+    ) {
+        let (_, sender) = Bus::new();
+        assert!(!handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tui,
+            s,
+            composer,
+            None,
+            sink,
+            &sender,
+            &ApprovalRegistry::new(),
+            5000,
+            overlay,
+            &mut String::new(),
+            &mut 0,
+            &mut 0,
+            &mut None,
+            queued,
+            &mut Vec::new(),
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut false
+        ));
+    }
+
+    fn press_empty_enter(s: &mut Scenario, sink: &CommandSink) {
+        let mut tui = Tui::new();
+        assert_eq!(tui.focus, Focus::Conversation);
+        let mut composer = String::new();
+        assert!(!s.is_busy() && composer.is_empty());
+        press_enter_in_context(s, sink, &mut tui, &mut composer, &mut None, &mut Vec::new());
+    }
+
+    #[test]
+    fn ordinary_intent_admission_preserves_original_variants_and_failed_send() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        for command in [
+            WorkerCommand::Prompt("p".into()),
+            WorkerCommand::PlanPrompt("p".into()),
+            WorkerCommand::ModCommand("m".into(), "c".into()),
+        ] {
+            let original = OrdinaryIntent::from_command(&command).unwrap();
+            let (mut s, operation, registration) = active_ordinary_operation(command);
+            s.apply("round_started", 0);
+            assert!(!s.can_resend_ordinary());
+            finish_owned_view(
+                &mut s,
+                operation,
+                registration,
+                OrdinaryEnd::Failed("failed".into()),
+                OrdinaryPublication::Saved,
+            );
+            assert_eq!(s.eligible_ordinary_intent(), Some(&original));
+            let (failed, receiver) = std::sync::mpsc::channel();
+            drop(receiver);
+            assert!(
+                submit_foreground(&mut s, &failed, WorkerCommand::Prompt("new".into())).is_err()
+            );
+            assert_eq!(s.eligible_ordinary_intent(), Some(&original));
+            assert!(
+                !format!("{:?}", OrdinaryIntent::Prompt("private-prompt".into()))
+                    .contains("private-prompt")
+            );
+        }
+    }
+
+    #[test]
+    fn queued_ordinary_admission_replaces_resend_intent_before_round_started() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        let (mut s, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("A".into()));
+        finish_owned_view(
+            &mut s,
+            operation,
+            registration,
+            OrdinaryEnd::Failed("A failed".into()),
+            OrdinaryPublication::Saved,
+        );
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::Queued,
+            text: "B".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            s.eligible_ordinary_intent(),
+            Some(&OrdinaryIntent::Prompt("A".into()))
+        );
+        let (sink, receiver) = std::sync::mpsc::channel();
+        submit_foreground(&mut s, &sink, WorkerCommand::Prompt("B".into())).unwrap();
+        let WorkerCommand::Bound { operation, command } = receiver.recv().unwrap() else {
+            panic!("bound B");
+        };
+        let registration = operation.start(&command).unwrap();
+        s.apply("round_started", 0);
+        finish_owned_view(
+            &mut s,
+            operation,
+            registration,
+            OrdinaryEnd::Failed("B failed".into()),
+            OrdinaryPublication::Saved,
+        );
+        assert_eq!(
+            s.eligible_ordinary_intent(),
+            Some(&OrdinaryIntent::Prompt("B".into()))
+        );
+    }
+
+    #[test]
+    fn ordinary_terminal_result_requires_exact_live_owner_and_binding() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        let (mut s, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("p".into()));
+        let mut foreign_binding = operation.source().clone();
+        foreign_binding.generation += 1;
+        for rejected in [
+            ForegroundOperation::new(operation.source().clone(), operation.kind(), operation.id())
+                .unwrap(),
+            ForegroundOperation::new(foreign_binding, operation.kind(), operation.id()).unwrap(),
+            ForegroundOperation::new(
+                operation.source().clone(),
+                ForegroundKind::Control,
+                operation.id(),
+            )
+            .unwrap(),
+        ] {
+            s.take_view_dirty();
+            let before = format!("{s:?}");
+            apply_msg(
+                crate::msg::Msg::OrdinaryTurnEnded {
+                    operation: rejected,
+                    end: OrdinaryEnd::Failed("bad".into()),
+                    publication: OrdinaryPublication::Saved,
+                },
+                &mut s,
+                2,
+            );
+            assert_eq!(format!("{s:?}"), before);
+            assert!(!s.take_view_dirty());
+        }
+        let terminal = crate::msg::Msg::OrdinaryTurnEnded {
+            operation: operation.clone(),
+            end: OrdinaryEnd::Completed,
+            publication: OrdinaryPublication::Saved,
+        };
+        apply_msg(terminal.clone(), &mut s, 2);
+        s.take_view_dirty();
+        let before = format!("{s:?}");
+        apply_msg(terminal.clone(), &mut s, 3);
+        assert_eq!(format!("{s:?}"), before);
+        assert!(!s.take_view_dirty());
+        apply_msg(
+            crate::msg::Msg::ResponseFinished {
+                output: String::new(),
+                input_tokens: 10,
+                output_tokens: 20,
+                cost_microcents: 30,
+            },
+            &mut s,
+            4,
+        );
+        drop(registration);
+        assert!(apply_session_projection(
+            projection(ProjectionReason::Operation { operation }),
+            &mut s,
+            5
+        ));
+        s.take_view_dirty();
+        let before = format!("{s:?}");
+        apply_msg(terminal, &mut s, 6);
+        assert_eq!(format!("{s:?}"), before);
+        assert!(!s.take_view_dirty());
+    }
+
+    #[test]
+    fn ordinary_failed_saved_result_enables_only_guarded_fresh_resend() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        for command in [
+            WorkerCommand::Prompt("p".into()),
+            WorkerCommand::PlanPrompt("p".into()),
+            WorkerCommand::ModCommand("m".into(), "c".into()),
+        ] {
+            let expected = OrdinaryIntent::from_command(&command).unwrap();
+            let (mut s, operation, registration) = active_ordinary_operation(command);
+            apply_msg(
+                crate::msg::Msg::BackendError("callback only".into()),
+                &mut s,
+                1,
+            );
+            assert!(!s.can_resend_ordinary());
+            let previous = operation.clone();
+            finish_owned_view(
+                &mut s,
+                operation,
+                registration,
+                OrdinaryEnd::Failed("failed".into()),
+                OrdinaryPublication::Saved,
+            );
+            let (sink, receiver) = std::sync::mpsc::channel();
+            assert!(receiver.try_recv().is_err());
+            assert!(failure_test_frame(&s, 110, 30, 0).contains("empty composer resends it"));
+            press_empty_enter(&mut s, &sink);
+            let WorkerCommand::Bound { operation, command } = receiver.try_recv().unwrap() else {
+                panic!("fresh ordinary resend");
+            };
+            assert_ne!(operation, previous);
+            assert_eq!(operation.source(), previous.source());
+            assert_eq!(OrdinaryIntent::from_command(&command), Some(expected));
+            assert!(receiver.try_recv().is_err());
+            assert!(s.is_busy() && !s.can_resend_ordinary());
+        }
+
+        // An eligible record cannot bypass the actual focus or modal key owner.
+        for (focus, initial_overlay) in [
+            (Focus::Workspace, None),
+            (Focus::Conversation, Some(Overlay::Help)),
+        ] {
+            let (mut s, operation, registration) =
+                active_ordinary_operation(WorkerCommand::Prompt("old intent".into()));
+            finish_owned_view(
+                &mut s,
+                operation,
+                registration,
+                OrdinaryEnd::Failed("failed".into()),
+                OrdinaryPublication::Saved,
+            );
+            assert!(s.can_resend_ordinary() && !s.is_busy());
+            let history = s.transcript.clone();
+            let report = s.turn_report.clone();
+            let totals = (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents);
+            let (sink, receiver) = std::sync::mpsc::channel();
+            let mut tui = Tui::new();
+            if focus == Focus::Workspace {
+                tui.app.focus = tui
+                    .app
+                    .tree
+                    .leaves()
+                    .iter()
+                    .position(|(_, view)| *view != super::super::layout::View::Conversation)
+                    .expect("the real layout must expose an unfocused panel");
+            }
+            tui.sync_focus();
+            assert_eq!(tui.focus, focus);
+            let mut composer = String::new();
+            let mut overlay = initial_overlay;
+            let mut queued = Vec::new();
+            press_enter_in_context(
+                &mut s,
+                &sink,
+                &mut tui,
+                &mut composer,
+                &mut overlay,
+                &mut queued,
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert!(composer.is_empty() && queued.is_empty() && !s.is_busy());
+            assert_eq!(
+                s.eligible_ordinary_intent(),
+                Some(&OrdinaryIntent::Prompt("old intent".into()))
+            );
+            assert_eq!(s.transcript, history);
+            assert_eq!(s.turn_report, report);
+            assert_eq!(
+                (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+                totals
+            );
+            if initial_overlay.is_some() {
+                assert_eq!(overlay, None, "the key closes Help and is consumed");
+            }
+        }
+
+        // A real nonempty draft uses ordinary fresh admission, never old intent.
+        let (mut s, old_operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("stale intent".into()));
+        finish_owned_view(
+            &mut s,
+            old_operation.clone(),
+            registration,
+            OrdinaryEnd::Failed("failed".into()),
+            OrdinaryPublication::Saved,
+        );
+        let (sink, receiver) = std::sync::mpsc::channel();
+        let mut tui = Tui::new();
+        let mut composer = "fresh draft".to_string();
+        tui.composer_cursor = super::super::composer::grapheme_count(&composer);
+        let mut queued = Vec::new();
+        assert_eq!(tui.focus, Focus::Conversation);
+        assert!(s.can_resend_ordinary());
+        press_enter_in_context(
+            &mut s,
+            &sink,
+            &mut tui,
+            &mut composer,
+            &mut None,
+            &mut queued,
+        );
+        let WorkerCommand::Bound { operation, command } = receiver.try_recv().unwrap() else {
+            panic!("fresh draft must be admitted");
+        };
+        assert_ne!(operation, old_operation);
+        assert_eq!(
+            OrdinaryIntent::from_command(&command),
+            Some(OrdinaryIntent::Prompt("fresh draft".into()))
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            composer.is_empty() && queued.is_empty() && s.is_busy() && !s.can_resend_ordinary()
+        );
+        assert_eq!(s.transcript.last().unwrap().kind, LineKind::User);
+        assert_eq!(s.transcript.last().unwrap().text, "fresh draft");
+        let registration = operation.start(&command).unwrap();
+        finish_owned_view(
+            &mut s,
+            operation,
+            registration,
+            OrdinaryEnd::Failed("fresh failed".into()),
+            OrdinaryPublication::Saved,
+        );
+        assert_eq!(
+            s.eligible_ordinary_intent(),
+            Some(&OrdinaryIntent::Prompt("fresh draft".into()))
+        );
+
+        // Busy control work blocks empty Enter while retaining the prior record.
+        let (mut s, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("prior failure".into()));
+        finish_owned_view(
+            &mut s,
+            operation,
+            registration,
+            OrdinaryEnd::Failed("failed".into()),
+            OrdinaryPublication::Saved,
+        );
+        let (sink, receiver) = std::sync::mpsc::channel();
+        submit_foreground(&mut s, &sink, WorkerCommand::SetModel("model".into())).unwrap();
+        let WorkerCommand::Bound { operation, command } = receiver.recv().unwrap() else {
+            panic!("actual busy control");
+        };
+        let registration = operation.start(&command).unwrap();
+        assert!(s.is_busy() && !s.ordinary_pending() && !s.can_resend_ordinary());
+        let history = s.transcript.clone();
+        let report = s.turn_report.clone();
+        let mut tui = Tui::new();
+        let mut composer = String::new();
+        let mut queued = Vec::new();
+        press_enter_in_context(
+            &mut s,
+            &sink,
+            &mut tui,
+            &mut composer,
+            &mut None,
+            &mut queued,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(composer.is_empty() && queued.is_empty());
+        assert_eq!(s.pending_foreground(), Some(&operation));
+        assert_eq!(s.transcript, history);
+        assert_eq!(s.turn_report, report);
+        drop(registration);
+        assert!(apply_session_projection(
+            projection(ProjectionReason::Operation { operation }),
+            &mut s,
+            6
+        ));
+        assert_eq!(
+            s.eligible_ordinary_intent(),
+            Some(&OrdinaryIntent::Prompt("prior failure".into()))
+        );
+
+        // Existing ordinary queue policy is unchanged: empty Enter is inert,
+        // and a nonempty busy draft is queued locally rather than dispatched.
+        let (mut s, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("active ordinary".into()));
+        s.apply("round_started", 0);
+        assert!(s.is_busy() && s.ordinary_pending() && !s.can_resend_ordinary());
+        let (sink, receiver) = std::sync::mpsc::channel();
+        let mut tui = Tui::new();
+        let mut composer = String::new();
+        let mut queued = Vec::new();
+        let history = s.transcript.clone();
+        press_enter_in_context(
+            &mut s,
+            &sink,
+            &mut tui,
+            &mut composer,
+            &mut None,
+            &mut queued,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(composer.is_empty() && queued.is_empty());
+        assert_eq!(s.transcript, history);
+        composer = "queued fresh draft".into();
+        tui.composer_cursor = super::super::composer::grapheme_count(&composer);
+        press_enter_in_context(
+            &mut s,
+            &sink,
+            &mut tui,
+            &mut composer,
+            &mut None,
+            &mut queued,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(composer.is_empty());
+        assert_eq!(queued, ["queued fresh draft".to_string()]);
+        assert_eq!(s.transcript.last().unwrap().kind, LineKind::Queued);
+        assert_eq!(s.transcript.last().unwrap().text, "queued fresh draft");
+        assert_eq!(s.pending_foreground(), Some(&operation));
+        finish_owned_view(
+            &mut s,
+            operation,
+            registration,
+            OrdinaryEnd::Completed,
+            OrdinaryPublication::Saved,
+        );
+        assert_eq!(s.transcript.last().unwrap().kind, LineKind::Queued);
+        assert_eq!(s.transcript.last().unwrap().text, "queued fresh draft");
+    }
+
+    #[test]
+    fn ordinary_completed_cancelled_and_blocked_publication_never_resend() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        for end in [
+            OrdinaryEnd::Completed,
+            OrdinaryEnd::Cancelled,
+            OrdinaryEnd::Failed("failed".into()),
+        ] {
+            for publication in [
+                OrdinaryPublication::Saved,
+                OrdinaryPublication::BlockedOrUncertain,
+            ] {
+                if matches!(&end, OrdinaryEnd::Failed(_))
+                    && publication == OrdinaryPublication::Saved
+                {
+                    continue;
+                }
+                let (mut s, operation, registration) =
+                    active_ordinary_operation(WorkerCommand::Prompt("p".into()));
+                finish_owned_view(&mut s, operation, registration, end.clone(), publication);
+                let history = s.transcript.clone();
+                let report = s.turn_report.clone();
+                let totals = (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents);
+                apply_msg(
+                    crate::msg::Msg::BackendNotice("storage warning".into()),
+                    &mut s,
+                    5,
+                );
+                let (control, received) = std::sync::mpsc::channel();
+                submit_foreground(&mut s, &control, WorkerCommand::SetModel("model".into()))
+                    .unwrap();
+                let WorkerCommand::Bound { operation, command } = received.recv().unwrap() else {
+                    panic!("settings repair");
+                };
+                let registration = operation.start(&command).unwrap();
+                drop(registration);
+                assert!(apply_session_projection(
+                    projection(ProjectionReason::Operation { operation }),
+                    &mut s,
+                    6
+                ));
+                apply_msg(
+                    crate::msg::Msg::BackendError("late diagnostic".into()),
+                    &mut s,
+                    7,
+                );
+                assert!(!s.is_busy() && !s.can_resend_ordinary());
+                let (sink, receiver) = std::sync::mpsc::channel();
+                press_empty_enter(&mut s, &sink);
+                assert!(receiver.try_recv().is_err());
+                assert_eq!(s.transcript, history);
+                assert_eq!(s.turn_report, report);
+                assert_eq!(
+                    (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+                    totals
+                );
+                assert!(!failure_test_frame(&s, 110, 30, 0).contains("empty composer resends it"));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_resend_namespace_refresh_and_control_lifecycle() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        let (mut s, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("p".into()));
+        finish_owned_view(
+            &mut s,
+            operation,
+            registration,
+            OrdinaryEnd::Failed("failed".into()),
+            OrdinaryPublication::Saved,
+        );
+        let mut refreshed = projection(ProjectionReason::Refresh);
+        assert!(apply_session_projection(refreshed.clone(), &mut s, 5));
+        assert!(s.can_resend_ordinary());
+        let (sink, receiver) = std::sync::mpsc::channel();
+        submit_foreground(&mut s, &sink, WorkerCommand::SetModel("model".into())).unwrap();
+        let WorkerCommand::Bound { operation, command } = receiver.recv().unwrap() else {
+            panic!("control");
+        };
+        let registration = operation.start(&command).unwrap();
+        drop(registration);
+        refreshed.reason = ProjectionReason::Operation { operation };
+        assert!(apply_session_projection(refreshed, &mut s, 6));
+        assert!(s.can_resend_ordinary());
+        apply_msg(
+            crate::msg::Msg::Identity {
+                model: "model".into(),
+                provider: "provider".into(),
+                session_prefix: "prefix".into(),
+                session_id: s.session_id.clone(),
+                priced: true,
+            },
+            &mut s,
+            7,
+        );
+        assert!(s.can_resend_ordinary());
+        apply_msg(
+            crate::msg::Msg::Identity {
+                model: "model".into(),
+                provider: "provider".into(),
+                session_prefix: "prefix".into(),
+                session_id: "session-next".into(),
+                priced: true,
+            },
+            &mut s,
+            8,
+        );
+        assert!(!s.can_resend_ordinary());
+        assert!(s.ordinary_end().is_none());
+        for transition in ["clear", "resume", "restore", "initial"] {
+            let (mut s, operation, registration) =
+                active_ordinary_operation(WorkerCommand::Prompt("p".into()));
+            finish_owned_view(
+                &mut s,
+                operation,
+                registration,
+                OrdinaryEnd::Failed("failed".into()),
+                OrdinaryPublication::Saved,
+            );
+            apply_msg(
+                crate::msg::Msg::BackendNotice("old notice".into()),
+                &mut s,
+                5,
+            );
+            if transition == "restore" {
+                apply_msg(
+                    crate::msg::Msg::TranscriptLoaded {
+                        lines: vec![],
+                        turns: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_microcents: 0,
+                    },
+                    &mut s,
+                    6,
+                );
+            } else if transition == "initial" {
+                apply_msg(
+                    crate::msg::Msg::Identity {
+                        model: "model".into(),
+                        provider: "provider".into(),
+                        session_prefix: "fresh".into(),
+                        session_id: "session-initial".into(),
+                        priced: true,
+                    },
+                    &mut s,
+                    6,
+                );
+                let mut initial = projection(ProjectionReason::Initial);
+                initial.binding = SessionBinding {
+                    session_id: "session-initial".into(),
+                    generation: 1,
+                };
+                initial.lines.clear();
+                initial.turns = 0;
+                assert!(apply_session_projection(initial, &mut s, 7));
+            } else {
+                let reason = if transition == "clear" {
+                    let operation = s.new_manual_operation(ManualAction::Clear).unwrap();
+                    assert!(s.admit_manual(operation.clone()));
+                    ProjectionReason::Manual {
+                        operation,
+                        outcome: ManualOutcome::Completed,
+                        applied: true,
+                    }
+                } else {
+                    ProjectionReason::Resume {
+                        previous: binding(),
+                    }
+                };
+                let mut next = projection(reason);
+                next.binding = SessionBinding {
+                    session_id: "session-next".into(),
+                    generation: 2,
+                };
+                next.lines.clear();
+                next.turns = 0;
+                assert!(apply_session_projection(next, &mut s, 7));
+            }
+            assert!(s.ordinary_end().is_none() && !s.can_resend_ordinary());
+            assert!(s.backend_notice().is_none());
+        }
+    }
+
+    #[test]
+    fn palette_customization_preserves_failed_intent_binding_notice_and_report() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        for (command, available) in [
+            ("/theme", false),
+            ("/customize", false),
+            ("/theme", true),
+            ("/customize", true),
+        ] {
+            let (mut s, operation, registration) =
+                active_ordinary_operation(WorkerCommand::Prompt("retained intent".into()));
+            finish_owned_view(
+                &mut s,
+                operation,
+                registration,
+                OrdinaryEnd::Failed("ordinary failure".into()),
+                OrdinaryPublication::Saved,
+            );
+            apply_msg(
+                crate::msg::Msg::BackendNotice("separate notice".into()),
+                &mut s,
+                5,
+            );
+            let history = s.transcript.clone();
+            let report = s.turn_report.clone();
+            let binding = s.session_binding().cloned();
+            let cost = s.cost_qualification();
+            assert!(s.can_resend_ordinary());
+            let mut tui = Tui::new();
+            if available {
+                let host = Arc::new(super::palette_review_tests::RecordingHost(
+                    std::sync::Mutex::new(Vec::new()),
+                ));
+                tui.customization =
+                    Some(crate::customization::CustomizationSession::open(host).unwrap());
+            }
+            let mut toast = None;
+            let (sink, received) = std::sync::mpsc::channel();
+            let (_bus, sender) = crate::bus::Bus::new();
+            assert!(
+                run_command(
+                    &mut tui,
+                    command,
+                    &mut s,
+                    &mut String::new(),
+                    &sink,
+                    &sender,
+                    5000,
+                    &mut toast,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut None,
+                    &mut false
+                )
+                .is_none()
+            );
+            assert_eq!(toast.as_ref().unwrap().ok, available);
+            assert_eq!(s.session_binding(), binding.as_ref());
+            assert_eq!(s.cost_qualification(), cost);
+            assert_eq!(s.transcript, history);
+            assert_eq!(s.turn_report, report);
+            assert_eq!(s.backend_notice(), Some("separate notice"));
+            assert_eq!(s.failure_reason.as_deref(), Some("ordinary failure"));
+            assert!(s.can_resend_ordinary());
+            assert!(matches!(
+                received.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            press_empty_enter(&mut s, &sink);
+            let WorkerCommand::Bound { command, .. } = received.try_recv().unwrap() else {
+                panic!("a later explicit Enter must retain the original eligible intent");
+            };
+            assert!(matches!(*command, WorkerCommand::Prompt(text) if text == "retained intent"));
+        }
+    }
+
+    #[test]
+    fn backend_notice_lifecycle_preserves_prior_failed_ordinary_and_report() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        let (mut s, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Prompt("p".into()));
+        finish_owned_view(
+            &mut s,
+            operation,
+            registration,
+            OrdinaryEnd::Failed("ordinary cause".into()),
+            OrdinaryPublication::Saved,
+        );
+        let history = s.transcript.clone();
+        let report = s.turn_report.clone();
+        for text in ["notice A", "notice B"] {
+            s.take_view_dirty();
+            apply_msg(crate::msg::Msg::BackendNotice(text.into()), &mut s, 5);
+            assert!(s.take_view_dirty());
+            assert_eq!(s.backend_notice(), Some(text));
+            assert!(s.can_resend_ordinary());
+            assert_eq!(s.failure_reason.as_deref(), Some("ordinary cause"));
+            assert_eq!(s.transcript, history);
+            assert_eq!(s.turn_report, report);
+            assert!(apply_session_projection(
+                projection(ProjectionReason::Refresh),
+                &mut s,
+                6
+            ));
+            assert_eq!(s.backend_notice(), Some(text));
+        }
+        let wrong = ForegroundOperation::new(
+            SessionBinding {
+                session_id: "other".into(),
+                generation: 1,
+            },
+            ForegroundKind::Control,
+            20,
+        )
+        .unwrap();
+        assert!(!s.admit_foreground(wrong));
+        assert_eq!(s.backend_notice(), Some("notice B"));
+        let (sink, receiver) = std::sync::mpsc::channel();
+        submit_foreground(&mut s, &sink, WorkerCommand::SetModel("model".into())).unwrap();
+        assert!(s.backend_notice().is_none());
+        assert!(receiver.try_recv().is_ok());
+        s.apply("round_started", 0);
+        assert!(s.backend_notice().is_none() && !s.can_resend_ordinary());
+        let mut empty = Scenario::new();
+        let mut initial = projection(ProjectionReason::Initial);
+        initial.lines.clear();
+        initial.turns = 0;
+        assert!(apply_session_projection(initial.clone(), &mut empty, 1));
+        apply_msg(
+            crate::msg::Msg::BackendNotice("settings unchanged 界 e\u{301}".into()),
+            &mut empty,
+            2,
+        );
+        initial.reason = ProjectionReason::Refresh;
+        assert!(apply_session_projection(initial, &mut empty, 3));
+        assert!(empty.transcript.is_empty() && empty.turn_report.is_none() && !empty.last_failed);
+        let frame = failure_test_frame(&empty, 110, 30, 0);
+        assert!(frame.contains("settings unchanged") && frame.contains("the harness that orbits"));
+        assert!(
+            !frame.contains("This turn failed") && !frame.contains("empty composer resends it")
+        );
+        let operation = empty.new_manual_operation(ManualAction::Compact).unwrap();
+        assert!(empty.admit_manual(operation));
+        assert!(empty.backend_notice().is_none());
+    }
+
+    #[test]
+    fn typed_failed_and_cancelled_first_draw_keep_reports_and_truthful_cells() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        use ratatui::{Terminal, backend::TestBackend, style::Color};
+        for end in [
+            OrdinaryEnd::Failed("useful failure 界 e\u{301}".into()),
+            OrdinaryEnd::Cancelled,
+        ] {
+            let (mut s, operation, registration) =
+                active_ordinary_operation(WorkerCommand::Prompt("p".into()));
+            s.turn_started_ms = 0;
+            s.turn_tools = 2;
+            let cancelled = matches!(&end, OrdinaryEnd::Cancelled);
+            finish_owned_view(
+                &mut s,
+                operation,
+                registration,
+                end,
+                OrdinaryPublication::Saved,
+            );
+            assert_eq!(s.turn_report.as_ref().unwrap().tools, 2);
+            let mut tui = Tui::new();
+            tui.reduced = true;
+            let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &tui, &s, "", None, "", 0, None, false, 0))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let expected = if cancelled { "cancelled" } else { "failed" };
+            let palette = super::super::shell::pal::Palette::default();
+            let rgb = if cancelled {
+                palette.amber
+            } else {
+                palette.red
+            };
+            let color = Color::Rgb(rgb.0, rgb.1, rgb.2);
+            let report = s.turn_report.as_ref().unwrap();
+            let report_text = format!(
+                "{expected} · {}s · {} tools",
+                report.duration_ms / 1000,
+                report.tools
+            );
+            let mut found_report = false;
+            let mut found = false;
+            for y in 1..30 {
+                let cells: Vec<_> = (0..110).map(|x| &buffer[(x, y)]).collect();
+                let row = cells.iter().map(|cell| cell.symbol()).collect::<String>();
+                if row.contains("2  Conversation") && row.contains(expected) {
+                    let symbols: Vec<_> = cells.iter().map(|cell| cell.symbol()).collect();
+                    let word: Vec<_> = expected.chars().map(|ch| ch.to_string()).collect();
+                    for x in 0..=symbols.len() - word.len() {
+                        if symbols[x..x + word.len()]
+                            .iter()
+                            .zip(&word)
+                            .all(|(a, b)| *a == b.as_str())
+                        {
+                            assert!(cells[x..x + word.len()].iter().all(|cell| cell.fg == color));
+                            found = true;
+                        }
+                    }
+                }
+                if row.contains(&report_text) && !row.contains("Conversation") {
+                    let symbols: Vec<_> = cells.iter().map(|cell| cell.symbol()).collect();
+                    let words: Vec<_> = report_text.chars().map(|ch| ch.to_string()).collect();
+                    for x in 0..=symbols.len() - words.len() {
+                        if symbols[x..x + words.len()]
+                            .iter()
+                            .zip(&words)
+                            .all(|(a, b)| *a == b.as_str())
+                        {
+                            assert!(
+                                cells[x..x + words.len()]
+                                    .iter()
+                                    .all(|cell| cell.fg == color),
+                                "the actual product report branch must preserve its typed accent and facts"
+                            );
+                            if cancelled {
+                                assert!(
+                                    cells
+                                        .iter()
+                                        .any(|cell| cell.symbol() == "⊘" && cell.fg == color)
+                                );
+                            }
+                            found_report = true;
+                        }
+                    }
+                }
+            }
+            assert!(found, "typed header colour not observed");
+            assert!(
+                found_report,
+                "actual typed report colour and duration/tool facts not observed"
+            );
+            let full = failure_test_frame(&s, 110, 30, 0);
+            assert!(full.contains(expected) && !full.contains("✓ done ·"));
+            let mut small = String::new();
+            for offset in 0..16 {
+                let frame = failure_test_frame(&s, 40, 11, offset);
+                assert!(frame.contains("Ask ORBIT") && frame.contains("⏎ send"));
+                small.push_str(&frame);
+            }
+            assert!(small.contains(expected) && small.contains("2 tools"));
+            if !cancelled {
+                assert!(
+                    full.contains("useful failure"),
+                    "the wide frame must preserve the failure reason:\n{full}"
+                );
+                assert!(
+                    small.contains("useful")
+                        && small.contains("failure")
+                        && small.contains("界")
+                        && small.contains("e\u{301}"),
+                    "failure details must remain readable when wrapped:\n{small}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod palette_review_tests {
+    use super::*;
+    use crate::bus::{Bus, BusSender};
+    use crate::msg::{ContextProjection, CostQualification, ProjectionReason, SessionProjection};
+    use crate::proto::shell::hits::Click;
+    use crate::worker::{ForegroundKind, SessionBinding};
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use orbit_frontend_protocol::customization::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex, mpsc},
+    };
+
+    struct Keys {
+        tui: Tui,
+        s: Scenario,
+        draft: String,
+        overlay: Option<Overlay>,
+        query: String,
+        selected: usize,
+        completion: usize,
+        toast: Option<Toast>,
+        queued: Vec<String>,
+        history: Vec<String>,
+        history_index: Option<usize>,
+        leader: Option<char>,
+        copy: bool,
+        sessions: bool,
+        sink: CommandSink,
+        received: mpsc::Receiver<WorkerCommand>,
+        _bus: Bus,
+        sender: BusSender,
+        approvals: ApprovalRegistry,
+        drawn: Option<PaletteFrame>,
+    }
+    impl Keys {
+        fn new(query: &str) -> Self {
+            let (sink, received) = mpsc::channel();
+            let (bus, sender) = Bus::new();
+            let mut tui = Tui::new();
+            tui.reduced = true;
+            tui.tick_ms = 5000;
+            Self {
+                tui,
+                s: Scenario::new(),
+                draft: String::new(),
+                overlay: Some(Overlay::Palette),
+                query: query.into(),
+                selected: 0,
+                completion: 0,
+                toast: None,
+                queued: Vec::new(),
+                history: Vec::new(),
+                history_index: None,
+                leader: None,
+                copy: false,
+                sessions: false,
+                sink,
+                received,
+                _bus: bus,
+                sender,
+                approvals: ApprovalRegistry::new(),
+                drawn: None,
+            }
+        }
+        fn bind(&mut self) {
+            assert!(apply_session_projection(
+                SessionProjection {
+                    binding: SessionBinding {
+                        session_id: "palette-source".into(),
+                        generation: 1
+                    },
+                    model: "fixture".into(),
+                    provider: "fixture".into(),
+                    priced: false,
+                    lines: Vec::new(),
+                    turns: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microcents: 0,
+                    cost: CostQualification::Known { revision: 0 },
+                    context: ContextProjection::Unavailable,
+                    reason: ProjectionReason::Initial,
+                },
+                &mut self.s,
+                1
+            ));
+        }
+        fn press(&mut self, code: KeyCode) {
+            let key = crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+            if handle_custom_key(
+                key,
+                &mut self.tui,
+                &mut self.s,
+                &mut self.draft,
+                None,
+                &mut self.toast,
+                5000,
+                self.overlay.is_some(),
+            ) {
+                return;
+            }
+            assert!(!handle_key(
+                key,
+                &mut self.tui,
+                &mut self.s,
+                &mut self.draft,
+                None,
+                &self.sink,
+                &self.sender,
+                &self.approvals,
+                5000,
+                &mut self.overlay,
+                &mut self.query,
+                &mut self.selected,
+                &mut self.completion,
+                &mut self.toast,
+                &mut self.queued,
+                &mut self.history,
+                &mut self.history_index,
+                &mut self.leader,
+                &mut self.copy,
+                &mut self.sessions
+            ));
+        }
+        fn frame(&mut self, width: u16, height: u16) -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut hits = Vec::new();
+            terminal
+                .draw(|f| {
+                    hits = draw_with_hits(
+                        f,
+                        &self.tui,
+                        &self.s,
+                        &self.draft,
+                        self.overlay,
+                        &self.query,
+                        self.selected,
+                        self.toast.as_ref(),
+                        false,
+                        0,
+                    );
+                })
+                .unwrap();
+            self.drawn = capture_palette_frame(&self.s, self.overlay, &self.query, &hits);
+            self.tui.hits = hits;
+            let buffer = terminal.backend().buffer();
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        }
+        fn click(&mut self, command: &str, width: u16, height: u16) -> Option<PaletteClick> {
+            let index = self
+                .drawn
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .find(|(_, text)| *text == command)
+                .unwrap()
+                .0;
+            let rect = self
+                .tui
+                .hits
+                .iter()
+                .find(|hit| hit.click == Click::Palette(index))
+                .unwrap()
+                .rect;
+            let outcome = handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x + 1,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut self.tui,
+                Rect::new(0, 0, width, height),
+                None,
+                true,
+            );
+            let MouseOutcome::Palette(index) = outcome else {
+                panic!("the actual drawn command row must be clickable");
+            };
+            capture_palette_click(
+                &self.s,
+                self.overlay,
+                &self.query,
+                self.drawn.as_ref(),
+                index,
+            )
+        }
+        fn activate(&mut self, click: PaletteClick) -> bool {
+            let key = palette_click_key(
+                click,
+                &self.s,
+                self.overlay,
+                &self.query,
+                &mut self.selected,
+            );
+            if let Some(key) = key {
+                self.press(key.code);
+                true
+            } else {
+                false
+            }
+        }
+        fn no_worker_command(&self) {
+            assert!(matches!(
+                self.received.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn palette_keyboard_runs_the_drawn_subsequence_command() {
+        for query in ["me", "md", "/ME"] {
+            let mut keys = Keys::new(query);
+            let rows = keys.frame(110, 30);
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("▌") && row.contains("/mode"))
+            );
+            keys.press(KeyCode::Enter);
+            assert!(
+                keys.s
+                    .transcript
+                    .iter()
+                    .any(|line| line.text.starts_with("mode: default"))
+            );
+            assert!(
+                !keys
+                    .s
+                    .transcript
+                    .iter()
+                    .any(|line| line.text.contains("usage: /resume"))
+            );
+            assert_eq!(keys.overlay, None);
+            keys.no_worker_command();
+        }
+    }
+
+    #[test]
+    fn palette_mouse_runs_the_actual_drawn_row() {
+        for (width, height) in [(110, 30), (40, 11)] {
+            let mut keys = Keys::new("me");
+            let rows = keys.frame(width, height);
+            let index = keys
+                .drawn
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .find(|(_, command)| *command == "/model")
+                .unwrap()
+                .0;
+            let hit = keys
+                .tui
+                .hits
+                .iter()
+                .find(|hit| hit.click == Click::Palette(index))
+                .unwrap();
+            assert!(rows[hit.rect.y as usize].contains("/model"));
+            assert!(!rows[hit.rect.y as usize].contains("/models"));
+            let click = keys.click("/model", width, height).unwrap();
+            assert!(keys.activate(click));
+            assert!(
+                keys.s
+                    .transcript
+                    .iter()
+                    .any(|line| line.text == "usage: /model <model-id>")
+            );
+            keys.no_worker_command();
+        }
+    }
+
+    #[test]
+    fn palette_keeps_the_selected_row_visible_with_global_hit_indices() {
+        for (width, height) in [(110, 30), (40, 11)] {
+            let mut keys = Keys::new("");
+            for _ in 0..8 {
+                keys.press(KeyCode::Down);
+            }
+            let rows = keys.frame(width, height);
+            let hit = keys
+                .tui
+                .hits
+                .iter()
+                .find(|hit| hit.click == Click::Palette(8))
+                .unwrap();
+            assert!(
+                rows[hit.rect.y as usize].contains("▌")
+                    && rows[hit.rect.y as usize].contains("/resume")
+            );
+            for _ in 0..50 {
+                keys.press(KeyCode::Down);
+            }
+            assert_eq!(keys.selected, 15);
+            let rows = keys.frame(width, height);
+            let hit = keys
+                .tui
+                .hits
+                .iter()
+                .find(|hit| hit.click == Click::Palette(15))
+                .unwrap();
+            assert!(
+                rows[hit.rect.y as usize].contains("▌")
+                    && rows[hit.rect.y as usize].contains("/theme")
+            );
+            assert!(
+                keys.tui
+                    .hits
+                    .iter()
+                    .filter(|hit| matches!(hit.click, Click::Palette(_)))
+                    .all(|hit| hit.rect.bottom() <= height)
+            );
+            for _ in 0..50 {
+                keys.press(KeyCode::Up);
+            }
+            assert_eq!(keys.selected, 0);
+            let rows = keys.frame(width, height);
+            let hit = keys
+                .tui
+                .hits
+                .iter()
+                .find(|hit| hit.click == Click::Palette(0))
+                .unwrap();
+            assert!(
+                rows[hit.rect.y as usize].contains("▌")
+                    && rows[hit.rect.y as usize].contains("/clear")
+            );
+            keys.no_worker_command();
+        }
+    }
+
+    #[test]
+    fn palette_rejects_a_last_frame_click_after_query_input_before_redraw() {
+        let mut keys = Keys::new("");
+        keys.bind();
+        keys.draft = "keep local draft".into();
+        keys.frame(110, 30);
+        keys.press(KeyCode::Char('m'));
+        assert_eq!(keys.query, "m");
+        // The old drawn row is /clear, while row zero of the new filter is
+        // /compact. Both are real controls: a stale index must run neither.
+        assert!(keys.click("/clear", 110, 30).is_none());
+        assert_eq!(keys.draft, "keep local draft");
+        assert_eq!(keys.overlay, Some(Overlay::Palette));
+        keys.no_worker_command();
+    }
+
+    #[test]
+    fn deferred_palette_click_cannot_reach_a_closed_overlay_or_changed_namespace() {
+        for changed_namespace in [false, true] {
+            let mut keys = Keys::new("me");
+            keys.bind();
+            keys.draft = "keep local draft".into();
+            keys.frame(110, 30);
+            let click = keys.click("/model", 110, 30).unwrap();
+            if changed_namespace {
+                apply_msg(
+                    crate::msg::Msg::Identity {
+                        model: "fixture".into(),
+                        provider: "fixture".into(),
+                        session_prefix: "different".into(),
+                        session_id: "different-session".into(),
+                        priced: false,
+                    },
+                    &mut keys.s,
+                    5001,
+                );
+            } else {
+                keys.overlay = None;
+            }
+            assert!(!keys.activate(click));
+            assert_eq!(keys.draft, "keep local draft");
+            keys.no_worker_command();
+        }
+    }
+
+    #[test]
+    fn palette_empty_result_does_not_activate_or_send_the_local_draft() {
+        let mut keys = Keys::new("zzzz");
+        keys.draft = "unsent".into();
+        keys.press(KeyCode::Down);
+        keys.press(KeyCode::Up);
+        assert_eq!(keys.selected, 0);
+        let rows = keys.frame(40, 11);
+        assert!(rows.join("\n").contains("no matching command"));
+        assert!(keys.drawn.as_ref().unwrap().rows.is_empty());
+        keys.press(KeyCode::Enter);
+        assert_eq!(keys.draft, "unsent");
+        assert_eq!(keys.overlay, Some(Overlay::Palette));
+        keys.no_worker_command();
+    }
+
+    pub(super) struct RecordingHost(pub(super) Mutex<Vec<ProfileCommand>>);
+    impl ProfileHost for RecordingHost {
+        fn load(&self) -> Result<ResolvedProfile, CustomizationError> {
+            Ok(ResolvedProfile {
+                profile: Profile::default(),
+                sources: BTreeMap::new(),
+                revision: "palette-fixture".into(),
+                capabilities: CustomizationCapabilities::default(),
+            })
+        }
+        fn command(
+            &self,
+            command: ProfileCommand,
+        ) -> Result<ProfileCommandResult, CustomizationError> {
+            self.0.lock().unwrap().push(command);
+            Ok(ProfileCommandResult {
+                message: "actual customization consumer".into(),
+                profile: None,
+            })
+        }
+        fn replace(&self, _: Profile, _: &str) -> Result<ResolvedProfile, CustomizationError> {
+            Err(CustomizationError::Busy)
+        }
+        fn reset(&self, _: &str) -> Result<ResolvedProfile, CustomizationError> {
+            Err(CustomizationError::Busy)
+        }
+        fn read_pane(&self, _: &str, _: &PaneContext) -> Result<PaneOutput, CustomizationError> {
+            Err(CustomizationError::Busy)
+        }
+    }
+
+    #[test]
+    fn palette_and_typed_customization_reach_the_same_real_consumer_and_toast() {
+        for (query, command) in [("th", "/theme"), ("cust", "/customize")] {
+            for busy in [false, true] {
+                let source = Arc::new(RecordingHost(Mutex::new(Vec::new())));
+                for route in ["palette-key", "palette-click", "typed"] {
+                    let mut keys = Keys::new(query);
+                    keys.bind();
+                    keys.tui.customization = Some(
+                        crate::customization::CustomizationSession::open(source.clone()).unwrap(),
+                    );
+                    if busy {
+                        let operation = keys
+                            .s
+                            .new_foreground_operation(ForegroundKind::Control)
+                            .unwrap();
+                        assert!(keys.s.admit_foreground(operation));
+                    }
+                    let owner = keys.s.pending_foreground().cloned();
+                    if route == "typed" {
+                        keys.overlay = None;
+                        keys.draft = command.into();
+                    }
+                    if route == "palette-click" {
+                        keys.frame(110, 30);
+                        let click = keys.click(command, 110, 30).unwrap();
+                        assert!(keys.activate(click));
+                    } else {
+                        keys.press(KeyCode::Enter);
+                    }
+                    let toast = keys.toast.as_ref().unwrap();
+                    assert!(toast.ok);
+                    assert_eq!(toast.text, "actual customization consumer");
+                    assert_eq!(keys.s.pending_foreground(), owner.as_ref());
+                    keys.no_worker_command();
+                }
+                assert_eq!(
+                    *source.0.lock().unwrap(),
+                    [
+                        ProfileCommand::Show,
+                        ProfileCommand::Show,
+                        ProfileCommand::Show
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn palette_customization_without_a_host_returns_the_real_error_toast() {
+        for query in ["th", "cust"] {
+            let mut keys = Keys::new(query);
+            keys.press(KeyCode::Enter);
+            let toast = keys.toast.as_ref().unwrap();
+            assert!(!toast.ok);
+            assert_eq!(
+                toast.text,
+                "invalid customization: customization host unavailable"
+            );
+            keys.no_worker_command();
+        }
     }
 }

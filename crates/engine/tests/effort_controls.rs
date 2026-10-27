@@ -3,6 +3,7 @@ use orbit_engine::{ProviderKind, TurnConfig};
 
 fn config() -> TurnConfig {
     TurnConfig {
+        billing: None,
         provider_id: "fixture".into(),
         gate: "http://127.0.0.1:1".into(),
         model: "fixture-model".into(),

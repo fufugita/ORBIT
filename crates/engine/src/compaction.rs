@@ -1288,6 +1288,156 @@ pub(crate) struct CompactionContexts<'a> {
     pub(crate) remaining_attempts: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpendEstimateQuoteV1 {
+    estimated_microdollars: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpendEstimateError {
+    Incomplete(&'static str),
+    ContractMismatch,
+    ArithmeticOverflow,
+}
+
+impl SpendEstimateError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Incomplete(message) => message,
+            Self::ContractMismatch => "billing contract does not match the selected provider/model",
+            Self::ArithmeticOverflow => "spend estimate arithmetic overflow",
+        }
+    }
+}
+
+fn estimate_spend_quote(
+    config: &crate::TurnConfig,
+    estimate: &RequestEstimate,
+) -> Result<SpendEstimateQuoteV1, SpendEstimateError> {
+    use orbit_adapter::types::{
+        PricingDeclarationState, ReasoningCounterBasis, ReasoningRatePolicy,
+    };
+    let contract = config
+        .billing
+        .as_ref()
+        .ok_or(SpendEstimateError::Incomplete(
+            "spend allowance requires an explicit v2 billing contract",
+        ))?;
+    if contract.provider_id().0.as_str() != config.provider_id
+        || contract.raw_model_id().0.as_str() != config.model
+    {
+        return Err(SpendEstimateError::ContractMismatch);
+    }
+    if contract.declaration() != PricingDeclarationState::DeclaredV2 {
+        return Err(SpendEstimateError::Incomplete(
+            "spend allowance requires explicit v2 prices and reasoning terms",
+        ));
+    }
+    let rates = contract.rates();
+    let input_rate = rates
+        .input_per_million_microdollars
+        .ok_or(SpendEstimateError::Incomplete(
+            "spend allowance requires an explicit input rate",
+        ))?;
+    let output_rate =
+        rates
+            .output_per_million_microdollars
+            .ok_or(SpendEstimateError::Incomplete(
+                "spend allowance requires an explicit output rate",
+            ))?;
+    let flat = rates
+        .request_flat_microdollars
+        .ok_or(SpendEstimateError::Incomplete(
+            "spend allowance requires an explicit request-flat rate",
+        ))?;
+    let cache_read_rate =
+        rates
+            .cache_read_per_million_microdollars
+            .ok_or(SpendEstimateError::Incomplete(
+                "spend allowance requires an explicit cache-read rate",
+            ))?;
+    let cache_write_rate =
+        rates
+            .cache_write_per_million_microdollars
+            .ok_or(SpendEstimateError::Incomplete(
+                "spend allowance requires an explicit cache-write rate",
+            ))?;
+    let input_ceiling_rate = input_rate.max(cache_read_rate).max(cache_write_rate);
+
+    if contract.reasoning_counter_basis() == ReasoningCounterBasis::Unknown
+        || contract.reasoning_rate_policy() == ReasoningRatePolicy::Unknown
+    {
+        return Err(SpendEstimateError::Incomplete(
+            "spend allowance requires an explicit reasoning-token basis and rate policy",
+        ));
+    }
+    let reasoning_rate = match contract.reasoning_rate_policy() {
+        ReasoningRatePolicy::OutputRate => None,
+        ReasoningRatePolicy::DedicatedRate => Some(
+            rates
+                .reasoning_per_million_microdollars
+                .ok_or(SpendEstimateError::Incomplete(
+                    "spend allowance requires an explicit dedicated reasoning rate",
+                ))?,
+        ),
+        ReasoningRatePolicy::Unknown => unreachable!("unknown policy rejected above"),
+    };
+    let reasoning_bound = match contract.reasoning_counter_basis() {
+        ReasoningCounterBasis::IncludedInOutput => None,
+        ReasoningCounterBasis::SeparateFromOutput => Some(contract.max_reasoning_tokens().ok_or(
+            SpendEstimateError::Incomplete(
+                "spend allowance requires max_reasoning_tokens when reasoning is separate",
+            ),
+        )?),
+        ReasoningCounterBasis::Unknown => unreachable!("unknown basis rejected above"),
+    };
+
+    fn ceil_cost(tokens: u64, rate: u64) -> Option<u128> {
+        let product = u128::from(tokens).checked_mul(u128::from(rate))?;
+        let quotient = product / 1_000_000;
+        quotient.checked_add(u128::from(product % 1_000_000 != 0))
+    }
+
+    let input_cost = ceil_cost(estimate.estimated_input_tokens, input_ceiling_rate)
+        .ok_or(SpendEstimateError::ArithmeticOverflow)?;
+    let output_cost = match (
+        contract.reasoning_counter_basis(),
+        reasoning_rate,
+        reasoning_bound,
+    ) {
+        (ReasoningCounterBasis::IncludedInOutput, None, None) => {
+            ceil_cost(estimate.requested_output_tokens, output_rate)
+        }
+        (ReasoningCounterBasis::IncludedInOutput, Some(reasoning_rate), None) => ceil_cost(
+            estimate.requested_output_tokens,
+            output_rate.max(reasoning_rate),
+        ),
+        (ReasoningCounterBasis::SeparateFromOutput, None, Some(reasoning_bound)) => {
+            let combined = estimate
+                .requested_output_tokens
+                .checked_add(reasoning_bound)
+                .ok_or(SpendEstimateError::ArithmeticOverflow)?;
+            ceil_cost(combined, output_rate)
+        }
+        (
+            ReasoningCounterBasis::SeparateFromOutput,
+            Some(reasoning_rate),
+            Some(reasoning_bound),
+        ) => ceil_cost(estimate.requested_output_tokens, output_rate)
+            .and_then(|output| ceil_cost(reasoning_bound, reasoning_rate)?.checked_add(output)),
+        _ => None,
+    }
+    .ok_or(SpendEstimateError::ArithmeticOverflow)?;
+    let total = input_cost
+        .checked_add(output_cost)
+        .and_then(|value| value.checked_add(u128::from(flat)))
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(SpendEstimateError::ArithmeticOverflow)?;
+    Ok(SpendEstimateQuoteV1 {
+        estimated_microdollars: total,
+    })
+}
+
 /// Spend admission uses the same prepared request estimate and selected output.
 /// It is a conservative pricing policy over an approximate token estimate, not
 /// a provider-enforced monetary reservation or a global/shared child allowance.
@@ -1305,6 +1455,12 @@ pub(crate) fn admit_spend(
         .remaining_microcents
         .checked_sub(spent)
         .ok_or("spend allowance exhausted before another provider request")?;
+    if config.billing.as_ref().is_some_and(|contract| {
+        contract.provider_id().0.as_str() != config.provider_id
+            || contract.raw_model_id().0.as_str() != config.model
+    }) {
+        return Err(SpendEstimateError::ContractMismatch.message());
+    }
     if estimate.status == crate::context_budget::EstimateStatus::UnknownMedia {
         return if housekeeping && allowance.allow_unpriced_housekeeping {
             Ok(())
@@ -1312,21 +1468,15 @@ pub(crate) fn admit_spend(
             Err("spend allowance cannot price unknown media or opaque request content")
         };
     }
-    let usage = orbit_adapter::types::ProviderUsage {
-        input_tokens: estimate.estimated_input_tokens,
-        output_tokens: estimate.requested_output_tokens,
-        cache_read_tokens: estimate.estimated_input_tokens,
-        cache_write_tokens: estimate.estimated_input_tokens,
-        reasoning_tokens: estimate.requested_output_tokens,
-    };
-    match config
-        .pricing
-        .and_then(|rates| rates.cost_microcents(&usage))
-    {
-        Some(cost) if cost <= remaining => Ok(()),
-        Some(_) => Err("spend allowance cannot cover the prepared request estimate"),
-        None if housekeeping && allowance.allow_unpriced_housekeeping => Ok(()),
-        None => Err("spend allowance requires complete selected request pricing"),
+    match estimate_spend_quote(config, estimate) {
+        Ok(quote) if quote.estimated_microdollars <= remaining => Ok(()),
+        Ok(_) => Err("spend allowance cannot cover the prepared request estimate"),
+        Err(SpendEstimateError::Incomplete(_))
+            if housekeeping && allowance.allow_unpriced_housekeeping =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.message()),
     }
 }
 
@@ -1367,6 +1517,7 @@ pub(crate) fn qualified(checkpoint: &DetailedAccountingCheckpoint, session: &str
 
 #[derive(Default)]
 pub(crate) struct MetadataAccounting {
+    usage_observation: std::cell::RefCell<orbit_adapter::stream::UsageObservationAccumulatorV1>,
     next: u64,
     invalid: bool,
     terminal: bool,
@@ -1402,8 +1553,10 @@ fn monotonic(
 impl MetadataAccounting {
     pub(crate) fn observe(&mut self, event: &orbit_adapter::types::ProviderStreamEvent) {
         use orbit_adapter::types::ProviderEventKind;
+        let _ = self.usage_observation.get_mut().observe(event);
         if self.terminal {
             self.invalid = true;
+            self.usage_observation.get_mut().invalidate();
             return;
         }
         if event.sequence != self.next {
@@ -1460,6 +1613,30 @@ impl MetadataAccounting {
             | ProviderEventKind::ThinkingDelta { .. }
             | ProviderEventKind::ThinkingSignatureDelta { .. } => {}
         }
+        if self.invalid {
+            self.usage_observation.get_mut().invalidate();
+        }
+    }
+    pub(crate) fn revoke_usage_observation(&self) {
+        self.usage_observation.borrow_mut().invalidate();
+    }
+    #[cfg(test)]
+    pub(crate) fn provisional_usage_observation(
+        &self,
+    ) -> orbit_adapter::stream::ProvisionalUsageObservationV1 {
+        self.usage_observation.borrow().provisional()
+    }
+    fn validated_terminal_billing_usage(
+        &self,
+    ) -> Option<orbit_adapter::types::BillingObservedUsageV1> {
+        if !self.admitted || !self.terminal || self.invalid {
+            return None;
+        }
+        let observed = self
+            .usage_observation
+            .borrow()
+            .validated_terminal_billing_usage()?;
+        (self.final_usage == Some(observed.raw_usage)).then_some(observed)
     }
     fn receipt(
         &self,
@@ -1468,6 +1645,9 @@ impl MetadataAccounting {
         config: &crate::TurnConfig,
         outcome: &Result<crate::TurnOutcome, crate::dispatch::DispatchFailure>,
     ) -> RequestAccountingReceipt {
+        if outcome.is_err() || self.invalid {
+            self.revoke_usage_observation();
+        }
         let valid = self.admitted && self.terminal && !self.invalid;
         let completed = valid
             && self.positive
@@ -1479,22 +1659,31 @@ impl MetadataAccounting {
                         Some("stop" | "end_turn" | "stop_sequence")
                     )
             });
-        let knownness = if valid && !self.cancelled && self.final_usage.is_some() {
+        let observed = self.validated_terminal_billing_usage();
+        let mut knownness = if observed.is_some() {
             AccountingKnownness::Known
         } else if completed {
             AccountingKnownness::UnknownUsage
         } else {
             AccountingKnownness::Uncertain
         };
-        let usage = self.final_usage.or(self.prior);
-        let totals = if knownness == AccountingKnownness::Known {
-            let usage = self.final_usage.unwrap_or_default();
+        let usage = observed.map(|value| value.raw_usage);
+        let mut totals = if let Some(observed) = observed {
+            let cost_microcents = config
+                .billing
+                .as_ref()
+                .filter(|contract| {
+                    contract.provider_id().0.as_str() == config.provider_id
+                        && contract.raw_model_id().0.as_str() == config.model
+                })
+                .and_then(|contract| {
+                    orbit_adapter::types::quote_observed_billing(contract, &observed)
+                        .full_total_microdollars
+                });
             AccountingTotals {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cost_microcents: config
-                    .pricing
-                    .and_then(|rates| rates.cost_microcents(&usage)),
+                input_tokens: observed.raw_usage.input_tokens,
+                output_tokens: observed.raw_usage.output_tokens,
+                cost_microcents,
             }
         } else {
             AccountingTotals {
@@ -1503,13 +1692,33 @@ impl MetadataAccounting {
                 cost_microcents: None,
             }
         };
+        let reconciled = if let Some(observed) = observed {
+            outcome.as_ref().is_ok_and(|turn| {
+                turn.input_tokens == observed.raw_usage.input_tokens
+                    && turn.output_tokens == observed.raw_usage.output_tokens
+                    && totals
+                        .cost_microcents
+                        .is_none_or(|cost| turn.cost_microcents == cost)
+            })
+        } else {
+            true
+        };
+        if !reconciled {
+            self.revoke_usage_observation();
+            knownness = AccountingKnownness::Uncertain;
+            totals = AccountingTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: None,
+            };
+        }
         RequestAccountingReceipt {
             request_id: id,
             purpose,
             totals,
-            usage,
+            usage: if reconciled { usage } else { None },
             knownness,
-            completed,
+            completed: completed && reconciled,
         }
     }
     pub(crate) fn ordinary_receipt(
@@ -1520,15 +1729,19 @@ impl MetadataAccounting {
         lifecycle_valid: bool,
     ) -> RequestAccountingReceipt {
         let mut receipt = self.receipt(id, AttemptPurpose::Ordinary, config, outcome);
-        let reconciled = outcome.as_ref().is_ok_and(|o| {
-            receipt.knownness != AccountingKnownness::Known
-                || (o.input_tokens == receipt.totals.input_tokens
-                    && o.output_tokens == receipt.totals.output_tokens
-                    && receipt
-                        .totals
-                        .cost_microcents
-                        .is_none_or(|cost| o.cost_microcents == cost))
-        });
+        let reconciled = receipt.knownness != AccountingKnownness::Uncertain
+            && outcome.as_ref().is_ok_and(|o| {
+                receipt.knownness != AccountingKnownness::Known
+                    || (o.input_tokens == receipt.totals.input_tokens
+                        && o.output_tokens == receipt.totals.output_tokens
+                        && receipt
+                            .totals
+                            .cost_microcents
+                            .is_none_or(|cost| o.cost_microcents == cost))
+            });
+        if !lifecycle_valid || !reconciled {
+            self.revoke_usage_observation();
+        }
         receipt.completed = self.admitted
             && self.terminal
             && !self.invalid
@@ -1541,13 +1754,14 @@ impl MetadataAccounting {
                         && !o.tool_calls.is_empty()
                         && matches!(o.finish_reason.as_deref(), Some("tool_calls" | "tool_use")))
             });
-        if outcome.is_ok() && !reconciled {
+        if !lifecycle_valid || (outcome.is_ok() && !reconciled) {
             receipt.knownness = AccountingKnownness::Uncertain;
             receipt.totals = AccountingTotals {
                 input_tokens: 0,
                 output_tokens: 0,
                 cost_microcents: None,
             };
+            receipt.usage = None;
         } else if receipt.completed && receipt.knownness == AccountingKnownness::Uncertain {
             receipt.knownness = AccountingKnownness::UnknownUsage;
         }
@@ -1567,6 +1781,9 @@ struct SummaryRunner<'a> {
     accounting: AccountingDelta,
     attempts: Vec<RequestAccountingReceipt>,
     receipt_limit: usize,
+    #[cfg(test)]
+    usage_observation_probe:
+        Option<Box<dyn FnMut(orbit_adapter::stream::ProvisionalUsageObservationV1)>>,
 }
 impl SummaryRunner<'_> {
     fn finish(
@@ -1770,6 +1987,13 @@ impl SummaryRunner<'_> {
             &self.options.session_id,
         );
         let receipt = metadata.receipt(intent.request_id.clone(), purpose, self.config, &result);
+        #[cfg(test)]
+        {
+            let snapshot = metadata.provisional_usage_observation();
+            if let Some(probe) = self.usage_observation_probe.as_deref_mut() {
+                probe(snapshot);
+            }
+        }
         let usable = receipt.completed;
         let uncertain = receipt.knownness == AccountingKnownness::Uncertain;
         self.settle(&reference, &intent, receipt)?;
@@ -1877,6 +2101,8 @@ pub(crate) fn compact_with_contexts(
         receipt_limit: contexts
             .remaining_attempts
             .min(crate::turn::MAX_TURN_ACCOUNTING_ATTEMPTS),
+        #[cfg(test)]
+        usage_observation_probe: None,
     };
     let operation_id = format!("compact-{}", ulid::Ulid::new());
     let mut parts = Vec::new();
@@ -2121,6 +2347,7 @@ mod tests {
             model: "same/raw-model".into(),
             kind,
             credential_env: None,
+            billing: None,
             pricing: None,
             max_output_tokens: 37,
             sampling: None,
@@ -3042,12 +3269,23 @@ mod accounting_tests {
     use orbit_adapter::types::{CostRates, ProviderEventKind, ProviderStreamEvent, ProviderUsage};
 
     fn config(pricing: Option<CostRates>) -> crate::TurnConfig {
+        let billing = pricing.map(|rates| {
+            test_billing_contract(
+                "summary-fixture",
+                "summary-fixture",
+                rates,
+                orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput,
+                orbit_adapter::types::ReasoningRatePolicy::DedicatedRate,
+                Some(100),
+            )
+        });
         crate::TurnConfig {
             provider_id: "summary-fixture".into(),
             gate: "http://127.0.0.1:1".into(),
             model: "summary-fixture".into(),
             kind: crate::ProviderKind::OpenAiCompatible,
             credential_env: None,
+            billing,
             pricing,
             max_output_tokens: 32,
             sampling: None,
@@ -3055,6 +3293,54 @@ mod accounting_tests {
             supported_efforts: None,
             first_byte_timeout_ms: None,
             idle_timeout_ms: None,
+        }
+    }
+    fn test_billing_contract(
+        provider: &str,
+        model: &str,
+        rates: CostRates,
+        basis: orbit_adapter::types::ReasoningCounterBasis,
+        policy: orbit_adapter::types::ReasoningRatePolicy,
+        max_reasoning_tokens: Option<u64>,
+    ) -> orbit_adapter::types::BillingQuoteContractV1 {
+        use orbit_adapter::types::{
+            BillingQuoteContractV1, BillingRatesV1, ModelId, PricingDeclarationState, ProviderId,
+        };
+        BillingQuoteContractV1::try_new_with_reasoning_bound(
+            ProviderId(provider.into()),
+            ModelId(model.into()),
+            PricingDeclarationState::DeclaredV2,
+            BillingRatesV1 {
+                input_per_million_microdollars: Some(rates.input_per_million_microcents),
+                output_per_million_microdollars: Some(rates.output_per_million_microcents),
+                cache_read_per_million_microdollars: rates.cache_read_per_million_microcents,
+                cache_write_per_million_microdollars: rates.cache_write_per_million_microcents,
+                reasoning_per_million_microdollars: rates.reasoning_per_million_microcents,
+                request_flat_microdollars: Some(rates.request_flat_microcents),
+            },
+            basis,
+            policy,
+            max_reasoning_tokens,
+        )
+        .unwrap()
+    }
+    fn estimate(input_tokens: u64, output_tokens: u64) -> RequestEstimate {
+        RequestEstimate {
+            body_bytes: 0,
+            text_bytes: 0,
+            system_bytes: 0,
+            tools_bytes: 0,
+            messages_bytes: 0,
+            framing_bytes: 0,
+            raw_system_bytes: 0,
+            raw_tools_bytes: 0,
+            raw_messages_bytes: 0,
+            raw_framing_bytes: 0,
+            estimated_input_tokens: input_tokens,
+            requested_output_tokens: output_tokens,
+            body_digest: String::new(),
+            binding_digest: String::new(),
+            status: crate::context_budget::EstimateStatus::Approximate,
         }
     }
     fn usage() -> ProviderUsage {
@@ -3078,9 +3364,25 @@ mod accounting_tests {
         }
     }
     fn observed(events: Vec<ProviderEventKind>) -> MetadataAccounting {
+        use orbit_adapter::types::{
+            UsageObservationMetaV1, UsageReasoningReportingV1, UsageSnapshotOriginV1,
+        };
         let mut metadata = MetadataAccounting::default();
         for (sequence, event) in events.into_iter().enumerate() {
+            let has_usage = matches!(
+                &event,
+                ProviderEventKind::UsageUpdate(_)
+                    | ProviderEventKind::Finished {
+                        final_usage: Some(_),
+                        ..
+                    }
+            );
             metadata.observe(&ProviderStreamEvent {
+                usage_observation: has_usage.then_some(UsageObservationMetaV1 {
+                    version: 1,
+                    reasoning_reporting: UsageReasoningReportingV1::Reported,
+                    snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+                }),
                 sequence: sequence as u64,
                 event,
             });
@@ -3088,9 +3390,33 @@ mod accounting_tests {
         metadata
     }
     fn result(reason: &str) -> Result<crate::TurnOutcome, crate::dispatch::DispatchFailure> {
+        result_for_usage(reason, usage())
+    }
+    fn result_for_usage(
+        reason: &str,
+        raw_usage: ProviderUsage,
+    ) -> Result<crate::TurnOutcome, crate::dispatch::DispatchFailure> {
+        let contract = test_billing_contract(
+            "summary-fixture",
+            "summary-fixture",
+            rates(),
+            orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput,
+            orbit_adapter::types::ReasoningRatePolicy::DedicatedRate,
+            Some(100),
+        );
+        let observed = orbit_adapter::types::BillingObservedUsageV1 {
+            raw_usage,
+            reasoning_reporting: orbit_adapter::types::ReasoningReporting::Reported,
+        };
+        let cost_microcents = orbit_adapter::types::quote_observed_billing(&contract, &observed)
+            .full_total_microdollars
+            .unwrap_or(0);
         Ok(crate::TurnOutcome {
             output: "usable continuation".into(),
             finish_reason: Some(reason.into()),
+            input_tokens: raw_usage.input_tokens,
+            output_tokens: raw_usage.output_tokens,
+            cost_microcents,
             ..Default::default()
         })
     }
@@ -3105,6 +3431,151 @@ mod accounting_tests {
             &config(pricing),
             &result(reason),
         )
+    }
+
+    #[test]
+    fn late_error_revokes_terminal_usage_before_receipt_billing() {
+        let raw = usage();
+        let mut metadata = observed(vec![started(), finished("stop", Some(raw))]);
+        let before = metadata.provisional_usage_observation();
+        assert!(!before.is_invalid());
+        let config = config(Some(rates()));
+        let outcome = Err(("E0410", "after-terminal transport sentinel".into()));
+        let receipt = metadata.receipt(
+            "late-error".into(),
+            AttemptPurpose::Chunk,
+            &config,
+            &outcome,
+        );
+        assert_eq!(receipt.knownness, AccountingKnownness::Uncertain);
+        assert_eq!(receipt.usage, None);
+        assert!(!receipt.completed);
+        assert_eq!(
+            receipt.totals,
+            AccountingTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: None,
+            }
+        );
+        let after = metadata.provisional_usage_observation();
+        assert!(after.is_invalid());
+        assert_eq!(after.selected(), before.selected());
+        assert_eq!(after.digest(), before.digest());
+        assert_eq!(after.raw_stream_sha256(), before.raw_stream_sha256());
+        metadata.revoke_usage_observation();
+        metadata.revoke_usage_observation();
+        assert_eq!(metadata.provisional_usage_observation(), after);
+        assert_eq!(
+            metadata.receipt(
+                "late-error".into(),
+                AttemptPurpose::Chunk,
+                &config,
+                &outcome,
+            ),
+            receipt
+        );
+        metadata.observe(&ProviderStreamEvent {
+            sequence: 2,
+            event: ProviderEventKind::TextDelta {
+                bytes: b"later".to_vec(),
+            },
+            usage_observation: None,
+        });
+        assert_eq!(metadata.provisional_usage_observation(), after);
+    }
+
+    #[test]
+    fn ordinary_reconciliation_revokes_only_the_new_capture() {
+        let raw = usage();
+        let config = config(Some(rates()));
+        for invalid_lifecycle in [false, true] {
+            let metadata = observed(vec![
+                started(),
+                ProviderEventKind::TextDelta {
+                    bytes: b"answer".to_vec(),
+                },
+                finished("stop", Some(raw)),
+            ]);
+            let before = metadata.provisional_usage_observation();
+            assert!(!before.is_invalid());
+            let outcome = Ok(crate::TurnOutcome {
+                output: "answer".into(),
+                finish_reason: Some("stop".into()),
+                input_tokens: raw.input_tokens + u64::from(!invalid_lifecycle),
+                output_tokens: raw.output_tokens,
+                cost_microcents: 35,
+                ..Default::default()
+            });
+            let actual = metadata.ordinary_receipt(
+                "reconciled".into(),
+                &config,
+                &outcome,
+                !invalid_lifecycle,
+            );
+            let expected = RequestAccountingReceipt {
+                request_id: "reconciled".into(),
+                purpose: AttemptPurpose::Ordinary,
+                totals: AccountingTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microcents: None,
+                },
+                usage: None,
+                knownness: AccountingKnownness::Uncertain,
+                completed: false,
+            };
+            assert_eq!(actual, expected);
+            let after = metadata.provisional_usage_observation();
+            assert!(after.is_invalid());
+            assert_eq!(after.selected(), before.selected());
+            assert_eq!(after.raw_stream_sha256(), before.raw_stream_sha256());
+            assert_eq!(after.digest(), before.digest());
+        }
+    }
+
+    #[test]
+    fn invalid_observation_metadata_cannot_certify_usage_or_cost() {
+        use orbit_adapter::types::{
+            UsageObservationMetaV1, UsageReasoningReportingV1, UsageSnapshotOriginV1,
+        };
+        let raw = usage();
+        let mut metadata = MetadataAccounting::default();
+        metadata.observe(&ProviderStreamEvent {
+            sequence: 0,
+            event: started(),
+            usage_observation: None,
+        });
+        metadata.observe(&ProviderStreamEvent {
+            sequence: 1,
+            event: finished("stop", Some(raw)),
+            usage_observation: Some(UsageObservationMetaV1 {
+                version: 2,
+                reasoning_reporting: UsageReasoningReportingV1::NotReported,
+                snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+            }),
+        });
+        assert!(metadata.provisional_usage_observation().is_invalid());
+        assert!(
+            !metadata.invalid,
+            "usage evidence validity is tracked separately from stream lifecycle"
+        );
+        let actual = receipt(&metadata, "stop", Some(rates()));
+        assert_eq!(
+            actual,
+            RequestAccountingReceipt {
+                request_id: "actual-request-1".into(),
+                purpose: AttemptPurpose::Chunk,
+                totals: AccountingTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microcents: None,
+                },
+                usage: None,
+                knownness: AccountingKnownness::UnknownUsage,
+                completed: true,
+            }
+        );
     }
 
     #[test]
@@ -3187,13 +3658,13 @@ mod accounting_tests {
             "stop",
             Some(rates()),
         );
-        let zero = receipt(
-            &observed(vec![
-                started(),
-                finished("stop", Some(ProviderUsage::default())),
-            ]),
-            "stop",
-            Some(rates()),
+        let zero_usage = ProviderUsage::default();
+        let zero_metadata = observed(vec![started(), finished("stop", Some(zero_usage))]);
+        let zero = zero_metadata.receipt(
+            "zero-request".into(),
+            AttemptPurpose::Chunk,
+            &config(Some(rates())),
+            &result_for_usage("stop", zero_usage),
         );
         assert_eq!(missing.knownness, AccountingKnownness::UnknownUsage);
         assert_eq!(missing.usage, None);
@@ -3204,6 +3675,180 @@ mod accounting_tests {
         assert_eq!(zero.totals.cost_microcents, Some(7));
         assert!(zero.completed);
         assert_ne!(missing.digest().unwrap(), zero.digest().unwrap());
+    }
+
+    #[test]
+    fn explicit_unknown_reasoning_basis_keeps_final_usage_and_withholds_cost() {
+        let mut selected_config = config(Some(rates()));
+        selected_config.billing = Some(test_billing_contract(
+            "summary-fixture",
+            "summary-fixture",
+            rates(),
+            orbit_adapter::types::ReasoningCounterBasis::Unknown,
+            orbit_adapter::types::ReasoningRatePolicy::Unknown,
+            None,
+        ));
+        let metadata = observed(vec![started(), finished("stop", Some(usage()))]);
+        let receipt = metadata.receipt(
+            "unknown-basis".into(),
+            AttemptPurpose::Ordinary,
+            &selected_config,
+            &result("stop"),
+        );
+        assert_eq!(receipt.knownness, AccountingKnownness::Known);
+        assert_eq!(receipt.usage, Some(usage()));
+        assert_eq!(receipt.totals.input_tokens, usage().input_tokens);
+        assert_eq!(receipt.totals.output_tokens, usage().output_tokens);
+        assert_eq!(receipt.totals.cost_microcents, None);
+        assert!(receipt.completed);
+    }
+
+    #[test]
+    fn synthetic_and_provisional_snapshots_never_become_receipt_usage() {
+        use orbit_adapter::types::{
+            UsageObservationMetaV1, UsageReasoningReportingV1, UsageSnapshotOriginV1,
+        };
+        let config = config(Some(rates()));
+        let mut synthetic = MetadataAccounting::default();
+        synthetic.observe(&ProviderStreamEvent {
+            sequence: 0,
+            event: started(),
+            usage_observation: None,
+        });
+        synthetic.observe(&ProviderStreamEvent {
+            sequence: 1,
+            event: finished("stop", Some(usage())),
+            usage_observation: Some(UsageObservationMetaV1 {
+                version: 1,
+                reasoning_reporting: UsageReasoningReportingV1::Reported,
+                snapshot_origin: UsageSnapshotOriginV1::Synthetic,
+            }),
+        });
+        let synthetic_receipt = synthetic.receipt(
+            "synthetic".into(),
+            AttemptPurpose::Ordinary,
+            &config,
+            &result("stop"),
+        );
+        assert_eq!(
+            synthetic_receipt.knownness,
+            AccountingKnownness::UnknownUsage
+        );
+        assert_eq!(synthetic_receipt.usage, None);
+        assert_eq!(
+            synthetic_receipt.totals,
+            AccountingTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: None,
+            }
+        );
+        assert!(synthetic_receipt.completed);
+
+        let provisional = observed(vec![started(), ProviderEventKind::UsageUpdate(usage())]);
+        let provisional_receipt = provisional.receipt(
+            "provisional".into(),
+            AttemptPurpose::Ordinary,
+            &config,
+            &result("stop"),
+        );
+        assert_eq!(
+            provisional_receipt.knownness,
+            AccountingKnownness::Uncertain
+        );
+        assert_eq!(provisional_receipt.usage, None);
+        assert_eq!(
+            provisional_receipt.totals,
+            AccountingTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microcents: None,
+            }
+        );
+        assert!(!provisional_receipt.completed);
+    }
+
+    #[test]
+    fn spend_estimator_implements_all_explicit_basis_rate_combinations() {
+        let mut prices = rates();
+        prices.input_per_million_microcents = 1_000_000;
+        prices.output_per_million_microcents = 2_000_000;
+        prices.cache_read_per_million_microcents = Some(3_000_000);
+        prices.cache_write_per_million_microcents = Some(4_000_000);
+        prices.reasoning_per_million_microcents = Some(5_000_000);
+        let estimate = estimate(10, 6);
+        for (basis, policy, expected) in [
+            (
+                orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+                orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+                59,
+            ),
+            (
+                orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+                orbit_adapter::types::ReasoningRatePolicy::DedicatedRate,
+                77,
+            ),
+            (
+                orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput,
+                orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+                63,
+            ),
+            (
+                orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput,
+                orbit_adapter::types::ReasoningRatePolicy::DedicatedRate,
+                69,
+            ),
+        ] {
+            let mut config = config(None);
+            config.billing = Some(test_billing_contract(
+                &config.provider_id,
+                &config.model,
+                prices,
+                basis,
+                policy,
+                Some(2),
+            ));
+            let quote = estimate_spend_quote(&config, &estimate).unwrap();
+            assert_eq!(quote.estimated_microdollars, expected);
+        }
+    }
+
+    #[test]
+    fn spend_admission_keeps_housekeeping_exception_narrow() {
+        use crate::turn::SpendAllowance;
+        let mut selected_config = config(Some(rates()));
+        selected_config.billing = Some(test_billing_contract(
+            "summary-fixture",
+            "summary-fixture",
+            rates(),
+            orbit_adapter::types::ReasoningCounterBasis::Unknown,
+            orbit_adapter::types::ReasoningRatePolicy::Unknown,
+            None,
+        ));
+        let allowance = SpendAllowance {
+            remaining_microcents: 1_000,
+            allow_unpriced_housekeeping: true,
+        };
+        let request = estimate(10, 6);
+        assert!(admit_spend(Some(allowance), &selected_config, &request, 0, false).is_err());
+        assert!(admit_spend(Some(allowance), &selected_config, &request, 0, true).is_ok());
+
+        selected_config.billing = Some(test_billing_contract(
+            "different-provider",
+            "summary-fixture",
+            rates(),
+            orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput,
+            orbit_adapter::types::ReasoningRatePolicy::DedicatedRate,
+            Some(100),
+        ));
+        assert!(admit_spend(Some(allowance), &selected_config, &request, 0, true).is_err());
+
+        let priced = config(Some(rates()));
+        let too_small = SpendAllowance {
+            remaining_microcents: 1,
+            allow_unpriced_housekeeping: true,
+        };
+        assert!(admit_spend(Some(too_small), &priced, &request, 0, true).is_err());
     }
 
     #[test]
@@ -3299,7 +3944,7 @@ mod accounting_tests {
                 None,
             );
             assert_eq!(invalid.knownness, AccountingKnownness::Uncertain);
-            assert_eq!(invalid.usage, Some(prefix));
+            assert_eq!(invalid.usage, None);
             assert!(!invalid.completed);
             assert_eq!(invalid.totals.cost_microcents, None);
         }
@@ -3310,10 +3955,12 @@ mod accounting_tests {
         for sequences in [[0, 2], [0, 0]] {
             let mut metadata = MetadataAccounting::default();
             metadata.observe(&ProviderStreamEvent {
+                usage_observation: None,
                 sequence: sequences[0],
                 event: started(),
             });
             metadata.observe(&ProviderStreamEvent {
+                usage_observation: None,
                 sequence: sequences[1],
                 event: finished("stop", Some(usage())),
             });
@@ -3346,7 +3993,7 @@ mod accounting_tests {
     }
 
     #[test]
-    fn decreasing_update_retains_last_usable_prefix_without_billing_it() {
+    fn decreasing_update_invalidates_the_usage_prefix_and_receipt() {
         let prefix = usage();
         let mut decreased = prefix;
         decreased.output_tokens -= 1;
@@ -3360,7 +4007,7 @@ mod accounting_tests {
             "stop",
             Some(rates()),
         );
-        assert_eq!(invalid.usage, Some(prefix));
+        assert_eq!(invalid.usage, None);
         assert_eq!(invalid.knownness, AccountingKnownness::Uncertain);
         assert_eq!(
             invalid.totals,
@@ -3408,7 +4055,7 @@ mod accounting_tests {
             &Err(("ORBIT-E0410", "controlled disconnect".into())),
         );
         assert_eq!(failure.knownness, AccountingKnownness::Uncertain);
-        assert_eq!(failure.usage, Some(usage()));
+        assert_eq!(failure.usage, None);
         assert_eq!(failure.totals.cost_microcents, None);
         assert!(!failure.completed);
     }
@@ -3423,7 +4070,7 @@ mod accounting_tests {
             Some(35)
         );
         let mut incomplete = rates();
-        incomplete.reasoning_per_million_microcents = None;
+        incomplete.cache_read_per_million_microcents = None;
         assert_eq!(
             receipt(&metadata, "stop", Some(incomplete))
                 .totals
@@ -3440,10 +4087,13 @@ mod accounting_tests {
         };
         let mut overflowing = rates();
         overflowing.input_per_million_microcents = u64::MAX;
-        let checked = receipt(
-            &observed(vec![started(), finished("stop", Some(huge))]),
-            "stop",
-            Some(overflowing),
+        let huge_metadata = observed(vec![started(), finished("stop", Some(huge))]);
+        let huge_config = config(Some(overflowing));
+        let checked = huge_metadata.receipt(
+            "huge-request".into(),
+            AttemptPurpose::Chunk,
+            &huge_config,
+            &result_for_usage("stop", huge),
         );
         assert_eq!(checked.knownness, AccountingKnownness::Known);
         assert_eq!(checked.totals.cost_microcents, None);
@@ -3485,10 +4135,11 @@ mod accounting_tests {
 
     #[test]
     fn cancelled_terminal_usage_is_provisional_while_positive_final_zero_is_known() {
-        for (reason, observed_usage, knownness, cost, completed) in [
+        for (reason, observed_usage, receipt_usage, knownness, cost, completed) in [
             (
                 "cancelled",
                 Some(ProviderUsage::default()),
+                None,
                 AccountingKnownness::Uncertain,
                 None,
                 false,
@@ -3496,12 +4147,14 @@ mod accounting_tests {
             (
                 "cancelled",
                 Some(usage()),
+                None,
                 AccountingKnownness::Uncertain,
                 None,
                 false,
             ),
             (
                 "cancelled",
+                None,
                 None,
                 AccountingKnownness::Uncertain,
                 None,
@@ -3510,18 +4163,22 @@ mod accounting_tests {
             (
                 "stop",
                 Some(ProviderUsage::default()),
+                Some(ProviderUsage::default()),
                 AccountingKnownness::Known,
                 Some(7),
                 true,
             ),
         ] {
-            let value = receipt(
-                &observed(vec![started(), finished(reason, observed_usage)]),
-                reason,
-                Some(rates()),
+            let metadata = observed(vec![started(), finished(reason, observed_usage)]);
+            let outcome = result_for_usage(reason, observed_usage.unwrap_or_default());
+            let value = metadata.receipt(
+                "actual-request-1".into(),
+                AttemptPurpose::Chunk,
+                &config(Some(rates())),
+                &outcome,
             );
             assert_eq!(value.knownness, knownness);
-            assert_eq!(value.usage, observed_usage);
+            assert_eq!(value.usage, receipt_usage);
             assert_eq!(value.completed, completed);
             assert_eq!(value.totals.input_tokens, 0);
             assert_eq!(value.totals.output_tokens, 0);
@@ -3531,5 +4188,565 @@ mod accounting_tests {
             assert_eq!(folded.knownness, knownness);
             assert_eq!(folded.housekeeping, value.totals);
         }
+    }
+}
+
+#[cfg(test)]
+pub mod usage_observation_owner_test_support {
+    use crate as orbit_engine;
+    include!("../tests/support/compaction_journal.rs");
+
+    pub(crate) type ProbeLog =
+        Arc<Mutex<Vec<orbit_adapter::stream::ProvisionalUsageObservationV1>>>;
+
+    pub(crate) struct OwnerHome(pub(crate) std::path::PathBuf);
+
+    impl OwnerHome {
+        pub(crate) fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let path =
+                std::env::temp_dir().join(format!("orbit-observation-owner-{}", ulid::Ulid::new()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for OwnerHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum OwnerReply {
+        HealthyA,
+        HealthyB,
+        FaultA,
+    }
+
+    impl OwnerReply {
+        fn body(self) -> String {
+            let (text, input, output, reasoning) = match self {
+                Self::HealthyA | Self::FaultA => ("A-answer", 23, 5, 2),
+                Self::HealthyB => ("B-answer", 11, 7, 0),
+            };
+            let mut body = format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}),
+                json!({"choices":[],"usage":{
+                    "prompt_tokens":input,"completion_tokens":output,
+                    "total_tokens":input+output,
+                    "completion_tokens_details":{"reasoning_tokens":reasoning}
+                }}),
+            );
+            if matches!(self, Self::FaultA) {
+                body.push_str("data: {malformed}\n\n");
+            } else {
+                body.push_str(&format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                ));
+            }
+            body
+        }
+    }
+
+    pub(crate) struct OwnerWire {
+        gate: String,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        task: Option<std::thread::JoinHandle<Result<(), &'static str>>>,
+        watchdog: Option<std::sync::mpsc::Sender<()>>,
+        watchdog_task: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl OwnerWire {
+        pub(crate) fn new(replies: Vec<OwnerReply>) -> Self {
+            let (watchdog, wait) = std::sync::mpsc::channel();
+            let watchdog_task = std::thread::spawn(move || {
+                if matches!(
+                    wait.recv_timeout(std::time::Duration::from_secs(30)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    eprintln!("owned observation fixture watchdog expired");
+                    std::process::exit(91);
+                }
+            });
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let gate = format!("http://{}/v1", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let task = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                use std::sync::atomic::Ordering;
+                use std::time::{Duration, Instant};
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut replies = replies.into_iter();
+                while !stopping.load(Ordering::SeqCst) {
+                    if Instant::now() >= deadline {
+                        return Err("listener deadline");
+                    }
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(value) => value,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(_) => return Err("listener accept"),
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .map_err(|_| "read timeout")?;
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .map_err(|_| "write timeout")?;
+                    let read_deadline = Instant::now() + Duration::from_secs(3);
+                    let mut raw = Vec::new();
+                    loop {
+                        if raw.len() > 16 * 1024 || Instant::now() >= read_deadline {
+                            return Err("header bound");
+                        }
+                        let mut byte = [0u8; 1];
+                        match socket.read(&mut byte) {
+                            Ok(1) => raw.push(byte[0]),
+                            Ok(_) => return Err("incomplete header"),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(_) => return Err("header read"),
+                        }
+                        if raw.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let headers = std::str::from_utf8(&raw).map_err(|_| "header encoding")?;
+                    if !headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n") {
+                        return Err("exact provider target");
+                    }
+                    let mut lengths = Vec::new();
+                    for line in headers.lines().skip(1) {
+                        let Some((key, value)) = line.split_once(':') else {
+                            continue;
+                        };
+                        if key.eq_ignore_ascii_case("authorization")
+                            || key.eq_ignore_ascii_case("x-api-key")
+                        {
+                            return Err("unexpected credential");
+                        }
+                        if key.eq_ignore_ascii_case("content-length") {
+                            lengths.push(value.trim().parse::<usize>().map_err(|_| "body length")?);
+                        }
+                    }
+                    if lengths.len() != 1 || lengths[0] == 0 || lengths[0] > 1024 * 1024 {
+                        return Err("one bounded request body");
+                    }
+                    let mut body = vec![0; lengths[0]];
+                    let mut offset = 0;
+                    while offset < body.len() {
+                        if Instant::now() >= read_deadline {
+                            return Err("body deadline");
+                        }
+                        match socket.read(&mut body[offset..]) {
+                            Ok(0) => return Err("incomplete body"),
+                            Ok(count) => offset += count,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(_) => return Err("body read"),
+                        }
+                    }
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&body).map_err(|_| "body JSON")?;
+                    if request["model"] != "owner-model" {
+                        return Err("exact provider model");
+                    }
+                    captured.lock().map_err(|_| "capture lock")?.push(request);
+                    let response = replies.next().ok_or("unexpected automatic replay")?.body();
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(), response,
+                    ).map_err(|_| "response write")?;
+                    socket.flush().map_err(|_| "response flush")?;
+                    socket
+                        .shutdown(std::net::Shutdown::Both)
+                        .map_err(|_| "socket close")?;
+                }
+                if replies.next().is_some() {
+                    return Err("expected explicit invocation was not sent");
+                }
+                Ok(())
+            });
+            Self {
+                gate,
+                requests,
+                stop,
+                task: Some(task),
+                watchdog: Some(watchdog),
+                watchdog_task: Some(watchdog_task),
+            }
+        }
+
+        pub(crate) fn config(&self) -> crate::TurnConfig {
+            crate::TurnConfig {
+                provider_id: "owner-provider".into(),
+                gate: self.gate.clone(),
+                model: "owner-model".into(),
+                kind: crate::ProviderKind::OpenAiCompatible,
+                credential_env: None,
+                billing: None,
+                pricing: None,
+                max_output_tokens: 64,
+                sampling: None,
+                effort: None,
+                supported_efforts: None,
+                first_byte_timeout_ms: Some(3_000),
+                idle_timeout_ms: Some(3_000),
+            }
+        }
+
+        pub(crate) fn count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+
+        pub(crate) fn finish(&mut self, expected: usize) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.task
+                .take()
+                .unwrap()
+                .join()
+                .expect("owned wire thread")
+                .expect("owned wire complete and bounded");
+            assert_eq!(self.count(), expected);
+        }
+    }
+
+    impl Drop for OwnerWire {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(task) = self.task.take() {
+                let _ = task.join();
+            }
+            if let Some(watchdog) = self.watchdog.take() {
+                let _ = watchdog.send(());
+            }
+            if let Some(task) = self.watchdog_task.take() {
+                let _ = task.join();
+            }
+        }
+    }
+
+    pub(crate) fn assert_clean_b(snapshot: &orbit_adapter::stream::ProvisionalUsageObservationV1) {
+        use orbit_adapter::types::{
+            ProviderUsage, UsageObservationDispositionV1, UsageObservationOriginV1,
+            UsageObservationQualificationV1, UsageReportingPresenceV1, UsageSource,
+        };
+        assert!(!snapshot.is_invalid());
+        assert_eq!(
+            snapshot.disposition(),
+            UsageObservationDispositionV1::CompleteText
+        );
+        assert_eq!(
+            snapshot.qualification(),
+            UsageObservationQualificationV1::ProviderReportedTerminalSnapshot
+        );
+        let selected = snapshot.selected().expect("actual B final snapshot");
+        assert_eq!(
+            selected.raw_usage,
+            ProviderUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+            }
+        );
+        assert_eq!(selected.source, UsageSource::Final);
+        assert_eq!(
+            selected.reasoning_reporting,
+            UsageReportingPresenceV1::Reported
+        );
+        assert_eq!(
+            selected.snapshot_origin,
+            UsageObservationOriginV1::ProviderReported
+        );
+    }
+}
+
+#[cfg(test)]
+mod usage_observation_owner_tests {
+    use super::usage_observation_owner_test_support::{
+        MemoryJournal, OwnerHome, OwnerReply, OwnerWire, ProbeLog, assert_clean_b,
+    };
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn options(
+        config: &crate::TurnConfig,
+        owner: &str,
+        journal: &Arc<MemoryJournal>,
+    ) -> crate::TurnOptions {
+        crate::TurnOptions {
+            max_attempts: 1,
+            session_id: owner.into(),
+            request_stem: "owned-summary".into(),
+            selected_budget: Some(SelectedBudget::legacy_input(config, 8_000).unwrap()),
+            journal: Some(journal.clone()),
+            ..Default::default()
+        }
+    }
+
+    fn runner<'a>(
+        home: &'a OwnerHome,
+        config: &'a crate::TurnConfig,
+        context: &'a RequestPreparationContext,
+        budget: &'a SelectedBudget,
+        options: &'a crate::TurnOptions,
+        cancel: &'a orbit_provider_http::CancelToken,
+        snapshots: ProbeLog,
+    ) -> SummaryRunner<'a> {
+        let journal = options.journal.as_ref().unwrap().as_ref();
+        SummaryRunner {
+            home: &home.0,
+            config,
+            context,
+            budget,
+            options,
+            journal,
+            cancel,
+            checkpoint: journal.accounting_checkpoint_detailed().unwrap(),
+            accounting: AccountingDelta::known_zero(),
+            attempts: Vec::new(),
+            receipt_limit: MAX_SUMMARY_CHUNKS + 1,
+            usage_observation_probe: Some(Box::new(move |snapshot| {
+                snapshots.lock().unwrap().push(snapshot);
+            })),
+        }
+    }
+
+    fn standalone_b() -> orbit_adapter::stream::ProvisionalUsageObservationV1 {
+        let home = OwnerHome::new();
+        let mut wire = OwnerWire::new(vec![OwnerReply::HealthyB]);
+        let config = wire.config();
+        let context = crate::dispatch::request_preparation_context(&config, None, &[]).unwrap();
+        let budget = SelectedBudget::legacy_input(&config, 8_000).unwrap();
+        let journal = MemoryJournal::fresh("m7-standalone");
+        let options = options(&config, "m7-standalone", &journal);
+        let cancel = orbit_provider_http::CancelToken::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = runner(
+            &home,
+            &config,
+            &context,
+            &budget,
+            &options,
+            &cancel,
+            log.clone(),
+        );
+        assert_eq!(
+            runner
+                .run("standalone B", AttemptPurpose::Chunk, None)
+                .unwrap(),
+            "B-answer"
+        );
+        assert_eq!(
+            journal.accounting_checkpoint().unwrap().revision,
+            AccountingRevision(2)
+        );
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_clean_b(&captured[0]);
+        let snapshot = captured[0].clone();
+        drop(captured);
+        wire.finish(1);
+        snapshot
+    }
+
+    #[test]
+    fn summary_same_runner_healthy_chunks_have_independent_capture() {
+        let home = OwnerHome::new();
+        let mut wire = OwnerWire::new(vec![OwnerReply::HealthyA, OwnerReply::HealthyB]);
+        let config = wire.config();
+        let context = crate::dispatch::request_preparation_context(&config, None, &[]).unwrap();
+        let budget = SelectedBudget::legacy_input(&config, 8_000).unwrap();
+        let journal = MemoryJournal::fresh("m7-summary");
+        let options = options(&config, "m7-summary", &journal);
+        let cancel = orbit_provider_http::CancelToken::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = runner(
+            &home,
+            &config,
+            &context,
+            &budget,
+            &options,
+            &cancel,
+            log.clone(),
+        );
+        assert_eq!(
+            runner
+                .run("healthy A", AttemptPurpose::Chunk, None)
+                .unwrap(),
+            "A-answer"
+        );
+        assert_eq!(
+            runner
+                .run("healthy B", AttemptPurpose::Chunk, None)
+                .unwrap(),
+            "B-answer"
+        );
+        assert_eq!(runner.attempts.len(), 2);
+        assert!(runner.attempts.iter().all(|receipt| receipt.completed && receipt.knownness == AccountingKnownness::Known));
+        assert!(
+            runner
+                .attempts
+                .iter()
+                .all(|receipt| receipt.totals.cost_microcents.is_none())
+        );
+        let checkpoint = journal.accounting_checkpoint().unwrap();
+        assert_eq!(checkpoint.revision, AccountingRevision(4));
+        assert!(checkpoint.pending.is_none());
+        assert_eq!(checkpoint.totals.knownness, AccountingKnownness::Known);
+        let intents = journal.intents();
+        assert_eq!(intents.len(), 2);
+        assert_ne!(intents[0].request_id, intents[1].request_id);
+        assert!(
+            intents
+                .iter()
+                .all(|intent| intent.purpose == AttemptPurpose::Chunk)
+        );
+        assert_eq!(journal.receipts(), runner.attempts);
+        assert_eq!(journal.events(), vec!["begin", "settle", "begin", "settle"]);
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(!captured[0].is_invalid());
+        assert_eq!(captured[0].selected().unwrap().raw_usage.input_tokens, 23);
+        assert_clean_b(&captured[1]);
+        assert_ne!(captured[0], captured[1]);
+        let after_a_b = captured[1].clone();
+        drop(captured);
+        wire.finish(2);
+        drop(wire);
+        assert_eq!(
+            after_a_b,
+            standalone_b(),
+            "same actual runner B equals fresh standalone B"
+        );
+    }
+
+    #[test]
+    fn summary_fault_preserves_pending_while_new_owner_b_is_independent() {
+        let home_a = OwnerHome::new();
+        let mut wire = OwnerWire::new(vec![OwnerReply::FaultA, OwnerReply::HealthyB]);
+        let config = wire.config();
+        let context = crate::dispatch::request_preparation_context(&config, None, &[]).unwrap();
+        let budget = SelectedBudget::legacy_input(&config, 8_000).unwrap();
+        let journal_a = MemoryJournal::fresh("m7-fault-a");
+        let options_a = options(&config, "m7-fault-a", &journal_a);
+        let cancel = orbit_provider_http::CancelToken::new();
+        let log_a = Arc::new(Mutex::new(Vec::new()));
+        let mut runner_a = runner(
+            &home_a,
+            &config,
+            &context,
+            &budget,
+            &options_a,
+            &cancel,
+            log_a.clone(),
+        );
+        assert!(matches!(
+            runner_a.run("faulted A", AttemptPurpose::Chunk, None),
+            Err(CompactionStatus::AccountingUncertain)
+        ));
+        assert_eq!(
+            wire.count(),
+            1,
+            "faulted summary must not consume B automatically"
+        );
+        assert_eq!(runner_a.attempts.len(), 1);
+        assert_eq!(
+            runner_a.attempts[0].knownness,
+            AccountingKnownness::Uncertain
+        );
+        assert!(!runner_a.attempts[0].completed);
+        let retained_a = journal_a.accounting_checkpoint().unwrap();
+        assert_eq!(retained_a.revision, AccountingRevision(2));
+        assert_eq!(retained_a.totals.knownness, AccountingKnownness::Uncertain);
+        let pending = retained_a
+            .pending
+            .as_ref()
+            .expect("faulted owner retains actual pending intent");
+        assert!(pending.uncertain);
+        assert_eq!(pending.intent.request_id, runner_a.attempts[0].request_id);
+        assert_eq!(
+            pending.reference.intent_digest,
+            pending.intent.digest().unwrap()
+        );
+        assert!(retained_a.last_settlement.is_none());
+        let receipts_a = journal_a.receipts();
+        let retained_receipts_a = journal_a.retained_receipts();
+        assert!(retained_receipts_a.0.is_none());
+        assert_eq!(retained_receipts_a.1.as_ref(), Some(&runner_a.attempts[0]));
+        assert_eq!(journal_a.events(), vec!["begin", "settle"]);
+        let captured_a = log_a.lock().unwrap();
+        assert_eq!(captured_a.len(), 1);
+        assert!(captured_a[0].is_invalid());
+        assert_eq!(captured_a[0].selected().unwrap().raw_usage.input_tokens, 23);
+        drop(captured_a);
+        drop(runner_a);
+
+        let home_b = OwnerHome::new();
+        let journal_b = MemoryJournal::fresh("m7-new-operation-b");
+        let options_b = options(&config, "m7-new-operation-b", &journal_b);
+        let log_b = Arc::new(Mutex::new(Vec::new()));
+        let mut runner_b = runner(
+            &home_b,
+            &config,
+            &context,
+            &budget,
+            &options_b,
+            &cancel,
+            log_b.clone(),
+        );
+        assert_eq!(
+            runner_b
+                .run("explicit new operation B", AttemptPurpose::Chunk, None)
+                .unwrap(),
+            "B-answer"
+        );
+        assert_eq!(
+            journal_b.accounting_checkpoint().unwrap().revision,
+            AccountingRevision(2)
+        );
+        let captured_b = log_b.lock().unwrap();
+        assert_eq!(captured_b.len(), 1);
+        assert_clean_b(&captured_b[0]);
+        let after_fault_a = captured_b[0].clone();
+        drop(captured_b);
+        assert_eq!(journal_a.accounting_checkpoint().unwrap(), retained_a);
+        assert_eq!(journal_a.receipts(), receipts_a);
+        assert_eq!(journal_a.retained_receipts(), retained_receipts_a);
+        wire.finish(2);
+        drop(wire);
+        assert_eq!(
+            after_fault_a,
+            standalone_b(),
+            "new owner B equals standalone without clearing A"
+        );
     }
 }

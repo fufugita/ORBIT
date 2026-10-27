@@ -3,9 +3,9 @@
 use crate::session_accounting::{
     AccountingError, FullCostStatus, RootOrigin, RootSessionAccounting, prepare_root,
 };
+use crate::session_config::SessionTurnConfig as TuiTurnConfig;
 use crate::sessions::{SessionFile, SessionLease, SessionLeaseError};
 use crate::tool_runtime::{ApprovalChannel, ApprovalRequest, ApprovalVerdict, AutoGrants};
-use crate::tui_worker::TuiTurnConfig;
 use orbit_adapter::types::{ChatMessage, ChatRole, EffortSetting};
 use orbit_provider_http::CancelToken;
 use serde::{Deserialize, Serialize};
@@ -361,7 +361,7 @@ pub(crate) fn scan_display(text: &str) -> String {
     }) {
         safe.push_str(&orbit_tools::scan::scan_result(span).text);
     }
-    orbit_hud_tui::safe_text(&safe)
+    orbit_hud::safe_text(&safe)
 }
 
 fn safe_text(text: &str, masks: &[String]) -> String {
@@ -2387,7 +2387,7 @@ fn owner_loop(
                     .is_none_or(|allow| allow.contains(&definition.name))
         });
         options.tools = definitions;
-        let mut cot = orbit_hud_tui::CotStripper::new();
+        let mut cot = orbit_hud::CotStripper::new();
         let mut display = DisplayStream::default();
         let mut events = |event: orbit_frontend_protocol::FrontendEvent| {
             let Ok(mut hub) = handle.lock() else { return };

@@ -100,6 +100,7 @@ fn the_engine_scopes_the_turn_token_around_each_rounds_tools() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("ledger")).expect("mkdir ledger");
     let config = orbit_engine::TurnConfig {
+        billing: None,
         sampling: None,
         effort: None,
         supported_efforts: None,

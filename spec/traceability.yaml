@@ -1910,9 +1910,7 @@ features:
   invariants: []
   errors: []
   tests:
-    unit:
-    - dist_static_musl_binary
-    - dist_wasi_runtime_vendored
+    unit: []
     property: []
     concurrency: []
     fault: []
@@ -1929,7 +1927,6 @@ features:
   errors: []
   tests:
     unit:
-    - dist_semver_compat_drop_in
     - dist_major_migration_plan
     property: []
     concurrency: []
@@ -1947,9 +1944,7 @@ features:
   invariants: []
   errors: []
   tests:
-    unit:
-    - dist_license_apache2_core
-    - dist_shim_dual_mit_apache2
+    unit: []
     property: []
     concurrency: []
     fault: []
@@ -1965,13 +1960,11 @@ features:
   invariants: []
   errors: []
   tests:
-    unit:
-    - dist_dependency_license_allowlist
+    unit: []
     property: []
     concurrency: []
     fault: []
-    security:
-    - dist_cargo_deny_blocks_copyleft
+    security: []
     compatibility: []
     e2e: []
   status: specified
@@ -2001,15 +1994,13 @@ features:
   invariants: []
   errors: []
   tests:
-    unit:
-    - dist_release_gate_9_item_ci
+    unit: []
     property: []
     concurrency: []
     fault: []
     security: []
     compatibility: []
-    e2e:
-    - dist_clean_machine_install_verify
+    e2e: []
   status: specified
 - id: ORBIT-F-DIST-008
   claim: SPDX 2.3 SBOM + SLSA provenance + GPG/Sigstore signing.
@@ -2019,14 +2010,11 @@ features:
   invariants: []
   errors: []
   tests:
-    unit:
-    - dist_sbom_spdx_generated
-    - dist_artifact_signed
+    unit: []
     property: []
     concurrency: []
     fault: []
-    security:
-    - dist_signature_verification
+    security: []
     compatibility: []
     e2e: []
   status: specified
@@ -2038,8 +2026,7 @@ features:
   invariants: []
   errors: []
   tests:
-    unit:
-    - dist_reproducible_twin_build_byte_identical
+    unit: []
     property: []
     concurrency: []
     fault: []
@@ -2402,7 +2389,7 @@ deferred_register:
     broker.
 - item: dist_semver_compat_drop_in (ORBIT-F-DIST-003)
   target: release-gate
-  why: Requires a real installed binary version pair; covered by the clean-machine E2E at build time.
+  why: Requires a real installed binary version pair; the current clean-machine workflow exercises one copied release binary only and does not cover managed installation or upgrades.
 - item: kill_in_flight_wasi_instance (ORBIT-F-SAND-006)
   target: implementation-phase M2 (WASI runtime binding)
   why: Requires the wasmtime host + instance pool reclaim timing (S11); pool bound is enforced in the plugin registry.

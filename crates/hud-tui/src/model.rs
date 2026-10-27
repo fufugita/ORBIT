@@ -150,6 +150,9 @@ pub enum TranscriptLine {
     /// CoT-stripped placeholder (NEVER shows raw reasoning).
     Stripped {
         tool_name: String,
+        /// Opaque call ID for settling this card and associating its Terminal tape.
+        /// Empty only when the persisted call identity is absent or ambiguous.
+        call_id: String,
         /// Display-safe argument summary (the bridge's safe_text output).
         /// Rendered as the tool card's argument column (§6.5).
         summary: String,
@@ -185,7 +188,8 @@ pub enum TranscriptLine {
 
 /// How a tool call ended (§6.5, §11.5 rule 4). `Denied` and `Blocked` are
 /// decisions, not failures: an operator refusal must never render as a red
-/// `✕ failed` — audits read refusals and crashes differently.
+/// `✕ failed` — audits read refusals and crashes differently. `Unavailable`
+/// is neutral because the saved result could not be validated safely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolOutcome {
     /// Ran and succeeded: `✓` muted.
@@ -202,6 +206,8 @@ pub enum ToolOutcome {
     /// turn ended before it reported: `⊘` muted + `cancelled`. Neither
     /// a failure nor a denial.
     Cancelled,
+    /// Saved result is missing, malformed, or ambiguous: `?` muted.
+    Unavailable,
 }
 
 /// Why the bridge rejected a text chunk (D7). Names the gate, not the text.

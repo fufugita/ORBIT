@@ -574,9 +574,11 @@ impl SavedTaskFixture {
         let config = format!(
             "[[provider]]\nname='a'\nurl={:?}\nenv={env_a:?}\n\
              [[provider.models]]\nid={SAVED_TASK_RAW:?}\ncontext_window=65536\nmax_output_tokens=1111\n\
+             [provider.models.billing]\nversion=2\ninput_per_million_microdollars=0\noutput_per_million_microdollars=0\ncache_read_per_million_microdollars=0\ncache_write_per_million_microdollars=0\nrequest_flat_microdollars=5\nreasoning_counter_basis='included_in_output'\nreasoning_rate_policy='output_rate'\n\
              [[provider]]\nname='b'\nurl={:?}\nenv={env_b:?}\n\
              [[provider.models]]\nid={SAVED_TASK_RAW:?}\ncontext_window=131072\nmax_output_tokens=733\n\
              supported_efforts=['medium','high']\ndefault_effort='medium'\n\
+             [provider.models.billing]\nversion=2\ninput_per_million_microdollars=700\noutput_per_million_microdollars=900\ncache_read_per_million_microdollars=0\ncache_write_per_million_microdollars=0\nreasoning_per_million_microdollars=1100\nrequest_flat_microdollars=7\nreasoning_counter_basis='separate_from_output'\nreasoning_rate_policy='dedicated_rate'\nmax_reasoning_tokens=50\n\
              [roles]\nmain='a/{SAVED_TASK_RAW}'\nexplore='a/{SAVED_TASK_RAW}'\nsubagent='a/{SAVED_TASK_RAW}'\n\
              [routing.phases.coding]\ndefault='b/{SAVED_TASK_RAW}'\nhard='b/{SAVED_TASK_RAW}'\n\
              [routing.phase_keywords]\nclear=true\ncoding=['implement']\n",
@@ -705,6 +707,34 @@ impl SavedTaskFixture {
 fn saved_private_fresh_routed_child_uses_target_key_duplicate_raw_output_and_default_effort() {
     use orbit_adapter::types::EffortSetting;
     let f = SavedTaskFixture::new();
+    let parent = f
+        .fixture
+        .cx
+        .ext::<tool_runtime::SessionTurnConfig>()
+        .unwrap()
+        .0
+        .clone();
+    let (routed, decision) = orbit_cli::try_phase_turn_config(
+        &f.fixture.home,
+        &parent,
+        "implement a comprehensive parser",
+        orbit_cli::phase_routing::SelectionOrigin::Default,
+    )
+    .unwrap();
+    assert_eq!(decision.unwrap().provider_id, "b");
+    let billing = routed.billing.as_ref().unwrap();
+    assert_eq!(billing.provider_id().0, "b");
+    assert_eq!(billing.raw_model_id().0, SAVED_TASK_RAW);
+    assert_eq!(billing.rates().input_per_million_microdollars, Some(700));
+    assert_eq!(billing.rates().request_flat_microdollars, Some(7));
+    assert_eq!(
+        billing.reasoning_counter_basis(),
+        orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput
+    );
+    assert_eq!(
+        billing.reasoning_rate_policy(),
+        orbit_adapter::types::ReasoningRatePolicy::DedicatedRate
+    );
     assert_eq!(f.fixture.a.calls() + f.fixture.b.calls(), 0);
     let result = f
         .fixture

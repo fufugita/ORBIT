@@ -239,6 +239,12 @@ pub fn draw(cv: &mut Cv, r: Rect, s: &Scenario, now_ms: u64, reduced: bool, mono
                     colors.green,
                 ),
                 ToolState::Failed => ("✕", colors.red, "failed".to_string(), colors.red),
+                ToolState::Unavailable => (
+                    "?",
+                    colors.muted,
+                    "result unavailable".to_string(),
+                    colors.muted,
+                ),
                 _ => ("○", colors.faint, String::new(), colors.faint),
             };
             cv.bold(x + 2, yy, g, gc, Some(colors.sidebar));

@@ -14,6 +14,7 @@
 
 use crate::bus::BusSender;
 use crate::msg::Msg;
+pub use orbit_hud::{CotStripper, safe_text, strip_cot};
 
 /// Emoji → ASCII fallback map (DR-21 L15). Default ON; disable with
 /// `ORBIT_ASCII_EMOJI=0`. These replacements are guaranteed to render in
@@ -122,183 +123,10 @@ pub fn sanitize_glyphs(text: &str) -> String {
     result
 }
 
-/// Tags that wrap chain-of-thought / private reasoning. Stripped at the bridge,
-/// never reaching the reducer. The content between tags is discarded entirely.
-const COT_TAGS: &[&str] = &[
-    "antml:thinking",
-    "reasoning",
-    "analysis",
-    "scratchpad",
-    "internal",
-    "thinking",
-];
-
-/// Strip chain-of-thought blocks from a text chunk. Removes everything between
-/// opening and closing tags (inclusive), including paired all-caps variants.
-/// This is a **bridge-level** defense — the Verbose panel never sees raw CoT.
-///
-/// Iterates over **chars** (not bytes) to preserve multi-byte UTF-8 sequences.
-/// The previous byte-level implementation corrupted accented characters by
-/// converting each byte to a char independently (e.g. `á` = `0xC3 0xA1` →
-/// `Ã` + `¡` → double-encoded when written back as UTF-8).
-pub fn strip_cot(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '<' {
-            // Reconstruct the substring from this position for tag matching.
-            let rest: String = chars[i..].iter().collect();
-            if let Some(_tag_len) = match_cot_open(&rest) {
-                // tag_len is in bytes (from the &str), but we need it in chars.
-                // Reconstruct the tag to get its char length.
-                let tag_str: String = chars[i..].iter().take_while(|&&c| c != '>').collect();
-                let tag_char_len = tag_str.len() + 1; // include the '>'
-                // Extract the tag name (without < >).
-                let tag_name: String = chars[i + 1..i + tag_char_len - 1].iter().collect();
-                let close = format!("</{tag_name}>");
-                let close_lower = close.to_lowercase();
-                // Search for the closing tag in the rest of the text.
-                let after_tag: String = chars[i + tag_char_len..].iter().collect();
-                if let Some(close_byte_pos) = after_tag.to_lowercase().find(&close_lower) {
-                    // Convert byte position to char position.
-                    let close_char_pos = after_tag[..close_byte_pos].chars().count();
-                    i = i + tag_char_len + close_char_pos + close.chars().count();
-                    continue;
-                }
-                // No closing tag found — drop the rest (fail closed).
-                return out;
-            }
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
-}
-
-/// Check if the text starts with a CoT opening tag. Returns the length of the
-/// match (including `<` and `>`) if so.
-fn match_cot_open(text: &str) -> Option<usize> {
-    for tag in COT_TAGS {
-        let open = format!("<{tag}>");
-        if text.to_lowercase().starts_with(&open.to_lowercase()) {
-            return Some(open.len());
-        }
-    }
-    None
-}
-
-/// Apply display_safe (H-3) to a text chunk. If the gate rejects, return a
-/// safe placeholder — never crash, never leak.
-pub fn safe_text(text: &str) -> String {
-    match orbit_hud::display_safe(text) {
-        Ok(clean) => clean,
-        Err(_) => "[redacted]".to_string(),
-    }
-}
-
 /// D7: probe the display-safe gate without coercing — `true` = the chunk is
 /// clean (use as-is); `false` = rejected (caller emits a Redacted msg).
 pub fn safe_text_probe(text: &str) -> bool {
     orbit_hud::display_safe(text).is_ok()
-}
-
-/// D6: stateful CoT stripper for streaming deltas. Owns two pieces of
-/// cross-delta state:
-///
-/// 1. `inside` — an opening tag was seen with no closing tag yet; everything
-///    is suppressed until the close arrives (fail closed).
-/// 2. `pending` — a partial tag prefix (`<thi`) at a buffer boundary; held
-///    back until the next delta either completes or disproves it.
-#[derive(Default)]
-pub struct CotStripper {
-    inside: Option<String>, // the open tag name, e.g. "think"
-    pending: String,        // trailing partial-tag bytes
-}
-
-impl CotStripper {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Feed one delta; returns the displayable remainder.
-    pub fn push(&mut self, delta: &str) -> String {
-        // Fast path: mid-block. Scan only for the closing tag.
-        if let Some(tag) = self.inside.clone() {
-            let close = format!("</{tag}>");
-            let hay = format!("{}{}", self.pending, delta);
-            self.pending.clear();
-            if let Some(pos) = hay.to_lowercase().find(&close.to_lowercase()) {
-                // Close found: resume AFTER it, re-entering normal mode for
-                // the remainder of this delta.
-                let after = hay[pos + close.len()..].to_string();
-                self.inside = None;
-                return self.push(&after);
-            }
-            // Still inside: keep a tail only if a partial `</...` prefix
-            // straddles the boundary. Inclusive range — the longest tail
-            // (i == hay.len()) must be reachable, else a delta that IS
-            // entirely a close-prefix would be dropped instead of held.
-            let mut keep = String::new();
-            let max_tail = hay.len().min(close.len());
-            for i in (1..=max_tail).rev() {
-                if !hay.is_char_boundary(hay.len() - i) {
-                    continue;
-                }
-                let tail = &hay[hay.len() - i..];
-                if close.to_lowercase().starts_with(&tail.to_lowercase()) {
-                    keep = tail.to_string();
-                    break;
-                }
-            }
-            self.pending = keep;
-            return String::new();
-        }
-
-        // Normal mode: not inside a block. Prepend any held-back partial tag.
-        let hay = format!("{}{}", self.pending, delta);
-        self.pending.clear();
-        let lower = hay.to_lowercase();
-        let chars: Vec<char> = hay.chars().collect();
-
-        // Look for a complete opening tag.
-        for tag in COT_TAGS {
-            let open = format!("<{tag}>");
-            if let Some(pos) = lower.find(&open.to_lowercase()) {
-                // Emit what precedes it, then enter the block and recurse on
-                // the remainder (which may itself contain the close).
-                let pos_ch = lower[..pos].chars().count();
-                let open_ch = open.chars().count();
-                let before: String = chars[..pos_ch].iter().collect();
-                let rest: String = chars[pos_ch + open_ch..].iter().collect();
-                self.inside = Some(tag.to_string());
-                return before + &self.push(&rest);
-            }
-        }
-
-        // No complete tag. Hold back a trailing partial open-tag prefix
-        // (`<thi`) so a tag split across deltas is still caught.
-        let mut hold = String::new();
-        for i in (1..hay.len().min(8).saturating_sub(0)).rev() {
-            if !hay.is_char_boundary(hay.len() - i) {
-                continue;
-            }
-            let tail = &hay[hay.len() - i..];
-            if COT_TAGS.iter().any(|t| {
-                format!("<{t}>")
-                    .to_lowercase()
-                    .starts_with(&tail.to_lowercase())
-                    && tail.starts_with('<')
-            }) {
-                hold = tail.to_string();
-                break;
-            }
-        }
-        let emit_len = hay.len() - hold.len();
-        let out = hay[..emit_len].to_string();
-        self.pending = hold;
-        out
-    }
 }
 
 /// The full bridge pipeline: strip CoT → emoji-sanitize → display_safe → emit TextDelta.
@@ -609,6 +437,31 @@ pub fn emit_plan_ready(sender: &BusSender, plan: &str) {
 pub fn emit_error(sender: &BusSender, error: &str) {
     let safe = safe_text(error);
     sender.send(Msg::BackendError(safe));
+}
+
+/// Emit a settings, startup or publication warning without failing a turn.
+pub fn emit_notice(sender: &BusSender, notice: &str) {
+    sender.send(Msg::BackendNotice(safe_text(&terminal_safe(notice))));
+}
+
+/// Emit one scoped execution/publication fact before ResponseFinished.
+pub fn emit_ordinary_turn_ended(
+    sender: &BusSender,
+    operation: crate::worker::ForegroundOperation,
+    end: crate::msg::OrdinaryEnd,
+    publication: crate::msg::OrdinaryPublication,
+) {
+    let end = match end {
+        crate::msg::OrdinaryEnd::Failed(reason) => {
+            crate::msg::OrdinaryEnd::Failed(safe_text(&terminal_safe(&reason)))
+        }
+        other => other,
+    };
+    sender.send(Msg::OrdinaryTurnEnded {
+        operation,
+        end,
+        publication,
+    });
 }
 
 /// Emit the cumulative cost update (legacy bridge path — Go bridge).
@@ -973,5 +826,49 @@ mod tests {
             }
             other => panic!("expected Redacted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ordinary_end_and_notice_emitters_keep_safe_text_and_variant_identity() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        use crate::worker::{ForegroundKind, ForegroundOperation, SessionBinding};
+        let (bus, sender) = Bus::new();
+        let operation = ForegroundOperation::new(
+            SessionBinding {
+                session_id: "session-emitter".into(),
+                generation: 1,
+            },
+            ForegroundKind::Prompt,
+            1,
+        )
+        .unwrap();
+        let unsafe_text =
+            "\u{1b}[31mwarning\u{1b}[0m token=ghp_0123456789abcdef0123456789abcdef0123 done";
+        emit_ordinary_turn_ended(
+            &sender,
+            operation.clone(),
+            OrdinaryEnd::Failed(unsafe_text.into()),
+            OrdinaryPublication::Saved,
+        );
+        emit_notice(&sender, unsafe_text);
+        emit_error(&sender, "legacy diagnostic");
+        let messages = drain(&bus);
+        let Msg::OrdinaryTurnEnded {
+            operation: actual,
+            end: OrdinaryEnd::Failed(reason),
+            publication,
+        } = &messages[0]
+        else {
+            panic!("typed ordinary result");
+        };
+        assert_eq!(actual, &operation);
+        assert_eq!(*publication, OrdinaryPublication::Saved);
+        assert!(reason.contains("warning") && reason.contains("done"));
+        assert!(!reason.contains("ghp_0123") && !reason.chars().any(char::is_control));
+        let Msg::BackendNotice(notice) = &messages[1] else {
+            panic!("separate notice");
+        };
+        assert!(!notice.contains("ghp_0123") && !notice.chars().any(char::is_control));
+        assert_eq!(messages[2], Msg::BackendError("legacy diagnostic".into()));
     }
 }

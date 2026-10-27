@@ -254,11 +254,18 @@ impl Home {
     }
     fn configure(&self, authority: &str) -> Vec<u8> {
         let model = |id: &str, cap: u32| {
-            json!({"id":id,"max_output_tokens":cap,
+            let mut value = json!({"id":id,"max_output_tokens":cap,
             "context_limits":{"input_tokens":128000},
             "pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,
                 "cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,
-                "reasoning_per_million_microdollars":0,"request_flat_microdollars":0}})
+                "reasoning_per_million_microdollars":0,"request_flat_microdollars":0}});
+            if id == MODEL {
+                value["billing"] = json!({"version":2,"input_per_million_microdollars":0,
+                    "output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,
+                    "cache_write_per_million_microdollars":0,"request_flat_microdollars":0,
+                    "reasoning_counter_basis":"included_in_output","reasoning_rate_policy":"output_rate"});
+            }
+            value
         };
         let config: orbit_cli::config::ProvidersConfig = serde_json::from_value(json!({
             "provider":[

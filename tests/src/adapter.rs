@@ -284,12 +284,14 @@ fn adapter_drift_does_not_change_terminal_status() {
 fn adapter_no_finished_yields_partial_terminal() {
     let events = vec![
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 0,
             event: ProviderEventKind::ResponseStarted {
                 upstream_request_id: None,
             },
         },
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 1,
             event: ProviderEventKind::TextDelta {
                 bytes: b"partial".to_vec(),
@@ -323,12 +325,14 @@ fn adapter_no_finished_yields_partial_terminal() {
 fn adapter_duplicate_sequence_rejected() {
     let skipped = vec![
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 0,
             event: ProviderEventKind::ResponseStarted {
                 upstream_request_id: None,
             },
         },
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 2,
             event: ProviderEventKind::Finished {
                 finish_reason: None,
@@ -340,12 +344,14 @@ fn adapter_duplicate_sequence_rejected() {
 
     let duplicate = vec![
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 0,
             event: ProviderEventKind::ResponseStarted {
                 upstream_request_id: None,
             },
         },
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 1,
             event: ProviderEventKind::Finished {
                 finish_reason: None,
@@ -353,6 +359,7 @@ fn adapter_duplicate_sequence_rejected() {
             },
         },
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 1,
             event: ProviderEventKind::Finished {
                 finish_reason: None,

@@ -84,6 +84,8 @@ pub struct TurnConfig {
     /// Adapter kind from providers.toml (default openai-compatible).
     pub kind: ProviderKind,
     pub credential_env: Option<String>,
+    /// Exact model-scoped v2 billing terms; legacy rates remain display-only.
+    pub billing: Option<orbit_adapter::types::BillingQuoteContractV1>,
     pub pricing: Option<orbit_adapter::types::CostRates>,
     pub max_output_tokens: u64,
     /// Optional sampling override (E8): temperature / top_p as
@@ -101,6 +103,56 @@ pub struct TurnConfig {
     /// Per-model stream-gap deadline from providers.toml (E5). None keeps
     /// the 90 s default.
     pub idle_timeout_ms: Option<u64>,
+}
+
+fn observed_billing_cost_microdollars(
+    config: &TurnConfig,
+    evidence: Option<&orbit_adapter::types::UsageObservationEvidenceV1>,
+) -> Option<u64> {
+    use orbit_adapter::types::{
+        BillingObservedUsageV1, ReasoningReporting, UsageObservationDispositionV1,
+        UsageObservationOriginV1, UsageObservationQualificationV1, UsageReportingPresenceV1,
+        UsageSource,
+    };
+    let contract = config.billing.as_ref()?;
+    if contract.provider_id().0.as_str() != config.provider_id
+        || contract.raw_model_id().0.as_str() != config.model
+    {
+        return None;
+    }
+    let evidence = evidence?;
+    // A terminal provider-reported snapshot is billable even when the model
+    // stopped for a non-success reason such as a token limit or content filter.
+    // Completion controls whether the turn can continue; it must not erase
+    // usage the provider has already finalized.
+    if evidence.encoding_version != 1
+        || !matches!(
+            evidence.disposition,
+            UsageObservationDispositionV1::CompleteText
+                | UsageObservationDispositionV1::CompleteTools
+                | UsageObservationDispositionV1::IncompleteOrOther
+        )
+        || evidence.qualification
+            != UsageObservationQualificationV1::ProviderReportedTerminalSnapshot
+    {
+        return None;
+    }
+    let snapshot = evidence.selected.as_ref()?;
+    if snapshot.source != UsageSource::Final
+        || snapshot.snapshot_origin != UsageObservationOriginV1::ProviderReported
+    {
+        return None;
+    }
+    let reasoning_reporting = match snapshot.reasoning_reporting {
+        UsageReportingPresenceV1::Reported => ReasoningReporting::Reported,
+        UsageReportingPresenceV1::NotReported => ReasoningReporting::NotReported,
+        UsageReportingPresenceV1::LegacyUnknown => ReasoningReporting::LegacyUnknown,
+    };
+    let observed = BillingObservedUsageV1 {
+        raw_usage: snapshot.raw_usage,
+        reasoning_reporting,
+    };
+    orbit_adapter::types::quote_observed_billing(contract, &observed).full_total_microdollars
 }
 
 impl TurnConfig {
@@ -732,6 +784,7 @@ pub(crate) fn run_prepared_dispatch_detailed(
         if current.binding_digest != prepared.context.binding_digest
             || current.route != prepared.request.route
             || config.pricing != prepared.context.config.pricing
+            || config.billing != prepared.context.config.billing
             || session_id != prepared.session_id
         {
             return Err(("ORBIT-E0413", "prepared provider binding changed".into()));
@@ -1010,11 +1063,22 @@ pub(crate) fn run_prepared_dispatch_detailed(
                             "provider context accounting overflow".to_owned(),
                         )
                     })?;
-                // Cost in microcents from the pricing config (zero if unpriced).
-                let cost_microcents = config
-                    .pricing
-                    .and_then(|p| p.cost_microcents(&usage))
-                    .unwrap_or(0);
+                // The legacy outcome field retains its historical unit name.
+                // V2 contracts quote only qualified provider-reported terminal
+                // usage; incomplete quotes remain zero here and are represented
+                // as `None` by the authoritative accounting receipt.
+                let cost_microcents = if config.billing.is_some() {
+                    observed_billing_cost_microdollars(
+                        config,
+                        r.accounting.usage_observation.as_deref(),
+                    )
+                    .unwrap_or(0)
+                } else {
+                    config
+                        .pricing
+                        .and_then(|p| p.cost_microcents(&usage))
+                        .unwrap_or(0)
+                };
                 Ok(TurnOutcome {
                     output,
                     thinking,
@@ -1079,6 +1143,7 @@ mod preparation_tests {
             model: "raw-model".into(),
             kind: ProviderKind::OpenAiCompatible,
             credential_env: None,
+            billing: None,
             pricing: None,
             max_output_tokens: 73,
             sampling: None,

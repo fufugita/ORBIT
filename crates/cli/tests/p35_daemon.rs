@@ -3,8 +3,8 @@
 pub use orbit_cli::{
     apply_effort_setting, checked_model_turn, config, context_window_for_turn, effort_status,
     model_limits, parse_effort_setting, phase_routing, provider_policies, resolve_selected_model,
-    route_command, session_accounting, sessions, tool_runtime, tools, try_engine_turn_config,
-    try_phase_turn_config, try_role_turn_config, tui_worker,
+    route_command, session_accounting, session_config, sessions, tool_runtime, tools,
+    try_engine_turn_config, try_phase_turn_config, try_role_turn_config,
 };
 #[path = "../src/attach.rs"]
 pub mod attach;
@@ -55,7 +55,7 @@ impl Fixture {
             serde_json::from_slice(&fs::read(root.join("ready.json")).unwrap()).unwrap();
         let gate = ready["gate"].as_str().unwrap().to_owned();
         fs::write(root.join("providers.toml"), format!("[[provider]]\nname=\"fixture\"\nurl={gate:?}\n[[provider.models]]\nid=\"model-a\"\nsupported_efforts=[\"low\",\"high\"]\ndefault_effort=\"low\"\n[[provider.models]]\nid=\"model-b\"\nsupported_efforts=[\"low\",\"high\"]\ndefault_effort=\"high\"\n")).unwrap();
-        let turn = tui_worker::TuiTurnConfig {
+        let turn = session_config::SessionTurnConfig {
             home: root.clone(),
             session_id: "owned".into(),
             gate,
@@ -676,7 +676,7 @@ fn daemon_child() {
     }
     let providers = config::ProvidersConfig::load(&root).unwrap();
     let provider = &providers.provider[0];
-    let turn = tui_worker::TuiTurnConfig {
+    let turn = session_config::SessionTurnConfig {
         home: root.clone(),
         session_id: "owned".into(),
         gate: provider.url.clone(),
@@ -2128,6 +2128,10 @@ mod manual_owner_capability {
             format!("{base}/main/v1?binding=main"),
             format!("{base}/summary/v1?binding=summary")
         );
+        let config = config.replace(
+            "request_flat_microdollars=17\n[roles]",
+            "request_flat_microdollars=17\n[provider.models.billing]\nversion=2\ninput_per_million_microdollars=0\noutput_per_million_microdollars=0\ncache_read_per_million_microdollars=0\ncache_write_per_million_microdollars=0\nrequest_flat_microdollars=17\nreasoning_counter_basis='included_in_output'\nreasoning_rate_policy='output_rate'\n[roles]",
+        );
         fs::write(f.root.join("providers.toml"), config).unwrap();
         let configured = orbit_cli::config::ProvidersConfig::load(&f.root).unwrap();
         let store = ProviderCredentialStore::new(&f.root).unwrap();
@@ -3366,7 +3370,7 @@ mod refusal_policy_owner {
                     .unwrap();
             orbit_cli::setup::apply_setup(&plan).unwrap();
             let wire = Wire::new(replies);
-            let model = |id: &str| json!({"id":id,"max_output_tokens":73,"context_limits":{"input_tokens":128000},"pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"reasoning_per_million_microdollars":0,"request_flat_microdollars":13}});
+            let model = |id: &str| json!({"id":id,"max_output_tokens":73,"context_limits":{"input_tokens":128000},"pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"reasoning_per_million_microdollars":0,"request_flat_microdollars":13},"billing":{"version":2,"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"request_flat_microdollars":13,"reasoning_counter_basis":"included_in_output","reasoning_rate_policy":"output_rate"}});
             let mut value = json!({"provider":[{"name":"base","kind":"openai-compatible","url":format!("http://{}/a/v1?route=base&raw=%2F",wire.authority),"models":[model("model-a")]},{"name":"selected","kind":"openai-compatible","url":format!("http://{}/b/v1?route=final&raw=%2F",wire.authority),"models":[model("model-b")]}],"roles":{"main":"base/model-a"}});
             if routing {
                 value["routing"] = json!({"phases":{"coding":{"default":"selected/model-b","hard":"selected/model-b"}},"phase_keywords":{"clear":true,"coding":["selected-route"]}});
@@ -3376,7 +3380,7 @@ mod refusal_policy_owner {
                 &home.join("providers.toml"),
                 toml::to_string(&configured).unwrap(),
             );
-            let turn = tui_worker::TuiTurnConfig {
+            let turn = session_config::SessionTurnConfig {
                 home: home.clone(),
                 session_id: "owned".into(),
                 gate: configured.provider[0].url.clone(),

@@ -109,7 +109,13 @@ fn phase_identity_coding_hard_has_exact_caps_and_offline_preview() {
     assert_eq!(d.provider_id, "local");
     assert_eq!(d.raw_model, "vendor/model-a");
     assert_eq!(d.model.caps.max_output_tokens, Some(777));
-    assert_eq!(d.model.pricing.input_per_million_microdollars, 123);
+    assert_eq!(
+        d.model
+            .pricing
+            .as_ref()
+            .and_then(|pricing| pricing.input_per_million_microdollars),
+        Some(123)
+    );
     assert_eq!(d.model.credential_env.as_deref(), Some("FIXTURE_TOKEN"));
     assert_eq!(
         d,

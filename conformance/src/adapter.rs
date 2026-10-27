@@ -110,7 +110,7 @@ pub fn run_conformance(
         name: "stream_contiguous_and_single_terminal",
         passed: stream_ok.is_empty(),
         detail: if stream_ok.is_empty() {
-            "events contiguous, one terminal, usage monotonic".into()
+            "events contiguous; terminal placement and usage snapshots validated".into()
         } else {
             stream_ok
         },
@@ -180,34 +180,13 @@ fn finish(results: Vec<AdapterAssertion>) -> Result<Vec<AdapterAssertion>, Adapt
     }
 }
 
-/// Validate a result's events: contiguous sequence, exactly one terminalizer,
-/// usage monotonic (GW-11/GW-13). Returns an error message or "" on success.
+/// Validate through the shared adapter stream checks, including raw usage and metadata.
+/// Valid partial prefixes retain their existing acceptance. Returns "" on success.
 fn validate_result_events(events: &[ProviderStreamEvent]) -> String {
-    let mut prev_seq: Option<u64> = None;
-    let mut finished_seen = false;
-    for ev in events {
-        if let Some(p) = prev_seq {
-            if ev.sequence != p + 1 {
-                return format!("sequence {} follows {} (E0411)", ev.sequence, p);
-            }
-        } else if ev.sequence != 0 {
-            return "first sequence must be 0 (E0411)".into();
-        }
-        if finished_seen {
-            return "event after Finished (E0411)".into();
-        }
-        if matches!(
-            ev.event,
-            orbit_adapter::types::ProviderEventKind::Finished { .. }
-        ) {
-            if finished_seen {
-                return "duplicate Finished (E0411)".into();
-            }
-            finished_seen = true;
-        }
-        prev_seq = Some(ev.sequence);
+    match orbit_adapter::stream::validate_stream(events) {
+        Ok(_) => String::new(),
+        Err(error) => error.to_string(),
     }
-    String::new()
 }
 
 #[cfg(test)]
@@ -219,8 +198,7 @@ mod tests {
     };
     use orbit_adapter::conformance::canonical_request;
     use orbit_adapter::types::{
-        AdapterKind, ProviderResult, ProviderRouteBinding, ProviderStreamEvent,
-        ProviderTerminalStatus, ProviderUsage, Sha256Digest,
+        AdapterKind, ProviderRouteBinding, ProviderStreamEvent, ProviderUsage, Sha256Digest,
     };
 
     fn route(kind: AdapterKind) -> ProviderRouteBinding {
@@ -288,18 +266,21 @@ mod tests {
         };
         let events = vec![
             ProviderStreamEvent {
+                usage_observation: None,
                 sequence: 0,
                 event: orbit_adapter::types::ProviderEventKind::ResponseStarted {
                     upstream_request_id: None,
                 },
             },
             ProviderStreamEvent {
+                usage_observation: None,
                 sequence: 1,
                 event: orbit_adapter::types::ProviderEventKind::TextDelta {
                     bytes: b"partial".to_vec(),
                 },
             },
             ProviderStreamEvent {
+                usage_observation: None,
                 sequence: 2,
                 event: orbit_adapter::types::ProviderEventKind::UsageUpdate(usage),
             },
@@ -335,74 +316,101 @@ mod tests {
 
     #[test]
     fn decreasing_usage_stream_fails_conformance() {
-        // Build a scripted adapter that emits decreasing usage (GW-13).
-        let events = vec![
-            ProviderStreamEvent {
-                sequence: 0,
-                event: orbit_adapter::types::ProviderEventKind::UsageUpdate(ProviderUsage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    ..Default::default()
-                }),
-            },
-            ProviderStreamEvent {
-                sequence: 1,
-                event: orbit_adapter::types::ProviderEventKind::UsageUpdate(ProviderUsage {
-                    input_tokens: 10,
-                    output_tokens: 4,
-                    ..Default::default()
-                }),
-            },
-            ProviderStreamEvent {
-                sequence: 2,
-                event: orbit_adapter::types::ProviderEventKind::Finished {
-                    finish_reason: Some(String::from("stop")),
-                    final_usage: None,
-                },
-            },
-        ];
-        let _ = events; // the harness validates the RETURNED events; for a
-        // negative case we assert via orbit_adapter::stream.
-        let r = route(AdapterKind::MockHttpV1);
-        let request = canonical_request(&r, b"conformance input");
-        // The negative stream validation is proven by the adapter crate's own
-        // stream module; here we assert the harness surfaces a failure when
-        // the adapter returns a non-contiguous stream.
-        let bad_result = ProviderResult {
-            status: ProviderTerminalStatus::Completed,
-            binding: Default::default(),
-            output: orbit_adapter::types::OutputEvidence::default(),
-            accounting: orbit_adapter::types::AccountingResult {
-                cost_microcents: 0,
-                usage: ProviderUsage::default(),
-                usage_source: Some(orbit_adapter::types::UsageSource::Final),
-                usage_complete: true,
-                ..Default::default()
-            },
-            transport: Default::default(),
-            events: vec![
-                ProviderStreamEvent {
-                    sequence: 0,
-                    event: orbit_adapter::types::ProviderEventKind::ResponseStarted {
-                        upstream_request_id: None,
-                    },
-                },
-                ProviderStreamEvent {
-                    sequence: 2, // SKIPPED 1 → non-contiguous
-                    event: orbit_adapter::types::ProviderEventKind::Finished {
-                        finish_reason: None,
-                        final_usage: None,
-                    },
-                },
-            ],
-        };
-        let bad_adapter = MockHttpV1::new(
+        let route = route(AdapterKind::MockHttpV1);
+        let request = canonical_request(&route, b"conformance input");
+        let canonical = canonical_success_result();
+        let control = MockHttpV1::new(
             identity(AdapterKind::MockHttpV1, &"i".repeat(64), &"p".repeat(64)),
             text_capabilities(),
-            MockScript::Success(bad_result),
+            MockScript::Success(canonical.clone()),
         );
-        let err = run_conformance("mock-http-v1-skipped-seq", &bad_adapter, &r, &request);
-        assert!(err.is_err(), "skipped sequence must fail conformance");
+        let assertions = run_conformance("canonical-control", &control, &route, &request)
+            .expect("the canonical result must pass the full conformance suite");
+        assert!(!assertions.is_empty());
+        assert!(assertions.iter().all(|assertion| assertion.passed));
+
+        let mut regressed = canonical.clone();
+        match &mut regressed
+            .events
+            .last_mut()
+            .expect("canonical terminal")
+            .event
+        {
+            orbit_adapter::types::ProviderEventKind::Finished {
+                final_usage: Some(usage),
+                ..
+            } => {
+                assert_eq!(usage.output_tokens, 2);
+                usage.output_tokens = 1;
+            }
+            _ => panic!("canonical result must end with final usage"),
+        }
+        assert_eq!(regressed.output, canonical.output);
+        assert_eq!(regressed.accounting, canonical.accounting);
+        let mut restored = regressed.clone();
+        match &mut restored
+            .events
+            .last_mut()
+            .expect("canonical terminal")
+            .event
+        {
+            orbit_adapter::types::ProviderEventKind::Finished {
+                final_usage: Some(usage),
+                ..
+            } => usage.output_tokens = 2,
+            _ => panic!("canonical result must end with final usage"),
+        }
+        assert_eq!(
+            restored, canonical,
+            "only the final output counter may differ"
+        );
+        let usage_error = orbit_adapter::stream::validate_stream(&regressed.events)
+            .expect_err("the shared validator must reject the final-only raw decrease");
+        assert_eq!(usage_error.code(), "E0416");
+        let bad = MockHttpV1::new(
+            identity(AdapterKind::MockHttpV1, &"i".repeat(64), &"p".repeat(64)),
+            text_capabilities(),
+            MockScript::Success(regressed.clone()),
+        );
+        run_conformance("final-raw-decrease", &bad, &route, &request)
+            .expect_err("conformance must reject the final-only raw decrease");
+        assert!(validate_result_events(&regressed.events).contains("E0416"));
+    }
+
+    #[test]
+    fn skipped_sequence_stream_fails_conformance() {
+        let route = route(AdapterKind::MockHttpV1);
+        let request = canonical_request(&route, b"conformance input");
+        let canonical = canonical_success_result();
+        let control = MockHttpV1::new(
+            identity(AdapterKind::MockHttpV1, &"i".repeat(64), &"p".repeat(64)),
+            text_capabilities(),
+            MockScript::Success(canonical.clone()),
+        );
+        let assertions = run_conformance("canonical-sequence-control", &control, &route, &request)
+            .expect("the canonical result must pass the full conformance suite");
+        assert!(!assertions.is_empty());
+        assert!(assertions.iter().all(|assertion| assertion.passed));
+
+        let mut skipped = canonical.clone();
+        assert_eq!(skipped.events[1].sequence, 1);
+        skipped.events[1].sequence = 2;
+        assert_eq!(skipped.output, canonical.output);
+        assert_eq!(skipped.accounting, canonical.accounting);
+        let mut restored = skipped.clone();
+        restored.events[1].sequence = 1;
+        assert_eq!(restored, canonical, "only the selected sequence may differ");
+        let sequence_error = orbit_adapter::stream::validate_stream(&skipped.events)
+            .expect_err("the shared validator must reject the skipped sequence");
+        assert_eq!(sequence_error.code(), "E0411");
+        let bad = MockHttpV1::new(
+            identity(AdapterKind::MockHttpV1, &"i".repeat(64), &"p".repeat(64)),
+            text_capabilities(),
+            MockScript::Success(skipped.clone()),
+        );
+        run_conformance("skipped-sequence", &bad, &route, &request)
+            .expect_err("conformance must reject the skipped sequence");
+        assert!(validate_result_events(&skipped.events).contains("E0411"));
     }
 }
 

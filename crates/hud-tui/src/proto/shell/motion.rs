@@ -2,8 +2,9 @@
 //! a test can render any frame at any time. Times are seconds as `f32`.
 //! Under reduced motion every curve collapses to its end state.
 
-use super::canvas::{Rgb, Seg, mix};
+use super::canvas::{Rgb, Seg, mix, text_width};
 use super::pal::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub fn secs(ms: u64) -> f32 {
     ms as f32 / 1000.0
@@ -65,20 +66,31 @@ pub fn star_at(now: f32, fps: f32, reduced: bool) -> &'static str {
 
 /// A bright band sweeping across `text` once per 1.6 s (M03).
 pub fn shimmer(text: &str, now: f32, base: Rgb, reduced: bool) -> Vec<Seg> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len() as f32;
     if reduced {
         return vec![Seg::new(text, base)];
     }
-    let (period, band) = (1.6_f32, 6.0_f32);
-    let pos = ((now % period) / period) * (n + band * 2.0) - band;
-    chars
+    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    let widths: Vec<usize> = graphemes
         .iter()
-        .enumerate()
-        .map(|(i, ch)| {
-            let d = (i as f32 - pos).abs();
+        .map(|grapheme| text_width(grapheme).max(0) as usize)
+        .collect();
+    let n: usize = widths.iter().sum();
+    let (period, band) = (1.6_f32, 6.0_f32);
+    let pos = ((now % period) / period) * (n as f32 + band * 2.0) - band;
+    let mut cell = 0usize;
+    graphemes
+        .iter()
+        .zip(widths)
+        .map(|(grapheme, width)| {
+            let center = if width == 0 {
+                cell as f32
+            } else {
+                cell as f32 + (width as f32 - 1.0) / 2.0
+            };
+            cell += width;
+            let d = (center - pos).abs();
             let a = (1.0 - d / (band / 2.0)).max(0.0);
-            Seg::new(ch.to_string(), mix(base, WHITE, 0.85 * a * a))
+            Seg::new(*grapheme, mix(base, WHITE, 0.85 * a * a))
         })
         .collect()
 }
@@ -112,6 +124,26 @@ mod tests {
             b.iter().map(|s| s.fg).collect::<Vec<_>>()
         );
         assert_eq!(shimmer("x", 0.8, CYAN, true)[0].fg, CYAN);
+    }
+
+    #[test]
+    fn shimmer_keeps_graphemes_whole_and_positions_by_display_cells() {
+        let text = "e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦";
+        let first = shimmer(text, 0.1, CYAN, false);
+        let later = shimmer(text, 0.8, CYAN, false);
+        assert_eq!(
+            first
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
+            text
+        );
+        assert_eq!(first.len(), text.graphemes(true).count());
+        assert_eq!(first.iter().map(Seg::width).sum::<i32>(), text_width(text));
+        assert_ne!(
+            first.iter().map(|segment| segment.fg).collect::<Vec<_>>(),
+            later.iter().map(|segment| segment.fg).collect::<Vec<_>>()
+        );
     }
 
     #[test]

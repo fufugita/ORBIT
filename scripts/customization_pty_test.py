@@ -34,6 +34,7 @@ def main():
         while time.monotonic() < deadline:
             session.read(0.15)
             if probe():
+                f.observe_pty(session)
                 return
             if session.proc.poll() is not None:
                 break
@@ -52,7 +53,8 @@ def main():
                 for value in (cell.fg, cell.bg)}
 
     def command(text):
-        session.type(text)
+        visible, screen = session.type_until_visible(text, timeout=5, interval=0.05)
+        assert visible, ("command was not accepted into the composer", text, screen)
         session.key("enter")
         session.read(0.4)
 
@@ -62,8 +64,9 @@ def main():
         session.read(0.2)
 
     def clear_draft():
-        session.write(b"\x7f" * 200)
-        session.read(0.2)
+        for _ in range(len("draft evidence only")):
+            session.key("backspace")
+            session.read(0.05)
 
     try:
         with Fixture(args.binary) as f:
@@ -85,11 +88,18 @@ def main():
             (f.home / "tui.toml").chmod(0o644)
 
             def start(extra=(), env=None, cols=160):
+                before = f.launch_snapshot("pty")
                 opened = PtySession([f.binary, "--home", str(f.home), "--model", "fixture/local", *extra],
                                     env={**f.env, "TERM": "xterm-256color", "COLORTERM": "truecolor", **(env or {})},
                                     cwd=f.work, rows=40, cols=cols)
                 f.sessions.append(opened)
+                f.register_launch(opened.proc, "pty", before)
                 return opened
+
+            def stop(opened):
+                if opened.master is not None:
+                    opened.terminate()
+                f.finish_launch(f.record_for(opened.proc))
 
             session = start()
             wait(lambda: has("Proof pane") and conversation_visible(), "custom layout startup")
@@ -135,7 +145,7 @@ def main():
             session.resize(40, 160)
             session.key("tab")
             session.read(0.3)
-            session.terminate()
+            stop(session)
             session = start()
             wait(lambda: has("Proof pane") and "123456" in colors(), "restart customization")
             checked("restart_retains_theme_color_density_glyphs_and_custom_layout",
@@ -144,12 +154,12 @@ def main():
             command("/customize set layout.preset review")
             wait(lambda: f.profile()["layout"]["preset"] == "review" and has("Review"), "layout preset reload")
             checked("slash_layout_preset_changes_the_actual_panel_tree", has("Review"), not f.calls)
-            session.terminate()
+            stop(session)
             session = start(env={"NO_COLOR": "1"})
             wait(conversation_visible, "no-color startup")
             checked("no_color_overrules_persisted_truecolor_in_real_terminal_cells",
                     not any(len(color) == 6 for color in colors()), f.profile()["color_mode"] == "truecolor", not f.calls)
-            session.terminate()
+            stop(session)
             malformed_legacy = b"[legacy broken\n"
             malformed_profile = b"{broken profile"
             (f.home / "tui.toml").write_bytes(malformed_legacy)
@@ -162,11 +172,15 @@ def main():
                     (f.home / "tui.toml").read_bytes() == malformed_legacy,
                     (f.home / "customization.json").read_bytes() == malformed_profile,
                     not has("Proof pane"), f.unchanged(allow_new_sessions=True))
-            session.terminate()
+            stop(session)
             session = None
+            checked("all_four_customization_tui_leases_release_without_inode_replacement",
+                    len(f.chat_records) == 4,
+                    all(item["launch_mode"] == "pty" and item["finished"] for item in f.chat_records),
+                    f.unchanged(allow_new_sessions=True), not f.calls)
     finally:
         if session and session.master is not None:
-            session.terminate()
+            stop(session)
         if inherited_no_color is not None:
             os.environ["NO_COLOR"] = inherited_no_color
         os.umask(inherited_umask)

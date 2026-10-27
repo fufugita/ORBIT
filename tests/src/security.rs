@@ -308,29 +308,11 @@ fn loopback_local_requires_explicit_card_and_egress_intent() {
     assert!(!p.wasi_imports.allow_wasi_http_proxy);
 }
 
-// ── ORBIT-F-DIST-005/008 ──────────────────────────────────────────
+// ── PIB signature verification ───────────────────────────────────
 
-/// dist_cargo_deny_blocks_copyleft — the license policy is permissive-only;
-/// the workspace uses permissive licenses (asserted via the manifest source).
+/// A PIB signature verifies its original payload and rejects altered bytes.
 #[test]
-fn dist_cargo_deny_blocks_copyleft() {
-    // The workspace dependency baseline is permissive-only (DR-13 §5). We assert
-    // the release crate's SBOM shape records SPDX expressions.
-    let entries = vec![orbit_release::SbomEntry {
-        name: "serde".into(),
-        version: "1".into(),
-        license: "MIT OR Apache-2.0".into(),
-        sha256: "a".repeat(64),
-        supplier: "crates.io".into(),
-    }];
-    let sbom = orbit_release::generate_sbom(&entries);
-    let v: serde_json::Value = serde_json::from_slice(&sbom).unwrap();
-    assert_eq!(v["packages"][0]["licenseConcluded"], "MIT OR Apache-2.0");
-}
-
-/// dist_signature_verification — the PIB signed-artifact path verifies or refuses.
-#[test]
-fn dist_signature_verification() {
+fn pib_signature_verifies_and_rejects_tampering() {
     use ed25519_dalek::{Signer, SigningKey};
     use orbit_pib::SignedBySourcePib;
     use rand_core::OsRng;

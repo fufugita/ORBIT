@@ -823,6 +823,7 @@ mod recovery_baselines {
                 reasoning_per_million_microcents: Some(0),
                 request_flat_microcents: 7,
             }),
+            billing: None,
             max_output_tokens: 73,
             sampling: None,
             effort: None,

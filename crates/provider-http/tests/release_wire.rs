@@ -1385,3 +1385,670 @@ async fn endpoint_query_anthropic_redirect_trap_receives_nothing() {
 async fn endpoint_query_ollama_redirect_trap_receives_nothing() {
     assert_redirect_refused(Family::Ollama).await;
 }
+
+mod usage_observation_wire {
+    use super::*;
+    use orbit_adapter::stream::usage_observation_evidence_v1;
+    use orbit_adapter::types::{
+        ProviderUsage, UsageObservationDispositionV1, UsageObservationMetaV1,
+        UsageObservationOriginV1, UsageObservationQualificationV1, UsageObservationSnapshotV1,
+        UsageReasoningReportingV1, UsageReportingPresenceV1, UsageSnapshotOriginV1, UsageSource,
+    };
+
+    fn usage(values: [u64; 5]) -> ProviderUsage {
+        ProviderUsage {
+            input_tokens: values[0],
+            output_tokens: values[1],
+            cache_read_tokens: values[2],
+            cache_write_tokens: values[3],
+            reasoning_tokens: values[4],
+        }
+    }
+
+    fn openai_body(snapshots: &[Value]) -> String {
+        let mut body = openai_reason("stop");
+        for snapshot in snapshots {
+            body.push_str(&sse(json!({"choices":[],"usage":snapshot})));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    // This collects actual wire events without promoting them to validated evidence.
+    async fn wire_events(
+        family: Family,
+        body: String,
+    ) -> Result<Vec<ProviderStreamEvent>, AdapterError> {
+        let adapter = adapter(family);
+        let mut mock = Mock::new(body, family).await;
+        let request = request(adapter.as_ref(), mock.port);
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let cancel = CancelToken::new();
+            let mut stream = adapter.invoke(&request, None, &cancel).await?;
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event?);
+            }
+            Ok::<_, AdapterError>(events)
+        })
+        .await
+        .expect("bounded wire fixture must complete");
+        assert!(
+            mock.captured().await.is_some(),
+            "the fixture must capture a real POST"
+        );
+        drop(mock);
+        result
+    }
+
+    async fn validated_wire(family: Family, body: String) -> Vec<ProviderStreamEvent> {
+        let events = wire_events(family, body)
+            .await
+            .expect("valid raw wire fixture");
+        orbit_adapter::stream::validate_stream(&events).expect("valid raw stream control");
+        events
+    }
+
+    fn update_events(events: &[ProviderStreamEvent]) -> Vec<&ProviderStreamEvent> {
+        events
+            .iter()
+            .filter(|event| matches!(event.event, ProviderEventKind::UsageUpdate(_)))
+            .collect()
+    }
+
+    fn assert_raw_stream(
+        events: &[ProviderStreamEvent],
+        reason: &str,
+        expected_updates: &[ProviderUsage],
+        expected_final: Option<ProviderUsage>,
+    ) {
+        assert!(matches!(
+            events.first().map(|event| &event.event),
+            Some(ProviderEventKind::ResponseStarted { .. })
+        ));
+        for (sequence, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, u64::try_from(sequence).unwrap());
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, ProviderEventKind::Finished { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(events.last().map(|event| &event.event),
+            Some(ProviderEventKind::Finished { finish_reason, .. })
+                if finish_reason.as_deref() == Some(reason)));
+        let updates: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.event {
+                ProviderEventKind::UsageUpdate(raw) => Some(raw),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.as_slice(), expected_updates);
+        assert_eq!(final_usage(events), expected_final);
+    }
+
+    fn assert_metadata(
+        event: &ProviderStreamEvent,
+        reporting: UsageReasoningReportingV1,
+        origin: UsageSnapshotOriginV1,
+        case: &str,
+    ) {
+        assert_eq!(
+            event.usage_observation,
+            Some(UsageObservationMetaV1 {
+                version: 1,
+                reasoning_reporting: reporting,
+                snapshot_origin: origin,
+            }),
+            "snapshot metadata must match its exact raw usage: {case}"
+        );
+    }
+
+    fn assert_other_metadata_absent(events: &[ProviderStreamEvent]) {
+        for event in events {
+            if !matches!(
+                event.event,
+                ProviderEventKind::UsageUpdate(_)
+                    | ProviderEventKind::Finished {
+                        final_usage: Some(_),
+                        ..
+                    }
+            ) {
+                assert_eq!(event.usage_observation, None);
+            }
+        }
+    }
+
+    fn assert_evidence(
+        events: &[ProviderStreamEvent],
+        selected: Option<UsageObservationSnapshotV1>,
+        qualification: UsageObservationQualificationV1,
+        disposition: UsageObservationDispositionV1,
+    ) {
+        let evidence = usage_observation_evidence_v1(events).expect("valid inspection evidence");
+        assert_eq!(evidence.encoding_version, 1);
+        assert_eq!(evidence.selected, selected);
+        assert_eq!(evidence.qualification, qualification);
+        assert_eq!(evidence.disposition, disposition);
+    }
+
+    #[derive(Clone, Copy)]
+    enum CancelBoundary {
+        Usage,
+        Text,
+    }
+
+    async fn cancel_after(
+        family: Family,
+        body: String,
+        boundary: CancelBoundary,
+    ) -> Vec<ProviderStreamEvent> {
+        let adapter = adapter(family);
+        let mut mock = Mock::scripted(body, family, Some(None)).await;
+        let request = request(adapter.as_ref(), mock.port);
+        let cancel = CancelToken::new();
+        let mut stream = adapter.invoke(&request, None, &cancel).await.unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut events = Vec::new();
+            let mut boundary_seen = false;
+            while let Some(event) = stream.next().await {
+                let event = event.expect("controlled cancellation must not become a wire error");
+                let reached = match boundary {
+                    CancelBoundary::Usage => {
+                        matches!(event.event, ProviderEventKind::UsageUpdate(_))
+                    }
+                    CancelBoundary::Text => {
+                        matches!(event.event, ProviderEventKind::TextDelta { .. })
+                    }
+                };
+                if !boundary_seen && reached {
+                    boundary_seen = true;
+                    cancel.cancel();
+                }
+                events.push(event);
+            }
+            assert!(
+                boundary_seen,
+                "cancel only after the actual requested wire event"
+            );
+            events
+        })
+        .await
+        .expect("bounded cancellation fixture must terminate");
+        drop(stream);
+        assert!(
+            mock.captured().await.is_some(),
+            "body cancellation follows a captured POST"
+        );
+        drop(mock);
+        orbit_adapter::stream::validate_stream(&events)
+            .expect("valid cancelled raw stream control");
+        events
+    }
+
+    #[tokio::test]
+    async fn openai_presence_is_paired_with_exact_normalized_usage() {
+        for (case, details, reasoning, reporting) in [
+            ("absent", None, 0, UsageReasoningReportingV1::NotReported),
+            (
+                "empty",
+                Some(json!({})),
+                0,
+                UsageReasoningReportingV1::NotReported,
+            ),
+            (
+                "null_details",
+                Some(Value::Null),
+                0,
+                UsageReasoningReportingV1::NotReported,
+            ),
+            (
+                "reported_zero",
+                Some(json!({"reasoning_tokens":0})),
+                0,
+                UsageReasoningReportingV1::Reported,
+            ),
+            (
+                "reported_positive",
+                Some(json!({"reasoning_tokens":7})),
+                7,
+                UsageReasoningReportingV1::Reported,
+            ),
+            (
+                "separate_compatible_counter",
+                Some(json!({"reasoning_tokens":540})),
+                540,
+                UsageReasoningReportingV1::Reported,
+            ),
+        ] {
+            let mut snapshot = json!({
+                "prompt_tokens":20, "completion_tokens":12, "total_tokens":32,
+                "prompt_tokens_details":{"cached_tokens":3}
+            });
+            if let Some(details) = details {
+                snapshot["completion_tokens_details"] = details;
+            }
+            let events = validated_wire(Family::OpenAi, openai_body(&[snapshot])).await;
+            let expected = usage([17, 12, 3, 0, reasoning]);
+            assert_raw_stream(&events, "stop", &[expected], Some(expected));
+            assert_eq!(events.len(), 3);
+            assert_other_metadata_absent(&events);
+            assert_metadata(
+                &events[1],
+                reporting,
+                UsageSnapshotOriginV1::ProviderReported,
+                case,
+            );
+            assert_metadata(
+                &events[2],
+                reporting,
+                UsageSnapshotOriginV1::ProviderReported,
+                case,
+            );
+            assert_evidence(
+                &events,
+                Some(UsageObservationSnapshotV1 {
+                    sequence: 2,
+                    raw_usage: expected,
+                    source: UsageSource::Final,
+                    reasoning_reporting: match reporting {
+                        UsageReasoningReportingV1::Reported => UsageReportingPresenceV1::Reported,
+                        UsageReasoningReportingV1::NotReported => {
+                            UsageReportingPresenceV1::NotReported
+                        }
+                    },
+                    snapshot_origin: UsageObservationOriginV1::ProviderReported,
+                }),
+                UsageObservationQualificationV1::ProviderReportedTerminalSnapshot,
+                UsageObservationDispositionV1::CompleteText,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_null_and_malformed_reasoning_counters_still_refuse() {
+        let baseline = json!({
+            "prompt_tokens":2, "completion_tokens":1,
+            "completion_tokens_details":{"reasoning_tokens":0}
+        });
+        let control =
+            validated_wire(Family::OpenAi, openai_body(std::slice::from_ref(&baseline))).await;
+        let expected = usage([2, 1, 0, 0, 0]);
+        assert_raw_stream(&control, "stop", &[expected], Some(expected));
+        for counter in [Value::Null, json!("bad"), json!(-1), json!(1.5)] {
+            let mut malformed = baseline.clone();
+            malformed["completion_tokens_details"]["reasoning_tokens"] = counter;
+            let mut restored = malformed.clone();
+            restored["completion_tokens_details"]["reasoning_tokens"] = json!(0);
+            assert_eq!(
+                restored, baseline,
+                "only the malformed numeric member may differ"
+            );
+            let error = wire_events(Family::OpenAi, openai_body(&[malformed]))
+                .await
+                .expect_err("present malformed reasoning must retain its parser refusal");
+            assert_eq!(error.code(), "E0411");
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_latest_absent_detail_replaces_reported_zero() {
+        let events = validated_wire(
+            Family::OpenAi,
+            openai_body(&[
+                json!({"prompt_tokens":20,"completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":3},
+                "completion_tokens_details":{"reasoning_tokens":0}}),
+                json!({"prompt_tokens":22,"completion_tokens":12,
+                "prompt_tokens_details":{"cached_tokens":3}}),
+            ]),
+        )
+        .await;
+        let first = usage([17, 10, 3, 0, 0]);
+        let latest = usage([19, 12, 3, 0, 0]);
+        assert_raw_stream(&events, "stop", &[first, latest], Some(latest));
+        assert_eq!(events.len(), 4);
+        assert_other_metadata_absent(&events);
+        assert_metadata(
+            &events[1],
+            UsageReasoningReportingV1::Reported,
+            UsageSnapshotOriginV1::ProviderReported,
+            "first explicit zero",
+        );
+        for event in [&events[2], &events[3]] {
+            assert_metadata(
+                event,
+                UsageReasoningReportingV1::NotReported,
+                UsageSnapshotOriginV1::ProviderReported,
+                "latest absent detail",
+            );
+        }
+        assert_evidence(
+            &events,
+            Some(UsageObservationSnapshotV1 {
+                sequence: 3,
+                raw_usage: latest,
+                source: UsageSource::Final,
+                reasoning_reporting: UsageReportingPresenceV1::NotReported,
+                snapshot_origin: UsageObservationOriginV1::ProviderReported,
+            }),
+            UsageObservationQualificationV1::ProviderReportedTerminalSnapshot,
+            UsageObservationDispositionV1::CompleteText,
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_absent_detail_after_positive_reasoning_retains_raw_regression() {
+        let first_wire = json!({"prompt_tokens":20,"completion_tokens":10,
+            "prompt_tokens_details":{"cached_tokens":3},
+            "completion_tokens_details":{"reasoning_tokens":5}});
+        let first = usage([17, 10, 3, 0, 5]);
+        let control = validated_wire(
+            Family::OpenAi,
+            openai_body(std::slice::from_ref(&first_wire)),
+        )
+        .await;
+        assert_raw_stream(&control, "stop", &[first], Some(first));
+        let latest = usage([19, 12, 3, 0, 0]);
+        let events = wire_events(
+            Family::OpenAi,
+            openai_body(&[
+                first_wire,
+                json!({"prompt_tokens":22,"completion_tokens":12,
+                "prompt_tokens_details":{"cached_tokens":3}}),
+            ]),
+        )
+        .await
+        .expect("the adapter must preserve the raw snapshot pair before validation");
+        assert_raw_stream(&events, "stop", &[first, latest], Some(latest));
+        assert_eq!(events.len(), 4);
+        let error = orbit_adapter::stream::validate_stream(&events)
+            .expect_err("raw positive reasoning followed by zero must remain a regression");
+        assert_eq!(error.code(), "E0416");
+        assert!(usage_observation_evidence_v1(&events).is_err());
+        assert_other_metadata_absent(&events);
+        assert_metadata(
+            &events[1],
+            UsageReasoningReportingV1::Reported,
+            UsageSnapshotOriginV1::ProviderReported,
+            "positive prefix",
+        );
+        for event in [&events[2], &events[3]] {
+            assert_metadata(
+                event,
+                UsageReasoningReportingV1::NotReported,
+                UsageSnapshotOriginV1::ProviderReported,
+                "regressed latest absence is not backfilled",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn thin_native_metadata_matches_existing_final_counters() {
+        for family in [Family::Anthropic, Family::Ollama] {
+            for positive in [false, true] {
+                let expected = if positive {
+                    match family {
+                        Family::Anthropic => usage([7, 4, 3, 2, 0]),
+                        Family::Ollama => usage([7, 4, 0, 0, 0]),
+                        Family::OpenAi => unreachable!(),
+                    }
+                } else {
+                    ProviderUsage::default()
+                };
+                let body = match family {
+                    Family::Anthropic => anthropic_response(
+                        Some(
+                            json!({"input_tokens":expected.input_tokens,"output_tokens":0,
+                            "cache_read_input_tokens":expected.cache_read_tokens,
+                            "cache_creation_input_tokens":expected.cache_write_tokens}),
+                        ),
+                        Some(json!({"output_tokens":expected.output_tokens})),
+                        vec![],
+                    ),
+                    Family::Ollama => format!(
+                        "{}\n",
+                        json!({
+                            "done":true,"prompt_eval_count":expected.input_tokens,
+                            "eval_count":expected.output_tokens
+                        })
+                    ),
+                    Family::OpenAi => unreachable!(),
+                };
+                let events = validated_wire(family, body).await;
+                let (updates, count, sequence, reason) = match family {
+                    Family::Anthropic => (vec![expected], 3, 2, "end_turn"),
+                    Family::Ollama => (vec![], 2, 1, "stop"),
+                    Family::OpenAi => unreachable!(),
+                };
+                assert_raw_stream(&events, reason, &updates, Some(expected));
+                assert_eq!(events.len(), count);
+                assert_other_metadata_absent(&events);
+                for event in update_events(&events).into_iter().chain(events.last()) {
+                    assert_metadata(
+                        event,
+                        UsageReasoningReportingV1::NotReported,
+                        UsageSnapshotOriginV1::ProviderReported,
+                        "thin native final snapshot",
+                    );
+                }
+                assert_evidence(
+                    &events,
+                    Some(UsageObservationSnapshotV1 {
+                        sequence,
+                        raw_usage: expected,
+                        source: UsageSource::Final,
+                        reasoning_reporting: UsageReportingPresenceV1::NotReported,
+                        snapshot_origin: UsageObservationOriginV1::ProviderReported,
+                    }),
+                    UsageObservationQualificationV1::ProviderReportedTerminalSnapshot,
+                    UsageObservationDispositionV1::CompleteText,
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_and_initial_only_usage_never_gain_snapshot_metadata() {
+        let cases = [
+            (Family::OpenAi, openai_body(&[]), "stop"),
+            (
+                Family::Anthropic,
+                anthropic_response(None, None, vec![]),
+                "end_turn",
+            ),
+            (Family::Ollama, "{\"done\":true}\n".into(), "stop"),
+            (
+                Family::Anthropic,
+                anthropic_response(
+                    Some(json!({"input_tokens":7,"output_tokens":0})),
+                    None,
+                    vec![],
+                ),
+                "end_turn",
+            ),
+            (
+                Family::Ollama,
+                format!(
+                    "{}\n{}\n",
+                    json!({"done":false,"prompt_eval_count":7,"eval_count":4}),
+                    json!({"done":true})
+                ),
+                "stop",
+            ),
+        ];
+        for (family, body, reason) in cases {
+            let events = validated_wire(family, body).await;
+            assert_raw_stream(&events, reason, &[], None);
+            assert_eq!(events.len(), 2);
+            assert!(events.iter().all(|event| event.usage_observation.is_none()));
+            assert_evidence(
+                &events,
+                None,
+                UsageObservationQualificationV1::MissingSnapshot,
+                UsageObservationDispositionV1::CompleteText,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prebody_cancellation_is_synthetic_zero_without_post() {
+        for family in [Family::OpenAi, Family::Anthropic, Family::Ollama] {
+            let adapter = adapter(family);
+            let mut mock = Mock::new(String::new(), family).await;
+            let request = request(adapter.as_ref(), mock.port);
+            let cancel = CancelToken::new();
+            cancel.cancel();
+            let events = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut stream = adapter.invoke(&request, None, &cancel).await.unwrap();
+                let mut events = Vec::new();
+                while let Some(event) = stream.next().await {
+                    events
+                        .push(event.expect("prebody cancellation must return its partial stream"));
+                }
+                events
+            })
+            .await
+            .expect("prebody cancellation is bounded");
+            assert!(
+                mock.captured().await.is_none(),
+                "a pre-cancelled invocation must not POST"
+            );
+            drop(mock);
+            orbit_adapter::stream::validate_stream(&events).expect("valid synthetic raw stream");
+            assert_raw_stream(&events, "cancelled", &[], Some(ProviderUsage::default()));
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].usage_observation, None);
+            assert_metadata(
+                &events[1],
+                UsageReasoningReportingV1::NotReported,
+                UsageSnapshotOriginV1::Synthetic,
+                "prebody synthetic zero",
+            );
+            assert_evidence(
+                &events,
+                Some(UsageObservationSnapshotV1 {
+                    sequence: 1,
+                    raw_usage: ProviderUsage::default(),
+                    source: UsageSource::Final,
+                    reasoning_reporting: UsageReportingPresenceV1::NotReported,
+                    snapshot_origin: UsageObservationOriginV1::Synthetic,
+                }),
+                UsageObservationQualificationV1::CancelledTerminalSnapshot,
+                UsageObservationDispositionV1::Cancelled,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_exact_prior_snapshot_as_provisional() {
+        for family in [Family::OpenAi, Family::Anthropic] {
+            for positive in [false, true] {
+                let expected = if positive {
+                    match family {
+                        Family::OpenAi => usage([7, 4, 3, 0, 5]),
+                        Family::Anthropic => usage([7, 4, 3, 2, 0]),
+                        Family::Ollama => unreachable!(),
+                    }
+                } else {
+                    ProviderUsage::default()
+                };
+                let (body, reporting, captured_reporting) = match family {
+                    Family::OpenAi => (
+                        sse(json!({"choices":[],"usage":{
+                            "prompt_tokens":expected.input_tokens + expected.cache_read_tokens,
+                            "completion_tokens":expected.output_tokens,
+                            "prompt_tokens_details":{"cached_tokens":expected.cache_read_tokens},
+                            "completion_tokens_details":{"reasoning_tokens":expected.reasoning_tokens}
+                        }})),
+                        UsageReasoningReportingV1::Reported,
+                        UsageReportingPresenceV1::Reported,
+                    ),
+                    Family::Anthropic => {
+                        let complete = anthropic_response(
+                            Some(
+                                json!({"input_tokens":expected.input_tokens,"output_tokens":0,
+                                "cache_read_input_tokens":expected.cache_read_tokens,
+                                "cache_creation_input_tokens":expected.cache_write_tokens}),
+                            ),
+                            Some(json!({"output_tokens":expected.output_tokens})),
+                            vec![],
+                        );
+                        let stop = sse(json!({"type":"message_stop"}));
+                        (
+                            complete.strip_suffix(&stop).unwrap().to_owned(),
+                            UsageReasoningReportingV1::NotReported,
+                            UsageReportingPresenceV1::NotReported,
+                        )
+                    }
+                    Family::Ollama => unreachable!(),
+                };
+                let events = cancel_after(family, body, CancelBoundary::Usage).await;
+                assert_raw_stream(&events, "cancelled", &[expected], None);
+                assert_eq!(events.len(), 3);
+                assert_eq!(events[2].usage_observation, None);
+                assert_other_metadata_absent(&events);
+                assert_metadata(
+                    &events[1],
+                    reporting,
+                    UsageSnapshotOriginV1::ProviderReported,
+                    "cancelled None retains the exact prior usage pair",
+                );
+                assert_evidence(
+                    &events,
+                    Some(UsageObservationSnapshotV1 {
+                        sequence: 1,
+                        raw_usage: expected,
+                        source: UsageSource::Incremental,
+                        reasoning_reporting: captured_reporting,
+                        snapshot_origin: UsageObservationOriginV1::ProviderReported,
+                    }),
+                    UsageObservationQualificationV1::ProvisionalSnapshot,
+                    UsageObservationDispositionV1::Cancelled,
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_usage_keeps_missing_snapshot() {
+        let anthropic_start = sse(json!({"type":"message_start","message":{
+            "id":"message-fixture","role":"assistant","content":[]
+        }}));
+        let cases = [
+            (Family::OpenAi, openai_delta(json!({"content":"partial"}))),
+            (
+                Family::Anthropic,
+                format!(
+                    "{}{}",
+                    anthropic_start,
+                    sse(json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":"text","text":"partial"}}))
+                ),
+            ),
+            (
+                Family::Ollama,
+                format!(
+                    "{}\n",
+                    json!({"message":{"content":"partial"},"done":false})
+                ),
+            ),
+        ];
+        for (family, body) in cases {
+            let events = cancel_after(family, body, CancelBoundary::Text).await;
+            assert_raw_stream(&events, "cancelled", &[], None);
+            assert_eq!(events.len(), 3);
+            assert_eq!(text(&events), "partial");
+            assert!(events.iter().all(|event| event.usage_observation.is_none()));
+            assert_evidence(
+                &events,
+                None,
+                UsageObservationQualificationV1::MissingSnapshot,
+                UsageObservationDispositionV1::Cancelled,
+            );
+        }
+    }
+}

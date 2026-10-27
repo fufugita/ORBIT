@@ -270,6 +270,7 @@ impl ToolExecutor for NoEffects {
 
 fn config(fixture: &Fixture) -> TurnConfig {
     TurnConfig {
+        billing: None,
         provider_id: "context-budget-fixture".into(),
         gate: fixture.url.clone(),
         model: MODEL.into(),
@@ -1645,6 +1646,7 @@ mod complete_group_compaction_old_api {
             append_pair(&mut older, "group-A", 2400, CHUNK_A);
             append_pair(&mut older, "group-B", 2400, CHUNK_B);
             let witness_config = TurnConfig {
+                billing: None,
                 provider_id: "exact-summary-provider".into(),
                 gate: "http://127.0.0.1:9".into(),
                 model: "raw-summary-model/unchanged".into(),

@@ -10,39 +10,23 @@
 use crate::session_accounting::{
     self, FullCostStatus, NamespaceAccounting, RootOrigin, RootSessionAccounting,
 };
-use orbit_adapter::types::{ChatMessage, ChatRole, ContentBlock, EffortSetting};
+#[cfg(test)]
+use orbit_adapter::types::EffortSetting;
+use orbit_adapter::types::{ChatMessage, ChatRole, ContentBlock};
 use orbit_hud_tui::bus::BusSender;
 use orbit_hud_tui::model::TranscriptLine;
 use orbit_hud_tui::msg::{
-    ContextProjection, CostQualification, ManualOutcome, Msg, ProjectionReason, SessionProjection,
-    SessionsRow as MsgSessionRow,
+    ContextProjection, CostQualification, ManualOutcome, Msg, OrdinaryEnd, OrdinaryPublication,
+    ProjectionReason, SessionProjection, SessionsRow as MsgSessionRow,
 };
-use orbit_hud_tui::worker::{CommandSink, ManualAction, SessionBinding, WorkerCommand, WorkerCtx};
+use orbit_hud_tui::worker::{
+    CommandSink, ForegroundKind, ForegroundOperation, ManualAction, SessionBinding, WorkerCommand,
+    WorkerCtx,
+};
 use orbit_hud_tui::{ApprovalRegistry, ApprovalResponse};
-use std::path::PathBuf;
 use std::sync::mpsc;
 
-/// The per-turn state the worker needs to run one prompt.
-#[derive(Clone)]
-pub struct TuiTurnConfig {
-    pub home: PathBuf,
-    pub session_id: String,
-    pub gate: String,
-    pub model: String,
-    /// Selection provenance, independent of the resolved provider wire value.
-    pub effort: Option<EffortSetting>,
-    pub provider_id: String,
-    pub auto_tools: bool,
-    /// The session's permission scope (S5): mode + operator lists.
-    /// Mutable at runtime via WorkerCommand::SetMode.
-    pub scope: crate::tool_runtime::PermissionScope,
-    /// Restored session state. Empty/zero for a fresh chat.
-    pub initial_transcript: Vec<ChatMessage>,
-    pub initial_turns: u64,
-    pub initial_input_tokens: u64,
-    pub initial_output_tokens: u64,
-    pub initial_cost_microcents: u64,
-}
+pub use crate::session_config::SessionTurnConfig as TuiTurnConfig;
 
 fn configured_turn(config: &TuiTurnConfig) -> Result<orbit_engine::TurnConfig, String> {
     let declared = crate::config::ProvidersConfig::load(&config.home)?;
@@ -111,10 +95,7 @@ fn emit_session_projection(
         binding: binding.clone(),
         model: config.model.clone(),
         provider: config.provider_id.clone(),
-        priced: crate::config::ProvidersConfig::load(&config.home)
-            .ok()
-            .and_then(|cfg| cfg.pricing_for_model(&config.model))
-            .is_some(),
+        priced: has_complete_projected_cost(&qualification),
         lines: session_to_transcript_lines(transcript),
         turns,
         input_tokens: input,
@@ -124,6 +105,63 @@ fn emit_session_projection(
         context,
         reason,
     }));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextProjectionCommand {
+    Prompt,
+    PlanPrompt,
+    Other,
+}
+
+fn context_projection_command(command: &WorkerCommand) -> ContextProjectionCommand {
+    match command {
+        WorkerCommand::Prompt(_) => ContextProjectionCommand::Prompt,
+        WorkerCommand::PlanPrompt(_) => ContextProjectionCommand::PlanPrompt,
+        _ => ContextProjectionCommand::Other,
+    }
+}
+
+fn project_context_after_command(
+    command: ContextProjectionCommand,
+    measured: ContextProjection,
+) -> ContextProjection {
+    match command {
+        ContextProjectionCommand::Prompt | ContextProjectionCommand::PlanPrompt => measured,
+        ContextProjectionCommand::Other => ContextProjection::Unavailable,
+    }
+}
+
+fn project_context_after_foreground_operation(
+    operation_kind: ForegroundKind,
+    command: ContextProjectionCommand,
+    measured: ContextProjection,
+) -> ContextProjection {
+    match (operation_kind, command) {
+        (ForegroundKind::Prompt, ContextProjectionCommand::Prompt)
+        | (ForegroundKind::PlanPrompt, ContextProjectionCommand::PlanPrompt) => measured,
+        _ => ContextProjection::Unavailable,
+    }
+}
+
+fn record_latest_usage_window(latest: &mut Option<u64>, window_tokens: u64) {
+    *latest = Some(window_tokens);
+}
+
+fn measured_context_projection(
+    base: (&str, &str),
+    effective: (&str, &str),
+    latest_usage_window_tokens: Option<u64>,
+) -> ContextProjection {
+    if base == effective && latest_usage_window_tokens.is_some_and(|window| window > 0) {
+        ContextProjection::PreserveMeasured
+    } else {
+        ContextProjection::Unavailable
+    }
+}
+
+fn has_complete_projected_cost(qualification: &CostQualification) -> bool {
+    matches!(qualification, CostQualification::Known { .. })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -174,7 +212,7 @@ fn save_controls(
         } else {
             format!("settings unchanged: {error}")
         };
-        orbit_hud_tui::emit_error(sender, &message);
+        orbit_hud_tui::emit_notice(sender, &message);
         return false;
     }
     true
@@ -263,11 +301,43 @@ fn save_turn(
             if manual {
                 orbit_hud_tui::emit_status(sender, &message);
             } else {
-                orbit_hud_tui::emit_error(sender, &message);
+                orbit_hud_tui::emit_notice(sender, &message);
             }
             false
         }
     }
+}
+
+/// Project an owning ordinary result without changing its registration or billing.
+fn emit_ordinary_result(
+    sender: &BusSender,
+    operation: Option<&ForegroundOperation>,
+    result: Result<&orbit_engine::TurnEnd, &str>,
+    saved: bool,
+    qualification: &CostQualification,
+) {
+    let Some(operation) = operation.filter(|operation| operation.kind().is_ordinary()) else {
+        return;
+    };
+    let end = match result {
+        Ok(orbit_engine::TurnEnd::Completed) => OrdinaryEnd::Completed,
+        Ok(orbit_engine::TurnEnd::Cancelled) => OrdinaryEnd::Cancelled,
+        Ok(orbit_engine::TurnEnd::Failed(failure)) => OrdinaryEnd::Failed(failure.message.clone()),
+        Err(error) => OrdinaryEnd::Failed(error.to_owned()),
+    };
+    let publication_qualified = match qualification {
+        CostQualification::Known { .. }
+        | CostQualification::UnknownHistory { .. }
+        | CostQualification::UnknownUsage { .. }
+        | CostQualification::Unpriced { .. } => true,
+        CostQualification::Uncertain { .. } | CostQualification::Unavailable => false,
+    };
+    let publication = if saved && publication_qualified {
+        OrdinaryPublication::Saved
+    } else {
+        OrdinaryPublication::BlockedOrUncertain
+    };
+    orbit_hud_tui::emit_ordinary_turn_ended(sender, operation.clone(), end, publication);
 }
 
 /// Build the worker spawner closure for the TUI. The CLI owns `run_turn`;
@@ -463,7 +533,7 @@ fn worker_main_owned(
         match crate::sessions::read_selection_origin(lease.home(), lease.session_id()) {
             Ok(origin) => origin,
             Err(error) => {
-                orbit_hud_tui::emit_error(&ctx.sender, &error);
+                orbit_hud_tui::emit_notice(&ctx.sender, &error);
                 return;
             }
         };
@@ -485,14 +555,14 @@ fn worker_main_owned(
         .with_effort(config.effort.clone())
         .with_selection_origin(selection_origin),
         Err(error) => {
-            orbit_hud_tui::emit_error(&ctx.sender, &error.to_string());
+            orbit_hud_tui::emit_notice(&ctx.sender, &error.to_string());
             return;
         }
     };
     let workspace = match crate::sessions::current_workspace() {
         Ok(workspace) => workspace,
         Err(error) => {
-            orbit_hud_tui::emit_error(&ctx.sender, &error.to_string());
+            orbit_hud_tui::emit_notice(&ctx.sender, &error.to_string());
             return;
         }
     };
@@ -502,14 +572,14 @@ fn worker_main_owned(
         seed.bind_workspace(&workspace)
     };
     if let Err(error) = admission {
-        orbit_hud_tui::emit_error(&ctx.sender, &error.to_string());
+        orbit_hud_tui::emit_notice(&ctx.sender, &error.to_string());
         return;
     }
     let mut accounting =
         match session_accounting::prepare_root(&lease, &mut seed, RootOrigin::RestoredOrLegacy) {
             Ok(accounting) => accounting,
             Err(error) => {
-                orbit_hud_tui::emit_error(&ctx.sender, &error.to_string());
+                orbit_hud_tui::emit_notice(&ctx.sender, &error.to_string());
                 return;
             }
         };
@@ -660,6 +730,8 @@ fn worker_main_owned(
                 | WorkerCommand::Effort(_)
                 | WorkerCommand::Undo
         ) || matches!(&cmd, WorkerCommand::Route(value) if value.trim() == "auto");
+        let context_projection_command = context_projection_command(&cmd);
+        let mut context_projection = ContextProjection::Unavailable;
         let mut projection_reason = ProjectionReason::Refresh;
         let manual_action = match &cmd {
             WorkerCommand::Compact(_) => Some(ManualAction::Compact),
@@ -675,7 +747,7 @@ fn worker_main_owned(
                     let Some(next_turns) = turns.checked_add(1) else {
                         orbit_hud_tui::emit_error(&ctx.sender, "session turn count overflows");
                         retain_local_intent(&mut transcript, &prompt, None);
-                        save_turn(
+                        let saved = save_turn(
                             &config,
                             &lease,
                             &accounting,
@@ -688,6 +760,13 @@ fn worker_main_owned(
                             &ctx.sender,
                             &mut qualification,
                             false,
+                        );
+                        emit_ordinary_result(
+                            &ctx.sender,
+                            foreground.as_ref().map(|(operation, _)| operation),
+                            Err("session turn count overflows"),
+                            saved,
+                            &qualification,
                         );
                         orbit_hud_tui::emit_response_finished(
                             &ctx.sender,
@@ -727,7 +806,11 @@ fn worker_main_owned(
                         *guard = None;
                     }
                     let usable_plan = match &completion {
-                        Ok(completion) => {
+                        Ok((completion, measured_context)) => {
+                            context_projection = project_context_after_command(
+                                context_projection_command,
+                                *measured_context,
+                            );
                             turns = next_turns;
                             completion.end == orbit_engine::TurnEnd::Completed
                                 && completion.report.ok
@@ -753,6 +836,16 @@ fn worker_main_owned(
                         &mut qualification,
                         false,
                     );
+                    emit_ordinary_result(
+                        &ctx.sender,
+                        foreground.as_ref().map(|(operation, _)| operation),
+                        completion
+                            .as_ref()
+                            .map(|(completion, _)| &completion.end)
+                            .map_err(String::as_str),
+                        saved,
+                        &qualification,
+                    );
                     orbit_hud_tui::emit_response_finished(
                         &ctx.sender,
                         "",
@@ -762,7 +855,7 @@ fn worker_main_owned(
                     );
                     if usable_plan
                         && saved
-                        && let Ok(completion) = completion
+                        && let Ok((completion, _)) = completion
                     {
                         orbit_hud_tui::emit_plan_ready(&ctx.sender, &completion.report.final_text);
                     }
@@ -771,7 +864,7 @@ fn worker_main_owned(
                     let Some(next_turns) = turns.checked_add(1) else {
                         orbit_hud_tui::emit_error(&ctx.sender, "session turn count overflows");
                         retain_local_intent(&mut transcript, &prompt, None);
-                        save_turn(
+                        let saved = save_turn(
                             &config,
                             &lease,
                             &accounting,
@@ -784,6 +877,13 @@ fn worker_main_owned(
                             &ctx.sender,
                             &mut qualification,
                             false,
+                        );
+                        emit_ordinary_result(
+                            &ctx.sender,
+                            foreground.as_ref().map(|(operation, _)| operation),
+                            Err("session turn count overflows"),
+                            saved,
+                            &qualification,
                         );
                         orbit_hud_tui::emit_response_finished(
                             &ctx.sender,
@@ -837,14 +937,20 @@ fn worker_main_owned(
                     if let Ok(mut guard) = cancel_slot.lock() {
                         *guard = None;
                     }
-                    match completion {
-                        Ok(_) => turns = next_turns,
+                    match &completion {
+                        Ok((_, measured_context)) => {
+                            turns = next_turns;
+                            context_projection = project_context_after_command(
+                                context_projection_command,
+                                *measured_context,
+                            );
+                        }
                         Err(error) => {
-                            orbit_hud_tui::emit_error(&ctx.sender, &error);
+                            orbit_hud_tui::emit_error(&ctx.sender, error);
                             retain_local_intent(&mut transcript, &expanded_prompt, user_blocks);
                         }
                     }
-                    save_turn(
+                    let saved = save_turn(
                         &config,
                         &lease,
                         &accounting,
@@ -873,6 +979,16 @@ fn worker_main_owned(
                             ),
                         );
                     }
+                    emit_ordinary_result(
+                        &ctx.sender,
+                        foreground.as_ref().map(|(operation, _)| operation),
+                        completion
+                            .as_ref()
+                            .map(|(completion, _)| &completion.end)
+                            .map_err(String::as_str),
+                        saved,
+                        &qualification,
+                    );
                     // Always emit ResponseFinished — the TUI's turn_in_flight flag
                     // and queue drain both depend on it, whether the turn
                     // completed, was cancelled by the operator, or errored. The
@@ -1697,7 +1813,7 @@ fn worker_main_owned(
                             orbit_hud_tui::emit_mode_changed(&ctx.sender, &mode_name);
                         }
                         None => {
-                            orbit_hud_tui::emit_error(
+                            orbit_hud_tui::emit_notice(
                                 &ctx.sender,
                                 &format!(
                                     "unknown mode {mode_name} (default, acceptEdits, plan, dontAsk, bypass)"
@@ -1819,6 +1935,11 @@ fn worker_main_owned(
                 qualification = CostQualification::Unavailable;
             }
             drop(registration);
+            let operation_context = project_context_after_foreground_operation(
+                operation.kind(),
+                context_projection_command,
+                context_projection,
+            );
             emit_session_projection(
                 &ctx.sender,
                 &config,
@@ -1830,7 +1951,7 @@ fn worker_main_owned(
                 cum_cost,
                 qualification,
                 ProjectionReason::Operation { operation },
-                ContextProjection::Unavailable,
+                operation_context,
             );
         } else if project_after {
             emit_session_projection(
@@ -1844,7 +1965,7 @@ fn worker_main_owned(
                 cum_cost,
                 qualification,
                 projection_reason,
-                ContextProjection::Unavailable,
+                context_projection,
             );
         }
     }
@@ -2201,64 +2322,404 @@ fn stage_clear(
         cost: Some(source_cost), uncertain: true })
 }
 
-/// Convert a saved session's transcript to TUI display lines. Assistant messages
-/// with tool_calls collapse to `Stripped` (same as the streaming path); tool
-/// results are dropped (they're already in the assistant's context). User and
-/// system messages pass through verbatim.
 fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
-    msgs.iter()
-        .filter_map(|msg| {
-            match msg.role {
-                ChatRole::User => Some(TranscriptLine::User {
-                    text: msg.content.clone(),
-                    time: None,
-                }),
-                ChatRole::Assistant => {
-                    if let Some(calls) = &msg.tool_calls {
-                        // Tool-calling round: emit one Stripped line per tool call.
-                        // The content (if any) is the model's reasoning, which we
-                        // never render (CoT defense, H-12).
-                        if calls.is_empty() {
-                            // Degenerate: tool_calls array present but empty.
-                            None
-                        } else {
-                            // Emit the first tool call's name only — multiple calls
-                            // in one round would require N Stripped lines, but the
-                            // streaming path already handles that per-call. For
-                            // resume, one summary line is sufficient.
-                            Some(TranscriptLine::Stripped {
-                                tool_name: calls[0].name.clone(),
-                                // Restored sessions carry no argument
-                                // summary — the call args aren't in the
-                                // display-safe form (they're raw JSON).
-                                // The outcome is unknown from the saved
-                                // transcript; settled-neutral is honest.
-                                summary: String::new(),
-                                outcome: Some(orbit_hud_tui::model::ToolOutcome::Ok),
-                                meta: String::new(),
-                                // Restored calls have no live duration.
-                                started_at: None,
-                            })
-                        }
-                    } else if !msg.content.is_empty() {
-                        Some(TranscriptLine::Assistant {
-                            text: orbit_hud_tui::bridge::strip_cot(&msg.content),
-                            time: None,
-                        })
-                    } else {
-                        None
-                    }
-                }
-                ChatRole::System => Some(TranscriptLine::System(msg.content.clone())),
-                ChatRole::Tool => {
-                    // Tool results are already in the assistant's context; don't
-                    // render them as separate transcript lines (matches the
-                    // streaming path, which only emits Stripped + finished).
-                    None
+    use orbit_hud_tui::model::ToolOutcome;
+    use std::collections::HashMap;
+
+    // Count every saved assistant call and tool result before projecting any
+    // line. A result can only settle a unique call with the exact same ID;
+    // name/order fallbacks would cross-wire parallel or legacy calls.
+    let mut call_counts = HashMap::<&str, usize>::new();
+    let mut results_by_id = HashMap::<&str, Vec<&ChatMessage>>::new();
+    for msg in msgs {
+        if let Some(calls) = &msg.tool_calls {
+            for call in calls {
+                if !call.id.is_empty() {
+                    *call_counts.entry(call.id.as_str()).or_default() += 1;
                 }
             }
-        })
-        .collect()
+        }
+        if msg.role == ChatRole::Tool
+            && let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty())
+        {
+            results_by_id.entry(id).or_default().push(msg);
+        }
+    }
+
+    let mut lines = Vec::new();
+    for msg in msgs {
+        match msg.role {
+            ChatRole::User => lines.push(TranscriptLine::User {
+                text: msg.content.clone(),
+                time: None,
+            }),
+            ChatRole::Assistant => {
+                if let Some(calls) = &msg.tool_calls {
+                    // Reasoning and raw arguments are never rendered. Each
+                    // call gets its own identity-bearing row in source order.
+                    for call in calls {
+                        let call_count = call_counts.get(call.id.as_str()).copied().unwrap_or(0);
+                        let matching = results_by_id.get(call.id.as_str());
+                        let result_count = matching.map_or(0, Vec::len);
+                        let unique_call = !call.id.is_empty() && call_count == 1;
+                        let unambiguous_pair = unique_call && result_count <= 1;
+                        let (outcome, meta) = if !unambiguous_pair || result_count != 1 {
+                            (ToolOutcome::Unavailable, String::new())
+                        } else {
+                            classify_saved_tool_result(call.name.as_str(), matching.unwrap()[0])
+                        };
+                        lines.push(TranscriptLine::Stripped {
+                            tool_name: call.name.clone(),
+                            call_id: if unambiguous_pair {
+                                call.id.clone()
+                            } else {
+                                String::new()
+                            },
+                            // Saved arguments are raw JSON and are deliberately
+                            // not treated as the bridge's safe display summary.
+                            summary: String::new(),
+                            outcome: Some(outcome),
+                            meta,
+                            started_at: None,
+                        });
+                    }
+                } else if !msg.content.is_empty() {
+                    lines.push(TranscriptLine::Assistant {
+                        text: orbit_hud_tui::bridge::strip_cot(&msg.content),
+                        time: None,
+                    });
+                }
+            }
+            ChatRole::System => lines.push(TranscriptLine::System(msg.content.clone())),
+            ChatRole::Tool => {
+                // Tool bodies stay in model context, never in the visible
+                // transcript or restored Terminal tape.
+            }
+        }
+    }
+    lines
+}
+
+fn classify_saved_tool_result(
+    tool: &str,
+    result: &ChatMessage,
+) -> (orbit_hud_tui::model::ToolOutcome, String) {
+    use orbit_hud_tui::model::ToolOutcome;
+
+    let unavailable = || (ToolOutcome::Unavailable, String::new());
+    let payload = match result.tool_result.as_deref() {
+        Some(saved) if saved != result.content => return unavailable(),
+        Some(saved) => saved,
+        None => result.content.as_str(),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return unavailable();
+    };
+    if !value.is_object() {
+        return unavailable();
+    }
+    let Some(ok) = value.get("ok").and_then(serde_json::Value::as_bool) else {
+        return unavailable();
+    };
+    let denied = match value.get("denied") {
+        None => None,
+        Some(flag) => match flag.as_bool() {
+            Some(flag) => Some(flag),
+            None => return unavailable(),
+        },
+    };
+    let error = value.get("error").and_then(serde_json::Value::as_str);
+    let blocked = error == Some("unknown tool (deny-by-default)");
+    let cancelled = error == Some("cancelled by user");
+
+    let outcome = match (ok, denied) {
+        (true, Some(true)) => ToolOutcome::Unavailable,
+        (true, _) if blocked || cancelled => ToolOutcome::Unavailable,
+        (true, _) => ToolOutcome::Ok,
+        (false, Some(true)) if cancelled => ToolOutcome::Unavailable,
+        (false, Some(true)) => ToolOutcome::Denied,
+        (false, Some(false)) if blocked => ToolOutcome::Unavailable,
+        (false, Some(false)) if cancelled => ToolOutcome::Cancelled,
+        (false, Some(false)) => ToolOutcome::Failed,
+        (false, None) if cancelled => ToolOutcome::Cancelled,
+        (false, None) if blocked => ToolOutcome::Blocked,
+        (false, None) => ToolOutcome::Failed,
+    };
+
+    // Bash's typed process status must agree with the top-level verdict.
+    // JSON booleans, floats, null and strings are not integer exit codes.
+    if tool == "Bash"
+        && let Some(exit_code) = value.get("exit_code")
+    {
+        let is_zero = exit_code
+            .as_i64()
+            .map(|code| code == 0)
+            .or_else(|| exit_code.as_u64().map(|code| code == 0));
+        if is_zero.is_none_or(|is_zero| ok != is_zero) {
+            return unavailable();
+        }
+    }
+
+    // Facts are derived only from a uniquely paired, internally consistent
+    // result. Unknown or contradictory records expose no result-derived text.
+    // A typed Bash exit code is useful after restore even when it is zero;
+    // only the fixed status is shown, never the saved output body.
+    let fact = if tool == "Bash"
+        && ok
+        && value.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0)
+    {
+        "exit 0".to_string()
+    } else if matches!(outcome, ToolOutcome::Ok | ToolOutcome::Failed) {
+        result_fact(tool, payload)
+    } else {
+        String::new()
+    };
+    (outcome, fact)
+}
+
+#[cfg(test)]
+mod saved_tool_projection_tests {
+    use super::*;
+    use orbit_adapter::types::ToolCallMessage;
+    use orbit_hud_tui::model::ToolOutcome;
+
+    fn message(role: ChatRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_string(),
+            blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
+            origin_model: None,
+            origin_provider: None,
+        }
+    }
+
+    fn call(id: &str, name: &str, arguments: &str) -> ToolCallMessage {
+        ToolCallMessage {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    fn assistant(calls: Vec<ToolCallMessage>, reasoning: &str) -> ChatMessage {
+        let mut message = message(ChatRole::Assistant, reasoning);
+        message.tool_calls = Some(calls);
+        message
+    }
+
+    fn result(id: &str, payload: &str) -> ChatMessage {
+        let mut message = message(ChatRole::Tool, payload);
+        message.tool_call_id = Some(id.to_string());
+        message.tool_result = Some(payload.to_string());
+        message
+    }
+
+    fn classify(tool: &str, payload: &str) -> (ToolOutcome, String) {
+        classify_saved_tool_result(tool, &result("call", payload))
+    }
+
+    fn projected_tools(lines: &[TranscriptLine]) -> Vec<&TranscriptLine> {
+        lines
+            .iter()
+            .filter(|line| matches!(line, TranscriptLine::Stripped { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn calls_keep_order_and_join_only_by_exact_id_without_leaking_saved_bodies() {
+        let reasoning = "PRIVATE_REASONING_MARKER";
+        let arguments = "PRIVATE_ARGUMENT_MARKER";
+        let secret = "PRIVATE_RESULT_BODY_MARKER";
+        let lines = session_to_transcript_lines(&[
+            assistant(
+                vec![
+                    call("bash-1", "Bash", arguments),
+                    call("glob-1", "Glob", arguments),
+                ],
+                reasoning,
+            ),
+            result(
+                "glob-1",
+                &format!(r#"{{"ok":true,"matches":["a.txt"],"secret":"{secret}"}}"#),
+            ),
+            result(
+                "bash-1",
+                &format!(r#"{{"ok":false,"exit_code":3,"output":"{secret}"}}"#),
+            ),
+        ]);
+        let tools = projected_tools(&lines);
+        assert_eq!(tools.len(), 2);
+        assert!(matches!(
+            tools[0],
+            TranscriptLine::Stripped {
+                tool_name,
+                call_id,
+                summary,
+                outcome: Some(ToolOutcome::Failed),
+                meta,
+                ..
+            } if tool_name == "Bash"
+                && call_id == "bash-1"
+                && summary.is_empty()
+                && meta == "exit 3"
+        ));
+        assert!(matches!(
+            tools[1],
+            TranscriptLine::Stripped {
+                tool_name,
+                call_id,
+                outcome: Some(ToolOutcome::Ok),
+                meta,
+                ..
+            } if tool_name == "Glob" && call_id == "glob-1" && meta == "1 file"
+        ));
+        let visible = format!("{lines:?}");
+        assert!(!visible.contains(reasoning));
+        assert!(!visible.contains(arguments));
+        assert!(!visible.contains(secret));
+    }
+
+    #[test]
+    fn typed_denial_legacy_block_cancel_and_failure_remain_distinct() {
+        assert_eq!(
+            classify(
+                "Bash",
+                r#"{"ok":false,"denied":true,"error":"unknown tool (deny-by-default)"}"#
+            )
+            .0,
+            ToolOutcome::Denied
+        );
+        assert_eq!(
+            classify(
+                "Bash",
+                r#"{"ok":false,"error":"unknown tool (deny-by-default)"}"#
+            )
+            .0,
+            ToolOutcome::Blocked
+        );
+        assert_eq!(
+            classify(
+                "Bash",
+                r#"{"ok":false,"denied":false,"error":"unknown tool (deny-by-default)"}"#
+            )
+            .0,
+            ToolOutcome::Unavailable
+        );
+        assert_eq!(
+            classify("Bash", r#"{"ok":false,"error":"cancelled by user"}"#).0,
+            ToolOutcome::Cancelled
+        );
+        assert_eq!(
+            classify(
+                "Bash",
+                r#"{"ok":false,"denied":true,"error":"cancelled by user"}"#
+            )
+            .0,
+            ToolOutcome::Unavailable
+        );
+        assert_eq!(classify("Bash", r#"{"ok":true}"#).0, ToolOutcome::Ok);
+        assert_eq!(
+            classify("Bash", r#"{"ok":false,"exit_code":3}"#),
+            (ToolOutcome::Failed, "exit 3".to_string())
+        );
+    }
+
+    #[test]
+    fn successful_bash_restore_exposes_only_the_typed_zero_exit_fact() {
+        let payload = r#"{"ok":true,"exit_code":0,"output":"PRIVATE_SAVED_OUTPUT"}"#;
+        assert_eq!(
+            classify("Bash", payload),
+            (ToolOutcome::Ok, "exit 0".to_string())
+        );
+        let without_exit_code = classify("Bash", r#"{"ok":true}"#);
+        assert_eq!(without_exit_code, (ToolOutcome::Ok, String::new()));
+    }
+
+    #[test]
+    fn malformed_or_contradictory_saved_results_are_unavailable() {
+        for payload in [
+            "not-json",
+            "[]",
+            r#"{"exit_code":3}"#,
+            r#"{"ok":"false"}"#,
+            r#"{"ok":false,"denied":"no"}"#,
+            r#"{"ok":true,"error":"unknown tool (deny-by-default)"}"#,
+            r#"{"ok":true,"error":"cancelled by user"}"#,
+            r#"{"ok":false,"exit_code":0}"#,
+            r#"{"ok":true,"exit_code":1}"#,
+            r#"{"ok":false,"exit_code":true}"#,
+            r#"{"ok":false,"exit_code":1.5}"#,
+        ] {
+            assert_eq!(
+                classify("Bash", payload),
+                (ToolOutcome::Unavailable, String::new()),
+                "payload should be unavailable: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_content_only_result_is_supported_but_conflicting_fields_are_not() {
+        let mut legacy = result(
+            "call",
+            r#"{"ok":false,"error":"unknown tool (deny-by-default)"}"#,
+        );
+        legacy.tool_result = None;
+        assert_eq!(
+            classify_saved_tool_result("Bash", &legacy).0,
+            ToolOutcome::Blocked
+        );
+
+        let mut conflicting = result("call", r#"{"ok":true}"#);
+        conflicting.tool_result = Some(r#"{"ok":false,"exit_code":4}"#.to_string());
+        assert_eq!(
+            classify_saved_tool_result("Bash", &conflicting),
+            (ToolOutcome::Unavailable, String::new())
+        );
+    }
+
+    #[test]
+    fn ambiguous_missing_and_duplicate_ids_never_settle_or_create_tape_identity() {
+        let lines = session_to_transcript_lines(&[
+            assistant(
+                vec![
+                    call("dup", "Bash", "{}"),
+                    call("dup", "Bash", "{}"),
+                    call("", "Bash", "{}"),
+                    call("many-results", "Bash", "{}"),
+                    call("no-result", "Bash", "{}"),
+                ],
+                "PRIVATE_REASONING",
+            ),
+            result("dup", r#"{"ok":true,"exit_code":0}"#),
+            result("many-results", r#"{"ok":true,"exit_code":0}"#),
+            result("many-results", r#"{"ok":false,"exit_code":7}"#),
+        ]);
+        let tools = projected_tools(&lines);
+        assert_eq!(tools.len(), 5);
+        for line in &tools[..4] {
+            assert!(matches!(
+                line,
+                TranscriptLine::Stripped {
+                    outcome: Some(ToolOutcome::Unavailable),
+                    call_id,
+                    meta,
+                    ..
+                } if call_id.is_empty() && meta.is_empty()
+            ));
+        }
+        assert!(matches!(
+            tools[4],
+            TranscriptLine::Stripped {
+                outcome: Some(ToolOutcome::Unavailable),
+                call_id,
+                ..
+            } if call_id == "no-result"
+        ));
+    }
 }
 
 /// A TUI-aware approval channel. Implements the CLI's `ApprovalChannel` trait
@@ -2608,7 +3069,7 @@ pub fn run_tui_turn(
     // The session's tool context (see `session_tool_context`).
     tool_cx: &orbit_tools::ToolContext,
 ) -> Result<(bool, u64, u64, u64, String), String> {
-    let completion = run_tui_turn_inner(
+    let (completion, _) = run_tui_turn_inner(
         config,
         transcript,
         prompt,
@@ -2656,7 +3117,7 @@ fn run_tui_turn_inner(
     // The session's tool context (see `session_tool_context`).
     tool_cx: &orbit_tools::ToolContext,
     accounting: Option<&NamespaceAccounting>,
-) -> Result<orbit_engine::TurnCompletion, String> {
+) -> Result<(orbit_engine::TurnCompletion, ContextProjection), String> {
     // One checkpoint per prompt (E7): /rewind restores a turn. The context
     // is the session's now, so the turn boundary is marked here.
     tool_cx.reset_turn_checkpoint();
@@ -2710,6 +3171,7 @@ fn run_tui_turn_inner(
     let mut first_round_seen = false;
     // The size a running compaction started from, for its "before → after".
     let mut compact_from: u64 = 0;
+    let mut latest_usage_window_tokens = None;
     let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
         use orbit_frontend_protocol::FrontendEvent as E;
         match ev {
@@ -2883,6 +3345,7 @@ fn run_tui_turn_inner(
                 window_tokens,
                 breakdown,
             } => {
+                record_latest_usage_window(&mut latest_usage_window_tokens, window_tokens);
                 orbit_hud_tui::emit_usage(sender, used_tokens, window_tokens, breakdown);
             }
             E::LedgerAppended {
@@ -2958,9 +3421,15 @@ fn run_tui_turn_inner(
         retry_policy.as_ref(),
     )
     .into_completion();
+    drop(events);
     *auto_grants = executor.auto_grants;
     *scope = executor.scope;
-    Ok(completion)
+    let context_projection = measured_context_projection(
+        (&base_turn_config.model, &base_turn_config.provider_id),
+        (&turn_config.model, &turn_config.provider_id),
+        latest_usage_window_tokens,
+    );
+    Ok((completion, context_projection))
 }
 
 /// The TUI's tool executor: bridges the engine's `ToolExecutor` trait
@@ -3243,6 +3712,154 @@ mod short_session_id_tests {
 }
 
 #[cfg(test)]
+mod context_projection_tests {
+    use super::*;
+
+    #[test]
+    fn measured_context_requires_the_latest_nonzero_window_and_exact_identity() {
+        assert_eq!(
+            measured_context_projection(("m", "p"), ("m", "p"), Some(160_000)),
+            ContextProjection::PreserveMeasured
+        );
+        assert_eq!(
+            measured_context_projection(("m", "p"), ("m", "p"), None),
+            ContextProjection::Unavailable
+        );
+        assert_eq!(
+            measured_context_projection(("m", "p"), ("m", "p"), Some(0)),
+            ContextProjection::Unavailable
+        );
+        assert_eq!(
+            measured_context_projection(("m", "p"), ("routed", "p"), Some(160_000)),
+            ContextProjection::Unavailable
+        );
+        assert_eq!(
+            measured_context_projection(("m", "p"), ("m", "routed"), Some(160_000)),
+            ContextProjection::Unavailable
+        );
+    }
+
+    #[test]
+    fn the_latest_usage_event_controls_the_context_projection() {
+        let mut latest = None;
+        record_latest_usage_window(&mut latest, 160_000);
+        record_latest_usage_window(&mut latest, 0);
+        assert_eq!(
+            measured_context_projection(("m", "p"), ("m", "p"), latest),
+            ContextProjection::Unavailable
+        );
+
+        record_latest_usage_window(&mut latest, 160_000);
+        assert_eq!(
+            measured_context_projection(("m", "p"), ("m", "p"), latest),
+            ContextProjection::PreserveMeasured
+        );
+    }
+
+    #[test]
+    fn only_prompt_commands_can_publish_their_measured_context_sample() {
+        for command in [
+            WorkerCommand::Prompt("prompt".into()),
+            WorkerCommand::PlanPrompt("plan".into()),
+        ] {
+            let kind = context_projection_command(&command);
+            assert_eq!(
+                project_context_after_command(kind, ContextProjection::PreserveMeasured),
+                ContextProjection::PreserveMeasured
+            );
+        }
+
+        let same_id_resume = WorkerCommand::ResumeSession("session-current".into());
+        let kind = context_projection_command(&same_id_resume);
+        assert_eq!(kind, ContextProjectionCommand::Other);
+        assert_eq!(
+            project_context_after_command(kind, ContextProjection::PreserveMeasured),
+            ContextProjection::Unavailable
+        );
+    }
+
+    #[test]
+    fn operation_settlement_preserves_only_the_matching_ordinary_prompt_kind() {
+        for (command, operation_kind) in [
+            (
+                WorkerCommand::Prompt("prompt".into()),
+                ForegroundKind::Prompt,
+            ),
+            (
+                WorkerCommand::PlanPrompt("plan".into()),
+                ForegroundKind::PlanPrompt,
+            ),
+        ] {
+            let command_kind = context_projection_command(&command);
+            assert_eq!(
+                project_context_after_foreground_operation(
+                    operation_kind,
+                    command_kind,
+                    ContextProjection::PreserveMeasured,
+                ),
+                ContextProjection::PreserveMeasured
+            );
+        }
+
+        for operation_kind in [ForegroundKind::Control, ForegroundKind::Resume] {
+            assert_eq!(
+                project_context_after_foreground_operation(
+                    operation_kind,
+                    ContextProjectionCommand::Prompt,
+                    ContextProjection::PreserveMeasured,
+                ),
+                ContextProjection::Unavailable
+            );
+            assert_eq!(
+                project_context_after_foreground_operation(
+                    operation_kind,
+                    ContextProjectionCommand::PlanPrompt,
+                    ContextProjection::PreserveMeasured,
+                ),
+                ContextProjection::Unavailable
+            );
+        }
+        assert_eq!(
+            project_context_after_foreground_operation(
+                ForegroundKind::Prompt,
+                ContextProjectionCommand::PlanPrompt,
+                ContextProjection::PreserveMeasured,
+            ),
+            ContextProjection::Unavailable
+        );
+        assert_eq!(
+            project_context_after_foreground_operation(
+                ForegroundKind::PlanPrompt,
+                ContextProjectionCommand::Prompt,
+                ContextProjection::PreserveMeasured,
+            ),
+            ContextProjection::Unavailable
+        );
+    }
+}
+
+#[cfg(test)]
+mod projection_price_tests {
+    use super::{CostQualification, has_complete_projected_cost};
+
+    #[test]
+    fn cost_display_requires_complete_known_session_accounting() {
+        assert!(has_complete_projected_cost(&CostQualification::Known {
+            revision: 4,
+        }));
+        for qualification in [
+            CostQualification::Unavailable,
+            CostQualification::UnknownHistory { revision: 4 },
+            CostQualification::UnknownUsage { revision: 4 },
+            CostQualification::Unpriced { revision: 4 },
+            CostQualification::Uncertain { revision: 4 },
+        ] {
+            assert!(!has_complete_projected_cost(&qualification));
+        }
+    }
+}
+
+#[cfg(test)]
 mod session_tests {
     use super::*;
 
@@ -3267,6 +3884,1180 @@ mod session_tests {
             initial_output_tokens: 0,
             initial_cost_microcents: 0,
         }
+    }
+
+    #[test]
+    fn ordinary_end_mapping_preserves_execution_and_publication_matrix() {
+        let binding = SessionBinding {
+            session_id: "outcome-mapping".into(),
+            generation: 1,
+        };
+        let operation =
+            ForegroundOperation::new(binding.clone(), ForegroundKind::Prompt, 1).unwrap();
+        let command = WorkerCommand::Prompt("original intent".into());
+        let registration = operation.start(&command).unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        for (engine, expected) in [
+            (orbit_engine::TurnEnd::Completed, OrdinaryEnd::Completed),
+            (orbit_engine::TurnEnd::Cancelled, OrdinaryEnd::Cancelled),
+            (
+                orbit_engine::TurnEnd::Failed(orbit_engine::TurnFailure {
+                    message: "typed provider failure".into(),
+                }),
+                OrdinaryEnd::Failed("typed provider failure".into()),
+            ),
+        ] {
+            for saved in [false, true] {
+                for (qualification, accounting_usable) in [
+                    (CostQualification::Known { revision: 7 }, true),
+                    (CostQualification::UnknownHistory { revision: 7 }, true),
+                    (CostQualification::UnknownUsage { revision: 7 }, true),
+                    (CostQualification::Unpriced { revision: 7 }, true),
+                    (CostQualification::Uncertain { revision: 7 }, false),
+                    (CostQualification::Unavailable, false),
+                ] {
+                    emit_ordinary_result(
+                        &sender,
+                        Some(&operation),
+                        Ok(&engine),
+                        saved,
+                        &qualification,
+                    );
+                    let Some(Msg::OrdinaryTurnEnded {
+                        operation: observed,
+                        end,
+                        publication,
+                    }) = bus.try_recv()
+                    else {
+                        panic!("exactly one typed ordinary result required");
+                    };
+                    assert_eq!(observed, operation);
+                    assert_eq!(end, expected);
+                    let expected_publication = if saved && accounting_usable {
+                        OrdinaryPublication::Saved
+                    } else {
+                        OrdinaryPublication::BlockedOrUncertain
+                    };
+                    assert_eq!(
+                        publication, expected_publication,
+                        "saved={saved} qualification={qualification:?}"
+                    );
+                    assert!(
+                        bus.try_recv().is_none(),
+                        "mapping cannot emit finish, notice, or projection"
+                    );
+                }
+            }
+        }
+        emit_ordinary_result(
+            &sender,
+            Some(&operation),
+            Err("setup refusal"),
+            true,
+            &CostQualification::Known { revision: 7 },
+        );
+        assert!(matches!(bus.try_recv(), Some(Msg::OrdinaryTurnEnded {
+            operation: observed, end: OrdinaryEnd::Failed(reason), publication: OrdinaryPublication::Saved,
+        }) if observed == operation && reason == "setup refusal"));
+        let control = ForegroundOperation::new(binding, ForegroundKind::Control, 2).unwrap();
+        emit_ordinary_result(
+            &sender,
+            Some(&control),
+            Ok(&orbit_engine::TurnEnd::Completed),
+            true,
+            &CostQualification::Unavailable,
+        );
+        emit_ordinary_result(
+            &sender,
+            None,
+            Err("unbound error"),
+            false,
+            &CostQualification::Unavailable,
+        );
+        assert!(
+            bus.try_recv().is_none(),
+            "control/unbound paths cannot mint ordinary results"
+        );
+        drop(registration);
+    }
+
+    #[cfg(unix)]
+    struct OutcomeHome {
+        path: std::path::PathBuf,
+        removable: std::cell::Cell<bool>,
+        identity: (u64, u64, u32),
+    }
+    #[cfg(unix)]
+    impl OutcomeHome {
+        fn new() -> Self {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            let path =
+                std::env::temp_dir().join(format!("orbit-outcome-component-{}", ulid::Ulid::new()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path.join("workspace"))
+                .unwrap();
+            let info = std::fs::symlink_metadata(&path).unwrap();
+            let identity = (info.dev(), info.ino(), info.uid());
+            Self {
+                path,
+                removable: std::cell::Cell::new(true),
+                identity,
+            }
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for OutcomeHome {
+        fn drop(&mut self) {
+            if self.removable.get() {
+                use std::os::unix::fs::MetadataExt;
+                let info = std::fs::symlink_metadata(&self.path).unwrap();
+                assert!(info.is_dir() && info.mode() & 0o077 == 0);
+                assert_eq!((info.dev(), info.ino(), info.uid()), self.identity);
+                let mut pending = vec![self.path.clone()];
+                let mut entries = 0usize;
+                while let Some(path) = pending.pop() {
+                    entries += 1;
+                    assert!(entries <= 5000, "owned outcome cleanup entry bound");
+                    let entry = std::fs::symlink_metadata(&path).unwrap();
+                    assert_eq!(entry.uid(), self.identity.2);
+                    if entry.is_dir() {
+                        for child in std::fs::read_dir(path).unwrap() {
+                            pending.push(child.unwrap().path());
+                        }
+                    } else {
+                        assert!(entry.is_file() || entry.file_type().is_symlink());
+                    }
+                }
+                let current = std::fs::symlink_metadata(&self.path).unwrap();
+                assert_eq!((current.dev(), current.ino(), current.uid()), self.identity);
+                std::fs::remove_dir_all(&self.path).expect("owned outcome fixture cleanup");
+            } else {
+                eprintln!("owned outcome fixture retained after incomplete snapshot restoration");
+            }
+        }
+    }
+    #[cfg(unix)]
+    struct OutcomeModeGuard {
+        file: std::fs::File,
+        mode: u32,
+    }
+    #[cfg(unix)]
+    impl Drop for OutcomeModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = self
+                .file
+                .set_permissions(std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completed_end_with_actual_save_failure_emits_notice_and_blocked_publication() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let home = OutcomeHome::new();
+        let config = config(&home.path);
+        let lease =
+            crate::sessions::SessionLease::acquire(&home.path, "session-test", "outcome-component")
+                .unwrap();
+        let mut initial = crate::sessions::SessionFile::from_chat(
+            "session-test",
+            "m",
+            "http://127.0.0.1:1",
+            "p",
+            &[],
+            0,
+            0,
+            0,
+            0,
+        )
+        .in_workspace(&home.path.join("workspace"))
+        .unwrap();
+        let accounting =
+            session_accounting::prepare_root(&lease, &mut initial, RootOrigin::FreshCandidate)
+                .unwrap();
+        let before_checkpoint = accounting.namespace().checkpoint().unwrap();
+        let path = home.path.join("sessions/session-test.json");
+        let before = std::fs::read(&path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let metadata = file.metadata().unwrap();
+        assert!(
+            metadata.is_file()
+                && metadata.uid() == home.identity.2
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0
+        );
+        let identity = (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.nlink(),
+        );
+        let guard = OutcomeModeGuard {
+            file,
+            mode: metadata.mode() & 0o7777,
+        };
+        home.removable.set(false);
+        guard
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(guard.mode | 0o040))
+            .unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (mut input, mut output, mut cost) = (0, 0, 0);
+        let mut qualification = CostQualification::Unavailable;
+        let transcript = vec![
+            orbit_engine::user_message("component intent"),
+            orbit_engine::assistant_message("component completed output"),
+        ];
+        let saved = save_turn(
+            &config,
+            &lease,
+            &accounting,
+            &transcript,
+            1,
+            &mut input,
+            &mut output,
+            &mut cost,
+            crate::phase_routing::SelectionOrigin::Default,
+            &sender,
+            &mut qualification,
+            false,
+        );
+        assert!(
+            !saved,
+            "the real private-file storage fault must reject publication"
+        );
+        let operation = ForegroundOperation::new(
+            SessionBinding {
+                session_id: "session-test".into(),
+                generation: 1,
+            },
+            ForegroundKind::Prompt,
+            1,
+        )
+        .unwrap();
+        let registration = operation
+            .start(&WorkerCommand::Prompt("component intent".into()))
+            .unwrap();
+        // Completed is a component input, not an observed full-worker engine run.
+        emit_ordinary_result(
+            &sender,
+            Some(&operation),
+            Ok(&orbit_engine::TurnEnd::Completed),
+            saved,
+            &qualification,
+        );
+        let (mut notices, mut terminal) = (0, 0);
+        while let Some(message) = bus.try_recv() {
+            match message {
+                Msg::BackendNotice(text) => {
+                    notices += 1;
+                    assert_eq!(
+                        text,
+                        "current prompt could not be saved: leased session storage could not be verified"
+                    );
+                }
+                Msg::OrdinaryTurnEnded {
+                    operation: observed,
+                    end,
+                    publication,
+                } => {
+                    terminal += 1;
+                    assert_eq!(observed, operation);
+                    assert_eq!(end, OrdinaryEnd::Completed);
+                    assert_eq!(publication, OrdinaryPublication::BlockedOrUncertain);
+                }
+                Msg::BackendError(_) | Msg::ResponseFinished { .. } | Msg::SessionProjection(_) => {
+                    panic!("component mapping must preserve existing finish/settlement ownership")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((notices, terminal), (1, 1));
+        assert_eq!((input, output, cost), (0, 0, 0));
+        assert_eq!(
+            accounting.namespace().checkpoint().unwrap(),
+            before_checkpoint
+        );
+        assert!(matches!(
+            crate::sessions::SessionLease::acquire(&home.path, "session-test", "must-stay-owned"),
+            Err(crate::sessions::SessionLeaseError::Busy { .. })
+        ));
+        guard
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(guard.mode))
+            .unwrap();
+        let held = guard.file.metadata().unwrap();
+        let current = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!((held.dev(), held.ino(), held.uid(), held.nlink()), identity);
+        assert_eq!(
+            (current.dev(), current.ino(), current.uid(), current.nlink()),
+            identity
+        );
+        assert_eq!(current.mode() & 0o7777, guard.mode);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // A real nonturn save_controls fault uses the same owned FD, separately.
+        guard
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(guard.mode | 0o040))
+            .unwrap();
+        assert!(!save_controls(
+            &config,
+            &lease,
+            &accounting,
+            &[],
+            0,
+            &mut input,
+            &mut output,
+            &mut cost,
+            &sender,
+            crate::phase_routing::SelectionOrigin::Default,
+            &mut qualification
+        ));
+        assert!(
+            matches!(bus.try_recv(), Some(Msg::BackendNotice(text)) if text == "settings unchanged: leased session storage could not be verified")
+        );
+        assert!(bus.try_recv().is_none());
+        guard
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(guard.mode))
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            accounting.namespace().checkpoint().unwrap(),
+            before_checkpoint
+        );
+        let current = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino(), current.uid(), current.nlink()),
+            identity
+        );
+        assert_eq!(current.mode() & 0o7777, guard.mode);
+        home.removable.set(true);
+        drop(guard);
+        drop(registration);
+        let saved_success = save_turn(
+            &config,
+            &lease,
+            &accounting,
+            &[],
+            0,
+            &mut input,
+            &mut output,
+            &mut cost,
+            crate::phase_routing::SelectionOrigin::Default,
+            &sender,
+            &mut qualification,
+            false,
+        );
+        assert!(
+            saved_success,
+            "the same actual save must succeed after the owned mode fault is removed"
+        );
+        let next = ForegroundOperation::new(operation.source().clone(), ForegroundKind::Prompt, 2)
+            .unwrap();
+        let next_registration = next
+            .start(&WorkerCommand::Prompt("saved component control".into()))
+            .unwrap();
+        emit_ordinary_result(
+            &sender,
+            Some(&next),
+            Ok(&orbit_engine::TurnEnd::Completed),
+            saved_success,
+            &qualification,
+        );
+        assert!(matches!(bus.try_recv(), Some(Msg::OrdinaryTurnEnded {
+            operation: observed, end: OrdinaryEnd::Completed, publication: OrdinaryPublication::Saved,
+        }) if observed == next));
+        assert!(
+            bus.try_recv().is_none(),
+            "successful repair cannot invent a notice or a second result"
+        );
+        assert_eq!(
+            accounting.namespace().checkpoint().unwrap(),
+            before_checkpoint
+        );
+        drop(next_registration);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nonturn_producers_emit_notices_without_ordinary_terminal_result() {
+        let home = OutcomeHome::new();
+        let initial = config(&home.path);
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        commands
+            .send(WorkerCommand::SetMode("invalid-outcome-mode".into()))
+            .unwrap();
+        drop(commands);
+        worker_main(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            initial,
+            Default::default(),
+        );
+        let mut notices = 0;
+        while let Some(message) = bus.try_recv() {
+            match message {
+                Msg::BackendNotice(text) => {
+                    notices += 1;
+                    assert!(text.starts_with("unknown mode invalid-outcome-mode"));
+                }
+                Msg::BackendError(_)
+                | Msg::OrdinaryTurnEnded { .. }
+                | Msg::ResponseFinished { .. } => {
+                    panic!("nonturn producer created ordinary failure or completion")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(notices, 1);
+    }
+
+    #[cfg(unix)]
+    fn startup_private_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::env::var("ORBIT_ACTIVATION_ISOLATED").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            std::env::var("ORBIT_ACTIVATION_RUNNER_DEPTH").as_deref(),
+            Ok("1")
+        );
+        let root = std::path::PathBuf::from(std::env::var_os("ORBIT_ACTIVATION_ROOT").unwrap());
+        let root_info = std::fs::symlink_metadata(&root).unwrap();
+        assert!(root_info.is_dir() && root_info.mode() & 0o077 == 0);
+        for path in [
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap()),
+            std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap()),
+            std::env::current_dir().unwrap(),
+        ] {
+            let canonical = std::fs::canonicalize(&path).unwrap();
+            let info = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                canonical.starts_with(&root)
+                    && info.is_dir()
+                    && info.uid() == root_info.uid()
+                    && info.mode() & 0o077 == 0
+            );
+        }
+        for (key, current) in [
+            ("ORBIT_ACTIVATION_PARENT_MOUNT_FD", "/proc/self/ns/mnt"),
+            ("ORBIT_ACTIVATION_PARENT_USER_FD", "/proc/self/ns/user"),
+        ] {
+            let descriptor: u32 = std::env::var(key).unwrap().parse().unwrap();
+            assert!(descriptor < 4096);
+            let parent = std::fs::metadata(format!("/proc/self/fd/{descriptor}")).unwrap();
+            let own = std::fs::metadata(current).unwrap();
+            assert_ne!((parent.dev(), parent.ino()), (own.dev(), own.ino()));
+        }
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(mounts.lines().any(
+            |line| line.split_whitespace().nth(4) == Some("/etc") && line.contains(" - tmpfs ")
+        ));
+        let marker = std::env::var("ORBIT_ACTIVATION_MANAGED_MARKER").unwrap();
+        assert!(
+            marker.starts_with("ORBIT_ACTIVATION_MANAGED_")
+                && marker.len() <= 128
+                && marker
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        );
+        assert_eq!(
+            std::fs::read_to_string("/etc/orbit/ORBIT.md").unwrap(),
+            marker
+        );
+        let names = [
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "TMPDIR",
+            "TERM",
+            "NO_COLOR",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "ORBIT_ACTIVATION_ROOT",
+            "ORBIT_ACTIVATION_PARENT_MOUNT_FD",
+            "ORBIT_ACTIVATION_PARENT_USER_FD",
+            "ORBIT_ACTIVATION_MANAGED_MARKER",
+            "ORBIT_ACTIVATION_ISOLATED",
+            "ORBIT_ACTIVATION_RUNNER_DEPTH",
+        ];
+        names
+            .into_iter()
+            .map(|name| (name.into(), std::env::var_os(name).unwrap()))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    struct OutcomeStartupChild {
+        child: std::process::Child,
+        reaped: bool,
+    }
+    #[cfg(unix)]
+    impl Drop for OutcomeStartupChild {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // This unreaped handle owns this exact child PID. No group or
+                // external command is signalled, and the namespace is inherited.
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn record_startup_child_failure(case: &str, stdout: &std::fs::File, stderr: &std::fs::File) {
+        use std::os::unix::fs::FileExt;
+        let private_root = std::env::var("ORBIT_ACTIVATION_ROOT").unwrap_or_default();
+        for (stream, file) in [("stdout", stdout), ("stderr", stderr)] {
+            let diagnostic = (|| -> std::io::Result<String> {
+                let length = file.metadata()?.len();
+                let offset = length.saturating_sub(2048);
+                let mut bytes = vec![0u8; (length - offset) as usize];
+                let mut read = 0usize;
+                while read < bytes.len() {
+                    let count = file.read_at(&mut bytes[read..], offset + read as u64)?;
+                    if count == 0 {
+                        break;
+                    }
+                    read += count;
+                }
+                bytes.truncate(read);
+                let text = String::from_utf8_lossy(&bytes);
+                let redacted = if private_root.is_empty() {
+                    text.into_owned()
+                } else {
+                    text.replace(&private_root, "<private-fixture>")
+                };
+                Ok(redacted
+                    .chars()
+                    .flat_map(char::escape_default)
+                    .take(4096)
+                    .collect())
+            })();
+            match diagnostic {
+                Ok(tail) => {
+                    eprintln!("ORBIT_STARTUP_CHILD_FAILURE case={case} stream={stream} tail={tail}")
+                }
+                Err(_) => eprintln!(
+                    "ORBIT_STARTUP_CHILD_FAILURE case={case} stream={stream} tail=<owned-fd-read-failed>"
+                ),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn startup_case_child(case: &str) {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        assert!(matches!(
+            case,
+            "provenance" | "snapshot" | "cwd" | "workspace" | "accounting"
+        ));
+        assert!(
+            std::env::var_os("ORBIT_TUI_STARTUP_CHILD_CASE").is_none(),
+            "startup parent must not recursively run as its ignored child"
+        );
+        let environment = startup_private_environment();
+        let home = OutcomeHome::new();
+        home.removable.set(false);
+        let executable = std::env::current_exe().unwrap();
+        let original = std::fs::symlink_metadata(&executable).unwrap();
+        assert!(
+            original.is_file()
+                && original.uid() == home.identity.2
+                && original.nlink() == 1
+                && original.mode() & 0o111 != 0
+        );
+        let stamp = |metadata: &std::fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.mode(),
+                metadata.nlink(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let stdout_path = home.path.join("startup-child.stdout");
+        let stderr_path = home.path.join("startup-child.stderr");
+        let open = |path: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+                .unwrap()
+        };
+        let stdout = open(&stdout_path);
+        let stderr = open(&stderr_path);
+        for file in [&stdout, &stderr] {
+            let info = file.metadata().unwrap();
+            assert!(
+                info.is_file()
+                    && info.uid() == home.identity.2
+                    && info.nlink() == 1
+                    && info.mode() & 0o7777 == 0o600
+            );
+        }
+        let mut guard = OutcomeStartupChild {
+            child: std::process::Command::new(&executable)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tui_worker::session_tests::startup_failure_child_dispatch",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .envs(environment)
+                .env("ORBIT_TUI_STARTUP_CHILD_CASE", case)
+                .current_dir(std::env::current_dir().unwrap())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::from(stdout.try_clone().unwrap()))
+                .stderr(std::process::Stdio::from(stderr.try_clone().unwrap()))
+                .spawn()
+                .unwrap(),
+            reaped: false,
+        };
+        let require_child = |passed: bool, reason: &str| {
+            if !passed {
+                // The enclosing runner removes its fixture root on all exits.
+                // Record bounded actual child output before its files vanish.
+                record_startup_child_failure(case, &stdout, &stderr);
+                panic!("{reason}");
+            }
+        };
+        let within_output_bound = || {
+            [&stdout, &stderr].into_iter().all(|file| {
+                file.metadata()
+                    .map(|info| info.len() <= 64 * 1024)
+                    .unwrap_or(false)
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            require_child(
+                within_output_bound(),
+                "startup child output bound or metadata failure",
+            );
+            let status = guard.child.try_wait().unwrap_or_else(|_| {
+                require_child(false, "startup child wait failed");
+                unreachable!()
+            });
+            if let Some(status) = status {
+                guard.reaped = true;
+                break status;
+            }
+            require_child(
+                std::time::Instant::now() < deadline,
+                "startup child control deadline",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        require_child(
+            status.success(),
+            "actual ignored startup child assertions failed",
+        );
+        require_child(
+            within_output_bound(),
+            "startup child final output bound or metadata failure",
+        );
+        let text = std::fs::read_to_string(&stdout_path).unwrap_or_else(|_| {
+            require_child(false, "startup child stdout decoding failed");
+            unreachable!()
+        });
+        let marker = format!("ORBIT_STARTUP_BRANCH_ASSERTIONS:{case}");
+        require_child(
+            text.lines().filter(|line| *line == marker.as_str()).count() == 1,
+            "actual startup child assertion marker missing or duplicated",
+        );
+        require_child(
+            text.lines()
+                .filter(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"))
+                .count()
+                == 1,
+            "a zero-test or ignored-only run is not startup branch evidence",
+        );
+        let current = std::fs::symlink_metadata(&executable).unwrap_or_else(|_| {
+            require_child(false, "startup child executable metadata unavailable");
+            unreachable!()
+        });
+        require_child(
+            stamp(&current) == stamp(&original),
+            "startup child executable identity changed",
+        );
+        home.removable.set(true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "invoked only by the five exact startup parents in a private single-test child"]
+    fn startup_failure_child_dispatch() {
+        let _ = startup_private_environment();
+        let case =
+            std::env::var("ORBIT_TUI_STARTUP_CHILD_CASE").expect("exact owned startup child case");
+        match case.as_str() {
+            "provenance" => startup_provenance_fixture(),
+            "snapshot" => startup_snapshot_fixture(),
+            "cwd" => startup_workspace_discovery_fixture(),
+            "workspace" => startup_workspace_admission_fixture(),
+            "accounting" => startup_accounting_preparation_fixture(),
+            _ => panic!("unknown startup child case"),
+        }
+        println!("\nORBIT_STARTUP_BRANCH_ASSERTIONS:{case}");
+    }
+
+    #[cfg(unix)]
+    struct OutcomeCwdGuard {
+        previous: std::path::PathBuf,
+        identity: (u64, u64, u32),
+        restored: bool,
+    }
+    #[cfg(unix)]
+    impl OutcomeCwdGuard {
+        fn enter(home: &OutcomeHome, target: &std::path::Path) -> Self {
+            use std::os::unix::fs::MetadataExt;
+            let previous = std::env::current_dir().expect("private prior CWD");
+            let before = std::fs::symlink_metadata(&previous).unwrap();
+            assert!(
+                before.is_dir() && before.uid() == home.identity.2 && before.mode() & 0o077 == 0,
+                "startup tests require a private owned runner CWD"
+            );
+            let target_info = std::fs::symlink_metadata(target).unwrap();
+            assert!(
+                target_info.is_dir()
+                    && target_info.uid() == home.identity.2
+                    && target_info.mode() & 0o077 == 0
+            );
+            assert!(
+                std::fs::canonicalize(target)
+                    .unwrap()
+                    .starts_with(&home.path)
+            );
+            home.removable.set(false);
+            std::env::set_current_dir(target).unwrap();
+            Self {
+                previous,
+                identity: (before.dev(), before.ino(), before.uid()),
+                restored: false,
+            }
+        }
+        fn restore(&mut self) -> bool {
+            use std::os::unix::fs::MetadataExt;
+            let result = (|| -> std::io::Result<()> {
+                let before = std::fs::symlink_metadata(&self.previous)?;
+                if !before.is_dir() || (before.dev(), before.ino(), before.uid()) != self.identity {
+                    return Err(std::io::Error::other("private prior CWD identity changed"));
+                }
+                std::env::set_current_dir(&self.previous)?;
+                let current = std::env::current_dir()?;
+                let after = std::fs::symlink_metadata(&current)?;
+                if current != self.previous
+                    || (after.dev(), after.ino(), after.uid()) != self.identity
+                {
+                    return Err(std::io::Error::other("private prior CWD was not restored"));
+                }
+                Ok(())
+            })();
+            self.restored = result.is_ok();
+            self.restored
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for OutcomeCwdGuard {
+        fn drop(&mut self) {
+            if !self.restored && !self.restore() {
+                eprintln!("owned startup fixture retained after incomplete CWD restoration");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn startup_snapshot(
+        home: &OutcomeHome,
+    ) -> (
+        crate::sessions::SessionLease,
+        crate::sessions::SessionFile,
+        std::path::PathBuf,
+    ) {
+        let lease =
+            crate::sessions::SessionLease::acquire(&home.path, "session-test", "startup-outcome")
+                .unwrap();
+        let saved = crate::sessions::SessionFile::from_chat(
+            "session-test",
+            "m",
+            "http://127.0.0.1:1",
+            "p",
+            &[],
+            0,
+            0,
+            0,
+            0,
+        )
+        .in_workspace(&home.path.join("workspace"))
+        .unwrap();
+        lease.save(&saved).unwrap();
+        (lease, saved, home.path.join("sessions/session-test.json"))
+    }
+
+    #[cfg(unix)]
+    fn rewrite_startup_snapshot(home: &OutcomeHome, path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        assert_eq!(path, home.path.join("sessions/session-test.json"));
+        assert!(bytes.len() <= 16384);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .unwrap();
+        let info = file.metadata().unwrap();
+        assert!(
+            info.is_file()
+                && info.uid() == home.identity.2
+                && info.nlink() == 1
+                && info.mode() & 0o077 == 0
+        );
+        let identity = (info.dev(), info.ino(), info.uid(), info.nlink());
+        file.set_len(0).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        let after = std::fs::symlink_metadata(path).unwrap();
+        assert_eq!(
+            (after.dev(), after.ino(), after.uid(), after.nlink()),
+            identity
+        );
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    fn assert_startup_notice(
+        home: &OutcomeHome,
+        lease: crate::sessions::SessionLease,
+        expected: &str,
+    ) {
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        drop(commands);
+        // EOF prevents a wrong successful startup from waiting for test input.
+        // This calls the actual production startup; no stubbed producer or hook.
+        worker_main_owned(
+            WorkerCtx {
+                sender,
+                approvals: ApprovalRegistry::new(),
+                command_rx,
+            },
+            config(&home.path),
+            Default::default(),
+            lease,
+        );
+        let mut messages = Vec::new();
+        while let Some(message) = bus.try_recv() {
+            messages.push(message);
+        }
+        assert_eq!(
+            messages.len(),
+            1,
+            "startup failure must emit exactly its Notice"
+        );
+        match messages.pop().unwrap() {
+            Msg::BackendNotice(text) => assert_eq!(text, expected),
+            _ => panic!(
+                "startup failure emitted an ordinary error, report, or initialization instead of Notice"
+            ),
+        }
+        let released =
+            crate::sessions::SessionLease::acquire(&home.path, "session-test", "startup-returned")
+                .expect("the actual returned startup releases its lease");
+        drop(released);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn startup_provenance_failure_is_notice_without_ordinary_events() {
+        startup_case_child("provenance");
+    }
+
+    #[cfg(unix)]
+    fn startup_provenance_fixture() {
+        let home = OutcomeHome::new();
+        let (lease, _, path) = startup_snapshot(&home);
+        rewrite_startup_snapshot(&home, &path, b"{");
+        assert_eq!(
+            crate::sessions::read_selection_origin(&home.path, "session-test").unwrap_err(),
+            "invalid saved session provenance"
+        );
+        let before = std::fs::read(&path).unwrap();
+        assert_startup_notice(&home, lease, "invalid saved session provenance");
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn startup_snapshot_failure_is_notice_without_ordinary_events() {
+        startup_case_child("snapshot");
+    }
+
+    #[cfg(unix)]
+    fn startup_snapshot_fixture() {
+        let home = OutcomeHome::new();
+        let (lease, mut saved, path) = startup_snapshot(&home);
+        saved.schema = "unsupported-fixture-schema".into();
+        rewrite_startup_snapshot(&home, &path, &serde_json::to_vec(&saved).unwrap());
+        // Provenance accepts the parsed identity; the next real lease load
+        // performs the schema check and reaches the distinct second branch.
+        assert!(crate::sessions::read_selection_origin(&home.path, "session-test").is_ok());
+        assert!(matches!(lease.load_optional(),
+            Err(crate::sessions::SessionLeaseError::InvalidData(reason)) if reason == "unsupported session schema"));
+        let before = std::fs::read(&path).unwrap();
+        assert_startup_notice(
+            &home,
+            lease,
+            "invalid saved session: unsupported session schema",
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn startup_workspace_discovery_failure_is_notice_without_ordinary_events() {
+        startup_case_child("cwd");
+    }
+
+    #[cfg(unix)]
+    fn startup_workspace_discovery_fixture() {
+        let home = OutcomeHome::new();
+        let workspace = home.path.join("workspace");
+        let lease =
+            crate::sessions::SessionLease::acquire(&home.path, "session-test", "startup-workspace")
+                .unwrap();
+        assert!(crate::sessions::read_selection_origin(&home.path, "session-test").is_ok());
+        assert!(lease.load_optional().unwrap().is_none());
+        let mut cwd = OutcomeCwdGuard::enter(&home, &workspace);
+        let expected = std::fs::symlink_metadata(&workspace).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let held = std::fs::symlink_metadata(std::path::Path::new(".")).unwrap();
+        assert_eq!(
+            (held.dev(), held.ino(), held.uid()),
+            (expected.dev(), expected.ino(), expected.uid())
+        );
+        // Only the exact new empty owned directory is removed, never the
+        // runner/operator CWD. This deterministically makes getcwd fail.
+        std::fs::remove_dir(&workspace).unwrap();
+        assert!(crate::sessions::current_workspace().is_err());
+        assert_startup_notice(
+            &home,
+            lease,
+            "invalid saved session: workspace directory is unavailable",
+        );
+        assert!(cwd.restore(), "private prior CWD restoration");
+        home.removable.set(true);
+        drop(cwd);
+        assert!(
+            !home.path.join("sessions/session-test.json").exists(),
+            "workspace discovery failure must not create a snapshot"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn startup_workspace_admission_failure_is_notice_without_ordinary_events() {
+        startup_case_child("workspace");
+    }
+
+    #[cfg(unix)]
+    fn startup_workspace_admission_fixture() {
+        use std::os::unix::fs::DirBuilderExt;
+        let home = OutcomeHome::new();
+        let (lease, saved, path) = startup_snapshot(&home);
+        let actual = home.path.join("current-workspace");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&actual)
+            .unwrap();
+        let mut cwd = OutcomeCwdGuard::enter(&home, &actual);
+        assert!(crate::sessions::read_selection_origin(&home.path, "session-test").is_ok());
+        assert!(lease.load_optional().unwrap().is_some());
+        let workspace = crate::sessions::current_workspace().unwrap();
+        assert!(saved.require_workspace(&workspace).is_err());
+        let before = std::fs::read(&path).unwrap();
+        assert_startup_notice(
+            &home,
+            lease,
+            "invalid saved session: session belongs to another workspace; open its original directory to resume",
+        );
+        assert!(cwd.restore(), "private prior CWD restoration");
+        home.removable.set(true);
+        drop(cwd);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn startup_accounting_preparation_failure_is_notice_without_ordinary_events() {
+        startup_case_child("accounting");
+    }
+
+    #[cfg(unix)]
+    fn startup_accounting_preparation_fixture() {
+        let home = OutcomeHome::new();
+        let (lease, mut saved, path) = startup_snapshot(&home);
+        saved.accounting_watermark = Some(session_accounting::SessionAccountingWatermark {
+            owner_session_id: "session-test".into(),
+            child_id: None,
+            revision: 1,
+            known_input_tokens: 0,
+            known_output_tokens: 0,
+            known_ordinary_microcents: 0,
+            known_housekeeping_microcents: 0,
+            full_cost_status: FullCostStatus::Known,
+        });
+        lease.save(&saved).unwrap();
+        let mut cwd = OutcomeCwdGuard::enter(&home, &home.path.join("workspace"));
+        assert!(crate::sessions::read_selection_origin(&home.path, "session-test").is_ok());
+        let observed = lease.load_optional().unwrap().unwrap();
+        observed
+            .require_workspace(&crate::sessions::current_workspace().unwrap())
+            .unwrap();
+        let journal =
+            crate::context_history::context_journal(&home.path, "session-test", None).unwrap();
+        assert!(matches!(
+            journal.accounting_checkpoint_detailed(),
+            Err(orbit_engine::HistoryError::Missing)
+        ));
+        let before = std::fs::read(&path).unwrap();
+        assert_startup_notice(
+            &home,
+            lease,
+            "saved accounting anchor exists but its journal is missing",
+        );
+        assert!(cwd.restore(), "private prior CWD restoration");
+        home.removable.set(true);
+        drop(cwd);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(matches!(
+            journal.accounting_checkpoint_detailed(),
+            Err(orbit_engine::HistoryError::Missing)
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_mod_body_settles_without_fabricated_ordinary_report() {
+        let home = OutcomeHome::new();
+        let initial = config(&home.path);
+        let lease =
+            crate::sessions::SessionLease::acquire(&home.path, "session-test", "missing-mod")
+                .unwrap();
+        home.removable.set(false);
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let (commands, command_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_main_owned(
+                WorkerCtx {
+                    sender,
+                    approvals: ApprovalRegistry::new(),
+                    command_rx,
+                },
+                initial,
+                Default::default(),
+                lease,
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let binding = loop {
+            match bus.try_recv() {
+                Some(Msg::SessionProjection(view))
+                    if matches!(view.reason, ProjectionReason::Initial) =>
+                {
+                    break view.binding;
+                }
+                Some(Msg::BackendError(_) | Msg::BackendNotice(_)) => {
+                    panic!("missing-mod fixture startup failed")
+                }
+                _ => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual initial binding absent"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let operation = ForegroundOperation::new(binding, ForegroundKind::Prompt, 1).unwrap();
+        commands
+            .send(WorkerCommand::Bound {
+                operation: operation.clone(),
+                command: Box::new(WorkerCommand::ModCommand(
+                    "absent-mod".into(),
+                    "absent-command".into(),
+                )),
+            })
+            .unwrap();
+        drop(commands);
+        worker.join().unwrap();
+        home.removable.set(true);
+        let (mut diagnostic, mut terminal) = (0, 0);
+        while let Some(message) = bus.try_recv() {
+            match message {
+                Msg::SystemMessage(text)
+                    if text == "no command absent-command in mod absent-mod" =>
+                {
+                    diagnostic += 1
+                }
+                Msg::SessionProjection(view)
+                    if matches!(&view.reason,
+                    ProjectionReason::Operation { operation: observed } if observed == &operation) =>
+                {
+                    terminal += 1
+                }
+                Msg::BackendError(_)
+                | Msg::BackendNotice(_)
+                | Msg::OrdinaryTurnEnded { .. }
+                | Msg::ResponseFinished { .. } => {
+                    panic!("missing body fabricated an ordinary execution")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((diagnostic, terminal), (1, 1));
+        let retained = crate::sessions::load_session(&home.path, "session-test").unwrap();
+        assert!(retained.transcript.is_empty());
+        assert_eq!(
+            (
+                retained.turns,
+                retained.input_tokens,
+                retained.output_tokens,
+                retained.cost_microcents
+            ),
+            (0, 0, 0, 0)
+        );
     }
 
     #[test]
@@ -3368,7 +5159,7 @@ mod session_tests {
                     }
                     _ => {}
                 },
-                Some(Msg::BackendError(_)) => backend_failure = true,
+                Some(Msg::BackendError(_)) | Some(Msg::BackendNotice(_)) => backend_failure = true,
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
@@ -3384,7 +5175,7 @@ mod session_tests {
                     rewound = true;
                     break;
                 }
-                Some(Msg::BackendError(_)) => backend_failure = true,
+                Some(Msg::BackendError(_)) | Some(Msg::BackendNotice(_)) => backend_failure = true,
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
@@ -3395,7 +5186,7 @@ mod session_tests {
         drop(commands);
         worker.join().unwrap();
         while let Some(message) = bus.try_recv() {
-            if matches!(message, Msg::BackendError(_)) {
+            if matches!(message, Msg::BackendError(_) | Msg::BackendNotice(_)) {
                 backend_failure = true;
             }
         }
@@ -3504,7 +5295,7 @@ mod session_tests {
                     refused = true;
                     break;
                 }
-                Some(Msg::BackendError(_)) => backend_failure = true,
+                Some(Msg::BackendError(_)) | Some(Msg::BackendNotice(_)) => backend_failure = true,
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
@@ -3516,7 +5307,7 @@ mod session_tests {
         drop(commands);
         worker.join().unwrap();
         while let Some(message) = bus.try_recv() {
-            if matches!(message, Msg::BackendError(_)) {
+            if matches!(message, Msg::BackendError(_) | Msg::BackendNotice(_)) {
                 backend_failure = true;
             }
         }
@@ -3626,7 +5417,7 @@ default_effort = "low"
                         refused = true;
                         break;
                     }
-                    Msg::BackendError(error) => {
+                    Msg::BackendError(error) | Msg::BackendNotice(error) => {
                         panic!("idle rejection failed a provider turn: {error}")
                     }
                     _ => {}
@@ -3642,7 +5433,7 @@ default_effort = "low"
         drop(commands);
         worker.join().unwrap();
         while let Some(message) = bus.try_recv() {
-            if let Msg::BackendError(error) = message {
+            if let Msg::BackendError(error) | Msg::BackendNotice(error) = message {
                 panic!("idle rejection failed a provider turn: {error}");
             }
         }
@@ -3774,36 +5565,139 @@ default_effort = "medium"
         let _ = std::fs::remove_dir_all(home);
     }
 
-    #[test]
-    fn saved_provider_owns_effort_when_model_ids_overlap() {
-        use orbit_adapter::types::EffortValue;
-        let home = std::env::temp_dir().join(format!("orbit-effort-owner-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(
-            home.join("providers.toml"),
+    struct TestHome(std::path::PathBuf);
+
+    impl TestHome {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("orbit-tui-billing-{}", ulid::Ulid::new()));
+            std::fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self(path)
+        }
+    }
+
+    impl std::ops::Deref for TestHome {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn duplicate_provider_config(first_url: &str, second_url: &str) -> String {
+        format!(
             r#"
 [[provider]]
 name = "first"
-url = "http://127.0.0.1:1"
+url = "{first_url}"
 [[provider.models]]
-id = "shared"
+id = "shared-notools"
 supported_efforts = ["low", "high"]
 default_effort = "low"
+[provider.models.billing]
+version = 2
+input_per_million_microdollars = 1000000
+output_per_million_microdollars = 1000000
+request_flat_microdollars = 10
+reasoning_counter_basis = "included_in_output"
+reasoning_rate_policy = "output_rate"
 [[provider]]
 name = "second"
-url = "http://127.0.0.1:2"
+url = "{second_url}"
 [[provider.models]]
-id = "shared"
+id = "shared-notools"
 supported_efforts = ["medium"]
 default_effort = "medium"
-"#,
+[provider.models.billing]
+version = 2
+input_per_million_microdollars = 2000000
+output_per_million_microdollars = 3000000
+request_flat_microdollars = 20
+reasoning_counter_basis = "included_in_output"
+reasoning_rate_policy = "output_rate"
+"#
+        )
+    }
+
+    struct MockProvider {
+        endpoint: String,
+        state: orbit_mock_provider::ServerState,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockProvider {
+        fn start() -> Self {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async move {
+                    let (addr, state, server) = orbit_mock_provider::spawn().await.unwrap();
+                    ready_tx.send((addr, state)).unwrap();
+                    let _ = stop_rx.await;
+                    server.abort();
+                });
+            });
+            let (addr, state) = ready_rx.recv().unwrap();
+            Self {
+                endpoint: format!("http://{addr}"),
+                state,
+                stop: Some(stop_tx),
+                thread: Some(thread),
+            }
+        }
+
+        fn request_count(&self) -> u64 {
+            use std::sync::atomic::Ordering;
+            self.state.requests.load(Ordering::SeqCst)
+        }
+
+        fn last_request(&self) -> serde_json::Value {
+            self.state.last_body.lock().unwrap().clone().unwrap()
+        }
+    }
+
+    impl Drop for MockProvider {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn saved_provider_owns_effort_and_billing_when_model_ids_overlap() {
+        use orbit_adapter::types::EffortValue;
+        let mock = MockProvider::start();
+        let home = TestHome::new();
+        std::fs::write(
+            home.join("providers.toml"),
+            duplicate_provider_config("http://127.0.0.1:1", &mock.endpoint),
         )
         .unwrap();
-        let initial = config(&home);
+        let mut initial = config(&home);
+        initial.model = "shared-notools".into();
+        initial.provider_id = "first".into();
+        initial.gate = "http://127.0.0.1:1".into();
         let saved = crate::sessions::SessionFile::from_chat(
             "owner",
-            "shared",
-            "http://127.0.0.1:2",
+            "shared-notools",
+            &mock.endpoint,
             "second",
             &[],
             0,
@@ -3826,6 +5720,9 @@ default_effort = "medium"
         commands
             .send(WorkerCommand::Effort("default".into()))
             .unwrap();
+        commands
+            .send(WorkerCommand::Prompt("use the resumed provider".into()))
+            .unwrap();
         drop(commands);
         worker_main(
             WorkerCtx {
@@ -3839,6 +5736,10 @@ default_effort = "medium"
         let after = crate::sessions::load_session(&home, "owner").unwrap();
         assert_eq!(after.provider, "second");
         assert_eq!(after.effort, Some(EffortSetting::Default));
+        assert_eq!((after.input_tokens, after.output_tokens), (3, 2));
+        assert_eq!(after.cost_microcents, 32);
+        assert_eq!(mock.request_count(), 1);
+        assert_eq!(mock.last_request()["model"], "shared-notools");
         let turn = configured_turn(&TuiTurnConfig {
             provider_id: after.provider,
             model: after.model,
@@ -3846,10 +5747,25 @@ default_effort = "medium"
             ..config(&home)
         })
         .unwrap();
-        assert_eq!(turn.gate, "http://127.0.0.1:2");
+        assert_eq!(turn.gate, mock.endpoint);
         assert_eq!(turn.effort, Some(EffortValue::Level("medium".into())));
+        let billing = turn.billing.as_ref().unwrap();
+        assert_eq!(billing.provider_id().0, "second");
+        assert_eq!(billing.raw_model_id().0, "shared-notools");
+        assert_eq!(
+            billing.rates().input_per_million_microdollars,
+            Some(2_000_000)
+        );
+        assert_eq!(billing.rates().request_flat_microdollars, Some(20));
+        assert_eq!(
+            billing.reasoning_counter_basis(),
+            orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput
+        );
+        assert_eq!(
+            billing.reasoning_rate_policy(),
+            orbit_adapter::types::ReasoningRatePolicy::OutputRate
+        );
         drop(bus);
-        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -3895,7 +5811,7 @@ default_effort = "medium"
         let mut reports = vec![];
         while let Some(message) = bus.try_recv() {
             match message {
-                Msg::BackendError(error) => {
+                Msg::BackendError(error) | Msg::BackendNotice(error) => {
                     panic!("idle control emitted a backend failure: {error}")
                 }
                 Msg::EffortStatus(text) => reports.push(text),

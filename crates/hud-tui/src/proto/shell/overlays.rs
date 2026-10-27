@@ -108,7 +108,7 @@ pub fn draw(cv: &mut Cv, w: i32, h: i32, ov: &Overlay, now_ms: u64, reduced: boo
             opened_ms,
             sel_ms,
         } => palette(
-            cv, w, query, *sel, *sel_prev, *opened_ms, *sel_ms, now_ms, reduced,
+            cv, w, h, query, *sel, *sel_prev, *opened_ms, *sel_ms, now_ms, reduced,
         ),
         Overlay::Help { opened_ms } => help(cv, w, h, *opened_ms, now_ms, reduced),
         Overlay::Quit { turn_live } => quit(cv, w, h, *turn_live),
@@ -152,14 +152,36 @@ fn choice_picker(
         return;
     }
     let colors = cv.palette;
+    let session_rows = title == "SESSIONS";
+    let row_height = if session_rows { 2 } else { 1 };
     let w = 76.min((sw - 8).max(8)).min(sw);
-    let y = 4.min(sh - 4);
+    let footer_rows = if session_rows { 1 } else { 0 };
+    let minimum_content_height = if rows.is_empty() { 1 } else { row_height };
+    let minimum_frame_height = minimum_content_height + 3;
+    if session_rows && sh < minimum_frame_height + footer_rows {
+        return;
+    }
+    let y = if session_rows {
+        4.min((sh - minimum_frame_height - footer_rows).max(0))
+    } else {
+        4.min(sh - 4)
+    };
     let x = (sw - w) / 2;
-    let capacity = (sh - y - 3).clamp(1, 12) as usize;
+    let available_rows = sh - y - 3 - footer_rows;
+    let rows_that_fit = available_rows / row_height;
+    if !rows.is_empty() && rows_that_fit == 0 {
+        return;
+    }
+    let capacity = rows_that_fit.clamp(1, 12) as usize;
     let selected = sel.min(rows.len().saturating_sub(1));
     let first = selected.saturating_sub(capacity - 1);
     let shown = rows.len().min(capacity) as i32;
-    let h = shown.max(1) + 3;
+    let content_height = if rows.is_empty() {
+        1
+    } else {
+        shown * row_height
+    };
+    let h = content_height + 3;
     let reveal = if reduced {
         h
     } else {
@@ -180,34 +202,50 @@ fn choice_picker(
                 cv.text(x + 4, y + 2, "no entries", colors.muted, Some(colors.raise));
             }
             for (i, row) in rows.iter().enumerate().skip(first).take(capacity) {
-                let ry = y + 2 + (i - first) as i32;
-                cv.hit(x + 1, ry, w - 2, 1, super::hits::Click::Picker(i));
+                let ry = y + 2 + (i - first) as i32 * row_height;
+                cv.hit(x + 1, ry, w - 2, row_height, super::hits::Click::Picker(i));
                 let on = i == selected;
                 if on {
-                    cv.fill(x + 1, ry, w - 2, 1, colors.magenta);
+                    cv.fill(x + 1, ry, w - 2, row_height, colors.magenta);
                 }
                 let fg = if on { colors.on_accent } else { colors.ink };
                 if on {
                     cv.text(x + 1, ry, "▌", colors.on_accent, Some(colors.magenta));
+                    if row_height == 2 {
+                        cv.text(x + 1, ry + 1, "▌", colors.on_accent, Some(colors.magenta));
+                    }
                 }
                 let content_width = w - 6;
-                let detail_width = if content_width >= 30 {
-                    content_width / 3
-                } else {
-                    0
-                };
-                let label_width = content_width - detail_width;
-                let label = clip_text(&crate::bridge::safe_text(&row.label), label_width);
                 let bg = Some(if on { colors.magenta } else { colors.raise });
-                cv.text(x + 3, ry, &label, fg, bg);
-                let detail = clip_text(&crate::bridge::safe_text(&row.detail), detail_width);
-                cv.text(
-                    x + 3 + label_width,
-                    ry,
-                    &detail,
-                    if on { colors.on_accent } else { colors.muted },
-                    bg,
-                );
+                if session_rows {
+                    let label = clip_text(&crate::bridge::safe_text(&row.label), content_width);
+                    cv.text(x + 3, ry, &label, fg, bg);
+                    let detail = clip_text(&crate::bridge::safe_text(&row.detail), content_width);
+                    cv.text(
+                        x + 3,
+                        ry + 1,
+                        &detail,
+                        if on { colors.on_accent } else { colors.muted },
+                        bg,
+                    );
+                } else {
+                    let detail_width = if content_width >= 30 {
+                        content_width / 3
+                    } else {
+                        0
+                    };
+                    let label_width = content_width - detail_width;
+                    let label = clip_text(&crate::bridge::safe_text(&row.label), label_width);
+                    cv.text(x + 3, ry, &label, fg, bg);
+                    let detail = clip_text(&crate::bridge::safe_text(&row.detail), detail_width);
+                    cv.text(
+                        x + 3 + label_width,
+                        ry,
+                        &detail,
+                        if on { colors.on_accent } else { colors.muted },
+                        bg,
+                    );
+                }
             }
         },
     );
@@ -360,6 +398,7 @@ fn diff(
 fn palette(
     cv: &mut Cv,
     sw: i32,
+    sh: i32,
     query: &str,
     sel: usize,
     sel_prev: usize,
@@ -370,9 +409,13 @@ fn palette(
 ) {
     let colors = cv.palette;
     let w = 70.min(sw - 8);
-    let (x, y) = ((sw - w) / 2, 4);
+    let y = 4.min((sh - 6).max(0));
+    let x = (sw - w) / 2;
     let items = palette_items(query);
-    let shown = items.len().min(9) as i32;
+    let capacity = (sh - y - 5).clamp(1, 9) as usize;
+    let selected = sel.min(items.len().saturating_sub(1));
+    let first = selected.saturating_sub(capacity - 1);
+    let shown = items.len().min(capacity) as i32;
     let h = shown.max(1) + 5;
     // Rows drop in at 12 ms each.
     let reveal = if reduced {
@@ -405,8 +448,10 @@ fn palette(
             }
             // The selection bar glides between rows.
             let p = ease_out(prog(secs(now_ms), Some(secs(sel_ms)), 0.08, reduced));
+            let previous = sel_prev.clamp(first, first + shown.max(1) as usize - 1) - first;
+            let current = selected - first;
             let sel_y =
-                y + 3 + (sel_prev as f32 + (sel as f32 - sel_prev as f32) * p).round() as i32;
+                y + 3 + (previous as f32 + (current as f32 - previous as f32) * p).round() as i32;
             if items.is_empty() {
                 cv.text(
                     x + 4,
@@ -416,10 +461,10 @@ fn palette(
                     Some(colors.raise),
                 );
             }
-            for (i, (cmd, desc)) in items.iter().take(9).enumerate() {
-                let ry = y + 3 + i as i32;
+            for (i, (cmd, desc)) in items.iter().enumerate().skip(first).take(capacity) {
+                let ry = y + 3 + (i - first) as i32;
                 cv.hit(x + 1, ry, w - 2, 1, super::hits::Click::Palette(i));
-                let on = i == sel;
+                let on = i == selected;
                 let q: Vec<char> = query
                     .trim_start_matches('/')
                     .to_lowercase()
@@ -518,7 +563,6 @@ fn help(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduced: boo
                 // scope is the part of these lines that must not be cut.
                 ("s", "this kind of call, session"),
                 ("a", "same, saved in this folder"),
-                ("R", "the whole tool, session"),
                 ("n", "deny, with a word on why"),
                 ("esc", "deny"),
             ],
@@ -740,13 +784,20 @@ pub fn toast(
     now_ms: u64,
     reduced: bool,
 ) {
+    let sw = sw.clamp(0, i32::from(u16::MAX));
+    let sh = sh.clamp(0, i32::from(u16::MAX));
+    if sw < 8 || sh < 6 {
+        return;
+    }
     let colors = cv.palette;
     let age = secs(now_ms.saturating_sub(shown_ms));
     let ttl = secs(ttl_ms);
     if age > ttl + 0.2 {
         return;
     }
-    let w = text_width(text) + 6;
+    let max_box_width = sw - 2;
+    let text = clip_text(text, max_box_width - 6);
+    let w = text_width(&text) + 6;
     let in_p = ease_out(prog(secs(now_ms), Some(secs(shown_ms)), 0.16, reduced));
     let out_p = if age > ttl {
         ease_in_out(prog(
@@ -760,7 +811,7 @@ pub fn toast(
     };
     let x = (sw as f32 - 2.0 - w as f32 + (w + 2) as f32 * (1.0 - in_p) + (w + 2) as f32 * out_p)
         .round() as i32;
-    let y = sh - 4;
+    let y = sh - 6;
     let col = if ok { colors.green } else { colors.violet };
     let bg = tint(col, colors.raise, 0.14);
     cv.veil(x + 1, y + 1, w, 2, (0, 0, 0), 0.4);
@@ -768,7 +819,7 @@ pub fn toast(
     cv.text(x, y, "▌", col, Some(bg));
     cv.text(x, y + 1, "▌", col, Some(bg));
     cv.bold(x + 2, y, if ok { "✓" } else { "✦" }, col, Some(bg));
-    cv.text(x + 4, y, text, colors.ink, Some(bg));
+    cv.text(x + 4, y, &text, colors.ink, Some(bg));
     // The drain line shows how long the toast stays.
     let left = if reduced {
         1.0
@@ -884,6 +935,16 @@ mod choice_picker_tests {
     }
 
     fn render(width: u16, height: u16, rows: &[PickerRow], sel: usize) -> (Buffer, Vec<Hit>) {
+        render_title(width, height, rows, sel, "MODELS")
+    }
+
+    fn render_title(
+        width: u16,
+        height: u16,
+        rows: &[PickerRow],
+        sel: usize,
+        title: &'static str,
+    ) -> (Buffer, Vec<Hit>) {
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
         let hits = {
             let mut cv = Cv::new(&mut buffer);
@@ -892,7 +953,7 @@ mod choice_picker_tests {
                 i32::from(width),
                 i32::from(height),
                 &Overlay::Picker {
-                    title: "MODELS",
+                    title,
                     rows,
                     sel,
                     opened_ms: 0,
@@ -937,6 +998,85 @@ mod choice_picker_tests {
                     .all(|hit| hit.rect.right() <= width && hit.rect.bottom() <= height)
             );
         }
+    }
+
+    #[test]
+    fn sessions_picker_keeps_full_identity_and_both_lines_share_one_hit() {
+        let id = "session-01JAB12CD34EF56GH78JK90MNP";
+        let rows = vec![PickerRow {
+            label: format!("{id}  (this session)"),
+            value: id.into(),
+            detail: "12 turns · mock/model-with-a-long-name".into(),
+        }];
+        let (buffer, hits) = render_title(80, 24, &rows, 0, "SESSIONS");
+        let row = hits
+            .iter()
+            .find(|hit| hit.click == Click::Picker(0))
+            .unwrap();
+        assert_eq!(row.rect.height, 2);
+        assert!(line(&buffer, row.rect.y).contains(id));
+        assert!(line(&buffer, row.rect.y).contains("(this session)"));
+        assert!(line(&buffer, row.rect.y + 1).contains("12 turns · mock/model-with-a-long-name"));
+        for y in [row.rect.y, row.rect.y + 1] {
+            assert_eq!(
+                super::super::hits::at(&hits, row.rect.x, y),
+                Some(Click::Picker(0))
+            );
+        }
+    }
+
+    #[test]
+    fn sessions_picker_height_boundaries_and_scrolled_selection_stay_bounded() {
+        let rows: Vec<_> = (0..40)
+            .map(|i| PickerRow {
+                label: format!("session-{i:02}"),
+                value: format!("session-{i:02}"),
+                detail: format!("{i} turns · mock/model · updated today"),
+            })
+            .collect();
+        let (_, no_capacity_hits) = render_title(80, 5, &rows[..1], 0, "SESSIONS");
+        assert!(
+            no_capacity_hits.is_empty(),
+            "zero capacity draws no partial picker"
+        );
+
+        let (minimum_buffer, minimum_hits) = render_title(80, 6, &rows[..1], 0, "SESSIONS");
+        let minimum_picker_hits: Vec<_> = minimum_hits
+            .iter()
+            .filter(|hit| matches!(hit.click, Click::Picker(_)))
+            .collect();
+        assert_eq!(minimum_picker_hits.len(), 1);
+        assert_eq!(minimum_picker_hits[0].rect.height, 2);
+        assert!(minimum_hits.iter().all(|hit| hit.rect.bottom() <= 5));
+        assert!(line(&minimum_buffer, 2).contains("session-00"));
+
+        let (buffer, hits) = render_title(80, 24, &rows, 27, "SESSIONS");
+        let picker_hits: Vec<_> = hits
+            .iter()
+            .filter(|hit| matches!(hit.click, Click::Picker(_)))
+            .collect();
+        assert_eq!(
+            picker_hits.len(),
+            8,
+            "capacity uses two terminal rows plus footer reserve"
+        );
+        let selected = picker_hits
+            .iter()
+            .find(|hit| hit.click == Click::Picker(27))
+            .expect("selected row remains visible while scrolled");
+        assert_eq!(selected.rect.height, 2);
+        assert!(line(&buffer, selected.rect.y).contains("session-27"));
+        assert!(line(&buffer, selected.rect.y + 1).contains("27 turns · mock/model"));
+        assert!(picker_hits.iter().all(|hit| hit.rect.bottom() <= 23));
+        let frame = hits
+            .iter()
+            .find(|hit| hit.click == Click::Inert && hit.rect.width == 72)
+            .expect("picker frame hit target exists");
+        assert!(
+            frame.rect.bottom() <= 23,
+            "leave terminal row 23 for status/footer"
+        );
+        assert!(frame.rect.bottom() <= buffer.area.height);
     }
 
     #[test]
@@ -1008,5 +1148,67 @@ mod choice_picker_tests {
         );
         assert_eq!(buffer[(wide.rect.right(), wide.rect.y)].symbol(), "┃");
         assert!((0..buffer.area.height).all(|y| !line(&buffer, y).chars().any(|c| c.is_control())));
+    }
+
+    fn render_toast(width: u16, height: u16, text: &str) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut cv = Cv::new(&mut buffer);
+        toast(
+            &mut cv,
+            i32::from(width),
+            i32::from(height),
+            text,
+            false,
+            0,
+            3000,
+            1000,
+            true,
+        );
+        buffer
+    }
+
+    #[test]
+    fn toast_clips_whole_graphemes_to_exact_and_one_cell_short_widths() {
+        let text = "e\u{301}界";
+        let exact_width = (text_width(text) + 8) as u16;
+        let exact = render_toast(exact_width, 8, text);
+        let exact_row = line(&exact, 2);
+        assert!(exact_row.contains(text), "{exact_row:?}");
+        assert!(text_width(&exact_row) <= i32::from(exact_width));
+
+        let short_width = exact_width - 1;
+        let short = render_toast(short_width, 8, text);
+        let short_row = line(&short, 2);
+        assert!(short_row.contains("e\u{301}…"), "{short_row:?}");
+        assert!(!short_row.contains('界'), "{short_row:?}");
+        assert!(text_width(&short_row) <= i32::from(short_width));
+    }
+
+    #[test]
+    fn toast_keeps_its_actionable_prefix_inside_a_48_column_terminal() {
+        let text = "wait for the active work to finish; draft retained";
+        let buffer = render_toast(48, 16, text);
+        let row = line(&buffer, 10);
+        assert!(row.contains("wait for the active work"), "{row:?}");
+        assert!(text_width(&row) <= 48);
+        for y in 0..buffer.area.height {
+            assert!(text_width(&line(&buffer, y)) <= 48);
+        }
+    }
+
+    #[test]
+    fn toast_omits_its_decoration_when_a_terminal_is_too_narrow() {
+        for width in 0..8 {
+            let buffer = render_toast(width, 8, "notice");
+            for y in 0..buffer.area.height {
+                assert!(line(&buffer, y).chars().all(|ch| ch == ' '));
+            }
+        }
+        for height in 0..6 {
+            let buffer = render_toast(48, height, "notice");
+            for y in 0..buffer.area.height {
+                assert!(line(&buffer, y).chars().all(|ch| ch == ' '));
+            }
+        }
     }
 }

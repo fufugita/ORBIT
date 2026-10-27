@@ -55,3 +55,7 @@ crates/hud-tui/review-receipts/
 docs/tui/receipts/
 docs/tui/review-receipts/
 .playwright-mcp/
+
+# Local agent/tool working state (never part of the source)
+.serena/
+graphify-out/

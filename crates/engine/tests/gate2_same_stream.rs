@@ -79,6 +79,7 @@ fn run_session(
     label: &str,
 ) -> (Vec<String>, orbit_engine::TurnReport) {
     let config = TurnConfig {
+        billing: None,
         sampling: None,
         effort: None,
         supported_efforts: None,

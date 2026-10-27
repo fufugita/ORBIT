@@ -206,6 +206,7 @@ fn tape_tone_themed(colors: Palette, state: ToolState) -> (&'static str, Rgb) {
         ToolState::Failed => ("✕", colors.red),
         ToolState::AwaitingYou => ("◆", colors.magenta),
         ToolState::Cancelled | ToolState::Denied | ToolState::Blocked => ("⊘", colors.muted),
+        ToolState::Unavailable => ("?", colors.muted),
         ToolState::Queued => ("◌", colors.muted),
     }
 }
@@ -304,6 +305,7 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
             ToolState::Failed => {
                 badge_themed(colors, BadgeState::Failed, None, inp.now_ms, inp.reduced)
             }
+            ToolState::Unavailable => vec![Seg::new("? result unavailable", colors.muted)],
             _ => badge_themed(colors, BadgeState::Idle, None, inp.now_ms, inp.reduced),
         },
     };
@@ -366,7 +368,9 @@ fn terminal(cv: &mut Cv, r: Rect, inp: &PaneIn) {
         }
         if let Some(c) = ended {
             let (g, col) = tape_tone_themed(colors, c.tool_state);
-            let what = if c.meta.is_empty() {
+            let what = if c.tool_state == ToolState::Unavailable {
+                "result unavailable".to_string()
+            } else if c.meta.is_empty() {
                 match c.tool_state {
                     ToolState::Denied => "denied".to_string(),
                     ToolState::Cancelled => "cancelled".to_string(),

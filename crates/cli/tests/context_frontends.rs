@@ -670,7 +670,11 @@ mod frontend_manual_baselines {
                     "id":id,"max_output_tokens":73,"context_limits":{"input_tokens":input},
                     "pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,
                         "cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,
-                        "reasoning_per_million_microdollars":0,"request_flat_microdollars":price}
+                        "reasoning_per_million_microdollars":0,"request_flat_microdollars":price},
+                    "billing":{"version":2,"input_per_million_microdollars":0,
+                        "output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,
+                        "cache_write_per_million_microdollars":0,"request_flat_microdollars":price,
+                        "reasoning_counter_basis":"included_in_output","reasoning_rate_policy":"output_rate"}
                 })
             };
             let value = json!({"provider":[{"name":"provider_a","kind":"openai-compatible","url":wire.url,
@@ -950,7 +954,12 @@ mod frontend_manual_baselines {
                         assert_eq!(projection.binding.generation, 1);
                         return projection;
                     }
-                    Some(Msg::BackendError(error)) => panic!("worker initialization: {error}"),
+                    Some(Msg::BackendError(error)) | Some(Msg::BackendNotice(error)) => {
+                        panic!("worker initialization: {error}")
+                    }
+                    Some(Msg::OrdinaryTurnEnded { .. }) => {
+                        panic!("ordinary result before Initial binding")
+                    }
                     Some(_) => {}
                     None => std::thread::sleep(Duration::from_millis(2)),
                 }
@@ -1006,6 +1015,12 @@ mod frontend_manual_baselines {
                     Some(Msg::ResponseFinished { .. }) => ordinary += 1,
                     Some(Msg::PlanReady(_)) => plans += 1,
                     Some(Msg::ToolCallStarted { .. }) => tools += 1,
+                    Some(Msg::BackendNotice(_)) => {
+                        panic!("unexpected notice during manual operation")
+                    }
+                    Some(Msg::OrdinaryTurnEnded { .. }) => {
+                        panic!("manual operation emitted ordinary result")
+                    }
                     Some(_) => {}
                     None => std::thread::sleep(Duration::from_millis(2)),
                 }
@@ -1022,7 +1037,9 @@ mod frontend_manual_baselines {
                 assert!(
                     !matches!(
                         event,
-                        Msg::ResponseFinished { .. }
+                        Msg::BackendNotice(_)
+                            | Msg::OrdinaryTurnEnded { .. }
+                            | Msg::ResponseFinished { .. }
                             | Msg::PlanReady(_)
                             | Msg::ToolCallStarted { .. }
                             | Msg::SessionProjection(SessionProjection {
@@ -1359,6 +1376,35 @@ mod frontend_manual_baselines {
                 let _ = runtime.shutdown();
             }
         }
+    }
+
+    #[test]
+    fn initial_observer_rejects_backend_notice_without_waiting() {
+        if !dispatch_isolated(
+            "frontend_manual_baselines::initial_observer_rejects_backend_notice_without_waiting",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let (bus, sender) = Bus::new();
+        orbit_hud_tui::emit_notice(&sender, "synthetic startup notice");
+        let tui = Tui {
+            bus,
+            commands: None,
+            cancel: Arc::new(|| {}),
+        };
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tui.initial()))
+            .expect_err("initial observer must reject the actual notice");
+        let message = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert_eq!(
+            message, "worker initialization: synthetic startup notice",
+            "a timeout assertion is not notice handling"
+        );
+        assert!(tui.bus.try_recv().is_none());
     }
 
     #[test]
@@ -4411,7 +4457,9 @@ mod frontend_manual_baselines {
                     .unwrap();
             value["provider"][0]["models"][0]["context_limits"]["input_tokens"] = json!(input);
             value["provider"][0]["models"][0]["pricing"]["request_flat_microdollars"] = json!(13);
+            value["provider"][0]["models"][0]["billing"]["request_flat_microdollars"] = json!(13);
             value["provider"][0]["models"][1]["pricing"]["request_flat_microdollars"] = json!(17);
+            value["provider"][0]["models"][1]["billing"]["request_flat_microdollars"] = json!(17);
             let mut second = value["provider"][0].clone();
             second["name"] = json!("provider_b");
             second["models"] = json!([value["provider"][0]["models"][0].clone()]);
@@ -4539,15 +4587,40 @@ mod frontend_manual_baselines {
             retries: usize,
         }
         fn terminal(tui: &Tui, operation: &ForegroundOperation) -> Terminal {
+            // A prompt owns one typed ordinary end plus one finish before
+            // its projection; a control operation owns only the projection.
+            let expect_ordinary = operation.kind() == ForegroundKind::Prompt;
             let end = Instant::now() + Duration::from_secs(10);
-            let (mut finished, mut retries) = (0, 0);
+            let (mut finished, mut retries, mut ordinary_ends) = (0, 0, 0);
             loop {
                 match tui.bus.try_recv() {
-                    Some(Msg::ResponseFinished { .. }) => finished += 1,
+                    Some(Msg::OrdinaryTurnEnded {
+                        operation: observed,
+                        ..
+                    }) => {
+                        assert_eq!(&observed, operation);
+                        assert_eq!(
+                            (ordinary_ends, finished),
+                            (0, 0),
+                            "typed end must be unique and before finish"
+                        );
+                        ordinary_ends += 1;
+                    }
+                    Some(Msg::BackendNotice(_)) => {
+                        panic!("unexpected notice during bound retry fixture")
+                    }
+                    Some(Msg::ResponseFinished { .. }) => {
+                        assert_eq!(ordinary_ends, 1);
+                        finished += 1;
+                    }
                     Some(Msg::Status(text)) if text.starts_with("retry ") => retries += 1,
                     Some(Msg::SessionProjection(projection)) if matches!(&projection.reason, ProjectionReason::Operation { operation: observed } if observed == operation) =>
                     {
                         assert_eq!(projection.binding, *operation.source());
+                        assert_eq!(
+                            (ordinary_ends, finished),
+                            if expect_ordinary { (1, 1) } else { (0, 0) }
+                        );
                         return Terminal {
                             projection,
                             finished,
@@ -4561,6 +4634,31 @@ mod frontend_manual_baselines {
                     Instant::now() < end,
                     "exact bound operation did not terminate"
                 );
+            }
+        }
+        /// A re-sent consumed operation is refused at admission: the worker
+        /// answers with the projection alone — no ordinary end, no finish,
+        /// no new provider traffic.
+        fn terminal_projection_only(tui: &Tui, operation: &ForegroundOperation) -> Terminal {
+            let end = Instant::now() + Duration::from_secs(10);
+            loop {
+                match tui.bus.try_recv() {
+                    Some(Msg::OrdinaryTurnEnded { .. }) | Some(Msg::ResponseFinished { .. }) => {
+                        panic!("a refused re-send produced ordinary traffic")
+                    }
+                    Some(Msg::SessionProjection(projection)) if matches!(&projection.reason, ProjectionReason::Operation { operation: observed } if observed == operation) =>
+                    {
+                        assert_eq!(projection.binding, *operation.source());
+                        return Terminal {
+                            projection,
+                            finished: 0,
+                            retries: 0,
+                        };
+                    }
+                    Some(_) => {}
+                    None => std::thread::sleep(Duration::from_millis(2)),
+                }
+                assert!(Instant::now() < end, "refused re-send did not terminate");
             }
         }
         fn close_single_operation(mut tui: Tui, f: &Fixture, operation: &ForegroundOperation) {
@@ -4580,7 +4678,9 @@ mod frontend_manual_baselines {
                 assert!(
                     !matches!(
                         event,
-                        Msg::ResponseFinished { .. }
+                        Msg::BackendNotice(_)
+                            | Msg::OrdinaryTurnEnded { .. }
+                            | Msg::ResponseFinished { .. }
                             | Msg::PlanReady(_)
                             | Msg::ToolCallStarted { .. }
                             | Msg::SessionProjection(SessionProjection {
@@ -4598,12 +4698,16 @@ mod frontend_manual_baselines {
                 match tui.bus.try_recv() {
                     Some(Msg::Status(text)) if text.starts_with("retry ") => return,
                     Some(
-                        Msg::ResponseFinished { .. }
+                        Msg::OrdinaryTurnEnded { .. }
+                        | Msg::ResponseFinished { .. }
                         | Msg::SessionProjection(SessionProjection {
                             reason: ProjectionReason::Operation { .. },
                             ..
                         }),
                     ) => panic!("operation ended before retry observation"),
+                    Some(Msg::BackendNotice(_)) => {
+                        panic!("unexpected notice while waiting for retry")
+                    }
                     Some(_) => {}
                     None => std::thread::sleep(Duration::from_millis(2)),
                 }
@@ -4975,7 +5079,7 @@ mod frontend_manual_baselines {
                         command: Box::new(WorkerCommand::Prompt("must never resubmit".into())),
                     })
                     .unwrap();
-                let stale = terminal(&tui, &first);
+                let stale = terminal_projection_only(&tui, &first);
                 assert_eq!((stale.finished, stale.retries), (0, 0));
                 assert_eq!(barrier(&wire), 2);
                 let second = begin(&tui, &initial.binding, 2, "implement new explicit input");

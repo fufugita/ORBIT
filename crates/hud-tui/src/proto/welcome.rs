@@ -7,6 +7,7 @@
 
 use super::comps;
 use super::core::Token;
+use super::shell::canvas::{clip_text, printable_text, text_width};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -196,25 +197,39 @@ fn centred(line: Line<'static>, block_w: u16, pane_w: u16) -> Line<'static> {
 fn readiness_line(chips: &[(bool, String)], pane_w: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut width = 0usize;
-    for (i, (ok, label)) in chips.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("    "));
-            width += 4;
-        }
+    for (ok, label) in chips {
+        let separator = if width == 0 { 0 } else { 4 };
         let (glyph, token) = if *ok {
             ("✓", Token::Green)
         } else {
             ("✕", Token::Red)
         };
+        let glyph_width = text_width(glyph).max(0) as usize;
+        let fixed_width = separator + glyph_width + 1;
+        let remaining = (pane_w as usize).saturating_sub(width);
+        if remaining <= fixed_width {
+            break;
+        }
+        if separator > 0 {
+            spans.push(Span::raw("    "));
+        }
         spans.push(Span::styled(
             glyph,
             Style::default().fg(comps::colour(token)),
         ));
+        let label_budget = remaining - fixed_width;
+        let printable_label = printable_text(label);
+        let full_label_width = text_width(&printable_label).max(0) as usize;
+        let visible_label = clip_text(&printable_label, label_budget as i32);
+        let visible_width = text_width(&visible_label).max(0) as usize;
         spans.push(Span::styled(
-            format!(" {label}"),
+            format!(" {visible_label}"),
             Style::default().fg(comps::colour(Token::Muted)),
         ));
-        width += 1 + 1 + label.chars().count();
+        width += fixed_width + visible_width;
+        if full_label_width > label_budget {
+            break;
+        }
     }
     centred(Line::from(spans), width as u16, pane_w)
 }
@@ -276,5 +291,55 @@ pub fn area(body: Rect, block_h: u16, block_w: u16) -> Rect {
         y: body.y + 2 + free / 3,
         width: block_w.min(body.width),
         height: block_h.min(body.height),
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn fitting_control_bearing_label_does_not_hide_later_readiness_chips() {
+        let chips = [
+            (true, "provider\tmodel".to_string()),
+            (true, "ledger".to_string()),
+        ];
+        let line = readiness_line(&chips, 64);
+        let rendered = line.spans.iter().fold(String::new(), |mut text, span| {
+            text.push_str(&span.content);
+            text
+        });
+
+        assert!(rendered.contains("provider⇥model"), "{rendered:?}");
+        assert!(rendered.contains("ledger"), "{rendered:?}");
+        assert!(
+            line.width() <= 64,
+            "width={} row={rendered:?}",
+            line.width()
+        );
+    }
+
+    #[test]
+    fn readiness_chips_center_by_cells_and_clip_the_first_overflow() {
+        let chips = [
+            (true, "界 · m".to_string()),
+            (false, "later status".to_string()),
+        ];
+        let line = readiness_line(&chips, 5);
+        let rendered = line.spans.iter().fold(String::new(), |mut text, span| {
+            text.push_str(&span.content);
+            text
+        });
+        assert_eq!(line.width(), 5);
+        assert!(rendered.contains("✓ 界…"), "{rendered:?}");
+        assert!(!rendered.contains("later status"), "{rendered:?}");
+
+        let wide = readiness_line(&[(true, "界".into())], 8);
+        assert_eq!(
+            wide.width(),
+            6,
+            "two leading center cells plus the four-cell chip"
+        );
+        assert!(wide.width() <= 8);
     }
 }

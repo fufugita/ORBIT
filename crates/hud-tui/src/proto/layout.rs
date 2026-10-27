@@ -9,6 +9,10 @@
 //! conversation in the middle. Any change saves the layout as
 //! **yours**, the last preset, stored as a tree in `tui.toml`.
 
+use orbit_frontend_protocol::customization::{
+    Direction as PortableDirection, LayoutNode as PortableLayoutNode, PortableLayoutPreset,
+    View as PortableView, portable_layout_preset,
+};
 use serde::{Deserialize, Serialize};
 
 /// One view a panel can show.
@@ -91,6 +95,39 @@ pub enum Node {
 pub enum Direction {
     Right,
     Down,
+}
+
+impl From<PortableLayoutNode> for Node {
+    fn from(node: PortableLayoutNode) -> Self {
+        match node {
+            PortableLayoutNode::Panel { view, agent } => Self::Panel {
+                view: match view {
+                    PortableView::Conversation => View::Conversation,
+                    PortableView::Changes => View::Changes,
+                    PortableView::Terminal => View::Terminal,
+                    PortableView::Plan => View::Plan,
+                    PortableView::Activity => View::Activity,
+                    PortableView::Context => View::Context,
+                    PortableView::Review => View::Review,
+                    PortableView::Agent => View::Agent,
+                },
+                agent,
+            },
+            PortableLayoutNode::Custom { pane_id } => Self::Custom { pane_id },
+            PortableLayoutNode::Split {
+                direction,
+                shares,
+                children,
+            } => Self::Split {
+                direction: match direction {
+                    PortableDirection::Right => Direction::Right,
+                    PortableDirection::Down => Direction::Down,
+                },
+                shares,
+                children: children.into_iter().map(Self::from).collect(),
+            },
+        }
+    }
 }
 
 impl Node {
@@ -465,7 +502,13 @@ impl Node {
 
     /// Portable layouts always retain a reachable composer, including review.
     pub fn profile_preset(which: Preset) -> Self {
-        Self::preset(which).with_conversation()
+        let preset = match which {
+            Preset::Columns => PortableLayoutPreset::Columns,
+            Preset::Build => PortableLayoutPreset::Build,
+            Preset::Agents => PortableLayoutPreset::Agents,
+            Preset::Review => PortableLayoutPreset::Review,
+        };
+        portable_layout_preset(preset).into()
     }
 
     pub fn with_conversation(self) -> Self {
@@ -1089,5 +1132,77 @@ mod tests {
         let s = toml::to_string_pretty(&v).unwrap();
         assert!(s.contains("kind = \"split\""));
         assert!(s.contains("view = \"conversation\""));
+    }
+
+    #[test]
+    fn portable_profile_presets_match_legacy_recipes_and_canonical_wire_trees() {
+        for (preset, portable) in [
+            (Preset::Columns, PortableLayoutPreset::Columns),
+            (Preset::Build, PortableLayoutPreset::Build),
+            (Preset::Agents, PortableLayoutPreset::Agents),
+            (Preset::Review, PortableLayoutPreset::Review),
+        ] {
+            let actual = Node::profile_preset(preset);
+            assert_eq!(actual, Node::preset(preset).with_conversation());
+            assert_eq!(
+                actual
+                    .leaves()
+                    .iter()
+                    .filter(|(_, view)| *view == View::Conversation)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(portable_layout_preset(portable)).unwrap()
+            );
+            let reopened: Node =
+                serde_json::from_slice(&serde_json::to_vec(&actual).unwrap()).unwrap();
+            assert_eq!(reopened, actual);
+        }
+    }
+
+    #[test]
+    fn portable_node_conversion_retains_all_views_custom_ids_agents_and_geometry() {
+        let tree = PortableLayoutNode::Split {
+            direction: PortableDirection::Down,
+            shares: vec![75, 25],
+            children: vec![
+                PortableLayoutNode::Split {
+                    direction: PortableDirection::Right,
+                    shares: vec![10, 10, 10, 10, 10, 10, 10, 30],
+                    children: [
+                        PortableView::Conversation,
+                        PortableView::Changes,
+                        PortableView::Terminal,
+                        PortableView::Plan,
+                        PortableView::Activity,
+                        PortableView::Context,
+                        PortableView::Review,
+                        PortableView::Agent,
+                    ]
+                    .into_iter()
+                    .map(|view| PortableLayoutNode::Panel {
+                        view,
+                        agent: if view == PortableView::Agent {
+                            "review-é".into()
+                        } else {
+                            String::new()
+                        },
+                    })
+                    .collect(),
+                },
+                PortableLayoutNode::Custom {
+                    pane_id: "notes-pane".into(),
+                },
+            ],
+        };
+        let converted = Node::from(tree.clone());
+        assert_eq!(
+            serde_json::to_value(&converted).unwrap(),
+            serde_json::to_value(tree).unwrap()
+        );
+        assert_eq!(converted.custom_id_at(8).as_deref(), Some("notes-pane"));
+        assert_eq!(converted.agent_at(7), "review-é");
     }
 }

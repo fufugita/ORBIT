@@ -1060,6 +1060,8 @@ fn run_turn_inner(
                 }
                 events(event);
             },
+            #[cfg(test)]
+            None,
         );
 
         let OrdinaryDispatch {
@@ -1384,6 +1386,9 @@ fn dispatch_with_retry(
     policy: Option<&crate::retry::RetryPolicyBinding>,
     refusals: &mut Vec<crate::retry::RefusalRecord>,
     events: EventSink<'_>,
+    #[cfg(test)] mut usage_observation_probe: Option<
+        &mut dyn FnMut(orbit_adapter::stream::ProvisionalUsageObservationV1),
+    >,
 ) -> Result<OrdinaryDispatch, OrdinaryDispatchError> {
     let mut attempt = 1u32;
     let max_attempts = policy.map_or(options.max_attempts, |policy| {
@@ -1620,6 +1625,13 @@ fn dispatch_with_retry(
             .is_ok_and(|o| lifecycle.matches(&o.tool_calls) && valid_tool_set(&o.tool_calls));
         let receipt =
             metadata.ordinary_receipt(intent.request_id.clone(), config, &result, lifecycle_valid);
+        #[cfg(test)]
+        {
+            let snapshot = metadata.provisional_usage_observation();
+            if let Some(probe) = usage_observation_probe.as_deref_mut() {
+                probe(snapshot);
+            }
+        }
         let uncertain = receipt.knownness == AccountingKnownness::Uncertain;
         let recorded =
             record_accounting_with_refusals(report, refusals, std::slice::from_ref(&receipt));
@@ -1716,6 +1728,9 @@ fn observe_ordinary_event(
     *observed = true;
     metadata.observe(event);
     lifecycle.observe(&event.event);
+    if lifecycle.invalid {
+        metadata.revoke_usage_observation();
+    }
     if let orbit_adapter::types::ProviderEventKind::TextDelta { bytes } = &event.event {
         events(FrontendEvent::TextDelta {
             text: String::from_utf8_lossy(bytes).into_owned(),
@@ -2048,6 +2063,7 @@ mod tests {
         assert!(is_retryable("ORBIT-E0407"));
         assert!(!is_retryable("ORBIT-E0402")); // auth: never retry
         assert!(!is_retryable("ORBIT-E0401")); // bad url: never retry
+        assert!(!is_retryable("ORBIT-E0412")); // delivery may have occurred
     }
 
     fn target(name: &str, args: serde_json::Value) -> String {
@@ -2430,6 +2446,67 @@ mod combined_accounting_tests {
     }
 
     #[test]
+    fn ordinary_orphan_tool_event_revokes_capture_before_receipt() {
+        use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent};
+        let mut metadata = crate::compaction::MetadataAccounting::default();
+        let mut lifecycle = ToolLifecycle::default();
+        let mut observed = false;
+        let mut frontend = Vec::new();
+        observe_ordinary_event(
+            &ProviderStreamEvent {
+                sequence: 0,
+                event: ProviderEventKind::ResponseStarted {
+                    upstream_request_id: None,
+                },
+                usage_observation: None,
+            },
+            &mut observed,
+            &mut metadata,
+            &mut lifecycle,
+            &mut |event| frontend.push(event),
+        );
+        assert!(!metadata.provisional_usage_observation().is_invalid());
+        observe_ordinary_event(
+            &ProviderStreamEvent {
+                sequence: 1,
+                event: ProviderEventKind::ToolCallArgumentsDelta {
+                    call_index: 0,
+                    bytes: b"{}".to_vec(),
+                },
+                usage_observation: None,
+            },
+            &mut observed,
+            &mut metadata,
+            &mut lifecycle,
+            &mut |event| frontend.push(event),
+        );
+        assert!(observed);
+        assert!(lifecycle.invalid);
+        assert!(lifecycle.calls.is_empty());
+        assert!(frontend.is_empty());
+        let revoked = metadata.provisional_usage_observation();
+        assert!(
+            revoked.is_invalid(),
+            "real ordinary observer must revoke on its stronger tool fault"
+        );
+        observe_ordinary_event(
+            &ProviderStreamEvent {
+                sequence: 2,
+                event: ProviderEventKind::TextDelta {
+                    bytes: b"later".to_vec(),
+                },
+                usage_observation: None,
+            },
+            &mut observed,
+            &mut metadata,
+            &mut lifecycle,
+            &mut |event| frontend.push(event),
+        );
+        assert_eq!(metadata.provisional_usage_observation(), revoked);
+        assert_eq!(frontend.len(), 1);
+    }
+
+    #[test]
     fn ordinary_observer_latches_all_provider_kinds_and_preserves_private_observations() {
         use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent, ProviderUsage};
         let usage = ProviderUsage {
@@ -2445,6 +2522,7 @@ mod combined_accounting_tests {
             model: "fixture-model".into(),
             kind: crate::ProviderKind::OpenAiCompatible,
             credential_env: None,
+            billing: None,
             pricing: None,
             max_output_tokens: 64,
             sampling: None,
@@ -2483,10 +2561,6 @@ mod combined_accounting_tests {
             },
         ];
         for kind in kinds {
-            let carries_usage = matches!(
-                &kind,
-                ProviderEventKind::UsageUpdate(_) | ProviderEventKind::Finished { .. }
-            );
             let is_text = matches!(&kind, ProviderEventKind::TextDelta { .. });
             let is_tool_start = matches!(&kind, ProviderEventKind::ToolCallStarted { .. });
             let invalid_tool_order = matches!(
@@ -2500,6 +2574,7 @@ mod combined_accounting_tests {
             let mut frontend = Vec::new();
             observe_ordinary_event(
                 &ProviderStreamEvent {
+                    usage_observation: None,
                     sequence: 0,
                     event: kind,
                 },
@@ -2525,7 +2600,7 @@ mod combined_accounting_tests {
                 &Err(("E0410", "fixture failure".into())),
                 false,
             );
-            assert_eq!(receipt.usage, carries_usage.then_some(usage));
+            assert_eq!(receipt.usage, None);
             assert_eq!(receipt.knownness, AccountingKnownness::Uncertain);
         }
     }
@@ -2587,6 +2662,7 @@ mod image_block_tests {
             model: "test".into(),
             kind: crate::dispatch::ProviderKind::OpenAiCompatible,
             credential_env: None,
+            billing: None,
             pricing: None,
             max_output_tokens: 32,
             sampling: None,
@@ -2693,5 +2769,132 @@ mod image_block_tests {
             }
             other => panic!("not an image block: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_observation_owner_tests {
+    use super::*;
+    use crate::compaction::usage_observation_owner_test_support::{
+        OwnerHome, OwnerReply, OwnerWire, assert_clean_b,
+    };
+    use orbit_adapter::stream::ProvisionalUsageObservationV1;
+
+    fn invoke(
+        home: &OwnerHome,
+        wire: &OwnerWire,
+        stem: &str,
+    ) -> (
+        Result<OrdinaryDispatch, OrdinaryDispatchError>,
+        TurnReport,
+        Vec<ProvisionalUsageObservationV1>,
+        Vec<FrontendEvent>,
+    ) {
+        let config = wire.config();
+        let options = TurnOptions {
+            max_attempts: 2,
+            session_id: "m7-ordinary".into(),
+            request_stem: stem.into(),
+            selected_budget: Some(
+                crate::context_budget::SelectedBudget::legacy_input(&config, 8_000).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let cancel = orbit_provider_http::CancelToken::new();
+        let mut report = TurnReport::default();
+        let mut refusals = Vec::new();
+        let mut snapshots = Vec::new();
+        let mut frontend = Vec::new();
+        let messages = vec![crate::user_message("explicit owned invocation")];
+        let result = {
+            let mut probe = |snapshot| snapshots.push(snapshot);
+            dispatch_with_retry(
+                &home.0,
+                &config,
+                &options,
+                "explicit owned invocation",
+                &messages,
+                &cancel,
+                1,
+                None,
+                &mut report,
+                None,
+                &mut refusals,
+                &mut |event| frontend.push(event),
+                Some(&mut probe),
+            )
+        };
+        assert!(refusals.is_empty());
+        (result, report, snapshots, frontend)
+    }
+
+    #[test]
+    fn ordinary_observed_fault_then_explicit_invocation_has_fresh_capture() {
+        let home = OwnerHome::new();
+        let mut wire = OwnerWire::new(vec![OwnerReply::FaultA, OwnerReply::HealthyB]);
+        let (failed, report_a, snapshots_a, frontend_a) = invoke(&home, &wire, "explicit-a");
+        match failed {
+            Err(OrdinaryDispatchError::Failure(message)) => assert!(message.contains("E0411")),
+            _ => panic!("malformed admitted stream must fail without replay"),
+        }
+        assert_eq!(wire.count(), 1, "observed A cannot automatically consume B");
+        assert_eq!(snapshots_a.len(), 1);
+        assert!(snapshots_a[0].is_invalid());
+        assert_eq!(
+            snapshots_a[0].selected().unwrap().raw_usage.input_tokens,
+            23
+        );
+        assert!(!snapshots_a[0].raw_stream_sha256().as_str().is_empty());
+        assert_eq!(report_a.attempts.len(), 1);
+        assert_eq!(
+            report_a.attempts[0].knownness,
+            AccountingKnownness::Uncertain
+        );
+        assert!(!report_a.attempts[0].completed);
+        assert!(
+            !frontend_a
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::Retrying { .. }))
+        );
+
+        let (completed, report_b, snapshots_b, frontend_b) = invoke(&home, &wire, "explicit-b");
+        match completed {
+            Ok(completed) => {
+                assert_eq!(completed.outcome.output, "B-answer");
+                assert_eq!(
+                    (
+                        completed.outcome.input_tokens,
+                        completed.outcome.output_tokens
+                    ),
+                    (11, 7)
+                );
+            }
+            Err(error) => panic!("explicit B failed: {}", error.into_message()),
+        }
+        assert_eq!(snapshots_b.len(), 1);
+        assert_clean_b(&snapshots_b[0]);
+        assert_eq!(report_b.attempts.len(), 1);
+        assert_eq!(report_b.attempts[0].knownness, AccountingKnownness::Known);
+        assert!(report_b.attempts[0].completed);
+        assert!(
+            !frontend_b
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::Retrying { .. }))
+        );
+        assert_ne!(snapshots_a[0], snapshots_b[0]);
+        wire.finish(2);
+        drop(wire);
+
+        let baseline_home = OwnerHome::new();
+        let mut baseline_wire = OwnerWire::new(vec![OwnerReply::HealthyB]);
+        let (baseline, _, standalone, _) = invoke(&baseline_home, &baseline_wire, "standalone-b");
+        assert!(baseline.is_ok());
+        assert_eq!(standalone.len(), 1);
+        assert_clean_b(&standalone[0]);
+        assert_eq!(
+            snapshots_b[0], standalone[0],
+            "whole actual owner snapshot equals standalone B"
+        );
+        baseline_wire.finish(1);
     }
 }

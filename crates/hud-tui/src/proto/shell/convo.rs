@@ -3,7 +3,9 @@
 //! prototype's `userRows` / `orbitRows` / `cardRows` / `approvalCard` /
 //! `composer`.
 
-use super::canvas::{Cv, Rgb, Seg, clip_text, mix, segs_width, text_width, tint, wrap_ranges};
+use super::canvas::{
+    Cv, Rgb, Seg, clip_text, mix, printable_text, segs_width, text_width, tint, wrap_ranges,
+};
 use super::frame::{BadgeState, FrameSpec, badge_themed, fit_hints, keycap, keyhints, panel_frame};
 use super::mark::{Hero, draw_hero};
 use super::motion::{ease_out, flash, prog, pulse, secs, shimmer, star_at};
@@ -12,6 +14,8 @@ use crate::proto::scenario::{LineKind, Scenario, ToolState, TranscriptLine};
 use crate::proto::welcome::BrandTier;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
+use std::rc::Rc;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 type RowFn = Box<dyn Fn(&mut Cv, i32, i32)>;
@@ -26,6 +30,8 @@ pub struct ConvIn<'a> {
     /// fresh-ink fade switch off.
     pub mono: bool,
     pub composer: &'a str,
+    /// Grapheme-boundary insertion point in `composer`.
+    pub composer_cursor: usize,
     /// The highlighted row of the `/` command list.
     pub completion_sel: usize,
     pub file_completion: Option<&'a crate::proto::composer::FileCompletion>,
@@ -58,7 +64,13 @@ pub fn kind_of(name: &str) -> String {
         "exitplanmode" => "PLAN",
         // A tool from an MCP server: `mcp__<server>__<tool>`.
         _ if n.starts_with("mcp__") => "MCP",
-        _ => return n.chars().take(5).collect::<String>().to_ascii_uppercase(),
+        _ => {
+            return n
+                .graphemes(true)
+                .take(5)
+                .collect::<String>()
+                .to_ascii_uppercase();
+        }
     };
     k.to_string()
 }
@@ -110,6 +122,38 @@ pub fn rich_plain(text: &str) -> (Vec<char>, Vec<bool>) {
     (plain, mask)
 }
 
+fn leading_printable_offset(grapheme: &str) -> usize {
+    grapheme
+        .chars()
+        .position(|ch| UnicodeWidthChar::width(ch).unwrap_or(0) > 0)
+        .unwrap_or(0)
+}
+
+fn grapheme_prefix(text: &str, count: usize) -> String {
+    text.graphemes(true).take(count).collect()
+}
+
+fn clip_suffix(text: &str, cells: usize) -> String {
+    if text_width(text).max(0) as usize <= cells {
+        return text.to_string();
+    }
+    if cells == 0 {
+        return String::new();
+    }
+    let budget = cells.saturating_sub(1);
+    let mut start = text.len();
+    let mut used = 0usize;
+    for (byte, grapheme) in text.grapheme_indices(true).rev() {
+        let width = text_width(grapheme).max(0) as usize;
+        if used.saturating_add(width) > budget {
+            break;
+        }
+        start = byte;
+        used = used.saturating_add(width);
+    }
+    format!("…{}", printable_text(&text[start..]))
+}
+
 fn user_rows_themed(colors: Palette, l: &TranscriptLine, w: i32) -> Vec<Row> {
     let time = l.time.clone().unwrap_or_default();
     let bg = tint(colors.magenta, colors.panel, 0.07);
@@ -130,7 +174,7 @@ fn user_rows_themed(colors: Palette, l: &TranscriptLine, w: i32) -> Vec<Row> {
                     cv.bold(x + 2, y, "›", colors.magenta, Some(bg));
                     if !time.is_empty() {
                         cv.text(
-                            x + w - 1 - time.chars().count() as i32,
+                            x + w - 1 - text_width(&time),
                             y,
                             &time,
                             colors.faint,
@@ -138,27 +182,42 @@ fn user_rows_themed(colors: Palette, l: &TranscriptLine, w: i32) -> Vec<Row> {
                         );
                     }
                 }
+                let end = b.min(plain.len());
+                let row_text: String = plain[a.min(end)..end].iter().collect();
                 let mut in_at = false;
-                for k in a..b.min(plain.len()) {
+                for k in 0..a.min(plain.len()) {
                     if plain[k] == '@' && (k == 0 || plain[k - 1] == ' ') {
                         in_at = true;
                     } else if plain[k] == ' ' {
                         in_at = false;
                     }
-                    let cbg = if mask[k] { colors.raise2 } else { bg };
+                }
+                let mut char_index = a.min(end);
+                let mut cell_x = x + 4;
+                for grapheme in row_text.graphemes(true) {
+                    let cluster_start = char_index;
+                    let cluster_len = grapheme.chars().count();
+                    for ch in grapheme.chars() {
+                        if ch == '@' && (char_index == 0 || plain[char_index - 1] == ' ') {
+                            in_at = true;
+                        } else if ch == ' ' {
+                            in_at = false;
+                        }
+                        char_index += 1;
+                    }
+                    let style_index = cluster_start + leading_printable_offset(grapheme);
+                    let cbg = if mask.get(style_index).copied().unwrap_or(false) {
+                        colors.raise2
+                    } else {
+                        bg
+                    };
                     let (fg, m) = if in_at {
                         (colors.blue, Modifier::BOLD)
                     } else {
                         (colors.ink, Modifier::empty())
                     };
-                    cv.put(
-                        x + 4 + (k - a) as i32,
-                        y,
-                        &plain[k].to_string(),
-                        fg,
-                        Some(cbg),
-                        m,
-                    );
+                    cell_x = cv.put(cell_x, y, grapheme, fg, Some(cbg), m);
+                    debug_assert_eq!(char_index, cluster_start + cluster_len);
                 }
                 // The words, for a selection: not the `▎ ›` or the time.
                 let words: String = plain[a.min(plain.len())..b.min(plain.len())]
@@ -212,30 +271,77 @@ fn hang_of(line: &[char], sty: &[super::md::Sty]) -> (usize, bool) {
 }
 
 /// Word-wrap one line (no newline in it) into char ranges: `first`
-/// columns on the first row, `rest` on the others. A word longer than a
-/// row is split; spaces at a break are dropped.
+/// terminal cells on the first row, `rest` on the others. A word longer
+/// than a row is split only between grapheme clusters; break spaces drop.
 fn wrap_line(chars: &[char], first: usize, rest: usize) -> Vec<(usize, usize)> {
-    let n = chars.len();
-    if n == 0 {
+    struct Cluster<'a> {
+        text: &'a str,
+        char_start: usize,
+        char_end: usize,
+        cells: usize,
+    }
+
+    let text: String = chars.iter().collect();
+    let mut clusters = Vec::new();
+    let mut char_offset = 0usize;
+    for grapheme in text.graphemes(true) {
+        let char_end = char_offset + grapheme.chars().count();
+        clusters.push(Cluster {
+            text: grapheme,
+            char_start: char_offset,
+            char_end,
+            cells: text_width(grapheme).max(0) as usize,
+        });
+        char_offset = char_end;
+    }
+    if clusters.is_empty() {
         return vec![(0, 0)];
     }
+
     let mut out = Vec::new();
-    let (mut i, mut w) = (0usize, first.max(1));
-    while i < n {
-        let mut end = (i + w).min(n);
-        if end < n
-            && chars[end] != ' '
-            && let Some(sp) = chars[i..end].iter().rposition(|&c| c == ' ')
-            && sp > 0
-        {
-            end = i + sp;
+    let mut i = 0usize;
+    let mut cells = first.max(1);
+    while i < clusters.len() {
+        let mut end = i;
+        let mut used = 0usize;
+        let mut last_space = None;
+        while end < clusters.len() {
+            let cluster_width = clusters[end].cells;
+            if used.saturating_add(cluster_width) > cells {
+                if end == i {
+                    // A single cluster wider than the row remains whole.
+                    end += 1;
+                }
+                break;
+            }
+            used = used.saturating_add(cluster_width);
+            if clusters[end].text == " " {
+                last_space = Some(end);
+            }
+            end += 1;
         }
-        out.push((i, end));
+
+        if end < clusters.len()
+            && clusters[end].text != " "
+            && let Some(space) = last_space
+            && space > i
+        {
+            end = space;
+        }
+        if end == i {
+            end += 1;
+        }
+        let char_end = if end < clusters.len() {
+            clusters[end].char_start
+        } else {
+            clusters.last().map_or(0, |cluster| cluster.char_end)
+        };
+        out.push((clusters[i].char_start, char_end));
         i = end;
-        while i < n && chars[i] == ' ' {
+        while i < clusters.len() && clusters[i].text == " " {
             i += 1;
         }
-        w = rest.max(1);
+        cells = rest.max(1);
     }
     out
 }
@@ -298,6 +404,9 @@ fn orbit_rows_themed(
     let last_data = arrivals.last().map(|a| a.1);
     let (plain, sty) = (md.plain, md.sty);
     let lines = reply_rows(&plain, &sty, width);
+    let plain: Rc<[char]> = plain.into();
+    let sty: Rc<[super::md::Sty]> = sty.into();
+    let arrivals: Rc<[(usize, u64)]> = arrivals.into();
     let n = lines.len();
     lines
         .into_iter()
@@ -316,6 +425,9 @@ fn orbit_rows_themed(
             let time = time.clone();
             let arrivals = arrivals.clone();
             Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
+                let row_start = a.min(plain.len());
+                let row_end = b.min(plain.len());
+                let row_text: String = plain[row_start..row_end].iter().collect();
                 if i == 0 {
                     cv.bold(
                         x + 2,
@@ -325,13 +437,7 @@ fn orbit_rows_themed(
                         None,
                     );
                     if !time.is_empty() {
-                        cv.text(
-                            x + w - 1 - time.chars().count() as i32,
-                            y,
-                            &time,
-                            colors.faint,
-                            None,
-                        );
+                        cv.text(x + w - 1 - text_width(&time), y, &time, colors.faint, None);
                     }
                 }
                 if gutter {
@@ -342,24 +448,29 @@ fn orbit_rows_themed(
                     if let Some(tag) = &tag {
                         let at = x + w - 3 - text_width(tag);
                         // Only where the code leaves room for it.
-                        if at > x + 4 + (b - a) as i32 + 1 {
+                        if at > x + 4 + text_width(&row_text) + 1 {
                             cv.text(at, y, tag, colors.muted, Some(colors.raise2));
                         }
                     }
                 }
-                for k in a..b.min(plain.len()) {
-                    let st = sty[k];
+                let mut char_index = row_start;
+                let mut cell_x = x + 4 + hang;
+                for grapheme in row_text.graphemes(true) {
+                    let cluster_start = char_index;
+                    let cluster_len = grapheme.chars().count();
+                    let style_index = cluster_start + leading_printable_offset(grapheme);
+                    let st = sty.get(style_index).copied().unwrap_or_default();
                     let bg = if st.code { Some(colors.raise2) } else { None };
                     // What the markdown meant, as colour and weight. Magenta
                     // stays reserved for ORBIT and authority; emphasis is
                     // brightness, links are blue, furniture is muted.
                     let (target, mods) = if st.code {
-                        let line_start = plain[..k]
+                        let line_start = plain[..style_index]
                             .iter()
                             .rposition(|c| *c == '\n')
                             .map_or(0, |i| i + 1);
-                        let prefix: String = plain[line_start..=k].iter().collect();
-                        let c = plain[k];
+                        let prefix: String = plain[line_start..=style_index].iter().collect();
+                        let c = plain[style_index];
                         let color = if prefix.trim_start().starts_with("//")
                             || prefix.trim_start().starts_with('#')
                         {
@@ -396,17 +507,15 @@ fn orbit_rows_themed(
                     };
                     // M06 fresh ink: a chunk lands near white and fades
                     // to its colour in 450 ms, ease-out.
-                    let t0 = arrivals.iter().rev().find(|a| a.0 <= k).map(|a| secs(a.1));
+                    let t0 = arrivals
+                        .iter()
+                        .rev()
+                        .find(|arrival| arrival.0 <= cluster_start)
+                        .map(|arrival| secs(arrival.1));
                     let fade = ease_out(prog(secs(now_ms), t0, 0.45, reduced || mono));
                     let fg = mix(mix(colors.white, colors.cyan, 0.35), target, fade);
-                    cv.put(
-                        x + 4 + hang + (k - a) as i32,
-                        y,
-                        &plain[k].to_string(),
-                        fg,
-                        bg,
-                        mods,
-                    );
+                    cell_x = cv.put(cell_x, y, grapheme, fg, bg, mods);
+                    char_index += cluster_len;
                 }
                 // The words, for a selection: not the `✦` or the time.
                 let words: String = plain[a.min(plain.len())..b.min(plain.len())]
@@ -429,8 +538,7 @@ fn orbit_rows_themed(
                     } else {
                         colors.cyan
                     };
-                    let end = (b.saturating_sub(a)) as i32;
-                    cv.text(x + 4 + hang + end, y, "▍", col, None);
+                    cv.text(cell_x, y, "▍", col, None);
                 }
             }) as RowFn)
         })
@@ -458,7 +566,7 @@ fn think_rows_themed(
         let el = now_ms.saturating_sub(since_ms) / 1000;
         if el >= 1 {
             cv.text(
-                x + 4 + label.chars().count() as i32,
+                x + 4 + text_width(&label),
                 y,
                 &format!(" · {el}s"),
                 colors.muted,
@@ -495,34 +603,40 @@ fn note_rows_themed(colors: Palette, l: &TranscriptLine, w: i32) -> Vec<Row> {
 fn wrapped_note_text(text: &str, width: i32) -> Vec<String> {
     let width = width.max(2) as usize;
     let mut rows = Vec::new();
-    for paragraph in text.split('\n') {
-        let chars: Vec<char> = paragraph.chars().collect();
-        if chars.is_empty() {
+    let structural_newlines = text.replace("\r\n", "\n");
+    for paragraph in structural_newlines.split('\n') {
+        let graphemes: Vec<&str> = paragraph.graphemes(true).collect();
+        if graphemes.is_empty() {
             rows.push(String::new());
             continue;
         }
         let mut start = 0;
-        while start < chars.len() {
+        while start < graphemes.len() {
             let mut end = start;
-            let mut cells = 0;
+            let mut cells = 0usize;
             let mut word_break = None;
-            while end < chars.len() {
-                let size = chars[end].width().unwrap_or(0);
-                if cells + size > width {
+            while end < graphemes.len() {
+                let grapheme = graphemes[end];
+                let size = text_width(grapheme).max(0) as usize;
+                if cells.saturating_add(size) > width {
                     break;
                 }
-                cells += size;
+                cells = cells.saturating_add(size);
                 end += 1;
-                if chars[end - 1] == ' ' {
+                if grapheme == " " {
                     word_break = Some(end);
                 }
             }
-            if end < chars.len()
+            if end < graphemes.len()
                 && let Some(boundary) = word_break
             {
                 end = boundary;
             }
-            rows.push(chars[start..end].iter().collect());
+            if end == start {
+                // Preserve a cluster intact when it is wider than the row.
+                end += 1;
+            }
+            rows.push(graphemes[start..end].concat());
             start = end;
         }
     }
@@ -543,17 +657,36 @@ fn report_rows_themed(
     ended_ms: Option<u64>,
     now_ms: u64,
     reduced: bool,
+    failed: bool,
+) -> Vec<Row> {
+    report_rows_accent(
+        colors,
+        text,
+        ended_ms,
+        now_ms,
+        reduced,
+        if failed { colors.red } else { colors.green },
+    )
+}
+
+fn report_rows_accent(
+    colors: Palette,
+    text: String,
+    ended_ms: Option<u64>,
+    now_ms: u64,
+    reduced: bool,
+    accent: Rgb,
 ) -> Vec<Row> {
     vec![Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
-        // M25: the report types in at 60 characters per second.
+        // M25: the report types in at 60 graphemes per second.
         let n = match ended_ms {
             Some(t) if !reduced => (now_ms.saturating_sub(t) as f32 / 1000.0 * 60.0) as usize,
             _ => usize::MAX,
         };
-        let shown: String = text.chars().take(n).collect();
-        let bg = tint(colors.green, colors.panel, 0.12);
+        let shown = grapheme_prefix(&text, n);
+        let bg = tint(accent, colors.panel, 0.12);
         cv.fill(x + 2, y, text_width(&text) + 2, 1, bg);
-        cv.bold(x + 3, y, &shown, colors.green, Some(bg));
+        cv.bold(x + 3, y, &shown, accent, Some(bg));
     }) as RowFn)]
 }
 
@@ -576,7 +709,9 @@ fn card_rows_themed(
         ToolState::Done => mix(colors.cyan, colors.green, settle),
         ToolState::Failed => mix(colors.cyan, colors.red, settle),
         ToolState::AwaitingYou => colors.magenta,
-        ToolState::Denied | ToolState::Queued | ToolState::Cancelled => colors.rule_hi,
+        ToolState::Denied | ToolState::Queued | ToolState::Cancelled | ToolState::Unavailable => {
+            colors.rule_hi
+        }
         ToolState::Blocked => colors.amber,
         ToolState::Running => colors.cyan,
     };
@@ -622,7 +757,12 @@ fn card_rows_themed(
         };
         xx += 1;
         let mut right: Vec<Seg> = Vec::new();
-        if !meta.is_empty() && !matches!(st, ToolState::Denied | ToolState::Running) {
+        if !meta.is_empty()
+            && !matches!(
+                st,
+                ToolState::Denied | ToolState::Running | ToolState::Unavailable
+            )
+        {
             right.push(Seg::new(meta.clone(), colors.muted));
         }
         let sep = if right.is_empty() { "" } else { "  " };
@@ -666,6 +806,11 @@ fn card_rows_themed(
                 Seg::bold("⊘ ", colors.muted),
                 Seg::new("cancelled", colors.muted),
             ]),
+            ToolState::Unavailable => right.extend([
+                Seg::new(sep, colors.muted),
+                Seg::bold("? ", colors.muted),
+                Seg::new("result unavailable", colors.muted),
+            ]),
             ToolState::Queued => right.extend([
                 Seg::new("◌ ", colors.muted),
                 Seg::new("queued", colors.muted),
@@ -686,12 +831,11 @@ fn card_rows_themed(
         } else {
             Modifier::empty()
         };
-        // M07: the target types in at 240 characters per second.
+        // M07: the target types in at 240 graphemes per second.
         let typed: String = match started {
-            Some(t0) if !reduced => target
-                .chars()
-                .take(((now - t0).max(0.0) * 240.0) as usize)
-                .collect(),
+            Some(t0) if !reduced => {
+                grapheme_prefix(&target, ((now - t0).max(0.0) * 240.0) as usize)
+            }
             _ => target.clone(),
         };
         cv.put(
@@ -764,7 +908,12 @@ fn card_rows_themed(
 }
 
 /// All transcript rows (None = blank), in order.
-fn transcript_rows_themed(colors: Palette, compact: bool, inp: &ConvIn, w: i32) -> Vec<Row> {
+fn transcript_rows_themed(
+    colors: Palette,
+    compact: bool,
+    inp: &ConvIn,
+    w: i32,
+) -> (Vec<Row>, usize) {
     let s = inp.s;
     let mut rows: Vec<Row> = Vec::new();
     let mut prev: Option<&str> = None;
@@ -819,7 +968,14 @@ fn transcript_rows_themed(colors: Palette, compact: bool, inp: &ConvIn, w: i32) 
         && !s.turn_live
     {
         let noun = if r.tools == 1 { "tool" } else { "tools" };
-        let mut t = format!("✓ done · {}s · {} {noun}", r.duration_ms / 1000, r.tools);
+        let state = if s.ordinary_cancelled() {
+            "⊘ cancelled"
+        } else if s.last_failed {
+            "✕ failed"
+        } else {
+            "✓ done"
+        };
+        let mut t = format!("{state} · {}s · {} {noun}", r.duration_ms / 1000, r.tools);
         if r.priced {
             t.push_str(&format!(
                 " · +${:.3}",
@@ -827,15 +983,95 @@ fn transcript_rows_themed(colors: Palette, compact: bool, inp: &ConvIn, w: i32) 
             ));
         }
         rows.push(None);
-        rows.extend(report_rows_themed(
-            colors,
-            t,
-            s.turn_ended_ms,
-            inp.now_ms,
-            inp.reduced,
-        ));
+        rows.extend(if s.ordinary_cancelled() {
+            report_rows_accent(
+                colors,
+                t,
+                s.turn_ended_ms,
+                inp.now_ms,
+                inp.reduced,
+                colors.amber,
+            )
+        } else {
+            report_rows_themed(
+                colors,
+                t,
+                s.turn_ended_ms,
+                inp.now_ms,
+                inp.reduced,
+                s.last_failed,
+            )
+        });
     }
-    rows
+    if s.last_failed {
+        if !rows.is_empty() {
+            rows.push(None);
+        }
+        let reason = s
+            .failure_reason
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .unwrap_or("No error details available");
+        let text = format!("This turn failed · {reason}");
+        rows.extend(wrapped_note_text(&text, w - 8).into_iter().enumerate().map(
+            |(index, text)| {
+                Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
+                    if index == 0 {
+                        cv.text(x + 2, y, "✕", colors.red, None);
+                    }
+                    cv.text(x + 4, y, &text, colors.red, None);
+                }) as RowFn)
+            },
+        ));
+        if s.can_resend_ordinary() && inp.focused && inp.composer.is_empty() {
+            rows.extend(note_rows_themed(
+                colors,
+                &TranscriptLine {
+                    kind: LineKind::System,
+                    text: "⏎ on an empty composer resends it".into(),
+                    wrap: true,
+                    ..Default::default()
+                },
+                w,
+            ));
+        }
+    }
+    let mut acknowledgement_rows = 0;
+    if let Some(source) = &s.cleared_from {
+        let acknowledgement = note_rows_themed(
+            colors,
+            &TranscriptLine {
+                kind: LineKind::System,
+                text: format!("new session started; previous session {source} retained"),
+                wrap: true,
+                ..Default::default()
+            },
+            w,
+        );
+        acknowledgement_rows = acknowledgement.len();
+        if !rows.is_empty() {
+            rows.push(None);
+        }
+        rows.extend(acknowledgement);
+    }
+    if let Some(notice) = s.backend_notice() {
+        let notice_rows = note_rows_themed(
+            colors,
+            &TranscriptLine {
+                kind: LineKind::System,
+                text: notice.to_string(),
+                wrap: true,
+                ..Default::default()
+            },
+            w,
+        );
+        acknowledgement_rows += notice_rows.len();
+        if !rows.is_empty() {
+            rows.push(None);
+        }
+        rows.extend(notice_rows);
+    }
+    (rows, acknowledgement_rows)
 }
 
 /// The approval card's facts, keys and risk — from real data only.
@@ -1106,8 +1342,8 @@ fn draw_approval(
     }
     // What the grant keys really grant (design law 6: a grant displays its
     // actual scope — never implied to be this one call). With a rule on
-    // offer, `s` and `a` name it; `R` stays on the key row, labelled with
-    // the whole tool. With none, `R` is the only grant and says so here.
+    // offer, `s` and `a` name it. The card offers no broader whole-tool
+    // grant; without a rule, no remembered grant is available.
     let room = w - 17;
     if let Some(g) = &ap.grant {
         cv.text(x + 3, yy, "s grants", colors.muted, Some(colors.raise));
@@ -1197,8 +1433,7 @@ fn draw_approval(
         }
         let tx = cv.text(n_end + 1, yy, label, colors.muted, Some(colors.raise));
         let room = (x + w - 3 - width_of(hs) - 2 - tx - 1).max(1) as usize;
-        let chars: Vec<char> = note.chars().collect();
-        let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
+        let shown = clip_suffix(note, room);
         let end = cv.bold(tx, yy, &shown, colors.ink, Some(colors.raise));
         cv.text(end, yy, "▏", colors.magenta, Some(colors.raise));
         return h;
@@ -1327,6 +1562,115 @@ fn draw_approval(
 }
 
 /// The composer: input row + key hints.
+#[derive(Debug, PartialEq, Eq)]
+struct ComposerWindow {
+    start: usize,
+    end: usize,
+    cursor_cells: usize,
+}
+
+/// Choose a contiguous grapheme window that keeps the cursor anchor visible.
+/// When `anchor_next` is true, the grapheme at the cursor is included first;
+/// the caller highlights it as a block cursor. Otherwise the cursor is a
+/// boundary and the available cell budget leaves room for a caret glyph.
+fn composer_window(
+    graphemes: &[&str],
+    cursor: usize,
+    max_cells: usize,
+    anchor_next: bool,
+) -> ComposerWindow {
+    let widths: Vec<usize> = graphemes
+        .iter()
+        .map(|grapheme| text_width(grapheme).max(0) as usize)
+        .collect();
+    let cursor = cursor.min(graphemes.len());
+    let anchor_next = anchor_next && cursor < graphemes.len();
+    let anchor_width = if anchor_next { widths[cursor] } else { 0 };
+    let left_budget = max_cells.saturating_sub(anchor_width) / 2;
+
+    let mut start = cursor;
+    let mut used_left = 0usize;
+    while start > 0 {
+        let width = widths[start - 1];
+        if used_left.saturating_add(width) > left_budget {
+            break;
+        }
+        start -= 1;
+        used_left += width;
+    }
+
+    let mut end = cursor + if anchor_next { 1 } else { 0 };
+    let mut used = used_left.saturating_add(anchor_width);
+    while end < graphemes.len() && used.saturating_add(widths[end]) <= max_cells {
+        used += widths[end];
+        end += 1;
+    }
+    while start > 0 && used.saturating_add(widths[start - 1]) <= max_cells {
+        start -= 1;
+        used += widths[start];
+    }
+    while end < graphemes.len() && used.saturating_add(widths[end]) <= max_cells {
+        used += widths[end];
+        end += 1;
+    }
+
+    let cursor_cells = widths[start..cursor]
+        .iter()
+        .fold(0usize, |cells, width| cells.saturating_add(*width));
+    ComposerWindow {
+        start,
+        end,
+        cursor_cells,
+    }
+}
+
+fn draw_composer_draft(
+    cv: &mut Cv,
+    (x, y, field_cells): (i32, i32, usize),
+    draft: &str,
+    cursor: usize,
+    focused: bool,
+    fg: Rgb,
+    bg: Rgb,
+) {
+    let graphemes: Vec<&str> = draft.graphemes(true).collect();
+    let cursor = if focused {
+        cursor.min(graphemes.len())
+    } else {
+        graphemes.len()
+    };
+    let target_width = graphemes
+        .get(cursor)
+        .map(|grapheme| text_width(grapheme).max(0) as usize)
+        .unwrap_or(0);
+    let block_cursor = focused && target_width > 0 && target_width <= field_cells;
+    let separate_caret = focused && !block_cursor && field_cells > 0;
+    let text_cells = field_cells.saturating_sub(if separate_caret { 1 } else { 0 });
+    let window = composer_window(&graphemes, cursor, text_cells, block_cursor);
+
+    let mut cx = x;
+    for (index, grapheme) in graphemes
+        .iter()
+        .enumerate()
+        .take(window.end)
+        .skip(window.start)
+    {
+        let modifier = if block_cursor && index == cursor {
+            Modifier::REVERSED
+        } else {
+            Modifier::empty()
+        };
+        cx = cv.put(cx, y, grapheme, fg, Some(bg), modifier);
+    }
+
+    if separate_caret {
+        let caret_x = x.saturating_add(window.cursor_cells.min(i32::MAX as usize) as i32);
+        if caret_x < x.saturating_add(field_cells.min(i32::MAX as usize) as i32) {
+            cv.text(caret_x, y, "▏", fg, Some(bg));
+        }
+    }
+}
+
 fn draw_composer(cv: &mut Cv, x: i32, y: i32, w: i32, inp: &ConvIn) {
     let colors = cv.palette;
     let s = inp.s;
@@ -1347,29 +1691,39 @@ fn draw_composer(cv: &mut Cv, x: i32, y: i32, w: i32, inp: &ConvIn) {
         if f { colors.magenta } else { colors.faint },
         Some(bg),
     );
+    let field_x = x + 4;
+    let field_cells = (w - 4).max(0) as usize;
     if !inp.composer.is_empty() {
-        let n = (w - 7).max(1) as usize;
-        let chars: Vec<char> = inp.composer.chars().collect();
-        let vis: String = chars[chars.len().saturating_sub(n)..]
-            .iter()
-            .map(|&ch| if ch == '\n' { '⏎' } else { ch })
-            .collect();
-        let e = cv.text(x + 4, y, &vis, colors.ink, Some(bg));
-        cv.text(e, y, "▏", colors.ink, Some(bg));
-    } else {
-        cv.text(
-            x + 4,
-            y,
-            "▏",
-            if f { colors.ink } else { colors.faint },
-            Some(bg),
+        draw_composer_draft(
+            cv,
+            (field_x, y, field_cells),
+            inp.composer,
+            inp.composer_cursor,
+            f,
+            colors.ink,
+            bg,
         );
+    } else {
+        let caret_cells = if f && field_cells > 0 { 1 } else { 0 };
+        if caret_cells > 0 {
+            cv.text(field_x, y, "▏", colors.ink, Some(bg));
+        }
         let ph = if s.turn_live {
             "Add to the queue, or wait for ORBIT"
         } else {
             "Ask ORBIT, or type / for commands"
         };
-        cv.text(x + 5, y, &clip_text(ph, w - 6), colors.faint, Some(bg));
+        let placeholder_x = field_x + caret_cells as i32;
+        let placeholder_cells = field_cells.saturating_sub(caret_cells);
+        if placeholder_cells > 0 {
+            cv.text(
+                placeholder_x,
+                y,
+                &clip_text(ph, placeholder_cells.min(i32::MAX as usize) as i32),
+                colors.faint,
+                Some(bg),
+            );
+        }
     }
     let hints: Vec<(&str, &str)> = if inp.history_search.is_some() {
         vec![("⌃r", "older"), ("⏎", "accept draft"), ("esc", "restore")]
@@ -1377,7 +1731,7 @@ fn draw_composer(cv: &mut Cv, x: i32, y: i32, w: i32, inp: &ConvIn) {
         vec![
             ("↑↓", "choose"),
             ("⇥", "complete"),
-            ("⏎", "accept draft"),
+            ("⏎", "accept file"),
             ("esc", "close"),
         ]
     } else if s.turn_live {
@@ -1406,6 +1760,103 @@ fn draw_composer(cv: &mut Cv, x: i32, y: i32, w: i32, inp: &ConvIn) {
     }
 }
 
+#[cfg(test)]
+mod composer_render_tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    fn render(draft: &str, cursor: usize, width: u16, focused: bool) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+        let mut cv = Cv::new(&mut buffer);
+        draw_composer_draft(
+            &mut cv,
+            (0, 0, width as usize),
+            draft,
+            cursor,
+            focused,
+            (240, 240, 240),
+            (20, 20, 20),
+        );
+        buffer
+    }
+
+    #[test]
+    fn focused_cursor_highlights_the_whole_next_grapheme_in_a_middle_draft() {
+        let buffer = render("ab界cd", 3, 5, true);
+        assert_eq!(buffer[(0, 0)].symbol(), "b");
+        assert_eq!(buffer[(1, 0)].symbol(), "界");
+        assert_eq!(buffer[(2, 0)].symbol(), "");
+        assert_eq!(buffer[(3, 0)].symbol(), "c");
+        assert!(buffer[(3, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buffer[(4, 0)].symbol(), "d");
+    }
+
+    #[test]
+    fn focused_end_cursor_keeps_a_cell_for_the_caret() {
+        let buffer = render("ab界cd", 5, 4, true);
+        assert_eq!(buffer[(0, 0)].symbol(), "c");
+        assert_eq!(buffer[(1, 0)].symbol(), "d");
+        assert_eq!(buffer[(2, 0)].symbol(), "▏");
+    }
+
+    #[test]
+    fn an_unfittable_wide_cluster_does_not_hide_the_start_caret() {
+        let buffer = render("界", 0, 1, true);
+        assert_eq!(buffer[(0, 0)].symbol(), "▏");
+    }
+
+    #[test]
+    fn unfocused_composer_has_no_caret_or_reverse_cursor() {
+        let buffer = render("draft", 2, 8, false);
+        assert!(buffer.content.iter().all(|cell| cell.symbol() != "▏"));
+        assert!(
+            buffer
+                .content
+                .iter()
+                .all(|cell| !cell.modifier.contains(Modifier::REVERSED))
+        );
+        assert_eq!(buffer[(0, 0)].symbol(), "d");
+    }
+
+    #[test]
+    fn newline_is_shown_as_one_cell_without_changing_the_draft() {
+        let draft = "a\nb";
+        let graphemes: Vec<&str> = draft.graphemes(true).collect();
+        let window = composer_window(&graphemes, 2, 3, true);
+        assert_eq!(window.start, 0);
+        assert_eq!(window.end, 3);
+        assert_eq!(window.cursor_cells, 2);
+        assert_eq!(draft, "a\nb");
+    }
+
+    #[test]
+    fn pasted_whitespace_and_control_characters_render_without_changing_the_draft() {
+        let draft = "x\t\r\n\u{1b}\u{7f}\u{85}\ry";
+        let buffer = render(draft, 6, 20, true);
+        let visible = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(visible.contains('⇥'), "{visible:?}");
+        assert!(visible.contains('⏎'), "{visible:?}");
+        assert!(visible.contains('␍'), "{visible:?}");
+        assert!(visible.contains('␛'), "{visible:?}");
+        assert!(visible.contains('␡'), "{visible:?}");
+        assert!(visible.contains('�'), "{visible:?}");
+        assert!(visible.contains('y'), "{visible:?}");
+        assert!(
+            buffer
+                .content
+                .iter()
+                .all(|cell| cell.symbol().chars().all(|ch| !ch.is_control())),
+            "{visible:?}"
+        );
+        assert_eq!(draft, "x\t\r\n\u{1b}\u{7f}\u{85}\ry");
+    }
+}
+
 /// Draw the whole Conversation panel into `r`.
 pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
     let colors = cv.palette;
@@ -1415,6 +1866,13 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
         badge_themed(colors, BadgeState::Needs, None, inp.now_ms, inp.reduced)
     } else if s.turn_live {
         badge_themed(colors, BadgeState::Working, None, inp.now_ms, inp.reduced)
+    } else if s.ordinary_cancelled() {
+        vec![
+            Seg::bold("⊘ ", colors.amber),
+            Seg::new("cancelled", colors.amber),
+        ]
+    } else if s.last_failed {
+        badge_themed(colors, BadgeState::Failed, None, inp.now_ms, inp.reduced)
     } else if s.turn_report.is_some() {
         badge_themed(colors, BadgeState::Done, None, inp.now_ms, inp.reduced)
     } else if s.transcript.is_empty() {
@@ -1425,7 +1883,7 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
     } else {
         badge_themed(colors, BadgeState::Idle, None, inp.now_ms, inp.reduced)
     };
-    let title = if s.transcript.is_empty() {
+    let title = if s.transcript.is_empty() && !s.last_failed && !s.ordinary_cancelled() {
         "New session"
     } else {
         "Conversation"
@@ -1472,10 +1930,13 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
                 None => 3 + i32::from(inp.history_search.is_some()),
             };
             let view_h = (h - bottom_h).max(0);
+            let (rows, acknowledgement_rows) = transcript_rows_themed(colors, cv.compact, inp, w);
             // The welcome hero (M01 startup, M26 welcome orbit): shown on an
             // empty session and while the first prompt waits.
-            let hero_on =
-                inp.brand != BrandTier::Off && (s.transcript.is_empty() || s.first_prompt_waiting);
+            let hero_on = inp.brand != BrandTier::Off
+                && !s.last_failed
+                && !s.ordinary_cancelled()
+                && (s.transcript.is_empty() || s.first_prompt_waiting);
             let animate = inp.brand == BrandTier::Anim && !inp.reduced;
             let mut used = 0;
             if hero_on {
@@ -1484,7 +1945,7 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
                     x,
                     y,
                     w,
-                    view_h,
+                    view_h - (acknowledgement_rows as i32).min(view_h),
                     &Hero {
                         since_start: if animate { secs(inp.now_ms) } else { 99.0 },
                         waiting_for: s.first_prompt_waiting.then(|| {
@@ -1499,9 +1960,13 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
                     },
                 );
             }
-            if !s.transcript.is_empty() {
+            if !s.transcript.is_empty()
+                || s.last_failed
+                || s.cleared_from.is_some()
+                || s.backend_notice().is_some()
+                || s.ordinary_cancelled()
+            {
                 let view_h = view_h - used;
-                let rows = transcript_rows_themed(colors, cv.compact, inp, w);
                 let total = rows.len() as i32;
                 let start = (total - view_h - inp.scroll_offset as i32).max(0);
                 let shown = (total - start).min(view_h);
@@ -1593,7 +2058,7 @@ fn draw_files(
     } else {
         ""
     };
-    let keys = format!("↑↓ choose   ⇥/⏎ accept draft{more}");
+    let keys = format!("↑↓ choose   ⇥/⏎ accept file{more}");
     let kw = text_width(&keys);
     if w > kw + 10 {
         cv.text(
@@ -1748,7 +2213,135 @@ mod effort_note_tests {
             1
         );
     }
+
+    #[test]
+    fn note_wrapping_and_typewriter_helpers_keep_graphemes_and_cell_budgets() {
+        let text = "e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦  tail";
+        assert_eq!(grapheme_prefix(text, 5), "e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦");
+
+        let rows = wrapped_note_text(text, 5);
+        assert_eq!(rows.concat(), text);
+        assert!(rows.iter().all(|row| text_width(row) <= 5), "{rows:?}");
+        let mut boundaries = vec![0];
+        let mut offset = 0;
+        for grapheme in text.graphemes(true) {
+            offset += grapheme.chars().count();
+            boundaries.push(offset);
+        }
+        offset = 0;
+        for row in &rows {
+            assert!(boundaries.contains(&offset), "invalid start for {row:?}");
+            offset += row.chars().count();
+            assert!(boundaries.contains(&offset), "invalid end for {row:?}");
+        }
+        assert_eq!(offset, text.chars().count());
+
+        let suffix = clip_suffix("e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦", 5);
+        assert_eq!(suffix, "…☀️👨‍👩‍👧‍👦");
+        assert!(text_width(&suffix) <= 5, "{suffix:?}");
+        assert_eq!(
+            suffix.graphemes(true).collect::<Vec<_>>(),
+            ["…", "☀️", "👨‍👩‍👧‍👦"]
+        );
+    }
+
+    #[test]
+    fn clipped_note_suffix_keeps_isolated_zero_width_graphemes_separate() {
+        for (raw, expected) in [("\u{301}", "…◌́"), ("\u{fe0f}", "…◌️"), ("\u{200d}", "…◌‍")]
+        {
+            let input = format!("long text\n{raw}");
+            let clipped = clip_suffix(&input, 2);
+            assert_eq!(clipped, expected, "raw suffix {raw:?}");
+            assert_eq!(text_width(&clipped), 2, "display budget for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_notes_consume_crlf_but_keep_standalone_cr_visible() {
+        let rows = wrapped_note_text("first\r\nsecond\rthird", 32);
+        assert_eq!(rows, ["first", "second\rthird"]);
+        assert_eq!(text_width(&rows[1]), 12);
+        assert_eq!(clip_text(&rows[1], 32), "second␍third");
+    }
 }
+
+#[cfg(test)]
+mod grapheme_typewriter_tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    fn paint(row: Row, width: u16) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 3));
+        let mut cv = Cv::new(&mut buffer);
+        row.unwrap()(&mut cv, 0, 0);
+        buffer
+    }
+
+    fn visible(buffer: &Buffer) -> String {
+        buffer
+            .content
+            .iter()
+            .filter(|cell| !cell.symbol().is_empty())
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn report_typewriter_reveals_only_complete_clusters() {
+        let text = "e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦";
+        let row = report_rows_themed(
+            Palette::default(),
+            text.to_string(),
+            Some(0),
+            34,
+            false,
+            false,
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+        let line = visible(&paint(row, 40));
+        assert!(line.contains("e\u{301}界"), "{line:?}");
+        assert!(
+            !line.contains("🇧🇷"),
+            "the next cluster must not appear early: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{301}') || line.contains("e\u{301}"),
+            "orphan mark: {line:?}"
+        );
+    }
+
+    #[test]
+    fn tool_target_typewriter_reveals_only_complete_clusters() {
+        let target = "e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦x";
+        let line = TranscriptLine {
+            text: target.to_string(),
+            tool_name: "Read".into(),
+            tool_state: ToolState::Running,
+            started_ms: Some(0),
+            ..Default::default()
+        };
+        let row = card_rows_themed(Palette::default(), &line, 100, 17, false, false)
+            .into_iter()
+            .next()
+            .unwrap();
+        let line = visible(&paint(row, 100));
+        assert!(
+            line.contains("e\u{301}界🇧🇷☀️"),
+            "four complete graphemes should be visible: {line:?}"
+        );
+        assert!(
+            !line.contains("👨‍👩‍👧‍👦"),
+            "family cluster must not appear early: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{301}') || line.contains("e\u{301}"),
+            "orphan mark: {line:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod kind_tests {
     use super::kind_of;
@@ -1787,6 +2380,7 @@ mod kind_tests {
 mod reply_row_tests {
     use super::*;
     use crate::proto::shell::md::rich_styled;
+    use ratatui::buffer::Buffer;
 
     fn rows(markdown: &str, width: usize) -> (Vec<char>, Vec<ReplyRow>) {
         let md = rich_styled(markdown);
@@ -1850,6 +2444,54 @@ mod reply_row_tests {
         assert_eq!(r.len(), 1);
     }
 
+    #[test]
+    fn reply_rows_treat_crlf_as_one_line_break() {
+        let (plain, rows) = rows("first\r\nsecond", 20);
+        assert_eq!(pieces(&plain, &rows), ["first", "second"]);
+        assert_eq!(plain.iter().filter(|ch| **ch == '\n').count(), 1);
+        assert!(!plain.contains(&'\r'));
+    }
+
+    #[test]
+    fn user_rows_keep_crlf_structural_and_show_standalone_cr() {
+        fn render(rows: Vec<Row>, width: u16) -> String {
+            let height = rows.len().max(1) as u16;
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+            let mut cv = Cv::new(&mut buffer);
+            for (y, row) in rows.into_iter().enumerate() {
+                if let Some(draw) = row {
+                    draw(&mut cv, 0, y as i32);
+                }
+            }
+            buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        }
+
+        let raw = "first\r\nsecond";
+        let (plain, mask) = rich_plain(raw);
+        assert_eq!(plain.iter().collect::<String>(), raw);
+        assert_eq!(mask.len(), plain.len());
+        let line = TranscriptLine {
+            text: raw.to_string(),
+            ..Default::default()
+        };
+        let rows = user_rows_themed(Palette::default(), &line, 40);
+        assert_eq!(rows.len(), 2);
+        let screen = render(rows, 40);
+        assert!(screen.contains("first") && screen.contains("second"));
+        assert!(!screen.contains('␍') && !screen.contains('⏎'));
+
+        let standalone = TranscriptLine {
+            text: "first\rsecond".to_string(),
+            ..Default::default()
+        };
+        let screen = render(user_rows_themed(Palette::default(), &standalone, 40), 40);
+        assert!(screen.contains("first␍second"));
+    }
+
     /// A word longer than the row is split, and a hang wider than the
     /// row cannot starve it of columns.
     #[test]
@@ -1858,5 +2500,126 @@ mod reply_row_tests {
         assert_eq!(pieces(&plain, &r), ["abcde", "fghij", "kl"]);
         let (_, r) = rows("- aaa bbb", 2);
         assert!(r.iter().all(|row| row.hang < 2), "{r:?}");
+    }
+
+    #[test]
+    fn reply_wrapping_uses_cells_and_only_returns_grapheme_boundaries() {
+        let text = "e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦";
+        let (plain, rows) = rows(text, 3);
+        let pieces = pieces(&plain, &rows);
+        assert_eq!(pieces.concat(), text);
+        assert_eq!(pieces, ["e\u{301}界", "🇧🇷", "☀️", "👨‍👩‍👧‍👦"]);
+
+        let mut boundaries = vec![0];
+        let mut offset = 0;
+        for grapheme in text.graphemes(true) {
+            offset += grapheme.chars().count();
+            boundaries.push(offset);
+        }
+        for row in &rows {
+            assert!(boundaries.contains(&row.a), "invalid start: {row:?}");
+            assert!(boundaries.contains(&row.b), "invalid end: {row:?}");
+            let piece: String = plain[row.a..row.b].iter().collect();
+            assert!(text_width(&piece) <= 3, "{piece:?}");
+        }
+    }
+
+    #[test]
+    fn user_and_model_rows_paint_complete_clusters_and_keep_leading_style() {
+        fn buffer_for(rows: Vec<Row>, width: u16) -> Buffer {
+            let height = rows.len().max(1) as u16;
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+            let mut cv = Cv::new(&mut buffer);
+            for (y, row) in rows.into_iter().enumerate() {
+                if let Some(draw) = row {
+                    draw(&mut cv, 0, y as i32);
+                }
+            }
+            buffer
+        }
+
+        let unicode = "e\u{301} 界 🇧🇷 ☀️ 👨‍👩‍👧‍👦";
+        let user = TranscriptLine {
+            kind: LineKind::User,
+            text: unicode.to_string(),
+            ..Default::default()
+        };
+        let user_buffer = buffer_for(user_rows_themed(Palette::default(), &user, 48), 48);
+        for grapheme in unicode.graphemes(true).filter(|g| !g.trim().is_empty()) {
+            assert!(
+                user_buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == grapheme),
+                "user row lost {grapheme:?}"
+            );
+        }
+
+        // Markdown markers put the heart's printable scalar in bold while
+        // leaving its variation selector outside the marker. The canvas
+        // must still paint the complete emoji with the leading scalar's style.
+        let model = TranscriptLine {
+            kind: LineKind::Model,
+            text: "**❤**️ e\u{301} 界 🇧🇷 ☀️ 👨‍👩‍👧‍👦".to_string(),
+            arrivals: vec![(0, 0)],
+            ..Default::default()
+        };
+        let model_buffer = buffer_for(
+            orbit_rows_themed(Palette::default(), &model, 48, false, 0, true, true),
+            48,
+        );
+        let heart = model_buffer
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "❤️");
+        assert!(
+            heart.is_some(),
+            "model row split the heart and variation selector"
+        );
+        assert!(
+            heart.unwrap().modifier.contains(Modifier::BOLD),
+            "the first printable scalar's style must apply to its full grapheme"
+        );
+        for grapheme in "e\u{301} 界 🇧🇷 ☀️ 👨‍👩‍👧‍👦"
+            .graphemes(true)
+            .filter(|g| !g.trim().is_empty())
+        {
+            assert!(
+                model_buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == grapheme),
+                "model row lost {grapheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_report_uses_amber_without_dropping_report_text() {
+        let colors = Palette::default();
+        let row = report_rows_accent(
+            colors,
+            "cancelled · 2s · 1 tool".into(),
+            Some(0),
+            1000,
+            true,
+            colors.amber,
+        )
+        .remove(0);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 3));
+        row.unwrap()(&mut Cv::new(&mut buffer), 0, 0);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("cancelled · 2s · 1 tool"));
+        let rgb = colors.amber;
+        for x in 3..12 {
+            assert_eq!(
+                buffer[(x, 0)].fg,
+                ratatui::style::Color::Rgb(rgb.0, rgb.1, rgb.2)
+            );
+        }
     }
 }

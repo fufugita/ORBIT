@@ -69,15 +69,24 @@ impl CancelToken {
 /// terminal contract as cancellation during streaming. It is never a retryable
 /// timeout or transport error.
 pub(crate) fn cancelled_stream() -> crate::AsyncProviderEventStream {
-    use orbit_adapter::types::{ProviderEventKind, ProviderStreamEvent, ProviderUsage};
+    use orbit_adapter::types::{
+        ProviderEventKind, ProviderStreamEvent, ProviderUsage, UsageObservationMetaV1,
+        UsageReasoningReportingV1, UsageSnapshotOriginV1,
+    };
     Box::pin(futures::stream::iter([
         Ok(ProviderStreamEvent {
+            usage_observation: None,
             sequence: 0,
             event: ProviderEventKind::ResponseStarted {
                 upstream_request_id: None,
             },
         }),
         Ok(ProviderStreamEvent {
+            usage_observation: Some(UsageObservationMetaV1 {
+                version: 1,
+                reasoning_reporting: UsageReasoningReportingV1::NotReported,
+                snapshot_origin: UsageSnapshotOriginV1::Synthetic,
+            }),
             sequence: 1,
             event: ProviderEventKind::Finished {
                 finish_reason: Some("cancelled".into()),

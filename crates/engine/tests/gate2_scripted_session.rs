@@ -75,6 +75,7 @@ fn gate2_scripted_session_through_engine() {
     std::fs::create_dir_all(dir.join("ledger")).expect("mkdir ledger");
 
     let config = orbit_engine::TurnConfig {
+        billing: None,
         sampling: None,
         effort: None,
         supported_efforts: None,
@@ -249,6 +250,7 @@ fn gate2_round_guard_stops_runaway() {
     std::fs::create_dir_all(dir.join("ledger")).expect("mkdir ledger");
 
     let config = orbit_engine::TurnConfig {
+        billing: None,
         sampling: None,
         effort: None,
         supported_efforts: None,

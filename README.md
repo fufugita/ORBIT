@@ -50,11 +50,10 @@ Add the installation directory to `PATH`. The managed installer switches both
 executables together and preserves your configuration. See [installation details](docs/setup.md)
 for bundle installation, upgrades, prerequisites, and uninstall instructions.
 
-### npm preview
+### Install with npm (Linux)
 
-The native Linux packages are available, but publication of the
-`@fufugita/orbit` launcher is still pending. The following command becomes usable
-once that launcher is published:
+The current prerelease is published under the `next` tag. Install the launcher
+and its optional native Linux executables with:
 
 ```sh
 npm install --global --include=optional @fufugita/orbit@next
@@ -63,7 +62,7 @@ npm install --global --include=optional @fufugita/orbit@next
 The npm distribution requires Node.js **22.15+ (22.x), or 23.11+**, Linux
 **x64 or arm64**, and **glibc 2.35+**. It includes both executables and needs no
 Rust compiler or lifecycle download script. See [package distribution](docs/setup.md#package-distribution)
-for availability and local archive installation.
+for platform requirements and local archive installation.
 
 ## Get started
 
@@ -71,21 +70,25 @@ Open a terminal in the project you want to work on:
 
 ```sh
 cd your-project
-orbit setup
+orbit init
 orbit doctor
 orbit
 ```
 
-Plain `orbit setup` opens the provider wizard when both input and output are
-terminals. It walks you through:
+Plain `orbit init` opens interactive setup when both input and output are
+terminals. `orbit setup` opens the same flow. Use the arrow keys and Enter to
+choose, or the displayed numbered choices in plain terminals. Back lets you
+review earlier choices; Ctrl-C cancels an unpublished draft. Setup walks you through:
 
 1. **Provider and endpoint:** choose a preset, or choose `custom` and enter a name,
    adapter kind, and your provider's base URL.
 2. **Authentication:** enter a hidden API key, name an environment variable, or
    use browser sign-in for the supported OpenRouter endpoint. Custom/local
    providers can also use explicit no-auth.
-3. **Models:** choose `discover` to fetch the catalog, filter it and select model
-   numbers, or enter exact raw IDs manually, including any slashes in the ID.
+3. **Models:** choose `discover` to fetch the catalog, then use the picker to
+   select models, page through results, and filter by model ID or label. Plain
+   terminals use numbered choices. You can also enter exact raw IDs manually,
+   including any slashes in the ID.
 4. **Default and save:** optionally select the main model, review the complete
    summary, and type `yes` to save.
 
@@ -141,6 +144,36 @@ flow when a local browser callback is unavailable. Other endpoints can use an
 API key or ENV reference. See [provider sign-in](docs/setup.md#sign-in-and-remove-a-saved-key)
 for the complete flow and local logout.
 
+### Change settings interactively
+
+```sh
+orbit config
+```
+
+Choose a main model or a model for delegated work, exploration, and compaction;
+set the easy and hard routing fallbacks; or change the theme, layout, spacing,
+glyphs, color mode, and motion preferences. The provider action opens the same setup
+wizard, so you can add another endpoint without editing a file.
+
+Each edit shows its scope and asks before saving. Canceling an edit preserves its
+previous value; edits you already saved remain saved when you leave the menu.
+Model defaults apply to fresh sessions. Explicit model selections and resumed
+sessions keep their selected model. Phase-specific routes take precedence over
+the routing fallbacks.
+
+For a read-only view, including from a script:
+
+```sh
+orbit config show
+orbit config show --json
+```
+
+To create only the local identity and configure providers later:
+
+```sh
+orbit init --no-provider
+```
+
 ### Where configuration lives
 
 `--home DIR` takes precedence over `ORBIT_HOME`. Otherwise ORBIT uses an existing
@@ -177,8 +210,9 @@ orbit setup --provider work --kind openai-compatible \
   --credential-env WORK_API_KEY
 ```
 
-`setup --json`, redirected plain setup, `setup --no-provider`, and
-`setup --dry-run` keep their offline, prompt-free behavior. `setup --guided`
+`init --json`, `init --no-provider`, redirected plain init/setup, and
+`setup --dry-run` keep their offline, prompt-free behavior. `setup --json` and
+`setup --no-provider` work the same way. `setup --guided`
 is the older offline ENV-name prompt flow and requires terminal input and output;
 interactive flags cannot be combined with JSON. `setup repair --dry-run` inspects
 missing identity artifacts without replacing the identity.
@@ -269,7 +303,7 @@ or the provider's generation or billing contract.
 | Understand or change a project | Run `orbit` in its directory; ask it to inspect files, propose edits, and run checks. |
 | Use the browser interface | Run `orbit web` from the project directory. |
 | Run one task from a script | `orbit -p "Summarize this project" --output-format text` |
-| Reopen work | `orbit --resume SESSION_ID` chooses a saved session. `--continue` reopens the latest session in the selected ORBIT home. |
+| Reopen work | Run `orbit --continue` in the original project directory, or choose its saved session with `orbit --resume SESSION_ID`. See [workspace-bound sessions](docs/setup.md#resume-in-the-right-project) for older sessions. |
 | Keep a session owned by another terminal | Use `orbit serve` and `orbit attach`; see [owned sessions](docs/integrations.md#keep-a-session-running-with-serve-and-attach). |
 | Summarize accumulated context | Use `/compact` in chat, or `orbit compact --session SESSION_ID --json` for an inactive saved session. Summary requests can incur provider charges. |
 | Inspect interrupted work | `orbit recovery status --session SESSION_ID --json` reads tracked accounting without sending a prompt. See [session preservation](docs/setup.md#preserve-an-inactive-session). |
@@ -376,8 +410,10 @@ orbit route status
 ```
 
 The names must exist in your configuration. Routing uses deterministic phase and
-difficulty rules; individual phase targets are configurable. An explicit model
-choice pins the session, while `/route auto` restores automatic routing. Roles
+difficulty rules; individual phase targets are configurable. `route setup`
+applies the easy/hard pair across all phases. The interactive `orbit config`
+routing menu changes fallback targets while preserving specific phase overrides.
+An explicit model choice pins the session, while `/route auto` restores automatic routing. Roles
 provide separate model choices for delegated work and other supported tasks.
 
 Use `--effort high` or `/effort high` only when the selected model declares that
@@ -385,6 +421,9 @@ choice; `/effort default` restores its configured default. See [provider configu
 for exact identities, roles, and routing commands.
 
 ## Make the workspace yours
+
+Start with `orbit config` for theme, layout and display preferences. The
+customization commands expose additional colors, panes and browser settings:
 
 ```sh
 orbit customize theme midnight

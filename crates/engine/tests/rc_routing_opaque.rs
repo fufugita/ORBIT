@@ -101,6 +101,7 @@ impl Provider {
     }
     fn config(&self, provider: &str, model: &str) -> TurnConfig {
         TurnConfig {
+            billing: None,
             provider_id: provider.into(),
             gate: self.url.clone(),
             model: model.into(),

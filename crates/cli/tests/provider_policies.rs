@@ -171,6 +171,7 @@ fn config() -> TurnConfig {
         kind: ProviderKind::OpenAiCompatible,
         credential_env: None,
         pricing: None,
+        billing: None,
         max_output_tokens: 73,
         sampling: None,
         effort: None,

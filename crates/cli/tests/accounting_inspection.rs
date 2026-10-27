@@ -372,6 +372,7 @@ mod accounting_inspection {
             kind: ProviderKind::OpenAiCompatible,
             credential_env: None,
             pricing: None,
+            billing: None,
             max_output_tokens: 32,
             sampling: None,
             effort: None,

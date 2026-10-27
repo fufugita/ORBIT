@@ -300,6 +300,28 @@ fn read_request(socket: &mut TcpStream) -> Result<Captured, &'static str> {
 
 fn config(fixture: &Fixture, summary: bool) -> TurnConfig {
     TurnConfig {
+        billing: summary.then(|| {
+            use orbit_adapter::types::{
+                BillingQuoteContractV1, BillingRatesV1, ModelId, PricingDeclarationState,
+                ProviderId, ReasoningCounterBasis, ReasoningRatePolicy,
+            };
+            BillingQuoteContractV1::try_new(
+                ProviderId("summary-provider".into()),
+                ModelId("raw-summary/model".into()),
+                PricingDeclarationState::DeclaredV2,
+                BillingRatesV1 {
+                    input_per_million_microdollars: Some(0),
+                    output_per_million_microdollars: Some(0),
+                    cache_read_per_million_microdollars: Some(0),
+                    cache_write_per_million_microdollars: Some(0),
+                    reasoning_per_million_microdollars: None,
+                    request_flat_microdollars: Some(17),
+                },
+                ReasoningCounterBasis::IncludedInOutput,
+                ReasoningRatePolicy::OutputRate,
+            )
+            .unwrap()
+        }),
         provider_id: if summary {
             "summary-provider"
         } else {
@@ -1062,7 +1084,9 @@ fn manual_known_unpriced_summary_applies_with_unknown_price_not_free_bill() {
     isolated!("manual_known_unpriced_summary_applies_with_unknown_price_not_free_bill");
     let (home, mut fixture, journal, selected, mut options) =
         setup(vec![Response::complete(SUMMARY)], 1000, 12_000);
-    options.compaction_config.as_mut().unwrap().pricing = None;
+    let compaction = options.compaction_config.as_mut().unwrap();
+    compaction.pricing = None;
+    compaction.billing = None;
     let mut source = history(3, 1800);
     let (result, events) = invoke(&home, &selected, &options, &mut source, &CancelToken::new());
     fixture.finish();

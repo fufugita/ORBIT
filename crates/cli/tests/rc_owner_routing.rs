@@ -1931,6 +1931,8 @@ mod context_frontend_tests {
             match bus.try_recv() {
                 Some(Msg::Status(text)) => events.push(json!({"type":"status","text":text})),
                 Some(Msg::BackendError(message)) => events.push(json!({"type":"error","message":message})),
+                Some(Msg::BackendNotice(message)) => events.push(json!({"type":"notice","message":message})),
+                Some(Msg::OrdinaryTurnEnded { .. }) => panic!("legacy unbound observer received a managed ordinary result"),
                 Some(Msg::Usage {used_tokens,window_tokens,breakdown}) => events.push(json!({"type":"usage","used_tokens":used_tokens,"window_tokens":window_tokens,"breakdown":breakdown})),
                 Some(Msg::PlanReady(text)) => events.push(json!({"type":"plan_ready","text":text})),
                 Some(Msg::ResponseFinished {..}) => done=true,
@@ -1959,6 +1961,13 @@ mod context_frontend_tests {
             }
         }
         while let Some(msg) = bus.try_recv() {
+            if let Msg::BackendNotice(message) = &msg {
+                events.push(json!({"type":"notice","message":message}));
+            }
+            assert!(
+                !matches!(&msg, Msg::OrdinaryTurnEnded { .. }),
+                "unbound tail received a managed result"
+            );
             if let Msg::PlanReady(text) = &msg {
                 events.push(json!({"type":"plan_ready","text":text}));
             }
@@ -2369,7 +2378,8 @@ mod caller_journal_activation {
     use orbit_engine::{
         AccountingBaseline, AccountingKnownness, AttemptPurpose, CompactionJournal,
     };
-    use orbit_hud_tui::worker::{CancelHandle, WorkerCommand, WorkerCtx};
+    use orbit_hud_tui::msg::{OrdinaryEnd, OrdinaryPublication, ProjectionReason};
+    use orbit_hud_tui::worker::{CancelHandle, ForegroundOperation, WorkerCommand, WorkerCtx};
     use orbit_hud_tui::{ApprovalRegistry, bus::Bus, msg::Msg};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -2833,7 +2843,11 @@ mod caller_journal_activation {
                 "id":id, "max_output_tokens":73, "context_limits":{"input_tokens":input},
                 "pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,
                     "cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,
-                    "reasoning_per_million_microdollars":0,"request_flat_microdollars":price}
+                    "reasoning_per_million_microdollars":0,"request_flat_microdollars":price},
+                "billing":{"version":2,"input_per_million_microdollars":0,
+                    "output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,
+                    "cache_write_per_million_microdollars":0,"request_flat_microdollars":price,
+                    "reasoning_counter_basis":"included_in_output","reasoning_rate_policy":"output_rate"}
             })
         };
         let document = json!({"provider":[{"name":"provider_a","kind":"openai-compatible","url":wire.url,
@@ -3016,6 +3030,12 @@ mod caller_journal_activation {
                     Some(Msg::BackendError(message)) => {
                         events.push(json!({"type":"error","message":message}))
                     }
+                    Some(Msg::BackendNotice(message)) => {
+                        events.push(json!({"type":"notice","message":message}))
+                    }
+                    Some(Msg::OrdinaryTurnEnded { .. }) => {
+                        panic!("legacy unbound observer received a managed ordinary result")
+                    }
                     Some(Msg::Status(text)) => events.push(json!({"type":"status","text":text})),
                     Some(Msg::PlanReady(text)) => {
                         events.push(json!({"type":"plan_ready","text":text}))
@@ -3036,11 +3056,117 @@ mod caller_journal_activation {
             assert!(done, "actual TUI terminal response missing");
             events
         }
+        fn run_bound(
+            &self,
+            command: WorkerCommand,
+            cancel_after_post: Option<(&Wire, usize)>,
+        ) -> Vec<Msg> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let binding = loop {
+                match self.bus.try_recv() {
+                    Some(Msg::SessionProjection(view))
+                        if matches!(view.reason, ProjectionReason::Initial) =>
+                    {
+                        break view.binding;
+                    }
+                    Some(Msg::BackendError(_) | Msg::BackendNotice(_)) => {
+                        panic!("managed outcome fixture startup failed")
+                    }
+                    Some(Msg::OrdinaryTurnEnded { .. }) => {
+                        panic!("ordinary result before actual Initial binding")
+                    }
+                    _ => {}
+                }
+                assert!(Instant::now() < deadline, "actual Initial binding absent");
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let operation =
+                ForegroundOperation::new(binding.clone(), command.foreground_kind().unwrap(), 1)
+                    .unwrap();
+            self.commands
+                .as_ref()
+                .unwrap()
+                .send(WorkerCommand::Bound {
+                    operation: operation.clone(),
+                    command: Box::new(command),
+                })
+                .unwrap();
+            if let Some((wire, count)) = cancel_after_post {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while wire.requests.lock().unwrap().len() < count {
+                    assert!(
+                        Instant::now() < deadline,
+                        "actual POST missing before managed cancellation"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                (self.cancel)();
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (mut ends, mut finishes) = (0, 0);
+            let mut events = Vec::new();
+            loop {
+                if let Some(message) = self.bus.try_recv() {
+                    let terminal = match &message {
+                        Msg::OrdinaryTurnEnded {
+                            operation: observed,
+                            ..
+                        } => {
+                            assert_eq!(observed, &operation);
+                            assert_eq!(
+                                (ends, finishes),
+                                (0, 0),
+                                "end must be unique and precede finish"
+                            );
+                            ends += 1;
+                            false
+                        }
+                        Msg::ResponseFinished { .. } => {
+                            assert_eq!((ends, finishes), (1, 0));
+                            finishes += 1;
+                            false
+                        }
+                        Msg::SessionProjection(view)
+                            if matches!(&view.reason,
+                            ProjectionReason::Operation { operation: observed } if observed == &operation) =>
+                        {
+                            assert_eq!(view.binding, binding);
+                            assert_eq!(
+                                (ends, finishes),
+                                (1, 1),
+                                "checked projection must follow the original finish"
+                            );
+                            true
+                        }
+                        Msg::BackendNotice(_) => {
+                            panic!("unexpected publication/control notice in normal managed case")
+                        }
+                        _ => false,
+                    };
+                    events.push(message);
+                    if terminal {
+                        return events;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "matching managed settlement absent"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
         fn wait_plan(&self) -> Value {
             let end = Instant::now() + Duration::from_secs(3);
             loop {
-                if let Some(Msg::PlanReady(text)) = self.bus.try_recv() {
-                    return json!({"type":"plan_ready","text":text});
+                match self.bus.try_recv() {
+                    Some(Msg::PlanReady(text)) => return json!({"type":"plan_ready","text":text}),
+                    Some(Msg::BackendNotice(_)) => {
+                        panic!("unexpected notice while waiting for an unbound plan")
+                    }
+                    Some(Msg::OrdinaryTurnEnded { .. }) => {
+                        panic!("unbound plan received a managed result")
+                    }
+                    _ => {}
                 }
                 assert!(
                     Instant::now() < end,
@@ -3055,6 +3181,17 @@ mod caller_journal_activation {
             loop {
                 if let Ok(lease) = SessionLease::acquire(&f.home, session, "activation-closed") {
                     drop(lease);
+                    while let Some(message) = self.bus.try_recv() {
+                        assert!(
+                            !matches!(
+                                message,
+                                Msg::OrdinaryTurnEnded { .. }
+                                    | Msg::ResponseFinished { .. }
+                                    | Msg::BackendNotice(_)
+                            ),
+                            "duplicate terminal or unexpected notice after worker EOF"
+                        );
+                    }
                     return;
                 }
                 assert!(Instant::now() < end, "TUI retained session lease after EOF");
@@ -3066,6 +3203,146 @@ mod caller_journal_activation {
         fn drop(&mut self) {
             (self.cancel)();
             self.commands.take();
+        }
+    }
+
+    #[test]
+    fn actual_bound_tui_length_end_is_failed_before_finished_and_checked_projection() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_bound_tui_length_end_is_failed_before_finished_and_checked_projection",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        let f = Fixture::new();
+        let _cwd = Cwd::enter(&f.workspace);
+        let mut wire = Wire::new(vec![Response::text(
+            "retained useful partial",
+            "length",
+            Some(json!({"prompt_tokens":11,"completion_tokens":7,"total_tokens":18})),
+        )]);
+        configure(&f, &wire, 64_000);
+        seed(&f, &wire, SESSION, &[], (10, 20, 30));
+        let tui = Tui::start(&f, SESSION);
+        let events = tui.run_bound(
+            WorkerCommand::Prompt("bounded partial request".into()),
+            None,
+        );
+        let ends = events
+            .iter()
+            .filter_map(|message| match message {
+                Msg::OrdinaryTurnEnded {
+                    end, publication, ..
+                } => Some((end, publication)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(ends.as_slice(), [(OrdinaryEnd::Failed(reason), OrdinaryPublication::Saved)] if !reason.is_empty())
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|message| matches!(message, Msg::BackendError(_))),
+            "length must be classified from the actual typed end without callback Error"
+        );
+        let retained = saved(&f, SESSION);
+        assert_eq!(retained.turns, 1);
+        assert_eq!(retained.transcript.len(), 2);
+        assert_eq!(retained.transcript[0].content, "bounded partial request");
+        assert_eq!(retained.transcript[1].content, "retained useful partial");
+        assert_known(&f, SESSION, 2, (10, 20, 30), 1);
+        assert!(
+            events
+                .iter()
+                .any(|message| matches!(message, Msg::ResponseFinished {
+            input_tokens, output_tokens, cost_microcents, ..
+        } if (*input_tokens, *output_tokens, *cost_microcents) ==
+             (retained.input_tokens, retained.output_tokens, retained.cost_microcents)))
+        );
+        tui.close(&f, SESSION);
+        wire.finish();
+        assert_wire(&wire, 1);
+    }
+
+    #[test]
+    fn actual_bound_tui_completed_and_cancelled_ends_preserve_saved_facts() {
+        if !dispatch_isolated(
+            "caller_journal_activation::actual_bound_tui_completed_and_cancelled_ends_preserve_saved_facts",
+        ) {
+            return;
+        }
+        require_private_system_fixture();
+        for mode in ["prompt", "plan", "cancel"] {
+            let f = Fixture::new();
+            let _cwd = Cwd::enter(&f.workspace);
+            let mut wire = if mode == "cancel" {
+                Wire::with_held_headers(vec![], true)
+            } else {
+                Wire::new(vec![Response::complete("bounded successful result")])
+            };
+            configure(&f, &wire, 64_000);
+            seed(&f, &wire, SESSION, &[], (0, 0, 0));
+            let tui = Tui::start(&f, SESSION);
+            let command = if mode == "plan" {
+                WorkerCommand::PlanPrompt("bounded ordinary plan".into())
+            } else {
+                WorkerCommand::Prompt("bounded ordinary prompt".into())
+            };
+            let events = tui.run_bound(command, (mode == "cancel").then_some((&wire, 1)));
+            let ends = events
+                .iter()
+                .filter_map(|message| match message {
+                    Msg::OrdinaryTurnEnded {
+                        end, publication, ..
+                    } => Some((end, publication)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if mode == "cancel" {
+                assert!(matches!(
+                    ends.as_slice(),
+                    [(
+                        OrdinaryEnd::Cancelled,
+                        OrdinaryPublication::BlockedOrUncertain
+                    )]
+                ));
+                let checkpoint = journal(&f, SESSION).accounting_checkpoint().unwrap();
+                assert!(checkpoint.pending.as_ref().unwrap().uncertain);
+                assert_eq!(checkpoint.totals.knownness, AccountingKnownness::Uncertain);
+                assert_eq!(
+                    saved(&f, SESSION)
+                        .accounting_watermark
+                        .unwrap()
+                        .full_cost_status,
+                    orbit_cli::session_accounting::FullCostStatus::Uncertain
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|message| matches!(message, Msg::PlanReady(_)))
+                );
+            } else {
+                assert!(matches!(
+                    ends.as_slice(),
+                    [(OrdinaryEnd::Completed, OrdinaryPublication::Saved)]
+                ));
+                assert_known(&f, SESSION, 2, (0, 0, 0), 1);
+                assert_eq!(
+                    saved(&f, SESSION).transcript.last().unwrap().content,
+                    "bounded successful result"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|message| matches!(message, Msg::PlanReady(_)))
+                        .count(),
+                    usize::from(mode == "plan")
+                );
+            }
+            tui.close(&f, SESSION);
+            wire.finish();
+            assert_wire(&wire, 1);
         }
     }
 
@@ -3871,6 +4148,12 @@ mod caller_journal_activation {
             match message {
                 Msg::ResponseFinished { .. } => finished += 1,
                 Msg::BackendError(message) => errors.push(message),
+                Msg::BackendNotice(_) => {
+                    panic!("overflow refusal emitted a storage/control notice")
+                }
+                Msg::OrdinaryTurnEnded { .. } => {
+                    panic!("unbound overflow received a managed result")
+                }
                 Msg::PlanReady(_) => plans += 1,
                 _ => {}
             }
@@ -3979,6 +4262,12 @@ mod caller_journal_activation {
             match message {
                 Msg::ResponseFinished { .. } => finished += 1,
                 Msg::BackendError(message) => errors.push(message),
+                Msg::BackendNotice(_) => {
+                    panic!("overflow refusal emitted a storage/control notice")
+                }
+                Msg::OrdinaryTurnEnded { .. } => {
+                    panic!("unbound overflow received a managed result")
+                }
                 Msg::PlanReady(_) => plans += 1,
                 _ => {}
             }

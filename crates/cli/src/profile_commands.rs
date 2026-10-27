@@ -242,25 +242,21 @@ fn set(profile: &mut Profile, key: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 fn layout_preset(name: &str) -> Result<Layout, Error> {
-    use orbit_hud_tui::proto::layout::{Node, Preset};
-    let tree = match name {
-        "default" | "columns" => Node::profile_preset(Preset::Columns),
-        "build" => Node::profile_preset(Preset::Build),
-        "agents" => Node::profile_preset(Preset::Agents),
-        "review" => Node::profile_preset(Preset::Review),
+    use orbit_frontend_protocol::customization::{PortableLayoutPreset, portable_layout_preset};
+    let preset = match name {
+        "default" | "columns" => PortableLayoutPreset::Columns,
+        "build" => PortableLayoutPreset::Build,
+        "agents" => PortableLayoutPreset::Agents,
+        "review" => PortableLayoutPreset::Review,
         _ => {
             return Err(invalid(
                 "layout.preset expects default, columns, build, agents or review",
             ));
         }
     };
-    let tree: LayoutNode = serde_json::from_value(
-        serde_json::to_value(tree).map_err(|_| invalid("preset cannot be encoded"))?,
-    )
-    .map_err(|_| invalid("preset cannot be displayed"))?;
     Ok(Layout {
         preset: name.into(),
-        tree,
+        tree: portable_layout_preset(preset),
     })
 }
 fn reset_key(profile: &mut Profile, key: &str) -> Result<(), Error> {
@@ -405,31 +401,168 @@ fn portable_strings(profile: &Profile, home: &Path, workspace: &Path) -> Result<
     )
 }
 
-fn contains_absolute_path(text: &str) -> bool {
-    for (index, character) in text.char_indices() {
-        if character != '/' {
+fn path_field_before(text: &str, index: usize) -> bool {
+    let prefix = text[..index]
+        .trim_end_matches(['"', '\''])
+        .trim_end()
+        .trim_end_matches(['=', ':'])
+        .trim_end()
+        .trim_end_matches(['"', '\''])
+        .trim_end();
+    let key_start = prefix
+        .char_indices()
+        .rev()
+        .find_map(|(offset, character)| {
+            (character.is_whitespace()
+                || matches!(
+                    character,
+                    '=' | ':'
+                        | ','
+                        | '"'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '`'
+                        | '<'
+                        | '>'
+                ))
+            .then_some(offset + character.len_utf8())
+        })
+        .unwrap_or(0);
+    let key = prefix[key_start..]
+        .trim_matches(['"', '\'', ' '])
+        .to_ascii_lowercase();
+    [
+        "path",
+        "file",
+        "directory",
+        "dir",
+        "folder",
+        "root",
+        "location",
+    ]
+    .iter()
+    .any(|field| key == *field || key.ends_with(&format!("_{field}")))
+}
+
+fn web_url_ranges(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii() {
+            index += 1;
             continue;
         }
-        let prefix = &text[..index];
-        let boundary = prefix.chars().next_back().is_none_or(|previous| {
+        let scheme_len = if bytes
+            .get(index..index + 8)
+            .is_some_and(|value| value.eq_ignore_ascii_case(b"https://"))
+        {
+            8
+        } else if bytes
+            .get(index..index + 7)
+            .is_some_and(|value| value.eq_ignore_ascii_case(b"http://"))
+        {
+            7
+        } else {
+            index += 1;
+            continue;
+        };
+        let boundary = text[..index].chars().next_back().is_none_or(|previous| {
             previous.is_whitespace()
                 || matches!(
                     previous,
-                    '=' | ':' | '"' | '\'' | '(' | '[' | '{' | '\\' | '`' | '<'
+                    '=' | ':' | '"' | '\'' | '(' | '[' | '{' | '`' | '<'
                 )
         });
         if !boundary {
+            index += scheme_len;
             continue;
         }
-        // Web URLs are portable; assignments, quoted JSON paths and file URLs are not.
-        if text[index..].starts_with("//")
-            && (prefix
-                .get(prefix.len().saturating_sub(5)..)
-                .is_some_and(|value| value.eq_ignore_ascii_case("http:"))
-                || prefix
-                    .get(prefix.len().saturating_sub(6)..)
-                    .is_some_and(|value| value.eq_ignore_ascii_case("https:")))
+        let mut end = index + scheme_len;
+        while end < bytes.len()
+            && !bytes[end].is_ascii_whitespace()
+            && !matches!(bytes[end], b'"' | b'\'' | b'<' | b'>')
         {
+            end += 1;
+        }
+        ranges.push((index, end));
+        index = end;
+    }
+    ranges
+}
+
+fn contains_absolute_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_boundary = |index: usize| {
+        text[..index].chars().next_back().is_none_or(|previous| {
+            previous.is_whitespace()
+                || matches!(
+                    previous,
+                    '=' | ':' | ',' | '"' | '\'' | '(' | '[' | '{' | '\\' | '`' | '<'
+                )
+        })
+    };
+
+    for index in 0..bytes.len() {
+        if !bytes[index].is_ascii() {
+            continue;
+        }
+        let is_backslash = bytes[index] == b'\\';
+        let drive_rooted = bytes[index].is_ascii_alphabetic()
+            && bytes.get(index + 1) == Some(&b':')
+            && bytes
+                .get(index + 2)
+                .is_some_and(|separator| matches!(*separator, b'/' | b'\\'));
+        if !is_backslash && !drive_rooted {
+            continue;
+        }
+        let unc_rooted = is_backslash && bytes.get(index + 1) == Some(&b'\\');
+        let single_rooted = is_backslash && !unc_rooted;
+        let comma_rooted = text[..index].ends_with(',');
+        if !is_boundary(index) {
+            continue;
+        }
+        if drive_rooted || unc_rooted {
+            return true;
+        }
+        let path_shape = bytes[index + 1..]
+            .iter()
+            .take_while(|byte| {
+                !byte.is_ascii_whitespace()
+                    && !matches!(**byte, b'"' | b'\'' | b')' | b']' | b'}' | b',')
+            })
+            .any(|byte| matches!(*byte, b'/' | b'\\'));
+        // Non-ASCII bytes were skipped above, so each candidate index is a
+        // UTF-8 boundary even when the profile contains non-ASCII characters.
+        if single_rooted && (comma_rooted || path_field_before(text, index) || path_shape) {
+            return true;
+        }
+    }
+
+    let url_ranges = web_url_ranges(text);
+    let mut url_index = 0;
+    for (index, character) in text.char_indices() {
+        while url_ranges
+            .get(url_index)
+            .is_some_and(|(_, end)| *end <= index)
+        {
+            url_index += 1;
+        }
+        if url_ranges
+            .get(url_index)
+            .is_some_and(|(start, end)| *start <= index && index < *end)
+        {
+            continue;
+        }
+        if character != '/' {
+            continue;
+        }
+        if !is_boundary(index) {
             continue;
         }
         return true;
@@ -512,14 +645,28 @@ mod tests {
         let f = Fixture::new();
         for text in [
             "capture_path=/opt/client/private",
+            "note,/opt/client/private",
             "capture `/opt/client/private`",
             "capture </opt/client/private>",
+            "capture_path=C:\\Users\\alice\\private",
+            "note,C:\\Users\\alice\\private",
+            r"capture_path=\Users\alice\private",
+            r"note,\Users\alice\private",
+            r"note,\Users",
+            r"note,\secret.txt",
+            r"note,\alpha",
+            r#"{"capture_path":"\Users"}"#,
+            "capture_path=\\\\server\\share\\private",
+            "référence C:\\Users\\alice\\private",
         ] {
             text_profile(&f, text);
             let before = std::fs::read(f.host.home.join("customization.json")).unwrap();
             private_write(&f.dir.join("existing.json"), b"preserve existing export");
             for path in ["new.json", "existing.json"] {
-                assert!(execute(&f.host, ProfileCommand::Export { path: path.into() }).is_err());
+                assert!(
+                    execute(&f.host, ProfileCommand::Export { path: path.into() }).is_err(),
+                    "expected path rejection for {text:?}"
+                );
             }
             assert!(!f.dir.join("new.json").exists());
             assert_eq!(
@@ -565,6 +712,88 @@ mod tests {
                 .unwrap()
                 .contains("HTTPS://example.invalid/public/path")
         );
+
+        let query_url = "https://example.invalid/?next=/docs";
+        text_profile(&f, query_url);
+        execute(
+            &f.host,
+            ProfileCommand::Export {
+                path: "query-url.json".into(),
+            },
+        )
+        .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.dir.join("query-url.json")).unwrap()).unwrap();
+        assert_eq!(exported["panes"][0]["source"]["text"], query_url);
+
+        let relative_path = r"reports\latest\brief.txt";
+        text_profile(&f, relative_path);
+        execute(
+            &f.host,
+            ProfileCommand::Export {
+                path: "relative-windows.json".into(),
+            },
+        )
+        .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.dir.join("relative-windows.json")).unwrap())
+                .unwrap();
+        assert_eq!(exported["panes"][0]["source"]["text"], relative_path);
+
+        let tex = r"Use \alpha in math";
+        text_profile(&f, tex);
+        execute(
+            &f.host,
+            ProfileCommand::Export {
+                path: "tex-command.json".into(),
+            },
+        )
+        .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.dir.join("tex-command.json")).unwrap())
+                .unwrap();
+        assert_eq!(exported["panes"][0]["source"]["text"], tex);
+
+        let formula = r"formula=\alpha";
+        text_profile(&f, formula);
+        execute(
+            &f.host,
+            ProfileCommand::Export {
+                path: "formula.json".into(),
+            },
+        )
+        .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.dir.join("formula.json")).unwrap()).unwrap();
+        assert_eq!(exported["panes"][0]["source"]["text"], formula);
+
+        let repeated_tex = r"(\a)".repeat(4096);
+        text_profile(&f, &repeated_tex);
+        execute(
+            &f.host,
+            ProfileCommand::Export {
+                path: "repeated-tex.json".into(),
+            },
+        )
+        .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.dir.join("repeated-tex.json")).unwrap())
+                .unwrap();
+        assert_eq!(exported["panes"][0]["source"]["text"], repeated_tex);
+
+        let repeated_quoted_tex = r#"\a""#.repeat(4096);
+        text_profile(&f, &repeated_quoted_tex);
+        execute(
+            &f.host,
+            ProfileCommand::Export {
+                path: "repeated-quoted-tex.json".into(),
+            },
+        )
+        .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.dir.join("repeated-quoted-tex.json")).unwrap())
+                .unwrap();
+        assert_eq!(exported["panes"][0]["source"]["text"], repeated_quoted_tex);
     }
     #[test]
     fn checked_profile_command_rejects_stale_browser_revision_before_publication() {
@@ -763,6 +992,43 @@ mod tests {
                 .profile;
             profile.validate().unwrap();
             assert_eq!(profile.layout.preset, preset);
+        }
+    }
+
+    #[test]
+    fn profile_preset_aliases_reopen_exact_portable_trees_through_the_checked_host() {
+        use orbit_frontend_protocol::customization::{
+            PortableLayoutPreset, portable_layout_preset,
+        };
+        let f = Fixture::new();
+        set(&f.host, "theme", "paper").unwrap();
+        for (name, preset) in [
+            ("default", PortableLayoutPreset::Columns),
+            ("columns", PortableLayoutPreset::Columns),
+            ("build", PortableLayoutPreset::Build),
+            ("agents", PortableLayoutPreset::Agents),
+            ("review", PortableLayoutPreset::Review),
+        ] {
+            let before = f.host.load().unwrap();
+            execute_checked(
+                &f.host,
+                ProfileCommand::Set {
+                    key: "layout.preset".into(),
+                    value: name.into(),
+                },
+                &before.revision,
+            )
+            .unwrap();
+            let fresh = LocalProfileHost {
+                home: f.host.home.clone(),
+                workspace: f.host.workspace.clone(),
+                scope: f.host.scope.clone(),
+            };
+            let reopened = fresh.load().unwrap();
+            reopened.profile.validate().unwrap();
+            assert_eq!(reopened.profile.layout.preset, name);
+            assert_eq!(reopened.profile.layout.tree, portable_layout_preset(preset));
+            assert_eq!(reopened.profile.theme, "paper");
         }
     }
 }

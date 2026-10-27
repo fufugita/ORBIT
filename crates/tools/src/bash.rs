@@ -1300,7 +1300,7 @@ mod cancel_tests {
             std::thread::sleep(Duration::from_millis(300));
             f.store(true, Ordering::SeqCst);
         });
-        let baseline: Vec<String> = pids_of("sleep");
+        let baseline: Vec<String> = own_group_sleeps();
         let t0 = std::time::Instant::now();
         // A grandchild that would outlive its parent shell.
         let r = run_command("sleep 31 & sleep 32 && echo done", 60, &cx);
@@ -1312,7 +1312,7 @@ mod cancel_tests {
         assert!(r.payload.contains("cancelled"), "{}", r.payload);
         let mut leaked = Vec::new();
         for _ in 0..30 {
-            leaked = pids_of("sleep")
+            leaked = own_group_sleeps()
                 .into_iter()
                 .filter(|p| !baseline.contains(p))
                 .collect();
@@ -1325,6 +1325,7 @@ mod cancel_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[allow(dead_code)]
     fn pids_of(name: &str) -> Vec<String> {
         let o = std::process::Command::new("pgrep")
             .arg("-x")
@@ -1334,6 +1335,29 @@ mod cancel_tests {
         String::from_utf8_lossy(&o.stdout)
             .split_whitespace()
             .map(String::from)
+            .collect()
+    }
+
+    /// The commands this module spawns run in their own process group, so
+    /// every process of the tree is that group's leader (pid == pgid).
+    /// Unrelated `sleep` processes on a busy machine (crons, editors,
+    /// agents) churn constantly and share long-lived groups — restricting
+    /// the orphan check to group leaders keeps the property under test
+    /// ("our tree is dead") without counting theirs.
+    fn own_group_sleeps() -> Vec<String> {
+        let o = std::process::Command::new("ps")
+            .args(["-o", "pid=,pgid=,comm="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let pid = parts.next()?;
+                let pgid = parts.next()?;
+                let comm = parts.next()?;
+                (comm == "sleep" && pid == pgid).then(|| pid.to_string())
+            })
             .collect()
     }
 }

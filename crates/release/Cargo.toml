@@ -1,5 +1,5 @@
 # ORBIT orbit-release — Phase G implementation
-# PURPOSE: `orbit version --evidence`, SBOM/provenance/reproducibility, evidence bundle
+# PURPOSE: Serialize caller-supplied release metadata and check evidence-layout paths
 # Contract: DR-13 §9-§11, DR-03 §11. G.
 
 [package]
@@ -8,7 +8,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "orbit version --evidence, SBOM/provenance/reproducibility, evidence bundle"
+description = "Caller-supplied release metadata and evidence-layout helpers; not a verified release bundle"
 
 [dependencies]
 serde.workspace = true

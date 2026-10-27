@@ -6,36 +6,40 @@ HTTP fixture. This script never builds or invokes an installed orbit binary.
 """
 import argparse
 import errno
+import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shlex
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import termios
 import threading
 import time
 import tomllib
+import unicodedata
 from urllib.parse import parse_qs, urlsplit
 
 
 # Longer than the terminal reader's former 256-byte allocation: both success
 # and cancellation exercise the full-bound hidden buffer, without echo.
-SECRET = "synthetic-private-onboarding-" + "k" * 1024 + "-736490152"
-OVERRIDE = "synthetic-explicit-env-override-825194"
-OLD_ENV = "synthetic-old-reference-must-not-serve-972846"
+SECRET = "skP7319Q-synthetic-private-onboarding-" + "k" * 1024 + "-736490152"
+OVERRIDE = "ovR6258Z-synthetic-explicit-env-override-825194"
+OLD_ENV = "oldN481K-synthetic-old-reference-must-not-serve-972846"
 MODEL = "family/vendor/raw-model"
 PROMPTS = {
     "provider": b"Provider (name or number): ",
     "name": b"Provider name", "replace": b"Replace this existing provider?",
     "kind": b"Adapter kind (openai-compatible/anthropic/ollama)",
-    "url": b"Base URL", "auth": b"Authentication (env/key/key-env/none): ",
+    "url": b"Base URL", "auth": b"Authentication method: ",
     "env": b"Credential ENV name", "key": b"API key (hidden): ",
     "source": b"Model source (manual/discover)", "models": b"Raw model IDs (comma-separated): ",
     "schema": b"Discovery schema (generic/openrouter)",
@@ -223,10 +227,11 @@ def private_write(path, text):
 
 
 class Terminal:
-    def __init__(self, fixture, home, args=("setup",), extra_env=None):
+    def __init__(self, fixture, home, args=("setup",), extra_env=None, size=(100, 32)):
         self.fixture = fixture
         self.master, self.slave = pty.openpty()
         self.initial = termios.tcgetattr(self.slave)
+        self.resize(*size)
         self.output = bytearray()
         self.cursor = 0
         self.process = subprocess.Popen(
@@ -235,6 +240,13 @@ class Terminal:
             stdin=self.slave, stdout=self.slave, stderr=self.slave,
             start_new_session=True, close_fds=True,
         )
+
+    def resize(self, columns, rows):
+        assert 0 <= columns <= 300 and 0 <= rows <= 120
+        fcntl.ioctl(self.slave, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, columns, 0, 0))
+        if hasattr(self, "process") and self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGWINCH)
 
     def __enter__(self):
         return self
@@ -260,6 +272,8 @@ class Terminal:
 
     def expect(self, prompt, timeout=12):
         wanted = PROMPTS.get(prompt, prompt)
+        if isinstance(wanted, str):
+            wanted = wanted.encode()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             found = self.output.find(wanted, self.cursor)
@@ -318,13 +332,18 @@ class Fixture:
                   "XDG_CONFIG_HOME": str(self.root / "xdg"), "LANG": "C.UTF-8",
                   "TERM": "xterm-256color", "NO_COLOR": "1", "RUST_BACKTRACE": "0"}
         if extra:
-            result.update(extra)
+            for name, value in extra.items():
+                if value is None:
+                    result.pop(name, None)
+                else:
+                    result[name] = value
         return result
 
     @staticmethod
     def assert_no_secrets(value):
         data = value.encode() if isinstance(value, str) else bytes(value)
-        assert all(secret.encode() not in data for secret in (SECRET, OVERRIDE, OLD_ENV)), "synthetic credential leaked"
+        for secret in (SECRET, OVERRIDE, OLD_ENV):
+            assert secret.encode() not in data and secret[:8].encode() not in data, "synthetic credential or identifying prefix leaked"
 
     def run(self, home, *args, success=True, extra_env=None, input_text=""):
         result = subprocess.run([str(self.binary), "--home", str(home), *args],
@@ -652,6 +671,7 @@ def preservation_cases(f, passed):
             session.answer("name", "fixture")
             session.answer("kind", "openai-compatible")
             session.answer("url", endpoint)
+            session.answer(b"Correct this field: ", "cancel")
             output = session.finish(False)
         assert not invalid.exists() and PROMPTS["key"] not in output
     passed("invalid_endpoint_refuses_before_hidden_input_and_home_creation")
@@ -659,6 +679,7 @@ def preservation_cases(f, passed):
     invalid_model = f.home()
     with Terminal(f, invalid_model) as session:
         f.through_models(session, model="duplicate,duplicate")
+        session.answer(b"Correct this field: ", "cancel")
         session.finish(False)
     assert not invalid_model.exists()
     passed("invalid_model_after_hidden_key_refuses_before_publication")
@@ -667,6 +688,7 @@ def preservation_cases(f, passed):
     with Terminal(f, oversize) as session:
         at_hidden(session)
         session.send(b"x" * (16 * 1024 + 1) + b"\n")
+        session.answer(b"Correct this field: ", "cancel")
         session.finish(False)
     assert not oversize.exists()
     passed("oversized_hidden_input_is_bounded_and_restores_terminal")
@@ -1112,10 +1134,333 @@ def login_boundary_cases(f, passed):
     passed("strict_login_logout_flags_and_redirected_input_refuse_before_home_creation_or_provider_io")
 
 
+
+def interactive_cases(f, passed):
+    home = f.home()
+    output = f.wizard(home, args=("init",))
+    assert f.config(home)["roles"]["main"] == "fixture/" + MODEL
+    assert b'"schema":"orbit.cli/v1"' not in output, "terminal init dumped a JSON receipt"
+    assert f.request(home)["auth"] == "Bearer " + SECRET
+    passed("bare_terminal_init_saves_private_provider_and_fresh_default_dispatch_uses_it")
+
+    request_count = len(f.calls)
+    offline = f.home()
+    with Terminal(f, offline, ("init", "--no-provider")) as session:
+        output = session.finish()
+    assert b"Provider (name or number)" not in output and (offline / "pib.json").exists()
+    for args in [("init",), ("init", "--json")]:
+        redirected = f.home()
+        result = f.run(redirected, *args)
+        assert json.loads(result.stdout)["command"] == "init"
+        assert "Authentication (" not in result.stdout and (redirected / "pib.json").exists()
+    assert len(f.calls) == request_count
+    passed("explicit_offline_terminal_and_redirected_init_preserve_prompt_free_identity_setup")
+
+    untouched = f.home()
+    request_count = len(f.calls)
+    for args in [("config",), ("config", "show"), ("config", "--json"),
+                 ("config", "show", "--json")]:
+        result = f.run(untouched, *args)
+        if "--json" in args:
+            assert isinstance(json.loads(result.stdout), dict)
+        assert not untouched.exists(), "read-only configuration created storage"
+    for args in [("config", "show", "--json", "--json"), ("config", "--json", "show"),
+                 ("config", "set"), ("config", "show", "extra")]:
+        f.run(untouched, *args, success=False)
+        assert not untouched.exists()
+    assert len(f.calls) == request_count
+    passed("configuration_show_and_strict_grammar_are_read_only_without_provider_effects")
+
+    absent = f.home()
+    with Terminal(f, absent, ("init",)) as session:
+        session.expect("provider")
+        session.send(b"\x03")
+        session.finish(False)
+    assert not absent.exists()
+    existing = f.home()
+    f.wizard(existing, auth="none")
+    before = snapshot(existing)
+    with Terminal(f, existing, ("init",)) as session:
+        session.expect("provider")
+        session.send(b"\x04")
+        session.finish(False)
+    assert snapshot(existing) == before
+    passed("terminal_init_cancel_and_eof_preserve_absence_and_existing_identity")
+
+    rich = f.home()
+    with Terminal(f, rich, ("init",), {"NO_COLOR": None}, size=(100, 32)) as session:
+        session.expect("provider")
+        session.resize(40, 10)
+        session.read(0.2)
+        session.resize(160, 32)
+        session.read(0.2)
+        session.send(b"\x1b[F\r")
+        session.answer("name", "fixture")
+        session.answer("kind", "openai-compatible")
+        session.answer("url", f.endpoint)
+        session.answer("auth", "key")
+        session.answer("key", SECRET)
+        session.expect("source")
+        session.send(b"\r")
+        session.answer("models", MODEL)
+        session.answer("default", "yes")
+        session.answer("main", MODEL)
+        session.answer("confirm", "yes")
+        output = session.finish()
+    assert b"\x1b[" in output and b"ORBIT" in output, "rich selector was not exercised"
+    assert f.config(rich)["roles"]["main"] == "fixture/" + MODEL
+    assert f.request(rich)["auth"] == "Bearer " + SECRET
+    passed("rich_selector_end_key_and_wide_narrow_resize_keep_exact_provider_and_private_key")
+
+    f.server.reset()
+    catalog_home = f.home()
+    second_model = "family/second/raw"
+    f.server.route("/v1/models", {"data": [advertised(MODEL), advertised(second_model)]})
+    before = len(f.calls)
+    with Terminal(f, catalog_home, ("init",), {"NO_COLOR": None}, size=(100, 32)) as session:
+        f.discovery_start(session, auth="none")
+        session.expect("Discovered models")
+        session.send("1")
+        session.expect("1 selected; Enter toggles")
+        session.send(b"\x1b[B\r")
+        session.expect("2 selected; Enter toggles")
+        session.send(b"\x1b[F\r")
+        session.answer("default", "yes")
+        session.answer("main", MODEL)
+        session.answer("confirm", "yes")
+        output = session.finish()
+    f.server.wait_idle()
+    calls = f.calls[before:]
+    only_get(calls)
+    models = f.config(catalog_home)["provider"][0]["models"]
+    assert [model["id"] for model in models] == [MODEL, second_model]
+    assert f.config(catalog_home)["roles"]["main"] == "fixture/" + MODEL
+    assert b"[x]" in output and b"Select model numbers" not in output
+    passed("rich_catalog_multi_select_toggles_models_and_preserves_exact_ids")
+
+    paged_home = f.home()
+    paged_models = [MODEL] + [f"family/extra/model-{index:02}" for index in range(1, 22)]
+    f.server.route("/v1/models", {"data": [advertised(model) for model in paged_models]})
+    with Terminal(f, paged_home, ("init",), {"NO_COLOR": None}, size=(100, 32)) as session:
+        f.discovery_start(session, auth="none")
+        session.expect("Discovered models")
+        session.send(b"\x1b[B" * 21 + b"\r")
+        session.expect("page 2/2")
+        session.send(b"\x1b[B\r")
+        session.expect("1 selected")
+        session.send(b"\x1b[B\x1b[B\r")
+        session.expect("page 1/2")
+        session.send(b"\r")
+        session.expect("2 selected")
+        session.send(b"\x1b[B" * 20 + b"\r")
+        session.expect("Filter models (blank shows all)")
+        session.send("family/extra/model-21")
+        session.expect("2 selected")
+        session.send(b"\x1b[F\r")
+        session.answer("default", "yes")
+        session.answer("main", MODEL)
+        session.answer("confirm", "yes")
+        session.finish()
+    models = f.config(paged_home)["provider"][0]["models"]
+    assert {model["id"] for model in models} == {MODEL, paged_models[-1]}
+    assert f.config(paged_home)["roles"]["main"] == "fixture/" + MODEL
+    passed("rich_catalog_paging_and_filter_keep_prior_selection_and_raw_ids")
+
+    for size in [(1, 1), (0, 0)]:
+        tiny = f.home()
+        request_count = len(f.calls)
+        with Terminal(f, tiny, ("init",), {"NO_COLOR": None}) as session:
+            session.expect(b"\x1b[?1049h")
+            session.expect("provider")
+            session.cursor = len(session.output)
+            session.resize(*size)
+            session.expect(b"\x1b[?1049l")
+            # The fresh plain prompt follows installation of its input guards.
+            session.expect("provider")
+            session.resize(80, 24)
+            session.send(b"\x03")
+            session.finish(False)
+        assert not tiny.exists() and len(f.calls) == request_count
+    passed("rich_zero_and_tiny_resize_cancel_restores_terminal_without_publication")
+
+
+    # These are actual CLI terminal journeys, followed by separate fresh consumers.
+    def edit(session, category, key, value):
+        session.answer(b"Configuration: ", category)
+        prompt = {"defaults": b"Models and roles: ", "routing": b"Phase routing: ",
+                  "appearance": b"Appearance and layout: "}[category]
+        session.answer(prompt, key)
+        session.answer(b"Choose appearance: " if category == "appearance" else b"Choose a model: ", value)
+        session.answer(b"Save this change? Type yes to confirm: ", "yes")
+
+    configured = f.home()
+    f.wizard(configured, model=MODEL + ",second/raw")
+    old_identity = immutable_identity(configured)
+    before = len(f.calls)
+    with Terminal(f, configured, ("config",)) as session:
+        edit(session, "defaults", "main", "fixture/second/raw")
+        edit(session, "defaults", "compaction", "fixture/" + MODEL)
+        session.answer(b"Configuration: ", "done")
+        session.finish()
+    assert len(f.calls) == before and immutable_identity(configured) == old_identity
+    assert f.config(configured)["roles"]["compaction"] == "fixture/" + MODEL
+    assert f.request(configured, model="second/raw")["auth"] == "Bearer " + SECRET
+    view = json.loads(f.run(configured, "config", "show", "--json").stdout)
+    assert view["roles"]["main"] == "fixture/second/raw"
+    assert view["roles"]["compaction"] == "fixture/" + MODEL
+    passed("terminal_configuration_saves_roles_and_fresh_unpinned_default_dispatch_uses_them")
+
+    routed = f.home()
+    f.wizard(routed, auth="none", model=MODEL + ",easy/raw,hard/raw,override/raw")
+    path = routed / "providers.toml"
+    private_write(path, path.read_bytes() + b"\n[routing.keywords]\nclear=true\neasy=['light']\nhard=['deep']\n[routing.phases.coding]\nhard='fixture/override/raw'\n[retained]\nvalue='preserve-me'\n")
+    before = len(f.calls)
+    with Terminal(f, routed, ("config",)) as session:
+        edit(session, "routing", "easy", "fixture/easy/raw")
+        edit(session, "routing", "hard", "fixture/hard/raw")
+        session.answer(b"Configuration: ", "done")
+        session.finish()
+    cfg = f.config(routed)
+    assert cfg["routing"]["phases"]["coding"]["hard"] == "fixture/override/raw"
+    assert cfg["retained"]["value"] == "preserve-me"
+    for text, model in [("light", "fixture/easy/raw"), ("deep", "fixture/hard/raw")]:
+        preview = json.loads(f.run(routed, "route", "test", text, "--json").stdout)
+        assert preview["model"] == model
+    pinned = json.loads(f.run(routed, "route", "test", "deep", "--model", "fixture/" + MODEL, "--json").stdout)
+    assert pinned["model"] == "fixture/" + MODEL
+    assert len(f.calls) == before, "configuration and preview contacted a provider"
+    passed("terminal_configuration_updates_both_fallbacks_preserves_phase_override_and_explicit_pin")
+
+    styled = f.home()
+    before = len(f.calls)
+    settings = [("theme", "midnight"), ("layout.preset", "columns"), ("density", "compact"),
+                ("glyphs", "ascii"), ("color_mode", "mono"), ("reduced_motion", "true")]
+    with Terminal(f, styled, ("config",)) as session:
+        for key, value in settings:
+            edit(session, "appearance", key, value)
+        session.answer(b"Configuration: ", "done")
+        session.finish()
+    fresh = json.loads(f.run(styled, "customize", "show", "--json").stdout)["profile"]["profile"]
+    assert (fresh["theme"], fresh["layout"]["preset"], fresh["density"], fresh["glyphs"],
+            fresh["color_mode"], fresh["reduced_motion"]) == ("midnight", "columns", "compact", "ascii", "mono", True)
+    assert not (styled / "providers.toml").exists() and len(f.calls) == before
+    unchanged = snapshot(styled)
+    with Terminal(f, styled, ("config",)) as session:
+        session.answer(b"Configuration: ", "appearance")
+        session.answer(b"Appearance and layout: ", "theme")
+        session.answer(b"Choose appearance: ", "paper")
+        session.answer(b"Save this change? Type yes to confirm: ", "no")
+        session.answer(b"Configuration: ", "done")
+        session.finish()
+    assert snapshot(styled) == unchanged
+    passed("terminal_appearance_edits_reopen_through_shared_profile_and_decline_preserves_exact_bytes")
+
+    stale = f.home()
+    f.wizard(stale, auth="none", model=MODEL + ",second/raw")
+    before = len(f.calls)
+    with Terminal(f, stale, ("config",)) as session:
+        session.answer(b"Configuration: ", "defaults")
+        session.answer(b"Models and roles: ", "main")
+        session.answer(b"Choose a model: ", "fixture/second/raw")
+        session.expect(b"Save this change? Type yes to confirm: ")
+        path = stale / "providers.toml"
+        private_write(path, path.read_bytes() + b"\n[concurrent]\nkeep=true\n")
+        concurrent = snapshot(stale)
+        session.send("yes")
+        session.expect(b"This edit was not retried")
+        session.answer(b"Configuration: ", "done")
+        session.finish()
+    assert snapshot(stale) == concurrent and len(f.calls) == before
+    passed("terminal_configuration_stale_confirmation_never_overwrites_or_retries")
+
+    long_home = f.home()
+    last = "vendor/模型/e\u0301-final"
+    models = ["raw/" + str(n) for n in range(32)] + [last]
+    f.wizard(long_home, auth="none", model=",".join(models))
+    before = len(f.calls)
+    with Terminal(f, long_home, ("config",), {"NO_COLOR": None}, size=(100, 32)) as session:
+        session.answer(b"Configuration: ", "defaults")
+        session.answer(b"Models and roles: ", "main")
+        session.expect(b"Choose a model: ")
+        def fresh_model_frame(checkpoint, columns, rows):
+            deadline = time.monotonic() + 5
+            marker = b"\x1b[H\x1b[2J"
+            footer = "Arrows select  Enter choose  Left/Esc back  Ctrl-C cancel"[:columns - 1]
+            newline_processing = termios.OPOST | termios.ONLCR
+            line_delimiter = "\r\r\n" if (session.initial[1] & newline_processing) == newline_processing else "\r\n"
+            while time.monotonic() < deadline:
+                fresh = bytes(session.output[checkpoint:])
+                if marker in fresh:
+                    frame = fresh.rsplit(marker, 1)[-1]
+                    if frame.endswith(b"\x1b[0m"):
+                        clean = re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", frame).decode("utf-8")
+                        lines = clean.split(line_delimiter)
+                        assert all("\r" not in line and "\n" not in line for line in lines), "choice frame contains an unexpected line delimiter"
+                        if lines[-1] == footer:
+                            assert lines[:2] == ["ORBIT  /  SETUP", "Choose a model"]
+                            assert len(lines) == rows, "long choice frame has wrong fresh viewport geometry"
+                            assert any(line.startswith("> ") and last in line for line in lines), "selected late Unicode identity was not visible"
+                            for line in lines:
+                                cells = sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in line)
+                                assert cells < columns, "choice frame exceeds terminal width"
+                            return
+                session.read(0.05)
+            raise AssertionError("no fresh complete choice frame after navigation or resize")
+        checkpoint = len(session.output)
+        session.send(b"\x1b[F")
+        fresh_model_frame(checkpoint, 100, 32)
+        for columns, rows in [(40, 10), (160, 32)]:
+            checkpoint = len(session.output)
+            session.resize(columns, rows)
+            fresh_model_frame(checkpoint, columns, rows)
+        session.send(b"\r")
+        session.answer(b"Save this change? Type yes to confirm: ", "yes")
+        session.answer(b"Configuration: ", "done")
+        session.finish()
+    assert len(f.calls) == before and f.config(long_home)["roles"]["main"] == "fixture/" + last
+    assert f.request(long_home, model=last)["auth"] is None
+    passed("rich_long_unicode_model_menu_keeps_selected_exact_identity_visible_through_resize")
+
+    added = f.home()
+    f.wizard(added)
+    before = len(f.calls)
+    old_identity = immutable_identity(added)
+    with Terminal(f, added, ("config",)) as session:
+        session.answer(b"Configuration: ", "provider")
+        f.through_models(session, name="second", auth="none")
+        session.answer("default", "no")
+        session.answer("confirm", "yes")
+        session.answer(b"Configuration: ", "done")
+        session.finish()
+    assert immutable_identity(added) == old_identity and len(f.calls) == before
+    assert [provider["name"] for provider in f.config(added)["provider"]] == ["fixture", "second"]
+    assert f.request(added)["auth"] == "Bearer " + SECRET
+    f.assert_public_private(added)
+    passed("configuration_provider_action_uses_shared_wizard_preserves_identity_and_old_private_default")
+
+    cached = f.home()
+    f.server.route("/v1/models", {"data": [advertised()]})
+    before = len(f.calls)
+    with Terminal(f, cached, ("init",)) as session:
+        f.discovery_start(session, auth="none")
+        session.answer("select", "1")
+        session.answer("default", "back")
+        session.answer(b"Model selection draft: ", "keep")
+        session.answer("default", "yes")
+        session.answer("main", MODEL)
+        session.answer("confirm", "back")
+        session.answer(b"Default model draft: ", "keep")
+        session.answer("confirm", "yes")
+        session.finish()
+    only_get(f.calls[before:])
+    assert f.config(cached)["roles"]["main"] == "fixture/" + MODEL
+    passed("terminal_back_and_keep_reuse_discovery_and_default_without_effect_replay")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/orbit"))
-    parser.add_argument("--group", choices=("manual", "private-key", "preservation", "discovery-tracer", "discovery-boundaries", "login-boundaries", "all"), default="all")
+    parser.add_argument("--group", choices=("manual", "private-key", "preservation", "discovery-tracer", "discovery-boundaries", "login-boundaries", "interactive", "all"), default="all")
     options = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     binary = options.binary.resolve(strict=True)
@@ -1149,7 +1494,8 @@ def main():
 
             groups = (("manual", manual_cases), ("private-key", private_cases),
                       ("preservation", preservation_cases), ("discovery-tracer", discovery_tracer_cases),
-                      ("discovery-boundaries", discovery_boundary_cases), ("login-boundaries", login_boundary_cases))
+                      ("discovery-boundaries", discovery_boundary_cases), ("login-boundaries", login_boundary_cases),
+                      ("interactive", interactive_cases))
             for name, cases in groups:
                 if options.group in (name, "all"):
                     server.reset()
@@ -1159,7 +1505,8 @@ def main():
                     if name in ("manual", "preservation"):
                         assert len(calls) == request_count, "offline onboarding contacted a provider"
             required = {"manual": 5, "private-key": 8, "preservation": 12,
-                        "discovery-tracer": 7, "discovery-boundaries": 12, "login-boundaries": 7, "all": 51}[options.group]
+                        "discovery-tracer": 7, "discovery-boundaries": 12, "login-boundaries": 7,
+                        "interactive": 15, "all": 66}[options.group]
             assert len(checks) == required, "missing named onboarding workflow"
             print("ORBIT_CHECK_RECEIPT " + json.dumps({"scenarios": checks}, sort_keys=True))
     return 0

@@ -2,9 +2,135 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const FILE_RESULTS_MAX: usize = 64;
 const FILE_SCAN_MAX: usize = 4096;
+
+/// Number of user-perceived text units in a draft. The composer cursor is
+/// stored in these units rather than UTF-8 bytes or Unicode scalar values.
+pub fn grapheme_count(text: &str) -> usize {
+    UnicodeSegmentation::graphemes(text, true).count()
+}
+
+/// Clamp a composer cursor to a valid grapheme boundary in `text`.
+pub fn clamp_cursor(text: &str, cursor: usize) -> usize {
+    cursor.min(grapheme_count(text))
+}
+
+/// UTF-8 byte offset for a grapheme-boundary cursor.
+pub fn cursor_byte_index(text: &str, cursor: usize) -> usize {
+    UnicodeSegmentation::grapheme_indices(text, true)
+        .nth(clamp_cursor(text, cursor))
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+/// Grapheme-boundary cursor at or after a UTF-8 byte offset. If an inserted
+/// combining mark or joiner merged with an adjacent cluster, the caret lands
+/// after the whole resulting cluster.
+fn cursor_for_byte_offset(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    for (index, (byte, cluster)) in UnicodeSegmentation::grapheme_indices(text, true).enumerate() {
+        if offset <= byte {
+            return index;
+        }
+        if offset < byte + cluster.len() {
+            return index + 1;
+        }
+    }
+    grapheme_count(text)
+}
+
+/// Insert literal text at a grapheme boundary and leave the cursor after the
+/// complete resulting grapheme, even when Unicode joins the inserted text to
+/// a neighbor.
+pub fn insert_at_cursor(text: &mut String, cursor: &mut usize, inserted: &str) {
+    if inserted.is_empty() {
+        *cursor = clamp_cursor(text, *cursor);
+        return;
+    }
+    *cursor = clamp_cursor(text, *cursor);
+    let byte = cursor_byte_index(text, *cursor);
+    text.insert_str(byte, inserted);
+    *cursor = cursor_for_byte_offset(text, byte + inserted.len());
+}
+
+/// Remove the grapheme before the insertion point.
+pub fn delete_before_cursor(text: &mut String, cursor: &mut usize) -> bool {
+    *cursor = clamp_cursor(text, *cursor);
+    if *cursor == 0 {
+        return false;
+    }
+    let start = cursor_byte_index(text, *cursor - 1);
+    let end = cursor_byte_index(text, *cursor);
+    text.replace_range(start..end, "");
+    *cursor = cursor_for_byte_offset(text, start);
+    true
+}
+
+/// Remove the grapheme at the insertion point.
+pub fn delete_at_cursor(text: &mut String, cursor: &mut usize) -> bool {
+    *cursor = clamp_cursor(text, *cursor);
+    let start = cursor_byte_index(text, *cursor);
+    let end = cursor_byte_index(text, *cursor + 1);
+    if start == end {
+        return false;
+    }
+    text.replace_range(start..end, "");
+    *cursor = cursor_for_byte_offset(text, start);
+    true
+}
+
+/// Ctrl+W: delete the previous space-delimited word (and its separator),
+/// preserving any text after the cursor. This retains the existing shortcut's
+/// ASCII-space behavior while making edits safe at a middle-of-draft cursor.
+pub fn delete_previous_word(text: &mut String, cursor: &mut usize) -> bool {
+    *cursor = clamp_cursor(text, *cursor);
+    if *cursor == 0 {
+        return false;
+    }
+    let clusters: Vec<&str> = UnicodeSegmentation::graphemes(text.as_str(), true).collect();
+    let end = *cursor;
+    let mut word_end = end;
+    while word_end > 0 && clusters[word_end - 1] == " " {
+        word_end -= 1;
+    }
+    let mut start = word_end;
+    while start > 0 && clusters[start - 1] != " " {
+        start -= 1;
+    }
+    start = start.saturating_sub(1);
+    if start == end {
+        return false;
+    }
+    let byte_start = cursor_byte_index(text, start);
+    let byte_end = cursor_byte_index(text, end);
+    text.replace_range(byte_start..byte_end, "");
+    *cursor = cursor_for_byte_offset(text, byte_start);
+    true
+}
+
+pub fn move_left(text: &str, cursor: &mut usize) {
+    *cursor = clamp_cursor(text, *cursor).saturating_sub(1);
+}
+
+pub fn move_right(text: &str, cursor: &mut usize) {
+    *cursor = (clamp_cursor(text, *cursor) + 1).min(grapheme_count(text));
+}
+
+pub fn move_home(text: &str, cursor: &mut usize) {
+    let byte = cursor_byte_index(text, *cursor);
+    let line_start = text[..byte].rfind('\n').map_or(0, |newline| newline + 1);
+    *cursor = grapheme_count(&text[..line_start]);
+}
+
+pub fn move_end(text: &str, cursor: &mut usize) {
+    let byte = cursor_byte_index(text, *cursor);
+    let line_end = UnicodeSegmentation::grapheme_indices(&text[byte..], true)
+        .find(|(_, cluster)| cluster.contains('\n'))
+        .map_or(text.len(), |(offset, _)| byte + offset);
+    *cursor = grapheme_count(&text[..line_end]);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileCandidate {
@@ -16,31 +142,34 @@ pub struct FileCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Mention {
     start: usize,
+    end: usize,
     prefix: String,
 }
 
-fn trailing_mention(draft: &str) -> Option<Mention> {
+fn trailing_mention(draft: &str, cursor: usize) -> Option<Mention> {
+    let cursor = cursor.min(draft.len());
+    let before_cursor = &draft[..cursor];
     let mut skip_until = 0;
-    for (start, ch) in draft.char_indices() {
+    for (start, ch) in before_cursor.char_indices() {
         if start < skip_until || ch != '@' {
             continue;
         }
         let mut boundary = start;
-        while let Some((idx, prev)) = draft[..boundary].char_indices().next_back() {
+        while let Some((idx, prev)) = before_cursor[..boundary].char_indices().next_back() {
             if matches!(prev, '(' | '[' | '{' | '<' | '\'' | '"' | '`') {
                 boundary = idx;
             } else {
                 break;
             }
         }
-        if draft[..boundary]
+        if before_cursor[..boundary]
             .chars()
             .next_back()
             .is_some_and(|prev| !prev.is_whitespace())
         {
             continue;
         }
-        let tail = &draft[start + 1..];
+        let tail = &before_cursor[start + 1..];
         let prefix = if tail.starts_with(['"', '\'']) {
             let quote = tail.chars().next()?;
             let mut chars = tail[quote.len_utf8()..].char_indices().peekable();
@@ -85,7 +214,11 @@ fn trailing_mention(draft: &str) -> Option<Mention> {
         {
             continue;
         }
-        return Some(Mention { start, prefix });
+        return Some(Mention {
+            start,
+            end: cursor,
+            prefix,
+        });
     }
     None
 }
@@ -120,6 +253,7 @@ fn mention_text(path: &str, directory: bool) -> String {
 pub struct FileCompletion {
     root: PathBuf,
     last_draft: Option<String>,
+    last_cursor: Option<usize>,
     mention: Option<Mention>,
     pub candidates: Vec<FileCandidate>,
     pub selected: usize,
@@ -137,6 +271,7 @@ impl FileCompletion {
         Self {
             root,
             last_draft: None,
+            last_cursor: None,
             mention: None,
             candidates: Vec::new(),
             selected: 0,
@@ -144,13 +279,21 @@ impl FileCompletion {
         }
     }
 
-    /// Refresh only when the draft changes, never on animation frames.
+    /// Refresh only when the draft or insertion point changes, never on animation frames.
     pub fn sync(&mut self, draft: &str) {
-        if self.last_draft.as_deref() == Some(draft) {
+        self.sync_at_cursor(draft, grapheme_count(draft));
+    }
+
+    /// Refresh suggestions for the text immediately before the insertion
+    /// point. Moving the caret away from an `@` mention closes its picker.
+    pub fn sync_at_cursor(&mut self, draft: &str, cursor: usize) {
+        let cursor = clamp_cursor(draft, cursor);
+        if self.last_draft.as_deref() == Some(draft) && self.last_cursor == Some(cursor) {
             return;
         }
         self.last_draft = Some(draft.to_string());
-        self.mention = trailing_mention(draft);
+        self.last_cursor = Some(cursor);
+        self.mention = trailing_mention(draft, cursor_byte_index(draft, cursor));
         self.candidates.clear();
         self.selected = 0;
         self.truncated = false;
@@ -252,15 +395,25 @@ impl FileCompletion {
     }
 
     pub fn accept(&mut self, draft: &mut String) {
+        let mut cursor = grapheme_count(draft);
+        self.accept_at_cursor(draft, &mut cursor);
+    }
+
+    /// Replace the active mention at the insertion point, preserving any
+    /// suffix after the caret and returning the caret after the inserted path.
+    pub fn accept_at_cursor(&mut self, draft: &mut String, cursor: &mut usize) {
         let Some(candidate) = self.candidates.get(self.selected).cloned() else {
             return;
         };
         let Some(mention) = &self.mention else {
             return;
         };
-        draft.truncate(mention.start);
-        draft.push_str(&mention_text(&candidate.path, candidate.directory));
-        self.sync(draft);
+        let start = mention.start;
+        let end = mention.end;
+        let replacement = mention_text(&candidate.path, candidate.directory);
+        draft.replace_range(start..end, &replacement);
+        *cursor = cursor_for_byte_offset(draft, start + replacement.len());
+        self.sync_at_cursor(draft, *cursor);
     }
 }
 
@@ -268,14 +421,20 @@ pub struct HistorySearch {
     pub query: String,
     pub matched: Option<usize>,
     original: String,
+    original_cursor: usize,
 }
 
 impl HistorySearch {
     pub fn new(draft: &str, history: &[String]) -> Self {
+        Self::new_with_cursor(draft, grapheme_count(draft), history)
+    }
+
+    pub fn new_with_cursor(draft: &str, cursor: usize, history: &[String]) -> Self {
         let mut search = Self {
             query: String::new(),
             matched: None,
             original: draft.to_string(),
+            original_cursor: clamp_cursor(draft, cursor),
         };
         search.find(history, 0);
         search
@@ -295,16 +454,19 @@ impl HistorySearch {
         self.find(history, 0);
     }
 
-    pub fn preview(&self, history: &[String], draft: &mut String) {
+    pub fn preview(&self, history: &[String], draft: &mut String) -> usize {
         draft.clone_from(
             self.matched
                 .and_then(|i| history.get(i))
                 .unwrap_or(&self.original),
         );
+        self.matched
+            .map_or(self.original_cursor, |_| grapheme_count(draft))
     }
 
-    pub fn restore(self, draft: &mut String) {
+    pub fn restore(self, draft: &mut String) -> usize {
         *draft = self.original;
+        self.original_cursor
     }
 }
 
@@ -350,25 +512,39 @@ mod tests {
             "@file then text",
             "@\"closed\"",
         ] {
-            assert!(trailing_mention(draft).is_none(), "{draft}");
+            assert!(trailing_mention(draft, draft.len()).is_none(), "{draft}");
         }
-        assert_eq!(trailing_mention("<@file").unwrap().prefix, "file");
+        assert_eq!(trailing_mention("<@file", 6).unwrap().prefix, "file");
+        let quoted_path = "日本語 (@\"docs/a b";
         assert_eq!(
-            trailing_mention("日本語 (@\"docs/a b").unwrap(),
+            trailing_mention(quoted_path, quoted_path.len()).unwrap(),
             Mention {
                 start: 11,
+                end: quoted_path.len(),
                 prefix: "docs/a b".into()
             }
         );
+        let escaped_path = "@\"a\\\"b\\\\c";
         assert_eq!(
-            trailing_mention("@\"a\\\"b\\\\c").unwrap().prefix,
+            trailing_mention(escaped_path, escaped_path.len())
+                .unwrap()
+                .prefix,
             "a\"b\\c"
         );
+        let nested_mention = "@\"old @file\" @next";
         assert_eq!(
-            trailing_mention("@\"old @file\" @next").unwrap().prefix,
+            trailing_mention(nested_mention, nested_mention.len())
+                .unwrap()
+                .prefix,
             "next"
         );
-        assert_eq!(trailing_mention("@\"a @b").unwrap().prefix, "a @b");
+        let open_quoted_path = "@\"a @b";
+        assert_eq!(
+            trailing_mention(open_quoted_path, open_quoted_path.len())
+                .unwrap()
+                .prefix,
+            "a @b"
+        );
     }
 
     #[test]
@@ -420,6 +596,25 @@ mod tests {
     }
 
     #[test]
+    fn completion_tracks_the_caret_and_preserves_text_after_it() {
+        let f = Fixture::new();
+        f.file("日本語.txt");
+        let mut picker = FileCompletion::new(f.0.clone());
+        let mut draft = "@日suffix".to_string();
+        let mut cursor = 2;
+        picker.sync_at_cursor(&draft, cursor);
+        assert_eq!(picker.candidates.len(), 1);
+        picker.accept_at_cursor(&mut draft, &mut cursor);
+        assert_eq!(draft, "@\"日本語.txt\" suffix");
+        assert_eq!(cursor, grapheme_count("@\"日本語.txt\" "));
+        assert!(!picker.is_open());
+
+        let draft = "@日".to_string();
+        picker.sync_at_cursor(&draft, 0);
+        assert!(!picker.is_open());
+    }
+
+    #[test]
     fn results_are_bounded_and_escape_only_dismisses_the_current_draft() {
         let f = Fixture::new();
         for n in 0..FILE_RESULTS_MAX + 5 {
@@ -455,5 +650,99 @@ mod tests {
         assert_eq!(search.matched, None);
         search.restore(&mut draft);
         assert_eq!(draft, "unfinished\n日本語");
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_edits_complete_graphemes_without_touching_suffixes() {
+        let mut text = "a🇧🇷b".to_string();
+        let mut cursor = 1;
+        insert_at_cursor(&mut text, &mut cursor, "猫");
+        assert_eq!(text, "a猫🇧🇷b");
+        assert_eq!(cursor, 2);
+        assert!(delete_at_cursor(&mut text, &mut cursor));
+        assert_eq!(text, "a猫b");
+        assert_eq!(cursor, 2);
+        assert!(delete_before_cursor(&mut text, &mut cursor));
+        assert_eq!(text, "ab");
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn inserting_combining_marks_and_joined_emoji_keeps_valid_boundaries() {
+        let mut text = "eX".to_string();
+        let mut cursor = 1;
+        insert_at_cursor(&mut text, &mut cursor, "\u{301}");
+        assert_eq!(text, "e\u{301}X");
+        assert_eq!(cursor, 1);
+
+        insert_at_cursor(&mut text, &mut cursor, "👩🏽‍💻");
+        assert_eq!(text, "e\u{301}👩🏽‍💻X");
+        assert_eq!(cursor, 2);
+        assert!(delete_before_cursor(&mut text, &mut cursor));
+        assert_eq!(text, "e\u{301}X");
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn word_delete_preserves_suffix_and_history_search_restores_cursor() {
+        let mut text = "one two three".to_string();
+        let mut cursor = 7;
+        assert!(delete_previous_word(&mut text, &mut cursor));
+        assert_eq!(text, "one three");
+        assert_eq!(cursor, 3);
+
+        let history = vec!["older prompt".to_string()];
+        let mut search = HistorySearch::new_with_cursor(&text, 2, &history);
+        let mut draft = text.clone();
+        search.query = "missing".into();
+        search.update(&history);
+        assert_eq!(search.preview(&history, &mut draft), 2);
+        assert_eq!(draft, text);
+        search.query = "older".into();
+        search.update(&history);
+        assert_eq!(
+            search.preview(&history, &mut draft),
+            grapheme_count("older prompt")
+        );
+        assert_eq!(draft, "older prompt");
+        assert_eq!(search.restore(&mut draft), 2);
+        assert_eq!(draft, text);
+    }
+
+    #[test]
+    fn home_and_end_stop_at_multiline_grapheme_boundaries() {
+        let text = "first\n🇧🇷second\nlast";
+        let mut cursor = grapheme_count("first\n🇧🇷sec");
+        move_home(text, &mut cursor);
+        assert_eq!(cursor, grapheme_count("first\n"));
+        move_end(text, &mut cursor);
+        assert_eq!(cursor, grapheme_count("first\n🇧🇷second"));
+    }
+
+    #[test]
+    fn home_and_end_keep_crlf_as_one_grapheme() {
+        let text = "first\r\nsecond";
+        let mut cursor = 0;
+
+        move_end(text, &mut cursor);
+        assert_eq!(cursor, grapheme_count("first"));
+        assert_eq!(cursor_byte_index(text, cursor), text.find('\r').unwrap());
+
+        move_home(text, &mut cursor);
+        assert_eq!(cursor, 0);
+        move_end(text, &mut cursor);
+        assert_eq!(cursor, grapheme_count("first"));
+
+        move_right(text, &mut cursor);
+        assert_eq!(cursor, grapheme_count("first\r\n"));
+        move_end(text, &mut cursor);
+        assert_eq!(cursor, grapheme_count(text));
+        move_home(text, &mut cursor);
+        assert_eq!(cursor, grapheme_count("first\r\n"));
     }
 }

@@ -188,14 +188,13 @@ pub fn preset_model_entry(preset: &ProviderPreset, model_id: &str) -> ModelEntry
         id: model_id.to_string(),
         label: fact.map(|f| f.label.to_string()),
         sampling: None,
-        pricing: fact
-            .map(|f| Pricing {
-                input_per_million_microdollars: f.pricing.0,
-                output_per_million_microdollars: f.pricing.1,
-                cache_read_per_million_microdollars: f.pricing.2,
-                ..Default::default()
-            })
-            .unwrap_or_default(),
+        pricing: fact.map(|f| Pricing {
+            input_per_million_microdollars: Some(f.pricing.0),
+            output_per_million_microdollars: Some(f.pricing.1),
+            cache_read_per_million_microdollars: f.pricing.2,
+            ..Default::default()
+        }),
+        billing: None,
         max_output_tokens: fact.and_then(|f| f.max_output_tokens),
         context_window: fact.and_then(|f| f.context_window),
     }
@@ -240,7 +239,8 @@ mod tests {
         let entry = preset_model_entry(&p, "claude-haiku-4-5");
         assert_eq!(entry.max_output_tokens, Some(64_000));
         assert_eq!(
-            entry.pricing.input_per_million_microdollars, 1_000_000,
+            entry.pricing.unwrap().input_per_million_microdollars,
+            Some(1_000_000),
             "microdollars: $1/M input"
         );
     }

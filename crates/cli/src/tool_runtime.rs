@@ -3751,6 +3751,7 @@ pub fn subagent_turn_config(_home: &Path) -> orbit_engine::TurnConfig {
         credential_env: std::env::var("ORBIT_CREDENTIAL_ENV")
             .ok()
             .or_else(crate::legacy_gate_credential_env),
+        billing: None,
         pricing: None,
         max_output_tokens: 0,
     }
@@ -3878,6 +3879,7 @@ mod tests {
             model: model.into(),
             kind: orbit_engine::ProviderKind::Anthropic,
             credential_env: Some("MY_KEY".into()),
+            billing: None,
             pricing: None,
             max_output_tokens: 4096,
             sampling: Some((Some(0.2), None)),
@@ -5429,6 +5431,7 @@ mod agent_lifecycle_tests {
                 model: model.into(),
                 kind: orbit_engine::ProviderKind::OpenAiCompatible,
                 credential_env: None,
+                billing: None,
                 pricing: None,
                 first_byte_timeout_ms: None,
                 idle_timeout_ms: None,

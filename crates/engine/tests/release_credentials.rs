@@ -289,6 +289,7 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
 
 fn config(provider: &Provider, credential_env: Option<&str>) -> TurnConfig {
     TurnConfig {
+        billing: None,
         provider_id: "credential-fixture".into(),
         gate: provider.url.clone(),
         model: "fixture-model".into(),

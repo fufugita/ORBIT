@@ -20,7 +20,8 @@ use orbit_adapter::credential::SecretBytes;
 use orbit_adapter::error::AdapterError;
 use orbit_adapter::types::{
     AdapterIdentity, AdapterKind, ProviderCapabilities, ProviderEventKind, ProviderRequest,
-    ProviderRouteBinding, ProviderStreamEvent, ProviderUsage, Sha256Digest,
+    ProviderRouteBinding, ProviderStreamEvent, ProviderUsage, Sha256Digest, UsageObservationMetaV1,
+    UsageReasoningReportingV1, UsageSnapshotOriginV1,
 };
 
 /// The OpenAI-compatible HTTP adapter.
@@ -117,9 +118,9 @@ impl OpenAiCompatibleHttpV1 {
             return Ok(crate::cancel::cancelled_stream());
         }
         let mut resp = response
-            .map_err(|_| AdapterError::ProviderTimeout("response headers timed out (E0409)".into()))
+            .map_err(|_| crate::dispatch_deadline_error("response headers"))
             .map_err(DetailedInvokeFailure::unknown)?
-            .map_err(|error| crate::reqwest_error(error, "response headers"))
+            .map_err(|error| crate::reqwest_dispatch_error(error, "response headers"))
             .map_err(DetailedInvokeFailure::unknown)?;
 
         let status = resp.status();
@@ -331,7 +332,9 @@ pub(crate) fn supported_image(media_type: &str) -> bool {
     )
 }
 
-fn openai_usage(value: &serde_json::Value) -> Result<ProviderUsage, AdapterError> {
+fn openai_usage(
+    value: &serde_json::Value,
+) -> Result<(ProviderUsage, UsageObservationMetaV1), AdapterError> {
     use crate::stream::{optional_counter, protocol, required_counter};
     if !value.is_object() {
         return Err(protocol("invalid OpenAI usage object"));
@@ -353,8 +356,7 @@ fn openai_usage(value: &serde_json::Value) -> Result<ProviderUsage, AdapterError
     let reasoning = details("completion_tokens_details")?
         .map(|value| optional_counter(value, "reasoning_tokens"))
         .transpose()?
-        .flatten()
-        .unwrap_or(0);
+        .flatten();
     // Cache reads are part of prompt_tokens. Compatible APIs may report
     // reasoning separately from completion_tokens; preserve both counters.
     if cached > prompt {
@@ -365,13 +367,24 @@ fn openai_usage(value: &serde_json::Value) -> Result<ProviderUsage, AdapterError
     {
         return Err(protocol("inconsistent OpenAI total usage"));
     }
-    Ok(ProviderUsage {
-        input_tokens: prompt - cached,
-        output_tokens: output,
-        cache_read_tokens: cached,
-        cache_write_tokens: 0,
-        reasoning_tokens: reasoning,
-    })
+    Ok((
+        ProviderUsage {
+            input_tokens: prompt - cached,
+            output_tokens: output,
+            cache_read_tokens: cached,
+            cache_write_tokens: 0,
+            reasoning_tokens: reasoning.unwrap_or(0),
+        },
+        UsageObservationMetaV1 {
+            version: 1,
+            reasoning_reporting: if reasoning.is_some() {
+                UsageReasoningReportingV1::Reported
+            } else {
+                UsageReasoningReportingV1::NotReported
+            },
+            snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+        },
+    ))
 }
 
 fn openai_stream(
@@ -395,7 +408,7 @@ fn openai_stream(
         let mut finish_reason = None;
         let mut calls = std::collections::BTreeMap::<u32, WireCall>::new();
         let mut total = 0usize;
-        yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ResponseStarted { upstream_request_id: None } });
+        yield Ok(ProviderStreamEvent { usage_observation: None, sequence: seq, event: ProviderEventKind::ResponseStarted { upstream_request_id: None } });
         seq += 1;
         let mut first = true;
         // One absolute trailer window, so pings cannot keep a completed
@@ -458,7 +471,7 @@ fn openai_stream(
                         }
                         if let Some(text) = delta.get("content").filter(|v| !v.is_null()) {
                             let Some(text) = text.as_str() else { yield Err(protocol("invalid text delta")); return; };
-                            yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::TextDelta { bytes: text.as_bytes().to_vec() } }); seq += 1;
+                            yield Ok(ProviderStreamEvent { usage_observation: None, sequence: seq, event: ProviderEventKind::TextDelta { bytes: text.as_bytes().to_vec() } }); seq += 1;
                         }
                         if let Some(refusal) = delta.get("refusal").filter(|v| !v.is_null()) {
                             let Some(refusal) = refusal.as_str() else { yield Err(protocol("invalid refusal delta")); return; };
@@ -491,9 +504,9 @@ fn openai_stream(
                     }
                 }
                 if let Some(value) = value.get("usage").filter(|v| !v.is_null()) {
-                    let parsed = match openai_usage(value) { Ok(usage) => usage, Err(error) => { yield Err(error); return; } };
-                    usage = Some(parsed);
-                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::UsageUpdate(parsed) }); seq += 1;
+                    let (parsed, metadata) = match openai_usage(value) { Ok(usage) => usage, Err(error) => { yield Err(error); return; } };
+                    usage = Some((parsed, metadata));
+                    yield Ok(ProviderStreamEvent { usage_observation: Some(metadata), sequence: seq, event: ProviderEventKind::UsageUpdate(parsed) }); seq += 1;
                 }
             }
             if saw_done { break; }
@@ -505,7 +518,7 @@ fn openai_stream(
             }
         }
         if cancel.is_cancelled() {
-            yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some("cancelled".into()), final_usage: None } });
+            yield Ok(ProviderStreamEvent { usage_observation: None, sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some("cancelled".into()), final_usage: None } });
             return;
         }
         if !parser.is_clean() { yield Err(protocol("unfinished SSE frame")); return; }
@@ -517,13 +530,13 @@ fn openai_stream(
             if !calls.is_empty() {
                 reason = "tool_calls".into();
                 for (index, call) in calls {
-                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallStarted { call_index: index, provider_call_id: Some(call.id), name: call.name } }); seq += 1;
-                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallArgumentsDelta { call_index: index, bytes: call.arguments.into_bytes() } }); seq += 1;
-                    yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::ToolCallFinished { call_index: index } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { usage_observation: None, sequence: seq, event: ProviderEventKind::ToolCallStarted { call_index: index, provider_call_id: Some(call.id), name: call.name } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { usage_observation: None, sequence: seq, event: ProviderEventKind::ToolCallArgumentsDelta { call_index: index, bytes: call.arguments.into_bytes() } }); seq += 1;
+                    yield Ok(ProviderStreamEvent { usage_observation: None, sequence: seq, event: ProviderEventKind::ToolCallFinished { call_index: index } }); seq += 1;
                 }
             }
         }
-        yield Ok(ProviderStreamEvent { sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some(reason), final_usage: usage } });
+        yield Ok(ProviderStreamEvent { usage_observation: usage.map(|(_, metadata)| metadata), sequence: seq, event: ProviderEventKind::Finished { finish_reason: Some(reason), final_usage: usage.map(|(raw, _)| raw) } });
     })
 }
 

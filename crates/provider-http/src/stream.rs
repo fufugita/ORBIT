@@ -129,12 +129,14 @@ pub type AsyncProviderEventStream =
 
 /// A per-event observer for live streaming. When provided, called for every
 /// event as the stream drains (before it lands in the collected Vec), so a
-/// caller can render TextDeltas live. `collect_stream` is byte-identical to
-/// the previous behavior when `None` is passed.
+/// caller can render TextDeltas live. Observations are provisional: a terminal
+/// callback can still be followed by a transport or validation failure.
+/// Passing `None` preserves the same collected result and errors.
 pub type StreamObserver<'a> = Option<&'a mut dyn FnMut(&ProviderStreamEvent)>;
 
-/// Collect a stream to its terminal result, validating sequence/usage on the
-/// way (GW-11/GW-13). Returns the events + the two-hash output evidence.
+/// Drain the stream, then validate the complete collected events (GW-11/GW-13).
+/// Any transport error is returned unchanged, including after a terminal callback.
+/// Only success returns the events and the two-hash output evidence.
 pub async fn collect_stream(
     mut stream: AsyncProviderEventStream,
     mut observer: StreamObserver<'_>,

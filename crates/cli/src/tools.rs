@@ -847,7 +847,7 @@ pub(crate) fn execute_task_resolved(
                     });
                 }
                 orbit_frontend_protocol::FrontendEvent::Status { text } => {
-                    let action = orbit_hud_tui::safe_text(&text);
+                    let action = orbit_hud::safe_text(&text);
                     notify(SubagentUpdate::Progress {
                         id: id.clone(),
                         action: action.clone(),

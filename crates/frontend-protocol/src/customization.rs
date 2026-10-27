@@ -124,6 +124,79 @@ impl LayoutNode {
         }
     }
 }
+/// Built-in portable layouts, independent of any terminal renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortableLayoutPreset {
+    Columns,
+    Build,
+    Agents,
+    Review,
+}
+
+/// Build the portable tree while keeping one reachable conversation panel.
+pub fn portable_layout_preset(preset: PortableLayoutPreset) -> LayoutNode {
+    let split = |direction, shares, children| LayoutNode::Split {
+        direction,
+        shares,
+        children,
+    };
+    match preset {
+        PortableLayoutPreset::Columns => Layout::default().tree,
+        PortableLayoutPreset::Build => split(
+            Direction::Right,
+            vec![56, 44],
+            vec![
+                LayoutNode::panel(View::Conversation),
+                split(
+                    Direction::Down,
+                    vec![48, 52],
+                    vec![
+                        LayoutNode::panel(View::Changes),
+                        LayoutNode::panel(View::Terminal),
+                    ],
+                ),
+            ],
+        ),
+        PortableLayoutPreset::Agents => split(
+            Direction::Right,
+            vec![30, 40, 30],
+            vec![
+                LayoutNode::Panel {
+                    view: View::Agent,
+                    agent: "explore".into(),
+                },
+                LayoutNode::panel(View::Conversation),
+                LayoutNode::Panel {
+                    view: View::Agent,
+                    agent: "review".into(),
+                },
+            ],
+        ),
+        PortableLayoutPreset::Review => split(
+            Direction::Right,
+            vec![40, 60],
+            vec![
+                LayoutNode::panel(View::Conversation),
+                split(
+                    Direction::Right,
+                    vec![70, 30],
+                    vec![
+                        LayoutNode::panel(View::Review),
+                        split(
+                            Direction::Down,
+                            vec![45, 55],
+                            vec![
+                                LayoutNode::panel(View::Plan),
+                                LayoutNode::panel(View::Activity),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum View {
@@ -553,4 +626,98 @@ fn unique_tokens<'de, D: serde::Deserializer<'de>>(
         }
     }
     d.deserialize_map(Visitor)
+}
+
+#[cfg(test)]
+mod portable_layout_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn portable_presets_keep_the_exact_retained_wire_trees() {
+        let cases = [
+            (
+                PortableLayoutPreset::Columns,
+                json!({"kind":"split","dir":"right","shares":[30,40,30],"children":[
+                    {"kind":"panel","view":"changes","agent":""},
+                    {"kind":"panel","view":"conversation","agent":""},
+                    {"kind":"panel","view":"terminal","agent":""}
+                ]}),
+            ),
+            (
+                PortableLayoutPreset::Build,
+                json!({"kind":"split","dir":"right","shares":[56,44],"children":[
+                    {"kind":"panel","view":"conversation","agent":""},
+                    {"kind":"split","dir":"down","shares":[48,52],"children":[
+                        {"kind":"panel","view":"changes","agent":""},
+                        {"kind":"panel","view":"terminal","agent":""}
+                    ]}
+                ]}),
+            ),
+            (
+                PortableLayoutPreset::Agents,
+                json!({"kind":"split","dir":"right","shares":[30,40,30],"children":[
+                    {"kind":"panel","view":"agent","agent":"explore"},
+                    {"kind":"panel","view":"conversation","agent":""},
+                    {"kind":"panel","view":"agent","agent":"review"}
+                ]}),
+            ),
+            (
+                PortableLayoutPreset::Review,
+                json!({"kind":"split","dir":"right","shares":[40,60],"children":[
+                    {"kind":"panel","view":"conversation","agent":""},
+                    {"kind":"split","dir":"right","shares":[70,30],"children":[
+                        {"kind":"panel","view":"review","agent":""},
+                        {"kind":"split","dir":"down","shares":[45,55],"children":[
+                            {"kind":"panel","view":"plan","agent":""},
+                            {"kind":"panel","view":"activity","agent":""}
+                        ]}
+                    ]}
+                ]}),
+            ),
+        ];
+        for (preset, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(portable_layout_preset(preset)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn portable_presets_validate_roundtrip_and_keep_the_default_baseline() {
+        fn conversations(node: &LayoutNode) -> usize {
+            match node {
+                LayoutNode::Panel {
+                    view: View::Conversation,
+                    ..
+                } => 1,
+                LayoutNode::Panel { .. } | LayoutNode::Custom { .. } => 0,
+                LayoutNode::Split { children, .. } => children.iter().map(conversations).sum(),
+            }
+        }
+        let baseline = Layout::default();
+        assert_eq!(baseline.preset, "default");
+        assert_eq!(
+            portable_layout_preset(PortableLayoutPreset::Columns),
+            baseline.tree
+        );
+        for preset in [
+            PortableLayoutPreset::Columns,
+            PortableLayoutPreset::Build,
+            PortableLayoutPreset::Agents,
+            PortableLayoutPreset::Review,
+        ] {
+            let tree = portable_layout_preset(preset);
+            assert_eq!(conversations(&tree), 1);
+            let mut profile = Profile::default();
+            profile.layout.tree = tree.clone();
+            profile.validate().unwrap();
+            let encoded = serde_json::to_vec(&profile).unwrap();
+            let reopened: Profile = serde_json::from_slice(&encoded).unwrap();
+            reopened.validate().unwrap();
+            assert_eq!(reopened.layout.tree, tree);
+        }
+        assert_eq!(Layout::default(), baseline);
+    }
 }

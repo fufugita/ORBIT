@@ -416,3 +416,142 @@ async fn openai_adapter_serializes_tools_and_parses_fragmented_call() {
         } if reason == "tool_calls"
     )));
 }
+
+#[tokio::test]
+async fn collector_terminal_callback_then_transport_error_keeps_original_failure() {
+    use orbit_adapter::error::AdapterError;
+    let events = vec![
+        ProviderStreamEvent {
+            sequence: 0,
+            event: ProviderEventKind::ResponseStarted {
+                upstream_request_id: None,
+            },
+            usage_observation: None,
+        },
+        ProviderStreamEvent {
+            sequence: 1,
+            event: ProviderEventKind::Finished {
+                finish_reason: Some("stop".into()),
+                final_usage: Some(orbit_adapter::types::ProviderUsage::default()),
+            },
+            usage_observation: None,
+        },
+    ];
+    orbit_adapter::stream::validate_stream(&events).expect("valid terminal-looking raw control");
+    let transport_error = AdapterError::ProviderTimeout("after-terminal transport sentinel".into());
+    let expected_message = transport_error.to_string();
+    let mut items: Vec<Result<ProviderStreamEvent, AdapterError>> =
+        events.iter().cloned().map(Ok).collect();
+    items.push(Err(transport_error));
+    let stream: orbit_provider_http::AsyncProviderEventStream =
+        Box::pin(futures::stream::iter(items));
+    let mut observed = Vec::new();
+    let error = orbit_provider_http::stream::collect_stream(
+        stream,
+        Some(&mut |event| observed.push(event.clone())),
+    )
+    .await
+    .expect_err("a terminal callback cannot hide the later transport failure");
+    assert_eq!(observed, events);
+    assert_eq!(error.code(), "E0409");
+    assert_eq!(error.to_string(), expected_message);
+}
+
+#[tokio::test]
+async fn collector_callbacks_remain_provisional_until_complete_validation() {
+    use orbit_adapter::types::{
+        ProviderUsage, UsageObservationMetaV1, UsageReasoningReportingV1, UsageSnapshotOriginV1,
+    };
+    let raw = ProviderUsage {
+        input_tokens: 3,
+        output_tokens: 2,
+        ..Default::default()
+    };
+    let control = vec![
+        ProviderStreamEvent {
+            sequence: 0,
+            event: ProviderEventKind::ResponseStarted {
+                upstream_request_id: None,
+            },
+            usage_observation: None,
+        },
+        ProviderStreamEvent {
+            sequence: 1,
+            event: ProviderEventKind::UsageUpdate(raw),
+            usage_observation: None,
+        },
+        ProviderStreamEvent {
+            sequence: 2,
+            event: ProviderEventKind::Finished {
+                finish_reason: Some("stop".into()),
+                final_usage: Some(raw),
+            },
+            usage_observation: None,
+        },
+    ];
+    for case in 0..4 {
+        let stream: orbit_provider_http::AsyncProviderEventStream =
+            Box::pin(futures::stream::iter(control.clone().into_iter().map(Ok)));
+        let mut control_observed = Vec::new();
+        let (control_returned, _) = orbit_provider_http::stream::collect_stream(
+            stream,
+            Some(&mut |event| control_observed.push(event.clone())),
+        )
+        .await
+        .expect("unchanged valid stream control");
+        assert_eq!(control_returned, control);
+        assert_eq!(control_observed, control);
+        let mut events = control.clone();
+        let expected_code = match case {
+            0 => {
+                events.push(ProviderStreamEvent {
+                    sequence: 3,
+                    event: ProviderEventKind::TextDelta {
+                        bytes: b"late".to_vec(),
+                    },
+                    usage_observation: None,
+                });
+                "E0411"
+            }
+            1 => {
+                events[1].usage_observation = Some(UsageObservationMetaV1 {
+                    version: 2,
+                    reasoning_reporting: UsageReasoningReportingV1::NotReported,
+                    snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+                });
+                "E0411"
+            }
+            2 => {
+                events[0].usage_observation = Some(UsageObservationMetaV1 {
+                    version: 1,
+                    reasoning_reporting: UsageReasoningReportingV1::NotReported,
+                    snapshot_origin: UsageSnapshotOriginV1::ProviderReported,
+                });
+                "E0411"
+            }
+            3 => {
+                if let ProviderEventKind::Finished { final_usage, .. } = &mut events[2].event {
+                    *final_usage = Some(ProviderUsage {
+                        input_tokens: 2,
+                        ..raw
+                    });
+                } else {
+                    panic!("control must have a real terminal");
+                }
+                "E0416"
+            }
+            _ => unreachable!(),
+        };
+        let stream: orbit_provider_http::AsyncProviderEventStream =
+            Box::pin(futures::stream::iter(events.clone().into_iter().map(Ok)));
+        let mut observed = Vec::new();
+        let error = orbit_provider_http::stream::collect_stream(
+            stream,
+            Some(&mut |event| observed.push(event.clone())),
+        )
+        .await
+        .expect_err("provisional callbacks cannot certify this invalid list");
+        assert_eq!(observed, events, "callbacks precede complete validation");
+        assert_eq!(error.code(), expected_code);
+    }
+}

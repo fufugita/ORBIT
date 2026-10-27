@@ -541,7 +541,7 @@ impl Fixture {
         }
     }
     fn configure(&self, wire: &Wire, window: u64, routing: bool) {
-        let model = |id: &str, input: u64, price: u64| json!({"id":id,"max_output_tokens":73,"context_limits":{"input_tokens":input},"pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"reasoning_per_million_microdollars":0,"request_flat_microdollars":price}});
+        let model = |id: &str, input: u64, price: u64| json!({"id":id,"max_output_tokens":73,"context_limits":{"input_tokens":input},"pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"reasoning_per_million_microdollars":0,"request_flat_microdollars":price},"billing":{"version":2,"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"request_flat_microdollars":price,"reasoning_counter_basis":"included_in_output","reasoning_rate_policy":"output_rate"}});
         let selected = format!("http://{}/selected/v1?route=final&raw=%2F", wire.authority);
         let mut value = json!({"provider":[{"name":"fixture","kind":"openai-compatible","url":wire.url,"models":[model("model-a",window,13),model("summary-model",64000,17)]},{"name":"selected","kind":"openai-compatible","url":selected,"models":[model("model-b",window,13)]}],"roles":{"main":"fixture/model-a","compaction":"fixture/summary-model"}});
         if routing {
@@ -565,6 +565,7 @@ impl Fixture {
             kind: ProviderKind::OpenAiCompatible,
             credential_env: None,
             pricing: None,
+            billing: None,
             max_output_tokens: 73,
             sampling: None,
             effort: None,
@@ -2597,7 +2598,8 @@ fn declared_policy_partial_ordinary_retains_provisional_usage_without_replay() {
         .map(|event| event["text"].as_str().unwrap())
         .collect();
     assert_eq!(emitted, partial);
-    assert_uncertain_ordinary(&f, &wire, Some(partial), Some(usage()));
+    // Live provisional observations stay outside terminal-only receipt usage.
+    assert_uncertain_ordinary(&f, &wire, Some(partial), None);
     wire.finish();
     assert_wire(&wire, 1);
 }
@@ -2828,7 +2830,8 @@ fn real_cli_post_refusal_manual_partial_summary_keeps_provisional_usage() {
         &["compact", "--session", &before.saved.session_id, "--json"],
     );
     failed_manual_summary(&result, false);
-    assert_uncertain_summary(&f, &wire, &before, None, Some(usage()));
+    // Live provisional observations stay outside terminal-only receipt usage.
+    assert_uncertain_summary(&f, &wire, &before, None, None);
     wire.finish();
     assert_wire(&wire, 6);
 }
@@ -2883,7 +2886,8 @@ fn real_cli_post_refusal_automatic_partial_summary_blocks_ordinary_replay() {
     failed_stream_events(&result);
     assert!(!result.stdout.contains(SUMMARY));
     assert!(!result.stderr.contains(SUMMARY));
-    assert_uncertain_summary(&f, &wire, &before, Some(current), Some(usage()));
+    // Live provisional observations stay outside terminal-only receipt usage.
+    assert_uncertain_summary(&f, &wire, &before, Some(current), None);
     wire.finish();
     assert_wire(&wire, 6);
 }

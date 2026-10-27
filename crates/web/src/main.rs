@@ -213,7 +213,7 @@ fn startup(args: &[String]) -> Result<(BridgeConfig, SessionLease, bool), String
         &provider.url,
         &model.id,
         provider.env.as_deref(),
-        Some(model.pricing),
+        model.pricing,
     )?;
     if let Some(choice) = &effort {
         orbit_cli::apply_effort_setting(&home, &mut checked, choice)?;

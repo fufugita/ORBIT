@@ -20,6 +20,7 @@ SCHEMA = 'orbit.context-session-isolation/v1'
 STAGE = 'orbit.context-session-isolation-stage/v1'
 MAX_BINARY = 1024 * 1024 * 1024
 MAX_OUTPUT = 2 * 1024 * 1024
+MAX_CLEANUP_ENTRIES = 5000
 EXCERPT = 16 * 1024
 
 
@@ -98,7 +99,10 @@ def environment(root):
     }
 
 
-def command(arguments, env, cwd, timeout, pass_fds=()):
+def command(arguments, env, cwd, timeout, pass_fds=(), lifecycle=None):
+    if lifecycle is not None:
+        require(lifecycle == {'spawn_attempted': False, 'reaped': False}, 'namespace_lifecycle_initial_state')
+        lifecycle['spawn_attempted'] = True
     process = subprocess.Popen(arguments, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                start_new_session=True, pass_fds=pass_fds)
@@ -131,8 +135,53 @@ def command(arguments, env, cwd, timeout, pass_fds=()):
             except ProcessLookupError:
                 pass
         process.wait(timeout=5)
+        if lifecycle is not None:
+            lifecycle['reaped'] = True
         process.stdout.close()
         process.stderr.close()
+
+
+def fixture_root_identity(info):
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700, 'owned_fixture_root_type_owner_mode')
+    return (info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode))
+
+
+def cleanup_owned_fixture(root, expected, lifecycle):
+    require(expected is not None, 'owned_fixture_original_identity_missing')
+    require(lifecycle['spawn_attempted'] is False or lifecycle['reaped'] is True,
+            'owned_namespace_reaping_unproven')
+    require(fixture_root_identity(root.lstat()) == expected, 'owned_fixture_root_changed')
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    walker = None
+    count = 0
+    try:
+        require(fixture_root_identity(os.fstat(descriptor)) == expected, 'owned_fixture_root_fd_changed')
+        def reject_walk_error(error):
+            raise error
+        walker = os.fwalk('.', topdown=True, onerror=reject_walk_error,
+                          follow_symlinks=False, dir_fd=descriptor)
+        for _base, directories, files, current in walker:
+            require(os.fstat(current).st_uid == expected[2], 'owned_fixture_directory_owner')
+            for name in directories + files:
+                count += 1
+                require(count <= MAX_CLEANUP_ENTRIES, 'owned_fixture_entry_bound')
+                require(os.stat(name, dir_fd=current, follow_symlinks=False).st_uid == expected[2],
+                        'owned_fixture_entry_owner')
+        require(fixture_root_identity(os.fstat(descriptor)) == expected, 'owned_fixture_root_fd_changed')
+    finally:
+        try:
+            if walker is not None:
+                walker.close()
+        finally:
+            os.close(descriptor)
+    # The walk is a bounded preflight, not an atomic proof of an immutable tree.
+    require(fixture_root_identity(root.lstat()) == expected, 'owned_fixture_root_changed')
+    require(getattr(shutil.rmtree, 'avoids_symlink_attacks', False) is True,
+            'owned_fixture_safe_rmtree_unavailable')
+    shutil.rmtree(root)
+    require(not root.exists() and not root.is_symlink(), 'owned_fixture_cleanup_incomplete')
+    return count
 
 
 def isolate(args, root, env):
@@ -200,6 +249,16 @@ def inside(args):
     result = 77
     try:
         report['isolation'] = isolate(args, root, env)
+        report['observed_namespace'] = {
+            'pid': os.getpid(),
+            'ppid': os.getppid(),
+            'uid': os.getuid(), 'gid': os.getgid(),
+            'uid_map': Path('/proc/self/uid_map').read_text().strip(),
+            'gid_map': Path('/proc/self/gid_map').read_text().strip(),
+            'mount_namespace': os.readlink('/proc/self/ns/mnt'),
+            'user_namespace': os.readlink('/proc/self/ns/user'),
+            'pid_namespace': os.readlink('/proc/self/ns/pid'),
+        }
         print(json.dumps({'schema': STAGE, 'phase': 'isolated_before_test', 'test_started': False}), flush=True)
         verify_binary(args.binary, args.binary_sha256)
         code, listing, _ = command([args.binary, '--list', '--format', 'terse'], env, root / 'work', 10,
@@ -241,6 +300,8 @@ def inside(args):
 
 def outer(args):
     root = None
+    root_identity = None
+    namespace_lifecycle = {'spawn_attempted': False, 'reaped': False}
     before_binary = None
     host_before = None
     host_checked = False
@@ -258,6 +319,7 @@ def outer(args):
             raise NotRun('namespace_tools_unavailable')
         root = Path(tempfile.mkdtemp(prefix='oc-'))
         root.chmod(0o700)
+        root_identity = fixture_root_identity(root.lstat())
         for name in ['user', 'tmp', 'work', 'user/config', 'user/cache', 'user/data', 'user/state', 'user/runtime']:
             (root / name).mkdir(mode=0o700)
         nonce = os.urandom(12).hex()
@@ -275,7 +337,8 @@ def outer(args):
                 arguments.append('--all')
             report.update({'phase': 'namespace_reexec', 'test_started': None})
             code, stdout, stderr = command(arguments, environment(root), root, args.timeout + 25,
-                                          pass_fds=(mount_ns.fileno(), user_ns.fileno()))
+                                          pass_fds=(mount_ns.fileno(), user_ns.fileno()),
+                                          lifecycle=namespace_lifecycle)
         records = [json.loads(line) for line in stdout.decode().splitlines() if line.strip()]
         stages = [record for record in records if record.get('schema') == STAGE]
         finals = [record for record in records if record.get('schema') == SCHEMA]
@@ -317,12 +380,15 @@ def outer(args):
                 report.update({'status': 'INFRA_FAILURE', 'reason': 'host_managed_metadata_recheck_failed'})
                 result = 2
         if root is not None:
+            report['owned_fixture_root_identity'] = root_identity
+            report['owned_namespace_lifecycle'] = dict(namespace_lifecycle)
             try:
-                shutil.rmtree(root)
-                report['owned_fixture_removed'] = not root.exists()
-                require(report['owned_fixture_removed'], 'owned_fixture_cleanup_incomplete')
-            except Exception:
-                report.update({'status': 'INFRA_FAILURE', 'reason': 'owned_fixture_cleanup_failed'})
+                report['owned_fixture_cleanup_entries'] = cleanup_owned_fixture(root, root_identity, namespace_lifecycle)
+                report['owned_fixture_removed'] = True
+            except Exception as error:
+                report.update({'status': 'INFRA_FAILURE', 'reason': 'owned_fixture_cleanup_failed',
+                               'owned_fixture_removed': False,
+                               'cleanup_detail': str(error)[:120] if isinstance(error, Failed) else type(error).__name__})
                 result = 2
     encoded = json.dumps(report, sort_keys=True, separators=(',', ':')).encode() + b'\n'
     if args.receipt is not None:

@@ -9,6 +9,7 @@ use super::anim::{Anim, Curve, pulse};
 use super::core::{Token, glyphs};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Map a token to a ratatui colour (true-colour tier).
 pub fn colour_themed(colors: crate::proto::shell::pal::Palette, t: Token) -> Color {
@@ -111,14 +112,14 @@ pub fn tool_line_themed(
     ])
 }
 
-/// 240 characters per second since `started_ms`.
+/// 240 grapheme clusters per second since `started_ms`.
 pub fn typed_prefix(s: &str, started_ms: u64, now_ms: u64) -> String {
     let elapsed = now_ms.saturating_sub(started_ms);
     let n = ((elapsed as f64 / 1000.0) * 240.0) as usize;
     if n == 0 {
         return String::new();
     }
-    s.chars().take(n).collect()
+    s.graphemes(true).take(n).collect()
 }
 
 /// M08 — the comet: a tool is running. One pass per 1.3 s over the
@@ -426,11 +427,31 @@ mod tests {
 
     #[test]
     fn typed_prefix_is_240_cps() {
-        // 240 cps = 4 chars per ~16.7 ms; at 250 ms ≈ 60 chars
+        // 240 graphemes per second = 4 ASCII clusters per ~16.7 ms.
         let s: String = "x".repeat(200);
         assert_eq!(typed_prefix(&s, 0, 0).len(), 0);
         assert_eq!(typed_prefix(&s, 0, 250).len(), 60);
         assert_eq!(typed_prefix(&s, 0, 60_000).len(), 200, "clamped");
+    }
+
+    #[test]
+    fn typed_prefix_never_reveals_a_partial_grapheme() {
+        let target = "e\u{301}界🇧🇷☀️👨‍👩‍👧‍👦";
+        assert_eq!(typed_prefix(target, 0, 5), "e\u{301}");
+        assert_eq!(typed_prefix(target, 0, 9), "e\u{301}界");
+        assert_eq!(typed_prefix(target, 0, 13), "e\u{301}界🇧🇷");
+        assert_eq!(typed_prefix(target, 0, 17), "e\u{301}界🇧🇷☀️");
+        assert_eq!(typed_prefix(target, 0, 100), target);
+
+        let line = tool_line_themed(
+            crate::proto::shell::pal::Palette::default(),
+            "Bash",
+            "👩🏽‍💻x",
+            0,
+            5,
+            false,
+        );
+        assert_eq!(line.spans[1].content, "👩🏽‍💻");
     }
 
     #[test]

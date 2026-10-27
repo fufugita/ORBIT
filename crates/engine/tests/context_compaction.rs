@@ -304,6 +304,7 @@ fn read_request(socket: &mut TcpStream) -> Result<Captured, &'static str> {
 
 fn config(fixture: &Fixture, summary: bool) -> TurnConfig {
     TurnConfig {
+        billing: None,
         provider_id: if summary {
             "summary-provider"
         } else {
@@ -871,14 +872,23 @@ fn service_priced_summary_cost_is_settled_once_and_unpriced_is_unknown() {
         let journal = MemoryJournal::fresh("service-owner");
         let mut options = options(&fixture, &journal, 1000, 12_000);
         if priced {
-            options.compaction_config.as_mut().unwrap().pricing = Some(CostRates {
+            let summary = options.compaction_config.as_mut().unwrap();
+            let rates = CostRates {
                 input_per_million_microcents: 1_000_000,
                 output_per_million_microcents: 2_000_000,
                 cache_read_per_million_microcents: None,
                 cache_write_per_million_microcents: None,
                 reasoning_per_million_microcents: None,
                 request_flat_microcents: 3,
-            });
+            };
+            summary.pricing = Some(rates);
+            task05_set_billing(
+                summary,
+                rates,
+                orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+                orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+                None,
+            );
         }
         let attempt = compaction::compact_context(
             &home.0,
@@ -957,14 +967,23 @@ fn service_positive_missing_usage_and_explicit_zero_keep_presence_distinct() {
     )]);
     let journal = MemoryJournal::fresh("service-owner");
     let mut options = options(&fixture, &journal, 1000, 12_000);
-    options.compaction_config.as_mut().unwrap().pricing = Some(CostRates {
+    let summary = options.compaction_config.as_mut().unwrap();
+    let rates = CostRates {
         input_per_million_microcents: 1,
         output_per_million_microcents: 1,
         cache_read_per_million_microcents: None,
         cache_write_per_million_microcents: None,
         reasoning_per_million_microcents: None,
         request_flat_microcents: 5,
-    });
+    };
+    summary.pricing = Some(rates);
+    task05_set_billing(
+        summary,
+        rates,
+        orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+        orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+        None,
+    );
     let attempt = compaction::compact_context(
         &home.0,
         &config(&fixture, false),
@@ -989,14 +1008,23 @@ fn service_known_billed_truncation_is_returned_without_a_candidate() {
     )]);
     let journal = MemoryJournal::fresh("service-owner");
     let mut options = options(&fixture, &journal, 1000, 12_000);
-    options.compaction_config.as_mut().unwrap().pricing = Some(CostRates {
+    let summary = options.compaction_config.as_mut().unwrap();
+    let rates = CostRates {
         input_per_million_microcents: 1_000_000,
         output_per_million_microcents: 2_000_000,
         cache_read_per_million_microcents: None,
         cache_write_per_million_microcents: None,
         reasoning_per_million_microcents: None,
         request_flat_microcents: 3,
-    });
+    };
+    summary.pricing = Some(rates);
+    task05_set_billing(
+        summary,
+        rates,
+        orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+        orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+        None,
+    );
     let attempt = compaction::compact_context(
         &home.0,
         &config(&fixture, false),
@@ -1079,6 +1107,7 @@ fn journal_fixture_revisions_scope_idempotence_and_stale_references_are_real() {
         Err(HistoryError::Conflict)
     );
     let c = TurnConfig {
+        billing: None,
         provider_id: "p".into(),
         gate: "http://127.0.0.1:9".into(),
         model: "m".into(),
@@ -2060,6 +2089,47 @@ fn task05_flat_price(flat: u64) -> CostRates {
         request_flat_microcents: flat,
     }
 }
+fn task05_set_billing(
+    selected: &mut TurnConfig,
+    rates: CostRates,
+    basis: orbit_adapter::types::ReasoningCounterBasis,
+    policy: orbit_adapter::types::ReasoningRatePolicy,
+    max_reasoning_tokens: Option<u64>,
+) {
+    use orbit_adapter::types::{
+        BillingQuoteContractV1, BillingRatesV1, ModelId, PricingDeclarationState, ProviderId,
+    };
+    selected.billing = Some(
+        BillingQuoteContractV1::try_new_with_reasoning_bound(
+            ProviderId(selected.provider_id.clone()),
+            ModelId(selected.model.clone()),
+            PricingDeclarationState::DeclaredV2,
+            BillingRatesV1 {
+                input_per_million_microdollars: Some(rates.input_per_million_microcents),
+                output_per_million_microdollars: Some(rates.output_per_million_microcents),
+                cache_read_per_million_microdollars: rates.cache_read_per_million_microcents,
+                cache_write_per_million_microdollars: rates.cache_write_per_million_microcents,
+                reasoning_per_million_microdollars: rates.reasoning_per_million_microcents,
+                request_flat_microdollars: Some(rates.request_flat_microcents),
+            },
+            basis,
+            policy,
+            max_reasoning_tokens,
+        )
+        .unwrap(),
+    );
+}
+fn task05_set_flat_billing(selected: &mut TurnConfig, flat: u64) {
+    let rates = task05_flat_price(flat);
+    selected.pricing = Some(rates);
+    task05_set_billing(
+        selected,
+        rates,
+        orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+        orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+        None,
+    );
+}
 fn task05_assert_terminal(events: &[FrontendEvent], report: &orbit_engine::TurnReport, ok: bool) {
     let ended: Vec<_> = events
         .iter()
@@ -2150,17 +2220,25 @@ fn task05_detailed_ordinary_usage_presence_zero_and_full_counter_pricing_are_exa
         let options = options(&fixture, &journal, 8000, 8000);
         let mut selected = config(&fixture, false);
         if mode == "priced-zero" {
-            selected.pricing = Some(task05_flat_price(5));
+            task05_set_flat_billing(&mut selected, 5);
         }
         if mode == "priced-counters" {
-            selected.pricing = Some(CostRates {
+            let rates = CostRates {
                 input_per_million_microcents: 2_000_000,
                 output_per_million_microcents: 3_000_000,
                 cache_read_per_million_microcents: Some(4_000_000),
                 cache_write_per_million_microcents: Some(5_000_000),
                 reasoning_per_million_microcents: Some(6_000_000),
                 request_flat_microcents: 7,
-            });
+            };
+            selected.pricing = Some(rates);
+            task05_set_billing(
+                &mut selected,
+                rates,
+                orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput,
+                orbit_adapter::types::ReasoningRatePolicy::DedicatedRate,
+                Some(73),
+            );
         }
         let mut source = Vec::new();
         let (completion, events) = task05_detailed(
@@ -2242,23 +2320,40 @@ fn task05_distinct_summary_and_ordinary_prices_are_attributed_once() {
     ]);
     let journal = MemoryJournal::fresh("service-owner");
     let mut options = options(&fixture, &journal, 1000, 12_000);
-    options.compaction_config.as_mut().unwrap().pricing = Some(CostRates {
+    let summary = options.compaction_config.as_mut().unwrap();
+    let summary_rates = CostRates {
         input_per_million_microcents: 1_000_000,
         output_per_million_microcents: 2_000_000,
         cache_read_per_million_microcents: None,
         cache_write_per_million_microcents: None,
         reasoning_per_million_microcents: None,
         request_flat_microcents: 3,
-    });
+    };
+    summary.pricing = Some(summary_rates);
+    task05_set_billing(
+        summary,
+        summary_rates,
+        orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+        orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+        None,
+    );
     let mut selected = config(&fixture, false);
-    selected.pricing = Some(CostRates {
+    let ordinary_rates = CostRates {
         input_per_million_microcents: 2_000_000,
         output_per_million_microcents: 3_000_000,
         cache_read_per_million_microcents: Some(4_000_000),
         cache_write_per_million_microcents: Some(5_000_000),
         reasoning_per_million_microcents: Some(6_000_000),
         request_flat_microcents: 7,
-    });
+    };
+    selected.pricing = Some(ordinary_rates);
+    task05_set_billing(
+        &mut selected,
+        ordinary_rates,
+        orbit_adapter::types::ReasoningCounterBasis::SeparateFromOutput,
+        orbit_adapter::types::ReasoningRatePolicy::DedicatedRate,
+        Some(73),
+    );
     let mut source = history(3, 1800);
     source.pop();
     let (completion, events) = task05_detailed(
@@ -2334,7 +2429,7 @@ fn task05_billed_truncated_ordinary_completion_retains_failure_accounting() {
     let journal = MemoryJournal::fresh("service-owner");
     let options = options(&fixture, &journal, 8000, 8000);
     let mut selected = config(&fixture, false);
-    selected.pricing = Some(task05_flat_price(9));
+    task05_set_flat_billing(&mut selected, 9);
     let mut source = Vec::new();
     let (completion, events) = task05_detailed(
         &fixture,
@@ -2422,7 +2517,7 @@ fn task05_ordinary_cancel_after_post_before_headers_is_uncertain_and_never_retri
 }
 
 #[test]
-fn task05_ordinary_cancel_during_partial_stream_preserves_provisional_usage_and_intent() {
+fn task05_ordinary_cancel_during_partial_stream_does_not_promote_provisional_usage() {
     let prefix =
         json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":1,"total_tokens":12}});
     let event = json!({"choices":[{"index":0,"delta":{"content":"visible partial ordinary"},"finish_reason":null}]});
@@ -2461,14 +2556,9 @@ fn task05_ordinary_cancel_during_partial_stream_preserves_provisional_usage_and_
     let receipt = &completion.report.attempts[0];
     assert_eq!(receipt.knownness, AccountingKnownness::Uncertain);
     assert_eq!(receipt.totals.cost_microcents, None);
-    assert_eq!(
-        receipt.usage,
-        Some(orbit_adapter::types::ProviderUsage {
-            input_tokens: 11,
-            output_tokens: 1,
-            ..Default::default()
-        })
-    );
+    // The stream prefix remains provisional diagnostic evidence, not final
+    // receipt usage or a billable subtotal.
+    assert_eq!(receipt.usage, None);
     assert_eq!(
         (
             completion.report.input_tokens,
@@ -2494,7 +2584,7 @@ fn task05_ordinary_cancel_during_partial_stream_preserves_provisional_usage_and_
 }
 
 #[test]
-fn task05_invalid_final_usage_keeps_last_usable_prefix_without_booking_a_bill() {
+fn task05_invalid_final_usage_does_not_promote_last_usable_prefix() {
     let prefix =
         json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":1,"total_tokens":12}});
     let invalid = json!({"choices":[{"index":0,"delta":{"content":"visible invalid-final prefix"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":7,"total_tokens":17}});
@@ -2524,14 +2614,9 @@ fn task05_invalid_final_usage_keeps_last_usable_prefix_without_booking_a_bill() 
     let receipt = &completion.report.attempts[0];
     assert_eq!(receipt.knownness, AccountingKnownness::Uncertain);
     assert_eq!(receipt.totals.cost_microcents, None);
-    assert_eq!(
-        receipt.usage,
-        Some(orbit_adapter::types::ProviderUsage {
-            input_tokens: 11,
-            output_tokens: 1,
-            ..Default::default()
-        })
-    );
+    // A monotonicity failure invalidates the final observation; the earlier
+    // prefix is not exposed as a receipt even though it was previously usable.
+    assert_eq!(receipt.usage, None);
     assert_eq!(
         (
             completion.report.input_tokens,
@@ -2635,9 +2720,9 @@ fn task05_failed_followup_retains_billed_summary_and_valid_tool_round_exactly_on
     let mut options = options(&fixture, &journal, 1000, 12_000);
     options.max_rounds = 3;
     options.max_attempts = 3;
-    options.compaction_config.as_mut().unwrap().pricing = Some(task05_flat_price(28));
+    task05_set_flat_billing(options.compaction_config.as_mut().unwrap(), 28);
     let mut selected = config(&fixture, false);
-    selected.pricing = Some(task05_flat_price(5));
+    task05_set_flat_billing(&mut selected, 5);
     let mut source = history(3, 1800);
     source.pop();
     let mut executor = OneTool(0);
@@ -2715,13 +2800,13 @@ fn task05_summary_exhausts_allowance_before_ordinary_admission() {
     let mut fixture = Fixture::new(vec![Response::complete(SUMMARY)]);
     let journal = MemoryJournal::fresh("service-owner");
     let mut options = options(&fixture, &journal, 1000, 12_000);
-    options.compaction_config.as_mut().unwrap().pricing = Some(task05_flat_price(28));
+    task05_set_flat_billing(options.compaction_config.as_mut().unwrap(), 28);
     options.spend_allowance = Some(orbit_engine::SpendAllowance {
         remaining_microcents: 28,
         allow_unpriced_housekeeping: false,
     });
     let mut selected = config(&fixture, false);
-    selected.pricing = Some(task05_flat_price(1));
+    task05_set_flat_billing(&mut selected, 1);
     let mut source = history(3, 1800);
     source.pop();
     let (completion, events) = task05_detailed(
@@ -2775,13 +2860,13 @@ fn task05_insufficient_allowance_refuses_before_housekeeping_or_ordinary_post() 
             if compact { 1000 } else { 8000 },
             12_000,
         );
-        options.compaction_config.as_mut().unwrap().pricing = Some(task05_flat_price(3));
+        task05_set_flat_billing(options.compaction_config.as_mut().unwrap(), 3);
         options.spend_allowance = Some(orbit_engine::SpendAllowance {
             remaining_microcents: 2,
             allow_unpriced_housekeeping: false,
         });
         let mut selected = config(&fixture, false);
-        selected.pricing = Some(task05_flat_price(3));
+        task05_set_flat_billing(&mut selected, 3);
         let mut source = if compact {
             history(3, 1800)
         } else {
@@ -2828,7 +2913,7 @@ fn task05_unpriced_housekeeping_requires_explicit_policy_without_granting_unpric
             allow_unpriced_housekeeping: allow,
         });
         let mut selected = config(&fixture, false);
-        selected.pricing = Some(task05_flat_price(1));
+        task05_set_flat_billing(&mut selected, 1);
         let mut source = history(3, 1800);
         source.pop();
         let (completion, events) = task05_detailed(
@@ -2896,7 +2981,7 @@ fn task05_legacy_unknown_namespace_refuses_spend_cap_without_inventing_zero() {
         allow_unpriced_housekeeping: true,
     });
     let mut selected = config(&fixture, false);
-    selected.pricing = Some(task05_flat_price(1));
+    task05_set_flat_billing(&mut selected, 1);
     let before = journal.accounting_checkpoint().unwrap();
     let (completion, events) = task05_detailed(
         &fixture,
@@ -3164,7 +3249,7 @@ fn review_regression_missing_summary_usage_under_cap_stops_before_the_next_reque
             allow_unpriced_housekeeping: true,
         });
         let mut selected = config(&fixture, false);
-        selected.pricing = Some(task05_flat_price(1));
+        task05_set_flat_billing(&mut selected, 1);
         let mut source = if multiple_chunks {
             history(2, 2400)
         } else {
@@ -3247,7 +3332,7 @@ fn review_regression_historical_missing_housekeeping_usage_under_cap_refuses_all
             if needs_compaction { 1000 } else { 8000 },
             12_000,
         );
-        options.compaction_config.as_mut().unwrap().pricing = Some(task05_flat_price(1));
+        task05_set_flat_billing(options.compaction_config.as_mut().unwrap(), 1);
         options.spend_allowance = Some(orbit_engine::SpendAllowance {
             remaining_microcents: 10,
             allow_unpriced_housekeeping: true,
@@ -3280,7 +3365,7 @@ fn review_regression_historical_missing_housekeeping_usage_under_cap_refuses_all
         let before = journal.accounting_checkpoint().unwrap();
         assert_eq!(before.totals.knownness, AccountingKnownness::UnknownUsage);
         let mut selected = config(&fixture, false);
-        selected.pricing = Some(task05_flat_price(1));
+        task05_set_flat_billing(&mut selected, 1);
         let mut source = if needs_compaction {
             history(3, 1800)
         } else {
@@ -3568,7 +3653,7 @@ mod task2a_journal_transition_tests {
             options.journal = Some(journal.clone());
             options.max_rounds = 2;
             let mut selected = config(&fixture, false);
-            selected.pricing = Some(task05_flat_price(3));
+            task05_set_flat_billing(&mut selected, 3);
             let mut source = Vec::new();
             let mut executor = NoEffects::default();
             let mut events = Vec::new();
@@ -3659,7 +3744,7 @@ mod task2a_journal_transition_tests {
             });
             let mut options = options(&fixture, &inner, 1000, 12_000);
             options.journal = Some(journal.clone());
-            options.compaction_config.as_mut().unwrap().pricing = Some(task05_flat_price(3));
+            task05_set_flat_billing(options.compaction_config.as_mut().unwrap(), 3);
             let mut source = history(3, 1800);
             let expected = source.clone();
             source.pop();
@@ -3775,7 +3860,7 @@ mod task2a_journal_transition_tests {
             })
         );
         let mut selected = config(&fixture, false);
-        selected.pricing = Some(task05_flat_price(1));
+        task05_set_flat_billing(&mut selected, 1);
         let mut source = Vec::new();
         let mut executor = NoEffects::default();
         let mut events = Vec::new();

@@ -20,58 +20,123 @@ pub fn validate_provider_endpoint(raw: &str) -> Result<url::Url, String> {
 /// Per-million-token pricing in microdollars (DR-09 §8; C5: the unit was
 /// mislabeled "microcents" — 200000 means $0.20 per million tokens, and the
 /// display path divides by 1e6 to print dollars, which is only correct for
-/// microdollars). All optional; a model with no pricing block is billed at
-/// $0 until the user declares rates.
+/// microdollars). This legacy block is retained for migration and display; it
+/// does not prove that a model is free or define reasoning-token billing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Pricing {
     #[serde(
         default,
+        skip_serializing_if = "Option::is_none",
         alias = "input_per_million_microcents",
         rename = "input_per_million_microdollars"
     )]
-    pub input_per_million_microdollars: u64,
+    pub input_per_million_microdollars: Option<u64>,
     #[serde(
         default,
+        skip_serializing_if = "Option::is_none",
         alias = "output_per_million_microcents",
         rename = "output_per_million_microdollars"
     )]
-    pub output_per_million_microdollars: u64,
+    pub output_per_million_microdollars: Option<u64>,
     #[serde(
         default,
+        skip_serializing_if = "Option::is_none",
         alias = "cache_read_per_million_microcents",
         rename = "cache_read_per_million_microdollars"
     )]
     pub cache_read_per_million_microdollars: Option<u64>,
     #[serde(
         default,
+        skip_serializing_if = "Option::is_none",
         alias = "cache_write_per_million_microcents",
         rename = "cache_write_per_million_microdollars"
     )]
     pub cache_write_per_million_microdollars: Option<u64>,
     #[serde(
         default,
+        skip_serializing_if = "Option::is_none",
         alias = "reasoning_per_million_microcents",
         rename = "reasoning_per_million_microdollars"
     )]
     pub reasoning_per_million_microdollars: Option<u64>,
     #[serde(
         default,
+        skip_serializing_if = "Option::is_none",
         alias = "request_flat_microcents",
         rename = "request_flat_microdollars"
     )]
-    pub request_flat_microdollars: u64,
+    pub request_flat_microdollars: Option<u64>,
 }
 
-impl From<Pricing> for orbit_adapter::types::CostRates {
-    fn from(p: Pricing) -> Self {
-        orbit_adapter::types::CostRates {
-            input_per_million_microcents: p.input_per_million_microdollars,
-            output_per_million_microcents: p.output_per_million_microdollars,
-            cache_read_per_million_microcents: p.cache_read_per_million_microdollars,
-            cache_write_per_million_microcents: p.cache_write_per_million_microdollars,
-            reasoning_per_million_microcents: p.reasoning_per_million_microdollars,
-            request_flat_microcents: p.request_flat_microdollars,
+impl Pricing {
+    /// Convert only a complete legacy row to its display-only cost projection.
+    /// This does not convey the reasoning basis required for admission or a complete receipt.
+    pub fn complete_legacy_cost_rates(self) -> Option<orbit_adapter::types::CostRates> {
+        Some(orbit_adapter::types::CostRates {
+            input_per_million_microcents: self.input_per_million_microdollars?,
+            output_per_million_microcents: self.output_per_million_microdollars?,
+            cache_read_per_million_microcents: self.cache_read_per_million_microdollars,
+            cache_write_per_million_microcents: self.cache_write_per_million_microdollars,
+            reasoning_per_million_microcents: self.reasoning_per_million_microdollars,
+            request_flat_microcents: self.request_flat_microdollars?,
+        })
+    }
+}
+
+/// Explicit model-scoped billing terms. Legacy `pricing` remains readable,
+/// but only this versioned block can authorize a spend-limited request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingConfigV2 {
+    pub version: u16,
+    pub input_per_million_microdollars: Option<u64>,
+    pub output_per_million_microdollars: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_per_million_microdollars: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_million_microdollars: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_per_million_microdollars: Option<u64>,
+    pub request_flat_microdollars: Option<u64>,
+    #[serde(default)]
+    pub reasoning_counter_basis: orbit_adapter::types::ReasoningCounterBasis,
+    #[serde(default)]
+    pub reasoning_rate_policy: orbit_adapter::types::ReasoningRatePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_reasoning_tokens: Option<u64>,
+}
+
+impl BillingConfigV2 {
+    pub fn contract(
+        &self,
+        provider_id: &str,
+        raw_model_id: &str,
+    ) -> Result<orbit_adapter::types::BillingQuoteContractV1, String> {
+        use orbit_adapter::types::{
+            BillingQuoteContractV1, BillingRatesV1, ModelId, PricingDeclarationState, ProviderId,
+        };
+        if self.version != 2 {
+            return Err("billing.version must be 2".into());
         }
+        // Keep partial and unknown terms available to receipt accounting.
+        // Spend admission and quote completeness fail closed at their consumers.
+        BillingQuoteContractV1::try_new_with_reasoning_bound(
+            ProviderId(provider_id.into()),
+            ModelId(raw_model_id.into()),
+            PricingDeclarationState::DeclaredV2,
+            BillingRatesV1 {
+                input_per_million_microdollars: self.input_per_million_microdollars,
+                output_per_million_microdollars: self.output_per_million_microdollars,
+                cache_read_per_million_microdollars: self.cache_read_per_million_microdollars,
+                cache_write_per_million_microdollars: self.cache_write_per_million_microdollars,
+                reasoning_per_million_microdollars: self.reasoning_per_million_microdollars,
+                request_flat_microdollars: self.request_flat_microdollars,
+            },
+            self.reasoning_counter_basis,
+            self.reasoning_rate_policy,
+            self.max_reasoning_tokens,
+        )
+        .map_err(|_| "billing v2 identity or declaration is invalid".into())
     }
 }
 
@@ -162,8 +227,11 @@ pub struct ModelEntry {
     pub id: String,
     #[serde(default)]
     pub label: Option<String>,
-    #[serde(default)]
-    pub pricing: Pricing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<Pricing>,
+    /// Versioned explicit billing terms; absent legacy terms remain unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<BillingConfigV2>,
     /// Maximum output tokens the model accepts. When absent the harness
     /// uses 32,000 — the old hard 2,048 cap silently truncated long
     /// answers and file writes.
@@ -497,6 +565,13 @@ impl ProvidersConfig {
                 model
                     .validate_effort(orbit_engine::ProviderKind::from_config(&provider.kind))
                     .map_err(|error| format!("provider '{}': {error}", provider.name))?;
+                if let Some(billing) = model.billing {
+                    billing
+                        .contract(&provider.name, &model.id)
+                        .map_err(|error| {
+                            format!("provider '{}' model '{}': {error}", provider.name, model.id)
+                        })?;
+                }
             }
         }
         Ok(())
@@ -578,12 +653,24 @@ impl ProvidersConfig {
             .and_then(|m| m.max_output_tokens)
     }
 
-    /// The pricing block declared for a model id, if any.
+    /// The pricing configured for one exact provider/model identity.
+    pub fn pricing_for_provider_model(&self, provider_id: &str, model: &str) -> Option<Pricing> {
+        self.model_entry(provider_id, model)
+            .and_then(|(_, entry)| entry.pricing)
+    }
+
+    /// Resolve pricing by a bare model id only when that id is unambiguous.
+    /// Callers that have selected a provider must use
+    /// [`Self::pricing_for_provider_model`] instead.
     pub fn pricing_for_model(&self, model: &str) -> Option<Pricing> {
-        self.provider
-            .iter()
-            .find_map(|p| p.models.iter().find(|m| m.id == model))
-            .map(|m| m.pricing)
+        let mut matches = self.provider.iter().flat_map(|provider| {
+            provider
+                .models
+                .iter()
+                .filter(move |entry| entry.id == model)
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first.pricing).flatten()
     }
 
     /// Append a provider, refusing a duplicate name. Returns an error string
@@ -910,8 +997,8 @@ output_per_million_microdollars = 600000
         )
         .unwrap();
         let pricing = cfg.pricing_for_model("m").expect("pricing found");
-        assert_eq!(pricing.input_per_million_microdollars, 200_000);
-        assert_eq!(pricing.output_per_million_microdollars, 600_000);
+        assert_eq!(pricing.input_per_million_microdollars, Some(200_000));
+        assert_eq!(pricing.output_per_million_microdollars, Some(600_000));
         assert_eq!(pricing.cache_read_per_million_microdollars, None);
     }
 
@@ -933,8 +1020,221 @@ output_per_million_microcents = 600000
         )
         .unwrap();
         let pricing = cfg.pricing_for_model("m").expect("pricing found");
-        assert_eq!(pricing.input_per_million_microdollars, 200_000);
-        assert_eq!(pricing.output_per_million_microdollars, 600_000);
+        assert_eq!(pricing.input_per_million_microdollars, Some(200_000));
+        assert_eq!(pricing.output_per_million_microdollars, Some(600_000));
+    }
+
+    #[test]
+    fn legacy_pricing_presence_survives_load_save_load_without_zero_filling() {
+        fn serialized_pricing(raw: &str) -> toml::Value {
+            let config: ProvidersConfig = toml::from_str(raw).expect("parse provider config");
+            let first_save = toml::to_string(&config).expect("serialize provider config");
+            let reloaded: ProvidersConfig =
+                toml::from_str(&first_save).expect("reload provider config");
+            let second_save = toml::to_string(&reloaded).expect("serialize reloaded config");
+            toml::from_str(&second_save).expect("inspect serialized provider config")
+        }
+
+        let base = r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:4001"
+[[provider.models]]
+id = "m"
+"#;
+
+        let absent = serialized_pricing(base);
+        let absent_model = &absent["provider"][0]["models"][0];
+        assert!(absent_model.get("pricing").is_none());
+
+        let empty = serialized_pricing(&format!("{base}\n[provider.models.pricing]\n"));
+        let empty_pricing = empty["provider"][0]["models"][0]["pricing"]
+            .as_table()
+            .expect("an explicitly empty pricing table remains present");
+        assert!(empty_pricing.is_empty());
+
+        let explicit_zero = serialized_pricing(&format!(
+            "{base}\n[provider.models.pricing]\ninput_per_million_microdollars = 0\n"
+        ));
+        let zero_pricing = explicit_zero["provider"][0]["models"][0]["pricing"]
+            .as_table()
+            .expect("an explicitly declared pricing table remains present");
+        assert_eq!(
+            zero_pricing.get("input_per_million_microdollars"),
+            Some(&toml::Value::Integer(0))
+        );
+        assert_eq!(
+            zero_pricing.len(),
+            1,
+            "omitted rates must not serialize as zero"
+        );
+    }
+
+    #[test]
+    fn billing_v2_explicit_zero_roundtrips_and_binds_exact_model() {
+        let raw = r#"
+[[provider]]
+name = "first"
+url = "http://127.0.0.1:4001"
+[[provider.models]]
+id = "shared/raw-model"
+[provider.models.billing]
+version = 2
+input_per_million_microdollars = 0
+output_per_million_microdollars = 0
+request_flat_microdollars = 0
+reasoning_counter_basis = "included_in_output"
+reasoning_rate_policy = "output_rate"
+
+[[provider]]
+name = "second"
+url = "http://127.0.0.1:4002"
+[[provider.models]]
+id = "shared/raw-model"
+"#;
+        let config: ProvidersConfig = toml::from_str(raw).unwrap();
+        config.validate_efforts().unwrap();
+        let (provider, model) = config
+            .model_entry("first", "shared/raw-model")
+            .expect("exact model entry");
+        let contract = model
+            .billing
+            .expect("explicit v2 declaration")
+            .contract(&provider.name, &model.id)
+            .unwrap();
+        assert_eq!(contract.provider_id().0, "first");
+        assert_eq!(contract.raw_model_id().0, "shared/raw-model");
+
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: ProvidersConfig = toml::from_str(&encoded).unwrap();
+        decoded.validate_efforts().unwrap();
+        let (first, first_model) = decoded.model_entry("first", "shared/raw-model").unwrap();
+        let rates = first_model.billing.unwrap();
+        assert_eq!(
+            rates.contract(&first.name, &first_model.id).unwrap(),
+            contract
+        );
+        assert_eq!(rates.input_per_million_microdollars, Some(0));
+        assert_eq!(rates.output_per_million_microdollars, Some(0));
+        assert_eq!(rates.request_flat_microdollars, Some(0));
+        assert!(
+            decoded
+                .model_entry("second", "shared/raw-model")
+                .unwrap()
+                .1
+                .billing
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn billing_v2_partial_terms_load_without_inventing_admission_authority() {
+        let unknown = r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:4001"
+[[provider.models]]
+id = "m"
+[provider.models.billing]
+version = 2
+"#;
+        let config: ProvidersConfig = toml::from_str(unknown).unwrap();
+        config.validate_efforts().unwrap();
+        let (provider, model) = config.model_entry("p", "m").unwrap();
+        let contract = model
+            .billing
+            .unwrap()
+            .contract(&provider.name, &model.id)
+            .unwrap();
+        assert_eq!(
+            contract.reasoning_counter_basis(),
+            orbit_adapter::types::ReasoningCounterBasis::Unknown
+        );
+        assert_eq!(
+            contract.reasoning_rate_policy(),
+            orbit_adapter::types::ReasoningRatePolicy::Unknown
+        );
+        assert_eq!(contract.rates().input_per_million_microdollars, None);
+        assert_eq!(contract.rates().output_per_million_microdollars, None);
+
+        let dedicated_without_rate = r#"
+[[provider]]
+name = "p"
+url = "http://127.0.0.1:4001"
+[[provider.models]]
+id = "m"
+[provider.models.billing]
+version = 2
+input_per_million_microdollars = 0
+output_per_million_microdollars = 0
+request_flat_microdollars = 0
+reasoning_counter_basis = "separate_from_output"
+reasoning_rate_policy = "dedicated_rate"
+"#;
+        let config: ProvidersConfig = toml::from_str(dedicated_without_rate).unwrap();
+        config.validate_efforts().unwrap();
+        let (provider, model) = config.model_entry("p", "m").unwrap();
+        let contract = model
+            .billing
+            .unwrap()
+            .contract(&provider.name, &model.id)
+            .unwrap();
+        assert_eq!(contract.rates().reasoning_per_million_microdollars, None);
+    }
+
+    #[test]
+    fn pricing_uses_exact_provider_for_duplicate_model_ids() {
+        let cfg: ProvidersConfig = toml::from_str(
+            r#"
+[[provider]]
+name = "first"
+url = "http://127.0.0.1:4001"
+[[provider.models]]
+id = "shared/model"
+[provider.models.pricing]
+input_per_million_microdollars = 100
+output_per_million_microdollars = 200
+
+[[provider]]
+name = "second"
+url = "http://127.0.0.1:4002"
+[[provider.models]]
+id = "shared/model"
+[provider.models.pricing]
+input_per_million_microdollars = 700
+output_per_million_microdollars = 900
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.pricing_for_provider_model("first", "shared/model")
+                .unwrap()
+                .input_per_million_microdollars,
+            Some(100)
+        );
+        assert_eq!(
+            cfg.pricing_for_provider_model("second", "shared/model")
+                .unwrap()
+                .input_per_million_microdollars,
+            Some(700)
+        );
+        assert_eq!(cfg.pricing_for_model("shared/model"), None);
+    }
+
+    #[test]
+    fn model_only_pricing_still_resolves_a_unique_id() {
+        let mut cfg: ProvidersConfig = toml::from_str(sample_toml()).unwrap();
+        cfg.provider[0].models[0].pricing = Some(Pricing {
+            input_per_million_microdollars: Some(0),
+            ..Pricing::default()
+        });
+        assert_eq!(
+            cfg.pricing_for_model("model-a")
+                .unwrap()
+                .input_per_million_microdollars,
+            Some(0)
+        );
     }
 
     #[test]
@@ -1006,11 +1306,12 @@ output_per_million_microcents = 600000
                 sampling: None,
                 id: "fixture-model".into(),
                 label: None,
-                pricing: Pricing {
-                    input_per_million_microdollars: 200_000,
-                    output_per_million_microdollars: 600_000,
+                pricing: Some(Pricing {
+                    input_per_million_microdollars: Some(200_000),
+                    output_per_million_microdollars: Some(600_000),
                     ..Default::default()
-                },
+                }),
+                billing: None,
                 max_output_tokens: None,
                 context_window: None,
             }],
@@ -1023,8 +1324,9 @@ output_per_million_microcents = 600000
         assert_eq!(
             loaded.provider[0].models[0]
                 .pricing
+                .unwrap()
                 .output_per_million_microdollars,
-            600_000
+            Some(600_000)
         );
         // Token VALUE never stored; only the env-var NAME is present.
         let raw = std::fs::read_to_string(ProvidersConfig::config_path(&home)).unwrap();

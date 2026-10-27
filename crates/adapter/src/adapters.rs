@@ -181,6 +181,7 @@ impl ProviderAdapter for MockHttpV1 {
                     binding: Default::default(),
                     output: evidence,
                     accounting: crate::types::AccountingResult {
+                        usage_observation: None,
                         cost_microcents: 0,
                         currency: None,
                         usage: *usage,
@@ -220,18 +221,21 @@ pub fn text_capabilities() -> ProviderCapabilities {
 pub fn canonical_success_result() -> ProviderResult {
     let events = vec![
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 0,
             event: ProviderEventKind::ResponseStarted {
                 upstream_request_id: Some(String::from("req-1")),
             },
         },
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 1,
             event: ProviderEventKind::TextDelta {
                 bytes: b"Hello, ORBIT".to_vec(),
             },
         },
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 2,
             event: ProviderEventKind::UsageUpdate(ProviderUsage {
                 input_tokens: 12,
@@ -240,6 +244,7 @@ pub fn canonical_success_result() -> ProviderResult {
             }),
         },
         ProviderStreamEvent {
+            usage_observation: None,
             sequence: 3,
             event: ProviderEventKind::Finished {
                 finish_reason: Some(String::from("stop")),

@@ -22,8 +22,8 @@ use crate::registry::ProviderRegistry;
 use orbit_adapter::ProviderAdapter;
 use orbit_adapter::credential::SecretBytes;
 use orbit_adapter::types::{
-    AccountingResult, DecisionId, ProviderEventKind, ProviderRequest, ProviderResult,
-    ProviderRouteBinding, ProviderTerminalStatus, ProviderUsage, RequestId, UsageSource,
+    AccountingResult, DecisionId, ProviderRequest, ProviderResult, ProviderRouteBinding,
+    ProviderTerminalStatus, ProviderUsage, RequestId, UsageSource,
 };
 use orbit_egress::{BrokerVerdict, EgressAllowlist, EgressBroker, EgressTuple, SpkiPin};
 use orbit_ledger::event::{EgressDestination, EgressIntent, LedgerEvent};
@@ -483,22 +483,26 @@ impl DispatchEngine {
                 ));
             }
         };
-        match orbit_provider_http::stream::collect_stream(stream, observer).await {
-            Ok((events, evidence)) => {
-                // Presence establishes finality: zero is a valid snapshot, while
-                // the latest update remains provisional without final usage.
-                let (usage, usage_source, usage_complete) = events
-                    .iter()
-                    .rev()
-                    .find_map(|e| match &e.event {
-                        ProviderEventKind::Finished {
-                            final_usage: Some(u),
-                            ..
-                        } => Some((*u, UsageSource::Final, true)),
-                        ProviderEventKind::UsageUpdate(u) => {
-                            Some((*u, UsageSource::Incremental, false))
-                        }
-                        _ => None,
+        let collected = orbit_provider_http::stream::collect_stream(stream, observer)
+            .await
+            .and_then(|(events, evidence)| {
+                let observation = orbit_adapter::stream::usage_observation_evidence_v1(&events)?;
+                Ok((events, evidence, observation))
+            });
+        match collected {
+            Ok((events, evidence, observation)) => {
+                // Preserve the legacy numeric projection: a final event snapshot
+                // includes explicit zero, while a latest update is provisional.
+                // This completeness flag does not certify provider billing.
+                let (usage, usage_source, usage_complete) = observation
+                    .selected
+                    .as_ref()
+                    .map(|snapshot| {
+                        (
+                            snapshot.raw_usage,
+                            snapshot.source,
+                            snapshot.source == UsageSource::Final,
+                        )
                     })
                     .unwrap_or((ProviderUsage::default(), UsageSource::Missing, false));
                 let result = ProviderResult {
@@ -506,6 +510,7 @@ impl DispatchEngine {
                     binding: Default::default(),
                     output: evidence,
                     accounting: AccountingResult {
+                        usage_observation: Some(Box::new(observation)),
                         usage,
                         usage_source: Some(usage_source),
                         usage_complete,

@@ -174,6 +174,7 @@ impl ToolExecutor for Executor {
 
 fn config(fixture: &Fixture) -> TurnConfig {
     TurnConfig {
+        billing: None,
         sampling: None,
         effort: None,
         supported_efforts: None,
@@ -187,6 +188,32 @@ fn config(fixture: &Fixture) -> TurnConfig {
         pricing: None,
         max_output_tokens: 2048,
     }
+}
+
+fn declared_billing(
+    rates: orbit_adapter::types::CostRates,
+    basis: orbit_adapter::types::ReasoningCounterBasis,
+    policy: orbit_adapter::types::ReasoningRatePolicy,
+) -> orbit_adapter::types::BillingQuoteContractV1 {
+    use orbit_adapter::types::{
+        BillingQuoteContractV1, BillingRatesV1, ModelId, PricingDeclarationState, ProviderId,
+    };
+    BillingQuoteContractV1::try_new(
+        ProviderId("fixture".into()),
+        ModelId("local-model".into()),
+        PricingDeclarationState::DeclaredV2,
+        BillingRatesV1 {
+            input_per_million_microdollars: Some(rates.input_per_million_microcents),
+            output_per_million_microdollars: Some(rates.output_per_million_microcents),
+            cache_read_per_million_microdollars: rates.cache_read_per_million_microcents,
+            cache_write_per_million_microdollars: rates.cache_write_per_million_microcents,
+            reasoning_per_million_microdollars: rates.reasoning_per_million_microcents,
+            request_flat_microdollars: Some(rates.request_flat_microcents),
+        },
+        basis,
+        policy,
+    )
+    .unwrap()
 }
 
 fn sse(text: &str, reason: &str) -> Response {
@@ -650,6 +677,11 @@ fn task05_detailed_anthropic_preserves_cache_write_and_full_usage_fields() {
         reasoning_per_million_microcents: Some(5_000_000),
         request_flat_microcents: 7,
     });
+    selected.billing = Some(declared_billing(
+        selected.pricing.unwrap(),
+        orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+        orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+    ));
     let journal = compaction_journal::MemoryJournal::fresh("ordinary-anthropic");
     let options = TurnOptions {
         session_id: "ordinary-anthropic".into(),
@@ -836,6 +868,11 @@ fn task05_valid_ordinary_tool_terminal_is_completed_and_billed_once_before_conti
         reasoning_per_million_microcents: Some(0),
         request_flat_microcents: 3,
     });
+    selected.billing = Some(declared_billing(
+        selected.pricing.unwrap(),
+        orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+        orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+    ));
     let journal = compaction_journal::MemoryJournal::fresh("ordinary-tool-positive");
     let options = TurnOptions {
         session_id: "ordinary-tool-positive".into(),
@@ -931,6 +968,11 @@ fn task05_unmanaged_legacy_retry_retains_uncertain_prefix_and_known_success_once
         reasoning_per_million_microcents: Some(0),
         request_flat_microcents: 4,
     });
+    selected.billing = Some(declared_billing(
+        selected.pricing.unwrap(),
+        orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+        orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+    ));
     let options = TurnOptions {
         session_id: "unmanaged-legacy-retry".into(),
         request_stem: "unmanaged-legacy-retry".into(),

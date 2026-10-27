@@ -909,6 +909,7 @@ fn read_request(socket: &mut TcpStream) -> Result<Capture, &'static str> {
 
 fn config(wire: &Wire) -> TurnConfig {
     TurnConfig {
+        billing: Some(test_billing("component-provider", "component/raw", 13)),
         provider_id: "component-provider".into(),
         gate: wire.url.clone(),
         model: "component/raw".into(),
@@ -929,6 +930,33 @@ fn config(wire: &Wire) -> TurnConfig {
         first_byte_timeout_ms: None,
         idle_timeout_ms: None,
     }
+}
+
+fn test_billing(
+    provider: &str,
+    model: &str,
+    flat_fee: u64,
+) -> orbit_adapter::types::BillingQuoteContractV1 {
+    use orbit_adapter::types::{
+        BillingQuoteContractV1, BillingRatesV1, ModelId, PricingDeclarationState, ProviderId,
+        ReasoningCounterBasis, ReasoningRatePolicy,
+    };
+    BillingQuoteContractV1::try_new(
+        ProviderId(provider.into()),
+        ModelId(model.into()),
+        PricingDeclarationState::DeclaredV2,
+        BillingRatesV1 {
+            input_per_million_microdollars: Some(0),
+            output_per_million_microdollars: Some(0),
+            cache_read_per_million_microdollars: Some(0),
+            cache_write_per_million_microdollars: Some(0),
+            reasoning_per_million_microdollars: None,
+            request_flat_microdollars: Some(flat_fee),
+        },
+        ReasoningCounterBasis::IncludedInOutput,
+        ReasoningRatePolicy::OutputRate,
+    )
+    .unwrap()
 }
 fn policy(config: &TurnConfig, ceiling: u32) -> RetryPolicyBinding {
     let selector = FinalRejectionSelector::new(
@@ -1530,16 +1558,7 @@ fn oversized_truncated_and_admitted_error_responses_never_authorize_replay() {
         assert_eq!(state.receipts[0].knownness, AccountingKnownness::Uncertain);
         assert_eq!(state.receipts[0].totals.cost_microcents, None);
         if kind == "partial" {
-            assert_eq!(
-                state.receipts[0].usage,
-                Some(ProviderUsage {
-                    input_tokens: 11,
-                    output_tokens: 7,
-                    cache_read_tokens: 3,
-                    cache_write_tokens: 0,
-                    reasoning_tokens: 5
-                })
-            );
+            assert!(state.receipts[0].usage.is_none());
             assert!(
                 transcript
                     .iter()
@@ -1982,6 +2001,7 @@ fn summary_selection(selected: &TurnConfig) -> TurnConfig {
     summary.provider_id = "summary-provider".into();
     summary.model = "summary/raw".into();
     summary.pricing.as_mut().unwrap().request_flat_microcents = 17;
+    summary.billing = Some(test_billing("summary-provider", "summary/raw", 17));
     summary
 }
 fn summary_options(
@@ -2936,16 +2956,7 @@ fn summary_failures_cancellation_and_publication_authority_remain_conservative()
                     Some(receipt)
                 );
                 if kind == "partial" {
-                    assert_eq!(
-                        receipt.usage,
-                        Some(ProviderUsage {
-                            input_tokens: 11,
-                            output_tokens: 7,
-                            cache_read_tokens: 3,
-                            cache_write_tokens: 0,
-                            reasoning_tokens: 5
-                        })
-                    );
+                    assert!(receipt.usage.is_none());
                 }
                 let counts = journal.counts();
                 let checkpoint = journal.snapshot();

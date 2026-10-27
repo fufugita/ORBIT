@@ -84,6 +84,7 @@ fn configured(gate: &str, summary: bool) -> TurnConfig {
         kind: ProviderKind::OpenAiCompatible,
         credential_env: None,
         pricing: None,
+        billing: None,
         max_output_tokens: if summary { 37 } else { 73 },
         sampling: None,
         effort: None,

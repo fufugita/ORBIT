@@ -106,6 +106,21 @@ impl Fixture {
     fn mode(&self, value: Value) {
         fs::write(self.root.join("mode.json"), value.to_string()).unwrap();
     }
+    fn price_default_model_for_test(&self) {
+        let path = self.root.join("providers.toml");
+        let current = fs::read_to_string(&path).unwrap();
+        let marker = "id=\"vendor/model-a\"\n";
+        assert!(current.contains(marker));
+        let replacement = format!(
+            "{marker}[provider.models.billing]\nversion=2\ninput_per_million_microdollars=0\noutput_per_million_microdollars=0\nrequest_flat_microdollars=17\nreasoning_counter_basis=\"included_in_output\"\nreasoning_rate_policy=\"output_rate\"\n"
+        );
+        let configured = current.replacen(marker, &replacement, 1);
+        let duplicate = format!(
+            "\n[[provider]]\nname=\"shadow\"\nurl={:?}\n[[provider.models]]\nid=\"vendor/model-a\"\n[provider.models.billing]\nversion=2\ninput_per_million_microdollars=0\noutput_per_million_microdollars=0\nrequest_flat_microdollars=99\nreasoning_counter_basis=\"included_in_output\"\nreasoning_rate_policy=\"output_rate\"\n",
+            "http://127.0.0.1:1"
+        );
+        fs::write(&path, format!("{duplicate}{configured}")).unwrap();
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -149,6 +164,7 @@ fn owner_query_actual_choices_are_typed_and_send_zero_provider_calls() {
 #[test]
 fn owner_query_one_prompt_uses_shared_engine_and_saves_once() {
     let fixture = Fixture::new();
+    fixture.price_default_model_for_test();
     let runtime = fixture.start();
     let state = fixture.bridge(&runtime);
     let mut client = state.claim_controller().unwrap();
@@ -160,6 +176,13 @@ fn owner_query_one_prompt_uses_shared_engine_and_saves_once() {
     });
     assert_eq!(fixture.calls().len(), 1);
     assert_eq!(fixture.calls()[0]["model"], "vendor/model-a");
+    let snapshot = state.snapshot().unwrap();
+    assert_eq!(snapshot.provider, "fixture");
+    assert_eq!(snapshot.cost_microcents, 17);
+    assert_eq!(
+        snapshot.accounting.unwrap().full_cost_status,
+        orbit_cli::session_accounting::FullCostStatus::Known
+    );
     let saved = sessions::load_session(&fixture.root, "browser-owned").unwrap();
     assert!(
         saved
@@ -1460,7 +1483,7 @@ mod manual_browser_capability {
         assert!(std::env::var_os(&main_env).is_none() && std::env::var_os(&summary_env).is_none());
         let pricing = "input_per_million_microdollars=0\noutput_per_million_microdollars=0\ncache_read_per_million_microdollars=0\ncache_write_per_million_microdollars=0\nreasoning_per_million_microdollars=0\n";
         let config = format!(
-            "[[provider]]\nname='manual_main'\nurl={:?}\nenv={main_env:?}\n[[provider.models]]\nid='family/shared-manual'\nmax_output_tokens=73\ncontext_limits={{input_tokens=8192}}\nsupported_efforts=['low','high']\ndefault_effort='low'\n[provider.models.pricing]\n{pricing}request_flat_microdollars=91\n[[provider]]\nname='manual_summary'\nurl={:?}\nenv={summary_env:?}\n[[provider.models]]\nid='family/shared-manual'\nmax_output_tokens=37\ncontext_limits={{input_tokens=65536}}\nsupported_efforts=['medium','high']\ndefault_effort='medium'\n[provider.models.pricing]\n{pricing}request_flat_microdollars=17\n[roles]\nmain='manual_main/family/shared-manual'\ncompaction='manual_summary/family/shared-manual'\n[routing.phases.coding]\ndefault='manual_summary/family/shared-manual'\nhard='manual_summary/family/shared-manual'\n[routing.phase_keywords]\nclear=true\ncoding=['compact']\n",
+            "[[provider]]\nname='manual_main'\nurl={:?}\nenv={main_env:?}\n[[provider.models]]\nid='family/shared-manual'\nmax_output_tokens=73\ncontext_limits={{input_tokens=8192}}\nsupported_efforts=['low','high']\ndefault_effort='low'\n[provider.models.pricing]\n{pricing}request_flat_microdollars=91\n[[provider]]\nname='manual_summary'\nurl={:?}\nenv={summary_env:?}\n[[provider.models]]\nid='family/shared-manual'\nmax_output_tokens=37\ncontext_limits={{input_tokens=65536}}\nsupported_efforts=['medium','high']\ndefault_effort='medium'\n[provider.models.pricing]\n{pricing}request_flat_microdollars=17\n[provider.models.billing]\nversion=2\ninput_per_million_microdollars=0\noutput_per_million_microdollars=0\ncache_read_per_million_microdollars=0\ncache_write_per_million_microdollars=0\nrequest_flat_microdollars=17\nreasoning_counter_basis='included_in_output'\nreasoning_rate_policy='output_rate'\n[roles]\nmain='manual_main/family/shared-manual'\ncompaction='manual_summary/family/shared-manual'\n[routing.phases.coding]\ndefault='manual_summary/family/shared-manual'\nhard='manual_summary/family/shared-manual'\n[routing.phase_keywords]\nclear=true\ncoding=['compact']\n",
             format!("{base}/main/v1?binding=main"),
             format!("{base}/summary/v1?binding=summary")
         );

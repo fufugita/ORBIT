@@ -21,6 +21,8 @@ pub mod panes;
 pub mod side;
 pub mod tier;
 
+pub(super) use canvas::printable_text;
+
 use crate::proto::app::App;
 use crate::proto::core::Tier;
 use crate::proto::layout::{Node, Preset, View};
@@ -257,6 +259,8 @@ pub struct DrawIn<'a> {
     pub fx: &'a Fx,
     pub scenario: &'a Scenario,
     pub composer: &'a str,
+    /// Grapheme-boundary insertion point in `composer`.
+    pub composer_cursor: usize,
     /// The highlighted row of the `/` command list.
     pub completion_sel: usize,
     pub file_completion: Option<&'a crate::proto::composer::FileCompletion>,
@@ -525,6 +529,7 @@ pub fn draw_with_profile(
                             reduced: red,
                             mono: inp.mono,
                             composer: inp.composer,
+                            composer_cursor: inp.composer_cursor,
                             completion_sel: inp.completion_sel,
                             file_completion: inp.file_completion,
                             history_search: inp.history_search,
@@ -733,6 +738,7 @@ mod tests {
                     fx: &Fx::default(),
                     scenario: s,
                     composer: "",
+                    composer_cursor: 0,
                     completion_sel: 0,
                     file_completion: None,
                     history_search: None,
@@ -911,6 +917,7 @@ mod tests {
                     fx: &Fx::default(),
                     scenario: &s,
                     composer: "",
+                    composer_cursor: 0,
                     completion_sel: 0,
                     file_completion: None,
                     history_search: None,
@@ -1601,6 +1608,7 @@ mod tests {
                     fx,
                     scenario: s,
                     composer: "",
+                    composer_cursor: 0,
                     completion_sel: 0,
                     file_completion: None,
                     history_search: None,
@@ -1880,6 +1888,7 @@ mod tests {
                         fx: &Fx::default(),
                         scenario: &s,
                         composer: "",
+                        composer_cursor: 0,
                         completion_sel: 0,
                         file_completion: None,
                         history_search: None,

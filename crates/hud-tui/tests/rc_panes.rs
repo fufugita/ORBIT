@@ -157,6 +157,7 @@ fn render(
                 fx: &Fx::default(),
                 scenario: &scenario,
                 composer: "ordinary draft",
+                composer_cursor: "ordinary draft".chars().count(),
                 completion_sel: 0,
                 file_completion: None,
                 history_search: None,

@@ -438,6 +438,7 @@ mod tests {
             model: "raw-model".into(),
             kind,
             credential_env: None,
+            billing: None,
             pricing: None,
             max_output_tokens: 73,
             sampling: None,

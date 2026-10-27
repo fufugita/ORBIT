@@ -563,7 +563,7 @@ mod headless_signal_baselines {
             }
         }
         fn configure(&self, wire: &Wire) -> PathBuf {
-            let config:orbit_cli::config::ProvidersConfig=serde_json::from_value(json!({"provider":[{"name":"signal_fixture","kind":"openai-compatible","url":wire.url,"models":[{"id":RAW,"max_output_tokens":73,"context_limits":{"input_tokens":64000},"pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"reasoning_per_million_microdollars":0,"request_flat_microdollars":5}}]}],"roles":{"main":format!("signal_fixture/{RAW}")}})).unwrap();
+            let config:orbit_cli::config::ProvidersConfig=serde_json::from_value(json!({"provider":[{"name":"signal_fixture","kind":"openai-compatible","url":wire.url,"models":[{"id":RAW,"max_output_tokens":73,"context_limits":{"input_tokens":64000},"pricing":{"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"reasoning_per_million_microdollars":0,"request_flat_microdollars":5},"billing":{"version":2,"input_per_million_microdollars":0,"output_per_million_microdollars":0,"cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,"request_flat_microdollars":5,"reasoning_counter_basis":"included_in_output","reasoning_rate_policy":"output_rate"}}]}],"roles":{"main":format!("signal_fixture/{RAW}")}})).unwrap();
             write_private(
                 &self.home.join("providers.toml"),
                 toml::to_string(&config).unwrap(),
