@@ -8,6 +8,7 @@ const COT_TAGS: &[&str] = &[
     "analysis",
     "scratchpad",
     "internal",
+    "think",
     "thinking",
 ];
 const MAX_COT_NESTING_DEPTH: usize = 64;
@@ -187,6 +188,73 @@ impl CotStripper {
 #[cfg(test)]
 mod tests {
     use super::{COT_TAGS, CotStripper, safe_text, strip_cot};
+
+    const THINK_TAG_CASES: &[(&str, &str)] = &[
+        ("", ""),
+        ("<think>hidden</think>", ""),
+        ("<think></think><thinking></thinking>", ""),
+        ("a<think>hidden</think>b", "ab"),
+        ("a<ThInK>hidden</tHiNk>b", "ab"),
+        ("a<thinking>hidden</thinking>b", "ab"),
+        (
+            "İ café 🦀<think>private 東京 İ</think> résumé",
+            "İ café 🦀 résumé",
+        ),
+        ("a<think>outer<think>inner</think>tail</think>b", "ab"),
+        ("a<think>outer<thinking>inner</thinking>tail</think>b", "ab"),
+        ("a<thinking>outer<think>inner</think>tail</thinking>b", "ab"),
+        (
+            "a<think>outer<thinking>inner</think>private</thinking>tail</think>b",
+            "ab",
+        ),
+        ("a<think>hidden 東京", "a"),
+        ("a<thinking>hidden 東京", "a"),
+        (
+            "a<thinker>literal</thinker>b",
+            "a<thinker>literal</thinker>b",
+        ),
+        (
+            "a<thinkish>literal</thinkish>b",
+            "a<thinkish>literal</thinkish>b",
+        ),
+        (
+            "a<think x>literal</think x>b",
+            "a<think x>literal</think x>b",
+        ),
+        ("a<think/>literal</think/>b", "a<think/>literal</think/>b"),
+        ("a</think>literal", "a</think>literal"),
+    ];
+
+    #[test]
+    fn think_tag_batch_keeps_exact_visible_text() {
+        for &(input, expected) in THINK_TAG_CASES {
+            assert_eq!(strip_cot(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn think_tag_streaming_keeps_exact_visible_text_at_every_utf8_split() {
+        for &(input, expected) in THINK_TAG_CASES {
+            for split in input
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(input.len()))
+            {
+                let mut stripper = CotStripper::new();
+                let output = stripper.push(&input[..split]) + &stripper.push(&input[split..]);
+                assert_eq!(output, expected, "input {input:?} at byte {split}");
+            }
+            let mut stripper = CotStripper::new();
+            let mut output = String::new();
+            for character in input.chars() {
+                output.push_str(&stripper.push(&character.to_string()));
+            }
+            assert_eq!(
+                output, expected,
+                "input {input:?} in single-character deltas"
+            );
+        }
+    }
 
     #[test]
     fn safe_text_redacts_secret_values_without_discarding_the_line() {

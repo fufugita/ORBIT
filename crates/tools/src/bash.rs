@@ -1288,76 +1288,188 @@ mod cancel_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Esc during a command kills the whole tree, orphans included
-    /// (ported from the process-wide-slot era; the property is unchanged).
+    /// Esc during a command kills the whole tree, orphans included.
     #[test]
     fn a_cancelled_turn_kills_the_running_command_and_leaves_no_orphan() {
         let (cx, dir) = cx();
         let flag = Arc::new(AtomicBool::new(false));
         cx.push_cancel_check(check(&flag));
-        let f = flag.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            f.store(true, Ordering::SeqCst);
+        // A unique argv[0] identifies only this test's two descendants,
+        // including when bubblewrap gives them different inner PIDs.
+        let name = format!("orbit-cancel-sleep-{}", ulid::Ulid::new());
+        let executable = dir.join(&name);
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("sleep executable");
+        std::os::unix::fs::symlink(sleep, &executable).unwrap();
+        let argv0 = format!("./{name}");
+        let command = format!("{argv0} 31 & {argv0} 32 && echo done");
+        let worker = std::thread::spawn(move || run_command(&command, 60, &cx));
+        // Establish that both processes actually started before cancel.
+        // Defer every assertion until the worker has been cancelled/joined.
+        let observed = (|| -> std::io::Result<Vec<FixtureSleep>> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let children = fixture_sleeps(&argv0)?;
+                if children.len() == 2
+                    && children.iter().any(|child| child.seconds == 31)
+                    && children.iter().any(|child| child.seconds == 32)
+                {
+                    println!(
+                        "orbit-cancel-observation process_count=2 nested_pid_namespace_count={}",
+                        children
+                            .iter()
+                            .filter(|child| child.nested_pid_namespace)
+                            .count()
+                    );
+                    return Ok(children);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("both fixture sleeps did not start: {children:?}"),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })();
+        let cancelled_at = std::time::Instant::now();
+        flag.store(true, Ordering::SeqCst);
+        let result = worker.join();
+        let cancelled_in = cancelled_at.elapsed();
+        let remaining = observed.as_ref().ok().map(|children| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            loop {
+                let mut running = Vec::new();
+                for child in children {
+                    if let Some((start_ticks, state)) = process_state(child.pid)?
+                        && start_ticks == child.start_ticks
+                        && !matches!(state, 'Z' | 'X')
+                    {
+                        running.push(*child);
+                    }
+                }
+                if running.is_empty() || std::time::Instant::now() >= deadline {
+                    return Ok::<_, std::io::Error>(running);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         });
-        let baseline: Vec<String> = own_group_sleeps();
-        let t0 = std::time::Instant::now();
-        // A grandchild that would outlive its parent shell.
-        let r = run_command("sleep 31 & sleep 32 && echo done", 60, &cx);
+        let cleanup = std::fs::remove_dir_all(&dir);
+        let r = result.expect("command worker panicked");
+        observed.expect("must observe both owned descendants before cancellation");
+        let running = remaining
+            .expect("observation was established")
+            .expect("read exact fixture identities after cancellation");
         assert!(
-            t0.elapsed() < Duration::from_secs(10),
-            "cancel must kill the child promptly (took {:?})",
-            t0.elapsed()
+            cancelled_in < Duration::from_secs(10),
+            "cancel must kill the child promptly (took {cancelled_in:?})"
         );
         assert!(r.payload.contains("cancelled"), "{}", r.payload);
-        let mut leaked = Vec::new();
-        for _ in 0..30 {
-            leaked = own_group_sleeps()
-                .into_iter()
-                .filter(|p| !baseline.contains(p))
-                .collect();
-            if leaked.is_empty() {
-                break;
+        assert!(running.is_empty(), "orphans survived the Esc: {running:?}");
+        cleanup.expect("remove fixture directory");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct FixtureSleep {
+        pid: u32,
+        start_ticks: u64,
+        seconds: u8,
+        nested_pid_namespace: bool,
+    }
+
+    /// Match the exact unique argv[0] and duration, then retain the
+    /// outer /proc identity rather than a PID printed inside a sandbox.
+    fn fixture_sleeps(argv0: &str) -> std::io::Result<Vec<FixtureSleep>> {
+        use std::os::unix::fs::MetadataExt as _;
+        let observer_namespace = std::fs::metadata("/proc/self/ns/pid")?.ino();
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let path = entry.path().join("cmdline");
+            let command = match std::fs::read(&path) {
+                Ok(command) => command,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let args: Vec<_> = command.split(|byte| *byte == 0).collect();
+            if args.len() != 3 || args[0] != argv0.as_bytes() || !args[2].is_empty() {
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(200));
+            let seconds = match args[1] {
+                b"31" => 31,
+                b"32" => 32,
+                _ => continue,
+            };
+            let Some((start_ticks, state)) = process_state(pid)? else {
+                continue;
+            };
+            if matches!(state, 'Z' | 'X') {
+                continue;
+            }
+            // Reject an exec/PID replacement across the observation.
+            let same_command = match std::fs::read(&path) {
+                Ok(current) => current == command,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error),
+            };
+            let child_namespace = match std::fs::metadata(entry.path().join("ns/pid")) {
+                Ok(metadata) => metadata.ino(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let nested_pid_namespace = child_namespace != observer_namespace;
+            if same_command
+                && process_state(pid)?.is_some_and(|(after, state)| {
+                    after == start_ticks && !matches!(state, 'Z' | 'X')
+                })
+            {
+                children.push(FixtureSleep {
+                    pid,
+                    start_ticks,
+                    seconds,
+                    nested_pid_namespace,
+                });
+            }
         }
-        assert!(leaked.is_empty(), "orphans survived the Esc: {leaked:?}");
-        let _ = std::fs::remove_dir_all(dir);
+        Ok(children)
     }
 
-    #[allow(dead_code)]
-    fn pids_of(name: &str) -> Vec<String> {
-        let o = std::process::Command::new("pgrep")
-            .arg("-x")
-            .arg(name)
-            .output()
-            .expect("pgrep");
-        String::from_utf8_lossy(&o.stdout)
-            .split_whitespace()
-            .map(String::from)
-            .collect()
-    }
-
-    /// The commands this module spawns run in their own process group, so
-    /// every process of the tree is that group's leader (pid == pgid).
-    /// Unrelated `sleep` processes on a busy machine (crons, editors,
-    /// agents) churn constantly and share long-lived groups — restricting
-    /// the orphan check to group leaders keeps the property under test
-    /// ("our tree is dead") without counting theirs.
-    fn own_group_sleeps() -> Vec<String> {
-        let o = std::process::Command::new("ps")
-            .args(["-o", "pid=,pgid=,comm="])
-            .output()
-            .expect("ps");
-        String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.split_whitespace();
-                let pid = parts.next()?;
-                let pgid = parts.next()?;
-                let comm = parts.next()?;
-                (comm == "sleep" && pid == pgid).then(|| pid.to_string())
-            })
-            .collect()
+    /// Start ticks distinguish PID reuse; zombies are settled rather
+    /// than running. An unreadable/malformed owned stat is an error.
+    fn process_state(pid: u32) -> std::io::Result<Option<(u64, char)>> {
+        let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let invalid =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed process stat");
+        let (_, rest) = text.rsplit_once(") ").ok_or_else(invalid)?;
+        let mut fields = rest.split_whitespace();
+        let state = fields
+            .next()
+            .and_then(|value| value.chars().next())
+            .ok_or_else(invalid)?;
+        let start_ticks = fields
+            .nth(18)
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(invalid)?;
+        Ok(Some((start_ticks, state)))
     }
 }

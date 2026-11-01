@@ -1,0 +1,209 @@
+{
+  "schema": 1,
+  "baseline": [
+    {
+      "role": "system",
+      "content": "provider System remains canonical"
+    },
+    {
+      "role": "assistant",
+      "content": "B αé 👩‍💻 中\n**tail**"
+    }
+  ],
+  "appended": [
+    {
+      "role": "user",
+      "content": "inspect @note.txt\n```txt\ngeneric fixture contents\n```"
+    },
+    {
+      "role": "assistant",
+      "content": "pre-tool A + discarded A",
+      "tool_calls": [
+        {
+          "id": "call-one",
+          "name": "Bash",
+          "arguments": "{\"command\":\"printf fixture\"}"
+        },
+        {
+          "id": "call-two",
+          "name": "Glob",
+          "arguments": "{\"pattern\":\"*.txt\"}"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "{\"ok\":true,\"matches\":[\"note.txt\"]}",
+      "tool_call_id": "call-two",
+      "tool_result": "{\"ok\":true,\"matches\":[\"note.txt\"]}"
+    },
+    {
+      "role": "tool",
+      "content": "{\"ok\":false,\"exit_code\":3,\"output\":\"generic hidden tool body\"}",
+      "tool_call_id": "call-one",
+      "tool_result": "{\"ok\":false,\"exit_code\":3,\"output\":\"generic hidden tool body\"}"
+    },
+    {
+      "role": "assistant",
+      "content": "B αé 👩‍💻 中\n**tail**"
+    }
+  ],
+  "engine_events": [
+    {
+      "kind": "round_started",
+      "round": 0
+    },
+    {
+      "kind": "tool_started_full",
+      "call_id": "call-one",
+      "tool_name": "Bash"
+    },
+    {
+      "kind": "tool_started_full",
+      "call_id": "call-two",
+      "tool_name": "Glob"
+    },
+    {
+      "kind": "round_started",
+      "round": 1
+    }
+  ],
+  "live": [
+    {
+      "kind": "user",
+      "text": "inspect @note.txt"
+    },
+    {
+      "kind": "queued",
+      "text": "later",
+      "id": "queue-one"
+    },
+    {
+      "kind": "queued",
+      "text": "later",
+      "id": "queue-two"
+    },
+    {
+      "kind": "round_started",
+      "round": 0
+    },
+    {
+      "kind": "text_delta",
+      "text": "pre-tool A"
+    },
+    {
+      "kind": "local_notice",
+      "text": "/usage: generic local notice"
+    },
+    {
+      "kind": "text_delta",
+      "text": " + discarded A"
+    },
+    {
+      "kind": "tool_started_full",
+      "call_id": "call-one",
+      "tool_name": "Bash",
+      "summary": "safe summary one"
+    },
+    {
+      "kind": "tool_started_full",
+      "call_id": "call-two",
+      "tool_name": "Glob",
+      "summary": "safe summary two"
+    },
+    {
+      "kind": "tool_finished_full",
+      "call_id": "call-two",
+      "tool_name": "Glob",
+      "outcome": "ok",
+      "meta": "1 file"
+    },
+    {
+      "kind": "tool_finished_full",
+      "call_id": "call-one",
+      "tool_name": "Bash",
+      "outcome": "failed",
+      "meta": "exit 3"
+    },
+    {
+      "kind": "round_started",
+      "round": 1
+    },
+    {
+      "kind": "text_delta",
+      "text": "B α"
+    },
+    {
+      "kind": "local_notice",
+      "text": "/usage: generic local notice"
+    },
+    {
+      "kind": "text_delta",
+      "text": "é 👩‍💻 中\n**tail**"
+    }
+  ],
+  "expected_lines": [
+    {
+      "kind": "system",
+      "text": "provider System remains canonical"
+    },
+    {
+      "kind": "assistant",
+      "text": "B αé 👩‍💻 中\n**tail**"
+    },
+    {
+      "kind": "user",
+      "text": "inspect @note.txt\n```txt\ngeneric fixture contents\n```"
+    },
+    {
+      "kind": "tool",
+      "tool_name": "Bash",
+      "call_id": "call-one",
+      "summary": "",
+      "outcome": "failed",
+      "meta": "exit 3"
+    },
+    {
+      "kind": "tool",
+      "tool_name": "Glob",
+      "call_id": "call-two",
+      "summary": "",
+      "outcome": "ok",
+      "meta": "1 file"
+    },
+    {
+      "kind": "assistant",
+      "text": "B αé 👩‍💻 中\n**tail**"
+    }
+  ],
+  "expected_layout": {
+    "line_count": 6,
+    "baseline_lines": 2,
+    "input_index": 2,
+    "groups": [
+      {
+        "round": 0,
+        "model_index": null,
+        "tools": [
+          {
+            "line_index": 3,
+            "call_id": "call-one",
+            "tool_name": "Bash",
+            "ordinal": 0
+          },
+          {
+            "line_index": 4,
+            "call_id": "call-two",
+            "tool_name": "Glob",
+            "ordinal": 1
+          }
+        ]
+      },
+      {
+        "round": 1,
+        "model_index": 5,
+        "tools": []
+      }
+    ]
+  }
+}

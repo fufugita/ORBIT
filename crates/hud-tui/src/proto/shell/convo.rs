@@ -21,6 +21,104 @@ use unicode_width::UnicodeWidthChar;
 type RowFn = Box<dyn Fn(&mut Cv, i32, i32)>;
 type Row = Option<RowFn>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadOwner {
+    Entry(u64),
+    Section(u64),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPart {
+    Text,
+    Meta,
+    Progress,
+    Separator,
+    Section,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadTarget {
+    pub(crate) owner: ReadOwner,
+    pub(crate) part: ReadPart,
+    pub(crate) raw: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadAnchor {
+    pub(crate) target: ReadTarget,
+    pub(crate) bias: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadMode {
+    Follow,
+    Start,
+    Anchored(ReadAnchor),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowOrigin {
+    owner: ReadOwner,
+    part: ReadPart,
+    span: super::md::SourceSpan,
+}
+pub(crate) struct ReadInput<'a> {
+    pub(crate) epoch: u64,
+    pub(crate) entries: &'a [u64],
+    pub(crate) sections: [u64; 6],
+    pub(crate) section_parent: Option<u64>,
+    pub(crate) mode: ReadMode,
+    pub(crate) delta: isize,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct ConversationFrame {
+    pub(crate) epoch: u64,
+    pub(crate) panel: Rect,
+    pub(crate) viewport: usize,
+    pub(crate) total: usize,
+    pub(crate) start: usize,
+    pub(crate) mode: ReadMode,
+    pub(crate) top: Option<ReadAnchor>,
+    pub(crate) entries: Vec<u64>,
+    origins: Vec<RowOrigin>,
+}
+
+fn span_of(spans: &[super::md::SourceSpan], start: usize, end: usize) -> super::md::SourceSpan {
+    let a = start.min(spans.len());
+    let b = end.max(a).min(spans.len());
+    let mut iter = spans[a..b].iter();
+    let Some(first) = iter.next() else {
+        let at = spans.get(a).map_or_else(
+            || spans.last().map_or(0, |last| last.end),
+            |span| span.start,
+        );
+        return super::md::SourceSpan::owner(at, at);
+    };
+    iter.fold(*first, |span, next| super::md::SourceSpan {
+        start: span.start.min(next.start),
+        end: span.end.max(next.end),
+        generated: span.generated && next.generated,
+    })
+}
+
+fn append_rows(
+    rows: &mut Vec<Row>,
+    origins: &mut Vec<Option<RowOrigin>>,
+    incoming: Vec<Row>,
+    owner: Option<ReadOwner>,
+    part: ReadPart,
+    spans: &[super::md::SourceSpan],
+) {
+    let exact = incoming.len() == spans.len();
+    origins.extend((0..incoming.len()).map(|index| {
+        if exact {
+            owner.map(|owner| RowOrigin {
+                owner,
+                part,
+                span: spans[index],
+            })
+        } else {
+            None
+        }
+    }));
+    rows.extend(incoming);
+}
+
 /// Everything the panel reads.
 pub struct ConvIn<'a> {
     pub s: &'a Scenario,
@@ -89,26 +187,47 @@ fn kind_colour_themed(colors: Palette, kind: &str) -> Rgb {
 /// Split model text into (plain chars, code mask): inline `code` spans
 /// and ``` fenced lines are masked; the markers are dropped.
 pub fn rich_plain(text: &str) -> (Vec<char>, Vec<bool>) {
+    rich_plain_impl(text, None)
+}
+
+fn rich_plain_impl(
+    text: &str,
+    mut origins: Option<&mut Vec<super::md::SourceSpan>>,
+) -> (Vec<char>, Vec<bool>) {
     let mut plain = Vec::new();
     let mut mask = Vec::new();
     let mut fence = false;
+    let mut raw_start = 0;
     let lines: Vec<&str> = text.split('\n').collect();
     for (li, line) in lines.iter().enumerate() {
         if line.trim_start().starts_with("```") {
             fence = !fence;
+            raw_start += line.chars().count() + 1;
             continue;
         }
         if fence {
-            for ch in line.chars() {
+            for (raw, ch) in line.chars().enumerate() {
+                if let Some(sink) = origins.as_deref_mut() {
+                    sink.push(super::md::SourceSpan::source(
+                        raw_start + raw,
+                        raw_start + raw + 1,
+                    ));
+                }
                 plain.push(ch);
                 mask.push(true);
             }
         } else {
             let mut code = false;
-            for ch in line.chars() {
+            for (raw, ch) in line.chars().enumerate() {
                 if ch == '`' {
                     code = !code;
                 } else {
+                    if let Some(sink) = origins.as_deref_mut() {
+                        sink.push(super::md::SourceSpan::source(
+                            raw_start + raw,
+                            raw_start + raw + 1,
+                        ));
+                    }
                     plain.push(ch);
                     mask.push(code);
                 }
@@ -117,7 +236,15 @@ pub fn rich_plain(text: &str) -> (Vec<char>, Vec<bool>) {
         if li + 1 < lines.len() {
             plain.push('\n');
             mask.push(false);
+            let len = line.chars().count();
+            if let Some(sink) = origins.as_deref_mut() {
+                sink.push(super::md::SourceSpan::source(
+                    raw_start + len - usize::from(line.ends_with('\r')),
+                    raw_start + len + 1,
+                ));
+            }
         }
+        raw_start += line.chars().count() + 1;
     }
     (plain, mask)
 }
@@ -155,11 +282,24 @@ fn clip_suffix(text: &str, cells: usize) -> String {
 }
 
 fn user_rows_themed(colors: Palette, l: &TranscriptLine, w: i32) -> Vec<Row> {
+    user_rows_origin(colors, l, w, None)
+}
+
+fn user_rows_origin(
+    colors: Palette,
+    l: &TranscriptLine,
+    w: i32,
+    output: Option<&mut Vec<super::md::SourceSpan>>,
+) -> Vec<Row> {
     let time = l.time.clone().unwrap_or_default();
     let bg = tint(colors.magenta, colors.panel, 0.07);
-    let (plain, mask) = rich_plain(&l.text);
+    let mut origins = Vec::new();
+    let (plain, mask) = rich_plain_impl(&l.text, output.as_ref().map(|_| &mut origins));
     let text: String = plain.iter().collect();
     let lines = wrap_ranges(&text, w - 5 - if time.is_empty() { 0 } else { 7 });
+    if let Some(sink) = output {
+        sink.extend(lines.iter().map(|&(a, b)| span_of(&origins, a, b)));
+    }
     lines
         .into_iter()
         .enumerate()
@@ -388,13 +528,52 @@ fn orbit_rows_themed(
     reduced: bool,
     mono: bool,
 ) -> Vec<Row> {
+    orbit_rows_origin(
+        colors,
+        l,
+        w,
+        ReplyRowOptions {
+            live,
+            now_ms,
+            reduced,
+            mono,
+        },
+        None,
+    )
+}
+
+struct ReplyRowOptions {
+    live: bool,
+    now_ms: u64,
+    reduced: bool,
+    mono: bool,
+}
+
+fn orbit_rows_origin(
+    colors: Palette,
+    l: &TranscriptLine,
+    w: i32,
+    options: ReplyRowOptions,
+    output: Option<&mut Vec<super::md::SourceSpan>>,
+) -> Vec<Row> {
+    let ReplyRowOptions {
+        live,
+        now_ms,
+        reduced,
+        mono,
+    } = options;
     let time = l.time.clone().unwrap_or_default();
     // The reply as the reader sees it: markdown markers gone, what they
     // meant kept as per-character style. Streaming arrival offsets count
     // raw chars; map them onto the displayed ones so the fresh-ink fade
     // keeps its place when markers drop.
     let width = (w - 5 - if time.is_empty() { 0 } else { 7 }).max(1) as usize;
-    let md = super::md::rich_styled_fit(&l.text, width);
+    let (md, origins) = if output.is_some() {
+        let value = super::md::rich_styled_origins(&l.text, width);
+        (value.styled, value.origins)
+    } else {
+        (super::md::rich_styled_fit(&l.text, width), Vec::new())
+    };
     let labels = md.labels.clone();
     let arrivals: Vec<(usize, u64)> = l
         .arrivals
@@ -404,6 +583,9 @@ fn orbit_rows_themed(
     let last_data = arrivals.last().map(|a| a.1);
     let (plain, sty) = (md.plain, md.sty);
     let lines = reply_rows(&plain, &sty, width);
+    if let Some(sink) = output {
+        sink.extend(lines.iter().map(|row| span_of(&origins, row.a, row.b)));
+    }
     let plain: Rc<[char]> = plain.into();
     let sty: Rc<[super::md::Sty]> = sty.into();
     let arrivals: Rc<[(usize, u64)]> = arrivals.into();
@@ -577,9 +759,23 @@ fn think_rows_themed(
 }
 
 fn note_rows_themed(colors: Palette, l: &TranscriptLine, w: i32) -> Vec<Row> {
+    note_rows_origin(colors, l, w, None)
+}
+
+fn note_rows_origin(
+    colors: Palette,
+    l: &TranscriptLine,
+    w: i32,
+    mut output: Option<&mut Vec<super::md::SourceSpan>>,
+) -> Vec<Row> {
     if l.wrap {
-        return wrapped_note_text(&l.text, w - 8)
+        let pieces = wrapped_note_pieces(&l.text, w - 8);
+        if let Some(sink) = output.as_deref_mut() {
+            sink.extend(pieces.iter().map(|piece| piece.1));
+        }
+        return pieces
             .into_iter()
+            .map(|piece| piece.0)
             .enumerate()
             .map(|(index, text)| {
                 Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
@@ -591,6 +787,9 @@ fn note_rows_themed(colors: Palette, l: &TranscriptLine, w: i32) -> Vec<Row> {
             })
             .collect();
     }
+    if let Some(sink) = output {
+        sink.push(super::md::SourceSpan::source(0, l.text.chars().count()));
+    }
     let text = l.text.clone();
     vec![Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
         cv.text(x + 2, y, "∙", colors.faint, None);
@@ -600,45 +799,79 @@ fn note_rows_themed(colors: Palette, l: &TranscriptLine, w: i32) -> Vec<Row> {
 
 /// Wrap just control reports by terminal cells; keep legal long values intact
 /// across rows and recompute ranges when their panel is resized.
+#[cfg(test)]
 fn wrapped_note_text(text: &str, width: i32) -> Vec<String> {
+    wrapped_note_pieces(text, width)
+        .into_iter()
+        .map(|piece| piece.0)
+        .collect()
+}
+
+fn wrapped_note_pieces(text: &str, width: i32) -> Vec<(String, super::md::SourceSpan)> {
     let width = width.max(2) as usize;
+    let mut normalized = String::new();
+    let mut source = Vec::new();
+    let mut raw = text.chars().enumerate().peekable();
+    while let Some((at, ch)) = raw.next() {
+        if ch == '\r' && raw.peek().is_some_and(|(_, next)| *next == '\n') {
+            raw.next();
+            normalized.push('\n');
+            source.push(super::md::SourceSpan::source(at, at + 2));
+        } else {
+            normalized.push(ch);
+            source.push(super::md::SourceSpan::source(at, at + 1));
+        }
+    }
     let mut rows = Vec::new();
-    let structural_newlines = text.replace("\r\n", "\n");
-    for paragraph in structural_newlines.split('\n') {
+    let mut base = 0;
+    for paragraph in normalized.split('\n') {
         let graphemes: Vec<&str> = paragraph.graphemes(true).collect();
+        let mut positions = vec![0];
+        for grapheme in &graphemes {
+            positions.push(positions.last().copied().unwrap_or(0) + grapheme.chars().count());
+        }
         if graphemes.is_empty() {
-            rows.push(String::new());
-            continue;
-        }
-        let mut start = 0;
-        while start < graphemes.len() {
-            let mut end = start;
-            let mut cells = 0usize;
-            let mut word_break = None;
-            while end < graphemes.len() {
-                let grapheme = graphemes[end];
-                let size = text_width(grapheme).max(0) as usize;
-                if cells.saturating_add(size) > width {
-                    break;
+            let boundary = source
+                .get(base)
+                .map_or_else(|| source.last().map_or(0, |s| s.end), |s| s.start);
+            rows.push((
+                String::new(),
+                super::md::SourceSpan::owner(boundary, boundary),
+            ));
+        } else {
+            let mut start = 0;
+            while start < graphemes.len() {
+                let mut end = start;
+                let mut cells = 0usize;
+                let mut word_break = None;
+                while end < graphemes.len() {
+                    let grapheme = graphemes[end];
+                    let size = text_width(grapheme).max(0) as usize;
+                    if cells.saturating_add(size) > width {
+                        break;
+                    }
+                    cells = cells.saturating_add(size);
+                    end += 1;
+                    if grapheme == " " {
+                        word_break = Some(end);
+                    }
                 }
-                cells = cells.saturating_add(size);
-                end += 1;
-                if grapheme == " " {
-                    word_break = Some(end);
+                if end < graphemes.len()
+                    && let Some(boundary) = word_break
+                {
+                    end = boundary;
                 }
+                if end == start {
+                    end += 1;
+                }
+                rows.push((
+                    graphemes[start..end].concat(),
+                    span_of(&source, base + positions[start], base + positions[end]),
+                ));
+                start = end;
             }
-            if end < graphemes.len()
-                && let Some(boundary) = word_break
-            {
-                end = boundary;
-            }
-            if end == start {
-                // Preserve a cluster intact when it is wider than the row.
-                end += 1;
-            }
-            rows.push(graphemes[start..end].concat());
-            start = end;
         }
+        base += paragraph.chars().count() + 1;
     }
     rows
 }
@@ -908,66 +1141,178 @@ fn card_rows_themed(
 }
 
 /// All transcript rows (None = blank), in order.
-fn transcript_rows_themed(
+fn transcript_rows_reading(
     colors: Palette,
     compact: bool,
     inp: &ConvIn,
     w: i32,
-) -> (Vec<Row>, usize) {
+    reading: Option<&ReadInput<'_>>,
+) -> (Vec<Row>, Vec<Option<RowOrigin>>, usize) {
     let s = inp.s;
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows = Vec::new();
+    let mut origins = Vec::new();
     let mut prev: Option<&str> = None;
-    let last_model = s.transcript.iter().rposition(|l| l.kind == LineKind::Model);
-    for (i, l) in s.transcript.iter().enumerate() {
-        let (kind, r): (&str, Vec<Row>) = match l.kind {
-            LineKind::User => ("user", user_rows_themed(colors, l, w)),
-            LineKind::Model => {
-                let live = s.turn_live && s.visible_output && Some(i) == last_model;
-                (
-                    "orbit",
-                    orbit_rows_themed(colors, l, w, live, inp.now_ms, inp.reduced, inp.mono),
-                )
-            }
-            LineKind::Tool => (
-                "card",
-                card_rows_themed(colors, l, w, inp.now_ms, inp.reduced, inp.mono),
-            ),
-            LineKind::System => ("note", note_rows_themed(colors, l, w)),
-            LineKind::Queued => ("note", queued_rows_themed(colors, l, w)),
-        };
-        if r.is_empty() {
+    let last_model = s
+        .transcript
+        .iter()
+        .rposition(|line| line.kind == LineKind::Model);
+    for (index, line) in s.transcript.iter().enumerate() {
+        let mut spans = Vec::new();
+        let (kind, produced, parts): (&str, Vec<Row>, Vec<(ReadPart, super::md::SourceSpan)>) =
+            match line.kind {
+                LineKind::User => {
+                    let produced = if reading.is_some() {
+                        user_rows_origin(colors, line, w, Some(&mut spans))
+                    } else {
+                        user_rows_themed(colors, line, w)
+                    };
+                    (
+                        "user",
+                        produced,
+                        spans
+                            .into_iter()
+                            .map(|span| (ReadPart::Text, span))
+                            .collect(),
+                    )
+                }
+                LineKind::Model => {
+                    let live = s.turn_live && s.visible_output && Some(index) == last_model;
+                    let produced = if reading.is_some() {
+                        orbit_rows_origin(
+                            colors,
+                            line,
+                            w,
+                            ReplyRowOptions {
+                                live,
+                                now_ms: inp.now_ms,
+                                reduced: inp.reduced,
+                                mono: inp.mono,
+                            },
+                            Some(&mut spans),
+                        )
+                    } else {
+                        orbit_rows_themed(colors, line, w, live, inp.now_ms, inp.reduced, inp.mono)
+                    };
+                    (
+                        "orbit",
+                        produced,
+                        spans
+                            .into_iter()
+                            .map(|span| (ReadPart::Text, span))
+                            .collect(),
+                    )
+                }
+                LineKind::Tool => {
+                    let produced =
+                        card_rows_themed(colors, line, w, inp.now_ms, inp.reduced, inp.mono);
+                    let mut parts = vec![(
+                        ReadPart::Text,
+                        super::md::SourceSpan::source(0, line.text.chars().count()),
+                    )];
+                    if kind_of(&line.tool_name) == "AGENT"
+                        && line.tool_state == ToolState::Running
+                        && !line.meta.is_empty()
+                    {
+                        parts.push((
+                            ReadPart::Meta,
+                            super::md::SourceSpan::source(0, line.meta.chars().count()),
+                        ));
+                    }
+                    if line.tool_state == ToolState::Running {
+                        parts.push((ReadPart::Progress, super::md::SourceSpan::owner(0, 0)));
+                    }
+                    ("card", produced, parts)
+                }
+                LineKind::System => {
+                    let produced = if reading.is_some() {
+                        note_rows_origin(colors, line, w, Some(&mut spans))
+                    } else {
+                        note_rows_themed(colors, line, w)
+                    };
+                    (
+                        "note",
+                        produced,
+                        spans
+                            .into_iter()
+                            .map(|span| (ReadPart::Text, span))
+                            .collect(),
+                    )
+                }
+                LineKind::Queued => (
+                    "note",
+                    queued_rows_themed(colors, line, w),
+                    vec![(
+                        ReadPart::Text,
+                        super::md::SourceSpan::source(0, line.text.chars().count()),
+                    )],
+                ),
+            };
+        if produced.is_empty() {
             continue;
         }
-        let both_cards = prev == Some("card") && kind == "card";
-        if !rows.is_empty() && !both_cards && !compact {
+        let owner = reading
+            .and_then(|input| input.entries.get(index).copied())
+            .map(ReadOwner::Entry);
+        if !rows.is_empty() && !(prev == Some("card") && kind == "card") && !compact {
             rows.push(None);
+            origins.push(owner.map(|owner| RowOrigin {
+                owner,
+                part: ReadPart::Separator,
+                span: super::md::SourceSpan::owner(0, 0),
+            }));
         }
-        rows.extend(r);
+        let exact = produced.len() == parts.len();
+        for (at, row) in produced.into_iter().enumerate() {
+            origins.push(if exact {
+                owner.map(|owner| RowOrigin {
+                    owner,
+                    part: parts[at].0,
+                    span: parts[at].1,
+                })
+            } else {
+                None
+            });
+            rows.push(row);
+        }
         prev = Some(kind);
     }
-    // Honest waiting (design law 5): the row says the MODEL is awaited
-    // only when it is. While an approval is open, a tool runs or a
-    // subagent works, the row is absent — the card, the tool line and
-    // the status bar already say what is happening.
+    let owner = |kind: usize| reading.map(|input| ReadOwner::Section(input.sections[kind]));
+    let separator =
+        |rows: &mut Vec<Row>, origins: &mut Vec<Option<RowOrigin>>, owner: Option<ReadOwner>| {
+            rows.push(None);
+            origins.push(owner.map(|owner| RowOrigin {
+                owner,
+                part: ReadPart::Separator,
+                span: super::md::SourceSpan::owner(0, 0),
+            }));
+        };
     if matches!(
         s.activity(),
         super::super::scenario::Activity::WaitingModel(_)
     ) {
         if !rows.is_empty() {
-            rows.push(None);
+            separator(&mut rows, &mut origins, owner(0));
         }
-        rows.extend(think_rows_themed(
+        let produced = think_rows_themed(
             colors,
             s.model.clone(),
             s.turn_started_ms,
             inp.now_ms,
             inp.reduced,
             inp.mono,
-        ));
-    } else if let Some(r) = &s.turn_report
+        );
+        append_rows(
+            &mut rows,
+            &mut origins,
+            produced,
+            owner(0),
+            ReadPart::Section,
+            &[super::md::SourceSpan::owner(0, 0)],
+        );
+    } else if let Some(report) = &s.turn_report
         && !s.turn_live
     {
-        let noun = if r.tools == 1 { "tool" } else { "tools" };
+        let noun = if report.tools == 1 { "tool" } else { "tools" };
         let state = if s.ordinary_cancelled() {
             "⊘ cancelled"
         } else if s.last_failed {
@@ -975,18 +1320,23 @@ fn transcript_rows_themed(
         } else {
             "✓ done"
         };
-        let mut t = format!("{state} · {}s · {} {noun}", r.duration_ms / 1000, r.tools);
-        if r.priced {
-            t.push_str(&format!(
+        let mut text = format!(
+            "{state} · {}s · {} {noun}",
+            report.duration_ms / 1000,
+            report.tools
+        );
+        if report.priced {
+            text.push_str(&format!(
                 " · +${:.3}",
-                r.cost_microcents as f64 / 1_000_000.0
+                report.cost_microcents as f64 / 1_000_000.0
             ));
         }
-        rows.push(None);
-        rows.extend(if s.ordinary_cancelled() {
+        let span = super::md::SourceSpan::source(0, text.chars().count());
+        separator(&mut rows, &mut origins, owner(1));
+        let produced = if s.ordinary_cancelled() {
             report_rows_accent(
                 colors,
-                t,
+                text,
                 s.turn_ended_ms,
                 inp.now_ms,
                 inp.reduced,
@@ -995,36 +1345,56 @@ fn transcript_rows_themed(
         } else {
             report_rows_themed(
                 colors,
-                t,
+                text,
                 s.turn_ended_ms,
                 inp.now_ms,
                 inp.reduced,
                 s.last_failed,
             )
-        });
+        };
+        append_rows(
+            &mut rows,
+            &mut origins,
+            produced,
+            owner(1),
+            ReadPart::Section,
+            &[span],
+        );
     }
     if s.last_failed {
         if !rows.is_empty() {
-            rows.push(None);
+            separator(&mut rows, &mut origins, owner(2));
         }
         let reason = s
             .failure_reason
             .as_deref()
             .filter(|text| !text.is_empty())
             .unwrap_or("No error details available");
-        let text = format!("This turn failed · {reason}");
-        rows.extend(wrapped_note_text(&text, w - 8).into_iter().enumerate().map(
-            |(index, text)| {
+        let pieces = wrapped_note_pieces(&format!("This turn failed · {reason}"), w - 8);
+        let spans: Vec<_> = pieces.iter().map(|piece| piece.1).collect();
+        let produced = pieces
+            .into_iter()
+            .enumerate()
+            .map(|(index, (text, _))| {
                 Some(Box::new(move |cv: &mut Cv, x: i32, y: i32| {
                     if index == 0 {
                         cv.text(x + 2, y, "✕", colors.red, None);
                     }
                     cv.text(x + 4, y, &text, colors.red, None);
                 }) as RowFn)
-            },
-        ));
+            })
+            .collect();
+        append_rows(
+            &mut rows,
+            &mut origins,
+            produced,
+            owner(2),
+            ReadPart::Section,
+            &spans,
+        );
         if s.can_resend_ordinary() && inp.focused && inp.composer.is_empty() {
-            rows.extend(note_rows_themed(
+            let mut spans = Vec::new();
+            let produced = note_rows_origin(
                 colors,
                 &TranscriptLine {
                     kind: LineKind::System,
@@ -1033,12 +1403,22 @@ fn transcript_rows_themed(
                     ..Default::default()
                 },
                 w,
-            ));
+                Some(&mut spans),
+            );
+            append_rows(
+                &mut rows,
+                &mut origins,
+                produced,
+                owner(3),
+                ReadPart::Section,
+                &spans,
+            );
         }
     }
     let mut acknowledgement_rows = 0;
     if let Some(source) = &s.cleared_from {
-        let acknowledgement = note_rows_themed(
+        let mut spans = Vec::new();
+        let produced = note_rows_origin(
             colors,
             &TranscriptLine {
                 kind: LineKind::System,
@@ -1047,15 +1427,24 @@ fn transcript_rows_themed(
                 ..Default::default()
             },
             w,
+            Some(&mut spans),
         );
-        acknowledgement_rows = acknowledgement.len();
+        acknowledgement_rows = produced.len();
         if !rows.is_empty() {
-            rows.push(None);
+            separator(&mut rows, &mut origins, owner(4));
         }
-        rows.extend(acknowledgement);
+        append_rows(
+            &mut rows,
+            &mut origins,
+            produced,
+            owner(4),
+            ReadPart::Section,
+            &spans,
+        );
     }
     if let Some(notice) = s.backend_notice() {
-        let notice_rows = note_rows_themed(
+        let mut spans = Vec::new();
+        let produced = note_rows_origin(
             colors,
             &TranscriptLine {
                 kind: LineKind::System,
@@ -1064,14 +1453,22 @@ fn transcript_rows_themed(
                 ..Default::default()
             },
             w,
+            Some(&mut spans),
         );
-        acknowledgement_rows += notice_rows.len();
+        acknowledgement_rows += produced.len();
         if !rows.is_empty() {
-            rows.push(None);
+            separator(&mut rows, &mut origins, owner(5));
         }
-        rows.extend(notice_rows);
+        append_rows(
+            &mut rows,
+            &mut origins,
+            produced,
+            owner(5),
+            ReadPart::Section,
+            &spans,
+        );
     }
-    (rows, acknowledgement_rows)
+    (rows, origins, acknowledgement_rows)
 }
 
 /// The approval card's facts, keys and risk — from real data only.
@@ -1858,7 +2255,173 @@ mod composer_render_tests {
 }
 
 /// Draw the whole Conversation panel into `r`.
+fn target_raw(input: &ReadInput<'_>, s: &Scenario, target: ReadTarget) -> usize {
+    let ReadOwner::Entry(id) = target.owner else {
+        return target.raw;
+    };
+    let Some(index) = input.entries.iter().position(|entry| *entry == id) else {
+        return target.raw;
+    };
+    let Some(line) = s.transcript.get(index) else {
+        return target.raw;
+    };
+    let text = if target.part == ReadPart::Meta {
+        &line.meta
+    } else {
+        &line.text
+    };
+    let mut offset = 0;
+    let mut boundary = 0;
+    for grapheme in text.graphemes(true) {
+        if offset > target.raw {
+            break;
+        }
+        boundary = offset;
+        offset += grapheme.chars().count();
+    }
+    if target.raw >= offset {
+        offset
+    } else {
+        boundary
+    }
+}
+
+fn origin_distance(span: super::md::SourceSpan, raw: usize) -> usize {
+    if raw < span.start {
+        span.start - raw
+    } else if raw >= span.end && span.end > span.start {
+        raw - (span.end - 1)
+    } else {
+        raw.saturating_sub(span.end)
+    }
+}
+
+fn target_row(origins: &[RowOrigin], target: ReadTarget) -> Option<usize> {
+    origins
+        .iter()
+        .enumerate()
+        .filter(|(_, origin)| origin.owner == target.owner && origin.part == target.part)
+        .min_by_key(|(index, origin)| {
+            (
+                origin_distance(origin.span, target.raw),
+                usize::from(origin.span.start > target.raw),
+                *index,
+            )
+        })
+        .map(|(index, _)| index)
+}
+
+fn anchored_row(origins: &[RowOrigin], anchor: ReadAnchor) -> Option<usize> {
+    let base = target_row(origins, anchor.target)?;
+    let origin = origins.get(base)?;
+    let limit = origins[base..]
+        .iter()
+        .take_while(|candidate| {
+            candidate.owner == origin.owner
+                && candidate.part == origin.part
+                && candidate.span == origin.span
+        })
+        .count()
+        .saturating_sub(1);
+    Some(base.saturating_add(anchor.bias.min(limit)))
+}
+
+fn anchor_at(origins: &[RowOrigin], index: usize) -> Option<ReadAnchor> {
+    let origin = origins.get(index)?;
+    let target = ReadTarget {
+        owner: origin.owner,
+        part: origin.part,
+        raw: origin.span.start,
+    };
+    let base = target_row(origins, target)?;
+    Some(ReadAnchor {
+        target,
+        bias: index.saturating_sub(base),
+    })
+}
+
+fn resolve_reading(
+    input: &ReadInput<'_>,
+    s: &Scenario,
+    origins: &[RowOrigin],
+    last: usize,
+) -> (usize, ReadMode) {
+    let (base, retained) = match input.mode {
+        ReadMode::Follow => (last, ReadMode::Follow),
+        ReadMode::Start => (0, ReadMode::Start),
+        ReadMode::Anchored(mut anchor) => {
+            anchor.target.raw = target_raw(input, s, anchor.target);
+            if let Some(index) = anchored_row(origins, anchor) {
+                (index.min(last), ReadMode::Anchored(anchor))
+            } else {
+                let fallback = origins
+                    .iter()
+                    .position(|origin| origin.owner == anchor.target.owner)
+                    .or_else(|| match anchor.target.owner {
+                        ReadOwner::Section(_) => input.section_parent.and_then(|id| {
+                            origins
+                                .iter()
+                                .rposition(|origin| origin.owner == ReadOwner::Entry(id))
+                        }),
+                        ReadOwner::Entry(_) => None,
+                    });
+                let index = fallback.unwrap_or(0).min(last);
+                (
+                    index,
+                    fallback
+                        .and_then(|_| anchor_at(origins, index))
+                        .map(ReadMode::Anchored)
+                        .unwrap_or(ReadMode::Start),
+                )
+            }
+        }
+    };
+    let start = if input.delta >= 0 {
+        base.saturating_sub(input.delta as usize)
+    } else {
+        base.saturating_add(input.delta.unsigned_abs()).min(last)
+    };
+    let mode = if input.delta == 0 {
+        retained
+    } else if input.delta < 0 && start == last {
+        ReadMode::Follow
+    } else {
+        anchor_at(origins, start)
+            .map(ReadMode::Anchored)
+            .unwrap_or(ReadMode::Start)
+    };
+    (start, mode)
+}
+
+impl ConversationFrame {
+    pub(crate) fn navigate(&self, from: usize, delta: isize) -> (usize, ReadMode) {
+        let last = self.total.saturating_sub(self.viewport);
+        let start = if delta >= 0 {
+            from.saturating_sub(delta as usize)
+        } else {
+            from.saturating_add(delta.unsigned_abs()).min(last)
+        };
+        let mode = if delta < 0 && start == last {
+            ReadMode::Follow
+        } else {
+            anchor_at(&self.origins, start)
+                .map(ReadMode::Anchored)
+                .unwrap_or(ReadMode::Start)
+        };
+        (start, mode)
+    }
+}
+
 pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
+    let _ = draw_reading(cv, r, inp, None);
+}
+
+pub(crate) fn draw_reading(
+    cv: &mut Cv,
+    r: Rect,
+    inp: &ConvIn,
+    reading: Option<&ReadInput<'_>>,
+) -> Option<ConversationFrame> {
     let colors = cv.palette;
     let s = inp.s;
     let ap = approval_of(s, inp.now_ms);
@@ -1904,9 +2467,7 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
         footer: vec![],
         footer_parts: vec![],
     };
-    let Some(inner) = panel_frame(cv, r, &spec) else {
-        return;
-    };
+    let inner = panel_frame(cv, r, &spec)?;
     let (x, y, w, h) = (
         inner.x as i32,
         inner.y as i32,
@@ -1914,8 +2475,9 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
         inner.height as i32,
     );
     if w < 8 || h < 4 {
-        return;
+        return None;
     }
+    let mut feedback = None;
     cv.clipped(
         Rect {
             x: r.x + 1,
@@ -1930,7 +2492,8 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
                 None => 3 + i32::from(inp.history_search.is_some()),
             };
             let view_h = (h - bottom_h).max(0);
-            let (rows, acknowledgement_rows) = transcript_rows_themed(colors, cv.compact, inp, w);
+            let (rows, origins, acknowledgement_rows) =
+                transcript_rows_reading(colors, cv.compact, inp, w, reading);
             // The welcome hero (M01 startup, M26 welcome orbit): shown on an
             // empty session and while the first prompt waits.
             let hero_on = inp.brand != BrandTier::Off
@@ -1966,17 +2529,33 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
                 || s.backend_notice().is_some()
                 || s.ordinary_cancelled()
             {
-                let view_h = view_h - used;
-                let total = rows.len() as i32;
-                let start = (total - view_h - inp.scroll_offset as i32).max(0);
-                let shown = (total - start).min(view_h);
-                let top = y + used + view_h - shown.min(view_h);
-                for (i, row) in rows
-                    .iter()
-                    .skip(start as usize)
-                    .take(shown as usize)
-                    .enumerate()
+                let view_h = (view_h - used).max(0) as usize;
+                let total = rows.len();
+                let exact: Option<Vec<_>> = origins.iter().copied().collect();
+                let last = total.saturating_sub(view_h);
+                let (start, mode) = match (reading, exact.as_deref()) {
+                    (Some(input), Some(origins)) => resolve_reading(input, inp.s, origins, last),
+                    _ => (last.saturating_sub(inp.scroll_offset), ReadMode::Follow),
+                };
+                let shown = total.saturating_sub(start).min(view_h);
+                let top = y + used + view_h as i32 - shown as i32;
+                if let (Some(input), Some(origins)) = (reading, exact)
+                    && view_h > 0
                 {
+                    let top = anchor_at(&origins, start);
+                    feedback = Some(ConversationFrame {
+                        epoch: input.epoch,
+                        panel: r,
+                        viewport: view_h,
+                        total,
+                        start,
+                        mode,
+                        top,
+                        entries: input.entries.to_vec(),
+                        origins,
+                    });
+                }
+                for (i, row) in rows.iter().skip(start).take(shown).enumerate() {
                     if let Some(f) = row {
                         f(cv, x, top + i as i32);
                     }
@@ -2031,6 +2610,7 @@ pub fn draw(cv: &mut Cv, r: Rect, inp: &ConvIn) {
             }
         },
     );
+    feedback
 }
 
 /// File rows follow the highlighted candidate just like slash completion.
@@ -2621,5 +3201,261 @@ mod reply_row_tests {
                 ratatui::style::Color::Rgb(rgb.0, rgb.1, rgb.2)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reading_anchor_tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    fn reading<'a>(entries: &'a [u64], mode: ReadMode) -> ReadInput<'a> {
+        ReadInput {
+            epoch: 1,
+            entries,
+            sections: [100, 101, 102, 103, 104, 105],
+            section_parent: entries.last().copied(),
+            mode,
+            delta: 0,
+        }
+    }
+    fn input(s: &Scenario) -> ConvIn<'_> {
+        ConvIn {
+            s,
+            now_ms: 9000,
+            reduced: true,
+            mono: false,
+            composer: "",
+            composer_cursor: 0,
+            completion_sel: 0,
+            file_completion: None,
+            history_search: None,
+            focused: false,
+            focus_fx: super::super::frame::FocusFx::settled(false),
+            scroll_offset: 0,
+            num: 1,
+            brand: BrandTier::Off,
+        }
+    }
+    fn paint(s: &Scenario, reading: &ReadInput<'_>, width: u16) -> (ConversationFrame, String) {
+        let area = Rect::new(0, 0, width, 18);
+        let mut buffer = Buffer::empty(area);
+        let frame =
+            draw_reading(&mut Cv::new(&mut buffer), area, &input(s), Some(reading)).unwrap();
+        let text = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        (frame, text)
+    }
+    fn model(text: String) -> Scenario {
+        let mut s = Scenario::new();
+        s.transcript = vec![TranscriptLine {
+            kind: LineKind::Model,
+            text,
+            ..Default::default()
+        }];
+        s
+    }
+    fn pin(raw: usize) -> ReadMode {
+        ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(7),
+                part: ReadPart::Text,
+                raw,
+            },
+            bias: 0,
+        })
+    }
+
+    #[test]
+    fn one_streaming_entry_keeps_the_same_source_row_while_more_rows_arrive() {
+        let mut s = model(
+            (0..40)
+                .map(|n| format!("ROW_{n:02} payload"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let raw = s.transcript[0].text.find("ROW_10").unwrap();
+        let mode = pin(raw);
+        let read = reading(&[7], mode);
+        let (before, text) = paint(&s, &read, 50);
+        assert!(text.contains("ROW_10 payload"));
+        s.transcript[0]
+            .text
+            .push_str("\nextra appended output\nmore output");
+        let (after, text) = paint(&s, &read, 50);
+        assert_eq!(s.transcript.len(), 1);
+        assert!(after.total > before.total);
+        assert_eq!(after.start, before.start);
+        assert_eq!(after.mode, mode);
+        assert_eq!(after.top.unwrap().target.raw, raw);
+        assert!(text.contains("ROW_10 payload"));
+    }
+
+    #[test]
+    fn repeated_width_changes_preserve_raw_anchor_intent_across_grapheme_reflow() {
+        let text = (0..35)
+            .map(|n| format!("PIN_{n:02} e\u{301} 👩‍💻 漢字 long payload with more words"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let s = model(text);
+        let byte = s.transcript[0].text.find("PIN_12").unwrap();
+        let raw = s.transcript[0].text[..byte].chars().count();
+        assert_eq!(raw, 552);
+        assert_eq!(byte, 708);
+        let mode = pin(raw);
+        let read = reading(&[7], mode);
+        let (wide, _) = paint(&s, &read, 76);
+        let (narrow, text) = paint(&s, &read, 40);
+        let (restored, _) = paint(&s, &read, 76);
+        assert_eq!(narrow.mode, mode);
+        assert_eq!(restored.mode, mode);
+        assert_eq!(wide.start, restored.start);
+        assert!(text.contains("PIN_12"));
+        assert_eq!(narrow.top.unwrap().target.raw, raw);
+        let top = narrow.top.unwrap().target.raw;
+        let boundary = s.transcript[0]
+            .text
+            .grapheme_indices(true)
+            .any(|(byte, _)| s.transcript[0].text[..byte].chars().count() == top);
+        assert!(boundary);
+    }
+
+    #[test]
+    fn a_new_markdown_closer_reflows_the_same_entry_without_changing_its_raw_owner() {
+        let mut s = model(format!(
+            "{}\n**target words that can reflow",
+            "prefix\n".repeat(20)
+        ));
+        let raw = s.transcript[0].text.find("target").unwrap();
+        let mode = pin(raw);
+        let read = reading(&[7], mode);
+        let (_, before) = paint(&s, &read, 40);
+        assert!(before.contains("target"));
+        s.transcript[0].text.push_str("**\nextra\nextra\nextra\nextra\nextra\nextra\nextra\nextra\nextra\nextra\nextra\nextra");
+        let (after, text) = paint(&s, &read, 40);
+        assert_eq!(after.mode, mode);
+        assert!(text.contains("target"));
+        assert_eq!(after.top.unwrap().target.owner, ReadOwner::Entry(7));
+    }
+
+    #[test]
+    fn settling_a_running_card_reanchors_removed_progress_to_its_surviving_header() {
+        let mut s = Scenario::new();
+        s.transcript = vec![TranscriptLine {
+            kind: LineKind::Tool,
+            tool_name: "Agent".into(),
+            call_id: "call".into(),
+            text: "inspect sources".into(),
+            meta: "reading".into(),
+            tool_state: ToolState::Running,
+            ..Default::default()
+        }];
+        let mode = ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(7),
+                part: ReadPart::Progress,
+                raw: 0,
+            },
+            bias: 0,
+        });
+        let read = reading(&[7], mode);
+        let (_, before) = paint(&s, &read, 60);
+        assert!(before.contains("inspect sources"));
+        s.transcript[0].tool_state = ToolState::Done;
+        let (after, text) = paint(&s, &read, 60);
+        assert!(text.contains("inspect sources"));
+        assert!(matches!(
+            after.mode,
+            ReadMode::Anchored(ReadAnchor {
+                target: ReadTarget {
+                    owner: ReadOwner::Entry(7),
+                    part: ReadPart::Text,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn every_existing_entry_and_generated_section_row_has_a_semantic_owner() {
+        let mut s = Scenario::new();
+        s.transcript = vec![
+            TranscriptLine {
+                kind: LineKind::User,
+                text: "user `code`\nnext".into(),
+                ..Default::default()
+            },
+            TranscriptLine {
+                kind: LineKind::Model,
+                text: "| a | b |\n|---|---|\n| e\u{301} | 漢 |".into(),
+                ..Default::default()
+            },
+            TranscriptLine {
+                kind: LineKind::System,
+                wrap: true,
+                text: "report ".repeat(30),
+                ..Default::default()
+            },
+            TranscriptLine {
+                kind: LineKind::Queued,
+                text: "queued".into(),
+                ..Default::default()
+            },
+            TranscriptLine {
+                kind: LineKind::Tool,
+                tool_name: "Agent".into(),
+                text: "target".into(),
+                meta: "working".into(),
+                tool_state: ToolState::Running,
+                ..Default::default()
+            },
+        ];
+        s.last_failed = true;
+        s.failure_reason = Some("long reason ".repeat(10));
+        s.cleared_from = Some("old".into());
+        s.turn_report = Some(crate::proto::scenario::TurnReport {
+            duration_ms: 9000,
+            tools: 1,
+            cost_microcents: 0,
+            priced: false,
+        });
+        let read = reading(&[1, 2, 3, 4, 5], ReadMode::Start);
+        let (rows, origins, ack) =
+            transcript_rows_reading(Palette::default(), false, &input(&s), 40, Some(&read));
+        assert_eq!(rows.len(), origins.len());
+        assert!(origins.iter().all(Option::is_some));
+        assert!(ack > 0);
+        assert!(
+            origins
+                .iter()
+                .flatten()
+                .any(|origin| origin.owner == ReadOwner::Section(101))
+        );
+        assert!(
+            origins
+                .iter()
+                .flatten()
+                .any(|origin| origin.owner == ReadOwner::Section(102))
+        );
+        assert!(
+            origins
+                .iter()
+                .flatten()
+                .any(|origin| origin.owner == ReadOwner::Section(104))
+        );
+    }
+
+    #[test]
+    fn reflow_bottom_clamping_stays_anchored_until_explicit_downward_navigation() {
+        let s = model("one\ntwo\nthree".into());
+        let mode = pin(4);
+        let read = reading(&[7], mode);
+        let (frame, _) = paint(&s, &read, 60);
+        assert_eq!(frame.start, 0);
+        assert_eq!(frame.mode, mode);
+        assert!(matches!(
+            frame.navigate(frame.start, -3).1,
+            ReadMode::Follow
+        ));
     }
 }

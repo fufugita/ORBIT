@@ -13,7 +13,9 @@ use crate::session_accounting::{
 #[cfg(test)]
 use orbit_adapter::types::EffortSetting;
 use orbit_adapter::types::{ChatMessage, ChatRole, ContentBlock};
-use orbit_hud_tui::bus::BusSender;
+use orbit_hud_tui::bus::{
+    BusSender, ViewProjectionGroup, ViewProjectionLayout, ViewToolProjection,
+};
 use orbit_hud_tui::model::TranscriptLine;
 use orbit_hud_tui::msg::{
     ContextProjection, CostQualification, ManualOutcome, Msg, OrdinaryEnd, OrdinaryPublication,
@@ -721,6 +723,23 @@ fn worker_main_owned(
         {
             cmd = WorkerCommand::Prompt(body);
         }
+        // Only the actual successfully started ordinary registration can
+        // mint this display publisher. Unbound/nonordinary commands retain
+        // their existing sender and never acquire ordinary source evidence.
+        let ordinary_view = foreground.as_ref().and_then(|(operation, registration)| {
+            matches!(
+                operation.kind(),
+                ForegroundKind::Prompt | ForegroundKind::PlanPrompt
+            )
+            .then(|| ctx.sender.scoped_view(registration))
+            .flatten()
+        });
+        let turn_sender = ordinary_view
+            .as_ref()
+            .map_or_else(|| ctx.sender.clone(), |view| view.sender());
+        let mut view_journal = ordinary_view
+            .as_ref()
+            .map(|_| OrdinaryViewJournal::new(&transcript));
         let project_after = matches!(
             &cmd,
             WorkerCommand::Prompt(_)
@@ -745,7 +764,7 @@ fn worker_main_owned(
                 }
                 WorkerCommand::PlanPrompt(prompt) => {
                     let Some(next_turns) = turns.checked_add(1) else {
-                        orbit_hud_tui::emit_error(&ctx.sender, "session turn count overflows");
+                        orbit_hud_tui::emit_error(&turn_sender, "session turn count overflows");
                         retain_local_intent(&mut transcript, &prompt, None);
                         let saved = save_turn(
                             &config,
@@ -757,19 +776,19 @@ fn worker_main_owned(
                             &mut cum_output,
                             &mut cum_cost,
                             selection_origin,
-                            &ctx.sender,
+                            &turn_sender,
                             &mut qualification,
                             false,
                         );
                         emit_ordinary_result(
-                            &ctx.sender,
+                            &turn_sender,
                             foreground.as_ref().map(|(operation, _)| operation),
                             Err("session turn count overflows"),
                             saved,
                             &qualification,
                         );
                         orbit_hud_tui::emit_response_finished(
-                            &ctx.sender,
+                            &turn_sender,
                             "",
                             cum_input,
                             cum_output,
@@ -785,12 +804,12 @@ fn worker_main_owned(
                         "{system_prompt}\n\n## PLAN MODE (read-only)\nYou are in plan mode. Do NOT attempt changes; all tool calls will be denied. Explore the problem, then respond with a concise, numbered implementation plan. End with a line: `PLAN READY`."
                     );
                     let mut scope = std::mem::take(&mut config.scope);
-                    let completion = run_tui_turn_inner(
+                    let completion = run_tui_turn_observed(
                         &config,
                         &mut transcript,
                         &prompt,
                         None,
-                        &ctx.sender,
+                        &turn_sender,
                         &ctx.approvals,
                         &token,
                         turns,
@@ -800,6 +819,7 @@ fn worker_main_owned(
                         &mut scope,
                         &tool_cx,
                         Some(accounting.namespace()),
+                        view_journal.as_mut(),
                     );
                     config.scope = scope;
                     if let Ok(mut guard) = cancel_slot.lock() {
@@ -817,7 +837,7 @@ fn worker_main_owned(
                                 && !completion.report.final_text.trim().is_empty()
                         }
                         Err(error) => {
-                            orbit_hud_tui::emit_error(&ctx.sender, error);
+                            orbit_hud_tui::emit_error(&turn_sender, error);
                             retain_local_intent(&mut transcript, &prompt, None);
                             false
                         }
@@ -832,12 +852,12 @@ fn worker_main_owned(
                         &mut cum_output,
                         &mut cum_cost,
                         selection_origin,
-                        &ctx.sender,
+                        &turn_sender,
                         &mut qualification,
                         false,
                     );
                     emit_ordinary_result(
-                        &ctx.sender,
+                        &turn_sender,
                         foreground.as_ref().map(|(operation, _)| operation),
                         completion
                             .as_ref()
@@ -847,7 +867,7 @@ fn worker_main_owned(
                         &qualification,
                     );
                     orbit_hud_tui::emit_response_finished(
-                        &ctx.sender,
+                        &turn_sender,
                         "",
                         cum_input,
                         cum_output,
@@ -857,12 +877,12 @@ fn worker_main_owned(
                         && saved
                         && let Ok((completion, _)) = completion
                     {
-                        orbit_hud_tui::emit_plan_ready(&ctx.sender, &completion.report.final_text);
+                        orbit_hud_tui::emit_plan_ready(&turn_sender, &completion.report.final_text);
                     }
                 }
                 WorkerCommand::Prompt(prompt) => {
                     let Some(next_turns) = turns.checked_add(1) else {
-                        orbit_hud_tui::emit_error(&ctx.sender, "session turn count overflows");
+                        orbit_hud_tui::emit_error(&turn_sender, "session turn count overflows");
                         retain_local_intent(&mut transcript, &prompt, None);
                         let saved = save_turn(
                             &config,
@@ -874,19 +894,19 @@ fn worker_main_owned(
                             &mut cum_output,
                             &mut cum_cost,
                             selection_origin,
-                            &ctx.sender,
+                            &turn_sender,
                             &mut qualification,
                             false,
                         );
                         emit_ordinary_result(
-                            &ctx.sender,
+                            &turn_sender,
                             foreground.as_ref().map(|(operation, _)| operation),
                             Err("session turn count overflows"),
                             saved,
                             &qualification,
                         );
                         orbit_hud_tui::emit_response_finished(
-                            &ctx.sender,
+                            &turn_sender,
                             "",
                             cum_input,
                             cum_output,
@@ -917,12 +937,12 @@ fn worker_main_owned(
                     let transcript_len_before = transcript.len();
                     let directive = system_prompt.clone();
                     let mut scope = std::mem::take(&mut config.scope);
-                    let completion = run_tui_turn_inner(
+                    let completion = run_tui_turn_observed(
                         &config,
                         &mut transcript,
                         &expanded_prompt,
                         user_blocks.clone(),
-                        &ctx.sender,
+                        &turn_sender,
                         &ctx.approvals,
                         &token,
                         turns,
@@ -932,6 +952,7 @@ fn worker_main_owned(
                         &mut scope,
                         &tool_cx,
                         Some(accounting.namespace()),
+                        view_journal.as_mut(),
                     );
                     config.scope = scope;
                     if let Ok(mut guard) = cancel_slot.lock() {
@@ -946,7 +967,7 @@ fn worker_main_owned(
                             );
                         }
                         Err(error) => {
-                            orbit_hud_tui::emit_error(&ctx.sender, error);
+                            orbit_hud_tui::emit_error(&turn_sender, error);
                             retain_local_intent(&mut transcript, &expanded_prompt, user_blocks);
                         }
                     }
@@ -960,7 +981,7 @@ fn worker_main_owned(
                         &mut cum_output,
                         &mut cum_cost,
                         selection_origin,
-                        &ctx.sender,
+                        &turn_sender,
                         &mut qualification,
                         false,
                     );
@@ -972,7 +993,7 @@ fn worker_main_owned(
                         && scan.exit_code != 0
                     {
                         orbit_hud_tui::emit_status(
-                            &ctx.sender,
+                            &turn_sender,
                             &format!(
                                 "UNVERIFIED CLAIM: \"{}\" exited {} at turn time — the claim is not attested",
                                 scan.command, scan.exit_code
@@ -980,7 +1001,7 @@ fn worker_main_owned(
                         );
                     }
                     emit_ordinary_result(
-                        &ctx.sender,
+                        &turn_sender,
                         foreground.as_ref().map(|(operation, _)| operation),
                         completion
                             .as_ref()
@@ -995,7 +1016,7 @@ fn worker_main_owned(
                     // reducer stamps a "cancelled" note when cancel_requested was
                     // set.
                     orbit_hud_tui::emit_response_finished(
-                        &ctx.sender,
+                        &turn_sender,
                         "",
                         cum_input,
                         cum_output,
@@ -1049,7 +1070,7 @@ fn worker_main_owned(
                     let providers = match crate::config::ProvidersConfig::load(&config.home) {
                         Ok(providers) => providers,
                         Err(error) => {
-                            ctx.sender
+                            turn_sender
                                 .send(Msg::EffortStatus(format!("Model unchanged:\n{error}")));
                             break 'command;
                         }
@@ -1058,7 +1079,7 @@ fn worker_main_owned(
                         match crate::resolve_selected_model(&providers, &model, None, false) {
                             Ok(selected) => selected,
                             Err(error) => {
-                                ctx.sender
+                                turn_sender
                                     .send(Msg::EffortStatus(format!("Model unchanged:\n{error}")));
                                 break 'command;
                             }
@@ -1070,7 +1091,7 @@ fn worker_main_owned(
                     let resolved = match configured_turn(&candidate) {
                         Ok(turn) => turn,
                         Err(e) => {
-                            ctx.sender.send(Msg::EffortStatus(format!(
+                            turn_sender.send(Msg::EffortStatus(format!(
                                 "Model unchanged:\n{e}\nUse /effort default before switching."
                             )));
                             break 'command;
@@ -1085,7 +1106,7 @@ fn worker_main_owned(
                         &mut cum_input,
                         &mut cum_output,
                         &mut cum_cost,
-                        &ctx.sender,
+                        &turn_sender,
                         crate::phase_routing::SelectionOrigin::Interactive,
                         &mut qualification,
                     ) {
@@ -1100,9 +1121,9 @@ fn worker_main_owned(
                         build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
                     tool_cx.set_ext(MemoryBytes(built.memory_bytes));
                     system_prompt = built.text;
-                    ctx.sender.send(Msg::ModelChanged(config.model.clone()));
+                    turn_sender.send(Msg::ModelChanged(config.model.clone()));
                     orbit_hud_tui::emit_status(
-                        &ctx.sender,
+                        &turn_sender,
                         &format!("model → {model} (was {old})"),
                     );
                 }
@@ -1112,7 +1133,7 @@ fn worker_main_owned(
                         match crate::parse_effort_setting(&value) {
                             Ok(choice) => candidate.effort = Some(choice),
                             Err(e) => {
-                                ctx.sender
+                                turn_sender
                                     .send(Msg::EffortStatus(format!("Effort unchanged:\n{e}")));
                                 break 'command;
                             }
@@ -1130,7 +1151,7 @@ fn worker_main_owned(
                                     &mut cum_input,
                                     &mut cum_output,
                                     &mut cum_cost,
-                                    &ctx.sender,
+                                    &turn_sender,
                                     selection_origin,
                                     &mut qualification,
                                 ) {
@@ -1138,7 +1159,7 @@ fn worker_main_owned(
                                 }
                                 config = candidate;
                             }
-                            ctx.sender
+                            turn_sender
                                 .send(Msg::EffortStatus(crate::effort_status(&config.home, &turn)));
                         }
                         Err(e) => ctx
@@ -1152,8 +1173,7 @@ fn worker_main_owned(
                     let base = match configured_turn(&config) {
                         Ok(base) => base,
                         Err(error) => {
-                            ctx.sender
-                                .send(Msg::SystemMessage(format!("route: {error}")));
+                            turn_sender.send(Msg::SystemMessage(format!("route: {error}")));
                             break 'command;
                         }
                     };
@@ -1165,7 +1185,7 @@ fn worker_main_owned(
                             selection_origin,
                         );
                         if let Err(error) = validation {
-                            ctx.sender
+                            turn_sender
                                 .send(Msg::SystemMessage(format!("routing unchanged: {error}")));
                             break 'command;
                         }
@@ -1178,13 +1198,13 @@ fn worker_main_owned(
                             &mut cum_input,
                             &mut cum_output,
                             &mut cum_cost,
-                            &ctx.sender,
+                            &turn_sender,
                             crate::phase_routing::SelectionOrigin::Default,
                             &mut qualification,
                         ) {
                             selection_origin = crate::phase_routing::SelectionOrigin::Default;
-                            ctx.sender.send(Msg::Routing(Vec::new()));
-                            ctx.sender.send(Msg::SystemMessage(
+                            turn_sender.send(Msg::Routing(Vec::new()));
+                            turn_sender.send(Msg::SystemMessage(
                                 "Automatic routing enabled for this session".into(),
                             ));
                         }
@@ -1195,7 +1215,7 @@ fn worker_main_owned(
                             Some(&base),
                             selection_origin,
                         ) {
-                            Ok(value) => ctx.sender.send(Msg::SystemMessage(
+                            Ok(value) => turn_sender.send(Msg::SystemMessage(
                                 serde_json::to_string_pretty(&value).unwrap_or_default(),
                             )),
                             Err(error) => ctx
@@ -1206,8 +1226,8 @@ fn worker_main_owned(
                 }
                 WorkerCommand::ListModels => {
                     match crate::config::ProvidersConfig::load(&config.home) {
-                        Ok(cfg) => ctx.sender.send(Msg::ModelsListed(cfg.all_models())),
-                        Err(error) => ctx.sender.send(Msg::ModelsListFailed(format!(
+                        Ok(cfg) => turn_sender.send(Msg::ModelsListed(cfg.all_models())),
+                        Err(error) => turn_sender.send(Msg::ModelsListFailed(format!(
                             "Cannot list models: {error}. Repair providers.toml or run orbit setup."
                         ))),
                     };
@@ -1225,13 +1245,13 @@ fn worker_main_owned(
                             })
                             .collect(),
                         Err(e) => {
-                            ctx.sender.send(Msg::SessionsListFailed(format!(
+                            turn_sender.send(Msg::SessionsListFailed(format!(
                                 "Cannot list sessions: {e}"
                             )));
                             break 'command;
                         }
                     };
-                    ctx.sender.send(Msg::SessionsListed(rows));
+                    turn_sender.send(Msg::SessionsListed(rows));
                 }
                 WorkerCommand::ResumeSession(id) => {
                     let same_id = id.strip_suffix(".json").unwrap_or(&id) == lease.session_id();
@@ -1250,7 +1270,7 @@ fn worker_main_owned(
                         Ok((candidate_lease, mut saved)) => {
                             if let Err(error) = saved.require_workspace(&tool_cx.working_dir) {
                                 orbit_hud_tui::emit_status(
-                                    &ctx.sender,
+                                    &turn_sender,
                                     &format!("resume refused: {error}"),
                                 );
                                 break 'command;
@@ -1265,7 +1285,7 @@ fn worker_main_owned(
                                 Ok(turn) => turn,
                                 Err(_) => {
                                     orbit_hud_tui::emit_status(
-                                        &ctx.sender,
+                                        &turn_sender,
                                         "resume refused: model configuration unavailable",
                                     );
                                     break 'command;
@@ -1278,7 +1298,7 @@ fn worker_main_owned(
                             } else {
                                 let Some(generation) = binding.generation.checked_add(1) else {
                                     orbit_hud_tui::emit_status(
-                                        &ctx.sender,
+                                        &turn_sender,
                                         "resume refused: session generation exhausted",
                                     );
                                     break 'command;
@@ -1295,7 +1315,7 @@ fn worker_main_owned(
                                 Ok(log) => log,
                                 Err(_) => {
                                     orbit_hud_tui::emit_status(
-                                        &ctx.sender,
+                                        &turn_sender,
                                         "resume refused: transcript unavailable",
                                     );
                                     break 'command;
@@ -1312,13 +1332,13 @@ fn worker_main_owned(
                                         qualification = CostQualification::Unavailable;
                                     }
                                     orbit_hud_tui::emit_status(
-                                        &ctx.sender,
+                                        &turn_sender,
                                         "resume refused: accounting cannot be verified",
                                     );
                                     break 'command;
                                 }
                             };
-                            let mut candidate_cx = session_tool_context(&candidate, &ctx.sender);
+                            let mut candidate_cx = session_tool_context(&candidate, &turn_sender);
                             candidate_cx.working_dir = tool_cx.working_dir.clone();
                             let built = build_session_prompt(
                                 &config.home,
@@ -1360,7 +1380,7 @@ fn worker_main_owned(
                                 qualification = CostQualification::Unavailable;
                             }
                             orbit_hud_tui::emit_status(
-                                &ctx.sender,
+                                &turn_sender,
                                 &format!("resume refused: {error}"),
                             );
                         }
@@ -1372,12 +1392,12 @@ fn worker_main_owned(
                         .and_then(|saved| saved.require_workspace(&tool_cx.working_dir))
                     {
                         orbit_hud_tui::emit_status(
-                            &ctx.sender,
+                            &turn_sender,
                             &format!("operation refused: {error}"),
                         );
                         let _ = operation.finish_unstarted();
                         emit_session_projection(
-                            &ctx.sender,
+                            &turn_sender,
                             &config,
                             &binding,
                             &transcript,
@@ -1425,7 +1445,7 @@ fn worker_main_owned(
                                 &mods,
                                 &mods_enabled,
                                 &token,
-                                &ctx.sender,
+                                &turn_sender,
                             );
                             let saved = save_turn(
                                 &config,
@@ -1437,7 +1457,7 @@ fn worker_main_owned(
                                 &mut cum_output,
                                 &mut cum_cost,
                                 selection_origin,
-                                &ctx.sender,
+                                &turn_sender,
                                 &mut qualification,
                                 true,
                             );
@@ -1496,7 +1516,7 @@ fn worker_main_owned(
                             match clear {
                                 Ok(candidate) => {
                                     let mut new_tool_cx =
-                                        session_tool_context(&candidate.config, &ctx.sender);
+                                        session_tool_context(&candidate.config, &turn_sender);
                                     new_tool_cx.working_dir = tool_cx.working_dir.clone();
                                     new_tool_cx.set_ext(MemoryBytes(
                                         tool_cx.ext::<MemoryBytes>().map_or(0, |bytes| bytes.0),
@@ -1510,7 +1530,7 @@ fn worker_main_owned(
                                         qualification = CostQualification::Unavailable;
                                         outcome = ManualOutcome::Cancelled;
                                         orbit_hud_tui::emit_status(
-                                            &ctx.sender,
+                                            &turn_sender,
                                             &format!(
                                                 "clear cancelled; current session retained; candidate {} contains staged files",
                                                 candidate.binding.session_id
@@ -1535,7 +1555,7 @@ fn worker_main_owned(
                                         applied = true;
                                         outcome = ManualOutcome::Completed;
                                         orbit_hud_tui::emit_status(
-                                            &ctx.sender,
+                                            &turn_sender,
                                             &format!(
                                                 "new session started; previous session {previous_id} retained"
                                             ),
@@ -1552,7 +1572,7 @@ fn worker_main_owned(
                                     } else {
                                         ManualOutcome::Failed
                                     };
-                                    orbit_hud_tui::emit_status(&ctx.sender, &failure.message);
+                                    orbit_hud_tui::emit_status(&turn_sender, &failure.message);
                                 }
                             }
                         }
@@ -1571,7 +1591,7 @@ fn worker_main_owned(
                             ContextProjection::Unavailable
                         };
                         emit_session_projection(
-                            &ctx.sender,
+                            &turn_sender,
                             &config,
                             &binding,
                             &transcript,
@@ -1602,12 +1622,12 @@ fn worker_main_owned(
                                     "compaction accounting is uncertain; inspect before continuing"
                                 }
                             };
-                            ctx.sender.send(Msg::SystemMessage(text.into()));
+                            turn_sender.send(Msg::SystemMessage(text.into()));
                         }
                     } else {
                         let _ = operation.finish_unstarted();
                         emit_session_projection(
-                            &ctx.sender,
+                            &turn_sender,
                             &config,
                             &binding,
                             &transcript,
@@ -1627,11 +1647,11 @@ fn worker_main_owned(
                 }
                 WorkerCommand::ListInstalledMods => {
                     if crate::mods::validation_status(&config.home).is_err() {
-                        ctx.sender.send(Msg::SystemMessage("Instruction bundle validation failed; run orbit doctor. Malformed enabled metadata is preserved and defaults stay disabled.".into()));
+                        turn_sender.send(Msg::SystemMessage("Instruction bundle validation failed; run orbit doctor. Malformed enabled metadata is preserved and defaults stay disabled.".into()));
                     }
 
                     if mods.is_empty() {
-                        ctx.sender.send(Msg::SystemMessage(
+                        turn_sender.send(Msg::SystemMessage(
                             "no mods installed — add $ORBIT_HOME/mods/<name>/instructions.md"
                                 .into(),
                         ));
@@ -1655,7 +1675,7 @@ fn worker_main_owned(
                                     .join(" ")
                             )
                         };
-                        ctx.sender.send(Msg::SystemMessage(format!(
+                        turn_sender.send(Msg::SystemMessage(format!(
                             "[{state}] {} — {}{cmds}",
                             m.name,
                             if m.description.is_empty() {
@@ -1685,13 +1705,13 @@ fn worker_main_owned(
                             );
                             tool_cx.set_ext(MemoryBytes(built.memory_bytes));
                             system_prompt = built.text;
-                            ctx.sender.send(Msg::SystemMessage(format!(
+                            turn_sender.send(Msg::SystemMessage(format!(
                                 "mod {name}: {}",
                                 if now_on { "enabled" } else { "disabled" }
                             )));
                         }
                         Err(e) => {
-                            ctx.sender.send(Msg::SystemMessage(e));
+                            turn_sender.send(Msg::SystemMessage(e));
                         }
                     }
                 }
@@ -1702,7 +1722,7 @@ fn worker_main_owned(
                         build_session_prompt(&config.home, &config.model, &mods, &mods_enabled);
                     tool_cx.set_ext(MemoryBytes(built.memory_bytes));
                     system_prompt = built.text;
-                    ctx.sender.send(Msg::SystemMessage(format!(
+                    turn_sender.send(Msg::SystemMessage(format!(
                         "mods reloaded: {} installed, {} enabled",
                         mods.len(),
                         mods_enabled.len()
@@ -1720,7 +1740,7 @@ fn worker_main_owned(
                     if arg.trim().is_empty() {
                         let list = cps.list();
                         if list.is_empty() {
-                            ctx.sender.send(Msg::SystemMessage(
+                            turn_sender.send(Msg::SystemMessage(
                                 "no checkpoints yet (one opens at each prompt that changes files)"
                                     .into(),
                             ));
@@ -1731,7 +1751,7 @@ fn worker_main_owned(
                                 .map(|id| format!("  {id}"))
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            ctx.sender.send(Msg::SystemMessage(format!(
+                            turn_sender.send(Msg::SystemMessage(format!(
                                 "checkpoints (newest first):\n{text}"
                             )));
                         }
@@ -1745,21 +1765,20 @@ fn worker_main_owned(
                                         },
                                     );
                                 }
-                                ctx.sender.send(Msg::SystemMessage(format!(
+                                turn_sender.send(Msg::SystemMessage(format!(
                                     "restored {} file(s) to checkpoint {}",
                                     files.len(),
                                     arg.trim()
                                 )));
                             }
                             Ok(_) => {
-                                ctx.sender.send(Msg::SystemMessage(format!(
+                                turn_sender.send(Msg::SystemMessage(format!(
                                 "checkpoint {} has no file snapshots (nothing was written that turn)",
                                 arg.trim()
                             )));
                             }
                             Err(e) => {
-                                ctx.sender
-                                    .send(Msg::SystemMessage(format!("rewind failed: {e}")));
+                                turn_sender.send(Msg::SystemMessage(format!("rewind failed: {e}")));
                             }
                         }
                     }
@@ -1787,21 +1806,20 @@ fn worker_main_owned(
                             &mut cum_input,
                             &mut cum_output,
                             &mut cum_cost,
-                            &ctx.sender,
+                            &turn_sender,
                             selection_origin,
                             &mut qualification,
                         ) {
                             transcript = candidate;
                             turns = candidate_turns;
                             let text = removed.join(" / ");
-                            ctx.sender.send(Msg::SystemMessage(format!(
+                            turn_sender.send(Msg::SystemMessage(format!(
                                 "undid last exchange ({})",
                                 if text.is_empty() { "no text" } else { &text }
                             )));
                         }
                     } else {
-                        ctx.sender
-                            .send(Msg::SystemMessage("nothing to undo".into()));
+                        turn_sender.send(Msg::SystemMessage("nothing to undo".into()));
                     }
                 }
                 WorkerCommand::SetMode(mode_name) => {
@@ -1810,11 +1828,11 @@ fn worker_main_owned(
                     match orbit_tools::permissions::PermissionMode::from_config(&mode_name) {
                         Some(mode) => {
                             config.scope.mode = mode;
-                            orbit_hud_tui::emit_mode_changed(&ctx.sender, &mode_name);
+                            orbit_hud_tui::emit_mode_changed(&turn_sender, &mode_name);
                         }
                         None => {
                             orbit_hud_tui::emit_notice(
-                                &ctx.sender,
+                                &turn_sender,
                                 &format!(
                                     "unknown mode {mode_name} (default, acceptEdits, plan, dontAsk, bypass)"
                                 ),
@@ -1830,7 +1848,7 @@ fn worker_main_owned(
                         &arg,
                     )
                     .unwrap_or_else(|error| format!("permissions: {error}"));
-                    ctx.sender.send(Msg::SystemMessage(text));
+                    turn_sender.send(Msg::SystemMessage(text));
                 }
                 WorkerCommand::ShellBang(command) => {
                     // The shell bang (gate 1): one command through the Bash
@@ -1848,7 +1866,7 @@ fn worker_main_owned(
                     };
                     let decision_id = format!("bang-{}", ulid::Ulid::new());
                     let mut approval_channel =
-                        TuiApprovalChannel::new(ctx.sender.clone(), ctx.approvals.clone());
+                        TuiApprovalChannel::new(turn_sender.clone(), ctx.approvals.clone());
                     let token = orbit_provider_http::CancelToken::new();
                     if let Ok(mut slot) = cancel_slot.lock() {
                         *slot = Some(token.clone());
@@ -1857,8 +1875,8 @@ fn worker_main_owned(
                     // The session's context: its ledger sink announces the
                     // `!` command's records like any other call's.
                     let tool_cx = tool_cx.clone();
-                    orbit_hud_tui::emit_tool_started(&ctx.sender, &call.id, "Bash", &command);
-                    tool_cx.set_output_sink(Some(live_output_sink(&ctx.sender, &call.id)));
+                    orbit_hud_tui::emit_tool_started(&turn_sender, &call.id, "Bash", &command);
+                    tool_cx.set_output_sink(Some(live_output_sink(&turn_sender, &call.id)));
                     let (result, _) = crate::tool_runtime::execute_call(
                         &config.home,
                         &config.session_id,
@@ -1881,7 +1899,7 @@ fn worker_main_owned(
                     let outcome = classify_tool_result(&result);
                     let fact = result_fact("Bash", &result);
                     orbit_hud_tui::emit_tool_finished(
-                        &ctx.sender,
+                        &turn_sender,
                         &call.id,
                         "Bash",
                         outcome,
@@ -1904,7 +1922,7 @@ fn worker_main_owned(
                             pending.push(WorkerCommand::Prompt(prompt));
                         }
                         None => {
-                            ctx.sender.send(Msg::SystemMessage(format!(
+                            turn_sender.send(Msg::SystemMessage(format!(
                                 "no command {cmd_name} in mod {mod_name}"
                             )));
                         }
@@ -1934,6 +1952,16 @@ fn worker_main_owned(
             } else {
                 qualification = CostQualification::Unavailable;
             }
+            // All source-affecting finish/error/save notices above are
+            // enqueued before closure. Queued stamps remain valid after the
+            // registration drops; retained executor clones cannot mint more.
+            let layout = view_journal
+                .as_ref()
+                .and_then(|journal| journal.projection_layout(&transcript));
+            let projection_sender = ordinary_view.as_ref().map_or_else(
+                || ctx.sender.clone(),
+                |view| view.close_and_projection_sender(layout),
+            );
             drop(registration);
             let operation_context = project_context_after_foreground_operation(
                 operation.kind(),
@@ -1941,7 +1969,7 @@ fn worker_main_owned(
                 context_projection,
             );
             emit_session_projection(
-                &ctx.sender,
+                &projection_sender,
                 &config,
                 &binding,
                 &transcript,
@@ -2322,6 +2350,248 @@ fn stage_clear(
         cost: Some(source_cost), uncertain: true })
 }
 
+const MAX_VIEW_LINES: usize = 4096;
+const MAX_VIEW_ROUNDS: usize = 4096;
+const MAX_VIEW_CALLS: usize = 4096;
+const MAX_VIEW_ID_BYTES: usize = 4096;
+
+struct OrdinaryViewRound {
+    round: u32,
+    calls: Vec<(String, String)>,
+}
+
+/// Ephemeral producer evidence only: no message bodies, arguments or result
+/// payloads are retained. A failure discards correspondence, never the turn.
+struct OrdinaryViewJournal {
+    prefix_len: usize,
+    prefix_digest: Option<[u8; 32]>,
+    baseline_lines: usize,
+    rounds: Vec<OrdinaryViewRound>,
+    call_ids: std::collections::HashSet<String>,
+    valid: bool,
+}
+
+struct ViewPrefixDigest(sha2::Sha256);
+impl std::io::Write for ViewPrefixDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn view_prefix_digest(messages: &[ChatMessage]) -> Option<[u8; 32]> {
+    use sha2::Digest;
+    // Stream the existing typed representation straight into a digest. No
+    // additional serialized DTO or full transcript/argument copy is created.
+    let mut digest = ViewPrefixDigest(sha2::Sha256::new());
+    serde_json::to_writer(&mut digest, messages).ok()?;
+    Some(digest.0.finalize().into())
+}
+
+fn checked_view_line_total(total: usize, additional: usize) -> Option<usize> {
+    total
+        .checked_add(additional)
+        .filter(|count| *count <= MAX_VIEW_LINES)
+}
+
+/// Match only the real normalizer's emission cardinality. Counting never
+/// clones/strips text, parses results, or retains message references.
+fn session_view_line_count(messages: &[ChatMessage]) -> Option<usize> {
+    messages.iter().try_fold(0usize, |total, message| {
+        let additional = match message.role {
+            ChatRole::User | ChatRole::System => 1,
+            ChatRole::Assistant => match &message.tool_calls {
+                Some(calls) => calls.len(),
+                None => usize::from(!message.content.is_empty()),
+            },
+            ChatRole::Tool => 0,
+        };
+        checked_view_line_total(total, additional)
+    })
+}
+
+impl OrdinaryViewJournal {
+    fn new(messages: &[ChatMessage]) -> Self {
+        // Every ordinary run appends a User. Reserve that one row before
+        // digesting a prefix whose eventual projection cannot fit the cap.
+        let baseline_lines = session_view_line_count(messages)
+            .filter(|count| checked_view_line_total(*count, 1).is_some());
+        let prefix_digest = baseline_lines.and_then(|_| view_prefix_digest(messages));
+        Self {
+            prefix_len: messages.len(),
+            prefix_digest,
+            baseline_lines: baseline_lines.unwrap_or(0),
+            rounds: Vec::new(),
+            call_ids: std::collections::HashSet::new(),
+            valid: prefix_digest.is_some(),
+        }
+    }
+
+    fn observe(&mut self, event: &orbit_frontend_protocol::FrontendEvent) {
+        use orbit_frontend_protocol::FrontendEvent as E;
+        if !self.valid {
+            return;
+        }
+        match event {
+            E::RoundStarted { round } => {
+                let expected = self
+                    .rounds
+                    .last()
+                    .map_or(Some(0), |last| last.round.checked_add(1));
+                if self.rounds.len() >= MAX_VIEW_ROUNDS || expected != Some(*round) {
+                    self.valid = false;
+                    return;
+                }
+                self.rounds.push(OrdinaryViewRound {
+                    round: *round,
+                    calls: Vec::new(),
+                });
+            }
+            E::ToolStartedFull { call_id, kind, .. } => {
+                if self.rounds.is_empty()
+                    || call_id.is_empty()
+                    || kind.is_empty()
+                    || call_id.len() > MAX_VIEW_ID_BYTES
+                    || kind.len() > MAX_VIEW_ID_BYTES
+                    || self.call_ids.len() >= MAX_VIEW_CALLS
+                    || !self.call_ids.insert(call_id.clone())
+                {
+                    self.valid = false;
+                    return;
+                }
+                self.rounds
+                    .last_mut()
+                    .unwrap()
+                    .calls
+                    .push((call_id.clone(), kind.clone()));
+            }
+            E::Compacting { .. } | E::Compacted { .. } => self.valid = false,
+            _ => {}
+        }
+    }
+
+    fn projection_layout(&self, messages: &[ChatMessage]) -> Option<ViewProjectionLayout> {
+        use std::collections::HashMap;
+        if !self.valid || self.rounds.is_empty() || self.prefix_digest.is_none() {
+            return None;
+        }
+        // Refuse oversized view evidence before digest work, ambiguity maps,
+        // group/string clones or the real emitter's later normalization.
+        let line_count = session_view_line_count(messages)?;
+        if self.prefix_digest != view_prefix_digest(messages.get(..self.prefix_len)?)
+            || messages.get(self.prefix_len)?.role != ChatRole::User
+        {
+            return None;
+        }
+        // Mirror the real normalizer's global ambiguity rule, including a
+        // historical duplicate ID. Results may arrive in either order.
+        let mut calls = HashMap::<&str, usize>::new();
+        let mut results = HashMap::<&str, usize>::new();
+        for message in messages {
+            if let Some(entries) = &message.tool_calls {
+                for call in entries {
+                    let count = calls.entry(&call.id).or_default();
+                    *count = count.checked_add(1)?;
+                }
+            }
+            if message.role == ChatRole::Tool
+                && let Some(id) = message.tool_call_id.as_deref()
+            {
+                let count = results.entry(id).or_default();
+                *count = count.checked_add(1)?;
+            }
+        }
+        let mut groups: Vec<ViewProjectionGroup> = self
+            .rounds
+            .iter()
+            .map(|round| ViewProjectionGroup {
+                round: round.round,
+                model_index: None,
+                tools: Vec::new(),
+            })
+            .collect();
+        let mut next_group = 0usize;
+        let mut line_index = self.baseline_lines.checked_add(1)?;
+        let tail_start = self.prefix_len.checked_add(1)?;
+        for message in messages.get(tail_start..)? {
+            match message.role {
+                ChatRole::Assistant => {
+                    let observed = self.rounds.get(next_group)?;
+                    let group = groups.get_mut(next_group)?;
+                    if let Some(entries) = &message.tool_calls {
+                        if entries.is_empty() || entries.len() != observed.calls.len() {
+                            return None;
+                        }
+                        for (ordinal, (call, (id, name))) in
+                            entries.iter().zip(&observed.calls).enumerate()
+                        {
+                            if call.id != *id
+                                || call.name != *name
+                                || calls.get(call.id.as_str()).copied() != Some(1)
+                                || results.get(call.id.as_str()).copied().unwrap_or(0) > 1
+                            {
+                                return None;
+                            }
+                            // The typed call vector, not result completion or
+                            // visible text order, establishes this exact slot.
+                            group.tools.push(ViewToolProjection {
+                                line_index,
+                                call_id: call.id.clone(),
+                                tool_name: call.name.clone(),
+                                ordinal,
+                            });
+                            line_index = line_index.checked_add(1)?;
+                        }
+                    } else {
+                        if !observed.calls.is_empty() {
+                            return None;
+                        }
+                        if !message.content.is_empty() {
+                            group.model_index = Some(line_index);
+                            line_index = line_index.checked_add(1)?;
+                        }
+                    }
+                    next_group = next_group.checked_add(1)?;
+                }
+                ChatRole::System => {
+                    // Provider System is canonical source, never a disposable
+                    // local notice. It consumes its actual normalizer slot.
+                    line_index = line_index.checked_add(1)?;
+                }
+                ChatRole::Tool => {
+                    let id = message.tool_call_id.as_deref()?;
+                    if !self.call_ids.contains(id) || results.get(id).copied() != Some(1) {
+                        return None;
+                    }
+                }
+                ChatRole::User => return None,
+            }
+        }
+        // A final round may stop before storing an assistant. It contributes
+        // no text correspondence; an unrepresented announced call is invalid.
+        if self.rounds.len().checked_sub(next_group)? > 1
+            || self
+                .rounds
+                .get(next_group..)?
+                .iter()
+                .any(|round| !round.calls.is_empty())
+            || line_index != line_count
+        {
+            return None;
+        }
+        Some(ViewProjectionLayout {
+            line_count,
+            baseline_lines: self.baseline_lines,
+            input_index: self.baseline_lines,
+            groups,
+        })
+    }
+}
+
 fn session_to_transcript_lines(msgs: &[ChatMessage]) -> Vec<TranscriptLine> {
     use orbit_hud_tui::model::ToolOutcome;
     use std::collections::HashMap;
@@ -2475,6 +2745,649 @@ fn classify_saved_tool_result(
         String::new()
     };
     (outcome, fact)
+}
+
+#[cfg(test)]
+mod ordinary_view_count_tests {
+    use super::*;
+    use orbit_adapter::types::ToolCallMessage;
+    use orbit_frontend_protocol::FrontendEvent as E;
+
+    fn message(role: ChatRole, content: &str, calls: Option<Vec<ToolCallMessage>>) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.into(),
+            blocks: None,
+            tool_calls: calls,
+            tool_call_id: None,
+            tool_result: None,
+            origin_model: None,
+            origin_provider: None,
+        }
+    }
+
+    fn call(id: &str) -> ToolCallMessage {
+        ToolCallMessage {
+            id: id.into(),
+            name: "Glob".into(),
+            arguments: "not parsed by the count".into(),
+        }
+    }
+
+    #[test]
+    fn structural_count_matches_real_role_option_empty_and_cot_cardinality() {
+        for role in [
+            ChatRole::User,
+            ChatRole::System,
+            ChatRole::Assistant,
+            ChatRole::Tool,
+        ] {
+            for content in ["", "visible content"] {
+                for calls in [None, Some(Vec::new()), Some(vec![call("one"), call("two")])] {
+                    let current = message(role, content, calls);
+                    let messages = std::slice::from_ref(&current);
+                    assert_eq!(
+                        session_view_line_count(messages),
+                        Some(session_to_transcript_lines(messages).len()),
+                        "role={role:?} content={content:?} calls={:?}",
+                        current.tool_calls
+                    );
+                }
+            }
+        }
+        let cot_only = [message(ChatRole::Assistant, "<think>hidden</think>", None)];
+        let actual = session_to_transcript_lines(&cot_only);
+        assert_eq!(session_view_line_count(&cot_only), Some(1));
+        assert!(
+            matches!(actual.as_slice(), [TranscriptLine::Assistant { text, .. }] if text.is_empty())
+        );
+        let empty_calls = [message(
+            ChatRole::Assistant,
+            "omitted tool-bearing text",
+            Some(Vec::new()),
+        )];
+        assert_eq!(session_view_line_count(&empty_calls), Some(0));
+        assert!(session_to_transcript_lines(&empty_calls).is_empty());
+    }
+
+    #[test]
+    fn structural_count_matches_real_ambiguous_missing_and_malformed_tool_rows() {
+        let mut messages = vec![
+            message(ChatRole::System, "", None),
+            message(ChatRole::User, "", None),
+            message(
+                ChatRole::Assistant,
+                "omitted before tools",
+                Some(vec![
+                    call("duplicate"),
+                    call("duplicate"),
+                    call(""),
+                    call("unique"),
+                    call("missing"),
+                ]),
+            ),
+        ];
+        for (id, payload) in [
+            ("duplicate", "{}"),
+            ("duplicate", "{}"),
+            ("unique", "malformed JSON"),
+            ("", ""),
+        ] {
+            let mut result = message(ChatRole::Tool, payload, None);
+            result.tool_call_id = Some(id.into());
+            result.tool_result = Some(payload.into());
+            messages.push(result);
+        }
+        messages.push(message(ChatRole::Assistant, "<think>hidden</think>", None));
+        let actual = session_to_transcript_lines(&messages);
+        assert_eq!(session_view_line_count(&messages), Some(actual.len()));
+        assert_eq!(actual.len(), 8);
+        let tools: Vec<_> = actual
+            .iter()
+            .filter(|line| matches!(line, TranscriptLine::Stripped { .. }))
+            .collect();
+        assert_eq!(tools.len(), 5);
+        assert!(tools.iter().all(|line| matches!(
+            line,
+            TranscriptLine::Stripped {
+                outcome: Some(orbit_hud_tui::model::ToolOutcome::Unavailable),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn structural_count_matches_actual_shared_fixture_baseline_and_projection() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../hud-tui/tests/fixtures/ordinary_view_projection.json"
+        ))
+        .unwrap();
+        let mut messages: Vec<ChatMessage> =
+            serde_json::from_value(fixture["baseline"].clone()).unwrap();
+        assert_eq!(
+            session_view_line_count(&messages),
+            Some(session_to_transcript_lines(&messages).len())
+        );
+        assert_eq!(session_view_line_count(&messages), Some(2));
+        messages.extend(
+            serde_json::from_value::<Vec<ChatMessage>>(fixture["appended"].clone()).unwrap(),
+        );
+        let expected =
+            usize::try_from(fixture["expected_layout"]["line_count"].as_u64().unwrap()).unwrap();
+        assert_eq!(
+            session_view_line_count(&messages),
+            Some(session_to_transcript_lines(&messages).len())
+        );
+        assert_eq!(session_view_line_count(&messages), Some(expected));
+    }
+
+    #[test]
+    fn checked_overflow_and_cap_refuse_proof_before_digest_or_journal_growth() {
+        assert_eq!(checked_view_line_total(0, 0), Some(0));
+        assert_eq!(
+            checked_view_line_total(MAX_VIEW_LINES - 1, 1),
+            Some(MAX_VIEW_LINES)
+        );
+        assert_eq!(checked_view_line_total(MAX_VIEW_LINES, 1), None);
+        assert_eq!(checked_view_line_total(usize::MAX, 1), None);
+        assert_eq!(checked_view_line_total(1, usize::MAX), None);
+        let mut messages = vec![message(ChatRole::User, "", None); MAX_VIEW_LINES];
+        assert_eq!(
+            session_view_line_count(&messages),
+            Some(session_to_transcript_lines(&messages).len())
+        );
+        let full = OrdinaryViewJournal::new(&messages);
+        assert!(!full.valid);
+        assert!(full.prefix_digest.is_none());
+        messages.push(message(ChatRole::System, "", None));
+        assert_eq!(session_view_line_count(&messages), None);
+        let mut refused = OrdinaryViewJournal::new(&messages);
+        assert!(!refused.valid);
+        assert!(refused.prefix_digest.is_none());
+        refused.observe(&E::RoundStarted { round: 0 });
+        assert!(refused.rounds.is_empty());
+        assert!(refused.call_ids.is_empty());
+        assert!(refused.projection_layout(&messages).is_none());
+        let mut bounded = vec![message(ChatRole::System, "", None); MAX_VIEW_LINES - 2];
+        let mut admitted = OrdinaryViewJournal::new(&bounded);
+        admitted.observe(&E::RoundStarted { round: 0 });
+        bounded.push(message(ChatRole::User, "prompt", None));
+        bounded.push(message(ChatRole::Assistant, "answer", None));
+        assert_eq!(session_view_line_count(&bounded), Some(MAX_VIEW_LINES));
+        assert_eq!(
+            session_view_line_count(&bounded),
+            Some(session_to_transcript_lines(&bounded).len())
+        );
+        assert_eq!(
+            admitted.projection_layout(&bounded).unwrap().line_count,
+            MAX_VIEW_LINES
+        );
+    }
+
+    #[test]
+    fn over_cap_final_count_keeps_real_completion_and_canonical_publication() {
+        let mut messages = vec![message(ChatRole::System, "", None); MAX_VIEW_LINES - 1];
+        let mut journal = OrdinaryViewJournal::new(&messages);
+        assert!(journal.valid);
+        assert!(journal.prefix_digest.is_some());
+        journal.observe(&E::RoundStarted { round: 0 });
+        messages.push(message(ChatRole::User, "current prompt", None));
+        messages.push(message(ChatRole::Assistant, "still completed", None));
+        assert_eq!(session_view_line_count(&messages), None);
+        let layout = journal.projection_layout(&messages);
+        assert!(layout.is_none());
+
+        let binding = SessionBinding {
+            session_id: "view-count-cap".into(),
+            generation: 1,
+        };
+        let operation =
+            ForegroundOperation::new(binding.clone(), ForegroundKind::Prompt, 1).unwrap();
+        let registration = operation
+            .start(&WorkerCommand::Prompt("current prompt".into()))
+            .unwrap();
+        let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+        let publisher = sender.scoped_view(&registration).unwrap();
+        let qualification = CostQualification::Known { revision: 1 };
+        emit_ordinary_result(
+            &publisher.sender(),
+            Some(&operation),
+            Ok(&orbit_engine::TurnEnd::Completed),
+            true,
+            &qualification,
+        );
+        let projection_sender = publisher.close_and_projection_sender(layout);
+        drop(registration);
+        let config = TuiTurnConfig {
+            home: std::path::PathBuf::new(),
+            session_id: binding.session_id.clone(),
+            gate: String::new(),
+            model: "fixture-model".into(),
+            provider_id: "fixture-provider".into(),
+            effort: None,
+            auto_tools: false,
+            scope: Default::default(),
+            initial_transcript: Vec::new(),
+            initial_turns: 0,
+            initial_input_tokens: 0,
+            initial_output_tokens: 0,
+            initial_cost_microcents: 0,
+        };
+        emit_session_projection(
+            &projection_sender,
+            &config,
+            &binding,
+            &messages,
+            1,
+            0,
+            0,
+            0,
+            qualification,
+            ProjectionReason::Operation {
+                operation: operation.clone(),
+            },
+            ContextProjection::Unavailable,
+        );
+        assert!(matches!(bus.try_recv(), Some(Msg::OrdinaryTurnEnded {
+            operation: received, end: OrdinaryEnd::Completed, publication: OrdinaryPublication::Saved,
+        }) if received == operation));
+        let Some(Msg::SessionProjection(projection)) = bus.try_recv() else {
+            panic!("missing real canonical projection");
+        };
+        assert_eq!(projection.lines.len(), MAX_VIEW_LINES + 1);
+        assert!(
+            matches!(projection.lines.last(), Some(TranscriptLine::Assistant { text, .. }) if text == "still completed")
+        );
+        assert!(
+            matches!(projection.reason, ProjectionReason::Operation { operation: received } if received == operation)
+        );
+        assert!(bus.try_recv().is_none());
+    }
+}
+
+#[cfg(test)]
+mod ordinary_view_producer_tests {
+    use super::*;
+    use orbit_frontend_protocol::FrontendEvent as E;
+    use orbit_hud_tui::model::ToolOutcome;
+    use serde_json::{Value, json};
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    enum FixtureEvent {
+        RoundStarted { round: u32 },
+        ToolStartedFull { call_id: String, tool_name: String },
+    }
+
+    fn fixture() -> (Value, Vec<ChatMessage>, OrdinaryViewJournal) {
+        let data: Value = serde_json::from_str(include_str!(
+            "../../hud-tui/tests/fixtures/ordinary_view_projection.json"
+        ))
+        .unwrap();
+        assert_eq!(data["schema"], 1);
+        let mut messages: Vec<ChatMessage> =
+            serde_json::from_value(data["baseline"].clone()).unwrap();
+        let mut journal = OrdinaryViewJournal::new(&messages);
+        let events: Vec<FixtureEvent> =
+            serde_json::from_value(data["engine_events"].clone()).unwrap();
+        for event in events {
+            journal.observe(&match event {
+                FixtureEvent::RoundStarted { round } => E::RoundStarted { round },
+                FixtureEvent::ToolStartedFull { call_id, tool_name } => E::ToolStartedFull {
+                    call_id,
+                    kind: tool_name,
+                    target: String::new(),
+                },
+            });
+        }
+        messages
+            .extend(serde_json::from_value::<Vec<ChatMessage>>(data["appended"].clone()).unwrap());
+        (data, messages, journal)
+    }
+
+    // A test-only representation keeps TranscriptLine's public shape free of
+    // serialization. The fixture is checked by the actual production normalizer.
+    fn fixture_lines(lines: &[TranscriptLine]) -> Value {
+        Value::Array(
+            lines
+                .iter()
+                .map(|line| match line {
+                    TranscriptLine::User { text, time } => {
+                        assert!(time.is_none());
+                        json!({"kind":"user", "text":text})
+                    }
+                    TranscriptLine::Assistant { text, time } => {
+                        assert!(time.is_none());
+                        json!({"kind":"assistant", "text":text})
+                    }
+                    TranscriptLine::System(text) => json!({"kind":"system", "text":text}),
+                    TranscriptLine::Stripped {
+                        tool_name,
+                        call_id,
+                        summary,
+                        outcome,
+                        meta,
+                        started_at,
+                    } => {
+                        assert!(started_at.is_none());
+                        let outcome = match outcome.unwrap() {
+                            ToolOutcome::Ok => "ok",
+                            ToolOutcome::Failed => "failed",
+                            ToolOutcome::Denied => "denied",
+                            ToolOutcome::Blocked => "blocked",
+                            ToolOutcome::Cancelled => "cancelled",
+                            ToolOutcome::Unavailable => "unavailable",
+                        };
+                        json!({"kind":"tool", "tool_name":tool_name, "call_id":call_id,
+                    "summary":summary, "outcome":outcome, "meta":meta})
+                    }
+                    _ => panic!("unexpected canonical row in ordinary fixture"),
+                })
+                .collect(),
+        )
+    }
+
+    fn fixture_layout(layout: &ViewProjectionLayout) -> Value {
+        json!({"line_count":layout.line_count, "baseline_lines":layout.baseline_lines,
+            "input_index":layout.input_index, "groups":layout.groups.iter().map(|group| {
+                json!({"round":group.round, "model_index":group.model_index,
+                    "tools":group.tools.iter().map(|tool| json!({"line_index":tool.line_index,
+                        "call_id":tool.call_id, "tool_name":tool.tool_name,
+                        "ordinal":tool.ordinal})).collect::<Vec<_>>()})
+            }).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn shared_fixture_matches_real_normalizer_and_actual_round_call_recipe() {
+        let (data, messages, journal) = fixture();
+        let lines = session_to_transcript_lines(&messages);
+        assert_eq!(fixture_lines(&lines), data["expected_lines"]);
+        assert_eq!(
+            fixture_layout(&journal.projection_layout(&messages).unwrap()),
+            data["expected_layout"]
+        );
+        assert_eq!(messages[4].tool_call_id.as_deref(), Some("call-two"));
+        assert_eq!(messages[5].tool_call_id.as_deref(), Some("call-one"));
+        assert_eq!(
+            lines[1], lines[5],
+            "identical earlier text is a different source slot"
+        );
+        let visible = format!("{lines:?}");
+        for omitted in ["pre-tool A", "generic hidden tool body", "printf fixture"] {
+            assert!(!visible.contains(omitted));
+        }
+        assert!(
+            matches!(&lines[0], TranscriptLine::System(text) if text == "provider System remains canonical")
+        );
+    }
+
+    #[test]
+    fn actual_file_expansion_changes_only_input_correspondence() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch =
+            Scratch(std::env::temp_dir().join(format!("orbit-view-mention-{}", ulid::Ulid::new())));
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        std::fs::write(
+            scratch.0.join("note.txt"),
+            "actual generic mention content\n",
+        )
+        .unwrap();
+        let cx = orbit_tools::ToolContext::new(
+            scratch.0.clone(),
+            "view-fixture".into(),
+            scratch.0.clone(),
+        );
+        let literal = "inspect @note.txt";
+        let expansion = expand_file_mentions(literal, &cx).text;
+        assert_ne!(expansion, literal);
+        assert!(expansion.contains("actual generic mention content"));
+        let (data, mut messages, journal) = fixture();
+        messages[2].content = expansion.clone();
+        assert_eq!(
+            fixture_layout(&journal.projection_layout(&messages).unwrap()),
+            data["expected_layout"]
+        );
+        let lines = session_to_transcript_lines(&messages);
+        assert!(matches!(&lines[2], TranscriptLine::User { text, .. } if text == &expansion));
+        assert_eq!(fixture_lines(&lines)[5], data["expected_lines"][5]);
+    }
+
+    #[test]
+    fn prefix_metadata_edit_compaction_and_missing_input_never_invent_a_boundary() {
+        let (_, messages, journal) = fixture();
+        let mut edited = messages.clone();
+        edited[1].origin_provider = Some("changed-provider-metadata".into());
+        assert_eq!(
+            session_to_transcript_lines(&edited),
+            session_to_transcript_lines(&messages)
+        );
+        assert!(
+            journal.projection_layout(&edited).is_none(),
+            "typed prefix, not just rendered text"
+        );
+        edited = messages.clone();
+        edited.remove(0);
+        assert!(journal.projection_layout(&edited).is_none());
+        edited = messages.clone();
+        edited[2].role = ChatRole::Assistant;
+        assert!(journal.projection_layout(&edited).is_none());
+        let (_, _, mut compacted) = fixture();
+        compacted.observe(&E::Compacting {
+            used_tokens: 100,
+            window_tokens: 1000,
+        });
+        assert!(compacted.projection_layout(&messages).is_none());
+    }
+
+    #[test]
+    fn call_vector_order_empty_duplicate_and_unobserved_id_are_unproved() {
+        let (_, messages, journal) = fixture();
+        let mut edited = messages.clone();
+        edited[3].tool_calls.as_mut().unwrap().swap(0, 1);
+        assert!(journal.projection_layout(&edited).is_none());
+        edited = messages.clone();
+        edited[3].tool_calls.as_mut().unwrap()[0].id.clear();
+        assert!(journal.projection_layout(&edited).is_none());
+        edited = messages.clone();
+        edited[3].tool_calls.as_mut().unwrap()[1].id = "call-one".into();
+        assert!(journal.projection_layout(&edited).is_none());
+        edited = messages.clone();
+        edited[4].tool_call_id = Some("unobserved-call".into());
+        assert!(journal.projection_layout(&edited).is_none());
+        edited = messages.clone();
+        edited.insert(5, edited[4].clone());
+        assert!(journal.projection_layout(&edited).is_none());
+        // A missing result preserves the unique tool header, with the actual
+        // normalizer's neutral unavailable outcome and no result-derived fact.
+        edited = messages.clone();
+        edited.remove(4);
+        assert!(journal.projection_layout(&edited).is_some());
+        assert!(
+            matches!(&session_to_transcript_lines(&edited)[4], TranscriptLine::Stripped {
+            outcome: Some(ToolOutcome::Unavailable), meta, .. } if meta.is_empty())
+        );
+    }
+
+    #[test]
+    fn historical_duplicate_cannot_borrow_current_call_identity() {
+        let (data, messages, _) = fixture();
+        let mut baseline: Vec<ChatMessage> =
+            serde_json::from_value(data["baseline"].clone()).unwrap();
+        baseline.push(messages[3].clone());
+        let mut journal = OrdinaryViewJournal::new(&baseline);
+        journal.observe(&E::RoundStarted { round: 0 });
+        for (call_id, kind) in [("call-one", "Bash"), ("call-two", "Glob")] {
+            journal.observe(&E::ToolStartedFull {
+                call_id: call_id.into(),
+                kind: kind.into(),
+                target: String::new(),
+            });
+        }
+        journal.observe(&E::RoundStarted { round: 1 });
+        baseline.extend(messages.into_iter().skip(2));
+        assert!(journal.projection_layout(&baseline).is_none());
+    }
+
+    #[test]
+    fn engine_announcements_are_origins_and_reverse_finishes_are_only_updates() {
+        let (data, messages, mut journal) = fixture();
+        for call_id in ["call-two", "call-one"] {
+            journal.observe(&E::ToolFinishedFull {
+                call_id: call_id.into(),
+                ok: true,
+                result_fact: String::new(),
+            });
+        }
+        assert_eq!(
+            fixture_layout(&journal.projection_layout(&messages).unwrap()),
+            data["expected_layout"]
+        );
+        journal.observe(&E::ToolStartedFull {
+            call_id: "call-one".into(),
+            kind: "Bash".into(),
+            target: String::new(),
+        });
+        assert!(journal.projection_layout(&messages).is_none());
+        let mut unstarted = OrdinaryViewJournal::new(&[]);
+        unstarted.observe(&E::ToolStartedFull {
+            call_id: "new".into(),
+            kind: "Bash".into(),
+            target: String::new(),
+        });
+        assert!(!unstarted.valid);
+    }
+
+    #[test]
+    fn producer_evidence_bounds_and_round_order_fail_only_correspondence() {
+        let mut rounds = OrdinaryViewJournal::new(&[]);
+        for round in 0..=MAX_VIEW_ROUNDS as u32 {
+            rounds.observe(&E::RoundStarted { round });
+        }
+        assert!(!rounds.valid);
+        assert_eq!(rounds.rounds.len(), MAX_VIEW_ROUNDS);
+        let mut calls = OrdinaryViewJournal::new(&[]);
+        calls.observe(&E::RoundStarted { round: 0 });
+        for number in 0..=MAX_VIEW_CALLS {
+            calls.observe(&E::ToolStartedFull {
+                call_id: format!("call-{number}"),
+                kind: "Read".into(),
+                target: String::new(),
+            });
+        }
+        assert!(!calls.valid);
+        assert_eq!(calls.call_ids.len(), MAX_VIEW_CALLS);
+        let mut order = OrdinaryViewJournal::new(&[]);
+        order.observe(&E::RoundStarted { round: 1 });
+        assert!(!order.valid);
+        let mut repeated = OrdinaryViewJournal::new(&[]);
+        repeated.observe(&E::RoundStarted { round: 0 });
+        repeated.observe(&E::RoundStarted { round: 0 });
+        assert!(!repeated.valid);
+    }
+
+    #[test]
+    fn final_typed_slot_is_independent_of_live_normalization_and_omitted_partial_text() {
+        let (data, mut messages, journal) = fixture();
+        // A slot is producer evidence, never a text-equality certificate. The
+        // receiving reducer must compare its observed scalar segments exactly
+        // and take changed-source fallback for this unseen canonical suffix.
+        messages[6].content.push_str(" unseen final suffix");
+        let layout = journal.projection_layout(&messages).unwrap();
+        assert_eq!(fixture_layout(&layout), data["expected_layout"]);
+        assert_ne!(
+            fixture_lines(&session_to_transcript_lines(&messages))[5],
+            data["expected_lines"][5]
+        );
+        messages.pop();
+        let layout = journal.projection_layout(&messages).unwrap();
+        assert_eq!(layout.line_count, 5);
+        assert_eq!(layout.groups[1].model_index, None);
+        assert!(layout.groups[1].tools.is_empty());
+        assert_eq!(layout.groups[0].tools.len(), 2);
+        // A real provider System consumes a canonical slot. It is never
+        // conflated with the explicitly local notices in the live fixture.
+        let mut system = messages[0].clone();
+        system.content = "another provider System".into();
+        messages.push(system);
+        let layout = journal.projection_layout(&messages).unwrap();
+        assert_eq!(layout.line_count, 6);
+        assert!(
+            matches!(&session_to_transcript_lines(&messages)[5], TranscriptLine::System(text)
+            if text == "another provider System")
+        );
+    }
+
+    #[test]
+    fn real_projection_emitter_keeps_fixture_after_ordinary_registration_drop() {
+        for kind in [ForegroundKind::Prompt, ForegroundKind::PlanPrompt] {
+            let (data, messages, journal) = fixture();
+            let binding = SessionBinding {
+                session_id: "view-fixture".into(),
+                generation: 1,
+            };
+            let operation = ForegroundOperation::new(binding.clone(), kind, 1).unwrap();
+            let command = if kind == ForegroundKind::Prompt {
+                WorkerCommand::Prompt("fixture".into())
+            } else {
+                WorkerCommand::PlanPrompt("fixture".into())
+            };
+            let registration = operation.start(&command).unwrap();
+            let (bus, sender) = orbit_hud_tui::bus::Bus::new();
+            let publisher = sender.scoped_view(&registration).unwrap();
+            publisher
+                .sender()
+                .send(Msg::TextDelta("last source before closure".into()));
+            let projection_sender =
+                publisher.close_and_projection_sender(journal.projection_layout(&messages));
+            drop(registration);
+            let config = TuiTurnConfig {
+                home: std::path::PathBuf::new(),
+                session_id: binding.session_id.clone(),
+                gate: String::new(),
+                model: "fixture-model".into(),
+                provider_id: "fixture-provider".into(),
+                effort: None,
+                auto_tools: false,
+                scope: Default::default(),
+                initial_transcript: Vec::new(),
+                initial_turns: 0,
+                initial_input_tokens: 0,
+                initial_output_tokens: 0,
+                initial_cost_microcents: 0,
+            };
+            emit_session_projection(
+                &projection_sender,
+                &config,
+                &binding,
+                &messages,
+                1,
+                0,
+                0,
+                0,
+                CostQualification::Unavailable,
+                ProjectionReason::Operation {
+                    operation: operation.clone(),
+                },
+                ContextProjection::Unavailable,
+            );
+            assert!(
+                matches!(bus.try_recv(), Some(Msg::TextDelta(text)) if text == "last source before closure")
+            );
+            let Some(Msg::SessionProjection(projection)) = bus.try_recv() else {
+                panic!("missing real projection");
+            };
+            assert_eq!(fixture_lines(&projection.lines), data["expected_lines"]);
+            assert!(
+                matches!(projection.reason, ProjectionReason::Operation { operation: received } if received == operation)
+            );
+            assert!(bus.try_recv().is_none());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3118,6 +4031,49 @@ fn run_tui_turn_inner(
     tool_cx: &orbit_tools::ToolContext,
     accounting: Option<&NamespaceAccounting>,
 ) -> Result<(orbit_engine::TurnCompletion, ContextProjection), String> {
+    run_tui_turn_observed(
+        config,
+        transcript,
+        prompt,
+        user_blocks,
+        sender,
+        approvals,
+        cancel,
+        _turns,
+        auto_grants,
+        mods_directive,
+        plan_mode,
+        scope,
+        tool_cx,
+        accounting,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tui_turn_observed(
+    config: &TuiTurnConfig,
+    transcript: &mut Vec<ChatMessage>,
+    prompt: &str,
+    user_blocks: Option<Vec<ContentBlock>>,
+    sender: &BusSender,
+    approvals: &ApprovalRegistry,
+    cancel: &orbit_provider_http::CancelToken,
+    // Kept for signature stability; the worker loop owns turn counting and
+    // session saving (D9) — the turn itself no longer needs it.
+    _turns: u64,
+    auto_grants: &mut crate::tool_runtime::AutoGrants,
+    mods_directive: &str,
+    plan_mode: bool,
+    // The session's permission scope (S5), mutable across turns: the
+    // worker loop's SetMode command updates config.scope in place —
+    // no process env, no per-call reads.
+    scope: &mut crate::tool_runtime::PermissionScope,
+    // The session's tool context (see `session_tool_context`).
+    tool_cx: &orbit_tools::ToolContext,
+    accounting: Option<&NamespaceAccounting>,
+    mut view_journal: Option<&mut OrdinaryViewJournal>,
+) -> Result<(orbit_engine::TurnCompletion, ContextProjection), String> {
     // One checkpoint per prompt (E7): /rewind restores a turn. The context
     // is the session's now, so the turn boundary is marked here.
     tool_cx.reset_turn_checkpoint();
@@ -3172,16 +4128,25 @@ fn run_tui_turn_inner(
     // The size a running compaction started from, for its "before → after".
     let mut compact_from: u64 = 0;
     let mut latest_usage_window_tokens = None;
+    let mut round_sender = sender.clone();
     let mut events = |ev: orbit_frontend_protocol::FrontendEvent| {
         use orbit_frontend_protocol::FrontendEvent as E;
+        if let Some(journal) = view_journal.as_deref_mut() {
+            journal.observe(&ev);
+        }
+        if let E::RoundStarted { round } = &ev {
+            sender.view_round_started(*round);
+            round_sender = sender.with_view_round(*round);
+        }
+        let event_sender = &round_sender;
         match ev {
             E::TextDelta { text } => {
-                orbit_hud_tui::emit_text(&mut cot, sender, text.as_bytes());
+                orbit_hud_tui::emit_text(&mut cot, event_sender, text.as_bytes());
             }
             E::RoundStarted { round } => {
                 if round == 0 {
                     ws.phase_index = 1; // reason
-                    orbit_hud_tui::emit_workspace(sender, ws.clone());
+                    orbit_hud_tui::emit_workspace(event_sender, ws.clone());
                     first_round_seen = true;
                 }
             }
@@ -3190,9 +4155,9 @@ fn run_tui_turn_inner(
                 window_tokens,
             } => {
                 compact_from = used_tokens;
-                orbit_hud_tui::emit_compaction(sender, true, used_tokens);
+                orbit_hud_tui::emit_compaction(event_sender, true, used_tokens);
                 orbit_hud_tui::emit_activity(
-                    sender,
+                    event_sender,
                     "compaction",
                     "compacting context",
                     &format!("{used_tokens} of {window_tokens} tokens"),
@@ -3203,10 +4168,10 @@ fn run_tui_turn_inner(
                 summary,
                 after_tokens,
             } => {
-                orbit_hud_tui::emit_compaction(sender, false, after_tokens);
+                orbit_hud_tui::emit_compaction(event_sender, false, after_tokens);
                 let _ = summary;
                 orbit_hud_tui::emit_activity(
-                    sender,
+                    event_sender,
                     "compaction",
                     "compacted",
                     &format!(
@@ -3222,7 +4187,7 @@ fn run_tui_turn_inner(
                     // Engine events can arrive before the first round
                     // completes; keep the rail honest.
                     ws.phase_index = 2; // act
-                    orbit_hud_tui::emit_workspace(sender, ws.clone());
+                    orbit_hud_tui::emit_workspace(event_sender, ws.clone());
                 }
                 // No card here: ToolStartedFull carries the call's id and
                 // target, and the card is keyed by that id.
@@ -3231,10 +4196,10 @@ fn run_tui_turn_inner(
             E::CostUpdated { total_microcents } => {
                 // D5: report the TURN's running cost; the committed total
                 // is only touched by ResponseFinished.
-                orbit_hud_tui::emit_turn_cost(sender, total_microcents);
+                orbit_hud_tui::emit_turn_cost(event_sender, total_microcents);
             }
             E::OutputTruncated { .. } => {
-                orbit_hud_tui::emit_status(sender, "reply cut off by the output-token limit");
+                orbit_hud_tui::emit_status(event_sender, "reply cut off by the output-token limit");
             }
             E::Retrying {
                 attempt,
@@ -3242,34 +4207,34 @@ fn run_tui_turn_inner(
                 reason,
             } => {
                 orbit_hud_tui::emit_status(
-                    sender,
+                    event_sender,
                     &format!("retry {attempt} in {retry_in_ms}ms — {reason}"),
                 );
                 orbit_hud_tui::emit_activity(
-                    sender,
+                    event_sender,
                     "retry",
                     &format!("attempt {attempt}"),
                     &format!("in {retry_in_ms} ms — {reason}"),
                     None,
                 );
                 // The failed attempt still wrote its egress record.
-                resync_ledger_chip(&config.home, sender);
+                resync_ledger_chip(&config.home, event_sender);
             }
             E::Error { message } => {
-                orbit_hud_tui::emit_error(sender, &message);
-                resync_ledger_chip(&config.home, sender);
+                orbit_hud_tui::emit_error(event_sender, &message);
+                resync_ledger_chip(&config.home, event_sender);
             }
             E::Status { text } => {
-                orbit_hud_tui::emit_status(sender, &text);
+                orbit_hud_tui::emit_status(event_sender, &text);
             }
             E::TurnEnded { interrupted, .. } => {
                 ws.phase_index = 4; // respond
-                orbit_hud_tui::emit_workspace(sender, ws.clone());
-                resync_ledger_chip(&config.home, sender);
+                orbit_hud_tui::emit_workspace(event_sender, ws.clone());
+                resync_ledger_chip(&config.home, event_sender);
                 if interrupted {
                     // The visible cancel: the MD's loop contract says a
                     // cancelled turn keeps the transcript valid — say so.
-                    orbit_hud_tui::emit_status(sender, "cancelled");
+                    orbit_hud_tui::emit_status(event_sender, "cancelled");
                 }
             }
             // ── The TUI prototype's motion events. Each carries what
@@ -3280,14 +4245,14 @@ fn run_tui_turn_inner(
                 target,
             } => {
                 orbit_hud_tui::emit_tool_started(
-                    sender,
+                    event_sender,
                     &call_id,
                     &kind,
                     &display_target(&kind, &target),
                 );
             }
             E::ToolOutput { call_id, line } => {
-                orbit_hud_tui::emit_tool_output(sender, &call_id, &line);
+                orbit_hud_tui::emit_tool_output(event_sender, &call_id, &line);
             }
             E::ToolFinishedFull {
                 call_id,
@@ -3304,9 +4269,15 @@ fn run_tui_turn_inner(
                 } else {
                     orbit_hud_tui::model::ToolOutcome::Failed
                 };
-                orbit_hud_tui::emit_tool_finished(sender, &call_id, "", outcome, &result_fact);
+                orbit_hud_tui::emit_tool_finished(
+                    event_sender,
+                    &call_id,
+                    "",
+                    outcome,
+                    &result_fact,
+                );
                 // The result record is on the chain by now.
-                resync_ledger_chip(&config.home, sender);
+                resync_ledger_chip(&config.home, event_sender);
             }
             E::FileChanged {
                 path,
@@ -3316,7 +4287,7 @@ fn run_tui_turn_inner(
                 hunks,
             } => {
                 orbit_hud_tui::emit_file_changed(
-                    sender,
+                    event_sender,
                     &display_path(&path),
                     added,
                     removed,
@@ -3329,16 +4300,16 @@ fn run_tui_turn_inner(
                 task,
                 model: _,
             } => {
-                orbit_hud_tui::emit_subagent_started(sender, &agent_id, &name, &task);
+                orbit_hud_tui::emit_subagent_started(event_sender, &agent_id, &name, &task);
             }
             E::SubagentProgress { agent_id, action } => {
-                orbit_hud_tui::emit_subagent_progress(sender, &agent_id, &action);
+                orbit_hud_tui::emit_subagent_progress(event_sender, &agent_id, &action);
             }
             E::SubagentFinished { agent_id, report } => {
-                orbit_hud_tui::emit_subagent_finished(sender, &agent_id, &report, true);
+                orbit_hud_tui::emit_subagent_finished(event_sender, &agent_id, &report, true);
             }
             E::ModeChanged { mode } => {
-                orbit_hud_tui::emit_mode_changed(sender, &mode);
+                orbit_hud_tui::emit_mode_changed(event_sender, &mode);
             }
             E::Usage {
                 used_tokens,
@@ -3346,7 +4317,7 @@ fn run_tui_turn_inner(
                 breakdown,
             } => {
                 record_latest_usage_window(&mut latest_usage_window_tokens, window_tokens);
-                orbit_hud_tui::emit_usage(sender, used_tokens, window_tokens, breakdown);
+                orbit_hud_tui::emit_usage(event_sender, used_tokens, window_tokens, breakdown);
             }
             E::LedgerAppended {
                 record_count,
@@ -3358,14 +4329,14 @@ fn run_tui_turn_inner(
                 // ledger's own total, which is the authority.
                 if !kind.is_empty() {
                     orbit_hud_tui::emit_activity(
-                        sender,
+                        event_sender,
                         &kind,
                         &host_of(&resolved_gate),
                         &summary,
                         Some(&head_digest),
                     );
                 }
-                orbit_hud_tui::emit_ledger_appended(sender, record_count);
+                orbit_hud_tui::emit_ledger_appended(event_sender, record_count);
             }
             _ => {}
         }

@@ -26,8 +26,932 @@ use crate::worker::WorkerCtx;
 
 use crate::ApprovalRegistry;
 use crate::WorkerCommand;
-use crate::bus::{Bus, BusSender};
+use crate::bus::{Bus, BusSender, ObservedEvent, ViewProjectionLayout, ViewStamp};
 use crate::worker::CommandSink;
+
+use super::shell::convo::{
+    ConversationFrame, ReadAnchor, ReadInput, ReadMode, ReadOwner, ReadPart, ReadTarget,
+};
+
+const VIEW_JOURNAL_MAX: usize = 4096;
+#[derive(Clone)]
+enum EditOrigin {
+    Local,
+    Input,
+    Queued,
+    Model,
+    Unproved,
+    Tool { call_id: String, name: String },
+}
+enum ViewEdit {
+    Insert { index: usize, origin: EditOrigin },
+    Extend { index: usize },
+}
+struct EditLog {
+    edits: Vec<ViewEdit>,
+    valid: bool,
+    extend_model: bool,
+}
+thread_local! { static DISPLAY_EDITS: std::cell::RefCell<Option<EditLog>> = const { std::cell::RefCell::new(None) }; }
+// Exact, bounded display edits; producer eligibility is checked separately.
+struct EditCapture {
+    previous: Option<EditLog>,
+    finished: bool,
+}
+impl EditCapture {
+    fn new() -> Self {
+        let previous = DISPLAY_EDITS.with(|slot| {
+            slot.replace(Some(EditLog {
+                edits: Vec::new(),
+                valid: true,
+                extend_model: true,
+            }))
+        });
+        if previous.is_some() {
+            DISPLAY_EDITS.with(|slot| {
+                if let Some(log) = slot.borrow_mut().as_mut() {
+                    log.valid = false;
+                }
+            });
+        }
+        Self {
+            previous,
+            finished: false,
+        }
+    }
+    fn with_model_boundary(extend_model: bool) -> Self {
+        let capture = Self::new();
+        DISPLAY_EDITS.with(|slot| {
+            if let Some(log) = slot.borrow_mut().as_mut() {
+                log.extend_model = extend_model;
+            }
+        });
+        capture
+    }
+    fn finish(mut self) -> EditLog {
+        self.finished = true;
+        let mut previous = self.previous.take();
+        if let Some(parent) = &mut previous {
+            parent.valid = false;
+        }
+        DISPLAY_EDITS
+            .with(|slot| slot.replace(previous))
+            .unwrap_or(EditLog {
+                edits: Vec::new(),
+                valid: false,
+                extend_model: false,
+            })
+    }
+}
+impl Drop for EditCapture {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut previous = self.previous.take();
+            if let Some(parent) = &mut previous {
+                parent.valid = false;
+            }
+            DISPLAY_EDITS.with(|slot| {
+                slot.replace(previous);
+            });
+        }
+    }
+}
+fn record_view_edit(edit: ViewEdit) {
+    DISPLAY_EDITS.with(|slot| {
+        if let Some(log) = slot.borrow_mut().as_mut() {
+            if log.edits.len() < VIEW_JOURNAL_MAX {
+                log.edits.push(edit);
+            } else {
+                log.valid = false;
+            }
+        }
+    });
+}
+fn tool_edit_origin(call_id: &str, name: &str) -> EditOrigin {
+    if call_id.is_empty() || call_id.len() > 4096 || name.is_empty() || name.len() > 4096 {
+        EditOrigin::Unproved
+    } else {
+        EditOrigin::Tool {
+            call_id: call_id.into(),
+            name: name.into(),
+        }
+    }
+}
+fn captured_model_may_extend() -> bool {
+    DISPLAY_EDITS.with(|slot| slot.borrow().as_ref().is_none_or(|log| log.extend_model))
+}
+fn foreground_end(s: &Scenario) -> usize {
+    s.transcript
+        .iter()
+        .rposition(|line| line.kind != LineKind::Queued)
+        .map_or(0, |index| index + 1)
+}
+fn push_display_line(s: &mut Scenario, line: TranscriptLine, origin: EditOrigin) {
+    let index = if line.kind == LineKind::Queued {
+        s.transcript.len()
+    } else {
+        foreground_end(s)
+    };
+    s.transcript.insert(index, line);
+    record_view_edit(ViewEdit::Insert { index, origin });
+}
+#[derive(Clone)]
+enum ObservedSource {
+    Model {
+        round: u32,
+    },
+    Tool {
+        round: u32,
+        call_id: String,
+        name: String,
+        ordinal: usize,
+    },
+    Local,
+}
+type ReadAssignments = std::collections::BTreeMap<usize, u64>;
+type ReadAliases = std::collections::BTreeMap<u64, (u64, usize, bool)>;
+type ReadCorrespondence = (ReadAssignments, ReadAliases);
+struct OrdinaryWitness {
+    operation: crate::worker::ForegroundOperation,
+    epoch: u64,
+    input: Option<u64>,
+    baseline: Vec<u64>,
+    origins: std::collections::BTreeMap<u64, ObservedSource>,
+    current_round: Option<u32>,
+    last_model: Option<(u64, u32)>,
+    rounds: Vec<u32>,
+    calls: Vec<(u32, String, String)>,
+    call_ids: std::collections::BTreeSet<String>,
+    round_call_count: usize,
+    valid: bool,
+}
+fn disabled_witness(mut witness: OrdinaryWitness, epoch: u64) -> OrdinaryWitness {
+    witness.valid = false;
+    witness.epoch = epoch;
+    witness.input = None;
+    witness.last_model = None;
+    witness.baseline.clear();
+    witness.origins.clear();
+    witness
+}
+fn view_source_matches(s: &Scenario, source: &ViewStamp) -> bool {
+    source.eligible
+        && s.frontend.foreground.as_ref() == Some(&source.operation)
+        && s.frontend.binding.as_ref() == Some(source.operation.source())
+}
+
+// Display identities are local to this event loop. They never enter worker commands or saved DTOs.
+struct ReadState {
+    epoch: u64,
+    next_id: Option<u64>,
+    valid: bool,
+    binding: Option<crate::worker::SessionBinding>,
+    entries: Vec<u64>,
+    sections: [u64; 6],
+    section_parent: Option<u64>,
+    mode: ReadMode,
+    frame: Option<ConversationFrame>,
+    navigation_start: Option<usize>,
+    witness: Option<OrdinaryWitness>,
+}
+
+struct ReadReplacement {
+    epoch: u64,
+    next_id: Option<u64>,
+    valid: bool,
+    binding: Option<crate::worker::SessionBinding>,
+    entries: Vec<u64>,
+    sections: [u64; 6],
+    section_parent: Option<u64>,
+    mode: ReadMode,
+}
+
+impl ReadState {
+    fn new(s: &Scenario) -> Self {
+        let mut state = Self {
+            epoch: 0,
+            next_id: Some(1),
+            valid: true,
+            binding: None,
+            entries: Vec::new(),
+            sections: [0; 6],
+            section_parent: None,
+            mode: ReadMode::Follow,
+            frame: None,
+            navigation_start: None,
+            witness: None,
+        };
+        state.reset(s);
+        state
+    }
+    fn mint(&mut self) -> u64 {
+        let Some(id) = self.next_id else {
+            self.valid = false;
+            return 0;
+        };
+        self.next_id = id.checked_add(1);
+        if self.next_id.is_none() {
+            self.valid = false;
+        }
+        id
+    }
+    fn reset(&mut self, s: &Scenario) {
+        let retained = self.witness.take().filter(|witness| {
+            s.frontend.foreground.as_ref() == Some(&witness.operation)
+                && s.frontend.binding.as_ref() == Some(witness.operation.source())
+        });
+        let Some(epoch) = self.epoch.checked_add(1) else {
+            self.valid = false;
+            self.frame = None;
+            self.witness = retained.map(|witness| disabled_witness(witness, self.epoch));
+            return;
+        };
+        self.epoch = epoch;
+        self.witness = retained.map(|witness| disabled_witness(witness, epoch));
+        self.binding = s.frontend.binding.clone();
+        self.entries.clear();
+        for _ in &s.transcript {
+            let id = self.mint();
+            self.entries.push(id);
+        }
+        self.section_parent = self.entries.last().copied();
+        for index in 0..self.sections.len() {
+            self.sections[index] = self.mint();
+        }
+        self.frame = None;
+        self.follow();
+    }
+    fn follow(&mut self) {
+        self.mode = ReadMode::Follow;
+        self.navigation_start = None;
+    }
+    fn scroll(&mut self, delta: isize) {
+        let Some(frame) = &self.frame else {
+            return;
+        };
+        if frame.epoch != self.epoch || !self.valid {
+            return;
+        }
+        let (start, mode) = frame.navigate(self.navigation_start.unwrap_or(frame.start), delta);
+        self.navigation_start = Some(start);
+        self.mode = mode;
+    }
+    fn scroll_pointer(&mut self, col: u16, row: u16, delta: isize) {
+        if self.frame.as_ref().is_some_and(|frame| {
+            col >= frame.panel.x
+                && col < frame.panel.right()
+                && row >= frame.panel.y
+                && row < frame.panel.bottom()
+        }) {
+            self.scroll(delta);
+        }
+    }
+    fn input(&self) -> Option<ReadInput<'_>> {
+        self.valid.then_some(ReadInput {
+            epoch: self.epoch,
+            entries: &self.entries,
+            sections: self.sections,
+            section_parent: self.section_parent,
+            mode: self.mode,
+            delta: 0,
+        })
+    }
+    fn commit(&mut self, frame: Option<ConversationFrame>) {
+        self.navigation_start = None;
+        let Some(frame) =
+            frame.filter(|frame| frame.epoch == self.epoch && frame.entries == self.entries)
+        else {
+            self.frame = None;
+            return;
+        };
+        self.mode = if matches!(frame.mode, ReadMode::Anchored(_)) && frame.top.is_none() {
+            ReadMode::Start
+        } else {
+            frame.mode
+        };
+        self.frame = Some(frame);
+    }
+    fn invalidate_witness(&mut self) {
+        if let Some(witness) = &mut self.witness {
+            witness.valid = false;
+        }
+    }
+    fn begin_ordinary(&mut self, s: &Scenario, input_index: usize) {
+        let Some(operation) = s
+            .frontend
+            .foreground
+            .as_ref()
+            .filter(|op| op.kind().is_ordinary())
+        else {
+            self.witness = None;
+            return;
+        };
+        let input = self.entries.get(input_index).copied().filter(|id| *id != 0);
+        let valid = self.valid
+            && input.is_some()
+            && input_index <= VIEW_JOURNAL_MAX
+            && s.transcript
+                .get(input_index)
+                .is_some_and(|line| line.kind == LineKind::User);
+        let baseline = if valid {
+            self.entries[..input_index].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.witness = Some(OrdinaryWitness {
+            operation: operation.clone(),
+            epoch: self.epoch,
+            input,
+            baseline,
+            origins: Default::default(),
+            current_round: None,
+            last_model: None,
+            rounds: Vec::new(),
+            calls: Vec::new(),
+            call_ids: Default::default(),
+            round_call_count: 0,
+            valid,
+        });
+    }
+    fn reset_view_proof(&mut self, s: &Scenario) {
+        let follow = matches!(self.mode, ReadMode::Follow);
+        self.reset(s);
+        if !follow {
+            self.mode = ReadMode::Start;
+        }
+    }
+    fn note_round(&mut self, s: &Scenario, source: &ViewStamp, round: u32) {
+        if !source.operation.kind().is_ordinary() || !view_source_matches(s, source) {
+            return;
+        }
+        if self
+            .witness
+            .as_ref()
+            .is_none_or(|witness| witness.operation != source.operation)
+        {
+            if round != 0 {
+                return;
+            }
+            let end = foreground_end(s);
+            let valid =
+                self.valid && end <= VIEW_JOURNAL_MAX && self.entries.len() == s.transcript.len();
+            self.witness = Some(OrdinaryWitness {
+                operation: source.operation.clone(),
+                epoch: self.epoch,
+                input: None,
+                baseline: if valid {
+                    self.entries[..end].to_vec()
+                } else {
+                    Vec::new()
+                },
+                origins: Default::default(),
+                current_round: None,
+                last_model: None,
+                rounds: Vec::new(),
+                calls: Vec::new(),
+                call_ids: Default::default(),
+                round_call_count: 0,
+                valid,
+            });
+        }
+        let Some(witness) = &mut self.witness else {
+            return;
+        };
+        if witness.operation != source.operation || witness.epoch != self.epoch {
+            return;
+        }
+        let expected = witness
+            .current_round
+            .map_or(Some(0), |round| round.checked_add(1));
+        if expected != Some(round) {
+            return;
+        }
+        witness.current_round = Some(round);
+        witness.last_model = None;
+        witness.round_call_count = 0;
+        if witness.rounds.len() >= VIEW_JOURNAL_MAX {
+            witness.valid = false;
+        } else {
+            witness.rounds.push(round);
+        }
+    }
+    fn observe_edits(
+        &mut self,
+        s: &Scenario,
+        previous_len: usize,
+        log: EditLog,
+        source: Option<&ViewStamp>,
+    ) {
+        if self.binding != s.frontend.binding || self.entries.len() != previous_len || !log.valid {
+            self.reset_view_proof(s);
+            return;
+        }
+        for edit in log.edits {
+            match edit {
+                ViewEdit::Insert { index, origin } => {
+                    if index > self.entries.len() {
+                        self.invalidate_witness();
+                        break;
+                    }
+                    let id = self.mint();
+                    self.entries.insert(index, id);
+                    if matches!(origin, EditOrigin::Input) {
+                        self.begin_ordinary(s, index);
+                        continue;
+                    }
+                    if matches!(origin, EditOrigin::Queued) {
+                        continue;
+                    }
+                    let Some(witness) = &mut self.witness else {
+                        continue;
+                    };
+                    if matches!(origin, EditOrigin::Model)
+                        && let Some(source) = source
+                        && source.eligible
+                        && source.operation == witness.operation
+                        && source.round == witness.current_round
+                        && let Some(round) = source.round
+                    {
+                        witness.last_model = Some((id, round));
+                    }
+                    if witness.origins.len() >= VIEW_JOURNAL_MAX {
+                        witness.valid = false;
+                        continue;
+                    }
+                    let observed = match origin {
+                        EditOrigin::Local => Some(ObservedSource::Local),
+                        EditOrigin::Model => source
+                            .and_then(|source| source.round.map(|round| (source, round)))
+                            .filter(|(source, round)| {
+                                source.eligible
+                                    && witness.operation == source.operation
+                                    && witness.current_round == Some(*round)
+                            })
+                            .map(|(_, round)| ObservedSource::Model { round }),
+                        EditOrigin::Tool { call_id, name } => {
+                            let valid = source.is_some_and(|source| {
+                                source.eligible
+                                    && source.operation == witness.operation
+                                    && source.round == witness.current_round
+                                    && source.round.is_some()
+                            }) && !call_id.is_empty()
+                                && call_id.len() <= 4096
+                                && name.len() <= 4096
+                                && !witness.call_ids.contains(&call_id)
+                                && witness.calls.len() < VIEW_JOURNAL_MAX;
+                            if valid {
+                                let round = source.and_then(|source| source.round).unwrap_or(0);
+                                let ordinal = witness.round_call_count;
+                                let Some(next_ordinal) = ordinal.checked_add(1) else {
+                                    witness.valid = false;
+                                    continue;
+                                };
+                                witness.round_call_count = next_ordinal;
+                                witness.call_ids.insert(call_id.clone());
+                                witness.calls.push((round, call_id.clone(), name.clone()));
+                                Some(ObservedSource::Tool {
+                                    round,
+                                    call_id,
+                                    name,
+                                    ordinal,
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        EditOrigin::Input | EditOrigin::Queued | EditOrigin::Unproved => None,
+                    };
+                    if let Some(observed) = observed {
+                        witness.origins.insert(id, observed);
+                    } else {
+                        witness.valid = false;
+                    }
+                }
+                ViewEdit::Extend { index } => {
+                    let Some(id) = self.entries.get(index) else {
+                        self.invalidate_witness();
+                        continue;
+                    };
+                    let Some(witness) = &mut self.witness else {
+                        continue;
+                    };
+                    if !matches!((witness.origins.get(id), source),
+                        (Some(ObservedSource::Model { round }), Some(source))
+                        if source.eligible && source.operation == witness.operation && source.round == Some(*round)
+                            && witness.current_round == Some(*round))
+                    {
+                        witness.valid = false;
+                    }
+                }
+            }
+        }
+        if self.entries.len() != s.transcript.len() {
+            self.reset_view_proof(s);
+            return;
+        }
+        if self.section_parent != self.entries.last().copied() {
+            self.mode = self.section_to_parent(s, self.mode);
+            self.section_parent = self.entries.last().copied();
+            for index in 0..self.sections.len() {
+                self.sections[index] = self.mint();
+            }
+        }
+    }
+    fn correspondence(
+        &self,
+        old: &Scenario,
+        lines: &[TranscriptLine],
+        layout: &ViewProjectionLayout,
+    ) -> Option<ReadCorrespondence> {
+        let witness = self.witness.as_ref()?;
+        if !witness.valid
+            || witness.epoch != self.epoch
+            || old.frontend.foreground.as_ref() != Some(&witness.operation)
+            || layout.line_count > lines.len()
+            || layout.line_count > VIEW_JOURNAL_MAX
+            || layout.baseline_lines != layout.input_index
+            || layout.input_index >= layout.line_count
+            || layout.groups.len() > VIEW_JOURNAL_MAX
+            || layout
+                .groups
+                .iter()
+                .try_fold(0usize, |sum, group| sum.checked_add(group.tools.len()))
+                .is_none_or(|sum| sum > VIEW_JOURNAL_MAX)
+            || lines[layout.input_index].kind != LineKind::User
+        {
+            return None;
+        }
+        let mut assigned = std::collections::BTreeMap::new();
+        let mut aliases = std::collections::BTreeMap::new();
+        for (index, id) in witness
+            .baseline
+            .iter()
+            .take(layout.baseline_lines)
+            .enumerate()
+        {
+            if same_read_source(old.transcript.get(index)?, lines.get(index)?, false) {
+                assigned.insert(index, *id);
+            } else {
+                break;
+            }
+        }
+        if let Some(input) = witness.input
+            && let Some(index) = self.entries.iter().position(|id| *id == input)
+            && same_read_source(
+                old.transcript.get(index)?,
+                &lines[layout.input_index],
+                false,
+            )
+        {
+            assigned.insert(layout.input_index, input);
+        }
+        let mut models: std::collections::BTreeMap<u32, Vec<(usize, u64)>> = Default::default();
+        let mut tools = std::collections::BTreeMap::new();
+        let mut calls_by_round: std::collections::BTreeMap<u32, Vec<(&str, &str)>> =
+            Default::default();
+        for (round, call, name) in &witness.calls {
+            calls_by_round.entry(*round).or_default().push((call, name));
+        }
+        for (index, id) in self.entries.iter().enumerate() {
+            match witness.origins.get(id) {
+                Some(ObservedSource::Model { round }) => {
+                    models.entry(*round).or_default().push((index, *id))
+                }
+                Some(ObservedSource::Tool {
+                    round,
+                    call_id,
+                    name,
+                    ordinal,
+                }) if tools
+                    .insert(
+                        call_id.as_str(),
+                        (*round, name.as_str(), *ordinal, index, *id),
+                    )
+                    .is_some() =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let known_rounds: std::collections::BTreeSet<_> = witness.rounds.iter().copied().collect();
+        let mut used = std::collections::BTreeSet::new();
+        let mut seen_rounds = std::collections::BTreeSet::new();
+        let mut previous_round = None;
+        for group in &layout.groups {
+            if !seen_rounds.insert(group.round)
+                || !known_rounds.contains(&group.round)
+                || previous_round.is_some_and(|previous| previous >= group.round)
+                || (group.model_index.is_some() && !group.tools.is_empty())
+            {
+                return None;
+            }
+            previous_round = Some(group.round);
+            if let Some(index) = group.model_index {
+                if index <= layout.input_index
+                    || index >= layout.line_count
+                    || !used.insert(index)
+                    || lines[index].kind != LineKind::Model
+                {
+                    return None;
+                }
+                if let Some(segments) = models.get(&group.round) {
+                    let Some((_, owner)) = segments.first().copied() else {
+                        continue;
+                    };
+                    let mut bytes = 0usize;
+                    let mut scalars = 0usize;
+                    let mut previous = None;
+                    let mut matches = true;
+                    let mut mapped = Vec::new();
+                    for (source_index, id) in segments {
+                        if let Some(previous) = previous
+                            && self.entries[previous + 1..*source_index].iter().any(|id| {
+                                !matches!(witness.origins.get(id), Some(ObservedSource::Local))
+                            })
+                        {
+                            matches = false;
+                            break;
+                        }
+                        let text = &old.transcript[*source_index].text;
+                        if !lines[index]
+                            .text
+                            .get(bytes..)
+                            .is_some_and(|suffix| suffix.starts_with(text))
+                        {
+                            matches = false;
+                            break;
+                        }
+                        mapped.push((*id, scalars));
+                        bytes = bytes.checked_add(text.len())?;
+                        scalars = scalars.checked_add(text.chars().count())?;
+                        previous = Some(*source_index);
+                    }
+                    if matches && bytes == lines[index].text.len() {
+                        assigned.insert(index, owner);
+                        for (id, base) in mapped {
+                            aliases.insert(id, (owner, base, false));
+                        }
+                    }
+                }
+            }
+            let actual_calls = calls_by_round
+                .get(&group.round)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if actual_calls.len() != group.tools.len() {
+                return None;
+            }
+            for (ordinal, tool) in group.tools.iter().enumerate() {
+                if tool.ordinal != ordinal
+                    || tool.line_index <= layout.input_index
+                    || tool.line_index >= layout.line_count
+                    || !used.insert(tool.line_index)
+                {
+                    return None;
+                }
+                let (round, name, actual_ordinal, source_index, id) =
+                    *tools.get(tool.call_id.as_str())?;
+                let line = &lines[tool.line_index];
+                if round != group.round
+                    || name != tool.tool_name
+                    || actual_ordinal != ordinal
+                    || line.kind != LineKind::Tool
+                    || line.call_id != tool.call_id
+                    || line.tool_name != tool.tool_name
+                    || actual_calls[ordinal] != (tool.call_id.as_str(), tool.tool_name.as_str())
+                {
+                    return None;
+                }
+                assigned.insert(tool.line_index, id);
+                aliases.insert(
+                    id,
+                    (
+                        id,
+                        0,
+                        old.transcript[source_index].text != line.text
+                            || old.transcript[source_index].meta != line.meta
+                            || old.transcript[source_index].tool_state != line.tool_state
+                            || old.transcript[source_index].agent_id.is_some(),
+                    ),
+                );
+            }
+        }
+        let queued: Vec<_> = old
+            .transcript
+            .iter()
+            .zip(&self.entries)
+            .filter(|(line, _)| line.kind == LineKind::Queued)
+            .collect();
+        if lines.len().checked_sub(layout.line_count)? != queued.len() {
+            return None;
+        }
+        for (offset, (before, id)) in queued.iter().enumerate() {
+            let index = layout.line_count.checked_add(offset)?;
+            if !same_read_source(before, &lines[index], false) {
+                return None;
+            }
+            assigned.insert(index, **id);
+        }
+        Some((assigned, aliases))
+    }
+    #[cfg(test)]
+    fn observe_append(&mut self, s: &Scenario, previous_len: usize) {
+        if self.binding != s.frontend.binding
+            || self.entries.len() != previous_len
+            || s.transcript.len() < previous_len
+        {
+            self.reset(s);
+            return;
+        }
+        for _ in previous_len..s.transcript.len() {
+            let id = self.mint();
+            self.entries.push(id);
+        }
+        if self.section_parent != self.entries.last().copied() {
+            self.mode = self.section_to_parent(s, self.mode);
+            self.section_parent = self.entries.last().copied();
+            for index in 0..self.sections.len() {
+                self.sections[index] = self.mint();
+            }
+        }
+    }
+    fn section_to_parent(&self, s: &Scenario, mode: ReadMode) -> ReadMode {
+        let ReadMode::Anchored(anchor) = mode else {
+            return mode;
+        };
+        if !matches!(anchor.target.owner, ReadOwner::Section(_)) {
+            return mode;
+        }
+        let Some(id) = self.section_parent else {
+            return ReadMode::Start;
+        };
+        let Some(index) = self.entries.iter().position(|entry| *entry == id) else {
+            return ReadMode::Start;
+        };
+        let raw = s
+            .transcript
+            .get(index)
+            .map_or(0, |line| line.text.chars().count());
+        ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(id),
+                part: ReadPart::Text,
+                raw,
+            },
+            bias: 0,
+        })
+    }
+    fn prepare_replacement_observed(
+        &self,
+        old: &Scenario,
+        lines: &[TranscriptLine],
+        binding: &crate::worker::SessionBinding,
+        switching: bool,
+        layout: Option<&ViewProjectionLayout>,
+    ) -> ReadReplacement {
+        let correspondence = if switching {
+            None
+        } else {
+            layout.and_then(|layout| self.correspondence(old, lines, layout))
+        };
+        let mut next_id = self.next_id;
+        let mut valid = self.valid;
+        let mut mint = || {
+            let id = next_id.unwrap_or(0);
+            next_id = next_id.and_then(|id| id.checked_add(1));
+            if next_id.is_none() {
+                valid = false;
+            }
+            id
+        };
+        let new_epoch = if switching {
+            self.epoch.checked_add(1)
+        } else {
+            Some(self.epoch)
+        };
+        let epoch = new_epoch.unwrap_or(self.epoch);
+        let mut entries = Vec::with_capacity(lines.len());
+        let mut prefix = !switching && self.binding.as_ref() == Some(binding);
+        for (index, line) in lines.iter().enumerate() {
+            prefix = prefix
+                && old.transcript.get(index).is_some_and(|before| {
+                    same_read_source(before, line, index + 1 == old.transcript.len())
+                })
+                && self.entries.get(index).is_some();
+            entries.push(
+                if let Some(id) = correspondence
+                    .as_ref()
+                    .and_then(|(mapped, _)| mapped.get(&index))
+                {
+                    *id
+                } else if prefix {
+                    self.entries[index]
+                } else {
+                    mint()
+                },
+            );
+        }
+        let parent = entries.last().copied();
+        let sections = if !switching && parent == self.section_parent {
+            self.sections
+        } else {
+            std::array::from_fn(|_| mint())
+        };
+        let mut mode = if switching {
+            ReadMode::Follow
+        } else if parent == self.section_parent {
+            self.mode
+        } else {
+            self.section_to_parent(old, self.mode)
+        };
+        if let (ReadMode::Anchored(mut anchor), Some((_, aliases))) =
+            (mode, correspondence.as_ref())
+            && let ReadOwner::Entry(id) = anchor.target.owner
+            && let Some((owner, base, header)) = aliases.get(&id)
+        {
+            anchor.target.owner = ReadOwner::Entry(*owner);
+            if *header {
+                anchor.target.part = ReadPart::Text;
+                anchor.target.raw = 0;
+                anchor.bias = 0;
+            } else if let Some(raw) = anchor.target.raw.checked_add(*base) {
+                anchor.target.raw = raw;
+            } else {
+                mode = ReadMode::Start;
+            }
+            if !matches!(mode, ReadMode::Start) {
+                mode = ReadMode::Anchored(anchor);
+            }
+        }
+        let surviving: std::collections::BTreeSet<_> = entries.iter().copied().collect();
+        if let ReadMode::Anchored(anchor) = mode
+            && let ReadOwner::Entry(id) = anchor.target.owner
+            && !surviving.contains(&id)
+        {
+            let prior = self.entries.iter().position(|entry| *entry == id);
+            let survivor = prior.and_then(|prior| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, id)| surviving.contains(*id))
+                    .min_by_key(|(index, _)| (index.abs_diff(prior), usize::from(*index > prior)))
+                    .map(|(index, id)| (index, *id))
+            });
+            mode = match (prior, survivor) {
+                (Some(prior), Some((index, id))) => {
+                    let raw = if index < prior {
+                        old.transcript[index].text.chars().count()
+                    } else {
+                        0
+                    };
+                    ReadMode::Anchored(ReadAnchor {
+                        target: ReadTarget {
+                            owner: ReadOwner::Entry(id),
+                            part: ReadPart::Text,
+                            raw,
+                        },
+                        bias: 0,
+                    })
+                }
+                _ => ReadMode::Start,
+            };
+        }
+        ReadReplacement {
+            epoch,
+            next_id,
+            valid: valid && new_epoch.is_some(),
+            binding: Some(binding.clone()),
+            entries,
+            sections,
+            section_parent: parent,
+            mode,
+        }
+    }
+    fn accept_replacement(&mut self, next: ReadReplacement) {
+        self.witness = None;
+        self.epoch = next.epoch;
+        self.next_id = next.next_id;
+        self.valid = next.valid;
+        self.binding = next.binding;
+        self.entries = next.entries;
+        self.sections = next.sections;
+        self.section_parent = next.section_parent;
+        self.mode = next.mode;
+        self.frame = None;
+        self.navigation_start = None;
+    }
+}
+
+fn same_read_source(before: &TranscriptLine, after: &TranscriptLine, _last_entry: bool) -> bool {
+    before.kind == after.kind
+        && before.text == after.text
+        && before.wrap == after.wrap
+        && (before.kind != LineKind::Tool
+            || (!before.call_id.is_empty()
+                && before.call_id == after.call_id
+                && before.tool_name == after.tool_name))
+}
 
 /// The UI tick: 16 ms. §10.5 — an idle ORBIT draws nothing; the loop
 /// still polls so redraws after events are instant.
@@ -59,6 +983,46 @@ pub struct Toast {
     pub text: String,
     pub ok: bool,
     pub shown_ms: u64,
+}
+
+/// One plain-history browse, owned beside the event loop's history index.
+/// The snapshot is display state only; it carries no worker authority.
+struct HistoryDraft {
+    original: String,
+    original_cursor: usize,
+    preview: String,
+    inventory: Vec<String>,
+    binding: Option<crate::worker::SessionBinding>,
+}
+
+fn finish_history_navigation(
+    history_idx: &mut Option<usize>,
+    history_draft: &mut Option<HistoryDraft>,
+) {
+    *history_idx = None;
+    *history_draft = None;
+}
+
+fn reconcile_history_navigation(
+    composer: &str,
+    history: &[String],
+    history_idx: &mut Option<usize>,
+    history_draft: &mut Option<HistoryDraft>,
+    scenario: &Scenario,
+) {
+    let valid = (*history_idx)
+        .and_then(|index| history.get(index))
+        .is_some_and(|entry| {
+            history_draft.as_ref().is_some_and(|saved| {
+                saved.inventory.as_slice() == history
+                    && saved.preview == entry.as_str()
+                    && saved.preview == composer
+                    && saved.binding.as_ref() == scenario.session_binding()
+            })
+        });
+    if !valid {
+        finish_history_navigation(history_idx, history_draft);
+    }
 }
 
 /// The runtime's own state (the App replacement): focus, the star
@@ -338,6 +1302,7 @@ fn run_proto_inner(
         .map(|raw| read_history(&raw))
         .unwrap_or_default();
     let mut history_idx: Option<usize> = None;
+    let mut history_draft: Option<HistoryDraft> = None;
     // The history length as of the last key: a change means a send
     // happened, and the file is written then, not at exit.
     let mut history_len_at_key = history.len();
@@ -378,6 +1343,7 @@ fn run_proto_inner(
     // The last frame drawn: a selection copies its text from here.
     let mut last_buf: Option<ratatui::buffer::Buffer> = None;
 
+    let mut reading = ReadState::new(&scenario);
     let mut exit_code = 0;
     loop {
         let timeout = UI_TICK
@@ -414,7 +1380,7 @@ fn run_proto_inner(
                     overlay_dirty = true;
                     let snap_before =
                         super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
-                    let handled_custom = handle_custom_key(
+                    let handled_custom = handle_custom_key_with_history(
                         k,
                         &mut tui,
                         &mut scenario,
@@ -423,11 +1389,14 @@ fn run_proto_inner(
                         &mut toast,
                         now_ms,
                         overlay.is_some(),
+                        &mut history_draft,
                     );
                     let quit = if handled_custom {
                         false
                     } else {
-                        handle_key(
+                        let previous_len = scenario.transcript.len();
+                        let edit_capture = EditCapture::new();
+                        let quit = handle_key_with_read(
                             k,
                             &mut tui,
                             &mut scenario,
@@ -445,10 +1414,14 @@ fn run_proto_inner(
                             &mut queued,
                             &mut history,
                             &mut history_idx,
+                            &mut history_draft,
                             &mut pending_leader,
                             &mut want_copy_mode,
                             &mut sessions_pushed,
-                        )
+                            Some(&mut reading),
+                        );
+                        reading.observe_edits(&scenario, previous_len, edit_capture.finish(), None);
+                        quit
                     };
                     let snap_after =
                         super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
@@ -473,6 +1446,7 @@ fn run_proto_inner(
                         &mut composer,
                         &history,
                         &mut history_idx,
+                        &mut history_draft,
                         overlay.is_some(),
                     ) {
                         scenario.last_key_ms = now_ms;
@@ -486,7 +1460,14 @@ fn run_proto_inner(
                     let snap_before =
                         super::shell::Snap::of(&tui.app, overlay_code(overlay), palette_sel);
                     let modal = overlay.is_some() || tui.app.picker.is_some();
-                    match handle_mouse(m, &mut tui, area, last_buf.as_ref(), modal) {
+                    match handle_mouse_with_read(
+                        m,
+                        &mut tui,
+                        area,
+                        last_buf.as_ref(),
+                        modal,
+                        Some(&mut reading),
+                    ) {
                         MouseOutcome::None => {}
                         MouseOutcome::Toast(text) => {
                             toast = Some(Toast {
@@ -535,6 +1516,7 @@ fn run_proto_inner(
                                 cancel_handle.as_ref(),
                                 &mut toast,
                                 now_ms,
+                                &mut history_draft,
                             );
                         }
                         MouseOutcome::Tape(i) => {
@@ -581,10 +1563,16 @@ fn run_proto_inner(
             }
             // Drain the bus into the scenario.
             let msgs_before = scenario.state_version();
-            while let Some(msg) = bus.try_recv() {
-                if let Some(text) =
-                    reduce_runtime_message(msg, &mut tui, &mut scenario, &mut overlay, now_ms)
-                {
+            while let Some(event) = bus.try_recv_observed() {
+                if let Some(text) = reduce_observed_runtime_message(
+                    event,
+                    &mut tui,
+                    &mut scenario,
+                    &mut overlay,
+                    now_ms,
+                    &mut history_draft,
+                    &mut reading,
+                ) {
                     // The agent-done toast (§9.13): replaces any current
                     // toast — the newest event wins.
                     toast = Some(Toast {
@@ -613,6 +1601,7 @@ fn run_proto_inner(
                         .position(|l| l.kind == LineKind::Queued && l.text == next)
                     {
                         scenario.transcript[pos].kind = LineKind::User;
+                        reading.begin_ordinary(&scenario, pos);
                     }
                     scenario.turn_started_ms = now_ms;
                     scenario.apply("round_started", 0);
@@ -666,10 +1655,12 @@ fn run_proto_inner(
                 overlay_dirty = false;
                 tui.completion_sel = completion_sel;
                 let mut frame_hits = Vec::new();
+                let mut conversation_frame = None;
+                let read_input = reading.input();
                 let done = guard
                     .terminal
                     .draw(|f| {
-                        frame_hits = draw_with_hits(
+                        (frame_hits, conversation_frame) = draw_with_hits_with_read(
                             f,
                             &tui,
                             &scenario,
@@ -680,6 +1671,7 @@ fn run_proto_inner(
                             toast.as_ref(),
                             sessions_pushed,
                             0,
+                            read_input.as_ref(),
                         );
                     })
                     .ok();
@@ -690,6 +1682,7 @@ fn run_proto_inner(
                         .map_or(1, crate::terminal::ShutdownSignal::exit_code);
                     break;
                 };
+                reading.commit(conversation_frame);
                 last_buf = Some(done.buffer.clone());
                 last_palette_frame =
                     capture_palette_frame(&scenario, overlay, &palette_query, &frame_hits);
@@ -735,6 +1728,8 @@ fn run_proto_inner(
 
 /// The keyboard (§11). Returns true to quit.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     k: crossterm::event::KeyEvent,
     tui: &mut Tui,
@@ -753,10 +1748,63 @@ fn handle_key(
     queued: &mut Vec<String>,
     history: &mut Vec<String>,
     history_idx: &mut Option<usize>,
+    history_draft: &mut Option<HistoryDraft>,
     pending_leader: &mut Option<char>,
     want_copy_mode: &mut bool,
     sessions_pushed: &mut bool,
 ) -> bool {
+    handle_key_with_read(
+        k,
+        tui,
+        scenario,
+        composer,
+        cancel_handle,
+        command_sink,
+        sender,
+        approvals,
+        now_ms,
+        overlay,
+        palette_query,
+        palette_sel,
+        completion_sel,
+        toast,
+        queued,
+        history,
+        history_idx,
+        history_draft,
+        pending_leader,
+        want_copy_mode,
+        sessions_pushed,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_key_with_read(
+    k: crossterm::event::KeyEvent,
+    tui: &mut Tui,
+    scenario: &mut Scenario,
+    composer: &mut String,
+    cancel_handle: Option<&crate::worker::CancelHandle>,
+    command_sink: &CommandSink,
+    sender: &BusSender,
+    approvals: &ApprovalRegistry,
+    now_ms: u64,
+    overlay: &mut Option<Overlay>,
+    palette_query: &mut String,
+    palette_sel: &mut usize,
+    completion_sel: &mut usize,
+    toast: &mut Option<Toast>,
+    queued: &mut Vec<String>,
+    history: &mut Vec<String>,
+    history_idx: &mut Option<usize>,
+    history_draft: &mut Option<HistoryDraft>,
+    pending_leader: &mut Option<char>,
+    want_copy_mode: &mut bool,
+    sessions_pushed: &mut bool,
+    mut reading: Option<&mut ReadState>,
+) -> bool {
+    reconcile_history_navigation(composer, history, history_idx, history_draft, scenario);
     let prev_key_ms = scenario.last_key_ms;
     scenario.last_key_ms = now_ms;
     if k.code == KeyCode::Esc
@@ -988,7 +2036,7 @@ fn handle_key(
     if tui.focus == Focus::Conversation
         && !tui.app.arranging
         && tui.app.picker.is_none()
-        && composer_key(k, tui, composer, history, history_idx)
+        && composer_key(k, tui, composer, history, history_idx, history_draft)
     {
         return false;
     }
@@ -1054,14 +2102,31 @@ fn handle_key(
     // Scrolling belongs to the focused panel alone.
     match k.code {
         KeyCode::PageUp => {
-            tui.scroll_by(8);
+            if tui.focus == Focus::Conversation
+                && let Some(reading) = reading.as_deref_mut()
+            {
+                reading.scroll(8);
+            } else {
+                tui.scroll_by(8);
+            }
             return false;
         }
         KeyCode::PageDown => {
-            tui.scroll_by(-8);
+            if tui.focus == Focus::Conversation
+                && let Some(reading) = reading.as_deref_mut()
+            {
+                reading.scroll(-8);
+            } else {
+                tui.scroll_by(-8);
+            }
             return false;
         }
         KeyCode::End if composer.is_empty() || tui.focus != Focus::Conversation => {
+            if tui.focus == Focus::Conversation
+                && let Some(reading) = reading.as_deref_mut()
+            {
+                reading.follow();
+            }
             tui.scroll_follow();
             return false;
         }
@@ -1076,10 +2141,12 @@ fn handle_key(
     }
     let _ = pending_leader;
 
-    // The `/` command list owns Up, Down and Tab while it is open.
+    // Outside an active history browse, the `/` list owns its arrow keys.
     if tui.focus == Focus::Conversation {
         let list = super::chrome::slash_list(composer);
-        if !list.is_empty() {
+        if !list.is_empty()
+            && !(history_idx.is_some() && matches!(k.code, KeyCode::Up | KeyCode::Down))
+        {
             match k.code {
                 KeyCode::Up => {
                     *completion_sel = completion_sel.saturating_sub(1);
@@ -1095,7 +2162,7 @@ fn handle_key(
                     composer.push_str(cmd);
                     composer.push(' ');
                     tui.composer_cursor = super::composer::grapheme_count(composer);
-                    *history_idx = None;
+                    finish_history_navigation(history_idx, history_draft);
                     *completion_sel = 0;
                     return false;
                 }
@@ -1162,7 +2229,7 @@ fn handle_key(
             KeyCode::Char('/') if composer.is_empty() => {
                 composer.push('/');
                 tui.composer_cursor = 1;
-                *history_idx = None;
+                finish_history_navigation(history_idx, history_draft);
                 *completion_sel = 0;
                 return false;
             }
@@ -1176,7 +2243,7 @@ fn handle_key(
                     &mut tui.composer_cursor,
                     "\n",
                 );
-                *history_idx = None;
+                finish_history_navigation(history_idx, history_draft);
             }
             KeyCode::Enter => {
                 // The shell bang (gate 1): `!command` runs one command
@@ -1193,13 +2260,15 @@ fn handle_key(
                 // sleep 5" gate).
                 if composer.starts_with('!') && composer.trim().len() > 1 {
                     let command = composer.trim()[1..].trim().to_string();
-                    composer.clear();
-                    tui.composer_cursor = 0;
-                    history.insert(0, format!("!{command}"));
-                    *history_idx = None;
+                    let history_entry = format!("!{command}");
                     if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::ShellBang(command)) {
                         *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
+                        return false;
                     }
+                    composer.clear();
+                    tui.composer_cursor = 0;
+                    history.insert(0, history_entry);
+                    finish_history_navigation(history_idx, history_draft);
                     return false;
                 }
                 if composer.starts_with('/') && !composer.trim().eq("/") {
@@ -1213,6 +2282,7 @@ fn handle_key(
                     }
                     composer.clear();
                     tui.composer_cursor = 0;
+                    finish_history_navigation(history_idx, history_draft);
                     let mut fs = false;
                     if let Some(o) = run_command(
                         tui,
@@ -1236,32 +2306,32 @@ fn handle_key(
                         *sessions_pushed = true;
                     }
                 } else if !composer.trim().is_empty() && !composer.starts_with('/') {
-                    tui.scroll_follow();
                     let text = composer.clone();
+                    let queue_prompt = scenario.ordinary_pending();
+                    if !queue_prompt
+                        && let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::Prompt(text.clone())) {
+                        *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
+                        return false;
+                    }
+                    if !queue_prompt { if let Some(reading) = reading.as_deref_mut() { reading.follow(); } tui.scroll_follow(); }
                     composer.clear();
                     tui.composer_cursor = 0;
                     history.insert(0, text.clone());
-                    *history_idx = None;
-                    if scenario.ordinary_pending() {
+                    finish_history_navigation(history_idx, history_draft);
+                    if queue_prompt {
                         queued.push(text.clone());
-                        scenario.transcript.push(TranscriptLine {
+                        push_display_line(scenario, TranscriptLine {
                             kind: LineKind::Queued,
                             text,
                             ..Default::default()
-                        });
+                        }, EditOrigin::Queued);
                     } else {
-                        if let Err(message) = submit_foreground(scenario, command_sink, WorkerCommand::Prompt(text.clone())) {
-                            *composer = text;
-                            tui.composer_cursor = super::composer::grapheme_count(composer);
-                            *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
-                            return false;
-                        }
-                        scenario.transcript.push(TranscriptLine {
+                        push_display_line(scenario, TranscriptLine {
                             kind: LineKind::User,
                             text: text.clone(),
                             time: Some(now_hhmm()),
                             ..Default::default()
-                        });
+                        }, EditOrigin::Input);
                         scenario.turn_started_ms = now_ms;
                         scenario.apply("round_started", 0);
                         if scenario.transcript.len() == 1 {
@@ -1275,12 +2345,14 @@ fn handle_key(
                         *toast = Some(Toast { text: message.into(), ok: false, shown_ms: now_ms });
                         return false;
                     }
-                    scenario.transcript.push(TranscriptLine {
+                    if let Some(reading) = reading { reading.follow(); }
+                    tui.scroll_follow();
+                    push_display_line(scenario, TranscriptLine {
                         kind: LineKind::User,
                         text: p.clone(),
                         time: Some(now_hhmm()),
                         ..Default::default()
-                    });
+                    }, EditOrigin::Input);
                     scenario.turn_started_ms = now_ms;
                     scenario.apply("round_started", 0);
                     *toast = Some(Toast {
@@ -1291,6 +2363,13 @@ fn handle_key(
                 }
             }
             KeyCode::Up if history_idx.is_none() && !history.is_empty() => {
+                *history_draft = Some(HistoryDraft {
+                    original: composer.clone(),
+                    original_cursor: super::composer::clamp_cursor(composer, tui.composer_cursor),
+                    preview: history[0].clone(),
+                    inventory: history.clone(),
+                    binding: scenario.session_binding().cloned(),
+                });
                 *history_idx = Some(0);
                 composer.clear();
                 composer.push_str(&history[0]);
@@ -1302,32 +2381,47 @@ fn handle_key(
                         *history_idx = Some(i + 1);
                         composer.clear();
                         composer.push_str(&history[i + 1]);
+                        if let Some(saved) = history_draft.as_mut() {
+                            saved.preview.clone_from(composer);
+                        }
                         tui.composer_cursor = super::composer::grapheme_count(composer);
                     }
             }
             KeyCode::Down => {
                 if let Some(i) = *history_idx {
                     if i == 0 {
-                        *history_idx = None;
-                        composer.clear();
-                        tui.composer_cursor = 0;
+                        let saved = history_draft.take();
+                        finish_history_navigation(history_idx, history_draft);
+                        if let Some(saved) = saved {
+                            *composer = saved.original;
+                            tui.composer_cursor = super::composer::clamp_cursor(
+                                composer,
+                                saved.original_cursor,
+                            );
+                        } else {
+                            composer.clear();
+                            tui.composer_cursor = 0;
+                        }
                     } else {
                         *history_idx = Some(i - 1);
                         composer.clear();
                         composer.push_str(&history[i - 1]);
+                        if let Some(saved) = history_draft.as_mut() {
+                            saved.preview.clone_from(composer);
+                        }
                         tui.composer_cursor = super::composer::grapheme_count(composer);
                     }
                 }
             }
             KeyCode::Backspace => {
                 if super::composer::delete_before_cursor(composer, &mut tui.composer_cursor) {
-                    *history_idx = None;
+                    finish_history_navigation(history_idx, history_draft);
                 }
                 *completion_sel = 0;
             }
             KeyCode::Delete if k.modifiers.is_empty() => {
                 if super::composer::delete_at_cursor(composer, &mut tui.composer_cursor) {
-                    *history_idx = None;
+                    finish_history_navigation(history_idx, history_draft);
                 }
                 *completion_sel = 0;
             }
@@ -1349,6 +2443,7 @@ fn handle_key(
                 if composer == "/" => {
                     composer.clear();
                     tui.composer_cursor = 0;
+                    finish_history_navigation(history_idx, history_draft);
                 }
 
             _ => {}
@@ -1361,7 +2456,7 @@ fn handle_key(
                 && c == 'w'
             {
                 if super::composer::delete_previous_word(composer, &mut tui.composer_cursor) {
-                    *history_idx = None;
+                    finish_history_navigation(history_idx, history_draft);
                 }
             } else if k
                 .modifiers
@@ -1380,7 +2475,7 @@ fn handle_key(
                     &mut tui.composer_cursor,
                     &ch.to_string(),
                 );
-                *history_idx = None;
+                finish_history_navigation(history_idx, history_draft);
                 *completion_sel = 0;
             }
         }
@@ -1483,6 +2578,7 @@ fn handle_key(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_paste(
     text: &str,
     tui: &mut Tui,
@@ -1490,6 +2586,7 @@ fn handle_paste(
     draft: &mut String,
     history: &[String],
     history_idx: &mut Option<usize>,
+    history_draft: &mut Option<HistoryDraft>,
     modal_open: bool,
 ) -> bool {
     if text.is_empty() || modal_open || tui.app.arranging || tui.app.picker.is_some() {
@@ -1511,7 +2608,7 @@ fn handle_paste(
         tui.composer_cursor = search.preview(history, draft);
     } else {
         super::composer::insert_at_cursor(draft, &mut tui.composer_cursor, text);
-        *history_idx = None;
+        finish_history_navigation(history_idx, history_draft);
         tui.file_completion
             .sync_at_cursor(draft, tui.composer_cursor);
     }
@@ -1526,6 +2623,7 @@ fn composer_key(
     draft: &mut String,
     history: &[String],
     history_idx: &mut Option<usize>,
+    history_draft: &mut Option<HistoryDraft>,
 ) -> bool {
     let reverse = k.code == KeyCode::Char('r')
         && k.modifiers.contains(KeyModifiers::CONTROL)
@@ -1538,7 +2636,7 @@ fn composer_key(
             super::composer::HistorySearch::new_with_cursor(draft, tui.composer_cursor, history);
         tui.composer_cursor = search.preview(history, draft);
         tui.history_search = Some(search);
-        *history_idx = None;
+        finish_history_navigation(history_idx, history_draft);
         return true;
     }
     if let Some(search) = tui.history_search.as_mut() {
@@ -1576,6 +2674,9 @@ fn composer_key(
         return true;
     }
 
+    if history_idx.is_some() && matches!(k.code, KeyCode::Up | KeyCode::Down) {
+        return false;
+    }
     tui.file_completion
         .sync_at_cursor(draft, tui.composer_cursor);
     if tui.file_completion.is_open() {
@@ -1587,7 +2688,7 @@ fn composer_key(
             }
             KeyCode::Tab => {
                 picker.accept_at_cursor(draft, &mut tui.composer_cursor);
-                *history_idx = None;
+                finish_history_navigation(history_idx, history_draft);
             }
             KeyCode::Enter
                 if !k
@@ -1595,7 +2696,7 @@ fn composer_key(
                     .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
                 picker.accept_at_cursor(draft, &mut tui.composer_cursor);
-                *history_idx = None;
+                finish_history_navigation(history_idx, history_draft);
             }
             KeyCode::Esc => picker.dismiss(),
             _ => return false,
@@ -2327,11 +3428,15 @@ fn run_command(
         return None;
     }
     let notice = |s: &mut Scenario, t: String| {
-        s.transcript.push(TranscriptLine {
-            kind: LineKind::System,
-            text: t,
-            ..Default::default()
-        });
+        push_display_line(
+            s,
+            TranscriptLine {
+                kind: LineKind::System,
+                text: t,
+                ..Default::default()
+            },
+            EditOrigin::Local,
+        );
     };
     let open: Option<Overlay> = match cmd {
         "/route" => {
@@ -2686,6 +3791,26 @@ pub fn apply_session_projection(
     scenario: &mut Scenario,
     now_ms: u64,
 ) -> bool {
+    apply_session_projection_with_read(projection, scenario, now_ms, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_session_projection_with_read(
+    projection: crate::msg::SessionProjection,
+    scenario: &mut Scenario,
+    now_ms: u64,
+    reading: Option<&mut ReadState>,
+) -> bool {
+    apply_session_projection_with_view(projection, scenario, now_ms, reading, None)
+}
+#[allow(clippy::too_many_arguments)]
+fn apply_session_projection_with_view(
+    projection: crate::msg::SessionProjection,
+    scenario: &mut Scenario,
+    now_ms: u64,
+    reading: Option<&mut ReadState>,
+    layout: Option<&ViewProjectionLayout>,
+) -> bool {
     use crate::msg::{ContextProjection, CostQualification, ManualOutcome, ProjectionReason};
     use crate::worker::ManualAction;
     let same = scenario.frontend.binding.as_ref() == Some(&projection.binding);
@@ -2834,6 +3959,29 @@ pub fn apply_session_projection(
         }
         _ => None,
     };
+    if !switching
+        && matches!(&projection.reason, ProjectionReason::Operation { operation }
+        if operation.kind().is_ordinary())
+    {
+        // Queued drafts belong to the local ordinary admission policy and
+        // have not entered the worker's typed working history yet.
+        lines.extend(
+            scenario
+                .transcript
+                .iter()
+                .filter(|line| line.kind == LineKind::Queued)
+                .cloned(),
+        );
+    }
+    let replacement = reading.as_deref().map(|reading| {
+        reading.prepare_replacement_observed(
+            scenario,
+            &lines,
+            &projection.binding,
+            switching,
+            layout,
+        )
+    });
     if switching {
         // Reuse the established identity-transition reset, once.
         apply_msg(
@@ -2852,20 +4000,6 @@ pub fn apply_session_projection(
     }
     if scenario.model_id != projection.model || scenario.provider != projection.provider {
         scenario.dismiss_picker();
-    }
-    if !switching
-        && matches!(&projection.reason, ProjectionReason::Operation { operation }
-        if operation.kind().is_ordinary())
-    {
-        // Queued drafts belong to the local ordinary admission policy and
-        // have not entered the worker's typed working history yet.
-        lines.extend(
-            scenario
-                .transcript
-                .iter()
-                .filter(|line| line.kind == LineKind::Queued)
-                .cloned(),
-        );
     }
     scenario.model = projection.model.clone();
     scenario.model_id = projection.model;
@@ -2928,6 +4062,9 @@ pub fn apply_session_projection(
         scenario.compacting_from = None;
     }
     scenario.frontend.dirty = true;
+    if let (Some(reading), Some(replacement)) = (reading, replacement) {
+        reading.accept_replacement(replacement);
+    }
     true
 }
 
@@ -3026,8 +4163,13 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
         Msg::TextDelta(text) => {
             scenario.apply("text_delta", 0);
             scenario.last_data_ms = now_ms;
-            match scenario.transcript.last_mut() {
-                Some(l) if l.kind == LineKind::Model => {
+            let end = foreground_end(scenario);
+            match end
+                .checked_sub(1)
+                .and_then(|index| scenario.transcript.get_mut(index))
+            {
+                Some(l) if l.kind == LineKind::Model && captured_model_may_extend() => {
+                    record_view_edit(ViewEdit::Extend { index: end - 1 });
                     // Fresh ink: remember when this chunk landed.
                     l.arrivals.push((l.text.chars().count(), now_ms));
                     if l.arrivals.len() > 64 {
@@ -3035,12 +4177,16 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                     }
                     l.text.push_str(&text);
                 }
-                _ => scenario.transcript.push(TranscriptLine {
-                    kind: LineKind::Model,
-                    text,
-                    arrivals: vec![(0, now_ms)],
-                    ..Default::default()
-                }),
+                _ => push_display_line(
+                    scenario,
+                    TranscriptLine {
+                        kind: LineKind::Model,
+                        text,
+                        arrivals: vec![(0, now_ms)],
+                        ..Default::default()
+                    },
+                    EditOrigin::Model,
+                ),
             }
         }
         Msg::ToolCallStarted {
@@ -3086,15 +4232,19 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 if name == "Bash" {
                     scenario.start_tape(&call_id);
                 }
-                scenario.transcript.push(TranscriptLine {
-                    kind: LineKind::Tool,
-                    text: arg.to_string(),
-                    tool_name: name.clone(),
-                    call_id: call_id.clone(),
-                    tool_state: super::scenario::ToolState::Running,
-                    started_ms: Some(now_ms),
-                    ..Default::default()
-                });
+                push_display_line(
+                    scenario,
+                    TranscriptLine {
+                        kind: LineKind::Tool,
+                        text: arg.to_string(),
+                        tool_name: name.clone(),
+                        call_id: call_id.clone(),
+                        tool_state: super::scenario::ToolState::Running,
+                        started_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                    tool_edit_origin(&call_id, &name),
+                );
             }
         }
         Msg::ToolOutput { call_id, line } => {
@@ -3328,31 +4478,43 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             scenario.apply("turn_ended", 0);
         }
         Msg::EffortStatus(text) => {
-            scenario.transcript.push(TranscriptLine {
-                kind: LineKind::System,
-                text,
-                wrap: true,
-                ..Default::default()
-            });
+            push_display_line(
+                scenario,
+                TranscriptLine {
+                    kind: LineKind::System,
+                    text,
+                    wrap: true,
+                    ..Default::default()
+                },
+                EditOrigin::Local,
+            );
         }
         Msg::SystemMessage(text) => {
             // §11.6: one notice per line (`/models` rows, session
             // lists), `muted`, at the content column.
             for line in text.split('\n') {
-                scenario.transcript.push(TranscriptLine {
-                    kind: LineKind::System,
-                    text: line.to_string(),
-                    ..Default::default()
-                });
+                push_display_line(
+                    scenario,
+                    TranscriptLine {
+                        kind: LineKind::System,
+                        text: line.to_string(),
+                        ..Default::default()
+                    },
+                    EditOrigin::Local,
+                );
             }
         }
         Msg::ModelsListed(rows) => {
             if rows.is_empty() {
-                scenario.transcript.push(TranscriptLine {
-                    kind: LineKind::System,
-                    text: "(no providers configured)".to_string(),
-                    ..Default::default()
-                });
+                push_display_line(
+                    scenario,
+                    TranscriptLine {
+                        kind: LineKind::System,
+                        text: "(no providers configured)".to_string(),
+                        ..Default::default()
+                    },
+                    EditOrigin::Local,
+                );
             } else {
                 scenario.open_picker(Picker {
                     kind: PickerKind::Models,
@@ -3370,11 +4532,15 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
         }
         Msg::SessionsListed(rows) => {
             if rows.is_empty() {
-                scenario.transcript.push(TranscriptLine {
-                    kind: LineKind::System,
-                    text: "(no saved sessions)".to_string(),
-                    ..Default::default()
-                });
+                push_display_line(
+                    scenario,
+                    TranscriptLine {
+                        kind: LineKind::System,
+                        text: "(no saved sessions)".to_string(),
+                        ..Default::default()
+                    },
+                    EditOrigin::Local,
+                );
             } else {
                 scenario.open_picker(Picker {
                     kind: PickerKind::Sessions,
@@ -3402,11 +4568,15 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
             }
         }
         Msg::ModelsListFailed(error) | Msg::SessionsListFailed(error) => {
-            scenario.transcript.push(TranscriptLine {
-                kind: LineKind::System,
-                text: clean(error),
-                ..Default::default()
-            });
+            push_display_line(
+                scenario,
+                TranscriptLine {
+                    kind: LineKind::System,
+                    text: clean(error),
+                    ..Default::default()
+                },
+                EditOrigin::Local,
+            );
         }
         Msg::Status(text) if text.starts_with("┃ ") => {
             // Streamed tool output (no call id): the newest tape.
@@ -3422,18 +4592,26 @@ fn apply_msg(msg: crate::msg::Msg, scenario: &mut Scenario, now_ms: u64) -> Opti
                 .unwrap_or(0);
             scenario.backoff_until_ms = Some(now_ms + ms);
             scenario.backoff_total_ms = ms.max(1);
-            scenario.transcript.push(TranscriptLine {
-                kind: LineKind::System,
-                text,
-                ..Default::default()
-            });
+            push_display_line(
+                scenario,
+                TranscriptLine {
+                    kind: LineKind::System,
+                    text,
+                    ..Default::default()
+                },
+                EditOrigin::Local,
+            );
         }
         Msg::Status(text) => {
-            scenario.transcript.push(TranscriptLine {
-                kind: LineKind::System,
-                text,
-                ..Default::default()
-            });
+            push_display_line(
+                scenario,
+                TranscriptLine {
+                    kind: LineKind::System,
+                    text,
+                    ..Default::default()
+                },
+                EditOrigin::Local,
+            );
         }
         Msg::WorkspaceUpdate(ws) => {
             // The worker's workspace carries the reactor phase; its plan
@@ -3691,6 +4869,36 @@ pub fn draw_with_hits(
     sessions_pushed: bool,
     scroll_offset: usize,
 ) -> Vec<super::shell::hits::Hit> {
+    draw_with_hits_with_read(
+        f,
+        tui,
+        scenario,
+        composer,
+        overlay,
+        palette_query,
+        palette_sel,
+        toast,
+        sessions_pushed,
+        scroll_offset,
+        None,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_with_hits_with_read(
+    f: &mut ratatui::Frame,
+    tui: &Tui,
+    scenario: &Scenario,
+    composer: &str,
+    overlay: Option<Overlay>,
+    palette_query: &str,
+    palette_sel: usize,
+    toast: Option<&Toast>,
+    sessions_pushed: bool,
+    scroll_offset: usize,
+    reading: Option<&ReadInput<'_>>,
+) -> (Vec<super::shell::hits::Hit>, Option<ConversationFrame>) {
     let _ = sessions_pushed;
     let area = f.area();
     // The size notice (§9.23): below 40 × 11 it is the whole screen.
@@ -3714,7 +4922,7 @@ pub fn draw_with_hits(
             f.buffer_mut(),
             super::shell::effective_tier(tui.tier, tui.profile.color_mode, false),
         );
-        return Vec::new();
+        return (Vec::new(), None);
     }
     use super::shell::overlays::Overlay as Ov;
     let ov = match overlay {
@@ -3759,7 +4967,7 @@ pub fn draw_with_hits(
         }
         None => None,
     };
-    super::shell::draw_with_profile(
+    super::shell::draw_with_reading(
         f,
         &super::shell::DrawIn {
             app: &tui.app,
@@ -3803,6 +5011,7 @@ pub fn draw_with_hits(
             overlay: ov,
         },
         &tui.profile,
+        reading,
     )
 }
 
@@ -3997,12 +5206,26 @@ fn picker_click_key(
 /// overlay or the picker) answers only its own controls; a click anywhere
 /// else on it closes it. A clicked key hint is the key press itself: it
 /// goes through the key handler, with every guard that has.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     m: crossterm::event::MouseEvent,
     tui: &mut Tui,
     area: Rect,
     last: Option<&ratatui::buffer::Buffer>,
     modal: bool,
+) -> MouseOutcome {
+    handle_mouse_with_read(m, tui, area, last, modal, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_mouse_with_read(
+    m: crossterm::event::MouseEvent,
+    tui: &mut Tui,
+    area: Rect,
+    last: Option<&ratatui::buffer::Buffer>,
+    modal: bool,
+    mut reading: Option<&mut ReadState>,
 ) -> MouseOutcome {
     use super::shell::hits::{self, Click};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -4154,14 +5377,30 @@ fn handle_mouse(
             MouseOutcome::Toast(format!("copied {} characters", text.chars().count()))
         }
         MouseEventKind::ScrollUp => {
-            if let Some((i, _, _)) = under {
-                tui.scroll_panel(*i, 3);
+            if let Some((i, _, view)) = under {
+                if *view == super::layout::View::Conversation
+                    && let Some(reading) = reading.as_deref_mut()
+                {
+                    if !modal {
+                        reading.scroll_pointer(col, row, 3);
+                    }
+                } else {
+                    tui.scroll_panel(*i, 3);
+                }
             }
             MouseOutcome::None
         }
         MouseEventKind::ScrollDown => {
-            if let Some((i, _, _)) = under {
-                tui.scroll_panel(*i, -3);
+            if let Some((i, _, view)) = under {
+                if *view == super::layout::View::Conversation
+                    && let Some(reading) = reading
+                {
+                    if !modal {
+                        reading.scroll_pointer(col, row, -3);
+                    }
+                } else {
+                    tui.scroll_panel(*i, -3);
+                }
             }
             MouseOutcome::None
         }
@@ -4322,11 +5561,15 @@ fn finish_approval(
     scenario.approval_queue.remove(0);
     if !delivered {
         // §11.5.3: the worker is gone — drop the request and note it.
-        scenario.transcript.push(TranscriptLine {
-            kind: LineKind::System,
-            text: "approval could not be delivered · the turn has ended".into(),
-            ..Default::default()
-        });
+        push_display_line(
+            scenario,
+            TranscriptLine {
+                kind: LineKind::System,
+                text: "approval could not be delivered · the turn has ended".into(),
+                ..Default::default()
+            },
+            EditOrigin::Local,
+        );
         scenario.apply("approval_resolved", 0);
     } else if scenario.approval_queue.is_empty() {
         scenario.apply("approval_resolved", 0);
@@ -6095,6 +7338,7 @@ mod composer_key_tests {
         draft: String,
         history: Vec<String>,
         history_idx: Option<usize>,
+        history_draft: Option<HistoryDraft>,
         overlay: Option<Overlay>,
         tx: CommandSink,
         rx: std::sync::mpsc::Receiver<WorkerCommand>,
@@ -6150,6 +7394,7 @@ mod composer_key_tests {
                 draft: String::new(),
                 history: Vec::new(),
                 history_idx: None,
+                history_draft: None,
                 overlay: None,
                 tx,
                 rx,
@@ -6183,6 +7428,7 @@ mod composer_key_tests {
                 &mut Vec::new(),
                 &mut self.history,
                 &mut self.history_idx,
+                &mut self.history_draft,
                 &mut None,
                 &mut false,
                 &mut false,
@@ -6227,6 +7473,7 @@ mod composer_key_tests {
                     &mut self.scenario,
                     &mut self.overlay,
                     5_000,
+                    &mut self.history_draft,
                 );
             }
         }
@@ -6298,6 +7545,327 @@ mod composer_key_tests {
     }
 
     #[test]
+    fn plain_history_round_trip_restores_multiline_grapheme_draft_and_cursor() {
+        let mut k = Keyboard::new();
+        k.history = vec!["newest".into(), "oldest".into()];
+        k.draft = "a🇧🇷é\n猫!".into();
+        k.tui.composer_cursor = 2;
+        let original = k.draft.clone();
+        for (key, expected) in [
+            (KeyCode::Up, "newest"),
+            (KeyCode::Up, "oldest"),
+            (KeyCode::Up, "oldest"),
+            (KeyCode::Down, "newest"),
+        ] {
+            k.plain(key);
+            assert_eq!(k.draft, expected);
+        }
+        k.plain(KeyCode::Left);
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, original);
+        assert_eq!(k.tui.composer_cursor, 2);
+        assert_eq!(k.history_idx, None);
+        assert!(k.history_draft.is_none());
+        assert_eq!(k.history, ["newest", "oldest"]);
+        k.no_send();
+    }
+
+    #[test]
+    fn plain_history_empty_and_absent_navigation_keep_existing_draft_contracts() {
+        let mut k = Keyboard::new();
+        k.history = vec!["previous".into()];
+        k.plain(KeyCode::Up);
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "");
+        assert_eq!(k.tui.composer_cursor, 0);
+        k.draft = "untouched 猫".into();
+        k.tui.composer_cursor = 3;
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "untouched 猫");
+        assert_eq!(k.tui.composer_cursor, 3);
+        k.history.clear();
+        k.plain(KeyCode::Up);
+        assert_eq!(k.draft, "untouched 猫");
+        assert_eq!(k.tui.composer_cursor, 3);
+        k.no_send();
+    }
+
+    #[test]
+    fn editing_a_recalled_entry_starts_a_new_draft_without_reviving_the_old_one() {
+        for edit in [0, 1, 2, 3, 4, 5] {
+            let mut k = Keyboard::new();
+            k.history = vec!["recall words".into()];
+            k.draft = "original unsent".into();
+            k.plain(KeyCode::Up);
+            match edit {
+                0 => k.plain(KeyCode::Char('x')),
+                1 => k.plain(KeyCode::Backspace),
+                2 => {
+                    k.plain(KeyCode::Home);
+                    k.plain(KeyCode::Delete);
+                }
+                3 => k.key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+                4 => k.key(KeyCode::Enter, KeyModifiers::ALT),
+                _ => assert!(handle_paste(
+                    " 猫",
+                    &mut k.tui,
+                    &mut k.scenario,
+                    &mut k.draft,
+                    &k.history,
+                    &mut k.history_idx,
+                    &mut k.history_draft,
+                    false,
+                )),
+            }
+            let edited = k.draft.clone();
+            let cursor = k.tui.composer_cursor;
+            assert_ne!(edited, "original unsent");
+            assert_eq!(k.history_idx, None);
+            assert!(k.history_draft.is_none());
+            k.plain(KeyCode::Down);
+            assert_eq!(k.draft, edited);
+            assert_eq!(k.tui.composer_cursor, cursor);
+            k.plain(KeyCode::Up);
+            k.plain(KeyCode::Down);
+            assert_eq!(k.draft, edited);
+            assert_eq!(k.tui.composer_cursor, cursor);
+            k.no_send();
+        }
+    }
+
+    #[test]
+    fn recalled_file_and_slash_menus_do_not_steal_active_history_arrows() {
+        for recalled in ["@alpha", "/he"] {
+            let mut k = Keyboard::new();
+            std::fs::write(k.root.join("alpha.rs"), "fixture").unwrap();
+            k.history = vec![recalled.into(), "older".into()];
+            k.draft = "keep this draft".into();
+            k.tui.composer_cursor = 4;
+            for (key, expected) in [
+                (KeyCode::Up, recalled),
+                (KeyCode::Up, "older"),
+                (KeyCode::Down, recalled),
+                (KeyCode::Down, "keep this draft"),
+            ] {
+                k.plain(key);
+                assert_eq!(k.draft, expected);
+            }
+            assert_eq!(k.tui.composer_cursor, 4);
+            k.no_send();
+        }
+    }
+
+    #[test]
+    fn submitting_a_recalled_entry_ends_preservation_after_real_bound_admission() {
+        let mut k = Keyboard::new();
+        k.history = vec!["recalled prompt".into()];
+        k.draft = "old draft".into();
+        k.plain(KeyCode::Up);
+        k.plain(KeyCode::Enter);
+        assert!(
+            matches!(k.received_command(), WorkerCommand::Prompt(text) if text == "recalled prompt")
+        );
+        assert!(k.history_draft.is_none());
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "");
+        assert_eq!(k.tui.composer_cursor, 0);
+        k.no_send();
+    }
+
+    #[test]
+    fn queuing_a_recalled_entry_ends_preservation_without_an_extra_worker_send() {
+        let mut k = Keyboard::new();
+        k.draft = "active prompt".into();
+        k.plain(KeyCode::Enter);
+        assert!(
+            matches!(k.received_command(), WorkerCommand::Prompt(text) if text == "active prompt")
+        );
+        assert!(k.scenario.ordinary_pending());
+        k.history = vec!["queued recall".into()];
+        k.draft = "older unsent draft".into();
+        k.plain(KeyCode::Up);
+        k.plain(KeyCode::Enter);
+        assert!(k.history_draft.is_none());
+        assert!(
+            k.scenario
+                .transcript
+                .iter()
+                .any(|line| line.kind == LineKind::Queued && line.text == "queued recall")
+        );
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "");
+        k.no_send();
+    }
+
+    #[test]
+    fn disconnected_worker_retains_the_exact_draft_cursor_and_history_browse() {
+        let mut k = Keyboard::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        k.tx = tx;
+        k.history = vec!["newest prompt".into(), "recalled prompt".into()];
+        k.draft = "old draft".into();
+        k.tui.composer_cursor = 2;
+        k.plain(KeyCode::Up);
+        k.plain(KeyCode::Up);
+        k.plain(KeyCode::Left);
+        let text = k.draft.clone();
+        let cursor = k.tui.composer_cursor;
+        let history = k.history.clone();
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.draft, text);
+        assert_eq!(k.tui.composer_cursor, cursor);
+        assert_eq!(k.history_idx, Some(1));
+        assert!(k.history_draft.is_some());
+        assert_eq!(k.history, history);
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "newest prompt");
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "old draft");
+        assert_eq!(k.tui.composer_cursor, 2);
+        k.no_send();
+    }
+
+    #[test]
+    fn disconnected_shell_bang_retains_the_exact_draft_cursor_and_history_browse() {
+        let mut k = Keyboard::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        k.tx = tx;
+        k.history = vec!["! echo fixture  ".into()];
+        k.draft = "old draft".into();
+        k.tui.composer_cursor = 3;
+        k.plain(KeyCode::Up);
+        k.plain(KeyCode::Left);
+        let text = k.draft.clone();
+        let cursor = k.tui.composer_cursor;
+        let history = k.history.clone();
+        k.plain(KeyCode::Enter);
+        assert_eq!(k.draft, text);
+        assert_eq!(k.tui.composer_cursor, cursor);
+        assert_eq!(k.history_idx, Some(0));
+        assert!(k.history_draft.is_some());
+        assert_eq!(k.history, history);
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "old draft");
+        assert_eq!(k.tui.composer_cursor, 3);
+        k.no_send();
+    }
+
+    #[test]
+    fn changed_draft_or_history_inventory_invalidates_the_cached_original() {
+        for change_history in [false, true] {
+            let mut k = Keyboard::new();
+            k.history = vec!["recalled prompt".into()];
+            k.draft = "old draft".into();
+            k.plain(KeyCode::Up);
+            if change_history {
+                k.history.clear();
+            } else {
+                k.draft = "replacement draft".into();
+            }
+            let current = k.draft.clone();
+            k.plain(KeyCode::Down);
+            assert_eq!(k.draft, current);
+            assert_eq!(k.history_idx, None);
+            assert!(k.history_draft.is_none());
+            k.no_send();
+        }
+    }
+
+    #[test]
+    fn appending_an_unselected_history_entry_invalidates_the_cached_original() {
+        let mut k = Keyboard::new();
+        k.history = vec!["selected prompt".into(), "older prompt".into()];
+        k.draft = "old draft".into();
+        k.tui.composer_cursor = 3;
+        k.plain(KeyCode::Up);
+        assert_eq!(k.history_idx, Some(0));
+        k.history.push("new unselected entry".into());
+        assert_eq!(k.history[0], k.draft);
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "selected prompt");
+        assert_eq!(k.history_idx, None);
+        assert!(k.history_draft.is_none());
+        k.no_send();
+    }
+
+    #[test]
+    fn replacing_an_unselected_history_entry_invalidates_the_cached_original() {
+        let mut k = Keyboard::new();
+        k.history = vec!["selected prompt".into(), "older prompt".into()];
+        k.draft = "old draft".into();
+        k.tui.composer_cursor = 3;
+        k.plain(KeyCode::Up);
+        assert_eq!(k.history_idx, Some(0));
+        k.history[1] = "replacement unselected entry".into();
+        assert_eq!(k.history[0], k.draft);
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "selected prompt");
+        assert_eq!(k.history_idx, None);
+        assert!(k.history_draft.is_none());
+        k.no_send();
+    }
+
+    #[test]
+    fn mutating_the_selected_history_entry_invalidates_the_cached_original() {
+        let mut k = Keyboard::new();
+        k.history = vec!["selected prompt".into(), "older prompt".into()];
+        k.draft = "old draft".into();
+        k.tui.composer_cursor = 3;
+        k.plain(KeyCode::Up);
+        assert_eq!(k.history_idx, Some(0));
+        k.history[0] = "replacement selected entry".into();
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "selected prompt");
+        assert_eq!(k.history_idx, None);
+        assert!(k.history_draft.is_none());
+        k.no_send();
+    }
+
+    #[test]
+    fn accepted_namespace_switch_ends_history_browse_but_rejected_reply_does_not() {
+        let mut k = Keyboard::new();
+        k.history = vec!["recalled prompt".into()];
+        k.draft = "old draft".into();
+        k.plain(KeyCode::Up);
+        let previous = k.scenario.session_binding().unwrap().clone();
+        let projection = crate::msg::SessionProjection {
+            binding: crate::worker::SessionBinding {
+                session_id: "next-history-session".into(),
+                generation: 2,
+            },
+            model: "fixture-model".into(),
+            provider: "fixture-provider".into(),
+            priced: false,
+            lines: Vec::new(),
+            turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_microcents: 0,
+            cost: crate::msg::CostQualification::Known { revision: 0 },
+            context: crate::msg::ContextProjection::Unavailable,
+            reason: crate::msg::ProjectionReason::Resume {
+                previous: previous.clone(),
+            },
+        };
+        let mut rejected = projection.clone();
+        rejected.binding.generation = 9;
+        k.receive(crate::msg::Msg::SessionProjection(rejected));
+        assert_eq!(k.scenario.session_binding(), Some(&previous));
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "old draft");
+        k.plain(KeyCode::Up);
+        k.receive(crate::msg::Msg::SessionProjection(projection));
+        assert_eq!(k.scenario.session_id, "next-history-session");
+        k.plain(KeyCode::Down);
+        assert_eq!(k.draft, "recalled prompt");
+        assert_eq!(k.history_idx, None);
+        assert!(k.history_draft.is_none());
+        k.no_send();
+    }
+
+    #[test]
     fn history_query_backspace_and_escape_keep_graphemes_and_cursor() {
         let mut k = Keyboard::new();
         k.draft = "a🇧🇷b".into();
@@ -6357,6 +7925,7 @@ mod composer_key_tests {
             &mut k.draft,
             &k.history,
             &mut k.history_idx,
+            &mut k.history_draft,
             false,
         ));
         assert_eq!(k.draft, "left \n日本語\n right");
@@ -7166,12 +8735,143 @@ fn apply_profile_preferences(
     };
     tui.profile = profile;
 }
+fn source_affects_transcript(msg: &crate::msg::Msg) -> bool {
+    use crate::msg::Msg;
+    match msg {
+        Msg::ModelsListed(rows) => rows.is_empty(),
+        Msg::SessionsListed(rows) => rows.is_empty(),
+        Msg::Status(text) => !text.starts_with("┃ "),
+        _ => matches!(
+            msg,
+            Msg::TextDelta(_)
+                | Msg::ToolCallStarted { .. }
+                | Msg::ToolCallFinished { .. }
+                | Msg::ResponseFinished { .. }
+                | Msg::EffortStatus(_)
+                | Msg::SystemMessage(_)
+                | Msg::ModelsListFailed(_)
+                | Msg::SessionsListFailed(_)
+                | Msg::TranscriptLoaded { .. }
+                | Msg::SubagentStarted { .. }
+                | Msg::SubagentProgress { .. }
+                | Msg::SubagentFinished { .. }
+                | Msg::ApprovalRequested { .. }
+                | Msg::BackendError(_)
+                | Msg::Redacted { .. }
+                | Msg::Identity { .. }
+                | Msg::ModelChanged(_)
+        ),
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn reduce_observed_runtime_message(
+    event: ObservedEvent,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    overlay: &mut Option<Overlay>,
+    now: u64,
+    history_draft: &mut Option<HistoryDraft>,
+    reading: &mut ReadState,
+) -> Option<String> {
+    let (msg, source, layout) = match event {
+        ObservedEvent::RoundStarted { round, source } => {
+            reading.note_round(s, &source, round);
+            return None;
+        }
+        ObservedEvent::Message {
+            msg,
+            source,
+            layout,
+        } => (*msg, source, layout),
+    };
+    if let Some(source) = &source {
+        if !view_source_matches(s, source) {
+            return None;
+        }
+        if let Some(round) = source.round
+            && reading.witness.as_ref().is_some_and(|witness| {
+                witness.operation == source.operation
+                    && witness.epoch == reading.epoch
+                    && witness.current_round != Some(round)
+            })
+        {
+            return None;
+        }
+        if let crate::msg::Msg::ToolCallStarted { .. } = &msg
+            && source.round.is_none()
+            && reading.witness.is_none()
+        {
+            return None;
+        }
+        if let crate::msg::Msg::ToolCallStarted { call_id, .. } = &msg
+            && let Some(witness) = &reading.witness
+        {
+            let announced = witness.call_ids.contains(call_id);
+            if (source.round.is_some() && announced) || (source.round.is_none() && !announced) {
+                return None;
+            }
+        }
+    }
+    reduce_runtime_message_with_view(
+        msg,
+        tui,
+        s,
+        overlay,
+        now,
+        history_draft,
+        Some(reading),
+        source.as_ref(),
+        layout.as_ref(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn reduce_runtime_message(
     msg: crate::msg::Msg,
     tui: &mut Tui,
     s: &mut Scenario,
     overlay: &mut Option<Overlay>,
     now: u64,
+    history_draft: &mut Option<HistoryDraft>,
+) -> Option<String> {
+    reduce_runtime_message_with_read(msg, tui, s, overlay, now, history_draft, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn reduce_runtime_message_with_read(
+    msg: crate::msg::Msg,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    overlay: &mut Option<Overlay>,
+    now: u64,
+    history_draft: &mut Option<HistoryDraft>,
+    reading: Option<&mut ReadState>,
+) -> Option<String> {
+    reduce_runtime_message_with_view(
+        msg,
+        tui,
+        s,
+        overlay,
+        now,
+        history_draft,
+        reading,
+        None,
+        None,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn reduce_runtime_message_with_view(
+    msg: crate::msg::Msg,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    overlay: &mut Option<Overlay>,
+    now: u64,
+    history_draft: &mut Option<HistoryDraft>,
+    reading: Option<&mut ReadState>,
+    source: Option<&ViewStamp>,
+    layout: Option<&ViewProjectionLayout>,
 ) -> Option<String> {
     use crate::msg::Msg;
     let previous_overlay = *overlay;
@@ -7201,7 +8901,10 @@ fn reduce_runtime_message(
             return None;
         }
     }
-    let result = reduce_frontend_message(msg, tui, s, now);
+    if matches!(&msg, Msg::TranscriptLoaded { .. }) {
+        *history_draft = None;
+    }
+    let result = reduce_frontend_message_with_view(msg, tui, s, now, reading, source, layout);
     if s.approval_call_id.is_some() {
         s.dismiss_picker();
     }
@@ -7223,14 +8926,40 @@ fn reduce_runtime_message(
     result
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn reduce_frontend_message(
     msg: crate::msg::Msg,
     tui: &mut Tui,
     s: &mut Scenario,
     now: u64,
 ) -> Option<String> {
+    reduce_frontend_message_with_read(msg, tui, s, now, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn reduce_frontend_message_with_read(
+    msg: crate::msg::Msg,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    now: u64,
+    reading: Option<&mut ReadState>,
+) -> Option<String> {
+    reduce_frontend_message_with_view(msg, tui, s, now, reading, None, None)
+}
+#[allow(clippy::too_many_arguments)]
+fn reduce_frontend_message_with_view(
+    msg: crate::msg::Msg,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    now: u64,
+    mut reading: Option<&mut ReadState>,
+    source: Option<&ViewStamp>,
+    layout: Option<&ViewProjectionLayout>,
+) -> Option<String> {
     if let crate::msg::Msg::SessionProjection(projection) = msg {
-        if apply_session_projection(projection, s, now)
+        if apply_session_projection_with_view(projection, s, now, reading.as_deref_mut(), layout)
             && let Some(session) = tui.customization.as_mut()
         {
             session.invalidate_session(pane_context(s, session.context.controller));
@@ -7238,8 +8967,41 @@ fn reduce_frontend_message(
         }
         return None;
     }
+    if source.is_none()
+        && source_affects_transcript(&msg)
+        && s.ordinary_pending()
+        && let Some(reading) = reading.as_deref_mut()
+    {
+        // Only admitted legacy mutations invalidate, before their actual rendering.
+        reading.invalidate_witness();
+    }
     let restored = matches!(&msg, crate::msg::Msg::TranscriptLoaded { .. });
+    let previous_len = s.transcript.len();
+    let extend_model = match (&msg, source, reading.as_deref()) {
+        (crate::msg::Msg::TextDelta(_), Some(source), Some(reading)) => {
+            let last = foreground_end(s)
+                .checked_sub(1)
+                .and_then(|index| reading.entries.get(index))
+                .copied();
+            reading.witness.as_ref().is_some_and(|witness| {
+                witness.operation == source.operation
+                    && witness
+                        .last_model
+                        .is_some_and(|(id, round)| Some(id) == last && Some(round) == source.round)
+            })
+        }
+        _ => true,
+    };
+    let capture = EditCapture::with_model_boundary(extend_model);
     let result = apply_msg(msg, s, now);
+    let edits = capture.finish();
+    if let Some(reading) = reading {
+        if restored {
+            reading.reset(s);
+        } else {
+            reading.observe_edits(s, previous_len, edits, source);
+        }
+    }
     if restored && let Some(session) = tui.customization.as_mut() {
         session.invalidate_session(pane_context(s, session.context.controller));
         s.custom_panes = session.outputs.clone();
@@ -7257,6 +9019,7 @@ fn run_pane_action(
     cancel: Option<&crate::worker::CancelHandle>,
     toast: &mut Option<Toast>,
     now: u64,
+    history_draft: &mut Option<HistoryDraft>,
 ) {
     let Some(id) = tui.app.tree.custom_id_at(panel) else {
         return;
@@ -7269,6 +9032,7 @@ fn run_pane_action(
     s.custom_panes = session.outputs.clone();
     match result {
         Ok(crate::customization::ActionEffect::InsertDraft(text)) => {
+            *history_draft = None;
             *composer = text;
             tui.composer_cursor = super::composer::grapheme_count(composer);
             tui.file_completion
@@ -7365,6 +9129,21 @@ pub fn handle_custom_key(
     now: u64,
     modal: bool,
 ) -> bool {
+    handle_custom_key_with_history(k, tui, s, composer, cancel, toast, now, modal, &mut None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_custom_key_with_history(
+    k: crossterm::event::KeyEvent,
+    tui: &mut Tui,
+    s: &mut Scenario,
+    composer: &mut String,
+    cancel: Option<&crate::worker::CancelHandle>,
+    toast: &mut Option<Toast>,
+    now: u64,
+    modal: bool,
+    history_draft: &mut Option<HistoryDraft>,
+) -> bool {
     if modal || tui.app.arranging {
         return false;
     }
@@ -7418,6 +9197,7 @@ pub fn handle_custom_key(
                     cancel,
                     toast,
                     now,
+                    history_draft,
                 );
                 return true;
             }
@@ -7784,6 +9564,7 @@ mod customization_review_tests {
                 &mut Vec::new(),
                 &mut None,
                 &mut None,
+                &mut None,
                 &mut false,
                 &mut false,
             );
@@ -7974,6 +9755,7 @@ mod customization_review_tests {
                 None,
                 &mut toast,
                 5000,
+                &mut None,
             );
             for id in ["routing", "usage", "agents"] {
                 assert_eq!(scenario.custom_panes[id].state, PaneState::Stale);
@@ -7995,6 +9777,7 @@ mod customization_review_tests {
             None,
             &mut toast,
             5000,
+            &mut None,
         );
         assert_eq!(scenario.custom_panes["usage"].text, "input 55");
         assert_eq!(scenario.custom_panes["usage"].state, PaneState::Ready);
@@ -9527,6 +11310,7 @@ mod bound_projection_tests {
             &mut Vec::new(),
             &mut None,
             &mut None,
+            &mut None,
             &mut false,
             &mut false
         ));
@@ -10512,6 +12296,7 @@ mod palette_review_tests {
                 &mut self.queued,
                 &mut self.history,
                 &mut self.history_index,
+                &mut None,
                 &mut self.leader,
                 &mut self.copy,
                 &mut self.sessions
@@ -10884,5 +12669,1370 @@ mod palette_review_tests {
             );
             keys.no_worker_command();
         }
+    }
+}
+
+#[cfg(test)]
+mod reading_state_tests {
+    use super::*;
+    use crate::msg::{ContextProjection, CostQualification, ProjectionReason, SessionProjection};
+    use crate::worker::SessionBinding;
+    use crossterm::event::KeyEvent;
+    use ratatui::backend::TestBackend;
+
+    fn binding() -> SessionBinding {
+        SessionBinding {
+            session_id: "session-reading".into(),
+            generation: 1,
+        }
+    }
+    fn setup() -> (Tui, Scenario, ReadState) {
+        let mut tui = Tui::new();
+        tui.app.tree = super::super::layout::Node::Panel {
+            view: super::super::layout::View::Conversation,
+            agent: String::new(),
+        };
+        tui.app.focus = 0;
+        tui.app.sidebar = false;
+        tui.reduced = true;
+        tui.brand_tier = super::super::welcome::BrandTier::Off;
+        tui.tick_ms = 9000;
+        tui.sync_focus();
+        let mut s = Scenario::new();
+        s.frontend.binding = Some(binding());
+        s.session_id = binding().session_id;
+        s.model_id = "model".into();
+        s.provider = "provider".into();
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::Model,
+            text: (0..80)
+                .map(|n| format!("ROW_{n:02} visible content"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ..Default::default()
+        });
+        let reading = ReadState::new(&s);
+        (tui, s, reading)
+    }
+    fn paint(
+        tui: &mut Tui,
+        s: &Scenario,
+        reading: &mut ReadState,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        let input = reading.input();
+        let mut result = (Vec::new(), None);
+        let done = terminal
+            .draw(|f| {
+                result = draw_with_hits_with_read(
+                    f,
+                    tui,
+                    s,
+                    "",
+                    None,
+                    "",
+                    0,
+                    None,
+                    false,
+                    0,
+                    input.as_ref(),
+                );
+            })
+            .unwrap();
+        let buffer = done.buffer.clone();
+        reading.commit(result.1);
+        tui.hits = result.0;
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+    fn key(
+        tui: &mut Tui,
+        s: &mut Scenario,
+        reading: &mut ReadState,
+        code: KeyCode,
+        draft: &mut String,
+        sink: &CommandSink,
+        queued: &mut Vec<String>,
+    ) {
+        let (_, sender) = Bus::new();
+        let previous = s.transcript.len();
+        assert!(!handle_key_with_read(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            tui,
+            s,
+            draft,
+            None,
+            sink,
+            &sender,
+            &ApprovalRegistry::new(),
+            9000,
+            &mut None,
+            &mut String::new(),
+            &mut 0,
+            &mut 0,
+            &mut None,
+            queued,
+            &mut Vec::new(),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut false,
+            Some(&mut *reading)
+        ));
+        reading.observe_append(s, previous);
+    }
+    fn projected(s: &Scenario, reason: ProjectionReason) -> SessionProjection {
+        SessionProjection {
+            binding: binding(),
+            model: "model".into(),
+            provider: "provider".into(),
+            priced: false,
+            lines: s
+                .transcript
+                .iter()
+                .map(|line| match line.kind {
+                    LineKind::Model => crate::model::TranscriptLine::Assistant {
+                        text: line.text.clone(),
+                        time: line.time.clone(),
+                    },
+                    _ => crate::model::TranscriptLine::User {
+                        text: line.text.clone(),
+                        time: line.time.clone(),
+                    },
+                })
+                .collect(),
+            turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_microcents: 0,
+            cost: CostQualification::Unavailable,
+            context: ContextProjection::Unavailable,
+            reason,
+        }
+    }
+
+    #[test]
+    fn page_navigation_then_text_delta_keeps_the_same_visible_source_in_one_entry() {
+        let (mut tui, mut s, mut reading) = setup();
+        let (sink, receiver) = std::sync::mpsc::channel();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        let tail = reading.frame.as_ref().unwrap().start;
+        key(
+            &mut tui,
+            &mut s,
+            &mut reading,
+            KeyCode::PageUp,
+            &mut String::new(),
+            &sink,
+            &mut Vec::new(),
+        );
+        let before = paint(&mut tui, &s, &mut reading, 70, 22);
+        let anchor = reading.mode;
+        assert_eq!(reading.frame.as_ref().unwrap().start, tail - 8);
+        let start = reading.frame.as_ref().unwrap().start;
+        reduce_runtime_message_with_read(
+            crate::msg::Msg::TextDelta("\nappended\nappended\nappended".into()),
+            &mut tui,
+            &mut s,
+            &mut None,
+            9001,
+            &mut None,
+            Some(&mut reading),
+        );
+        let after = paint(&mut tui, &s, &mut reading, 70, 22);
+        assert_eq!(s.transcript.len(), 1);
+        assert_eq!(reading.mode, anchor);
+        assert_eq!(reading.frame.as_ref().unwrap().start, start);
+        let visible_before: Vec<_> = before.iter().filter(|row| row.contains("ROW_")).collect();
+        let visible_after: Vec<_> = after.iter().filter(|row| row.contains("ROW_")).collect();
+        assert_eq!(visible_before, visible_after);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn multiple_navigation_events_use_the_last_successful_frame_before_bus_growth() {
+        let (mut tui, mut s, mut reading) = setup();
+        let (sink, receiver) = std::sync::mpsc::channel();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        let start = reading.frame.as_ref().unwrap().start;
+        key(
+            &mut tui,
+            &mut s,
+            &mut reading,
+            KeyCode::PageUp,
+            &mut String::new(),
+            &sink,
+            &mut Vec::new(),
+        );
+        key(
+            &mut tui,
+            &mut s,
+            &mut reading,
+            KeyCode::PageUp,
+            &mut String::new(),
+            &sink,
+            &mut Vec::new(),
+        );
+        reduce_runtime_message_with_read(
+            crate::msg::Msg::TextDelta("\nnew\nnew\nnew".into()),
+            &mut tui,
+            &mut s,
+            &mut None,
+            9001,
+            &mut None,
+            Some(&mut reading),
+        );
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        assert_eq!(reading.frame.as_ref().unwrap().start, start - 16);
+        assert!(receiver.try_recv().is_err());
+        key(
+            &mut tui,
+            &mut s,
+            &mut reading,
+            KeyCode::End,
+            &mut String::new(),
+            &sink,
+            &mut Vec::new(),
+        );
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        assert_eq!(reading.mode, ReadMode::Follow);
+        let frame = reading.frame.as_ref().unwrap();
+        assert_eq!(frame.start, frame.total - frame.viewport);
+    }
+
+    #[test]
+    fn accepted_projection_preserves_proven_prefix_ids_and_rejected_projection_changes_nothing() {
+        let (mut tui, mut s, mut reading) = setup();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        reading.scroll(8);
+        let expected = (
+            reading.epoch,
+            reading.entries.clone(),
+            reading.sections,
+            reading.mode,
+            reading.next_id,
+        );
+        let mut rejected = projected(&s, ProjectionReason::Refresh);
+        rejected.binding.generation += 1;
+        assert!(!apply_session_projection_with_read(
+            rejected,
+            &mut s,
+            9001,
+            Some(&mut reading)
+        ));
+        assert_eq!(
+            (
+                reading.epoch,
+                reading.entries.clone(),
+                reading.sections,
+                reading.mode,
+                reading.next_id
+            ),
+            expected
+        );
+        let accepted = projected(&s, ProjectionReason::Refresh);
+        assert!(apply_session_projection_with_read(
+            accepted,
+            &mut s,
+            9002,
+            Some(&mut reading)
+        ));
+        assert_eq!(
+            (
+                reading.epoch,
+                reading.entries.clone(),
+                reading.sections,
+                reading.mode,
+                reading.next_id
+            ),
+            expected
+        );
+        assert!(s.frontend.foreground.is_none());
+        assert!(s.frontend.pending.is_none());
+    }
+
+    #[test]
+    fn unobserved_same_binding_tail_extension_remints_source_and_uses_start_fallback() {
+        let (mut tui, mut s, mut reading) = setup();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        reading.scroll(8);
+        let old_ids = reading.entries.clone();
+        let old_epoch = reading.epoch;
+        let mut next = projected(&s, ProjectionReason::Refresh);
+        next.lines[0] = crate::model::TranscriptLine::Assistant {
+            text: format!("{}\nunobserved suffix", s.transcript[0].text),
+            time: None,
+        };
+        assert!(apply_session_projection_with_read(
+            next,
+            &mut s,
+            9001,
+            Some(&mut reading)
+        ));
+        assert_eq!(reading.epoch, old_epoch);
+        assert_ne!(reading.entries, old_ids);
+        assert_eq!(reading.mode, ReadMode::Start);
+        assert!(reading.frame.is_none());
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        assert!(s.frontend.foreground.is_none());
+        assert!(s.frontend.pending.is_none());
+    }
+
+    #[test]
+    fn projection_extension_of_an_earlier_model_does_not_preserve_its_identity() {
+        let (_, mut s, _) = setup();
+        s.transcript.push(TranscriptLine {
+            kind: LineKind::User,
+            text: "later user".into(),
+            ..Default::default()
+        });
+        let mut reading = ReadState::new(&s);
+        let old_ids = reading.entries.clone();
+        reading.mode = ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(old_ids[0]),
+                part: ReadPart::Text,
+                raw: 20,
+            },
+            bias: 0,
+        });
+        let mut next = projected(&s, ProjectionReason::Refresh);
+        next.lines[0] = crate::model::TranscriptLine::Assistant {
+            text: format!("{} appended", s.transcript[0].text),
+            time: None,
+        };
+        assert!(apply_session_projection_with_read(
+            next,
+            &mut s,
+            9001,
+            Some(&mut reading)
+        ));
+        assert!(reading.entries.iter().all(|id| !old_ids.contains(id)));
+        assert_eq!(reading.mode, ReadMode::Start);
+    }
+
+    #[test]
+    fn replacing_the_last_model_without_its_original_prefix_mints_a_new_identity() {
+        let (_, mut s, mut reading) = setup();
+        let old_id = reading.entries[0];
+        reading.mode = ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(old_id),
+                part: ReadPart::Text,
+                raw: 20,
+            },
+            bias: 0,
+        });
+        let mut next = projected(&s, ProjectionReason::Refresh);
+        next.lines[0] = crate::model::TranscriptLine::Assistant {
+            text: "different source".into(),
+            time: None,
+        };
+        assert!(apply_session_projection_with_read(
+            next,
+            &mut s,
+            9001,
+            Some(&mut reading)
+        ));
+        assert_ne!(reading.entries[0], old_id);
+        assert_eq!(reading.mode, ReadMode::Start);
+    }
+
+    #[test]
+    fn accepted_session_swap_creates_a_new_display_epoch_and_follows() {
+        let (mut tui, mut s, mut reading) = setup();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        reading.scroll(8);
+        let old_epoch = reading.epoch;
+        let old_ids = reading.entries.clone();
+        let mut next = projected(
+            &s,
+            ProjectionReason::Resume {
+                previous: binding(),
+            },
+        );
+        next.binding = SessionBinding {
+            session_id: "session-next".into(),
+            generation: 2,
+        };
+        assert!(apply_session_projection_with_read(
+            next,
+            &mut s,
+            9001,
+            Some(&mut reading)
+        ));
+        assert_eq!(reading.epoch, old_epoch + 1);
+        assert_eq!(reading.mode, ReadMode::Follow);
+        assert!(reading.entries.iter().all(|id| !old_ids.contains(id)));
+        assert!(reading.frame.is_none());
+        assert!(s.frontend.foreground.is_none());
+        assert!(s.frontend.pending.is_none());
+    }
+
+    #[test]
+    fn removed_anchor_uses_preceding_survivor_and_equal_suffix_text_never_reuses_identity() {
+        let (_, mut s, _) = setup();
+        s.transcript = ["first", "duplicate", "duplicate"]
+            .into_iter()
+            .map(|text| TranscriptLine {
+                kind: LineKind::User,
+                text: text.into(),
+                ..Default::default()
+            })
+            .collect();
+        let mut reading = ReadState::new(&s);
+        let old = reading.entries.clone();
+        reading.mode = ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(old[2]),
+                part: ReadPart::Text,
+                raw: 3,
+            },
+            bias: 0,
+        });
+        let mut next = projected(&s, ProjectionReason::Refresh);
+        next.lines.remove(1);
+        assert!(apply_session_projection_with_read(
+            next,
+            &mut s,
+            9001,
+            Some(&mut reading)
+        ));
+        assert_eq!(reading.entries, old[..2]);
+        assert!(
+            matches!(reading.mode, ReadMode::Anchored(ReadAnchor { target: ReadTarget { owner: ReadOwner::Entry(id), raw: 9, .. }, .. }) if id == old[1])
+        );
+        let mut changed = projected(&s, ProjectionReason::Refresh);
+        changed.lines[0] = crate::model::TranscriptLine::User {
+            text: "changed".into(),
+            time: None,
+        };
+        assert!(apply_session_projection_with_read(
+            changed,
+            &mut s,
+            9002,
+            Some(&mut reading)
+        ));
+        assert!(reading.entries.iter().all(|id| !old.contains(id)));
+        assert_eq!(reading.mode, ReadMode::Start);
+    }
+
+    #[test]
+    fn queued_submission_preserves_reader_and_queued_to_user_keeps_the_same_entry_id() {
+        let (mut tui, mut s, mut reading) = setup();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        reading.scroll(8);
+        let mode = reading.mode;
+        let (sink, receiver) = std::sync::mpsc::channel();
+        submit_foreground(&mut s, &sink, WorkerCommand::Prompt("active".into())).unwrap();
+        let _active = receiver.recv().unwrap();
+        let mut queued = Vec::new();
+        let mut draft = "queued next".to_string();
+        key(
+            &mut tui,
+            &mut s,
+            &mut reading,
+            KeyCode::Enter,
+            &mut draft,
+            &sink,
+            &mut queued,
+        );
+        assert_eq!(reading.mode, mode);
+        assert!(draft.is_empty());
+        assert_eq!(queued, ["queued next"]);
+        let id = *reading.entries.last().unwrap();
+        let index = s.transcript.len() - 1;
+        assert_eq!(s.transcript[index].kind, LineKind::Queued);
+        s.transcript[index].kind = LineKind::User;
+        reading.observe_append(&s, s.transcript.len());
+        assert_eq!(reading.entries[index], id);
+        assert_eq!(reading.mode, mode);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn admitted_prompt_follows_but_failed_worker_send_preserves_draft_and_reader() {
+        let (mut tui, mut s, mut reading) = setup();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        reading.scroll(8);
+        let mode = reading.mode;
+        let ids = reading.entries.clone();
+        let (closed_sink, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        let mut draft = "keep my draft".to_string();
+        key(
+            &mut tui,
+            &mut s,
+            &mut reading,
+            KeyCode::Enter,
+            &mut draft,
+            &closed_sink,
+            &mut Vec::new(),
+        );
+        assert_eq!(draft, "keep my draft");
+        assert_eq!(reading.mode, mode);
+        assert_eq!(reading.entries, ids);
+        let (sink, receiver) = std::sync::mpsc::channel();
+        key(
+            &mut tui,
+            &mut s,
+            &mut reading,
+            KeyCode::Enter,
+            &mut draft,
+            &sink,
+            &mut Vec::new(),
+        );
+        assert!(draft.is_empty());
+        assert_eq!(reading.mode, ReadMode::Follow);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            WorkerCommand::Bound { .. }
+        ));
+    }
+
+    #[test]
+    fn wheel_uses_three_rows_of_actual_panel_and_hidden_or_minimum_notice_gives_no_frame() {
+        let (mut tui, s, mut reading) = setup();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        let frame = reading.frame.as_ref().unwrap();
+        let start = frame.start;
+        let panel = frame.panel;
+        reading.scroll_pointer(panel.x + 2, panel.y + 2, 3);
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        assert_eq!(reading.frame.as_ref().unwrap().start, start - 3);
+        let mode = reading.mode;
+        reading.scroll_pointer(0, 0, 3);
+        assert_eq!(reading.mode, mode);
+        paint(&mut tui, &s, &mut reading, 39, 10);
+        assert!(reading.frame.is_none());
+        assert_eq!(reading.mode, mode);
+        tui.app.tree = super::super::layout::Node::Panel {
+            view: super::super::layout::View::Terminal,
+            agent: String::new(),
+        };
+        tui.sync_focus();
+        paint(&mut tui, &s, &mut reading, 70, 22);
+        assert!(reading.frame.is_none());
+        assert_eq!(reading.mode, mode);
+    }
+}
+
+#[cfg(test)]
+mod ordinary_view_correspondence_tests {
+    use super::*;
+    use crate::bus::{ViewLease, ViewProjectionGroup, ViewToolProjection};
+    use crate::msg::{
+        ContextProjection, CostQualification, Msg, ProjectionReason, SessionProjection,
+    };
+    use crate::worker::{ForegroundOperation, ForegroundRegistration, SessionBinding};
+    fn fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/ordinary_view_projection.json"
+        ))
+        .unwrap()
+    }
+    fn row(value: &serde_json::Value) -> crate::model::TranscriptLine {
+        use crate::model::TranscriptLine as Saved;
+        let text = || value["text"].as_str().unwrap().to_string();
+        match value["kind"].as_str().unwrap() {
+            "system" => Saved::System(text()),
+            "assistant" => Saved::Assistant {
+                text: text(),
+                time: None,
+            },
+            "user" => Saved::User {
+                text: text(),
+                time: None,
+            },
+            "tool" => Saved::Stripped {
+                tool_name: value["tool_name"].as_str().unwrap().into(),
+                call_id: value["call_id"].as_str().unwrap().into(),
+                summary: value["summary"].as_str().unwrap().into(),
+                outcome: Some(if value["outcome"] == "failed" {
+                    crate::model::ToolOutcome::Failed
+                } else {
+                    crate::model::ToolOutcome::Ok
+                }),
+                meta: value["meta"].as_str().unwrap().into(),
+                started_at: None,
+            },
+            _ => panic!("closed test fixture row kind"),
+        }
+    }
+    fn layout(value: &serde_json::Value) -> ViewProjectionLayout {
+        ViewProjectionLayout {
+            line_count: value["line_count"].as_u64().unwrap() as usize,
+            baseline_lines: value["baseline_lines"].as_u64().unwrap() as usize,
+            input_index: value["input_index"].as_u64().unwrap() as usize,
+            groups: value["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|group| ViewProjectionGroup {
+                    round: group["round"].as_u64().unwrap() as u32,
+                    model_index: group["model_index"].as_u64().map(|index| index as usize),
+                    tools: group["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|tool| ViewToolProjection {
+                            line_index: tool["line_index"].as_u64().unwrap() as usize,
+                            call_id: tool["call_id"].as_str().unwrap().into(),
+                            tool_name: tool["tool_name"].as_str().unwrap().into(),
+                            ordinal: tool["ordinal"].as_u64().unwrap() as usize,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+    fn setup_for(
+        kind: crate::worker::ForegroundKind,
+    ) -> (
+        Tui,
+        Scenario,
+        ReadState,
+        Bus,
+        BusSender,
+        ForegroundOperation,
+        ForegroundRegistration,
+        ViewLease,
+    ) {
+        let f = fixture();
+        let mut s = Scenario::new();
+        s.frontend.binding = Some(SessionBinding {
+            session_id: "session-view-fixture".into(),
+            generation: 1,
+        });
+        s.session_id = "session-view-fixture".into();
+        s.model_id = "model".into();
+        s.provider = "provider".into();
+        s.transcript = f["expected_lines"].as_array().unwrap()[..2]
+            .iter()
+            .map(|line| restored_transcript_line(row(line)))
+            .collect();
+        let mut reading = ReadState::new(&s);
+        let command = if kind == crate::worker::ForegroundKind::PlanPrompt {
+            WorkerCommand::PlanPrompt("inspect @note.txt".into())
+        } else {
+            WorkerCommand::Prompt("inspect @note.txt".into())
+        };
+        let operation = s.new_foreground_operation(kind).unwrap();
+        assert!(s.admit_foreground(operation.clone()));
+        s.remember_ordinary_intent(
+            OrdinaryIntent::from_command(&command).unwrap(),
+            operation.source().clone(),
+        );
+        let capture = EditCapture::new();
+        let before = s.transcript.len();
+        push_display_line(
+            &mut s,
+            TranscriptLine {
+                kind: LineKind::User,
+                text: "inspect @note.txt".into(),
+                ..Default::default()
+            },
+            EditOrigin::Input,
+        );
+        reading.observe_edits(&s, before, capture.finish(), None);
+        let registration = operation.start(&command).unwrap();
+        let (bus, sender) = Bus::new();
+        let lease = sender.scoped_view(&registration).unwrap();
+        (
+            Tui::new(),
+            s,
+            reading,
+            bus,
+            sender,
+            operation,
+            registration,
+            lease,
+        )
+    }
+    fn drain(bus: &Bus, tui: &mut Tui, s: &mut Scenario, reading: &mut ReadState) {
+        while let Some(event) = bus.try_recv_observed() {
+            reduce_observed_runtime_message(event, tui, s, &mut None, 9000, &mut None, reading);
+        }
+    }
+    fn local(s: &mut Scenario, reading: &mut ReadState, text: &str, queued: bool) {
+        let capture = EditCapture::new();
+        let before = s.transcript.len();
+        push_display_line(
+            s,
+            TranscriptLine {
+                kind: if queued {
+                    LineKind::Queued
+                } else {
+                    LineKind::System
+                },
+                text: text.into(),
+                ..Default::default()
+            },
+            if queued {
+                EditOrigin::Queued
+            } else {
+                EditOrigin::Local
+            },
+        );
+        reading.observe_edits(s, before, capture.finish(), None);
+    }
+    fn live(
+        f: &serde_json::Value,
+        bus: &Bus,
+        lease: &ViewLease,
+        tui: &mut Tui,
+        s: &mut Scenario,
+        reading: &mut ReadState,
+    ) {
+        let mut sender = lease.sender();
+        for event in f["live"].as_array().unwrap() {
+            let text = || event["text"].as_str().unwrap();
+            match event["kind"].as_str().unwrap() {
+                "user" => continue,
+                "queued" => local(s, reading, text(), true),
+                "local_notice" => local(s, reading, text(), false),
+                "round_started" => {
+                    let round = event["round"].as_u64().unwrap() as u32;
+                    sender = lease.sender().with_view_round(round);
+                    sender.view_round_started(round);
+                }
+                "text_delta" => sender.send(Msg::TextDelta(text().into())),
+                "tool_started_full" => sender.send(Msg::ToolCallStarted {
+                    call_id: event["call_id"].as_str().unwrap().into(),
+                    name: event["tool_name"].as_str().unwrap().into(),
+                    summary: event["summary"].as_str().unwrap().into(),
+                }),
+                "tool_finished_full" => lease.sender().send(Msg::ToolCallFinished {
+                    call_id: event["call_id"].as_str().unwrap().into(),
+                    name: event["tool_name"].as_str().unwrap().into(),
+                    outcome: if event["outcome"] == "failed" {
+                        crate::model::ToolOutcome::Failed
+                    } else {
+                        crate::model::ToolOutcome::Ok
+                    },
+                    fact: event["meta"].as_str().unwrap().into(),
+                }),
+                _ => panic!("closed live fixture kind"),
+            }
+            drain(bus, tui, s, reading);
+        }
+    }
+    fn projection(f: &serde_json::Value, operation: ForegroundOperation) -> Msg {
+        Msg::SessionProjection(SessionProjection {
+            binding: operation.source().clone(),
+            model: "model".into(),
+            provider: "provider".into(),
+            priced: false,
+            lines: f["expected_lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(row)
+                .collect(),
+            turns: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_microcents: 0,
+            cost: CostQualification::Unavailable,
+            context: ContextProjection::Unavailable,
+            reason: ProjectionReason::Operation { operation },
+        })
+    }
+
+    fn setup() -> (
+        Tui,
+        Scenario,
+        ReadState,
+        Bus,
+        BusSender,
+        ForegroundOperation,
+        ForegroundRegistration,
+        ViewLease,
+    ) {
+        setup_for(crate::worker::ForegroundKind::Prompt)
+    }
+    fn model_ids(reading: &ReadState, round: u32) -> Vec<u64> {
+        let witness = reading.witness.as_ref().unwrap();
+        reading.entries.iter().filter(|id| matches!(witness.origins.get(id), Some(ObservedSource::Model { round: r }) if *r == round)).copied().collect()
+    }
+    #[test]
+    fn checked_real_normalizer_fixture_preserves_later_segments_while_still_busy_before_queue_promotion()
+     {
+        for kind in [
+            crate::worker::ForegroundKind::Prompt,
+            crate::worker::ForegroundKind::PlanPrompt,
+        ] {
+            let f = fixture();
+            let (mut tui, mut s, mut reading, bus, _, operation, registration, lease) =
+                setup_for(kind);
+            let baseline_model = reading.entries[1];
+            let input_id = reading.entries[2];
+            live(&f, &bus, &lease, &mut tui, &mut s, &mut reading);
+            assert!(reading.witness.as_ref().unwrap().valid);
+            let models = model_ids(&reading, 1);
+            assert_eq!(models.len(), 2);
+            let queued = reading.entries[reading.entries.len() - 2..].to_vec();
+            reading.mode = ReadMode::Anchored(ReadAnchor {
+                target: ReadTarget {
+                    owner: ReadOwner::Entry(models[1]),
+                    part: ReadPart::Text,
+                    raw: 1,
+                },
+                bias: 0,
+            });
+            lease.sender().send(Msg::OrdinaryTurnEnded {
+                operation: operation.clone(),
+                end: crate::msg::OrdinaryEnd::Completed,
+                publication: crate::msg::OrdinaryPublication::Saved,
+            });
+            drain(&bus, &mut tui, &mut s, &mut reading);
+            assert!(s.is_busy());
+            assert_eq!(s.pending_foreground(), Some(&operation));
+            let projection_sender =
+                lease.close_and_projection_sender(Some(layout(&f["expected_layout"])));
+            projection_sender.send(projection(&f, operation));
+            drop(registration);
+            drain(&bus, &mut tui, &mut s, &mut reading);
+            assert_eq!(reading.entries[5], models[0]);
+            assert_ne!(reading.entries[5], baseline_model);
+            assert_ne!(reading.entries[2], input_id); // actual expanded input has its own changed-source fallback
+            assert_eq!(&reading.entries[6..], queued.as_slice());
+            assert_eq!(s.transcript[0].kind, LineKind::System);
+            assert_eq!(s.transcript[0].text, "provider System remains canonical");
+            assert_eq!(
+                (
+                    s.transcript[3].call_id.as_str(),
+                    s.transcript[4].call_id.as_str()
+                ),
+                ("call-one", "call-two")
+            );
+            assert_eq!(
+                reading.mode,
+                ReadMode::Anchored(ReadAnchor {
+                    target: ReadTarget {
+                        owner: ReadOwner::Entry(models[0]),
+                        part: ReadPart::Text,
+                        raw: "B α".chars().count() + 1
+                    },
+                    bias: 0
+                })
+            );
+            assert!(reading.witness.is_none());
+            assert!(!s.is_busy());
+            assert_eq!(
+                s.transcript
+                    .iter()
+                    .filter(|line| line.kind == LineKind::Queued)
+                    .count(),
+                2
+            );
+        }
+    }
+    #[test]
+    fn stamped_foreign_expired_and_wrong_round_leave_ids_source_and_navigation_unchanged() {
+        let (mut tui, mut s, mut reading, bus, sender, operation, _registration, lease) = setup();
+        let other =
+            ForegroundOperation::new(operation.source().clone(), operation.kind(), operation.id())
+                .unwrap();
+        let other_registration = other.start(&WorkerCommand::Prompt("other".into())).unwrap();
+        let foreign = sender.scoped_view(&other_registration).unwrap();
+        reading.mode = ReadMode::Start;
+        reading.navigation_start = Some(7);
+        let before = (
+            format!("{:?}", s.transcript),
+            reading.entries.clone(),
+            reading.next_id,
+            reading.mode,
+            reading.navigation_start,
+            s.state_version(),
+        );
+        foreign.sender().send(Msg::TextDelta("foreign".into()));
+        lease
+            .sender()
+            .with_view_round(7)
+            .send(Msg::TextDelta("wrong round".into()));
+        let late = lease.sender();
+        lease.close();
+        late.send(Msg::TextDelta("expired".into()));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_eq!(
+            (
+                format!("{:?}", s.transcript),
+                reading.entries.clone(),
+                reading.next_id,
+                reading.mode,
+                reading.navigation_start,
+                s.state_version()
+            ),
+            before
+        );
+    }
+    #[test]
+    fn unscoped_custom_worker_keeps_legacy_rendering_after_invalidating_continuity() {
+        let (mut tui, mut s, mut reading, bus, sender, _, _registration, lease) = setup();
+        let scoped = lease.sender().with_view_round(0);
+        scoped.view_round_started(0);
+        scoped.send(Msg::TextDelta("owned".into()));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert!(reading.witness.as_ref().unwrap().valid);
+        sender.send(Msg::TextDelta(" legacy".into()));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_eq!(s.transcript.last().unwrap().text, "owned legacy");
+        assert!(!reading.witness.as_ref().unwrap().valid);
+    }
+    #[test]
+    fn unannounced_executor_and_duplicate_engine_calls_cannot_create_trusted_tool_origins() {
+        for duplicate in [false, true] {
+            let (mut tui, mut s, mut reading, bus, _, _, _registration, lease) = setup();
+            let scoped = lease.sender().with_view_round(0);
+            scoped.view_round_started(0);
+            scoped.send(Msg::ToolCallStarted {
+                call_id: "known".into(),
+                name: "Glob".into(),
+                summary: "one".into(),
+            });
+            drain(&bus, &mut tui, &mut s, &mut reading);
+            assert!(reading.witness.as_ref().unwrap().valid);
+            let before = (
+                reading.entries.clone(),
+                reading.next_id,
+                format!("{:?}", s.transcript),
+            );
+            let sender = if duplicate { scoped } else { lease.sender() };
+            sender.send(Msg::ToolCallStarted {
+                call_id: if duplicate { "known" } else { "unannounced" }.into(),
+                name: "Glob".into(),
+                summary: "two".into(),
+            });
+            drain(&bus, &mut tui, &mut s, &mut reading);
+            assert!(reading.witness.as_ref().unwrap().valid);
+            assert_eq!(
+                (
+                    reading.entries.clone(),
+                    reading.next_id,
+                    format!("{:?}", s.transcript)
+                ),
+                before
+            );
+        }
+    }
+    #[test]
+    fn changed_final_text_and_arbitrary_earlier_growth_do_not_inherit_segment_aliases() {
+        let f = fixture();
+        let (mut tui, mut s, mut reading, bus, _, _, _registration, lease) = setup();
+        live(&f, &bus, &lease, &mut tui, &mut s, &mut reading);
+        let mut lines: Vec<_> = f["expected_lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| restored_transcript_line(row(value)))
+            .collect();
+        lines.extend(
+            s.transcript
+                .iter()
+                .filter(|line| line.kind == LineKind::Queued)
+                .cloned(),
+        );
+        let l = layout(&f["expected_layout"]);
+        lines[1].text.push_str(" arbitrary earlier extension");
+        let (mapped, _) = reading.correspondence(&s, &lines, &l).unwrap();
+        assert!(!mapped.contains_key(&1));
+        assert!(mapped.contains_key(&5));
+        lines[5].text.push_str(" unstreamed suffix");
+        let (mapped, aliases) = reading.correspondence(&s, &lines, &l).unwrap();
+        assert!(!mapped.contains_key(&5));
+        assert!(mapped.contains_key(&3));
+        for id in model_ids(&reading, 1) {
+            assert!(!aliases.contains_key(&id));
+        }
+        let mut invalid = l;
+        invalid.line_count = usize::MAX;
+        assert!(reading.correspondence(&s, &lines, &invalid).is_none());
+    }
+    #[test]
+    fn removed_tool_summary_and_progress_anchor_falls_to_that_same_tool_header() {
+        let f = fixture();
+        let (mut tui, mut s, mut reading, bus, _, operation, _registration, lease) = setup();
+        live(&f, &bus, &lease, &mut tui, &mut s, &mut reading);
+        let index = s
+            .transcript
+            .iter()
+            .position(|line| line.call_id == "call-two")
+            .unwrap();
+        let id = reading.entries[index];
+        reading.mode = ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(id),
+                part: ReadPart::Progress,
+                raw: 77,
+            },
+            bias: 1,
+        });
+        lease
+            .close_and_projection_sender(Some(layout(&f["expected_layout"])))
+            .send(projection(&f, operation));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_eq!(reading.entries[4], id);
+        assert_eq!(
+            reading.mode,
+            ReadMode::Anchored(ReadAnchor {
+                target: ReadTarget {
+                    owner: ReadOwner::Entry(id),
+                    part: ReadPart::Text,
+                    raw: 0
+                },
+                bias: 0
+            })
+        );
+    }
+    #[test]
+    fn nested_overflow_and_missing_edit_scopes_fail_closed_for_view_only() {
+        let (_, mut s, mut reading, _, _, operation, _registration, _lease) = setup();
+        reading.mode = ReadMode::Start;
+        let before = s.transcript.len();
+        let outer = EditCapture::new();
+        {
+            let _inner = EditCapture::new();
+            push_display_line(
+                &mut s,
+                TranscriptLine {
+                    text: "nested".into(),
+                    ..Default::default()
+                },
+                EditOrigin::Local,
+            );
+        }
+        let log = outer.finish();
+        assert!(!log.valid);
+        reading.observe_edits(&s, before, log, None);
+        assert_eq!(reading.mode, ReadMode::Start);
+        assert_eq!(s.pending_foreground(), Some(&operation));
+        let before = s.transcript.len();
+        let capture = EditCapture::new();
+        for _ in 0..=VIEW_JOURNAL_MAX {
+            record_view_edit(ViewEdit::Extend { index: 0 });
+        }
+        let log = capture.finish();
+        assert!(!log.valid);
+        reading.observe_edits(&s, before, log, None);
+        assert!(
+            reading
+                .witness
+                .as_ref()
+                .is_none_or(|witness| !witness.valid)
+        );
+        let before = s.transcript.len();
+        push_display_line(&mut s, TranscriptLine::default(), EditOrigin::Local);
+        reading.observe_edits(
+            &s,
+            before,
+            EditLog {
+                edits: Vec::new(),
+                valid: true,
+                extend_model: true,
+            },
+            None,
+        );
+        assert_eq!(reading.entries.len(), s.transcript.len());
+        assert_eq!(s.pending_foreground(), Some(&operation));
+    }
+    #[test]
+    fn rejected_projection_cannot_consume_witness_ids_or_pending_navigation() {
+        let f = fixture();
+        let (mut tui, mut s, mut reading, bus, _, operation, _registration, lease) = setup();
+        live(&f, &bus, &lease, &mut tui, &mut s, &mut reading);
+        reading.mode = ReadMode::Start;
+        reading.navigation_start = Some(5);
+        let before = (
+            reading.entries.clone(),
+            reading.next_id,
+            reading.mode,
+            reading.navigation_start,
+            reading.witness.as_ref().unwrap().origins.len(),
+            s.state_version(),
+        );
+        let Msg::SessionProjection(mut projected) = projection(&f, operation.clone()) else {
+            unreachable!()
+        };
+        projected.binding.generation += 1;
+        lease
+            .close_and_projection_sender(Some(layout(&f["expected_layout"])))
+            .send(Msg::SessionProjection(projected));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_eq!(
+            (
+                reading.entries.clone(),
+                reading.next_id,
+                reading.mode,
+                reading.navigation_start,
+                reading.witness.as_ref().unwrap().origins.len(),
+                s.state_version()
+            ),
+            before
+        );
+        assert_eq!(s.pending_foreground(), Some(&operation));
+    }
+    #[test]
+    fn queued_suffix_stays_after_real_notice_handlers_without_double_identity_allocation() {
+        let (mut tui, mut s, mut reading, bus, _, _, _registration, lease) = setup();
+        local(&mut s, &mut reading, "queued", true);
+        let queue = *reading.entries.last().unwrap();
+        for msg in [
+            Msg::EffortStatus("effort".into()),
+            Msg::SystemMessage("one\ntwo".into()),
+            Msg::Status("retry 1 in 20ms".into()),
+            Msg::Status("status".into()),
+        ] {
+            let count = s.transcript.len();
+            lease.sender().send(msg);
+            drain(&bus, &mut tui, &mut s, &mut reading);
+            assert!(s.transcript.len() > count);
+            assert_eq!(reading.entries.len(), s.transcript.len());
+            assert_eq!(reading.entries.last(), Some(&queue));
+            assert_eq!(s.transcript.last().unwrap().kind, LineKind::Queued);
+            let ids: std::collections::BTreeSet<_> = reading.entries.iter().copied().collect();
+            assert_eq!(ids.len(), reading.entries.len());
+        }
+    }
+    #[test]
+    fn plain_unchanged_user_cannot_bypass_exact_mapping_with_unseen_final_suffix() {
+        let (mut tui, mut s, mut reading, bus, _, operation, _registration, lease) = setup();
+        let sender = lease.sender().with_view_round(0);
+        sender.view_round_started(0);
+        sender.send(Msg::TextDelta("hello".into()));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        let old_id = *reading.entries.last().unwrap();
+        reading.mode = ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(old_id),
+                part: ReadPart::Text,
+                raw: 1,
+            },
+            bias: 0,
+        });
+        let mut f = fixture();
+        let mut lines = f["expected_lines"].as_array().unwrap()[..3].to_vec();
+        lines[2]["text"] = "inspect @note.txt".into();
+        lines.push(serde_json::json!({ "kind": "assistant", "text": "hello unseen suffix" }));
+        f["expected_lines"] = serde_json::Value::Array(lines);
+        let l = ViewProjectionLayout {
+            line_count: 4,
+            baseline_lines: 2,
+            input_index: 2,
+            groups: vec![ViewProjectionGroup {
+                round: 0,
+                model_index: Some(3),
+                tools: Vec::new(),
+            }],
+        };
+        lease
+            .close_and_projection_sender(Some(l))
+            .send(projection(&f, operation));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_ne!(reading.entries[3], old_id);
+        assert!(!reading.entries.contains(&old_id));
+        assert_eq!(s.transcript[3].text, "hello unseen suffix");
+        assert!(!s.is_busy());
+    }
+
+    #[test]
+    fn rejected_unscoped_picker_replies_and_foreign_ends_do_not_invalidate_owned_evidence() {
+        let (mut tui, mut s, mut reading, bus, sender, operation, _registration, lease) = setup();
+        let stream = lease.sender().with_view_round(0);
+        stream.view_round_started(0);
+        stream.send(Msg::TextDelta("owned".into()));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        let foreign =
+            ForegroundOperation::new(operation.source().clone(), operation.kind(), operation.id())
+                .unwrap();
+        let before = (
+            reading.entries.clone(),
+            reading.next_id,
+            reading.mode,
+            reading.witness.as_ref().unwrap().origins.len(),
+            s.state_version(),
+        );
+        for msg in [
+            Msg::ModelsListed(vec![("provider".into(), "model".into())]),
+            Msg::ModelsListFailed("stale".into()),
+            Msg::SessionsListed(Vec::new()),
+            Msg::SessionsListFailed("stale".into()),
+            Msg::OrdinaryTurnEnded {
+                operation: foreign,
+                end: crate::msg::OrdinaryEnd::Completed,
+                publication: crate::msg::OrdinaryPublication::Saved,
+            },
+        ] {
+            sender.send(msg);
+            drain(&bus, &mut tui, &mut s, &mut reading);
+            assert!(reading.witness.as_ref().unwrap().valid);
+            assert_eq!(
+                (
+                    reading.entries.clone(),
+                    reading.next_id,
+                    reading.mode,
+                    reading.witness.as_ref().unwrap().origins.len(),
+                    s.state_version()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn bound_mod_without_local_user_starts_only_at_eligible_round_zero_and_fences_prior_model() {
+        let f = fixture();
+        let mut s = Scenario::new();
+        let mut tui = Tui::new();
+        s.frontend.binding = Some(SessionBinding {
+            session_id: "session-mod-view".into(),
+            generation: 1,
+        });
+        s.session_id = "session-mod-view".into();
+        s.model_id = "model".into();
+        s.provider = "provider".into();
+        s.transcript = f["expected_lines"].as_array().unwrap()[..2]
+            .iter()
+            .map(|value| restored_transcript_line(row(value)))
+            .collect();
+        let mut reading = ReadState::new(&s);
+        let baseline = reading.entries.clone();
+        let previous = s.transcript[1].text.clone();
+        let operation = s
+            .new_foreground_operation(crate::worker::ForegroundKind::Prompt)
+            .unwrap();
+        let command = WorkerCommand::ModCommand("module".into(), "inspect".into());
+        assert!(s.admit_foreground(operation.clone()));
+        s.remember_ordinary_intent(
+            OrdinaryIntent::from_command(&command).unwrap(),
+            operation.source().clone(),
+        );
+        let bound = WorkerCommand::Bound {
+            operation: operation.clone(),
+            command: Box::new(command),
+        };
+        let WorkerCommand::Bound {
+            operation: owned,
+            command,
+        } = bound
+        else {
+            unreachable!()
+        };
+        let registration = owned.start(&command).unwrap();
+        let (bus, sender) = Bus::new();
+        let lease = sender.scoped_view(&registration).unwrap();
+        assert!(reading.witness.is_none());
+        live(&f, &bus, &lease, &mut tui, &mut s, &mut reading);
+        assert!(reading.witness.as_ref().unwrap().valid);
+        assert!(reading.witness.as_ref().unwrap().input.is_none());
+        assert_eq!(s.transcript[1].text, previous);
+        assert_eq!(&reading.entries[..2], baseline.as_slice());
+        assert!(s.transcript.iter().all(|line| line.kind != LineKind::User));
+        assert_eq!(
+            s.transcript
+                .iter()
+                .filter(|line| line.kind == LineKind::Queued)
+                .count(),
+            2
+        );
+        let models = model_ids(&reading, 1);
+        assert_eq!(models.len(), 2);
+        assert!(!baseline.contains(&models[0]));
+        let queues = reading.entries[reading.entries.len() - 2..].to_vec();
+        reading.mode = ReadMode::Anchored(ReadAnchor {
+            target: ReadTarget {
+                owner: ReadOwner::Entry(models[1]),
+                part: ReadPart::Text,
+                raw: 1,
+            },
+            bias: 0,
+        });
+        lease
+            .close_and_projection_sender(Some(layout(&f["expected_layout"])))
+            .send(projection(&f, operation));
+        drop(registration);
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_eq!(&reading.entries[..2], baseline.as_slice());
+        assert_eq!(reading.entries[5], models[0]);
+        assert_eq!(&reading.entries[6..], queues.as_slice());
+        assert_eq!(
+            s.transcript
+                .iter()
+                .filter(|line| line.kind == LineKind::User)
+                .count(),
+            1
+        );
+        assert_eq!(
+            reading.mode,
+            ReadMode::Anchored(ReadAnchor {
+                target: ReadTarget {
+                    owner: ReadOwner::Entry(models[0]),
+                    part: ReadPart::Text,
+                    raw: 4
+                },
+                bias: 0
+            })
+        );
+    }
+    #[test]
+    fn duplicate_foreign_and_stale_round_zero_cannot_restart_or_reenable_a_view_window() {
+        let (mut tui, mut s, mut reading, bus, sender, operation, _registration, lease) = setup();
+        let round0 = lease.sender().with_view_round(0);
+        round0.view_round_started(0);
+        round0.send(Msg::TextDelta("owned".into()));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        reading.mode = ReadMode::Start;
+        reading.navigation_start = Some(3);
+        let snapshot = |reading: &ReadState, s: &Scenario| {
+            (
+                reading.entries.clone(),
+                reading.next_id,
+                reading.mode,
+                reading.navigation_start,
+                reading.witness.as_ref().unwrap().current_round,
+                reading.witness.as_ref().unwrap().valid,
+                s.state_version(),
+            )
+        };
+        let before = snapshot(&reading, &s);
+        let foreign =
+            ForegroundOperation::new(operation.source().clone(), operation.kind(), operation.id())
+                .unwrap();
+        assert!(
+            foreign
+                .start(&WorkerCommand::PlanPrompt("rejected".into()))
+                .is_err()
+        );
+        let foreign_registration = foreign
+            .start(&WorkerCommand::Prompt("other".into()))
+            .unwrap();
+        let foreign_view = sender.scoped_view(&foreign_registration).unwrap();
+        round0.view_round_started(0);
+        round0.view_round_started(2);
+        foreign_view.sender().view_round_started(0);
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_eq!(snapshot(&reading, &s), before);
+        reading.reset_view_proof(&s);
+        assert!(!reading.witness.as_ref().unwrap().valid);
+        reading.navigation_start = Some(3);
+        let disabled = snapshot(&reading, &s);
+        round0.view_round_started(0);
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_eq!(snapshot(&reading, &s), disabled);
+        lease.sender().with_view_round(1).view_round_started(1);
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        let after_round = snapshot(&reading, &s);
+        round0.send(Msg::TextDelta("stale after proof reset".into()));
+        drain(&bus, &mut tui, &mut s, &mut reading);
+        assert_eq!(snapshot(&reading, &s), after_round);
+        assert!(!reading.witness.as_ref().unwrap().valid);
     }
 }

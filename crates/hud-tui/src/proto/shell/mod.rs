@@ -328,6 +328,16 @@ pub fn draw_with_profile(
     inp: &DrawIn,
     profile: &orbit_frontend_protocol::customization::Profile,
 ) -> Vec<hits::Hit> {
+    draw_with_reading(f, inp, profile, None).0
+}
+
+pub(super) fn draw_with_reading(
+    f: &mut ratatui::Frame,
+    inp: &DrawIn,
+    profile: &orbit_frontend_protocol::customization::Profile,
+    reading: Option<&convo::ReadInput<'_>>,
+) -> (Vec<hits::Hit>, Option<convo::ConversationFrame>) {
+    let mut conversation_feedback = None;
     let palette = pal::Palette::from_profile(profile);
     let area = f.area();
     let (w, h) = (area.width as i32, area.height as i32);
@@ -520,7 +530,7 @@ pub fn draw_with_profile(
             };
             cv.clipped(shown, |cv| {
                 if *view == View::Conversation {
-                    convo::draw(
+                    let frame = convo::draw_reading(
                         cv,
                         *r,
                         &convo::ConvIn {
@@ -543,7 +553,11 @@ pub fn draw_with_profile(
                             num: i + 1,
                             brand: inp.brand,
                         },
+                        reading,
                     );
+                    if reveal >= 1.0 {
+                        conversation_feedback = frame;
+                    }
                 } else if *view == View::Custom {
                     let id = sh.tree.custom_id_at(*i).unwrap_or_default();
                     crate::customization::draw_pane(
@@ -687,7 +701,7 @@ pub fn draw_with_profile(
         f.buffer_mut(),
         effective_tier(inp.tier, profile.color_mode, false),
     );
-    hits
+    (hits, conversation_feedback)
 }
 
 fn view_colour_themed(palette: pal::Palette, v: View) -> canvas::Rgb {

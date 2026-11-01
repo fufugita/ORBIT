@@ -54,6 +54,45 @@ pub struct Styled {
     pub labels: Vec<(usize, String)>,
 }
 
+/// Provenance for one displayed character, in raw Unicode scalar offsets.
+/// Generated furniture owns a source span but is not an original grapheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SourceSpan {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) generated: bool,
+}
+
+impl SourceSpan {
+    pub(super) fn source(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            generated: false,
+        }
+    }
+    pub(super) fn owner(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            generated: true,
+        }
+    }
+    fn shifted(self, by: usize) -> Self {
+        Self {
+            start: self.start.saturating_add(by),
+            end: self.end.saturating_add(by),
+            ..self
+        }
+    }
+}
+
+pub(super) struct OriginStyled {
+    pub(super) styled: Styled,
+    pub(super) origins: Vec<SourceSpan>,
+    empty_owner: SourceSpan,
+}
+
 fn is_word(c: char) -> bool {
     c.is_alphanumeric()
 }
@@ -90,6 +129,7 @@ struct Table {
     lines: usize,
     /// Displayed rows, one per raw line: the header, the rule, the body.
     shown: Vec<Vec<(char, Sty)>>,
+    origins: Vec<Vec<SourceSpan>>,
 }
 
 /// A `|` that is not escaped.
@@ -105,30 +145,90 @@ fn has_pipe(line: &str) -> bool {
 }
 
 /// The cells of a pipe row: outer pipes dropped, `\|` a literal pipe.
-fn split_cells(line: &str) -> Vec<String> {
-    let t = line.trim();
-    let t = t.strip_prefix('|').unwrap_or(t);
-    let t = if t.ends_with('|') && !t.ends_with("\\|") {
-        &t[..t.len() - 1]
-    } else {
-        t
-    };
-    let mut cells = Vec::new();
-    let mut cur = String::new();
-    let mut chars = t.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' && chars.peek() == Some(&'|') {
-            cur.push('|');
-            chars.next();
-        } else if c == '|' {
-            cells.push(cur.trim().to_string());
-            cur.clear();
+struct CellSource {
+    text: String,
+    chars: Vec<SourceSpan>,
+    boundary: usize,
+}
+
+impl CellSource {
+    fn translate(&self, span: SourceSpan) -> SourceSpan {
+        let start = self.chars.get(span.start).map_or_else(
+            || self.chars.last().map_or(self.boundary, |last| last.end),
+            |first| first.start,
+        );
+        let end = if span.end > span.start {
+            self.chars
+                .get(span.end.saturating_sub(1))
+                .map_or(start, |last| last.end)
         } else {
-            cur.push(c);
+            start
+        };
+        SourceSpan {
+            start,
+            end,
+            generated: span.generated,
         }
     }
-    cells.push(cur.trim().to_string());
+}
+
+fn split_cell_sources(line: &str) -> Vec<CellSource> {
+    let raw: Vec<char> = line.chars().collect();
+    let mut start = raw
+        .iter()
+        .position(|ch| !ch.is_whitespace())
+        .unwrap_or(raw.len());
+    let mut end = raw
+        .iter()
+        .rposition(|ch| !ch.is_whitespace())
+        .map_or(start, |at| at + 1);
+    if raw.get(start) == Some(&'|') {
+        start += 1;
+    }
+    if end > start && raw[end - 1] == '|' && (end < 2 || raw[end - 2] != '\\') {
+        end -= 1;
+    }
+    let mut cells = Vec::new();
+    let mut chars: Vec<(char, SourceSpan)> = Vec::new();
+    let finish = |chars: &mut Vec<(char, SourceSpan)>, boundary: usize| {
+        let a = chars
+            .iter()
+            .position(|(ch, _)| !ch.is_whitespace())
+            .unwrap_or(chars.len());
+        let b = chars
+            .iter()
+            .rposition(|(ch, _)| !ch.is_whitespace())
+            .map_or(a, |at| at + 1);
+        let cell = CellSource {
+            text: chars[a..b].iter().map(|(ch, _)| *ch).collect(),
+            chars: chars[a..b].iter().map(|(_, span)| *span).collect(),
+            boundary,
+        };
+        chars.clear();
+        cell
+    };
+    let mut at = start;
+    while at < end {
+        if raw[at] == '\\' && raw.get(at + 1) == Some(&'|') {
+            chars.push(('|', SourceSpan::source(at + 1, at + 2)));
+            at += 2;
+        } else if raw[at] == '|' {
+            cells.push(finish(&mut chars, at));
+            at += 1;
+        } else {
+            chars.push((raw[at], SourceSpan::source(at, at + 1)));
+            at += 1;
+        }
+    }
+    cells.push(finish(&mut chars, end));
     cells
+}
+
+fn split_cells(line: &str) -> Vec<String> {
+    split_cell_sources(line)
+        .into_iter()
+        .map(|cell| cell.text)
+        .collect()
 }
 
 /// The alignments of a `|---|:---:|` row, or None if it is not one.
@@ -152,22 +252,26 @@ fn rule_aligns(line: &str) -> Option<Vec<Align>> {
 }
 
 /// Clip a styled cell to `w` cells, ending in `…` when it had to be cut.
-fn clip_cell(cell: &Styled, w: usize) -> Vec<(char, Sty)> {
-    let text: String = cell.plain.iter().collect();
+fn clip_cell(cell: &OriginStyled, w: usize) -> (Vec<(char, Sty)>, Vec<SourceSpan>) {
+    let text: String = cell.styled.plain.iter().collect();
     if text_width(&text).max(0) as usize <= w {
-        return cell
-            .plain
-            .iter()
-            .copied()
-            .zip(cell.sty.iter().copied())
-            .collect();
+        return (
+            cell.styled
+                .plain
+                .iter()
+                .copied()
+                .zip(cell.styled.sty.iter().copied())
+                .collect(),
+            cell.origins.clone(),
+        );
     }
 
     if w == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let mut out: Vec<(char, Sty)> = Vec::new();
+    let mut origins = Vec::new();
     let mut char_offset = 0usize;
     let mut used = 0usize;
     for grapheme in text.graphemes(true) {
@@ -180,17 +284,29 @@ fn clip_cell(cell: &Styled, w: usize) -> Vec<(char, Sty)> {
             .position(|ch| text_width(&ch.to_string()) > 0)
             .unwrap_or(0);
         let style = cell
+            .styled
             .sty
             .get(char_offset + printable)
             .copied()
             .unwrap_or_default();
         out.extend(grapheme.chars().map(|ch| (ch, style)));
+        origins
+            .extend_from_slice(&cell.origins[char_offset..char_offset + grapheme.chars().count()]);
         char_offset += grapheme.chars().count();
         used = used.saturating_add(width);
     }
     let st = out.last().map_or_else(Sty::default, |(_, st)| *st);
     out.push(('…', st));
-    out
+    let omitted = cell
+        .origins
+        .get(char_offset)
+        .copied()
+        .unwrap_or(cell.empty_owner);
+    origins.push(SourceSpan {
+        generated: true,
+        ..omitted
+    });
+    (out, origins)
 }
 
 /// A table starting at line `at`: a header row with a pipe in it, a rule
@@ -210,17 +326,33 @@ fn table_at(lines: &[&str], at: usize, max_width: usize) -> Option<Table> {
     }
     // Cells, inline markup parsed. The rule row sits between the header
     // and the body but has no cells of its own.
-    let mut rows: Vec<Vec<Styled>> = Vec::new();
+    let mut rows: Vec<Vec<OriginStyled>> = Vec::new();
     for (k, line) in lines[at..at + count].iter().enumerate() {
         if k == 1 {
             continue;
         }
-        let mut cells = split_cells(line);
-        cells.resize(n, String::new());
-        rows.push(cells.iter().map(|c| rich_styled(c)).collect());
+        let mut cells = split_cell_sources(line);
+        cells.resize_with(n, || CellSource {
+            text: String::new(),
+            chars: Vec::new(),
+            boundary: line.chars().count(),
+        });
+        rows.push(
+            cells
+                .iter()
+                .map(|cell| {
+                    let mut parsed = rich_styled_origins(&cell.text, usize::MAX);
+                    for span in &mut parsed.origins {
+                        *span = cell.translate(*span);
+                    }
+                    parsed.empty_owner = SourceSpan::owner(cell.boundary, cell.boundary);
+                    parsed
+                })
+                .collect(),
+        );
     }
-    let cell_w = |c: &Styled| {
-        let text: String = c.plain.iter().collect();
+    let cell_w = |c: &OriginStyled| {
+        let text: String = c.styled.plain.iter().collect();
         text_width(&text).max(0) as usize
     };
     let mut widths: Vec<usize> = (0..n)
@@ -241,13 +373,21 @@ fn table_at(lines: &[&str], at: usize, max_width: usize) -> Option<Table> {
         ..Sty::default()
     };
     let mut shown: Vec<Vec<(char, Sty)>> = Vec::new();
+    let mut shown_origins = Vec::new();
     for (k, row) in rows.iter().enumerate() {
         let mut out: Vec<(char, Sty)> = Vec::new();
+        let mut row_origins = Vec::new();
         for (c, w) in widths.iter().enumerate() {
+            let boundary = row[c]
+                .origins
+                .first()
+                .map_or(row[c].empty_owner.start, |span| span.start);
+            let owner = SourceSpan::owner(boundary, boundary);
             if c > 0 {
                 out.extend([(' ', dim), ('│', dim), (' ', dim)]);
+                row_origins.extend([owner; 3]);
             }
-            let mut cell = clip_cell(&row[c], *w);
+            let (mut cell, cell_origins) = clip_cell(&row[c], *w);
             if k == 0 {
                 for (_, st) in cell.iter_mut() {
                     st.bold = true;
@@ -262,13 +402,17 @@ fn table_at(lines: &[&str], at: usize, max_width: usize) -> Option<Table> {
                 Align::Center => (pad / 2, pad - pad / 2),
             };
             out.extend(std::iter::repeat_n((' ', Sty::default()), left));
+            row_origins.extend(std::iter::repeat_n(owner, left));
             out.extend(cell);
+            row_origins.extend(cell_origins);
             // No trailing padding on the last column.
             if c + 1 < n {
                 out.extend(std::iter::repeat_n((' ', Sty::default()), right));
+                row_origins.extend(std::iter::repeat_n(owner, right));
             }
         }
         shown.push(out);
+        shown_origins.push(row_origins);
         if k == 0 {
             // The `|---|` row becomes a rule under the header, even while
             // the body has not arrived yet.
@@ -279,12 +423,15 @@ fn table_at(lines: &[&str], at: usize, max_width: usize) -> Option<Table> {
                 }
                 rule.extend(std::iter::repeat_n(('─', dim), *w));
             }
+            let owner = SourceSpan::owner(0, lines[at + 1].chars().count());
+            shown_origins.push(vec![owner; rule.len()]);
             shown.push(rule);
         }
     }
     Some(Table {
         lines: count,
         shown,
+        origins: shown_origins,
     })
 }
 
@@ -298,6 +445,7 @@ fn emit_table(
     raw: &[&str],
     mut ri: usize,
     more_after: bool,
+    mut origins: Option<&mut Vec<SourceSpan>>,
 ) -> usize {
     for (k, line) in raw.iter().enumerate() {
         let shown = &table.shown[k];
@@ -313,9 +461,12 @@ fn emit_table(
                 out.raw_to_plain[ri + r] = at;
             }
         }
-        for (c, st) in shown {
+        for (index, (c, st)) in shown.iter().enumerate() {
             out.plain.push(*c);
             out.sty.push(*st);
+            if let Some(sink) = origins.as_deref_mut() {
+                sink.push(table.origins[k][index].shifted(ri));
+            }
         }
         if has_newline {
             if crlf {
@@ -326,6 +477,9 @@ fn emit_table(
             out.raw_to_plain[ri + len] = out.plain.len();
             out.plain.push('\n');
             out.sty.push(Sty::default());
+            if let Some(sink) = origins.as_deref_mut() {
+                sink.push(SourceSpan::source(ri + content_len, ri + len + 1));
+            }
         }
         ri += len + 1;
     }
@@ -341,6 +495,25 @@ pub fn rich_styled(text: &str) -> Styled {
 /// Parse a reply for a panel `max_width` cells wide: only a table cares
 /// (it shrinks its columns to fit); everything else wraps later.
 pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
+    rich_styled_impl(text, max_width, None)
+}
+
+pub(super) fn rich_styled_origins(text: &str, max_width: usize) -> OriginStyled {
+    let mut origins = Vec::new();
+    let styled = rich_styled_impl(text, max_width, Some(&mut origins));
+    debug_assert_eq!(styled.plain.len(), origins.len());
+    OriginStyled {
+        styled,
+        origins,
+        empty_owner: SourceSpan::owner(0, 0),
+    }
+}
+
+fn rich_styled_impl(
+    text: &str,
+    max_width: usize,
+    mut origins: Option<&mut Vec<SourceSpan>>,
+) -> Styled {
     let raw_len = text.chars().count();
     let all_lines: Vec<&str> = text.split('\n').collect();
     let nlines = all_lines.len();
@@ -377,6 +550,7 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
                 &all_lines[li..li + table.lines],
                 ri,
                 li + table.lines < nlines,
+                origins.as_deref_mut(),
             );
             skip_to = li + table.lines;
             continue;
@@ -394,11 +568,24 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
         // char with no raw origin (the bullet that replaces a dash).
         macro_rules! emit {
             ($r:expr, $c:expr, $s:expr) => {{
-                if let Some(r) = $r {
+                let raw: Option<usize> = $r;
+                if let Some(r) = raw {
                     out.raw_to_plain[ri + r] = out.plain.len();
+                    if let Some(sink) = origins.as_deref_mut() {
+                        sink.push(SourceSpan::source(ri + r, ri + r + 1));
+                    }
                 }
                 out.plain.push($c);
                 out.sty.push($s);
+            }};
+        }
+        macro_rules! emit_generated {
+            ($start:expr, $end:expr, $c:expr, $s:expr) => {{
+                out.plain.push($c);
+                out.sty.push($s);
+                if let Some(sink) = origins.as_deref_mut() {
+                    sink.push(SourceSpan::owner(ri + $start, ri + $end));
+                }
             }};
         }
         // Mark raw index `$r` consumed without displaying it.
@@ -459,12 +646,12 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
                 drop_raw!(indent + 1);
                 base.quote = true;
                 let gutter = Sty { dim: true, ..base };
-                emit!(None::<usize>, '│', gutter);
-                emit!(None::<usize>, ' ', gutter);
+                emit_generated!(indent, indent + 2, '│', gutter);
+                emit_generated!(indent, indent + 2, ' ', gutter);
                 j = indent + 2;
             } else if matches!(rest.first(), Some('-' | '*' | '+')) && rest.get(1) == Some(&' ') {
                 drop_raw!(indent);
-                emit!(None::<usize>, '•', base);
+                emit_generated!(indent, indent + 1, '•', base);
                 j = indent + 1; // the space after the bullet stays
             }
             // Inline.
@@ -542,12 +729,12 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
                         drop_raw!(close);
                         drop_raw!(close + 1);
                         let dim = Sty { dim: true, ..sty };
-                        emit!(None::<usize>, ' ', dim);
-                        emit!(None::<usize>, '(', dim);
+                        emit_generated!(close, close + 2, ' ', dim);
+                        emit_generated!(close + 1, close + 2, '(', dim);
                         for (r, ch) in line.iter().enumerate().take(end).skip(close + 2) {
                             emit!(Some(r), *ch, dim);
                         }
-                        emit!(None::<usize>, ')', dim);
+                        emit_generated!(end, end + 1, ')', dim);
                         drop_raw!(end);
                         j = end + 1;
                         continue;
@@ -569,6 +756,9 @@ pub fn rich_styled_fit(text: &str, max_width: usize) -> Styled {
             // still a row of the band.
             if !is_fence {
                 out.plain.push('\n');
+                if let Some(sink) = origins.as_deref_mut() {
+                    sink.push(SourceSpan::source(ri + line.len(), ri + raw_line_len + 1));
+                }
                 out.sty.push(Sty {
                     block: fence,
                     ..Default::default()
@@ -922,5 +1112,106 @@ mod tests {
             assert_eq!(s.raw_to_plain.len(), n + 1);
             assert!(s.raw_to_plain.iter().all(|i| *i <= s.plain.len()));
         }
+    }
+}
+
+#[cfg(test)]
+mod reading_origin_tests {
+    use super::*;
+
+    #[test]
+    fn inline_origins_use_raw_scalar_positions_before_markup_is_removed() {
+        let parsed = rich_styled_origins("## **é** e\u{301} 👩‍💻", 80);
+        assert_eq!(
+            parsed.styled.plain.iter().collect::<String>(),
+            "é e\u{301} 👩‍💻"
+        );
+        assert_eq!(parsed.origins[0], SourceSpan::source(5, 6));
+        assert_eq!(parsed.origins[2], SourceSpan::source(9, 10));
+        assert_eq!(parsed.origins[3], SourceSpan::source(10, 11));
+        assert_eq!(parsed.origins[5], SourceSpan::source(12, 13));
+        assert_eq!(parsed.origins[6], SourceSpan::source(13, 14));
+        assert_eq!(parsed.origins[7], SourceSpan::source(14, 15));
+    }
+
+    #[test]
+    fn transformed_bullets_and_quote_gutters_own_their_marker_spans() {
+        let parsed = rich_styled_origins("- one\n> two", 80);
+        assert_eq!(
+            parsed.styled.plain.iter().collect::<String>(),
+            "• one\n│ two"
+        );
+        assert_eq!(parsed.origins[0], SourceSpan::owner(0, 1));
+        let gutter = parsed
+            .styled
+            .plain
+            .iter()
+            .position(|ch| *ch == '│')
+            .unwrap();
+        assert_eq!(parsed.origins[gutter], SourceSpan::owner(6, 8));
+        assert_eq!(parsed.origins[gutter + 2], SourceSpan::source(8, 9));
+    }
+
+    #[test]
+    fn table_escapes_cells_and_rule_keep_actual_source_owners() {
+        let raw = "| a\\|b | z |\n|---|---|\n| **漢** | q |";
+        let parsed = rich_styled_origins(raw, 80);
+        let plain = &parsed.styled.plain;
+        let pipe = plain.iter().position(|ch| *ch == '|').unwrap();
+        assert_eq!(parsed.origins[pipe], SourceSpan::source(4, 5));
+        let han = plain.iter().position(|ch| *ch == '漢').unwrap();
+        let expected = raw.chars().position(|ch| ch == '漢').unwrap();
+        assert_eq!(
+            parsed.origins[han],
+            SourceSpan::source(expected, expected + 1)
+        );
+        let rule = plain.iter().position(|ch| *ch == '─').unwrap();
+        let delimiter = raw.find("|---").unwrap();
+        assert_eq!(
+            parsed.origins[rule],
+            SourceSpan::owner(delimiter, delimiter + 9)
+        );
+        assert_eq!(plain.len(), parsed.origins.len());
+    }
+
+    #[test]
+    fn clipped_cell_ellipsis_is_owned_by_the_first_omitted_grapheme() {
+        let parsed = rich_styled_origins("e\u{301}漢字", 80);
+        let (glyphs, origins) = clip_cell(&parsed, 3);
+        assert_eq!(
+            glyphs.iter().map(|(ch, _)| *ch).collect::<String>(),
+            "e\u{301}…"
+        );
+        assert_eq!(
+            origins,
+            [
+                SourceSpan::source(0, 1),
+                SourceSpan::source(1, 2),
+                SourceSpan::owner(2, 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn fence_labels_and_crlf_share_the_existing_parser_and_arrival_map() {
+        let raw = "```rs\r\nlet 漢;\r\n```\r\nafter";
+        let parsed = rich_styled_origins(raw, 80);
+        let legacy = rich_styled_fit(raw, 80);
+        assert_eq!(parsed.styled.plain, legacy.plain);
+        assert_eq!(parsed.styled.sty, legacy.sty);
+        assert_eq!(parsed.styled.raw_to_plain, legacy.raw_to_plain);
+        assert_eq!(parsed.styled.labels, legacy.labels);
+        assert_eq!(
+            parsed.styled.plain.iter().collect::<String>(),
+            "let 漢;\nafter"
+        );
+        let newline = parsed
+            .styled
+            .plain
+            .iter()
+            .position(|ch| *ch == '\n')
+            .unwrap();
+        assert_eq!(parsed.origins[newline], SourceSpan::source(13, 15));
+        assert_eq!(parsed.origins.len(), parsed.styled.plain.len());
     }
 }

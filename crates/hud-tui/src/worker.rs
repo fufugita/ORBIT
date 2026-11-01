@@ -215,11 +215,36 @@ impl PartialEq for ForegroundOperation {
 }
 impl Eq for ForegroundOperation {}
 
+pub(crate) struct ForegroundViewState {
+    pub open: bool,
+    pub claimed: bool,
+    pub projection_sent: bool,
+}
+pub(crate) type RegisteredViewSource = (
+    ForegroundOperation,
+    std::sync::Arc<std::sync::Mutex<ForegroundViewState>>,
+);
 pub struct ForegroundRegistration {
     operation: ForegroundOperation,
+    view_source: std::sync::Arc<std::sync::Mutex<ForegroundViewState>>,
+}
+impl ForegroundRegistration {
+    // The held registration supplies display identity, never new admission.
+    pub(crate) fn claim_view_source(&self) -> Option<RegisteredViewSource> {
+        let mut view = self.view_source.lock().ok()?;
+        if !view.open || view.claimed {
+            return None;
+        }
+        view.claimed = true;
+        Some((self.operation.clone(), self.view_source.clone()))
+    }
 }
 impl Drop for ForegroundRegistration {
     fn drop(&mut self) {
+        // This is the same enqueue/close lock: no fresh source stamp after Drop.
+        if let Ok(mut view) = self.view_source.lock() {
+            view.open = false;
+        }
         self.operation
             .inner
             .state
@@ -277,6 +302,11 @@ impl ForegroundOperation {
             .map_err(|_| "foreground operation already consumed")?;
         Ok(ForegroundRegistration {
             operation: self.clone(),
+            view_source: std::sync::Arc::new(std::sync::Mutex::new(ForegroundViewState {
+                open: true,
+                claimed: false,
+                projection_sent: false,
+            })),
         })
     }
     pub fn finish_unstarted(&self) -> Result<(), &'static str> {
