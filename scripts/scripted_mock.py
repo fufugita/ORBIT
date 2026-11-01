@@ -215,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
                     "content": text}}]}))
             self._chunk(_sse({"choices": [{"index": 0, "delta": {},
                                            "finish_reason": finish_reason}]}))
-        if include_usage:
+        if include_usage and step.get("omit_usage") is not True:
             # Test-only terminal evidence. These fixed synthetic counters
             # exercise clients that require a final usage snapshot without
             # claiming live-provider or reasoning-token semantics.

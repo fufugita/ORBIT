@@ -681,13 +681,22 @@ fn scenario_a1_anthropic_wire() {
 // "mock-model · 0 in / 0 out", as if the call had cost nothing.
 #[test]
 fn scenario_g1_egress_row_without_usage() {
-    let script: serde_json::Value = serde_json::json!({"main": [{"text": "ok"}]});
+    let script: serde_json::Value =
+        serde_json::json!({"main": [{"text": "ok", "omit_usage": true}]});
     let mock = Mock::start(&script, "openai");
     let home = Home::init(&mock, "openai", "");
     let fix = Fixture::failing_test();
 
     let (events, code) = run_p(&mock, &home, &fix.path, "hello", &[]);
     assert_eq!(code, 0, "the turn completes: {events:?}");
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 1, "one request completes the turn: {reqs:?}");
+    assert_eq!(
+        reqs[0]["body"]["stream_options"]["include_usage"].as_bool(),
+        Some(true),
+        "the OpenAI request asks for usage even when the response omits it: {reqs:?}"
+    );
 
     let egress: Vec<&str> = events
         .iter()
@@ -701,6 +710,40 @@ fn scenario_g1_egress_row_without_usage() {
         egress,
         ["mock-model"],
         "no reported usage means the row names the model and claims no counts"
+    );
+}
+
+// ── G2: a provider that reports usage ─────────────────────────────
+#[test]
+fn scenario_g2_egress_row_with_usage() {
+    let script: serde_json::Value = serde_json::json!({"main": [{"text": "ok"}]});
+    let mock = Mock::start(&script, "openai");
+    let home = Home::init(&mock, "openai", "");
+    let fix = Fixture::failing_test();
+
+    let (events, code) = run_p(&mock, &home, &fix.path, "hello", &[]);
+    assert_eq!(code, 0, "the turn completes: {events:?}");
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 1, "one request completes the turn: {reqs:?}");
+    assert_eq!(
+        reqs[0]["body"]["stream_options"]["include_usage"].as_bool(),
+        Some(true),
+        "the OpenAI request asks for the usage snapshot: {reqs:?}"
+    );
+
+    let egress: Vec<&str> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("ledger_appended")
+                && e.get("kind").and_then(|k| k.as_str()) == Some("egress")
+        })
+        .filter_map(|e| e.get("summary").and_then(|s| s.as_str()))
+        .collect();
+    assert_eq!(
+        egress,
+        ["mock-model · 17 in / 5 out"],
+        "the egress row carries the reported OpenAI usage"
     );
 }
 
