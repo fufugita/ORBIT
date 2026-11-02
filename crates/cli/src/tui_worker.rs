@@ -3265,8 +3265,8 @@ mod ordinary_view_producer_tests {
     #[test]
     fn producer_evidence_bounds_and_round_order_fail_only_correspondence() {
         let mut rounds = OrdinaryViewJournal::new(&[]);
-        for round in 0..=MAX_VIEW_ROUNDS as u32 {
-            rounds.observe(&E::RoundStarted { round });
+        for ordinal in 0..=MAX_VIEW_ROUNDS as u32 {
+            rounds.observe(&E::RoundStarted { round: ordinal });
         }
         assert!(!rounds.valid);
         assert_eq!(rounds.rounds.len(), MAX_VIEW_ROUNDS);

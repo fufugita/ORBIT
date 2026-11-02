@@ -1347,7 +1347,9 @@ fn scenario_k1_compaction_keeps_the_question() {
         0,
         0,
         0,
-    );
+    )
+    .in_workspace(&fix.path)
+    .unwrap();
     {
         let lease =
             orbit_cli::sessions::SessionLease::acquire(&home.path, SESSION, "fixture").unwrap();

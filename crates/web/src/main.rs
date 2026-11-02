@@ -269,6 +269,18 @@ fn startup(args: &[String]) -> Result<(BridgeConfig, SessionLease, bool), String
     seed.accounting_watermark = saved
         .as_ref()
         .and_then(|saved| saved.accounting_watermark.clone());
+    // The worker admits execution only in the directory whose tools own
+    // this history (tui_worker's saved-session admission): a fresh
+    // browser session binds its workspace, a resumed one carries its
+    // saved workspace and must match it.
+    let workspace = orbit_cli::sessions::current_workspace().map_err(|error| error.to_string())?;
+    if let Some(saved) = &saved {
+        seed.workspace = saved.workspace.clone();
+        seed.require_workspace(&workspace)
+    } else {
+        seed.bind_workspace(&workspace)
+    }
+    .map_err(|error| error.to_string())?;
     prepare_root(&lease, &mut seed, accounting_origin).map_err(|error| error.to_string())?;
     let turn = TuiTurnConfig {
         home,
@@ -472,6 +484,13 @@ mod browser_accounting_startup_tests {
             "fresh browser startup must establish accounting before bridge work"
         );
         let saved = lease.load().unwrap();
+        // A fresh browser session binds its workspace so the worker's
+        // saved-session admission finds it when the bridge starts.
+        assert_eq!(
+            saved.workspace.as_deref(),
+            std::env::current_dir().ok().as_deref(),
+            "fresh browser startup must bind its workspace"
+        );
         let watermark = saved.accounting_watermark.unwrap();
         assert_eq!(watermark.owner_session_id, config.turn.session_id);
         assert_eq!(watermark.revision, 0);
@@ -501,7 +520,9 @@ mod browser_accounting_startup_tests {
             10,
             20,
             30,
-        );
+        )
+        .in_workspace(&std::env::current_dir().unwrap())
+        .unwrap();
         lease.save(&saved).unwrap();
         let accounting = prepare_root(&lease, &mut saved, RootOrigin::RestoredOrLegacy).unwrap();
         let journal = context_journal(&home.0, id, None).unwrap();

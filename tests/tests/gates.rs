@@ -417,7 +417,9 @@ compaction = "gate/gate-test-model-notools-summary"
     );
     let saved = orbit_cli::sessions::SessionFile::from_chat(
         SESSION, MODEL, &gate, "gate", &history, 9, 0, 0, 0,
-    );
+    )
+    .in_workspace(&std::path::Path::new(".").canonicalize().unwrap())
+    .unwrap();
     {
         let lease = orbit_cli::sessions::SessionLease::acquire(&home, SESSION, "fixture").unwrap();
         lease.save(&saved).unwrap();
