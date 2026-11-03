@@ -59,6 +59,32 @@ pub struct LedgerWriter {
 }
 
 impl LedgerWriter {
+    /// Open under contention: retry the non-blocking flock with exponential
+    /// backoff before giving up. Contention is expected when two writers
+    /// append near-simultaneously (tool calls, subagents) — that is not a
+    /// wedged ledger. E0719 is still returned once the attempts are spent.
+    pub fn open_with_retry(
+        dir: &Path,
+        writer_id: String,
+        writer_version: &str,
+    ) -> Result<Self, LedgerError> {
+        const ATTEMPTS: u32 = 8;
+        const FIRST_WAIT_MS: u64 = 2;
+        let mut wait_ms = FIRST_WAIT_MS;
+        loop {
+            match Self::open(dir, writer_id.clone(), writer_version) {
+                Ok(writer) => return Ok(writer),
+                Err(LedgerError::LedgerUnavailableAtBoot(_))
+                    if wait_ms < (FIRST_WAIT_MS << (ATTEMPTS - 1)) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    wait_ms *= 2;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Open (or create) the ledger at `dir` under the single-writer lock.
     /// Returns E0719 if the lock cannot be acquired (another writer holds it).
     pub fn open(dir: &Path, writer_id: String, writer_version: &str) -> Result<Self, LedgerError> {

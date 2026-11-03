@@ -385,8 +385,101 @@ impl Drop for ResponseGuard {
     }
 }
 
+fn dispatch_isolated(exact: &str) -> bool {
+    let isolated = std::env::var_os("ORBIT_ACTIVATION_ISOLATED");
+    let depth = std::env::var_os("ORBIT_ACTIVATION_RUNNER_DEPTH");
+    if isolated.as_deref() == Some(std::ffi::OsStr::new("1")) {
+        assert_eq!(
+            depth.as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "invalid isolated runner depth"
+        );
+        return true;
+    }
+    assert!(
+        isolated.is_none() && depth.is_none(),
+        "malformed isolation dispatch controls"
+    );
+    let required = std::env::var("ORBIT_REQUIRE_CONTEXT_SESSION_ISOLATION").as_deref() == Ok("1");
+    let output = std::process::Command::new("/usr/bin/python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/fixtures/context_session_isolation.py"
+        ))
+        .arg("--binary")
+        .arg(std::env::current_exe().unwrap())
+        // Each round here starts the real CLI binary several times (the
+        // 4×2 matrix runs twelve rounds), so this family needs a far wider
+        // budget than the lib-level engine tests: a clean isolated run of
+        // the slowest case measures ~75s on this machine. 180s keeps a hard
+        // hang deadline without turning sequential load into INFRA_FAILURE.
+        .args(["--exact", exact, "--timeout", "180"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("tracked isolation runner did not start");
+    assert!(
+        output.stdout.len() <= 512 * 1024 && output.stderr.len() <= 64 * 1024,
+        "runner receipt output bound"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "invalid isolation runner receipt, exit {:?}",
+            output.status.code()
+        )
+    });
+    assert_eq!(report["schema"], "orbit.context-session-isolation/v1");
+    assert_eq!(report["test_filter"], exact);
+    let visible = json!({"schema":report["schema"],"test_filter":exact,"status":report["status"],
+            "test_started":report["test_started"],"reason":report["reason"],"harness":report["harness"],
+            "binary_sha256":report["binary_sha256"],"binary_metadata_and_hash_unchanged":report["binary_metadata_and_hash_unchanged"],
+            "host_managed_path_metadata_unchanged":report["host_managed_path_metadata_unchanged"],"owned_fixture_removed":report["owned_fixture_removed"]});
+    let line = format!("ORBIT_CONTEXT_SESSION_ISOLATION {visible}\n");
+    std::io::Write::write_all(&mut std::io::stdout().lock(), line.as_bytes()).unwrap();
+    match report["status"].as_str() {
+        Some("TEST_PASSED") => {
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(report["test_started"], true);
+            assert_eq!(report["harness"]["passed"], 1);
+            assert_eq!(report["harness"]["failed"], 0);
+            assert_eq!(report["harness"]["ignored"], 0);
+            for field in [
+                "binary_metadata_and_hash_unchanged",
+                "host_managed_path_metadata_unchanged",
+                "owned_fixture_removed",
+                "binary_postcheck_inside",
+            ] {
+                assert_eq!(report[field], true);
+            }
+        }
+        Some("NOTRUN") => {
+            assert_eq!(output.status.code(), Some(77));
+            assert_eq!(report["test_started"], false);
+            assert!(
+                !required,
+                "NOTRUN: this infrastructure-required job needs namespace capability"
+            );
+        }
+        Some("TEST_FAILED") | Some("INFRA_FAILURE") => {
+            panic!(
+                "isolated test did not pass: {} / {} / {}",
+                report["status"], report["stdout_excerpt"], report["stderr_excerpt"]
+            );
+        }
+        _ => panic!("unknown isolation runner status"),
+    }
+    false
+}
+
 #[test]
 fn fixture_clock_counts_runtime_cumulatively_without_resetting_for_fingerprints() {
+    if !dispatch_isolated(
+        "fixture_clock_counts_runtime_cumulatively_without_resetting_for_fingerprints",
+    ) {
+        return;
+    }
     let seconds = Duration::from_secs;
     let mut state = ClockState::default();
     let baseline = state.begin_wire(seconds(0)).unwrap();
@@ -413,6 +506,11 @@ fn fixture_clock_counts_runtime_cumulatively_without_resetting_for_fingerprints(
 
 #[test]
 fn fixture_clock_guards_child_lifecycles_and_counts_response_work_during_verification() {
+    if !dispatch_isolated(
+        "fixture_clock_guards_child_lifecycles_and_counts_response_work_during_verification",
+    ) {
+        return;
+    }
     let seconds = Duration::from_secs;
     let mut state = ClockState::default();
     state.begin_child(seconds(0)).unwrap();
@@ -1310,6 +1408,9 @@ fn seed_retry(f: &Fixture, wire: &Wire) -> SessionFile {
 
 #[test]
 fn declared_500_and_503_retry_once_with_persistent_unknown_bill() {
+    if !dispatch_isolated("declared_500_and_503_retry_once_with_persistent_unknown_bill") {
+        return;
+    }
     for status in [500, 503] {
         let f = Fixture::new();
         let mut wire = Wire::new(
@@ -1495,41 +1596,65 @@ fn policy_runtime_effect(kind: &str) {
 
 #[test]
 fn missing_policy_uses_conservative_runtime_path() {
+    if !dispatch_isolated("missing_policy_uses_conservative_runtime_path") {
+        return;
+    }
     policy_runtime_effect("missing");
 }
 
 #[test]
 fn unmatched_policy_uses_conservative_runtime_path() {
+    if !dispatch_isolated("unmatched_policy_uses_conservative_runtime_path") {
+        return;
+    }
     policy_runtime_effect("unmatched");
 }
 
 #[test]
 fn stale_policy_uses_conservative_runtime_path() {
+    if !dispatch_isolated("stale_policy_uses_conservative_runtime_path") {
+        return;
+    }
     policy_runtime_effect("stale");
 }
 
 #[test]
 fn malformed_policy_stops_new_runtime_traffic() {
+    if !dispatch_isolated("malformed_policy_stops_new_runtime_traffic") {
+        return;
+    }
     policy_runtime_effect("malformed");
 }
 
 #[test]
 fn unsafe_policy_stops_new_runtime_traffic() {
+    if !dispatch_isolated("unsafe_policy_stops_new_runtime_traffic") {
+        return;
+    }
     policy_runtime_effect("unsafe");
 }
 
 #[test]
 fn oversized_policy_stops_new_runtime_traffic() {
+    if !dispatch_isolated("oversized_policy_stops_new_runtime_traffic") {
+        return;
+    }
     policy_runtime_effect("oversized");
 }
 
 #[test]
 fn inactive_invalid_policy_stops_new_runtime_traffic() {
+    if !dispatch_isolated("inactive_invalid_policy_stops_new_runtime_traffic") {
+        return;
+    }
     policy_runtime_effect("inactive-invalid");
 }
 
 #[test]
 fn explicit_and_phase_selection_load_the_final_policy() {
+    if !dispatch_isolated("explicit_and_phase_selection_load_the_final_policy") {
+        return;
+    }
     for phase in [false, true] {
         for final_policy in [false, true] {
             let f = Fixture::new();
@@ -1616,6 +1741,9 @@ fn explicit_and_phase_selection_load_the_final_policy() {
 
 #[test]
 fn file_edits_are_frozen_for_one_operation_and_reloaded_next() {
+    if !dispatch_isolated("file_edits_are_frozen_for_one_operation_and_reloaded_next") {
+        return;
+    }
     for remove in [false, true] {
         let f = Fixture::new();
         let (held, control) = Reply::rejection(503).held();
@@ -1669,6 +1797,9 @@ fn file_edits_are_frozen_for_one_operation_and_reloaded_next() {
 
 #[test]
 fn literal_policy_removal_preserves_history_without_enabling_retry() {
+    if !dispatch_isolated("literal_policy_removal_preserves_history_without_enabling_retry") {
+        return;
+    }
     for rejected in [false, true] {
         let f = Fixture::new();
         let mut wire = Wire::new(
@@ -1728,6 +1859,9 @@ fn schema(f: &Fixture) -> PathBuf {
 }
 #[test]
 fn schema_repair_loads_a_fresh_policy_and_fresh_ids() {
+    if !dispatch_isolated("schema_repair_loads_a_fresh_policy_and_fresh_ids") {
+        return;
+    }
     let f = Fixture::new();
     let (held, control) = Reply::text("{\"wrong\":true}").held();
     let mut wire = Wire::new(
@@ -1801,6 +1935,9 @@ fn schema_repair_loads_a_fresh_policy_and_fresh_ids() {
 
 #[test]
 fn invalid_repair_policy_stops_only_the_repair_send() {
+    if !dispatch_isolated("invalid_repair_policy_stops_only_the_repair_send") {
+        return;
+    }
     let f = Fixture::new();
     let (held, control) = Reply::text("{\"wrong\":true}").held();
     let mut wire = Wire::new(
@@ -1957,6 +2094,9 @@ fn invalid_repair_policy_stops_only_the_repair_send() {
 
 #[test]
 fn plain_repl_reloads_between_actual_prompt_boundaries() {
+    if !dispatch_isolated("plain_repl_reloads_between_actual_prompt_boundaries") {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(
         &f.clock,
@@ -2024,6 +2164,9 @@ fn plain_repl_reloads_between_actual_prompt_boundaries() {
 
 #[test]
 fn direct_ask_remains_one_selected_request() {
+    if !dispatch_isolated("direct_ask_remains_one_selected_request") {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(&f.clock, vec![Reply::rejection(503)]);
     f.configure(&wire, 128000, false);
@@ -2052,6 +2195,9 @@ fn direct_ask_remains_one_selected_request() {
 
 #[test]
 fn historical_unknown_bill_caps_stop_before_new_traffic() {
+    if !dispatch_isolated("historical_unknown_bill_caps_stop_before_new_traffic") {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(&f.clock, vec![Reply::rejection(503), Reply::text(ANSWER)]);
     f.configure(&wire, 128000, false);
@@ -2132,6 +2278,9 @@ fn verify_summary_receipt(view: &DetailedAccountingInspection) {
 
 #[test]
 fn real_cli_refusal_then_manual_summary_preserves_exact_archive() {
+    if !dispatch_isolated("real_cli_refusal_then_manual_summary_preserves_exact_archive") {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(
         &f.clock,
@@ -2200,6 +2349,9 @@ fn real_cli_refusal_then_manual_summary_preserves_exact_archive() {
 
 #[test]
 fn real_cli_refusal_then_automatic_summary_after_policy_removal() {
+    if !dispatch_isolated("real_cli_refusal_then_automatic_summary_after_policy_removal") {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(
         &f.clock,
@@ -2531,6 +2683,9 @@ fn assert_uncertain_ordinary(
 
 #[test]
 fn declared_policy_admitted_idle_stays_uncertain_without_replay() {
+    if !dispatch_isolated("declared_policy_admitted_idle_stays_uncertain_without_replay") {
+        return;
+    }
     let f = Fixture::new();
     let (held, control) = Reply::partial("", false).held();
     let mut wire = Wire::new(&f.clock, vec![held, Reply::text(ANSWER)]);
@@ -2582,6 +2737,11 @@ fn declared_policy_admitted_idle_stays_uncertain_without_replay() {
 
 #[test]
 fn declared_policy_partial_ordinary_retains_provisional_usage_without_replay() {
+    if !dispatch_isolated(
+        "declared_policy_partial_ordinary_retains_provisional_usage_without_replay",
+    ) {
+        return;
+    }
     let f = Fixture::new();
     let partial = "visible controlled incomplete ordinary text";
     let mut wire = Wire::new(
@@ -2606,6 +2766,9 @@ fn declared_policy_partial_ordinary_retains_provisional_usage_without_replay() {
 
 #[test]
 fn declared_policy_truncated_503_stays_uncertain_without_replay() {
+    if !dispatch_isolated("declared_policy_truncated_503_stays_uncertain_without_replay") {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(
         &f.clock,
@@ -2804,6 +2967,9 @@ fn failed_manual_summary(result: &CliResult, cancelled: bool) {
 
 #[test]
 fn real_cli_post_refusal_manual_503_summary_does_not_retry() {
+    if !dispatch_isolated("real_cli_post_refusal_manual_503_summary_does_not_retry") {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(&f.clock, summary_failure_replies(Reply::rejection(503)));
     let before = summary_failure_seed(&f, &wire);
@@ -2819,6 +2985,9 @@ fn real_cli_post_refusal_manual_503_summary_does_not_retry() {
 
 #[test]
 fn real_cli_post_refusal_manual_partial_summary_keeps_provisional_usage() {
+    if !dispatch_isolated("real_cli_post_refusal_manual_partial_summary_keeps_provisional_usage") {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(
         &f.clock,
@@ -2838,6 +3007,9 @@ fn real_cli_post_refusal_manual_partial_summary_keeps_provisional_usage() {
 
 #[test]
 fn real_cli_post_refusal_manual_sigterm_summary_preserves_source() {
+    if !dispatch_isolated("real_cli_post_refusal_manual_sigterm_summary_preserves_source") {
+        return;
+    }
     let f = Fixture::new();
     let (held, control) = Reply::partial("", false).held();
     let mut wire = Wire::new(&f.clock, summary_failure_replies(held));
@@ -2865,6 +3037,10 @@ fn real_cli_post_refusal_manual_sigterm_summary_preserves_source() {
 
 #[test]
 fn real_cli_post_refusal_automatic_partial_summary_blocks_ordinary_replay() {
+    if !dispatch_isolated("real_cli_post_refusal_automatic_partial_summary_blocks_ordinary_replay")
+    {
+        return;
+    }
     let f = Fixture::new();
     let mut wire = Wire::new(
         &f.clock,

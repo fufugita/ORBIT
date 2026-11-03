@@ -823,7 +823,28 @@ mod recovery_baselines {
                 reasoning_per_million_microcents: Some(0),
                 request_flat_microcents: 7,
             }),
-            billing: None,
+            // A priced receipt needs the versioned v2 terms; legacy pricing
+            // rows stay display-only projections.
+            billing: Some(
+                orbit_adapter::types::BillingQuoteContractV1::try_new(
+                    orbit_adapter::types::ProviderId("provider_a".into()),
+                    orbit_adapter::types::ModelId(
+                        if summary { "summary-model" } else { RAW_A }.into(),
+                    ),
+                    orbit_adapter::types::PricingDeclarationState::DeclaredV2,
+                    orbit_adapter::types::BillingRatesV1 {
+                        input_per_million_microdollars: Some(0),
+                        output_per_million_microdollars: Some(0),
+                        cache_read_per_million_microdollars: Some(0),
+                        cache_write_per_million_microdollars: Some(0),
+                        reasoning_per_million_microdollars: Some(0),
+                        request_flat_microdollars: Some(7),
+                    },
+                    orbit_adapter::types::ReasoningCounterBasis::IncludedInOutput,
+                    orbit_adapter::types::ReasoningRatePolicy::OutputRate,
+                )
+                .unwrap(),
+            ),
             max_output_tokens: 73,
             sampling: None,
             effort: None,

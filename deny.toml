@@ -14,6 +14,20 @@ feature-depth = 1
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Any advisory (incl. yanked) fails the check.
 yanked = "deny"
+# Documented acceptances for advisories with no in-range fix (2026-11-02 audit).
+ignore = [
+    # RUSTSEC-2026-0374: basic-toml 0.1.10 is unmaintained (repo archived
+    # 2025-03). Reachable only as a build-time config parser of
+    # i18n-config/i18n-embed via age's fluent macro; not a runtime data path.
+    # No replacement release exists; i18n-config 0.4.8 is the latest.
+    "RUSTSEC-2026-0374",
+    # RUSTSEC-2026-0387: crypto-bigint 0.5.5 constant-time variability.
+    # Pulled by p256 0.13 via age 0.12 (hpke); orbit only uses age::x25519
+    # (identity/recipient export sealing), never the p256 ECDSA operations
+    # the advisory describes. crypto-bigint 0.7 is API-incompatible with
+    # elliptic-curve 0.13; age 0.12.1 is the latest release.
+    "RUSTSEC-2026-0387",
+]
 [licenses]
 allow = [
     "MIT",

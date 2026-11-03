@@ -84,7 +84,11 @@ def main():
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.end_headers()
-                    event = {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                    # The engine treats a terminal round without final usage as
+                    # uncertain accounting and refuses to continue the turn; a
+                    # real provider sends usage on every stream, so carry it.
+                    event = {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                             "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
                     self.wfile.write(("data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n").encode())
                     self.wfile.flush()
                 except Exception as error:

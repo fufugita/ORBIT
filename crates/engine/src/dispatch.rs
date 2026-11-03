@@ -941,20 +941,14 @@ pub(crate) fn run_prepared_dispatch_detailed(
         // Run the full pipeline via tokio.
         // E6: one shared runtime for the process — a round used to spawn
         // its own thread pool every time.
+        //
+        // The ledger dir is passed, not a held writer: the egress-intent
+        // append inside dispatch opens its own short-lived, contention-
+        // retried writer. Holding a flock across the provider round
+        // serialized concurrent sessions behind it and failed their boot
+        // with E0719.
         let result = orbit_provider_http::shared_runtime()
             .block_on(async {
-                let mut writer = orbit_ledger::LedgerWriter::open(
-                    &home.join("ledger"),
-                    "orbit-engine".into(),
-                    "0.1.0",
-                )
-                .map_err(|e| orbit_gateway::DispatchError {
-                    code: "E0719",
-                    phase: "ledger",
-                    message: e.to_string(),
-                    session_id: session.clone(),
-                    decision_id: decision.0.clone(),
-                })?;
                 engine
                     .dispatch_async_detailed(
                         &config.model,
@@ -962,7 +956,7 @@ pub(crate) fn run_prepared_dispatch_detailed(
                         &decision.0,
                         request,
                         credential.as_ref(),
-                        &mut writer,
+                        &home.join("ledger"),
                         &cancel,
                         observer,
                     )

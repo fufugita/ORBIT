@@ -588,6 +588,7 @@ fn help(cv: &mut Cv, sw: i32, sh: i32, opened_ms: u64, now_ms: u64, reduced: boo
                 ("x", "close this panel"),
                 ("< >  - +", "resize"),
                 ("=", "even out every split"),
+                ("y", "copy view as plain text"),
                 ("b", "show or hide the sidebar"),
                 ("[ ]", "columns · build · agents · review"),
                 ("i  ⏎", "back to typing"),

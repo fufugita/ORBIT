@@ -1077,10 +1077,11 @@ mod headless_signal_baselines {
         assert_eq!(receipt["totals"]["output_tokens"], 0);
         assert!(receipt["totals"]["cost_microcents"].is_null());
         if boundary.partial() {
-            assert_eq!(
-                receipt["usage"],
-                json!({"input_tokens":10,"output_tokens":2,"cache_read_tokens":3,"cache_write_tokens":0,"reasoning_tokens":1})
-            );
+            // The mid-stream prefix counts remain provisional diagnostic
+            // evidence, not receipt usage — the interrupted round settles
+            // conservatively (task05 contract).
+            assert!(receipt["usage"].is_null());
+            assert!(evidence.entry["pending"]["uncertain_receipt"]["usage"].is_null());
         } else {
             assert!(
                 receipt["usage"].is_null()

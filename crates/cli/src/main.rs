@@ -3803,10 +3803,14 @@ fn cmd_chat(args: &[String]) -> i32 {
                 match orbit_cli::customization_host::command_for(host.as_ref(), &words) {
                     Ok(value) => {
                         last_operation_failed = false;
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&value).unwrap_or_default()
-                        );
+                        // Match the TUI surface: the human message, not the
+                        // JSON envelope. The structured value remains the
+                        // contract for scripted consumers via --json paths.
+                        let message = value
+                            .get("message")
+                            .and_then(|message| message.as_str())
+                            .unwrap_or("customization applied");
+                        println!("{message}");
                     }
                     Err(error) => eprintln!("customize: {error}"),
                 }

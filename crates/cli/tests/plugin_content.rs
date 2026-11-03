@@ -748,7 +748,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             beta = any(message.get('role') == 'user' and 'attempt-beta' in message.get('content', '') for message in messages)
             delta = {'tool_calls':[{'index':0,'id':'child-mcp-call','type':'function','function':{'name':sys.argv[3] if beta else sys.argv[2],'arguments':'{}'}}]}
             finish = 'tool_calls'
-        chunks = [{'id':'fixture','choices':[{'delta':delta,'finish_reason':None}]}, {'id':'fixture','choices':[{'delta':{},'finish_reason':finish}]}]
+        chunks = [{'id':'fixture','choices':[{'delta':delta,'finish_reason':None}]}, {'id':'fixture','choices':[{'delta':{},'finish_reason':finish}]}, {'id':'fixture','choices':[],'usage':{'prompt_tokens':5,'completion_tokens':2,'total_tokens':7}}]
         reply = ''.join('data: ' + json.dumps(chunk) + '\n\n' for chunk in chunks) + 'data: [DONE]\n\n'
         encoded = reply.encode()
         self.send_response(200)

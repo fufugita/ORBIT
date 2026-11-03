@@ -423,15 +423,16 @@ fn setup_main_incoming_known_optional_fields_and_pricing_aliases_replace_old_val
     ] {
         assert!(!pricing.contains_key(alias), "old pricing alias {alias}");
     }
-    assert_eq!(
-        pricing["input_per_million_microdollars"].as_integer(),
-        Some(0)
-    );
-    assert_eq!(
-        pricing["output_per_million_microdollars"].as_integer(),
-        Some(0)
-    );
-    assert!(!pricing.contains_key("cache_read_per_million_microdollars"));
+    // Unspecified rates stay absent (they are no longer plain zero
+    // defaults); only the known incoming fields and the preserved
+    // metadata survive.
+    for key in [
+        "input_per_million_microdollars",
+        "output_per_million_microdollars",
+        "cache_read_per_million_microdollars",
+    ] {
+        assert!(!pricing.contains_key(key), "unspecified rate {key}");
+    }
     assert_eq!(pricing["pricing_note"].as_str(), Some("preserved-pricing"));
 }
 
@@ -473,7 +474,14 @@ fn setup_main_scripted_model_list_omits_removed_ids_and_does_not_match_suffixes(
     assert_eq!(models[0]["id"].as_str(), Some("family/raw"));
     assert!(models[0].get("model_note").is_none());
     assert!(models[0].get("extensions").is_none());
-    assert!(models[0]["pricing"].get("pricing_note").is_none());
+    // The new model is not a suffix match of the old one, so none of the
+    // old model's metadata (including its pricing table) leaks into it.
+    assert!(
+        models[0]
+            .get("pricing")
+            .and_then(|pricing| pricing.get("pricing_note"))
+            .is_none()
+    );
 }
 
 #[test]

@@ -216,8 +216,94 @@ fn selector(entry: &Value) -> FinalRejectionSelector {
     .unwrap()
 }
 
+fn dispatch_isolated(exact: &str) -> bool {
+    let isolated = std::env::var_os("ORBIT_ACTIVATION_ISOLATED");
+    let depth = std::env::var_os("ORBIT_ACTIVATION_RUNNER_DEPTH");
+    if isolated.as_deref() == Some(std::ffi::OsStr::new("1")) {
+        assert_eq!(
+            depth.as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "invalid isolated runner depth"
+        );
+        return true;
+    }
+    assert!(
+        isolated.is_none() && depth.is_none(),
+        "malformed isolation dispatch controls"
+    );
+    let required = std::env::var("ORBIT_REQUIRE_CONTEXT_SESSION_ISOLATION").as_deref() == Ok("1");
+    let output = std::process::Command::new("/usr/bin/python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/fixtures/context_session_isolation.py"
+        ))
+        .arg("--binary")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", exact, "--timeout", "45"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("tracked isolation runner did not start");
+    assert!(
+        output.stdout.len() <= 512 * 1024 && output.stderr.len() <= 64 * 1024,
+        "runner receipt output bound"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "invalid isolation runner receipt, exit {:?}",
+            output.status.code()
+        )
+    });
+    assert_eq!(report["schema"], "orbit.context-session-isolation/v1");
+    assert_eq!(report["test_filter"], exact);
+    let visible = json!({"schema":report["schema"],"test_filter":exact,"status":report["status"],
+            "test_started":report["test_started"],"reason":report["reason"],"harness":report["harness"],
+            "binary_sha256":report["binary_sha256"],"binary_metadata_and_hash_unchanged":report["binary_metadata_and_hash_unchanged"],
+            "host_managed_path_metadata_unchanged":report["host_managed_path_metadata_unchanged"],"owned_fixture_removed":report["owned_fixture_removed"]});
+    let line = format!("ORBIT_CONTEXT_SESSION_ISOLATION {visible}\n");
+    std::io::Write::write_all(&mut std::io::stdout().lock(), line.as_bytes()).unwrap();
+    match report["status"].as_str() {
+        Some("TEST_PASSED") => {
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(report["test_started"], true);
+            assert_eq!(report["harness"]["passed"], 1);
+            assert_eq!(report["harness"]["failed"], 0);
+            assert_eq!(report["harness"]["ignored"], 0);
+            for field in [
+                "binary_metadata_and_hash_unchanged",
+                "host_managed_path_metadata_unchanged",
+                "owned_fixture_removed",
+                "binary_postcheck_inside",
+            ] {
+                assert_eq!(report[field], true);
+            }
+        }
+        Some("NOTRUN") => {
+            assert_eq!(output.status.code(), Some(77));
+            assert_eq!(report["test_started"], false);
+            assert!(
+                !required,
+                "NOTRUN: this infrastructure-required job needs namespace capability"
+            );
+        }
+        Some("TEST_FAILED") | Some("INFRA_FAILURE") => {
+            panic!(
+                "isolated test did not pass: {} / {} / {}",
+                report["status"], report["stdout_excerpt"], report["stderr_excerpt"]
+            );
+        }
+        _ => panic!("unknown isolation runner status"),
+    }
+    false
+}
+
 #[test]
 fn absent_and_empty_policy_documents_do_not_create_state() {
+    if !dispatch_isolated("absent_and_empty_policy_documents_do_not_create_state") {
+        return;
+    }
     let f = Home::new();
     let c = config();
     let absent = f.root.join("absent");
@@ -279,6 +365,9 @@ fn absent_and_empty_policy_documents_do_not_create_state() {
 
 #[test]
 fn exact_selection_uses_actual_provider_model_endpoint_and_identity() {
+    if !dispatch_isolated("exact_selection_uses_actual_provider_model_endpoint_and_identity") {
+        return;
+    }
     let f = Home::new();
     let c = config();
     let e = entry(&c, "selected");
@@ -309,6 +398,9 @@ fn exact_selection_uses_actual_provider_model_endpoint_and_identity() {
 
 #[test]
 fn canonical_endpoints_preserve_raw_query_and_reject_overlap() {
+    if !dispatch_isolated("canonical_endpoints_preserve_raw_query_and_reject_overlap") {
+        return;
+    }
     let f = Home::new();
     let mut c = config();
     c.gate = "http://127.0.0.1:9".into();
@@ -350,6 +442,9 @@ fn canonical_endpoints_preserve_raw_query_and_reject_overlap() {
 
 #[test]
 fn whole_file_validation_includes_inactive_declarations() {
+    if !dispatch_isolated("whole_file_validation_includes_inactive_declarations") {
+        return;
+    }
     let f = Home::new();
     let c = config();
     let active = entry(&c, "active");
@@ -376,6 +471,9 @@ fn whole_file_validation_includes_inactive_declarations() {
 
 #[test]
 fn duplicate_keys_ids_and_unknown_fields_are_errors() {
+    if !dispatch_isolated("duplicate_keys_ids_and_unknown_fields_are_errors") {
+        return;
+    }
     let f = Home::new();
     let c = config();
     let a = entry(&c, "same");
@@ -418,6 +516,9 @@ fn duplicate_keys_ids_and_unknown_fields_are_errors() {
 
 #[test]
 fn document_and_declaration_bounds_are_exact() {
+    if !dispatch_isolated("document_and_declaration_bounds_are_exact") {
+        return;
+    }
     let f = Home::new();
     let c = config();
     let declarations: Vec<_> = (0..128)
@@ -482,6 +583,9 @@ fn document_and_declaration_bounds_are_exact() {
 
 #[test]
 fn unsafe_policy_storage_is_not_absent() {
+    if !dispatch_isolated("unsafe_policy_storage_is_not_absent") {
+        return;
+    }
     for kind in [
         "symlink",
         "dangling",
@@ -533,6 +637,9 @@ fn unsafe_policy_storage_is_not_absent() {
 
 #[test]
 fn errors_are_nonsecret_and_providers_file_is_unchanged() {
+    if !dispatch_isolated("errors_are_nonsecret_and_providers_file_is_unchanged") {
+        return;
+    }
     let f = Home::new();
     let c = config();
     let marker = "POLICY_SECRET_MARKER";

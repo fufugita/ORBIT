@@ -11,7 +11,6 @@ use orbit_gateway::dispatch::{
     DetailedDispatchOutcome, DispatchEngine, DispatchOutcome, EgressReservation,
 };
 use orbit_gateway::{ModelRef, ProviderRegistry, new_session_id};
-use orbit_ledger::LedgerWriter;
 use orbit_provider_http::adapter_trait::{DetailedInvokeFailure, FailureObservation};
 use orbit_provider_http::openai::{openai_capabilities, openai_identity};
 use orbit_provider_http::{
@@ -227,17 +226,14 @@ async fn detailed(
     let directory = OwnedDir::new();
     let ledger = directory.0.join("ledger");
     let engine = engine(adapter, &request.route, ledger.clone());
-    let mut writer = LedgerWriter::open(&ledger, "typed-refusal".into(), "0.2.0").unwrap();
     if poison {
-        let segments = ledger.join("segments");
-        let held = ledger.join("segments-held");
-        std::fs::rename(&segments, &held).unwrap();
-        let failure = writer.fsync();
-        std::fs::rename(&held, &segments).unwrap();
-        assert!(
-            failure.is_err(),
-            "actual directory-identity refusal poisons writer"
-        );
+        // The dispatch's egress-intent append opens its own short-lived
+        // writer at `ledger`; a fault there must BLOCK dispatch (GW-04).
+        // Cut the ledger directory off so that writer cannot open or
+        // append: unreadable dir (chmod 000) makes open fail.
+        std::fs::create_dir_all(&ledger).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o000)).unwrap();
     }
     let mut observed = Vec::new();
     let session = new_session_id();
@@ -249,7 +245,7 @@ async fn detailed(
             outer_decision,
             request,
             None,
-            &mut writer,
+            &ledger,
             &CancelToken::new(),
             Some(&mut |event| observed.push(event.clone())),
         ),
@@ -258,10 +254,10 @@ async fn detailed(
     .unwrap()
     .unwrap();
     if poison {
-        assert!(writer.close().is_err());
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(reservation.intent_digest.is_empty());
     } else {
-        writer.close().unwrap();
         assert!(!reservation.intent_digest.is_empty());
         let (records, _) = orbit_ledger::verify_ledger(&ledger).unwrap();
         let intents: Vec<_> = records
@@ -369,7 +365,6 @@ async fn cancellation_during_real_error_body_is_unknown_and_preserves_cancelled_
     let directory = OwnedDir::new();
     let ledger = directory.0.join("ledger");
     let engine = engine(adapter(), &request.route, ledger.clone());
-    let mut writer = LedgerWriter::open(&ledger, "cancel-body".into(), "0.2.0").unwrap();
     let cancel = CancelToken::new();
     let session = new_session_id();
     let mut observed = Vec::new();
@@ -381,7 +376,7 @@ async fn cancellation_during_real_error_body_is_unknown_and_preserves_cancelled_
             &request.decision_id.0,
             &request,
             None,
-            &mut writer,
+            &ledger,
             &cancel,
             Some(&mut observer),
         );
@@ -394,7 +389,6 @@ async fn cancellation_during_real_error_body_is_unknown_and_preserves_cancelled_
         }
     };
     wire.finish().await;
-    writer.close().unwrap();
     assert!(!reservation.intent_digest.is_empty());
     assert_eq!(outcome.observation(), &FailureObservation::Unknown);
     let DispatchOutcome::Completed(result) = outcome.into_legacy() else {
@@ -548,7 +542,6 @@ async fn legacy_dispatch_wrapper_calls_adapter_once_and_retains_prose_and_observ
             &request.route,
             ledger.clone(),
         );
-        let mut writer = LedgerWriter::open(&ledger, "legacy-wrapper".into(), "0.2.0").unwrap();
         let mut observed = Vec::new();
         let (outcome, _) = engine
             .dispatch_async(
@@ -557,13 +550,12 @@ async fn legacy_dispatch_wrapper_calls_adapter_once_and_retains_prose_and_observ
                 &request.decision_id.0,
                 &request,
                 None,
-                &mut writer,
+                &ledger,
                 &CancelToken::new(),
                 Some(&mut |event| observed.push(event.clone())),
             )
             .await
             .unwrap();
-        writer.close().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         match outcome {
             DispatchOutcome::Completed(result) => {

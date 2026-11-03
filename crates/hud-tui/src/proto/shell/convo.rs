@@ -1415,6 +1415,32 @@ fn transcript_rows_reading(
             );
         }
     }
+    // Cancelled turns get their own guidance: what to do next after the
+    // single-word "cancelled" report, reachable at the 40x11 minimum by
+    // scrolling (this is a transcript section, never a fixed footer row).
+    if s.ordinary_cancelled() && inp.focused && inp.composer.is_empty() && !s.is_busy() {
+        let mut spans = Vec::new();
+        let produced = note_rows_origin(
+            colors,
+            &TranscriptLine {
+                kind: LineKind::System,
+                text: "turn cancelled · retype the prompt to retry, or /clear for a fresh session"
+                    .into(),
+                wrap: true,
+                ..Default::default()
+            },
+            w,
+            Some(&mut spans),
+        );
+        append_rows(
+            &mut rows,
+            &mut origins,
+            produced,
+            owner(3),
+            ReadPart::Section,
+            &spans,
+        );
+    }
     let mut acknowledgement_rows = 0;
     if let Some(source) = &s.cleared_from {
         let mut spans = Vec::new();

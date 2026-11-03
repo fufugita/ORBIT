@@ -1263,9 +1263,15 @@ fn gate2_one_loop_same_event_stream() {
                 continue;
             }
             // DisplayStream flushes its scanned line at response completion;
-            // accounting can therefore precede the displayed text. Defer only
-            // across these accounting events, never tools, rounds or statuses.
-            if pending_text && !matches!(kind, "ledger_appended" | "cost_updated" | "usage") {
+            // accounting (and the per-round pricing notice that rides with it)
+            // can therefore precede the displayed text. Defer only across the
+            // accounting cluster, never tools or rounds.
+            if pending_text
+                && !matches!(
+                    kind,
+                    "ledger_appended" | "cost_updated" | "usage" | "status"
+                )
+            {
                 normalized.push("text_delta");
                 pending_text = false;
             }
@@ -1466,10 +1472,14 @@ fn gate2_one_loop_same_event_stream() {
     // Extract the web front-end's turn happenings as protocol names.
     // Web-only service events (identity/resumed/models/…) are outside
     // the turn stream and ignored; the comparison is the SESSION's
-    // protocol stream.
+    // protocol stream. Events after turn_ended are the post-turn
+    // accounting notice, which headless prints to stderr instead of
+    // stream-json — same content, different channel — so the turn
+    // stream ends at turn_ended on both sides.
     let seq_b = normalize_text_chunks(
         frames
             .iter()
+            .take_while(|(k, _)| k.as_str() != "request_finished")
             .filter(|(k, _)| {
                 matches!(
                     k.as_str(),

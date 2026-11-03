@@ -193,10 +193,27 @@ fn frame(value: Value) -> String {
 }
 fn openai_text(text: &str, reason: Option<&str>, sentinel: bool) -> String {
     let mut body = frame(json!({"choices":[{"delta":{"content":text},"finish_reason":reason}]}));
+    // Real OpenAI streams send a final usage chunk (include_usage); a
+    // terminal round without usage is uncertain accounting.
     if sentinel {
         body.push_str("data: [DONE]\n\n");
     }
     body
+}
+/// A body whose terminal frame carries the usage chunk a real [OI] stream
+/// sends (include_usage). A terminal round without usage is uncertain
+/// accounting and the turn refuses to continue.
+fn with_final_usage(body: String) -> String {
+    // The usage chunk precedes the completion sentinel (a real [OI] stream
+    // sends it as the last data frame).
+    const SENTINEL: &str = "data: [DONE]\n\n";
+    let usage = frame(
+        json!({"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}),
+    );
+    match body.strip_suffix(SENTINEL) {
+        Some(head) => format!("{head}{usage}{SENTINEL}"),
+        None => format!("{body}{usage}"),
+    }
 }
 fn call(index: usize, id: &str, name: &str, arguments: &str) -> Value {
     json!({"index":index,"id":id,"type":"function","function":{"name":name,"arguments":arguments}})
@@ -493,12 +510,16 @@ fn terminal_policy_openai_positive_markers_and_tool_pairing() {
         (Some("tool_calls"), true),
     ] {
         let provider = Provider::new(vec![
-            Reply::complete(openai_calls(
+            Reply::complete(with_final_usage(openai_calls(
                 vec![call(0, "effect-1", "Effect", "{}")],
                 reason,
                 sentinel,
-            )),
-            Reply::complete(openai_text("complete", Some("stop"), true)),
+            ))),
+            Reply::complete(with_final_usage(openai_text(
+                "complete",
+                Some("stop"),
+                true,
+            ))),
         ]);
         let home = Home::new();
         let mut executor = Executor::default();
@@ -626,13 +647,15 @@ fn terminal_policy_ollama_truncation_rejects_complete_json() {
 
 #[test]
 fn ollama_tool_round_preserves_same_name_result_association() {
+    // Real ollama final frames carry usage; a terminal round without it is
+    // uncertain accounting and the turn refuses to continue.
     let first = format!(
         "{}\n",
-        json!({"message":{"role":"assistant","content":"","tool_calls":[{"function":{"index":2,"name":"Effect","arguments":{"value":1}}},{"function":{"index":7,"name":"Effect","arguments":{"value":2}}}]},"done":true,"done_reason":"stop"})
+        json!({"message":{"role":"assistant","content":"","tool_calls":[{"function":{"index":2,"name":"Effect","arguments":{"value":1}}},{"function":{"index":7,"name":"Effect","arguments":{"value":2}}}]},"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":4})
     );
     let last = format!(
         "{}\n",
-        json!({"message":{"role":"assistant","content":"complete"},"done":true,"done_reason":"stop"})
+        json!({"message":{"role":"assistant","content":"complete"},"done":true,"done_reason":"stop","prompt_eval_count":14,"eval_count":7})
     );
     let provider = Provider::new(vec![Reply::complete(first), Reply::complete(last)]);
     let home = Home::new();

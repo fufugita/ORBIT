@@ -29,6 +29,7 @@ use orbit_egress::{BrokerVerdict, EgressAllowlist, EgressBroker, EgressTuple, Sp
 use orbit_ledger::event::{EgressDestination, EgressIntent, LedgerEvent};
 use orbit_ledger::{LedgerError, LedgerWriter, SessionId};
 use orbit_provider_http::adapter_trait::FailureObservation;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Durable dispatch state (DR-09 §6). This is what survives a crash.
@@ -205,7 +206,7 @@ impl DispatchEngine {
         decision_id: &str,
         request: &ProviderRequest,
         credential: Option<&SecretBytes>,
-        writer: &mut LedgerWriter,
+        ledger_dir: &Path,
     ) -> Result<(DispatchOutcome, EgressReservation), DispatchError> {
         // P0-3: replay guard — if this decision_id was already dispatched
         // (its EgressIntent is in the durable chain), refuse with E0701.
@@ -277,10 +278,11 @@ impl DispatchEngine {
         }
 
         // The no-network-before-fsync boundary (GW-04): append + fsync the
-        // EgressIntent to the injected long-lived writer BEFORE any adapter
-        // invocation (P0-5 fix — no competing writer lock).
+        // EgressIntent to a short-lived writer BEFORE any adapter invocation
+        // (P0-5: one writer per append — no competing flock, no round-long
+        // hold).
         let reservation =
-            match self.fsync_egress_intent(writer, session_id, decision_id, &tuple, &verdict) {
+            match self.fsync_egress_intent(ledger_dir, session_id, decision_id, &tuple, &verdict) {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok((
@@ -325,7 +327,7 @@ impl DispatchEngine {
     /// `observer` is optional and called per event as the stream drains (for
     /// live streaming in the interactive CLI); `None` is byte-identical to
     /// the previous buffered behavior.
-    #[allow(clippy::too_many_arguments)] // engine API: model/session/decision/request/cred/writer/cancel/observer
+    #[allow(clippy::too_many_arguments)] // engine API: model/session/decision/request/cred/ledger_dir/cancel/observer
     pub async fn dispatch_async<'o>(
         &self,
         model: &str,
@@ -333,7 +335,7 @@ impl DispatchEngine {
         decision_id: &str,
         request: &ProviderRequest,
         credential: Option<&SecretBytes>,
-        writer: &mut LedgerWriter,
+        ledger_dir: &Path,
         cancel: &orbit_provider_http::CancelToken,
         observer: orbit_provider_http::stream::StreamObserver<'o>,
     ) -> Result<(DispatchOutcome, EgressReservation), DispatchError> {
@@ -343,7 +345,7 @@ impl DispatchEngine {
             decision_id,
             request,
             credential,
-            writer,
+            ledger_dir,
             cancel,
             observer,
         )
@@ -361,7 +363,7 @@ impl DispatchEngine {
         decision_id: &str,
         request: &ProviderRequest,
         credential: Option<&SecretBytes>,
-        writer: &mut LedgerWriter,
+        ledger_dir: &Path,
         cancel: &orbit_provider_http::CancelToken,
         observer: orbit_provider_http::stream::StreamObserver<'o>,
     ) -> Result<(DetailedDispatchOutcome, EgressReservation), DispatchError> {
@@ -439,7 +441,7 @@ impl DispatchEngine {
 
         // GW-04: fsync the EgressIntent before any adapter invocation.
         let reservation =
-            match self.fsync_egress_intent(writer, session_id, decision_id, &tuple, &verdict) {
+            match self.fsync_egress_intent(ledger_dir, session_id, decision_id, &tuple, &verdict) {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok((
@@ -538,10 +540,13 @@ impl DispatchEngine {
 
     /// Append + fsync the EgressIntent to the ledger. This is the point where
     /// a fault (disk full, fsync failure) must BLOCK dispatch (GW-04).
-    /// P0-5 fix: uses the injected long-lived writer — no competing flock.
+    /// The write window is one short-lived writer: open under contention
+    /// retry, append + fsync, close. Holding the lock across the provider
+    /// round instead serialized concurrent sessions behind a whole-round
+    /// flock and failed their boot with E0719.
     fn fsync_egress_intent(
         &self,
-        writer: &mut LedgerWriter,
+        ledger_dir: &Path,
         session_id: &str,
         decision_id: &str,
         tuple: &EgressTuple,
@@ -566,8 +571,10 @@ impl DispatchEngine {
             capability_card_proofs: None,
         };
         // EgressIntent requires fsync-before-ACK by the ledger's own policy.
-        let intent_digest = writer.append(LedgerEvent::EgressIntent(intent))?;
-        // Caller is responsible for the writer's lifecycle (close → fsync).
+        let mut short_lived =
+            LedgerWriter::open_with_retry(ledger_dir, "orbit-egress".into(), "0.1.0")?;
+        let intent_digest = short_lived.append(LedgerEvent::EgressIntent(intent))?;
+        short_lived.close()?;
         Ok(EgressReservation {
             decision_id: decision_id.into(),
             session_id: session_id.into(),
@@ -716,7 +723,10 @@ pub fn new_request_id() -> RequestId {
 
 /// Build a dispatch-friendly temp dir helper (used by gateway tests).
 pub fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("orbit-gw-{tag}-{}", std::process::id()));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("orbit-gw-{tag}-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }

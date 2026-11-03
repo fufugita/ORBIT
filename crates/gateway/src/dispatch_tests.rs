@@ -6,7 +6,7 @@
 //! - P0-1: the egress gate uses an EXTERNAL allowlist; an unadmitted
 //!   destination is refused E0307.
 //! - P0-3: a re-dispatched decision_id is refused E0701.
-//! - P0-5: dispatch uses an injected writer (no competing flock).
+//! - P0-5: dispatch opens one short-lived, contention-retried writer per egress-intent append (no competing flock, no round-long hold).
 
 use crate::dispatch::{DispatchEngine, DispatchOutcome, DispatchState};
 use crate::registry::ProviderRegistry;
@@ -18,7 +18,6 @@ use orbit_adapter::conformance::canonical_request;
 use orbit_adapter::credential::SecretBytes;
 use orbit_adapter::types::{AdapterKind, ProviderRouteBinding, Sha256Digest};
 use orbit_egress::{EgressAllowlist, EgressTuple, SpkiPin};
-use orbit_ledger::LedgerWriter;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -108,7 +107,7 @@ fn usage_events(
 }
 
 // Exercise registry admission, durable egress, the real collector and completion.
-// The writer is closed and its private directory removed before assertions return.
+// The private directory is removed before assertions return.
 async fn dispatch_usage_fixture(
     adapter: Arc<dyn AsyncProviderAdapter>,
     binding: ProviderRouteBinding,
@@ -139,7 +138,6 @@ async fn dispatch_usage_fixture(
         vec![tuple.clone()],
         vec![],
     );
-    let mut writer = LedgerWriter::open(&dir, "usage-writer".into(), "0.1.0").unwrap();
     let session = new_session_id();
     let decision = new_decision_id();
     let mut request = canonical_request(&binding, b"hello");
@@ -156,7 +154,7 @@ async fn dispatch_usage_fixture(
             &decision.0,
             &request,
             None,
-            &mut writer,
+            &dir,
             &cancel,
             Some(&mut |event| observed.push(event.clone())),
         ),
@@ -164,7 +162,6 @@ async fn dispatch_usage_fixture(
     .await
     .expect("bounded gateway fixture")
     .unwrap();
-    writer.close().unwrap();
     let state = engine.recovery_state(&session, &decision.0).unwrap();
     let (records, _) = orbit_ledger::verify_ledger(&dir).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
@@ -687,7 +684,6 @@ fn dispatch_endpoint_request(
         vec![tuple],
         vec![spki_pin()],
     );
-    let mut writer = LedgerWriter::open(&dir, "path-writer".into(), "0.1.0").unwrap();
     let mut request = canonical_request(&binding, b"hello");
     alter(&mut request.route);
     let secret = SecretBytes::new(b"synthetic-path-bound-key".to_vec());
@@ -700,7 +696,7 @@ fn dispatch_endpoint_request(
             &decision.0,
             &request,
             Some(&secret),
-            &mut writer,
+            &dir,
         )
         .map(|(outcome, _)| outcome);
     if result.is_err() {
@@ -709,7 +705,6 @@ fn dispatch_endpoint_request(
             DispatchState::Reserved
         ));
     }
-    writer.close().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     (result, probe.load(std::sync::atomic::Ordering::SeqCst))
 }
@@ -797,7 +792,6 @@ async fn gateway_endpoint_path_async_request_cannot_change_the_admitted_route() 
             vec![bound_tuple()],
             vec![spki_pin()],
         );
-        let mut writer = LedgerWriter::open(&dir, "route-writer".into(), "0.1.0").unwrap();
         let secret = SecretBytes::new(b"synthetic-path-bound-key".to_vec());
         let session = new_session_id();
         let decision = new_decision_id();
@@ -809,7 +803,7 @@ async fn gateway_endpoint_path_async_request_cannot_change_the_admitted_route() 
                 &decision.0,
                 &request,
                 Some(&secret),
-                &mut writer,
+                &dir,
                 &CancelToken::new(),
                 Some(&mut |event| observed.push(event.clone())),
             )
@@ -821,14 +815,13 @@ async fn gateway_endpoint_path_async_request_cannot_change_the_admitted_route() 
             engine.recovery_state(&session, &decision.0).unwrap(),
             DispatchState::Reserved
         ));
-        writer.close().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
 /// Build an engine whose egress allowlist CONTAINS the bound tuple (admitted)
-/// plus a writer already open on the ledger dir (P0-5: injected, not competing).
-fn engine(tag: &str) -> (DispatchEngine, PathBuf, LedgerWriter) {
+/// The ledger dir is passed to dispatch; it opens its own short-lived writer per append.
+fn engine(tag: &str) -> (DispatchEngine, PathBuf) {
     let dir = crate::tmpdir(tag);
     let mut registry = ProviderRegistry::new();
     let adapter = DeterministicTestV1::new(
@@ -850,13 +843,12 @@ fn engine(tag: &str) -> (DispatchEngine, PathBuf, LedgerWriter) {
         vec![bound_tuple()],
         vec![spki_pin()],
     );
-    let writer = LedgerWriter::open(&dir, "test-writer".into(), "0.1.0").unwrap();
-    (engine, dir, writer)
+    (engine, dir)
 }
 
 /// Build an engine whose egress allowlist does NOT contain the bound tuple —
 /// dispatch of the bound model must be refused E0307 (P0-1).
-fn engine_unadmitted(tag: &str) -> (DispatchEngine, PathBuf, LedgerWriter) {
+fn engine_unadmitted(tag: &str) -> (DispatchEngine, PathBuf) {
     let dir = crate::tmpdir(tag);
     let mut registry = ProviderRegistry::new();
     let adapter = DeterministicTestV1::new(
@@ -873,13 +865,12 @@ fn engine_unadmitted(tag: &str) -> (DispatchEngine, PathBuf, LedgerWriter) {
     // Allowlist contains a DIFFERENT tuple — the bound destination is NOT admitted.
     let allowlist = EgressAllowlist::new(vec![]);
     let engine = DispatchEngine::new(registry, dir.clone(), allowlist, vec![], vec![]);
-    let writer = LedgerWriter::open(&dir, "test-writer".into(), "0.1.0").unwrap();
-    (engine, dir, writer)
+    (engine, dir)
 }
 
 #[test]
 fn gateway_four_gate_admission_order_via_engine() {
-    let (engine, dir, _writer) = engine("order");
+    let (engine, dir) = engine("order");
     // Unknown model → Trust gate denied.
     match engine.resolve("unknown", "s", "d") {
         Err(e) => assert_eq!(e.code, "E0404", "unknown model fails Trust gate"),
@@ -895,20 +886,13 @@ fn gateway_four_gate_admission_order_via_engine() {
 
 #[test]
 fn gateway_dispatch_completes_and_writes_egress_intent() {
-    let (engine, dir, mut writer) = engine("complete");
+    let (engine, dir) = engine("complete");
     let session = new_session_id();
     let decision = new_decision_id();
     let route = test_binding();
     let request = canonical_request(&route, b"hello");
     let (outcome, reservation) = engine
-        .dispatch(
-            "test-model",
-            &session,
-            &decision.0,
-            &request,
-            None,
-            &mut writer,
-        )
+        .dispatch("test-model", &session, &decision.0, &request, None, &dir)
         .unwrap();
 
     assert_eq!(reservation.decision_id, decision.0);
@@ -923,8 +907,6 @@ fn gateway_dispatch_completes_and_writes_egress_intent() {
         other => panic!("expected Completed, got {other:?}"),
     }
 
-    // The egress intent must be durable in the ledger (GW-04).
-    writer.close().unwrap();
     let state = engine.recovery_state(&session, &decision.0).unwrap();
     assert!(
         matches!(state, DispatchState::EgressIntentDurable),
@@ -961,7 +943,6 @@ fn gateway_credential_reaches_only_the_admitted_adapter() {
         vec![bound_tuple()],
         vec![spki_pin()],
     );
-    let mut writer = LedgerWriter::open(&dir, "test-writer".into(), "0.1.0").unwrap();
 
     let session = new_session_id();
     let decision = new_decision_id();
@@ -974,7 +955,7 @@ fn gateway_credential_reaches_only_the_admitted_adapter() {
             &decision.0,
             &request,
             Some(&secret),
-            &mut writer,
+            &dir,
         )
         .unwrap();
     assert!(
@@ -991,7 +972,7 @@ fn gateway_credential_reaches_only_the_admitted_adapter() {
 
 #[test]
 fn gateway_recovery_returns_reserved_when_no_intent() {
-    let (engine, dir, _writer) = engine("reserved");
+    let (engine, dir) = engine("reserved");
     let session = new_session_id();
     let decision = new_decision_id();
     // No dispatch happened — recovery must report Reserved.
@@ -1004,19 +985,12 @@ fn gateway_recovery_returns_reserved_when_no_intent() {
 fn gateway_egress_allowlist_refuses_unadmitted_destination() {
     // P0-1: the egress gate uses an EXTERNAL allowlist; a destination not in
     // it is refused E0307 even though the model is allowlisted + has a route.
-    let (engine, dir, mut writer) = engine_unadmitted("unadmitted");
+    let (engine, dir) = engine_unadmitted("unadmitted");
     let session = new_session_id();
     let decision = new_decision_id();
     let route = test_binding();
     let request = canonical_request(&route, b"hello");
-    let r = engine.dispatch(
-        "test-model",
-        &session,
-        &decision.0,
-        &request,
-        None,
-        &mut writer,
-    );
+    let r = engine.dispatch("test-model", &session, &decision.0, &request, None, &dir);
     match r {
         Err(e) => {
             assert_eq!(e.code, "E0307", "unadmitted destination must fail egress");
@@ -1030,7 +1004,7 @@ fn gateway_egress_allowlist_refuses_unadmitted_destination() {
 #[test]
 fn gateway_replayed_decision_id_refused_e0701() {
     // P0-3: a decision_id already dispatched is refused on the second attempt.
-    let (engine, dir, mut writer) = engine("replay");
+    let (engine, dir) = engine("replay");
     let session = new_session_id();
     let decision = new_decision_id();
     let route = test_binding();
@@ -1038,26 +1012,12 @@ fn gateway_replayed_decision_id_refused_e0701() {
 
     // First dispatch: completed.
     let (outcome, _) = engine
-        .dispatch(
-            "test-model",
-            &session,
-            &decision.0,
-            &request,
-            None,
-            &mut writer,
-        )
+        .dispatch("test-model", &session, &decision.0, &request, None, &dir)
         .unwrap();
     assert!(matches!(outcome, DispatchOutcome::Completed(_)));
 
     // Replay of the same decision_id → E0701.
-    let r2 = engine.dispatch(
-        "test-model",
-        &session,
-        &decision.0,
-        &request,
-        None,
-        &mut writer,
-    );
+    let r2 = engine.dispatch("test-model", &session, &decision.0, &request, None, &dir);
     match r2 {
         Err(e) => {
             assert_eq!(e.code, "E0701", "replayed decision must fail E0701");
@@ -1110,7 +1070,6 @@ async fn gateway_async_dispatch_streams_from_mock_provider() {
     };
     let allowlist = EgressAllowlist::new(vec![mock_tuple.clone()]);
     let engine = DispatchEngine::new(registry, dir.clone(), allowlist, vec![mock_tuple], vec![]);
-    let mut writer = LedgerWriter::open(&dir, "test-writer".into(), "0.1.0").unwrap();
 
     let session = new_session_id();
     let decision = new_decision_id();
@@ -1123,7 +1082,7 @@ async fn gateway_async_dispatch_streams_from_mock_provider() {
             &decision.0,
             &request,
             None,
-            &mut writer,
+            &dir,
             &cancel,
             None,
         )
@@ -1200,7 +1159,6 @@ fn endpoint_query_sync_fixture(
         vec![bound_tuple()],
         vec![spki_pin()],
     );
-    let mut writer = LedgerWriter::open(&dir, "query-writer".into(), "0.1.0").unwrap();
     let session = new_session_id();
     let decision = new_decision_id();
     let secret = SecretBytes::new(b"synthetic-query-bound-key".to_vec());
@@ -1211,7 +1169,7 @@ fn endpoint_query_sync_fixture(
             &decision.0,
             &request,
             Some(&secret),
-            &mut writer,
+            &dir,
         )
         .map(|(outcome, _)| outcome);
     if result.is_err() {
@@ -1220,8 +1178,9 @@ fn endpoint_query_sync_fixture(
             DispatchState::Reserved
         );
     }
-    writer.close().unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
+    // Capability refusals happen before any ledger write; the dir may never
+    // have been created. Best-effort cleanup.
+    let _ = std::fs::remove_dir_all(&dir);
     (result, probe.load(Ordering::SeqCst))
 }
 
@@ -1286,7 +1245,6 @@ async fn endpoint_query_async_fixture(
         vec![bound_tuple()],
         vec![spki_pin()],
     );
-    let mut writer = LedgerWriter::open(&dir, "query-writer".into(), "0.1.0").unwrap();
     let session = new_session_id();
     let decision = new_decision_id();
     let secret = SecretBytes::new(b"synthetic-query-bound-key".to_vec());
@@ -1299,7 +1257,7 @@ async fn endpoint_query_async_fixture(
             &decision.0,
             &request,
             Some(&secret),
-            &mut writer,
+            &dir,
             &CancelToken::new(),
             Some(&mut |event| observed.push(event.clone())),
         ),
@@ -1314,8 +1272,9 @@ async fn endpoint_query_async_fixture(
         );
         assert!(observed.is_empty());
     }
-    writer.close().unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
+    // Capability refusals happen before any ledger write; the dir may never
+    // have been created. Best-effort cleanup.
+    let _ = std::fs::remove_dir_all(&dir);
     (
         result,
         probe.load(Ordering::SeqCst),
@@ -1948,4 +1907,66 @@ async fn gateway_usage_accounting_final_zero_after_positive_snapshot_is_refused(
         outcome,
         DispatchOutcome::AdapterRefused { code: "E0416", .. }
     ));
+}
+
+#[test]
+fn gateway_concurrent_sessions_share_the_ledger_without_starving() {
+    // E0719 fix: the egress-intent append opens one short-lived,
+    // contention-retried writer per append. Two sessions dispatching into
+    // the SAME ledger dir concurrently must both record their intent —
+    // a round-long writer hold would starve the second boot instead.
+    let dir = crate::tmpdir("concurrent-sessions");
+    let mut registry = ProviderRegistry::new();
+    let adapter = DeterministicTestV1::new(
+        identity(
+            AdapterKind::DeterministicTestV1,
+            &"i".repeat(64),
+            &"p".repeat(64),
+        ),
+        text_capabilities(),
+        canonical_success_result(),
+    );
+    registry.register_model(crate::ModelRef("test-model".into()), test_binding());
+    registry.register_adapter(AdapterKind::DeterministicTestV1, Arc::new(adapter));
+    let engine = Arc::new(DispatchEngine::new(
+        registry,
+        dir.clone(),
+        EgressAllowlist::new(vec![bound_tuple()]),
+        vec![bound_tuple()],
+        vec![spki_pin()],
+    ));
+    let route = test_binding();
+
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let engine = engine.clone();
+            let dir = dir.clone();
+            let route = route.clone();
+            std::thread::spawn(move || {
+                let session = new_session_id();
+                let decision = new_decision_id();
+                let request = canonical_request(&route, format!("hello-{i}").as_bytes());
+                let (outcome, reservation) = engine
+                    .dispatch("test-model", &session, &decision.0, &request, None, &dir)
+                    .expect("concurrent dispatch must complete");
+                assert!(matches!(outcome, DispatchOutcome::Completed(_)));
+                assert!(!reservation.intent_digest.is_empty());
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("dispatch thread must not panic");
+    }
+
+    // Every session's intent landed in the chain.
+    let (records, _) = orbit_ledger::verify_ledger(&dir).unwrap();
+    let intents: Vec<_> = records
+        .iter()
+        .filter_map(|record| match &record.record.event {
+            orbit_ledger::event::LedgerEvent::EgressIntent(intent) => Some(intent),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(intents.len(), 4, "each session must record its intent");
+    let _ = std::fs::remove_dir_all(&dir);
 }

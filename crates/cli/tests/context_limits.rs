@@ -145,13 +145,11 @@ fn absent_context_limits_preserves_existing_model_serialization() {
         json!({
             "id": RAW_MODEL,
             "label": "Fixture A",
+            // Absent optional pricing axes stay absent in serialization
+            // (skip_serializing_if): an undeclared axis must not be invented.
             "pricing": {
                 "input_per_million_microdollars": 123,
-                "output_per_million_microdollars": 456,
-                "cache_read_per_million_microdollars": null,
-                "cache_write_per_million_microdollars": null,
-                "reasoning_per_million_microdollars": null,
-                "request_flat_microdollars": 0
+                "output_per_million_microdollars": 456
             },
             "max_output_tokens": 2048,
             "context_window": 8192,

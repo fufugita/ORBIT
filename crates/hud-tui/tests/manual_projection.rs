@@ -513,8 +513,11 @@ fn ordinary_lifecycle_end_keeps_admission_busy_until_its_exact_whole_view() {
         assert!(s.take_view_dirty());
         // These are the public lifecycle reductions used by ResponseFinished
         // and BackendError; neither is the checked whole-session terminal.
+        // They still leave the view dirty (round_started does, unconditionally),
+        // but the rejected Refresh projection must add nothing.
         s.apply("round_started", 91);
         s.apply(lifecycle, 92);
+        assert!(s.take_view_dirty());
         assert!(!s.turn_live);
         assert!(s.is_busy());
         assert!(s.ordinary_pending());

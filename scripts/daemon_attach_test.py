@@ -132,23 +132,55 @@ def main():
             wait_for(lambda: len(calls()) == 2, "blocked request")
             cli("attach", "--socket", str(socket), "--cancel")
             cancelled = wait_for(lambda: (s if (s := status())["state"] in ["idle", "interrupted"] else None), "cancel completion", seconds=3)
-            interrupted_ids = [key for key, record in cancelled["requests"].items() if record["state"] == "interrupted"]
+            # A cancelled in-flight request settles conservative: billing is
+            # uncertain (no receipt ever arrived), so the record is unknown
+            # with a terminal snapshot state — never silently replayed. This
+            # matches owned-session p35_daemon cancel expectations.
+            unknown_ids = [key for key, record in cancelled["requests"].items() if record["state"] == "unknown"]
             checked("cancel_is_bounded_and_never_replays", len(calls()) == 2,
-                    calls()[-1].get("reasoning_effort") == "high", len(interrupted_ids) == 1)
+                    calls()[-1].get("reasoning_effort") == "high", len(unknown_ids) == 1,
+                    cancelled["state"] in ["idle", "interrupted"])
             cli("attach", "--socket", str(socket), "--stop")
             assert owner.wait(timeout=8) == 0
             wait_for(lambda: not socket.exists(), "socket cleanup")
             (fixture / "release").touch()
             (fixture / "mode.json").write_text("{}")
-            owner = start_owner(resume=True)
-            snapshot = status()
-            checked("restart_restores_settings_without_resubmission", snapshot["session_id"] == "owned-cli",
-                    snapshot["resolved_effort"] == "high", len(calls()) == 2,
-                    snapshot["model"] == "fixture/model-a", snapshot["provider"] == "fixture",
-                    snapshot["requests"][interrupted_ids[0]]["state"] == "interrupted")
-            owner.send_signal(signal.SIGTERM)
-            checked("foreground_signal_cleans_up_with_signal_exit", owner.wait(timeout=8) == 128 + signal.SIGTERM,
-                    not socket.exists(), len(calls()) == 2)
+            # The cancelled request settled conservatively: its accounting is
+            # uncertain, so admission of a new owner is refused until the
+            # uncertainty is inspected read-only (orbit recovery status).
+            # This matches owned-session p35_daemon restart-refusal tests.
+            resumed = subprocess.Popen(
+                [binary, "--permission-mode", "dontAsk", "serve", "--home", str(home),
+                 "--socket", str(socket), "--resume", "owned-cli"],
+                cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            processes.append(resumed)
+            wait_for(lambda: resumed.poll() is not None, "resume refusal exit")
+            checked("restart_admission_refused_after_uncertainty", resumed.returncode != 0,
+                    len(calls()) == 2)
+            inspect = cli("recovery", "status", "--session", "owned-cli", "--json")
+            inspected = json.loads(inspect.stdout)
+            checked("restart_refused_and_inspection_reads_uncertainty",
+                    len(calls()) == 2,
+                    inspected["status"] == "available",
+                    inspected["owner_session_id"] == "owned-cli",
+                    inspected["totals"]["knownness"] == "uncertain",
+                    inspected["pending"]["uncertain"] is True,
+                    unknown_ids[0] in inspected["pending"]["receipt"]["request_id"])
+            # Signal cleanup needs a live owner: run one on a fresh session.
+            signal_socket = home / "run/signal.sock"
+            signal_owner = subprocess.Popen(
+                [binary, "--permission-mode", "dontAsk", "serve", "--home", str(home),
+                 "--socket", str(signal_socket), "--session", "owned-signal",
+                 "--model", "fixture/fixture/model-a"],
+                cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            processes.append(signal_owner)
+            wait_for(lambda: signal_socket.exists() or signal_owner.poll() is not None, "signal socket")
+            assert signal_owner.poll() is None
+            signal_owner.send_signal(signal.SIGTERM)
+            checked("foreground_signal_cleans_up_with_signal_exit", signal_owner.wait(timeout=8) == 128 + signal.SIGTERM,
+                    not signal_socket.exists(), len(calls()) == 2)
             owner_log.close()
             print("ORBIT_CHECK_RECEIPT " + json.dumps({"scenarios": scenarios}), flush=True)
     finally:

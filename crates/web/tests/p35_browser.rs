@@ -6,7 +6,8 @@ use axum::{
 };
 use orbit_cli::{
     daemon::{EventCursor, OwnerConfig, OwnerRuntime, TurnState},
-    sessions::{self, SessionLease},
+    session_accounting::{RootOrigin, prepare_root},
+    sessions::{self, SessionFile, SessionLease},
     tool_runtime::PermissionScope,
     tui_worker::TuiTurnConfig,
 };
@@ -82,6 +83,7 @@ impl Fixture {
     fn start(&self) -> OwnerRuntime {
         let lease = SessionLease::acquire(&self.root, "browser-owned", "browser").unwrap();
         let mut config = self.config.clone();
+        let mut fresh = true;
         if self.root.join("sessions/browser-owned.json").exists() {
             let saved = lease.load().unwrap();
             config.turn.model = saved.model;
@@ -90,6 +92,28 @@ impl Fixture {
             config.turn.effort = saved.effort;
             config.turn.initial_transcript = saved.transcript;
             config.turn.initial_turns = saved.turns;
+            fresh = false;
+        }
+        // Mirror the real web boot (web/src/main.rs): a fresh session
+        // anchors its namespace as a fresh candidate before the owner
+        // runtime's conservative standalone default runs.
+        if fresh {
+            // The owner's own workspace is the authority (the fixture never
+            // changes directory), so the fresh candidate binds the same one.
+            let workspace = config.working_dir.clone();
+            let mut seed = SessionFile::from_chat(
+                "browser-owned",
+                &config.turn.model,
+                &config.turn.gate,
+                &config.turn.provider_id,
+                &config.turn.initial_transcript,
+                0,
+                0,
+                0,
+                0,
+            );
+            seed.bind_workspace(&workspace).unwrap();
+            prepare_root(&lease, &mut seed, RootOrigin::FreshCandidate).unwrap();
         }
         OwnerRuntime::start(config, lease).unwrap()
     }
@@ -109,7 +133,10 @@ impl Fixture {
     fn price_default_model_for_test(&self) {
         let path = self.root.join("providers.toml");
         let current = fs::read_to_string(&path).unwrap();
-        let marker = "id=\"vendor/model-a\"\n";
+        // The billing table header must come AFTER the model's effort
+        // keys: a TOML table header swallows every following key into the
+        // billing schema, and `supported_efforts` is not a billing field.
+        let marker = "default_effort=\"low\"\n";
         assert!(current.contains(marker));
         let replacement = format!(
             "{marker}[provider.models.billing]\nversion=2\ninput_per_million_microdollars=0\noutput_per_million_microdollars=0\nrequest_flat_microdollars=17\nreasoning_counter_basis=\"included_in_output\"\nreasoning_rate_policy=\"output_rate\"\n"
@@ -711,9 +738,13 @@ mod context_browser_tests {
                 .unwrap()
                 .accounting_checkpoint()
                 .unwrap();
+        // A fresh standalone owner with no saved session has no restored
+        // history: the namespace starts known-zero (FreshCandidate), not
+        // legacy-unknown. The budget refusal below comes from the
+        // unpriced spend policy, not from an unknown baseline.
         assert_eq!(
             initial_checkpoint.baseline,
-            orbit_engine::AccountingBaseline::UnknownLegacy
+            orbit_engine::AccountingBaseline::FreshKnownZero
         );
         assert_eq!(initial_checkpoint.owner_session_id, "browser-owned");
         assert!(initial_checkpoint.child_id.is_none());
@@ -721,7 +752,7 @@ mod context_browser_tests {
         assert!(initial_checkpoint.pending.is_none());
         assert_eq!(
             initial_checkpoint.totals,
-            orbit_engine::AccountingDelta::unknown_legacy()
+            orbit_engine::AccountingDelta::known_zero()
         );
         assert_eq!(
             initial_checkpoint.known_priced_subtotals,
@@ -796,7 +827,7 @@ mod context_browser_tests {
         assert_eq!(watermark.revision, checkpoint.revision.0);
         assert_eq!(
             watermark.full_cost_status,
-            orbit_cli::session_accounting::FullCostStatus::UnknownLegacy
+            orbit_cli::session_accounting::FullCostStatus::Known
         );
         let config = orbit_cli::config::ProvidersConfig::load(&f.root).unwrap();
         assert_eq!(config.provider[0].models[0].max_output_tokens, Some(1024));

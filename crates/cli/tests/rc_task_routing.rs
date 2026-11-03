@@ -2125,6 +2125,17 @@ mod child_journal_activation {
                     "cache_read_per_million_microdollars":0,"cache_write_per_million_microdollars":0,
                     "reasoning_per_million_microdollars":0,"request_flat_microdollars":5});
                 model.pricing = serde_json::from_value(value).unwrap();
+                // A priced receipt needs the versioned v2 terms: legacy
+                // pricing rows stay display-only projections.
+                model.billing = serde_json::from_value(json!({
+                    "version":2,
+                    "input_per_million_microdollars":0,
+                    "output_per_million_microdollars":0,
+                    "request_flat_microdollars":5,
+                    "reasoning_counter_basis":"included_in_output",
+                    "reasoning_rate_policy":"output_rate"
+                }))
+                .unwrap();
                 model.context_limits =
                     Some(serde_json::from_value(json!({"input_tokens":64_000})).unwrap());
             }

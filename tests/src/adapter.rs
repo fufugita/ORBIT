@@ -53,7 +53,7 @@ fn test_binding() -> ProviderRouteBinding {
 }
 
 #[allow(dead_code)] // used only in #[test] fns
-fn engine_with_registry(tag: &str) -> (DispatchEngine, std::path::PathBuf, LedgerWriter) {
+fn engine_with_registry(tag: &str) -> (DispatchEngine, std::path::PathBuf) {
     let dir = orbit_gateway::tmpdir(&format!("adapter-e2e-{tag}"));
     let mut registry = ProviderRegistry::new();
     let adapter = DeterministicTestV1::new(
@@ -86,8 +86,7 @@ fn engine_with_registry(tag: &str) -> (DispatchEngine, std::path::PathBuf, Ledge
         spki_sha256: "expected-test-pin".into(),
     };
     let engine = DispatchEngine::new(registry, dir.clone(), allowlist, vec![tuple], vec![pin]);
-    let writer = LedgerWriter::open(&dir, "test-writer".into(), "0.1.0").unwrap();
-    (engine, dir, writer)
+    (engine, dir)
 }
 
 /// GW-04 — the adapter is never invoked before the EgressIntent is fsync'd.
@@ -96,20 +95,13 @@ fn engine_with_registry(tag: &str) -> (DispatchEngine, std::path::PathBuf, Ledge
 /// fsync path must BLOCK the invoke — tested by refusing the ledger.
 #[test]
 fn gateway_dispatch_does_not_invoke_adapter_before_egress_fsync() {
-    let (engine, dir, mut writer) = engine_with_registry("fsync-a");
+    let (engine, dir) = engine_with_registry("fsync-a");
     let session = new_session_id();
     let decision = new_decision_id();
     let route = test_binding();
     let request = canonical_request(&route, b"hello");
     let (outcome, reservation) = engine
-        .dispatch(
-            "test-model",
-            &session,
-            &decision.0,
-            &request,
-            None,
-            &mut writer,
-        )
+        .dispatch("test-model", &session, &decision.0, &request, None, &dir)
         .unwrap();
     // The reservation (egress intent) must be durable — that's what gates
     // the invoke. Adapter completion implies the intent was fsync'd.
@@ -124,7 +116,7 @@ fn gateway_dispatch_does_not_invoke_adapter_before_egress_fsync() {
 /// GW-16 — the credential reaches exactly one adapter and never leaks.
 #[test]
 fn gateway_dispatch_credential_reaches_only_one_adapter() {
-    let (engine, dir, mut writer) = engine_with_registry("fsync-b");
+    let (engine, dir) = engine_with_registry("fsync-b");
     let session = new_session_id();
     let decision = new_decision_id();
     let route = test_binding();
@@ -137,7 +129,7 @@ fn gateway_dispatch_credential_reaches_only_one_adapter() {
             &decision.0,
             &request,
             Some(&secret),
-            &mut writer,
+            &dir,
         )
         .unwrap();
     let result = match outcome {
@@ -156,20 +148,13 @@ fn gateway_dispatch_credential_reaches_only_one_adapter() {
 /// GW-09 — recovery reads the durable dispatch state.
 #[test]
 fn gateway_recovery_reads_durable_dispatch_state() {
-    let (engine, dir, mut writer) = engine_with_registry("fsync-c");
+    let (engine, dir) = engine_with_registry("fsync-c");
     let session = new_session_id();
     let decision = new_decision_id();
     let route = test_binding();
     let request = canonical_request(&route, b"hello");
     engine
-        .dispatch(
-            "test-model",
-            &session,
-            &decision.0,
-            &request,
-            None,
-            &mut writer,
-        )
+        .dispatch("test-model", &session, &decision.0, &request, None, &dir)
         .unwrap();
     let state = engine.recovery_state(&session, &decision.0).unwrap();
     assert_eq!(

@@ -1727,7 +1727,6 @@ fn run_proto_inner(
 }
 
 /// The keyboard (§11). Returns true to quit.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
@@ -8374,6 +8373,10 @@ mod composer_key_tests {
             let frame = k.frame(164, 30);
             assert!(frame.contains("KEYS"), "{frame}");
             assert!(frame.contains("APPROVALS"), "{frame}");
+            assert!(
+                frame.contains("copy view as plain text"),
+                "the help overlay must surface the copy-mode path:\n{frame}"
+            );
 
             k.plain(KeyCode::Esc);
             assert_eq!(k.overlay, None);
@@ -11780,6 +11783,73 @@ mod bound_projection_tests {
                     totals
                 );
                 assert!(!failure_test_frame(&s, 110, 30, 0).contains("empty composer resends it"));
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_publication_keyboard_journey_shows_guidance_and_keeps_history_intact() {
+        use crate::msg::{OrdinaryEnd, OrdinaryPublication};
+        // The full journey: an ordinary turn ends with BlockedOrUncertain
+        // publication (the save may have committed), the worker's diagnostic
+        // arrives as a backend notice, and the operator presses Enter on an
+        // empty composer. The frame must show the worker's exact wording so
+        // the operator knows what happened, the resend must not fire, and the
+        // transcript/report/totals must stay exactly as they were.
+        for end in [OrdinaryEnd::Completed, OrdinaryEnd::Cancelled] {
+            let (mut s, operation, registration) =
+                active_ordinary_operation(WorkerCommand::Prompt("journey".into()));
+            finish_owned_view(
+                &mut s,
+                operation,
+                registration,
+                end.clone(),
+                OrdinaryPublication::BlockedOrUncertain,
+            );
+            let worker_diagnostic = "current prompt save may have committed; inspect the session before retrying: \
+                 leased session storage could not be verified";
+            apply_msg(
+                crate::msg::Msg::BackendNotice(worker_diagnostic.into()),
+                &mut s,
+                5,
+            );
+            let history = s.transcript.clone();
+            let report = s.turn_report.clone();
+            let totals = (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents);
+            // The guidance is visible in the drawn frame before the keypress.
+            let frame = failure_test_frame(&s, 110, 30, 0);
+            assert!(
+                frame.contains("may have committed; inspect the session"),
+                "blocked publication must show the worker's diagnostic:\n{frame}"
+            );
+            // Enter on an empty composer is a no-op: no resend, no mutation.
+            let (sink, receiver) = std::sync::mpsc::channel();
+            press_empty_enter(&mut s, &sink);
+            assert!(receiver.try_recv().is_err());
+            assert!(!s.can_resend_ordinary());
+            assert_eq!(s.transcript, history);
+            assert_eq!(s.turn_report, report);
+            assert_eq!(
+                (s.turns, s.input_tokens, s.output_tokens, s.cost_microcents),
+                totals
+            );
+            // The notice is not a failure card: no resend hint may appear.
+            assert!(
+                !frame.contains("empty composer resends it"),
+                "a blocked publication is not a resendable failure:\n{frame}"
+            );
+            if end == OrdinaryEnd::Cancelled {
+                // The cancel guidance is a transcript section (scrollable), so
+                // it must also survive the 40x11 minimum geometry by scrolling,
+                // never crowd the fixed footer.
+                let mut small = String::new();
+                for offset in 0..24 {
+                    small.push_str(&failure_test_frame(&s, 40, 11, offset));
+                }
+                assert!(
+                    small.contains("the prompt to retry"),
+                    "the 40x11 minimum frame must surface the cancel guidance while scrolling:\n{small}"
+                );
             }
         }
     }

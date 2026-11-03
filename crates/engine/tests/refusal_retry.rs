@@ -1075,8 +1075,96 @@ fn assert_wire(wire: &Wire, count: usize) {
     }
 }
 
+fn dispatch_isolated(exact: &str) -> bool {
+    let isolated = std::env::var_os("ORBIT_ACTIVATION_ISOLATED");
+    let depth = std::env::var_os("ORBIT_ACTIVATION_RUNNER_DEPTH");
+    if isolated.as_deref() == Some(std::ffi::OsStr::new("1")) {
+        assert_eq!(
+            depth.as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "invalid isolated runner depth"
+        );
+        return true;
+    }
+    assert!(
+        isolated.is_none() && depth.is_none(),
+        "malformed isolation dispatch controls"
+    );
+    let required = std::env::var("ORBIT_REQUIRE_CONTEXT_SESSION_ISOLATION").as_deref() == Ok("1");
+    let output = std::process::Command::new("/usr/bin/python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/fixtures/context_session_isolation.py"
+        ))
+        .arg("--binary")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", exact, "--timeout", "45"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("tracked isolation runner did not start");
+    assert!(
+        output.stdout.len() <= 512 * 1024 && output.stderr.len() <= 64 * 1024,
+        "runner receipt output bound"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "invalid isolation runner receipt, exit {:?}",
+            output.status.code()
+        )
+    });
+    assert_eq!(report["schema"], "orbit.context-session-isolation/v1");
+    assert_eq!(report["test_filter"], exact);
+    let visible = json!({"schema":report["schema"],"test_filter":exact,"status":report["status"],
+            "test_started":report["test_started"],"reason":report["reason"],"harness":report["harness"],
+            "binary_sha256":report["binary_sha256"],"binary_metadata_and_hash_unchanged":report["binary_metadata_and_hash_unchanged"],
+            "host_managed_path_metadata_unchanged":report["host_managed_path_metadata_unchanged"],"owned_fixture_removed":report["owned_fixture_removed"]});
+    let line = format!("ORBIT_CONTEXT_SESSION_ISOLATION {visible}\n");
+    std::io::Write::write_all(&mut std::io::stdout().lock(), line.as_bytes()).unwrap();
+    match report["status"].as_str() {
+        Some("TEST_PASSED") => {
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(report["test_started"], true);
+            assert_eq!(report["harness"]["passed"], 1);
+            assert_eq!(report["harness"]["failed"], 0);
+            assert_eq!(report["harness"]["ignored"], 0);
+            for field in [
+                "binary_metadata_and_hash_unchanged",
+                "host_managed_path_metadata_unchanged",
+                "owned_fixture_removed",
+                "binary_postcheck_inside",
+            ] {
+                assert_eq!(report[field], true);
+            }
+        }
+        Some("NOTRUN") => {
+            assert_eq!(output.status.code(), Some(77));
+            assert_eq!(report["test_started"], false);
+            assert!(
+                !required,
+                "NOTRUN: this infrastructure-required job needs namespace capability"
+            );
+        }
+        Some("TEST_FAILED") | Some("INFRA_FAILURE") => {
+            panic!(
+                "isolated test did not pass: {} / {} / {}",
+                report["status"], report["stdout_excerpt"], report["stderr_excerpt"]
+            );
+        }
+        _ => panic!("unknown isolation runner status"),
+    }
+    false
+}
+
 #[test]
 fn genuine_qualified_retry_has_fresh_ids_one_retry_and_sticky_unknown_full_bill() {
+    if !dispatch_isolated(
+        "genuine_qualified_retry_has_fresh_ids_one_retry_and_sticky_unknown_full_bill",
+    ) {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![Reply::rejection(503, 17), Reply::success()]);
     let selected = config(&wire);
@@ -1207,6 +1295,11 @@ fn genuine_qualified_retry_has_fresh_ids_one_retry_and_sticky_unknown_full_bill(
 
 #[test]
 fn zero_ceiling_blocks_even_otherwise_automatic_summary_input_before_any_post() {
+    if !dispatch_isolated(
+        "zero_ceiling_blocks_even_otherwise_automatic_summary_input_before_any_post",
+    ) {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![]);
     let selected = config(&wire);
@@ -1304,6 +1397,9 @@ fn zero_ceiling_blocks_even_otherwise_automatic_summary_input_before_any_post() 
 
 #[test]
 fn policy_and_existing_attempt_ceilings_intersect_without_raising_one() {
+    if !dispatch_isolated("policy_and_existing_attempt_ceilings_intersect_without_raising_one") {
+        return;
+    }
     for (caller, policy_max, expected) in [(1, 8, 1), (3, 2, 2), (2, 8, 2)] {
         let home = Home::new();
         let mut wire = Wire::new((0..expected).map(|_| Reply::rejection(503, 1)).collect());
@@ -1334,6 +1430,11 @@ fn policy_and_existing_attempt_ceilings_intersect_without_raising_one() {
 
 #[test]
 fn selected_policy_refuses_no_journal_caps_compacting_and_wrong_selection_before_send() {
+    if !dispatch_isolated(
+        "selected_policy_refuses_no_journal_caps_compacting_and_wrong_selection_before_send",
+    ) {
+        return;
+    }
     for kind in [
         "no-journal",
         "cap",
@@ -1410,6 +1511,11 @@ fn selected_policy_refuses_no_journal_caps_compacting_and_wrong_selection_before
 
 #[test]
 fn none_policy_new_invocation_preserves_history_but_reports_only_its_own_success() {
+    if !dispatch_isolated(
+        "none_policy_new_invocation_preserves_history_but_reports_only_its_own_success",
+    ) {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![
         Reply::rejection(503, 1),
@@ -1485,6 +1591,9 @@ fn none_policy_new_invocation_preserves_history_but_reports_only_its_own_success
 
 #[test]
 fn no_policy_complete_http_rejection_never_replays_or_mints_refusal() {
+    if !dispatch_isolated("no_policy_complete_http_rejection_never_replays_or_mints_refusal") {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![Reply::rejection(503, 8)]);
     let selected = config(&wire);
@@ -1517,6 +1626,10 @@ fn no_policy_complete_http_rejection_never_replays_or_mints_refusal() {
 
 #[test]
 fn oversized_truncated_and_admitted_error_responses_never_authorize_replay() {
+    if !dispatch_isolated("oversized_truncated_and_admitted_error_responses_never_authorize_replay")
+    {
+        return;
+    }
     for kind in ["body-cap", "truncated", "admitted", "partial"] {
         let home = Home::new();
         let reply = match kind {
@@ -1571,6 +1684,9 @@ fn oversized_truncated_and_admitted_error_responses_never_authorize_replay() {
 
 #[test]
 fn incomplete_rejection_body_cancellation_cannot_become_a_final_refusal() {
+    if !dispatch_isolated("incomplete_rejection_body_cancellation_cannot_become_a_final_refusal") {
+        return;
+    }
     let home = Home::new();
     let cancel = CancelToken::new();
     let mut reply = Reply::rejection(503, 17);
@@ -1602,6 +1718,9 @@ fn incomplete_rejection_body_cancellation_cannot_become_a_final_refusal() {
 
 #[test]
 fn begin_failure_or_bad_returned_reference_never_enters_dispatch() {
+    if !dispatch_isolated("begin_failure_or_bad_returned_reference_never_enters_dispatch") {
+        return;
+    }
     for (fault, cancel_at) in [
         (Fault::Begin, CancelAt::None),
         (Fault::Begin, CancelAt::BeginEntry),
@@ -1636,6 +1755,11 @@ fn begin_failure_or_bad_returned_reference_never_enters_dispatch() {
 
 #[test]
 fn refusal_settlement_and_lost_ack_errors_outrank_racing_cancellation_without_second_settlement() {
+    if !dispatch_isolated(
+        "refusal_settlement_and_lost_ack_errors_outrank_racing_cancellation_without_second_settlement",
+    ) {
+        return;
+    }
     for (fault, cancel_at) in [
         (Fault::RefusalBefore, CancelAt::None),
         (Fault::RefusalBefore, CancelAt::RefusalEntry),
@@ -1687,6 +1811,9 @@ fn refusal_settlement_and_lost_ack_errors_outrank_racing_cancellation_without_se
 
 #[test]
 fn earlier_genuine_component_ack_cannot_acknowledge_a_new_live_refusal() {
+    if !dispatch_isolated("earlier_genuine_component_ack_cannot_acknowledge_a_new_live_refusal") {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![Reply::rejection(503, 8), Reply::rejection(503, 8)]);
     let selected = config(&wire);
@@ -1741,6 +1868,11 @@ fn earlier_genuine_component_ack_cannot_acknowledge_a_new_live_refusal() {
 
 #[test]
 fn normal_settlement_errors_outrank_racing_cancellation_and_preserve_partial_text() {
+    if !dispatch_isolated(
+        "normal_settlement_errors_outrank_racing_cancellation_and_preserve_partial_text",
+    ) {
+        return;
+    }
     for (fault, cancel_at) in [
         (Fault::NormalBefore, CancelAt::NormalEntry),
         (Fault::NormalAfter, CancelAt::NormalEntry),
@@ -1798,6 +1930,10 @@ fn normal_settlement_errors_outrank_racing_cancellation_and_preserve_partial_tex
 
 #[test]
 fn cancellation_before_or_after_begin_uses_only_positive_not_sent_receipt() {
+    if !dispatch_isolated("cancellation_before_or_after_begin_uses_only_positive_not_sent_receipt")
+    {
+        return;
+    }
     for before_begin in [true, false] {
         let home = Home::new();
         let mut wire = Wire::new(vec![]);
@@ -1850,6 +1986,11 @@ fn cancellation_before_or_after_begin_uses_only_positive_not_sent_receipt() {
 
 #[test]
 fn cancellation_after_live_refusal_construction_finishes_one_settlement_and_retains_it() {
+    if !dispatch_isolated(
+        "cancellation_after_live_refusal_construction_finishes_one_settlement_and_retains_it",
+    ) {
+        return;
+    }
     for cancel_at in [CancelAt::RefusalEntry, CancelAt::RefusalAck] {
         let home = Home::new();
         let mut wire = Wire::new(vec![Reply::rejection(503, 8)]);
@@ -1886,6 +2027,9 @@ fn cancellation_after_live_refusal_construction_finishes_one_settlement_and_reta
 
 #[test]
 fn cancellation_in_retry_event_never_starts_a_second_attempt() {
+    if !dispatch_isolated("cancellation_in_retry_event_never_starts_a_second_attempt") {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![Reply::rejection(503, 8)]);
     let selected = config(&wire);
@@ -1914,6 +2058,11 @@ fn cancellation_in_retry_event_never_starts_a_second_attempt() {
 
 #[test]
 fn cancellation_after_second_begin_settles_not_sent_without_replaying_first_refusal() {
+    if !dispatch_isolated(
+        "cancellation_after_second_begin_settles_not_sent_without_replaying_first_refusal",
+    ) {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![Reply::rejection(503, 8)]);
     let selected = config(&wire);
@@ -2324,6 +2473,10 @@ fn assert_summary_wire(
 
 #[test]
 fn summary_manual_after_refusal_preserves_full_original_and_qualified_bill() {
+    if !dispatch_isolated("summary_manual_after_refusal_preserves_full_original_and_qualified_bill")
+    {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![
         Reply::rejection(503, 17),
@@ -2368,6 +2521,11 @@ fn summary_manual_after_refusal_preserves_full_original_and_qualified_bill() {
 
 #[test]
 fn summary_automatic_after_refusal_uses_publication_checkpoint_and_current_delta() {
+    if !dispatch_isolated(
+        "summary_automatic_after_refusal_uses_publication_checkpoint_and_current_delta",
+    ) {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![
         Reply::rejection(503, 17),
@@ -2471,6 +2629,9 @@ fn summary_automatic_after_refusal_uses_publication_checkpoint_and_current_delta
 
 #[test]
 fn summary_partitioned_chunks_and_merge_keep_one_qualified_journal() {
+    if !dispatch_isolated("summary_partitioned_chunks_and_merge_keep_one_qualified_journal") {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::with_request_limit(
         vec![
@@ -2524,6 +2685,9 @@ fn summary_partitioned_chunks_and_merge_keep_one_qualified_journal() {
 
 #[test]
 fn summary_none_continuation_preserves_historical_qualification() {
+    if !dispatch_isolated("summary_none_continuation_preserves_historical_qualification") {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![
         Reply::rejection(503, 17),
@@ -2619,6 +2783,9 @@ fn summary_none_continuation_preserves_historical_qualification() {
 
 #[test]
 fn summary_caps_and_pending_refuse_before_summary_traffic() {
+    if !dispatch_isolated("summary_caps_and_pending_refuse_before_summary_traffic") {
+        return;
+    }
     for kind in ["cap", "cap-housekeeping-optin", "pending"] {
         let home = Home::new();
         let mut replies = vec![Reply::rejection(503, 17), Reply::success()];
@@ -2856,6 +3023,11 @@ fn summary_authority_denials_use_real_candidates() {
 
 #[test]
 fn summary_failures_cancellation_and_publication_authority_remain_conservative() {
+    if !dispatch_isolated(
+        "summary_failures_cancellation_and_publication_authority_remain_conservative",
+    ) {
+        return;
+    }
     for kind in [
         "rejection",
         "partial",

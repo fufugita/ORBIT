@@ -2374,3 +2374,53 @@ mod billing_kernel_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tool_round_quote_probe {
+    use super::*;
+
+    // Live repro (2026-11-03): a tool-call round on the real gateway reported
+    // usage {input 846, output 76, reasoning 49-with-separate-counter-shape},
+    // and the engine recorded that receipt's cost as None while an identical
+    // contract priced the final text round Some(0). This probe pins the
+    // exact wire shape: reasoning_tokens > output_tokens with the reasoning
+    // REPORTED and a separate-from-output + dedicated-rate contract whose
+    // rates are all zero. The quote must be complete (Some(0)), because a
+    // complete declaration with explicit zero rates prices every group.
+    #[test]
+    fn tool_round_reasoning_exceeding_output_quotes_complete_zero() {
+        let contract = BillingQuoteContractV1::try_new(
+            ProviderId("fixture-provider".into()),
+            ModelId("fixture-model".into()),
+            PricingDeclarationState::DeclaredV2,
+            BillingRatesV1 {
+                input_per_million_microdollars: Some(0),
+                output_per_million_microdollars: Some(0),
+                cache_read_per_million_microdollars: None,
+                cache_write_per_million_microdollars: None,
+                reasoning_per_million_microdollars: Some(0),
+                request_flat_microdollars: Some(0),
+            },
+            ReasoningCounterBasis::SeparateFromOutput,
+            ReasoningRatePolicy::DedicatedRate,
+        )
+        .expect("explicit zero v2 declaration");
+        let observed = BillingObservedUsageV1 {
+            raw_usage: ProviderUsage {
+                input_tokens: 846,
+                output_tokens: 76,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 49,
+            },
+            reasoning_reporting: ReasoningReporting::Reported,
+        };
+        let quote = quote_observed_billing(&contract, &observed);
+        assert_eq!(quote.full_total_microdollars, Some(0));
+        assert!(
+            quote.unknown_reasons.is_empty(),
+            "unexpected unknown reasons: {:?}",
+            quote.unknown_reasons
+        );
+    }
+}

@@ -53,7 +53,10 @@ class Provider(BaseHTTPRequestHandler):
             latest_user = max((index for index, message in enumerate(messages) if message.get("role") == "user"), default=-1)
             if mode.get("tool") and not any(m.get("role") == "tool" for m in messages[latest_user + 1:]):
                 delta = {"tool_calls": [{"index": 0, "id": "fixture-call", "type": "function", "function": {"name": mode["tool"], "arguments": json.dumps(mode.get("arguments", {}))}}]}
-                events = [{"choices": [{"index": 0, "delta": delta, "finish_reason": "tool_calls"}]}]
+                # The engine treats a terminal round without final usage as
+                # uncertain accounting and refuses to continue the turn; a
+                # real provider sends usage on every stream, so carry it.
+                events = [{"choices": [{"index": 0, "delta": delta, "finish_reason": "tool_calls"}]}, {"choices": [{"index": 0, "delta": {}, "finish_reason": None}], "usage": {"prompt_tokens": 2, "completion_tokens": 3}}]
             else:
                 events = [{"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]} for text in mode.get("chunks", [mode.get("reply", "owned fixture reply")])]
                 events.append({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 2, "completion_tokens": 3}})

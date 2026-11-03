@@ -4135,6 +4135,10 @@ mod accounting_tests {
 
     #[test]
     fn cancelled_terminal_usage_is_provisional_while_positive_final_zero_is_known() {
+        // An interrupted (cancelled) round settles conservatively: totals
+        // stay zero (no certified bill), knownness stays Uncertain, and the
+        // mid-stream prefix counts remain provisional diagnostic evidence —
+        // never receipt usage (task05 contract).
         for (reason, observed_usage, receipt_usage, knownness, cost, completed) in [
             (
                 "cancelled",

@@ -52,6 +52,89 @@ const MAX_TRACE: usize = 64;
 const SNAPSHOT_LIMIT: u64 = 131072;
 const CHANNEL_WAIT: Duration = Duration::from_secs(3);
 
+fn dispatch_isolated(exact: &str) -> bool {
+    let isolated = std::env::var_os("ORBIT_ACTIVATION_ISOLATED");
+    let depth = std::env::var_os("ORBIT_ACTIVATION_RUNNER_DEPTH");
+    if isolated.as_deref() == Some(std::ffi::OsStr::new("1")) {
+        assert_eq!(
+            depth.as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "invalid isolated runner depth"
+        );
+        return true;
+    }
+    assert!(
+        isolated.is_none() && depth.is_none(),
+        "malformed isolation dispatch controls"
+    );
+    let required = std::env::var("ORBIT_REQUIRE_CONTEXT_SESSION_ISOLATION").as_deref() == Ok("1");
+    let output = std::process::Command::new("/usr/bin/python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/fixtures/context_session_isolation.py"
+        ))
+        .arg("--binary")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", exact, "--timeout", "45"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("tracked isolation runner did not start");
+    assert!(
+        output.stdout.len() <= 512 * 1024 && output.stderr.len() <= 64 * 1024,
+        "runner receipt output bound"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "invalid isolation runner receipt, exit {:?}",
+            output.status.code()
+        )
+    });
+    assert_eq!(report["schema"], "orbit.context-session-isolation/v1");
+    assert_eq!(report["test_filter"], exact);
+    let visible = json!({"schema":report["schema"],"test_filter":exact,"status":report["status"],
+            "test_started":report["test_started"],"reason":report["reason"],"harness":report["harness"],
+            "binary_sha256":report["binary_sha256"],"binary_metadata_and_hash_unchanged":report["binary_metadata_and_hash_unchanged"],
+            "host_managed_path_metadata_unchanged":report["host_managed_path_metadata_unchanged"],"owned_fixture_removed":report["owned_fixture_removed"]});
+    let line = format!("ORBIT_CONTEXT_SESSION_ISOLATION {visible}\n");
+    std::io::Write::write_all(&mut std::io::stdout().lock(), line.as_bytes()).unwrap();
+    match report["status"].as_str() {
+        Some("TEST_PASSED") => {
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(report["test_started"], true);
+            assert_eq!(report["harness"]["passed"], 1);
+            assert_eq!(report["harness"]["failed"], 0);
+            assert_eq!(report["harness"]["ignored"], 0);
+            for field in [
+                "binary_metadata_and_hash_unchanged",
+                "host_managed_path_metadata_unchanged",
+                "owned_fixture_removed",
+                "binary_postcheck_inside",
+            ] {
+                assert_eq!(report[field], true);
+            }
+        }
+        Some("NOTRUN") => {
+            assert_eq!(output.status.code(), Some(77));
+            assert_eq!(report["test_started"], false);
+            assert!(
+                !required,
+                "NOTRUN: this infrastructure-required job needs namespace capability"
+            );
+        }
+        Some("TEST_FAILED") | Some("INFRA_FAILURE") => {
+            panic!(
+                "isolated test did not pass: {} / {} / {}",
+                report["status"], report["stdout_excerpt"], report["stderr_excerpt"]
+            );
+        }
+        _ => panic!("unknown isolation runner status"),
+    }
+    false
+}
+
 fn require_private_system_fixture() {
     // Check descriptors/namespace identity BEFORE opening managed content,
     // creating a fixture, spawning a provider or starting any caller.
@@ -1341,6 +1424,9 @@ fn assert_positive(
 
 #[test]
 fn qualified_retry_waits_for_real_durable_ack_before_second_post() {
+    if !dispatch_isolated("qualified_retry_waits_for_real_durable_ack_before_second_post") {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![Reply::rejection(503, 17), Reply::success()]);
     let selected = config(&wire);
@@ -1532,6 +1618,9 @@ fn assert_uncertain(
 
 #[test]
 fn qualified_child_retry_preserves_owner_and_stable_child_scope() {
+    if !dispatch_isolated("qualified_child_retry_preserves_owner_and_stable_child_scope") {
+        return;
+    }
     let home = Home::new();
     let mut wire = Wire::new(vec![Reply::rejection(503, 17), Reply::success()]);
     let selected = config(&wire);
@@ -1641,6 +1730,9 @@ fn qualified_child_retry_preserves_owner_and_stable_child_scope() {
 
 #[test]
 fn lost_real_ack_stops_without_replay_or_second_settlement() {
+    if !dispatch_isolated("lost_real_ack_stops_without_replay_or_second_settlement") {
+        return;
+    }
     for racing_cancel in [false, true] {
         let mut fixture = Managed::new(
             vec![Reply::rejection(503, 17)],
@@ -1699,6 +1791,9 @@ fn lost_real_ack_stops_without_replay_or_second_settlement() {
 
 #[test]
 fn real_owned_layout_failure_stops_without_replay_or_second_settlement() {
+    if !dispatch_isolated("real_owned_layout_failure_stops_without_replay_or_second_settlement") {
+        return;
+    }
     for racing_cancel in [false, true] {
         let mut fixture = Managed::new(
             vec![Reply::rejection(503, 17)],
@@ -1771,6 +1866,11 @@ fn real_owned_layout_failure_stops_without_replay_or_second_settlement() {
 }
 #[test]
 fn explicit_new_invocations_use_current_policy_without_replaying_refused_intent() {
+    if !dispatch_isolated(
+        "explicit_new_invocations_use_current_policy_without_replaying_refused_intent",
+    ) {
+        return;
+    }
     for qualified_again in [false, true] {
         let home = Home::new();
         let mut replies = vec![Reply::rejection(503, 17), Reply::success()];
@@ -2025,6 +2125,9 @@ fn explicit_new_invocations_use_current_policy_without_replaying_refused_intent(
 
 #[test]
 fn historical_refusal_caps_refuse_before_any_new_traffic() {
+    if !dispatch_isolated("historical_refusal_caps_refuse_before_any_new_traffic") {
+        return;
+    }
     let mut fixture = Managed::new(
         vec![Reply::rejection(503, 17), Reply::success()],
         Mode::Plain,
@@ -2107,6 +2210,9 @@ fn historical_refusal_caps_refuse_before_any_new_traffic() {
 
 #[test]
 fn no_policy_complete_rejection_uses_one_detailed_uncertain_settlement() {
+    if !dispatch_isolated("no_policy_complete_rejection_uses_one_detailed_uncertain_settlement") {
+        return;
+    }
     let mut fixture = Managed::new(vec![Reply::rejection(503, 17)], Mode::Plain, 2, false);
     let (result, events, transcript) = fixture.run(false);
     assert!(matches!(result.completion().end, TurnEnd::Failed(_)));
@@ -2178,6 +2284,9 @@ fn no_policy_complete_rejection_uses_one_detailed_uncertain_settlement() {
 
 #[test]
 fn zero_and_one_attempt_ceilings_are_never_raised_by_policy() {
+    if !dispatch_isolated("zero_and_one_attempt_ceilings_are_never_raised_by_policy") {
+        return;
+    }
     for ceiling in [0, 1] {
         let replies = if ceiling == 0 {
             vec![]
@@ -2214,6 +2323,9 @@ fn zero_and_one_attempt_ceilings_are_never_raised_by_policy() {
 }
 #[test]
 fn pre_begin_and_post_begin_cancellation_never_send_or_invent_refusal() {
+    if !dispatch_isolated("pre_begin_and_post_begin_cancellation_never_send_or_invent_refusal") {
+        return;
+    }
     for before_begin in [false, true] {
         let mut fixture = Managed::new(
             vec![],
@@ -2269,6 +2381,9 @@ fn pre_begin_and_post_begin_cancellation_never_send_or_invent_refusal() {
 
 #[test]
 fn cancellation_before_complete_rejection_observation_remains_uncertain() {
+    if !dispatch_isolated("cancellation_before_complete_rejection_observation_remains_uncertain") {
+        return;
+    }
     let (held, notice) = mpsc::sync_channel(1);
     let (release, resumed) = mpsc::sync_channel(1);
     let mut reply = Reply::rejection(503, 17);
@@ -2314,6 +2429,9 @@ fn cancellation_before_complete_rejection_observation_remains_uncertain() {
 
 #[test]
 fn cancellation_after_live_proof_finishes_exactly_one_real_settlement() {
+    if !dispatch_isolated("cancellation_after_live_proof_finishes_exactly_one_real_settlement") {
+        return;
+    }
     for hold_actual_ack in [false, true] {
         let mut fixture = Managed::new(
             vec![Reply::rejection(503, 17)],
@@ -2401,6 +2519,9 @@ fn cancellation_after_live_proof_finishes_exactly_one_real_settlement() {
 
 #[test]
 fn cancellation_during_retry_backoff_never_begins_another_attempt() {
+    if !dispatch_isolated("cancellation_during_retry_backoff_never_begins_another_attempt") {
+        return;
+    }
     let mut fixture = Managed::new(vec![Reply::rejection(503, 17)], Mode::Plain, 2, true);
     let (result, events, _) = fixture.run(true);
     assert_eq!(fixture.wire.barrier(), 1);
@@ -2416,6 +2537,9 @@ fn cancellation_during_retry_backoff_never_begins_another_attempt() {
 
 #[test]
 fn cancellation_after_second_begin_does_not_send_second_post() {
+    if !dispatch_isolated("cancellation_after_second_begin_does_not_send_second_post") {
+        return;
+    }
     let mut fixture = Managed::new(
         vec![Reply::rejection(503, 17)],
         Mode::CancelBegin(2),
@@ -2458,6 +2582,9 @@ fn cancellation_after_second_begin_does_not_send_second_post() {
 
 #[test]
 fn unqualified_wire_failures_retain_actual_uncertainty_and_never_retry() {
+    if !dispatch_isolated("unqualified_wire_failures_retain_actual_uncertainty_and_never_retry") {
+        return;
+    }
     for kind in ["body-cap", "truncated", "admitted-with-usage"] {
         let reply = match kind {
             "body-cap" => Reply::rejection(503, 65_537),
