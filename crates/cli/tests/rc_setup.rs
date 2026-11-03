@@ -411,3 +411,20 @@ fn credential_query_refuses_before_home_and_preserves_existing_identity_and_conf
             .contains("api-version=2026-01-01")
     );
 }
+
+#[test]
+fn verify_bounded_ledger_accepts_more_than_1024_segments() {
+    // The writer opens one segment per boot, so long-lived homes legitimately
+    // exceed 1024 segments; the byte bounds stay the DoS boundary.
+    let f = Fixture::new();
+    f.init();
+    let segments = f.home.join("ledger/segments");
+    use std::os::unix::fs::PermissionsExt;
+    for ordinal in 1..1101u64 {
+        let path = segments.join(format!("{ordinal:016x}.log"));
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let (records, _) = verify_bounded_ledger(&f.home).unwrap();
+    assert!(records >= 2);
+}

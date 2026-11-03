@@ -142,9 +142,11 @@ pub fn verify_bounded_ledger(home: &Path) -> Result<(usize, String), Error> {
                 return Err(Error::Invalid("ledger segment ordinal is invalid".into()));
             }
             names.push(name);
-            if names.len() > 1024 {
-                return Err(Error::Invalid("ledger exceeds 1024 segments".into()));
-            }
+            // No segment-count bound here: the writer opens one segment per
+            // boot and boot recovery (recover_head) already reads every
+            // segment unbounded, so a count cap only false-positives on
+            // legitimate long-lived homes. The per-file and total byte
+            // bounds below remain the DoS boundary.
         }
     }
     names.sort();

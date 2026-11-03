@@ -52,12 +52,16 @@ for bundle installation, upgrades, prerequisites, and uninstall instructions.
 
 ### Install with npm (Linux)
 
-The current prerelease is published under the `next` tag. Install the launcher
-and its optional native Linux executables with:
+The launcher package is `@fufugita/orbit`; once a prerelease is published under
+the `next` tag, install the launcher and its optional native Linux executables
+with:
 
 ```sh
 npm install --global --include=optional @fufugita/orbit@next
 ```
+
+Registry installation requires an actually published version; to try the
+current source without publishing, see [package distribution](docs/setup.md#package-distribution).
 
 The npm distribution requires Node.js **22.15+ (22.x), or 23.11+**, Linux
 **x64 or arm64**, and **glibc 2.35+**. It includes both executables and needs no
