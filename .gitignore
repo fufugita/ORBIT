@@ -46,6 +46,7 @@ profraw/
 # local session artifacts (never commit)
 docs/handoff-pivot-to-claude-code.md
 docs/handoff-tui-endtoend.md
+docs/handoff-tui-release-100.md
 .planning/
 # PTY-suite byproduct (mock provider touches this in cwd)
 approval-probe.txt
