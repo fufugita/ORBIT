@@ -34,7 +34,7 @@ use super::shell::convo::{
 };
 
 const VIEW_JOURNAL_MAX: usize = 4096;
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EditOrigin {
     Local,
     Input,
@@ -147,6 +147,10 @@ fn foreground_end(s: &Scenario) -> usize {
         .map_or(0, |index| index + 1)
 }
 fn push_display_line(s: &mut Scenario, line: TranscriptLine, origin: EditOrigin) {
+    let mut line = line;
+    if line.kind == LineKind::System && origin == EditOrigin::Local {
+        line.local_notice = true;
+    }
     let index = if line.kind == LineKind::Queued {
         s.transcript.len()
     } else {
@@ -3924,6 +3928,21 @@ fn apply_session_projection_with_view(
         .into_iter()
         .map(restored_transcript_line)
         .collect();
+    // The worker's typed history excludes local status notices. Its initial
+    // snapshot or a completed control operation (for example /effort) must
+    // not wipe the notice that the operator just asked to see.
+    let keeps_local_notices = matches!(&projection.reason, ProjectionReason::Initial)
+        || matches!(&projection.reason, ProjectionReason::Operation { operation }
+            if operation.kind() == crate::worker::ForegroundKind::Control);
+    if keeps_local_notices {
+        let kept: Vec<_> = scenario
+            .transcript
+            .iter()
+            .filter(|line| line.local_notice && !lines.iter().any(|kept| kept.text == line.text))
+            .cloned()
+            .collect();
+        lines.extend(kept);
+    }
     if projection.context == ContextProjection::PreserveUnchanged
         && (switching
             || !matches!(&projection.reason,
@@ -9865,6 +9884,49 @@ mod bound_projection_tests {
             1
         ));
         assert!(s.take_view_dirty());
+    }
+
+    // A control command's status notice is pushed TUI-side before the worker's
+    // matching projection lands. The projection reflects only the worker's
+    // saved history, so applying it must not swallow the notice the operator
+    // just asked for (the welcome hero would otherwise return).
+    #[test]
+    fn initial_and_control_projections_keep_local_notices() {
+        let mut s = Scenario::new();
+        apply_msg(
+            crate::msg::Msg::EffortStatus("Configured effort for fixture/a: \"high\"".into()),
+            &mut s,
+            1,
+        );
+        assert!(s.transcript.iter().any(|line| line.local_notice));
+
+        // The worker's late initial snapshot has no lines: the notice stays.
+        let mut initial = projection(ProjectionReason::Initial);
+        initial.lines = Vec::new();
+        assert!(apply_session_projection(initial, &mut s, 2));
+        assert!(
+            s.transcript.iter().any(|line| line.local_notice),
+            "the initial projection must keep a local notice"
+        );
+
+        // A completed control operation's projection keeps it too.
+        let (mut scenario, operation, registration) =
+            active_ordinary_operation(WorkerCommand::Undo);
+        drop(registration);
+        apply_msg(
+            crate::msg::Msg::EffortStatus("route status".into()),
+            &mut scenario,
+            3,
+        );
+        let mut control = projection(ProjectionReason::Operation {
+            operation: operation.clone(),
+        });
+        control.lines = Vec::new();
+        assert!(apply_session_projection(control, &mut scenario, 4));
+        assert!(
+            scenario.transcript.iter().any(|line| line.local_notice),
+            "a control projection must keep a local notice"
+        );
     }
 
     fn active_ordinary_operation(

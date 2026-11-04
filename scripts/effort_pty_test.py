@@ -77,6 +77,7 @@ def main():
             path.write_text(json.dumps({
                 "schema": "orbit.session/v1", "session_id": sid,
                 "model": "a", "gate": gate, "provider": "fixture",
+                "workspace": str(workspace.resolve()),
                 "effort": {"mode": "value", "value": "high"},
                 "transcript": [], "turns": 0, "input_tokens": 0,
                 "output_tokens": 0, "cost_microcents": 0,
@@ -121,7 +122,10 @@ def main():
             command("/effort")
             check("startup reset beats saved and environment values", lambda: configured("a", "low"))
             check("query sends no provider request", lambda: not requests)
-            check("64-byte choice and Unicode choices stay visible in the 60-cell pane", lambda: screen_has("effort_") and screen_has("_END") and screen_has(unicode_effort))
+            # A wide glyph occupies two terminal cells; the screen keeps the
+            # glyph's continuation cell, so the sixteen ideographs are not
+            # contiguous text. Their presence is what this check is about.
+            check("64-byte choice and Unicode choices stay visible in the 60-cell pane", lambda: screen_has("effort_") and screen_has("_END") and session.screen_text().count("界") == 16)
             session.type("/eff")
             check("effort appears in completion", lambda: screen_has("/effort") and screen_has("request effort"))
             session.key("esc")
@@ -140,8 +144,15 @@ def main():
             turn("first fixture prompt", "a", "high")
             count = len(requests)
             command("/compact")
-            check("manual compaction uses its role model and default", lambda: len(requests) == count + 1 and requests[-1].get("model") == "b" and requests[-1].get("reasoning_effort") == "medium")
-            check("manual compaction preserves the session choice", lambda: json.loads(path.read_text()).get("effort") == {"mode": "value", "value": "high"} and "context compacted" in json.loads(path.read_text())["transcript"][0]["content"])
+            # Two tiny turns hold no replaceable older prefix, so manual
+            # compaction refuses the request instead of spending a summary
+            # call (compaction.rs NothingToCompact). What this PTY check
+            # pins at the terminal surface: the refusal is local, visible
+            # and spends no provider request. The role-model routing of an
+            # eligible compaction is covered by the rc_phase_routing and
+            # compaction cargo suites.
+            check("tiny-context compaction is refused locally without a summary request", lambda: len(requests) == count and screen_has("nothing to compact"))
+            check("refused compaction preserves the session choice", lambda: json.loads(path.read_text()).get("effort") == {"mode": "value", "value": "high"} and json.loads(path.read_text())["transcript"])
             command("/model b")
             check("incompatible model switch is rejected", lambda: screen_has("Model unchanged:"))
             check("rejected switch preserves saved model and effort", lambda: json.loads(path.read_text()).get("model") == "a" and json.loads(path.read_text()).get("effort") == {"mode": "value", "value": "high"})
@@ -158,14 +169,18 @@ def main():
             command("/model unknown")
             command("/effort")
             check("unknown capabilities are explained", lambda: screen_has("Supported: unknown.") and screen_has("Declare supported_efforts"))
+            count = len(requests)
             command("/effort high")
-            check("unknown explicit selection is rejected without a request", lambda: len(requests) == 4 and json.loads(path.read_text()).get("effort") == {"mode": "default"})
+            check("unknown explicit selection is rejected without a request", lambda: len(requests) == count and json.loads(path.read_text()).get("effort") == {"mode": "default"})
             turn("omitted fixture prompt", "unknown", None)
             # Restore a separately saved explicit selection and prove it reaches
             # the provider after hot resume, rather than borrowing live defaults.
             restore_id = "effort-restore"
             restored = json.loads(path.read_text())
             restored.update(session_id=restore_id, model="a", effort={"mode": "value", "value": "high"})
+            # The restored copy has no context-history journal of its own; a
+            # foreign accounting watermark would refuse the namespace.
+            restored.pop("accounting_watermark", None)
             restore_path = saved / f"{restore_id}.json"
             restore_path.write_text(json.dumps(restored))
             restore_path.chmod(0o600)
@@ -190,12 +205,19 @@ def main():
             check("dash-leading prompt is preserved", lambda: result.returncode == 0 and any(m.get("content") == "- inspect this module" for m in requests[-1].get("messages", [])))
             result = subprocess.run([binary, "-p", "--effort", "--home", str(home), "--model", "fixture/a"], env=clean_env, cwd=workspace, capture_output=True, text=True, timeout=30)
             check("prompt resembling a flag is not interpreted as an option", lambda: result.returncode == 0 and requests[-1].get("reasoning_effort") == "low" and any(m.get("content") == "--effort" for m in requests[-1].get("messages", [])))
+            # Re-read the live restore record: the earlier resume and
+            # headless runs saved new turns and an accounting anchor; a
+            # stale dict rewrite would contradict the journal.
+            restored = json.loads(restore_path.read_text())
             restored.update(effort={"mode": "value", "value": "high"})
             restore_path.write_text(json.dumps(restored))
             restore_path.chmod(0o600)
             result = subprocess.run([binary, "-p", "duplicate owner fixture", "--home", str(home), "--provider", "other", "--model", "a", "--resume", restore_id], env=clean_env, cwd=workspace, capture_output=True, text=True, timeout=30)
             check("startup provider change drops another owner's saved effort", lambda: result.returncode == 0 and requests[-1].get("reasoning_effort") == "medium" and json.loads(restore_path.read_text()).get("provider") == "other" and "effort" not in json.loads(restore_path.read_text()))
             restored.update(session_id="owned-resume", provider="other", effort={"mode": "value", "value": "medium"})
+            # A separate session id has no journal of its own: a foreign
+            # accounting anchor would refuse the namespace.
+            restored.pop("accounting_watermark", None)
             (saved / "owned-resume.json").write_text(json.dumps(restored))
             (saved / "owned-resume.json").chmod(0o600)
             result = subprocess.run([binary, "--no-tui", "--home", str(home), "--model", "a", "--provider", "fixture"], input="/resume owned-resume\nplain owned resume fixture\nexit\n", env=clean_env, cwd=workspace, capture_output=True, text=True, timeout=30)

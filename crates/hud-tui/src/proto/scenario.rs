@@ -334,6 +334,11 @@ pub struct TurnReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptLine {
     pub kind: LineKind,
+    /// A local system notice (an /effort or /route status, an idle
+    /// rejection) that never entered the worker's saved history. Runtime
+    /// state only: an initial session projection keeps these so a late
+    /// worker snapshot cannot wipe a notice the operator can still see.
+    pub local_notice: bool,
     pub text: String,
     /// A structured control report whose full text must remain readable.
     pub wrap: bool,
@@ -377,6 +382,7 @@ impl Default for TranscriptLine {
             finished_ms: None,
             started_ms: None,
             agent_id: None,
+            local_notice: false,
         }
     }
 }
