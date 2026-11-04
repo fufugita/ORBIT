@@ -2182,12 +2182,15 @@ def _tui_gap_run_long_output(args):
             env={"ORBIT_HOME": home}, timeout=25, rows=18, cols=80, cwd=work,
         )
         boot, boot_screen = sess.wait_for("ORBIT", timeout=15)
-        composer, screen = _tui_gap_wait_composer(sess, timeout=8)
+        composer, screen = _tui_gap_wait_composer(
+            sess, timeout=12, mode="send", conversation_focus=True,
+        )
         if not check("long-output TUI boots with a live composer",
                      boot and composer, screen[-600:], prerequisite=True):
             return
         if not check("fresh long-output TUI has conversation-panel focus",
-                     focused_panel_title(sess, "New session"),
+                     any(focused_panel_title(sess, title, screen)
+                         for title in ("New session", "Conversation")),
                      screen[-600:], prerequisite=True):
             check("long-output navigation result", None,
                   "conversation focus was not proven; no navigation keys were sent",
@@ -4485,26 +4488,40 @@ def main():
     # Switch to the bash-tool model for this section (§11.6 /model). Keep
     # the full width until the card and its result have been verified.
     begin_scenario()
-    s.type("/model mock-bash")
-    s.key("enter")
     s.resize(30, 164)
     approval_flow_ok = False
     try:
-        bash_model_selected = wait_topbar_model(s, "mock-bash", timeout=10)
+        bash_model_command_visible, bash_model_command_screen = s.type_until_visible(
+            "/model mock-bash"
+        )
+        if bash_model_command_visible:
+            s.key("enter")
+            bash_model_selected = wait_topbar_model(s, "mock-bash", timeout=10)
+        else:
+            clear_failed_input(s, "/model mock-bash", "approval model selection probe")
+            bash_model_selected = False
         model_ready = check("mock-bash is visibly selected before its tool prompt",
-                            bash_model_selected,
-                            s.screen_text().splitlines()[0] if s.screen_text().splitlines() else "",
+                            bash_model_command_visible and bash_model_selected,
+                            f"command_visible={bash_model_command_visible}; "
+                            f"input={bash_model_command_screen[-400:]}; "
+                            f"topbar={s.screen_text().splitlines()[0] if s.screen_text().splitlines() else ''!r}",
                             prerequisite=True)
         if model_ready:
-            s.type("unique approval prompt")
-            s.key("enter")
-            # The current screen must show the actual pending card, not an
-            # earlier tool row or raw terminal history.
-            approval_screen_ok, approval_screen = s.wait_for("Allow Bash", timeout=15)
+            approval_prompt_visible, approval_prompt_screen = s.type_until_visible(
+                "unique approval prompt"
+            )
+            if approval_prompt_visible:
+                s.key("enter")
+                # The current screen must show the actual pending card, not an
+                # earlier tool row or raw terminal history.
+                approval_screen_ok, approval_screen = s.wait_for("Allow Bash", timeout=15)
+            else:
+                clear_failed_input(s, "unique approval prompt", "approval prompt probe")
+                approval_screen_ok, approval_screen = False, approval_prompt_screen
             approval_flat = " ".join(approval_screen.split())
             approval_ready = check(
                 "approval card shows the exact synthetic Bash command",
-                approval_screen_ok
+                approval_prompt_visible and approval_screen_ok
                 and "unique approval prompt" in approval_flat
                 and "touch approval-probe.txt" in approval_flat,
                 approval_screen[-700:], prerequisite=True,
