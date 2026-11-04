@@ -114,6 +114,10 @@ impl Fixture {
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
+
+    fn requests_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        self.requests.clone()
+    }
 }
 
 impl Drop for Fixture {
@@ -1025,8 +1029,23 @@ async fn cancellation_during_exchange_drops_request_without_key_or_retry() {
     let code = login
         .accept_headless_code(SecretBytes::new(b"fixture-code".to_vec()))
         .unwrap();
+    // Cancel once the request is provably in flight (the fixture recorded
+    // it and the server is still holding its 120 ms reply), so the race
+    // cannot cancel before dispatch under load.
+    let recorded = {
+        let requests = fixture.requests_handle().clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while requests.lock().unwrap().is_empty() {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("exchange request never reached the fixture");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
     let cancellation = async {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        recorded.await;
         cancel.cancel();
     };
     let (result, ()) = tokio::join!(login.exchange(code), cancellation);
