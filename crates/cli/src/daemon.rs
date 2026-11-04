@@ -990,6 +990,11 @@ impl OwnerRuntime {
             cost_microcents: accounting.file.cost_microcents,
             accounting: accounting.summary,
         };
+        // Validate the request store before anything persists session state:
+        // a refused startup must leave the saved record byte-identical, and
+        // prepare_root has already rewritten it (a fresh updated_at) by now.
+        let request_store = request_storage::RequestStore::new(lease.home(), lease.session_id())?;
+        let saved = request_store.load(lease.session_id())?;
         let (commands, receiver) = mpsc::sync_channel(1);
         let handle = OwnerHandle {
             hub: Arc::new(Mutex::new(Hub {
@@ -1008,8 +1013,6 @@ impl OwnerRuntime {
             })),
             commands,
         };
-        let request_store = request_storage::RequestStore::new(lease.home(), lease.session_id())?;
-        let saved = request_store.load(lease.session_id())?;
         {
             let mut hub = handle.lock()?;
             hub.snapshot.current_request = saved.current_request;
