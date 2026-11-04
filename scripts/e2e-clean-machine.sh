@@ -4,6 +4,10 @@
 # it does not exercise the managed installer or establish release evidence.
 set -euo pipefail
 
+# The workspace pins rust-version 1.99; build with the same toolchain as every
+# other release gate instead of the machine's rustup default.
+export RUSTUP_TOOLCHAIN="1.99.0"
+
 ROOT="$(realpath -e -- "$(dirname "${BASH_SOURCE[0]}")/..")"
 if [[ $# -ne 1 || "$1" != /* ]]; then
   printf 'Usage: %s /absolute/new/output-directory\n' "$0" >&2
