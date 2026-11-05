@@ -2653,6 +2653,7 @@ mod registry_witness_tests {
         user_sid: &str,
         package_sid: &str,
         rights: &str,
+        operation: &'static str,
     ) -> io::Result<()> {
         let descriptor_sddl = wide(OsStr::new(&format!(
             "O:{user_sid}D:P(A;;FA;;;{user_sid})(A;;{rights};;;{package_sid})"
@@ -2695,7 +2696,10 @@ mod registry_witness_tests {
         if status == ERROR_SUCCESS {
             Ok(())
         } else {
-            Err(io::Error::from_raw_os_error(status as i32))
+            Err(operation_error(
+                operation,
+                io::Error::from_raw_os_error(status as i32),
+            ))
         }
     }
 
@@ -2706,7 +2710,8 @@ mod registry_witness_tests {
         package_sid: &str,
     ) -> io::Result<HeldHelperImage> {
         let directory = session.folder.join(format!("registry-helper-{nonce}"));
-        std::fs::create_dir(&directory)?;
+        std::fs::create_dir(&directory)
+            .map_err(|error| operation_error("CreateDirectory(helper image)", error))?;
         let path = directory.join("orbit-registry-helper.exe");
         let mut image_file_created = false;
         let result = (|| {
@@ -2728,6 +2733,7 @@ mod registry_witness_tests {
                 user_sid,
                 package_sid,
                 "FX",
+                "SetSecurityInfo(helper image directory)",
             )?;
             drop(directory_handle);
 
@@ -2746,14 +2752,21 @@ mod registry_witness_tests {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            let mut source_file = File::open(&source)?;
+            let mut source_file = File::open(&source)
+                .map_err(|error| operation_error("File::open(helper image source)", error))?;
             let mut target_file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&path)?;
+                .open(&path)
+                .map_err(|error| {
+                    operation_error("OpenOptions::create_new(helper image target)", error)
+                })?;
             image_file_created = true;
-            io::copy(&mut source_file, &mut target_file)?;
-            target_file.flush()?;
+            io::copy(&mut source_file, &mut target_file)
+                .map_err(|error| operation_error("io::copy(helper image)", error))?;
+            target_file
+                .flush()
+                .map_err(|error| operation_error("flush(helper image target)", error))?;
             drop(target_file);
             let path_wide = wide(path.as_os_str())?;
             let file = own("CreateFileW(owned helper image security handle)", unsafe {
@@ -2768,7 +2781,13 @@ mod registry_witness_tests {
                 )
             })?;
             check_object(file.as_raw_handle(), false)?;
-            set_owned_resource_dacl(file.as_raw_handle(), user_sid, package_sid, "FRFX")?;
+            set_owned_resource_dacl(
+                file.as_raw_handle(),
+                user_sid,
+                package_sid,
+                "FRFX",
+                "SetSecurityInfo(helper image file)",
+            )?;
             let identity = script_identity(file.as_raw_handle())?;
             let file = File::from(file);
             let mut reader = file.try_clone()?;
