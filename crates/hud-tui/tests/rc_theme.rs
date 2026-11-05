@@ -70,6 +70,76 @@ fn render(
 fn screen(p: &Profile) -> Buffer {
     render(p, &Scenario::new(), Tier::TrueColor, None, 160, 40, 5000)
 }
+
+#[test]
+fn empty_conversation_offers_a_task_and_enter_hint() {
+    let rendered = text(&screen(&Profile::default()));
+    assert!(rendered.contains("Describe a task below and press Enter"));
+    assert!(rendered.contains("Try: Explain this project and where to start."));
+}
+
+#[test]
+fn startup_notice_keeps_both_the_task_hint_and_session_context_visible() {
+    let mut scenario = Scenario::new();
+    scenario.welcome_chips = vec![
+        (true, "trust root".into()),
+        (true, "ledger".into()),
+        (true, "provider".into()),
+        (true, "sandbox".into()),
+    ];
+    scenario.transcript.push(TranscriptLine {
+        kind: LineKind::System,
+        text: "session example-session".into(),
+        local_notice: true,
+        ..Default::default()
+    });
+    let rendered = text(&render(
+        &Profile::default(),
+        &scenario,
+        Tier::TrueColor,
+        None,
+        160,
+        40,
+        5000,
+    ));
+    assert!(rendered.contains("Try: Explain this project and where to start."));
+    assert!(rendered.contains("session example-session"));
+}
+
+#[test]
+fn task_hint_does_not_replace_a_user_turn_or_failure() {
+    let mut scenario = Scenario::new();
+    scenario.transcript.push(TranscriptLine {
+        kind: LineKind::User,
+        text: "My first real task".into(),
+        ..Default::default()
+    });
+    let rendered = text(&render(
+        &Profile::default(),
+        &scenario,
+        Tier::TrueColor,
+        None,
+        160,
+        40,
+        5000,
+    ));
+    assert!(!rendered.contains("Try: Explain this project"));
+    assert!(rendered.contains("My first real task"));
+    scenario.transcript.clear();
+    scenario.last_failed = true;
+    scenario.failure_reason = Some("Connection failed".into());
+    let rendered = text(&render(
+        &Profile::default(),
+        &scenario,
+        Tier::TrueColor,
+        None,
+        160,
+        40,
+        5000,
+    ));
+    assert!(!rendered.contains("Try: Explain this project"));
+    assert!(rendered.contains("Connection failed"));
+}
 fn drawn(p: &Profile, paint: impl FnOnce(&mut Cv)) -> Buffer {
     let mut b = Buffer::empty(Rect::new(0, 0, 90, 8));
     let mut cv = Cv::with_profile(&mut b, p);

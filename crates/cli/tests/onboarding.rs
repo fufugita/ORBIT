@@ -113,7 +113,6 @@ fn key_answers() -> Vec<&'static str> {
         SECRET,
         "manual",
         "family/raw,other/raw",
-        "yes",
         "family/raw",
         "yes",
     ]
@@ -128,10 +127,82 @@ fn env_answers() -> Vec<&'static str> {
         "FIXTURE_ONBOARDING_ABSENT",
         "manual",
         "family/raw",
-        "yes",
         "family/raw",
         "yes",
     ]
+}
+
+#[test]
+fn preset_uses_known_identity_and_selects_main_without_a_separate_opt_in() {
+    let f = Fixture::new();
+    let mut terminal = Terminal::new(&[
+        "openai",
+        "key",
+        SECRET,
+        "manual",
+        "family/raw",
+        "family/raw",
+        "yes",
+    ]);
+    let collected = collect_onboarding(&f.home, None, &mut terminal);
+    assert!(
+        collected.is_ok(),
+        "preset should go straight to authentication and main selection"
+    );
+    let draft = collected.unwrap();
+    assert_eq!(draft.provider().name, "openai");
+    assert_eq!(draft.provider().url, "https://api.openai.com/v1");
+    assert!(!terminal.output.contains("Provider name"));
+    assert!(!terminal.output.contains("Base URL"));
+    assert!(!terminal.output.contains("Set main default?"));
+    assert!(!terminal.output.contains(SECRET));
+    assert!(!f.home.exists(), "review must not publish a draft");
+    commit_onboarding(draft).unwrap();
+    assert_eq!(f.config().roles.main, "openai/family/raw");
+}
+
+#[test]
+fn preset_details_remain_editable_before_collecting_a_key() {
+    let f = Fixture::new();
+    let mut terminal = Terminal::new(&[
+        "openai",
+        "back",
+        "edit",
+        "my-provider",
+        "https://gateway.example/v1",
+        "key",
+        SECRET,
+        "manual",
+        "family/raw",
+        "family/raw",
+        "yes",
+    ]);
+    let draft = collect_onboarding(&f.home, None, &mut terminal).unwrap();
+    assert_eq!(draft.provider().name, "my-provider");
+    assert_eq!(draft.provider().url, "https://gateway.example/v1");
+    assert!(!terminal.output.contains(SECRET));
+    assert!(!f.home.exists());
+    commit_onboarding(draft).unwrap();
+    assert_eq!(f.config().roles.main, "my-provider/family/raw");
+}
+
+#[test]
+fn a_model_named_no_is_not_confused_with_keeping_the_default() {
+    let f = Fixture::new();
+    let mut terminal = Terminal::new(&[
+        "custom",
+        "fixture",
+        "openai-compatible",
+        "http://127.0.0.1:9/v1",
+        "none",
+        "manual",
+        "no",
+        "no",
+        "yes",
+    ]);
+    let draft = collect_onboarding(&f.home, None, &mut terminal).unwrap();
+    commit_onboarding(draft).unwrap();
+    assert_eq!(f.config().roles.main, "fixture/no");
 }
 
 #[test]
@@ -286,7 +357,6 @@ fn commit_main_replacement_decline_preserves_whole_config() {
         "none",
         "manual",
         "new/raw",
-        "yes",
         "new/raw",
         "no",
     ];

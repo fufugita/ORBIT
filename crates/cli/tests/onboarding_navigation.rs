@@ -598,7 +598,6 @@ fn discovery_back_and_keep_preserve_one_catalog_and_exact_private_binding() {
         "discover",
         "generic",
         "1",
-        "yes",
         "family/raw",
         "back",
         "back",
@@ -628,14 +627,11 @@ fn browser_back_and_keep_do_not_reopen_or_exchange_authorization() {
     let (mut discovery, mut login, calls) = services(false, true);
     let mut terminal = Terminal::new(&[
         "openrouter",
-        "",
-        "",
         "browser",
         "headless",
         "synthetic-code",
         "manual",
         "family/raw",
-        "yes",
         "family/raw",
         "back",
         "back",
@@ -670,7 +666,6 @@ fn unchanged_identity_edit_keeps_collected_key_without_another_authentication() 
         SECRET,
         "manual",
         "family/raw",
-        "yes",
         "family/raw",
         "back",
         "back",
@@ -706,7 +701,6 @@ fn editing_authentication_discards_old_secret_models_and_default() {
         SECRET,
         "manual",
         "old/raw",
-        "yes",
         "old/raw",
         "back",
         "back",
@@ -715,7 +709,6 @@ fn editing_authentication_discards_old_secret_models_and_default() {
         "none",
         "manual",
         "new/raw",
-        "yes",
         "new/raw",
         "yes",
     ]);
@@ -746,7 +739,6 @@ fn changing_provider_identity_invalidates_the_old_credential_binding() {
         SECRET,
         "manual",
         "old/raw",
-        "yes",
         "old/raw",
         "back",
         "back",
@@ -795,7 +787,6 @@ fn pure_field_and_catalog_correction_never_refetches_or_saves_a_partial_draft() 
         "0",
         "retry",
         "1",
-        "yes",
         "missing/raw",
         "family/raw",
         "yes",
@@ -887,6 +878,8 @@ fn invalid_preset_identity_can_go_back_and_choose_a_different_provider_without_e
     let f = Fixture::new();
     let (mut discovery, mut login, calls) = services(false, false);
     let mut terminal = Terminal::new(&[
+        "back",
+        "edit",
         "",
         "bad-url",
         "back",
@@ -1061,7 +1054,7 @@ fn invalid_default_and_review_back_preserve_completed_drafts_without_recollectin
 fn hosted_provider_does_not_offer_no_authentication() {
     let f = Fixture::new();
     let (mut discovery, mut login, calls) = services(false, false);
-    let mut terminal = Terminal::new(&["openrouter", "", "", "cancel"]);
+    let mut terminal = Terminal::new(&["openrouter", "cancel"]);
 
     assert!(matches!(
         collect_onboarding_with_services(&f.home, None, &mut terminal, &mut discovery, &mut login),
@@ -1135,7 +1128,15 @@ fn cancel_at_each_pure_field_recovery_has_no_publication_or_provider_effect() {
             ),
             Err(OnboardingError::Canceled)
         ));
-        assert!(terminal.output.contains("Correct this field"));
+        if prefix.len() == 9 && prefix.last() == Some(&"maybe") {
+            assert!(
+                terminal
+                    .output
+                    .contains("Choose an offered number or exact identity. Nothing was changed.")
+            );
+        } else {
+            assert!(terminal.output.contains("Correct this field"));
+        }
         assert!(terminal.input.is_empty());
         assert!(!f.home.exists());
         assert!(!terminal.output.contains(SECRET));

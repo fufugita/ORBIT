@@ -259,6 +259,24 @@ pub fn draw_hero(cv: &mut Cv, x: i32, y: i32, w: i32, h: i32, hero: &Hero) -> i3
                 mix(glow, colors.ink2, ta),
                 Some(glow),
             );
+            if !waiting {
+                for (row, hint) in [
+                    "Describe a task below and press Enter",
+                    "Try: Explain this project and where to start.",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let hint = super::canvas::clip_text(hint, hw - 2);
+                    cv.text(
+                        x + (w - super::canvas::text_width(&hint)) / 2,
+                        my + 5 + row as i32,
+                        &hint,
+                        mix(glow, colors.ink2, ta),
+                        Some(glow),
+                    );
+                }
+            }
         },
     );
     if waiting {

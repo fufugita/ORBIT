@@ -2525,16 +2525,32 @@ pub(crate) fn draw_reading(
             let hero_on = inp.brand != BrandTier::Off
                 && !s.last_failed
                 && !s.ordinary_cancelled()
-                && (s.transcript.is_empty() || s.first_prompt_waiting);
+                && (s.transcript.is_empty()
+                    || (!s.is_busy()
+                        && s.transcript
+                            .iter()
+                            .all(|line| line.kind == LineKind::System))
+                    || s.first_prompt_waiting);
             let animate = inp.brand == BrandTier::Anim && !inp.reduced;
             let mut used = 0;
             if hero_on {
+                // Initial status rows are still meaningful. Reserve their
+                // rendered height instead of letting the hero consume them.
+                let status_rows = if s
+                    .transcript
+                    .iter()
+                    .all(|line| line.kind == LineKind::System)
+                {
+                    rows.len()
+                } else {
+                    acknowledgement_rows
+                };
                 used = draw_hero(
                     cv,
                     x,
                     y,
                     w,
-                    view_h - (acknowledgement_rows as i32).min(view_h),
+                    view_h - (status_rows.min(view_h as usize) as i32),
                     &Hero {
                         since_start: if animate { secs(inp.now_ms) } else { 99.0 },
                         waiting_for: s.first_prompt_waiting.then(|| {

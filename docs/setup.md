@@ -42,21 +42,31 @@ then check `orbit --version` and `orbit --help` from outside the checkout.
 ## Initialize once
 
 ```sh
-orbit init
-orbit doctor
 orbit
 ```
 
-Plain `orbit init` and `orbit setup` open the same provider wizard when both input
-and output are terminals. Use the arrow keys and Enter for choices; plain
+Your first interactive `orbit` launch opens provider setup, then enters the
+conversation after saving a usable credential. A configured launch goes straight
+to the conversation. `orbit init` and `orbit setup` open the same provider wizard
+when both input and output are terminals. Use the arrow keys and Enter for choices; plain
 terminals offer numbered input. Back revisits completed stages without repeating
-login or model discovery. Ctrl-C cancels an unpublished draft. Choose a preset or custom provider name, adapter and base URL, then
+login or model discovery. Ctrl-C cancels an unpublished draft. Choose a preset
+with its name and endpoint filled in, or choose a custom provider and enter those
+details. Go back from authentication to edit preset details. Then
 choose a hidden API key, a credential ENV reference, supported browser sign-in,
-or explicit no-auth for a custom/local provider. Choose manual model IDs or online discovery, optionally
-choose the main default, review the summary and type `yes` to save.
+or explicit no-auth for a custom/local provider. Choose manual model IDs or online
+discovery, select the main default or keep the current choice, review the summary
+and type `yes` to save. Nothing is saved before that confirmation. Describe your
+first task and press Enter; for example, “Explain this project and where to start.”
+The conversation shows your project and active model; use `?` for keyboard help.
 `orbit provider add` opens the same wizard for another provider. Manual model
 entry with API-key/ENV/no-auth authentication sends no provider requests. Browser
 sign-in and online model discovery contact their selected provider.
+
+If the selected credential ENV variable is missing, the first launch saves your
+offline configuration and explains what to set before launching again. Local
+configuration and `orbit doctor` checks do not establish provider connectivity;
+a successful model response does. Change appearance later with `orbit config`.
 
 For a sequential numbered menu, set `NO_COLOR=1` or `TERM=dumb` before running
 `orbit init`. This avoids the alternate-screen picker while keeping the same

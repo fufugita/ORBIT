@@ -775,11 +775,11 @@ fn assert_saved_official(home: &Path) {
     let provider = config
         .provider
         .iter()
-        .find(|provider| provider.name == "browserfixture")
+        .find(|provider| provider.name == "openrouter")
         .unwrap();
     assert_eq!(provider.url.trim_end_matches('/'), OPENROUTER_PROVIDER_URL);
     assert_eq!(provider.models[0].id, "family/raw");
-    assert_eq!(config.roles.main, "browserfixture/family/raw");
+    assert_eq!(config.roles.main, "openrouter/family/raw");
     let resolved = ProviderCredentialStore::new(home)
         .unwrap()
         .resolve_with(&auth_identity(provider), |_| Ok(None))
@@ -851,17 +851,8 @@ fn loopback_browser_setup_discovers_with_draft_then_saves_exact_official_binding
     let mut discovery = WizardDiscovery {
         address: protocol.address,
     };
-    let mut terminal = Terminal::new(&[
-        "browserfixture",
-        "",
-        "browser",
-        "loopback",
-        "discover",
-        "1",
-        "yes",
-        "family/raw",
-        "yes",
-    ]);
+    let mut terminal =
+        Terminal::new(&["browser", "loopback", "discover", "1", "family/raw", "yes"]);
     let unpublished = home.clone();
     terminal.before_confirm = Some(Box::new(move || assert!(!unpublished.exists())));
     let draft = collect_onboarding_with_services(
@@ -910,14 +901,11 @@ async fn headless_browser_setup_works_inside_runtime_with_non_send_terminal_and_
         address: protocol.address,
     };
     let mut terminal = Terminal::new(&[
-        "browserfixture",
-        "",
         "browser",
         "headless",
         AUTH_CODE,
         "discover",
         "1",
-        "yes",
         "family/raw",
         "yes",
     ]);
@@ -956,14 +944,11 @@ fn headless_browser_decline_after_exchange_and_catalog_leaves_no_home_or_private
         address: protocol.address,
     };
     let mut terminal = Terminal::new(&[
-        "browserfixture",
-        "",
         "browser",
         "headless",
         AUTH_CODE,
         "discover",
         "1",
-        "yes",
         "family/raw",
         "no",
     ]);

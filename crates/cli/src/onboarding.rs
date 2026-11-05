@@ -513,25 +513,30 @@ fn collect_identity<T: SetupTerminal>(
     terminal: &mut T,
     preset: &crate::presets::ProviderPreset,
     existing: &ProvidersConfig,
+    edit_preset: bool,
 ) -> Result<StepValue<IdentityDraft>, OnboardingError> {
     let custom = preset.id == "custom";
-    let name = setup_field!(terminal, |terminal| {
-        let name = answer(
-            terminal,
-            "Provider name",
-            (!custom).then_some(preset.id),
-            128,
-        )?;
-        // Validate the name before asking about replacement or collecting a key.
-        ProviderAuthIdentity::new(
-            &name,
-            "openai-compatible",
-            "https://provider.example/",
-            None,
-        )
-        .map_err(|_| OnboardingError::Invalid("Use a valid bounded provider name"))?;
-        Ok(name)
-    });
+    let name = if !custom && !edit_preset {
+        preset.id.to_owned()
+    } else {
+        setup_field!(terminal, |terminal| {
+            let name = answer(
+                terminal,
+                "Provider name",
+                (!custom).then_some(preset.id),
+                128,
+            )?;
+            // Validate the name before asking about replacement or collecting a key.
+            ProviderAuthIdentity::new(
+                &name,
+                "openai-compatible",
+                "https://provider.example/",
+                None,
+            )
+            .map_err(|_| OnboardingError::Invalid("Use a valid bounded provider name"))?;
+            Ok(name)
+        })
+    };
     let previous = existing
         .provider
         .iter()
@@ -568,16 +573,25 @@ fn collect_identity<T: SetupTerminal>(
     } else {
         preset.kind.to_owned()
     };
-    let url = setup_field!(terminal, |terminal| {
-        let url = answer(terminal, "Base URL", (!custom).then_some(preset.url), 2048)?;
-        crate::config::validate_provider_endpoint(&url)
-            .map(|url| url.to_string())
-            .map_err(|_| {
-                OnboardingError::Invalid(
-                    "Use an absolute HTTP(S) provider URL without credentials or a fragment",
-                )
-            })
-    });
+    let url = if !custom && !edit_preset {
+        terminal.message(&format!(
+            "Using {} at {}. Go back from authentication to edit these details.",
+            safe_display(preset.id),
+            safe_display(preset.url)
+        ))?;
+        preset.url.to_owned()
+    } else {
+        setup_field!(terminal, |terminal| {
+            let url = answer(terminal, "Base URL", (!custom).then_some(preset.url), 2048)?;
+            crate::config::validate_provider_endpoint(&url)
+                .map(|url| url.to_string())
+                .map_err(|_| {
+                    OnboardingError::Invalid(
+                        "Use an absolute HTTP(S) provider URL without credentials or a fragment",
+                    )
+                })
+        })
+    };
     ProviderAuthIdentity::new(&name, &kind, &url, None)?;
     Ok(StepValue::Complete(IdentityDraft {
         provider: ProviderConfig {
@@ -633,11 +647,13 @@ fn collect_authentication<T: SetupTerminal>(
                 detail: Some("For custom or local providers only"),
             });
         }
-        let auth = match terminal.select("Authentication method", &choices, None, true)? {
-            SetupSelection::Chosen(auth) => auth,
-            SetupSelection::Back => return Ok(StepValue::Back),
-            SetupSelection::Canceled => return Err(OnboardingError::Canceled),
-        };
+        let suggested = if base.kind == "ollama" { "none" } else { "key" };
+        let auth =
+            match terminal.select("Authentication method", &choices, Some(suggested), true)? {
+                SetupSelection::Chosen(auth) => auth,
+                SetupSelection::Back => return Ok(StepValue::Back),
+                SetupSelection::Canceled => return Err(OnboardingError::Canceled),
+            };
         let (env, key) = match auth.as_str() {
             "env" => {
                 let name = setup_field!(terminal, |terminal| {
@@ -777,11 +793,6 @@ fn selected_provider(
     Ok(provider)
 }
 
-enum DefaultIntent {
-    Select,
-    Unchanged,
-    Back,
-}
 enum ReviewIntent {
     Save,
     Back,
@@ -792,29 +803,12 @@ fn collect_default<T: SetupTerminal>(
     provider: &ProviderConfig,
     existing_main: &str,
 ) -> Result<StepValue<Option<String>>, OnboardingError> {
-    let intent = setup_field!(terminal, |terminal| match answer(
-        terminal,
-        "Set main default? (yes/no)",
-        None,
-        16
-    )?
-    .to_ascii_lowercase()
-    .as_str()
-    {
-        "yes" => Ok(DefaultIntent::Select),
-        "" | "no" => Ok(DefaultIntent::Unchanged),
-        "back" => Ok(DefaultIntent::Back),
-        "cancel" => Err(OnboardingError::Canceled),
-        _ => Err(OnboardingError::Invalid(
-            "Enter yes, no, back or cancel. Nothing was saved."
-        )),
-    });
-    match intent {
-        DefaultIntent::Unchanged => return Ok(StepValue::Complete(None)),
-        DefaultIntent::Back => return Ok(StepValue::Back),
-        DefaultIntent::Select => {}
+    // Keep the action distinct even when a provider has a model named "no".
+    let mut keep = "no".to_owned();
+    while provider.models.iter().any(|model| model.id == keep) {
+        keep.push_str("-default");
     }
-    let choices: Vec<_> = provider
+    let mut choices: Vec<_> = provider
         .models
         .iter()
         .map(|model| SetupChoice {
@@ -823,15 +817,38 @@ fn collect_default<T: SetupTerminal>(
             detail: model.label.as_deref(),
         })
         .collect();
+    choices.push(SetupChoice {
+        id: &keep,
+        label: if existing_main.is_empty() {
+            "Choose later"
+        } else {
+            "Keep current default"
+        },
+        detail: Some(if existing_main.is_empty() {
+            "Save this provider without setting a default"
+        } else {
+            existing_main
+        }),
+    });
     let prefix = format!("{}/", provider.name);
     let current = existing_main
         .strip_prefix(&prefix)
         .filter(|id| provider.models.iter().any(|model| model.id == *id));
+    let current = current.or_else(|| {
+        if existing_main.is_empty() {
+            provider.models.first().map(|model| model.id.as_str())
+        } else {
+            Some(keep.as_str())
+        }
+    });
     let id = match terminal.select("Main model ID", &choices, current, true)? {
         SetupSelection::Chosen(id) => id,
         SetupSelection::Back => return Ok(StepValue::Back),
         SetupSelection::Canceled => return Err(OnboardingError::Canceled),
     };
+    if id == keep {
+        return Ok(StepValue::Complete(None));
+    }
     let qualified = format!("{}/{}", provider.name, id);
     if !existing_main.is_empty()
         && existing_main != qualified
@@ -857,7 +874,7 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
     let _ = ProviderCredentialStore::new(home)?;
     let baseline = setup::plan_setup(home, &SetupRequest::default())?;
     let existing = config_snapshot(home)?;
-    terminal.message("ORBIT\nProvider setup. Type Ctrl-C to cancel. Manual model entry makes no provider request.")?;
+    terminal.message("ORBIT\nConnect a provider, choose a model, then review and save.\nNothing is saved until you confirm. Ctrl-C cancels. Manual model entry works offline.")?;
     let offered = crate::presets::presets();
     let mut preset = preset_id
         .map(|id| {
@@ -941,14 +958,16 @@ pub fn collect_onboarding_with_services<T: SetupTerminal>(
                         SetupSelection::Canceled => return Err(OnboardingError::Canceled),
                     }
                 }
-                let next = match collect_identity(home, terminal, selected_preset, &existing)? {
-                    StepValue::Complete(next) => next,
-                    StepValue::Back => {
-                        revisiting = true;
-                        state = SetupStage::Provider;
-                        continue;
-                    }
-                };
+                let next =
+                    match collect_identity(home, terminal, selected_preset, &existing, revisiting)?
+                    {
+                        StepValue::Complete(next) => next,
+                        StepValue::Back => {
+                            revisiting = true;
+                            state = SetupStage::Provider;
+                            continue;
+                        }
+                    };
                 if identity_draft
                     .as_ref()
                     .is_none_or(|old| old.provider != next.provider)

@@ -74,13 +74,12 @@ Open a terminal in the project you want to work on:
 
 ```sh
 cd your-project
-orbit init
-orbit doctor
 orbit
 ```
 
-Plain `orbit init` opens interactive setup when both input and output are
-terminals. `orbit setup` opens the same flow. Use the arrow keys and Enter to
+On your first interactive launch, `orbit` guides you through setup, then opens
+the conversation. Configured launches go straight to your work. Plain `orbit init`
+and `orbit setup` open the same setup flow. Use the arrow keys and Enter to
 choose, or the displayed numbered choices in plain terminals. Back lets you
 review earlier choices; Ctrl-C cancels an unpublished draft. Setup walks you through:
 
@@ -93,8 +92,17 @@ review earlier choices; Ctrl-C cancels an unpublished draft. Setup walks you thr
    select models, page through results, and filter by model ID or label. Plain
    terminals use numbered choices. You can also enter exact raw IDs manually,
    including any slashes in the ID.
-4. **Default and save:** optionally select the main model, review the complete
+4. **Default and save:** choose the main model (or keep the existing default), review the complete
    summary, and type `yes` to save.
+
+Presets fill in their known name and endpoint. Go back from authentication to
+edit those details. Nothing is saved before the final confirmation. After saving,
+describe a task and press Enter; try “Explain this project and where to start.”
+If the credential ENV variable is still missing, setup saves your offline
+configuration and tells you what to set. Set that variable, then run `orbit`
+again to enter the conversation.
+`orbit doctor` checks local configuration; your first model response confirms
+the provider connection. Change appearance later with `orbit config`.
 
 A privately saved key needs no shell export. With an ENV reference, set that exact
 variable before making requests. Replacing an existing provider or main default

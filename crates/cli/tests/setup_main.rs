@@ -553,7 +553,6 @@ fn setup_main_wizard_retains_private_key_when_post_config_verification_fails() {
         secret,
         "manual",
         "owner/family/raw",
-        "yes",
         "owner/family/raw",
         "yes",
     ];

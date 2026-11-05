@@ -45,7 +45,7 @@ PROMPTS = {
     "schema": b"Discovery schema (generic/openrouter)",
     "select": b"Select model numbers (comma-separated), next, prev, filter TEXT, manual, or cancel",
     "partial": b"Catalog is incomplete. Use partial results?",
-    "default": b"Set main default? (yes/no): ", "main": b"Main model ID: ",
+    "main": b"Main model ID: ",
     "replace_main": b"Replace main default?", "confirm": b"Save provider configuration?",
 }
 
@@ -243,6 +243,7 @@ class Terminal:
 
     def resize(self, columns, rows):
         assert 0 <= columns <= 300 and 0 <= rows <= 120
+        self.columns, self.rows = columns, rows
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, columns, 0, 0))
         if hasattr(self, "process") and self.process.poll() is None:
@@ -295,6 +296,35 @@ class Terminal:
             _, ready, _ = select.select([], [self.master], [], 0.1)
             if ready:
                 offset += os.write(self.master, raw[offset:offset + 1024])
+
+    def expect_screen(self, text, timeout=12):
+        # Reuse the full PTY suite's screen parser: cursor-motion rendering can
+        # omit literal spaces in the byte stream. Require a current cell frame.
+        import pyte
+        required = (text,) if isinstance(text, str) else tuple(text)
+        screen = pyte.Screen(self.columns, self.rows)
+        stream = pyte.ByteStream(screen)
+        consumed = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if consumed is None:
+                # A real terminal starts its alternate screen empty. pyte's
+                # basic Screen does not switch buffers for DEC1049 itself.
+                marker = b"\x1b[?1049h"
+                entered = self.output.rfind(marker)
+                if entered < 0:
+                    assert self.process.poll() is None, "current binary exited before the alternate screen"
+                    self.read()
+                    continue
+                consumed = entered + len(marker)
+            stream.feed(bytes(self.output[consumed:]))
+            consumed = len(self.output)
+            frame = "\n".join(screen.display)
+            if all(value in frame for value in required):
+                return frame
+            assert self.process.poll() is None, "current binary exited before the expected screen"
+            self.read()
+        raise AssertionError("onboarding current-screen deadline exceeded")
 
     def answer(self, prompt, value):
         self.expect(prompt)
@@ -412,9 +442,7 @@ class Fixture:
                     session.answer("select", choice)
             else:
                 session.answer("models", manual_fallback)
-            session.answer("default", "yes" if default else "no")
-            if default:
-                session.answer("main", main)
+            session.answer("main", main if default else "no")
             if replace_main:
                 session.answer("replace_main", "yes")
             session.expect("confirm")
@@ -433,9 +461,7 @@ class Fixture:
         before = len(self.calls)
         with Terminal(self, home, args, extra_env) as session:
             self.through_models(session, name, auth, replacement, model)
-            session.answer("default", "yes" if default else "no")
-            if default:
-                session.answer("main", model.split(",")[0])
+            session.answer("main", model.split(",")[0] if default else "no")
             if replace_main:
                 session.answer("replace_main", "yes")
             session.answer("confirm", "yes")
@@ -621,7 +647,7 @@ def preservation_cases(f, passed):
 
     with Terminal(f, existing) as session:
         f.through_models(session, name="second")
-        session.answer("default", "no")
+        session.answer("main", "no")
         session.answer("confirm", "no")
         session.finish(False)
     assert snapshot(existing) == before
@@ -637,7 +663,6 @@ def preservation_cases(f, passed):
 
     with Terminal(f, existing) as session:
         f.through_models(session, name="second", auth="none")
-        session.answer("default", "yes")
         session.answer("main", MODEL)
         session.answer("replace_main", "no")
         session.finish(False)
@@ -646,7 +671,7 @@ def preservation_cases(f, passed):
 
     with Terminal(f, existing) as session:
         f.through_models(session, name="second")
-        session.answer("default", "no")
+        session.answer("main", "no")
         session.expect("confirm")
         config = existing / "providers.toml"
         private_write(config, config.read_bytes() + b'\n[concurrent]\nkeep = true\n')
@@ -921,7 +946,7 @@ def discovery_boundary_cases(f, passed):
         assert not call["response_started"], "config edit was not made during the actual pending request"
         concurrent = snapshot(stale)
         session.answer("select", "1")
-        session.answer("default", "no")
+        session.answer("main", "no")
         session.finish(False)
     f.server.wait_idle()
     assert snapshot(stale) == concurrent
@@ -1203,7 +1228,6 @@ def interactive_cases(f, passed):
         session.expect("source")
         session.send(b"\r")
         session.answer("models", MODEL)
-        session.answer("default", "yes")
         session.answer("main", MODEL)
         session.answer("confirm", "yes")
         output = session.finish()
@@ -1225,7 +1249,6 @@ def interactive_cases(f, passed):
         session.send(b"\x1b[B\r")
         session.expect("2 selected; Enter toggles")
         session.send(b"\x1b[F\r")
-        session.answer("default", "yes")
         session.answer("main", MODEL)
         session.answer("confirm", "yes")
         output = session.finish()
@@ -1257,7 +1280,6 @@ def interactive_cases(f, passed):
         session.send("family/extra/model-21")
         session.expect("2 selected")
         session.send(b"\x1b[F\r")
-        session.answer("default", "yes")
         session.answer("main", MODEL)
         session.answer("confirm", "yes")
         session.finish()
@@ -1428,7 +1450,7 @@ def interactive_cases(f, passed):
     with Terminal(f, added, ("config",)) as session:
         session.answer(b"Configuration: ", "provider")
         f.through_models(session, name="second", auth="none")
-        session.answer("default", "no")
+        session.answer("main", "no")
         session.answer("confirm", "yes")
         session.answer(b"Configuration: ", "done")
         session.finish()
@@ -1444,9 +1466,8 @@ def interactive_cases(f, passed):
     with Terminal(f, cached, ("init",)) as session:
         f.discovery_start(session, auth="none")
         session.answer("select", "1")
-        session.answer("default", "back")
+        session.answer("main", "back")
         session.answer(b"Model selection draft: ", "keep")
-        session.answer("default", "yes")
         session.answer("main", MODEL)
         session.answer("confirm", "back")
         session.answer(b"Default model draft: ", "keep")
@@ -1457,10 +1478,127 @@ def interactive_cases(f, passed):
     passed("terminal_back_and_keep_reuse_discovery_and_default_without_effect_replay")
 
 
+def first_run_cases(f, passed):
+    for name, args, extra in [
+        ("explicit", ("--effort", " high"), None),
+        ("environment", (), {"ORBIT_EFFORT": '"unterminated'}),
+    ]:
+        invalid = f.home()
+        calls_before = len(f.calls)
+        workspace_before = snapshot(f.work)
+        with Terminal(f, invalid, args, extra) as session:
+            deadline = time.monotonic() + 3
+            while session.process.poll() is None and time.monotonic() < deadline:
+                session.read()
+            assert b"Provider (name or number)" not in session.output, "invalid effort entered provider setup"
+            assert session.process.poll() is not None, "invalid effort was not rejected immediately"
+            output = session.finish(success=False)
+        assert b"ORBIT-E1101" in output
+        assert not invalid.exists() and snapshot(f.work) == workspace_before
+        assert len(f.calls) == calls_before
+        passed("bare_invalid_" + name + "_effort_refuses_before_setup_or_state")
+
+    override = f.home()
+    with Terminal(f, override, ("--effort", "default"), {"ORBIT_EFFORT": '"unterminated'}) as session:
+        session.expect("provider")
+        session.send(b"\x03")
+        session.finish(success=False)
+    assert not override.exists()
+    passed("bare_valid_explicit_effort_overrides_invalid_environment_before_setup")
+
+    home = f.home()
+    with Terminal(f, home, ()) as session:
+        session.expect("provider")
+        assert not home.exists(), "welcome published state before confirmation"
+        session.send(b"\x03")
+        session.finish(success=False)
+    assert not home.exists(), "canceled bare launch initialized state"
+    passed("bare_first_launch_opens_cancelable_unpublished_setup")
+
+    prepared = f.home()
+    f.run(prepared, "init", "--no-provider")
+    before = snapshot(prepared)
+    with Terminal(f, prepared, ()) as session:
+        session.expect("provider")
+        session.send(b"\x04")
+        session.finish(success=False)
+    assert snapshot(prepared) == before
+    passed("bare_missing_provider_eof_preserves_initialized_state")
+
+    redirected = f.home()
+    result = f.run(redirected, success=False)
+    assert "ORBIT-E0706" in result.stderr and "Authentication method" not in result.stderr
+    assert not redirected.exists()
+    invalid = f.home()
+    with Terminal(f, invalid, ("--json",)) as session:
+        output = session.finish(success=False)
+    assert b"ORBIT-E1101" in output and b"Provider (name or number)" not in output
+    assert not invalid.exists()
+    passed("bare_redirected_and_invalid_modes_do_not_enter_setup")
+
+    offline = f.home()
+    calls_before = len(f.calls)
+    with Terminal(f, offline, ("--no-tui",)) as session:
+        session.answer("provider", "openai")
+        session.answer("auth", "env")
+        session.answer("env", "ORBIT_FIRST_RUN_MISSING_KEY")
+        session.answer("source", "manual")
+        session.answer("models", MODEL)
+        session.answer("main", MODEL)
+        session.expect("confirm")
+        assert not offline.exists()
+        session.send("yes")
+        output = session.finish()
+    assert b"Provider name" not in output and b"Base URL" not in output
+    assert b"Set main default?" not in output and b"Saved for later" in output
+    assert f.config(offline)["roles"]["main"] == "openai/" + MODEL
+    assert len(f.calls) == calls_before and not (offline / "auth").exists()
+    passed("bare_preset_setup_saves_offline_without_claiming_model_connectivity")
+
+    conversation = f.home()
+    with Terminal(f, conversation, ("--no-tui",)) as session:
+        f.through_models(session, auth="none")
+        session.answer("main", MODEL)
+        session.expect("confirm")
+        assert not conversation.exists()
+        session.send("yes")
+        session.expect(b"Describe a task and press Enter")
+        assert str(f.work).encode() in session.output and b"provider fixture" in session.output
+        session.send("Explain this project")
+        session.expect(b"onboarding fixture reply")
+        session.send("exit")
+        session.finish()
+    assert f.calls[-1]["method"] == "POST" and f.calls[-1]["body"]["model"] == MODEL
+    with Terminal(f, conversation, ("--no-tui", "--continue")) as session:
+        session.expect(b"resumed session")
+        session.expect(b"Describe a task and press Enter")
+        assert b"Provider (name or number)" not in session.output
+        session.send("exit")
+        session.finish()
+    with Terminal(f, conversation, ("--no-tui",)) as session:
+        session.expect(b"Describe a task and press Enter")
+        assert b"Provider (name or number)" not in session.output
+        session.send("exit")
+        session.finish()
+    passed("bare_review_save_mock_conversation_exit_and_resume_bypass_setup")
+
+    tui = f.home()
+    with Terminal(f, tui, (), size=(160, 42)) as session:
+        f.through_models(session, auth="none")
+        session.answer("main", MODEL)
+        session.answer("confirm", "yes")
+        session.expect_screen(("Try: Explain this project and where to start.", MODEL, "session "))
+        session.send(b"\x04")
+        session.expect_screen("QUIT ORBIT?")
+        session.send(b"y")
+        session.finish()
+    passed("bare_default_tui_opens_actionable_empty_conversation_and_restores_terminal")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/orbit"))
-    parser.add_argument("--group", choices=("manual", "private-key", "preservation", "discovery-tracer", "discovery-boundaries", "login-boundaries", "interactive", "all"), default="all")
+    parser.add_argument("--group", choices=("manual", "private-key", "preservation", "discovery-tracer", "discovery-boundaries", "login-boundaries", "interactive", "first-run", "all"), default="all")
     options = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     binary = options.binary.resolve(strict=True)
@@ -1495,7 +1633,7 @@ def main():
             groups = (("manual", manual_cases), ("private-key", private_cases),
                       ("preservation", preservation_cases), ("discovery-tracer", discovery_tracer_cases),
                       ("discovery-boundaries", discovery_boundary_cases), ("login-boundaries", login_boundary_cases),
-                      ("interactive", interactive_cases))
+                      ("interactive", interactive_cases), ("first-run", first_run_cases))
             for name, cases in groups:
                 if options.group in (name, "all"):
                     server.reset()
@@ -1506,7 +1644,7 @@ def main():
                         assert len(calls) == request_count, "offline onboarding contacted a provider"
             required = {"manual": 5, "private-key": 8, "preservation": 12,
                         "discovery-tracer": 7, "discovery-boundaries": 12, "login-boundaries": 7,
-                        "interactive": 15, "all": 66}[options.group]
+                        "interactive": 15, "first-run": 9, "all": 75}[options.group]
             assert len(checks) == required, "missing named onboarding workflow"
             print("ORBIT_CHECK_RECEIPT " + json.dumps({"scenarios": checks}, sort_keys=True))
     return 0

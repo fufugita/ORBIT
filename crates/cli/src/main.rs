@@ -3306,6 +3306,15 @@ fn cmd_chat(args: &[String]) -> i32 {
         eprintln!("ORBIT-E1101: {error}");
         return 2;
     }
+    // Model-independent input must be valid before setup, worktree creation
+    // or session ownership. Keep the parsed value for later capability checks.
+    let requested_effort = match startup_effort_argument(args, std::env::var("ORBIT_EFFORT").ok()) {
+        Ok(effort) => effort,
+        Err(error) => {
+            eprintln!("ORBIT-E1101: {error}");
+            return 2;
+        }
+    };
     // The v1 three-pane HUD was removed; say so rather than pretending the
     // flag is unknown (or, worse, quietly starting the default screen).
     if args.iter().any(|a| a == "--old-tui") {
@@ -3333,6 +3342,61 @@ fn cmd_chat(args: &[String]) -> i32 {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(".orbit"))
     });
+    // Guide only a fresh interactive conversation. Automation, explicit resume
+    // and the existing environment-only provider contract keep their grammar.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && !args
+            .iter()
+            .any(|arg| arg == "--resume" || arg == "--continue")
+    {
+        let configured = match config::ProvidersConfig::load(&home) {
+            Ok(configured) => configured,
+            Err(error) => {
+                eprintln!("ORBIT-E1106: {error}");
+                return 2;
+            }
+        };
+        let environment_provider = value_after(args, "--gate")
+            .or_else(|| std::env::var("ORBIT_GATE_URL").ok())
+            .is_some_and(|value| !value.is_empty())
+            && value_after(args, "--model")
+                .or_else(|| std::env::var("ORBIT_MODEL").ok())
+                .or_else(|| std::env::var("ORBIT_ACTIVE_MODEL").ok())
+                .is_some_and(|value| !value.is_empty());
+        if configured.provider.is_empty() && !environment_provider {
+            match run_onboarding_command(&home, None, "setup") {
+                Ok(receipt) => {
+                    println!("Provider configuration saved.");
+                    if let Some(warnings) = receipt
+                        .get("warnings")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        for warning in warnings.iter().filter_map(serde_json::Value::as_str) {
+                            println!("{warning}");
+                        }
+                    }
+                    if receipt
+                        .get("credential_ready")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                    {
+                        println!(
+                            "Saved for later. Set the credential environment variable shown above, then run orbit again. No model request was made."
+                        );
+                        return 0;
+                    }
+                    println!(
+                        "Saved. Describe a task to begin; your first message will test the provider connection."
+                    );
+                }
+                Err((code, message)) => {
+                    eprintln!("{code}: {message}");
+                    return 2;
+                }
+            }
+        }
+    }
     if let Err((code, msg)) = ensure_initialized(&home) {
         eprintln!("{code}: {msg}");
         return 2;
@@ -3414,14 +3478,12 @@ fn cmd_chat(args: &[String]) -> i32 {
     model = startup_turn.model.clone();
     let mut gate = startup_turn.gate.clone();
     let mut active_provider = startup_turn.provider_id.clone();
-    let mut selected_effort =
-        match startup_effort_argument(args, std::env::var("ORBIT_EFFORT").ok()) {
-            Ok(s) => sessions::startup_effort(s, resumed_file.as_ref(), &model, &active_provider),
-            Err(e) => {
-                eprintln!("ORBIT-E1101: {e}");
-                return 2;
-            }
-        };
+    let mut selected_effort = sessions::startup_effort(
+        requested_effort,
+        resumed_file.as_ref(),
+        &model,
+        &active_provider,
+    );
     if let Err(e) = apply_selected_effort(&home, &mut startup_turn, selected_effort.as_ref()) {
         eprintln!("ORBIT-E0401: {e}");
         return 2;
@@ -3565,10 +3627,23 @@ fn cmd_chat(args: &[String]) -> i32 {
             text: format!("interactive harness — model {model}, session {session}"),
         },
     );
+    if let Ok(directory) = std::env::current_dir() {
+        let directory: String = directory
+            .to_string_lossy()
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        render_hud(
+            &hud,
+            &orbit_hud::HudEvent::Message {
+                text: format!("Project: {directory} · provider {active_provider}"),
+            },
+        );
+    }
     render_hud(
         &hud,
         &orbit_hud::HudEvent::Message {
-            text: "type /help for commands, exit to quit".into(),
+            text: "Describe a task and press Enter. Try: Explain this project. /help shows commands; exit quits.".into(),
         },
     );
 

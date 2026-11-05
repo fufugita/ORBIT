@@ -268,7 +268,6 @@ fn direct_answers() -> Vec<&'static str> {
         "discover",
         "openrouter",
         "1",
-        "yes",
         "family/raw",
         "yes",
     ]
