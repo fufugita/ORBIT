@@ -38,7 +38,11 @@ def main():
     brew = options.brew or shutil.which("brew")
     if not brew:
         parser.error("Homebrew is unavailable; supply --brew or install Homebrew before running this check")
-    brew = Path(brew).resolve(strict=True)
+    # Homebrew derives its prefix from the selected launcher, including symlinks.
+    brew = Path(os.path.abspath(brew))
+    target = brew.resolve(strict=True)
+    if not target.is_file() or not os.access(brew, os.X_OK):
+        parser.error("Homebrew executable must target an executable regular file")
 
     metadata = json.loads(run(brew, "info", "--json=v2", "--formula", options.formula))
     formulae = metadata.get("formulae", [])
