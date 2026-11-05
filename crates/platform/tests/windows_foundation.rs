@@ -27,9 +27,12 @@ fn lock_namespace_is_reserved_consistently() {
 
 #[cfg(windows)]
 mod windows {
-    use orbit_platform::fs::{Directory, EnumerationLimits, LockMode, RemovalState};
+    use orbit_platform::fs::{
+        Directory, EnumerationLimits, InspectionLimits, LockMode, PrivateFileAccess, RemovalState,
+    };
     use std::ffi::OsStr;
     use std::fs;
+    use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,6 +81,70 @@ mod windows {
         Path::new(&std::env::var_os("SystemRoot").unwrap())
             .join("System32")
             .join(program)
+    }
+
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
+        fn visit(root: &Path, current: &Path, entries: &mut Vec<(PathBuf, bool, Vec<u8>)>) {
+            for item in fs::read_dir(current).unwrap() {
+                let item = item.unwrap();
+                let path = item.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let reparse = metadata.file_attributes() & 0x400 != 0;
+                if reparse {
+                    entries.push((relative, true, Vec::new()));
+                } else if metadata.is_dir() {
+                    entries.push((relative, true, Vec::new()));
+                    visit(root, &path, entries);
+                } else {
+                    entries.push((relative, false, fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn run_icacls(path: &Path, args: &[&str]) -> String {
+        let output = Command::new(command("icacls.exe"))
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "icacls {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    fn current_sid() -> String {
+        let output = Command::new(command("whoami.exe"))
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "whoami failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let row = String::from_utf8_lossy(&output.stdout);
+        let sid = row
+            .trim()
+            .split(',')
+            .nth(1)
+            .expect("whoami CSV must include a SID")
+            .trim_matches('"');
+        assert!(sid.starts_with("S-1-"), "invalid current SID: {sid}");
+        sid.to_owned()
     }
 
     #[test]
@@ -903,6 +970,302 @@ mod windows {
                 .open_for_rename(OsStr::new("OTHER.LOCK"), lock_id, &held)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn inspection_empty_root_is_no_effect() {
+        let home = Home::new();
+        let before = tree_snapshot(&home.path());
+        let inspected = home
+            .dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+                max_depth: 4,
+            })
+            .unwrap();
+        assert_eq!(inspected.root_identity, home.dir().identity());
+        assert!(inspected.entries.is_empty());
+        assert_eq!(tree_snapshot(&home.path()), before);
+        assert!(!home.path().join("inspection.lock").exists());
+    }
+
+    #[test]
+    fn inspection_observes_existing_shared_lock_and_nested_files() {
+        let home = Home::new();
+        let nested = home.dir().child(OsStr::new("nested"), true).unwrap();
+        let mut full = nested.create_file(OsStr::new("full.json")).unwrap();
+        full.write_all(b"full control fixture").unwrap();
+        let full_identity = full.identity();
+        drop(full);
+
+        let sid = current_sid();
+        let mut read_only = home.dir().create_file(OsStr::new("read-only.dat")).unwrap();
+        read_only.write_all(b"read-only fixture").unwrap();
+        let read_only_identity = read_only.identity();
+        drop(read_only);
+        let read_only_rule = format!("*{sid}:(R)");
+        run_icacls(
+            &home.path().join("read-only.dat"),
+            &["/grant:r", &read_only_rule],
+        );
+
+        let mut read_execute = home
+            .dir()
+            .create_file(OsStr::new("read-execute.dat"))
+            .unwrap();
+        read_execute.write_all(b"read-execute fixture").unwrap();
+        let read_execute_identity = read_execute.identity();
+        drop(read_execute);
+        let read_execute_rule = format!("*{sid}:(RX)");
+        run_icacls(
+            &home.path().join("read-execute.dat"),
+            &["/grant:r", &read_execute_rule],
+        );
+
+        let seed = home
+            .dir()
+            .try_lock(OsStr::new("existing.lock"), LockMode::Exclusive)
+            .unwrap();
+        let lock_identity = seed.identity();
+        drop(seed);
+        let shared = home
+            .dir()
+            .open_lock_existing(OsStr::new("existing.lock"), LockMode::Shared)
+            .unwrap();
+        assert_eq!(shared.identity(), lock_identity);
+        shared.check().unwrap();
+
+        let before = tree_snapshot(&home.path());
+        let inspected = home
+            .dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+                max_depth: 4,
+            })
+            .unwrap();
+        assert_eq!(inspected.root_identity, home.dir().identity());
+        assert_eq!(inspected.entries.len(), 5);
+        let get = |name: &str| {
+            inspected
+                .entries
+                .iter()
+                .find(|entry| entry.relative_path == Path::new(name))
+                .unwrap_or_else(|| panic!("missing inspected entry {name}"))
+        };
+        assert!(get("nested").directory);
+        assert_eq!(get("nested").identity, nested.identity());
+        assert_eq!(get("nested").file_access, None);
+        assert_eq!(get("nested").snapshot, None);
+
+        let full_entry = get("nested/full.json");
+        assert_eq!(full_entry.identity, full_identity);
+        assert_eq!(full_entry.file_access, Some(PrivateFileAccess::FullControl));
+        assert_eq!(full_entry.snapshot.unwrap().length, 20);
+
+        let read_only_entry = get("read-only.dat");
+        assert_eq!(read_only_entry.identity, read_only_identity);
+        assert_eq!(
+            read_only_entry.file_access,
+            Some(PrivateFileAccess::ReadOnly)
+        );
+        assert_eq!(read_only_entry.snapshot.unwrap().length, 17);
+
+        let read_execute_entry = get("read-execute.dat");
+        assert_eq!(read_execute_entry.identity, read_execute_identity);
+        assert_eq!(
+            read_execute_entry.file_access,
+            Some(PrivateFileAccess::ReadExecute)
+        );
+        assert_eq!(read_execute_entry.snapshot.unwrap().length, 20);
+
+        let lock_entry = get("existing.lock");
+        assert_eq!(lock_entry.identity, lock_identity);
+        assert_eq!(lock_entry.file_access, Some(PrivateFileAccess::FullControl));
+        assert_eq!(lock_entry.snapshot.unwrap().length, 0);
+        assert_eq!(tree_snapshot(&home.path()), before);
+        shared.check().unwrap();
+    }
+
+    #[test]
+    fn inspection_rejects_permissive_and_wrong_owner_entries_without_repair() {
+        let home = Home::new();
+        let nested = home.dir().child(OsStr::new("nested"), true).unwrap();
+        drop(nested.create_file(OsStr::new("private.dat")).unwrap());
+        let nested_path = home.path().join("nested");
+        let permissive_acl = run_icacls(&nested_path, &["/grant", "*S-1-1-0:(F)"]);
+        let before = tree_snapshot(&home.path());
+        assert!(
+            home.dir()
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: 8,
+                    max_name_bytes: 1024,
+                    max_depth: 4,
+                })
+                .is_err()
+        );
+        assert_eq!(tree_snapshot(&home.path()), before);
+        assert_eq!(run_icacls(&nested_path, &[]), permissive_acl);
+        drop(home);
+
+        let home = Home::new();
+        let mut record = home
+            .dir()
+            .create_file(OsStr::new("wrong-owner.dat"))
+            .unwrap();
+        record.write_all(b"owner fixture").unwrap();
+        drop(record);
+        let record_path = home.path().join("wrong-owner.dat");
+        run_icacls(&record_path, &["/setowner", "*S-1-5-32-544"]);
+        let owner_before = run_icacls(&record_path, &["/getowner"]);
+        let before = tree_snapshot(&home.path());
+        assert!(
+            home.dir()
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: 8,
+                    max_name_bytes: 1024,
+                    max_depth: 4,
+                })
+                .is_err()
+        );
+        assert_eq!(tree_snapshot(&home.path()), before);
+        assert_eq!(run_icacls(&record_path, &["/getowner"]), owner_before);
+    }
+
+    #[test]
+    fn inspection_rejects_reparse_and_hardlink_entries() {
+        let home = Home::new();
+        let mut original = home.dir().create_file(OsStr::new("original.dat")).unwrap();
+        original.write_all(b"hardlink fixture").unwrap();
+        drop(original);
+        fs::hard_link(
+            home.path().join("original.dat"),
+            home.path().join("alias.dat"),
+        )
+        .unwrap();
+        let before = tree_snapshot(&home.path());
+        assert!(
+            home.dir()
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: 8,
+                    max_name_bytes: 1024,
+                    max_depth: 4,
+                })
+                .is_err()
+        );
+        assert_eq!(tree_snapshot(&home.path()), before);
+
+        let home = Home::new();
+        let outside = home.base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("canary"), b"unchanged").unwrap();
+        let junction = home.path().join("junction");
+        let output = Command::new(command("cmd.exe"))
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let before = tree_snapshot(&home.path());
+        assert!(
+            home.dir()
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: 8,
+                    max_name_bytes: 1024,
+                    max_depth: 4,
+                })
+                .is_err()
+        );
+        assert_eq!(tree_snapshot(&home.path()), before);
+        assert_eq!(fs::read(outside.join("canary")).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn inspection_limits_reject_extra_entry_path_and_depth_without_changes() {
+        let home = Home::new();
+        drop(home.dir().create_file(OsStr::new("a")).unwrap());
+        let one_entry = home
+            .dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 1,
+                max_name_bytes: 2,
+                max_depth: 1,
+            })
+            .unwrap();
+        assert_eq!(one_entry.entries.len(), 1);
+
+        drop(home.dir().create_file(OsStr::new("b")).unwrap());
+        let before = tree_snapshot(&home.path());
+        assert!(
+            home.dir()
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: 1,
+                    max_name_bytes: 1024,
+                    max_depth: 1,
+                })
+                .is_err()
+        );
+        assert_eq!(tree_snapshot(&home.path()), before);
+        assert!(
+            home.dir()
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: 8,
+                    max_name_bytes: 3,
+                    max_depth: 1,
+                })
+                .is_err()
+        );
+        assert_eq!(tree_snapshot(&home.path()), before);
+
+        let child = home.dir().child(OsStr::new("nested"), true).unwrap();
+        assert!(
+            home.dir()
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: 8,
+                    max_name_bytes: 1024,
+                    max_depth: 1,
+                })
+                .is_ok()
+        );
+        drop(child.create_file(OsStr::new("leaf")).unwrap());
+        let before_nested = tree_snapshot(&home.path());
+        assert!(
+            home.dir()
+                .inspect_private_tree(InspectionLimits {
+                    max_entries: 8,
+                    max_name_bytes: 1024,
+                    max_depth: 1,
+                })
+                .is_err()
+        );
+        assert_eq!(tree_snapshot(&home.path()), before_nested);
+    }
+
+    #[test]
+    fn inspection_holds_root_and_ancestors_while_walking() {
+        let home = Home::new();
+        let mut file = home.dir().create_file(OsStr::new("record")).unwrap();
+        file.write_all(b"stable").unwrap();
+        drop(file);
+        let before = tree_snapshot(&home.path());
+        let inspected = home
+            .dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+                max_depth: 4,
+            })
+            .unwrap();
+        assert_eq!(inspected.root_identity, home.dir().identity());
+        assert!(fs::rename(home.path(), home.base.join("replacement")).is_err());
+        assert!(fs::rename(&home.base, home.base.with_extension("swapped")).is_err());
+        assert_eq!(tree_snapshot(&home.path()), before);
     }
 
     #[test]

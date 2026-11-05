@@ -865,6 +865,7 @@ pub struct PrivateTreeEntry {
     pub relative_path: std::path::PathBuf,
     pub identity: FileIdentity,
     pub directory: bool,
+    /// Observed privacy class only; it is not mutation or transaction authority.
     pub file_access: Option<PrivateFileAccess>,
     pub snapshot: Option<FileSnapshot>,
 }
@@ -921,6 +922,23 @@ fn inspect_directory(
             .ok_or_else(|| invalid("private inspection path limit exceeded"))?;
         state.count += 1;
         paths.push((entry, path));
+    }
+    #[cfg(test)]
+    if INSPECTION_REPLACE_AFTER_ENUMERATION.swap(false, Ordering::SeqCst) {
+        let Some((entry, _)) = paths.iter().find(|(entry, _)| entry.name == "record") else {
+            return Err(invalid("replacement fixture entry was not enumerated"));
+        };
+        let lock = directory.try_lock(OsStr::new("inspection-hook.lock"), LockMode::Exclusive)?;
+        let expected = FileIdentity {
+            volume: directory.identity.volume,
+            file: entry.identity,
+        };
+        let held = directory.open_for_rename(&entry.name, expected, &lock)?;
+        directory.rename(&held.file, OsStr::new("displaced"))?;
+        drop(held);
+        let mut replacement = directory.create_file(&entry.name)?;
+        replacement.write_all(b"replacement bytes")?;
+        replacement.sync_all()?;
     }
     for (entry, path) in paths {
         let access = FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE;
@@ -994,6 +1012,14 @@ fn inspect_directory(
                     }
                 }
                 INSPECTION_DACL_MUTATION_APPLIED.store(true, Ordering::SeqCst);
+            }
+            let access_after = directory
+                .security
+                .check_owner_access(handle.as_raw_handle(), true)?;
+            if access_after != access {
+                return Err(denied(
+                    "inspected file owner or DACL changed after snapshot",
+                ));
             }
             state.entries.push(PrivateTreeEntry {
                 relative_path: path,
@@ -1555,6 +1581,8 @@ thread_local! { static GAP_CHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
 static INSPECTION_DACL_AFTER_SNAPSHOT: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static INSPECTION_DACL_MUTATION_APPLIED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static INSPECTION_REPLACE_AFTER_ENUMERATION: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests {
@@ -1606,6 +1634,7 @@ mod tests {
         fn drop(&mut self) {
             INSPECTION_DACL_AFTER_SNAPSHOT.store(false, Ordering::SeqCst);
             INSPECTION_DACL_MUTATION_APPLIED.store(false, Ordering::SeqCst);
+            INSPECTION_REPLACE_AFTER_ENUMERATION.store(false, Ordering::SeqCst);
         }
     }
 
@@ -1644,8 +1673,8 @@ mod tests {
             max_name_bytes: 1024,
             max_depth: 4,
         });
-        // The candidate deliberately has no post-snapshot ACL recheck. The hook
-        // must prove it changed this fixture before the expected assertion runs.
+        // The hook must prove the owner DACL changed on this fixture after its
+        // file snapshot, before the inspection result is checked.
         assert!(
             INSPECTION_DACL_MUTATION_APPLIED.load(Ordering::SeqCst),
             "the native fixture DACL mutation did not occur"
@@ -1655,6 +1684,30 @@ mod tests {
             result.is_err(),
             "inspection accepted an owner DACL changed after its file snapshot"
         );
+    }
+
+    #[test]
+    fn inspection_revalidates_full_identity_after_replacement() {
+        let home = Home::new();
+        let original = home.original();
+        let _reset_hook = ResetInspectionHook;
+        INSPECTION_REPLACE_AFTER_ENUMERATION.store(true, Ordering::SeqCst);
+
+        let error = home
+            .dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+                max_depth: 4,
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let mut displaced = home.dir().open_file(OsStr::new("displaced")).unwrap();
+        let mut replacement = home.dir().open_file(OsStr::new("record")).unwrap();
+        assert_eq!(displaced.identity(), original);
+        assert_ne!(replacement.identity(), original);
+        assert_eq!(displaced.read_limited(64).unwrap(), b"original");
+        assert_eq!(replacement.read_limited(64).unwrap(), b"replacement bytes");
     }
 
     #[test]
