@@ -32,23 +32,53 @@ use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
+#[derive(Debug)]
+struct OperationError {
+    operation: &'static str,
+    source: io::Error,
+}
+impl std::fmt::Display for OperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {} (OS code {:?})",
+            self.operation,
+            self.source,
+            self.source.raw_os_error()
+        )
+    }
+}
+impl std::error::Error for OperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+fn operation_error(operation: &'static str, source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), OperationError { operation, source })
+}
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
-fn ok(value: i32) -> io::Result<()> {
+fn ok(operation: &'static str, value: i32) -> io::Result<()> {
     if value == 0 {
-        Err(io::Error::last_os_error())
+        Err(operation_error(operation, io::Error::last_os_error()))
     } else {
         Ok(())
     }
 }
-fn hresult(value: i32) -> io::Result<()> {
+fn hresult(operation: &'static str, value: i32) -> io::Result<()> {
     if value >= 0 {
         Ok(())
     } else if value as u32 & 0xffff0000 == 0x80070000 {
-        Err(io::Error::from_raw_os_error(value & 0xffff))
+        Err(operation_error(
+            operation,
+            io::Error::from_raw_os_error(value & 0xffff),
+        ))
     } else {
-        Err(io::Error::other(format!("Windows HRESULT {value:#x}")))
+        Err(operation_error(
+            operation,
+            io::Error::other(format!("Windows HRESULT {value:#x}")),
+        ))
     }
 }
 fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
@@ -59,9 +89,9 @@ fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
     encoded.push(0);
     Ok(encoded)
 }
-fn own(handle: HANDLE) -> io::Result<OwnedHandle> {
+fn own(operation: &'static str, handle: HANDLE) -> io::Result<OwnedHandle> {
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        Err(io::Error::last_os_error())
+        Err(operation_error(operation, io::Error::last_os_error()))
     } else {
         // SAFETY: the caller transfers a successful newly created handle.
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
@@ -106,8 +136,9 @@ impl SandboxSession {
             )
         };
         if status < 0 {
-            return Err(io::Error::from_raw_os_error(
-                unsafe { RtlNtStatusToDosError(status) } as i32,
+            return Err(operation_error(
+                "BCryptGenRandom",
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32),
             ));
         }
         let name = format!(
@@ -117,7 +148,7 @@ impl SandboxSession {
         let name_wide = wide(OsStr::new(&name))?;
         let mut allocated_sid = null_mut();
         // No network, registry, COM or device capability is requested.
-        hresult(unsafe {
+        hresult("CreateAppContainerProfile", unsafe {
             CreateAppContainerProfile(
                 name_wide.as_ptr(),
                 name_wide.as_ptr(),
@@ -134,11 +165,17 @@ impl SandboxSession {
             }
             let mut sid = vec![0u32; (length as usize).div_ceil(4)];
             unsafe {
-                ok(CopySid(length, sid.as_mut_ptr().cast(), allocated_sid))?;
+                ok(
+                    "CopySid",
+                    CopySid(length, sid.as_mut_ptr().cast(), allocated_sid),
+                )?;
             }
             let mut sid_string = null_mut();
             unsafe {
-                ok(ConvertSidToStringSidW(allocated_sid, &mut sid_string))?;
+                ok(
+                    "ConvertSidToStringSidW",
+                    ConvertSidToStringSidW(allocated_sid, &mut sid_string),
+                )?;
             }
             let mut folder_pointer = null_mut();
             let folder_result =
@@ -146,14 +183,14 @@ impl SandboxSession {
             unsafe {
                 LocalFree(sid_string.cast());
             }
-            hresult(folder_result)?;
+            hresult("GetAppContainerFolderPath", folder_result)?;
             let folder_result = unsafe { string_from_pointer(folder_pointer) };
             unsafe {
                 CoTaskMemFree(folder_pointer.cast());
             }
             let folder = PathBuf::from(folder_result?);
             let path = wide(folder.as_os_str())?;
-            let root = own(unsafe {
+            let root = own("CreateFileW(profile root)", unsafe {
                 CreateFileW(
                     path.as_ptr(),
                     FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
@@ -255,11 +292,12 @@ impl SandboxSession {
             )
         };
         if result < 0 {
-            return Err(io::Error::from_raw_os_error(
-                unsafe { RtlNtStatusToDosError(result) } as i32,
+            return Err(operation_error(
+                "NtCreateFile(resource)",
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) } as i32),
             ));
         }
-        let handle = own(handle)?;
+        let handle = own("NtCreateFile(resource handle)", handle)?;
         check_object(handle.as_raw_handle(), false)?;
         Ok(handle)
     }
@@ -276,7 +314,9 @@ impl SandboxSession {
                 self.name
             )));
         }
-        hresult(unsafe { DeleteAppContainerProfile(wide(OsStr::new(&self.name))?.as_ptr()) })?;
+        hresult("DeleteAppContainerProfile", unsafe {
+            DeleteAppContainerProfile(wide(OsStr::new(&self.name))?.as_ptr())
+        })?;
         self.closed = true;
         Ok(())
     }
@@ -298,18 +338,24 @@ fn check_object(handle: HANDLE, directory: bool) -> io::Result<()> {
     let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
     let mut standard = FILE_STANDARD_INFO::default();
     unsafe {
-        ok(GetFileInformationByHandleEx(
-            handle,
-            FileAttributeTagInfo,
-            (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
-            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-        ))?;
-        ok(GetFileInformationByHandleEx(
-            handle,
-            FileStandardInfo,
-            (&mut standard as *mut FILE_STANDARD_INFO).cast(),
-            size_of::<FILE_STANDARD_INFO>() as u32,
-        ))?;
+        ok(
+            "GetFileInformationByHandleEx",
+            GetFileInformationByHandleEx(
+                handle,
+                FileAttributeTagInfo,
+                (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            ),
+        )?;
+        ok(
+            "GetFileInformationByHandleEx",
+            GetFileInformationByHandleEx(
+                handle,
+                FileStandardInfo,
+                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                size_of::<FILE_STANDARD_INFO>() as u32,
+            ),
+        )?;
     }
     if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || standard.DeletePending
@@ -327,20 +373,34 @@ struct Attributes {
 impl Attributes {
     fn new(count: u32) -> io::Result<Self> {
         let mut bytes = 0;
-        unsafe {
-            InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes);
+        let sizing = unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes) };
+        let sizing_error = if sizing == 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        if sizing_error.as_ref().and_then(io::Error::raw_os_error)
+            != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        {
+            return Err(operation_error(
+                "InitializeProcThreadAttributeList(size)",
+                sizing_error.unwrap_or_else(|| invalid("unexpected successful sizing call")),
+            ));
         }
         if bytes == 0 || bytes > 1024 * 1024 {
-            return Err(io::Error::last_os_error());
+            return Err(invalid("attribute-list sizing limit"));
         }
         let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
         unsafe {
-            ok(InitializeProcThreadAttributeList(
-                storage.as_mut_ptr().cast(),
-                count,
-                0,
-                &mut bytes,
-            ))?;
+            ok(
+                "InitializeProcThreadAttributeList",
+                InitializeProcThreadAttributeList(
+                    storage.as_mut_ptr().cast(),
+                    count,
+                    0,
+                    &mut bytes,
+                ),
+            )?;
         }
         Ok(Self { storage })
     }
@@ -348,16 +408,29 @@ impl Attributes {
         self.storage.as_mut_ptr().cast()
     }
     fn set<T>(&mut self, key: u32, value: &T) -> io::Result<()> {
+        let operation = match key {
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES => {
+                "UpdateProcThreadAttribute(SECURITY_CAPABILITIES)"
+            }
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY => {
+                "UpdateProcThreadAttribute(ALL_APPLICATION_PACKAGES_POLICY)"
+            }
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST => "UpdateProcThreadAttribute(HANDLE_LIST)",
+            _ => "UpdateProcThreadAttribute",
+        };
         unsafe {
-            ok(UpdateProcThreadAttribute(
-                self.pointer(),
-                0,
-                key as usize,
-                (value as *const T).cast(),
-                size_of::<T>(),
-                null_mut(),
-                null(),
-            ))
+            ok(
+                operation,
+                UpdateProcThreadAttribute(
+                    self.pointer(),
+                    0,
+                    key as usize,
+                    (value as *const T).cast(),
+                    size_of::<T>(),
+                    null_mut(),
+                    null(),
+                ),
+            )
         }
     }
 }
@@ -377,27 +450,50 @@ fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
     };
     let (mut read, mut write) = (null_mut(), null_mut());
     unsafe {
-        ok(CreatePipe(&mut read, &mut write, &attributes, 4096))?;
+        ok(
+            "CreatePipe",
+            CreatePipe(&mut read, &mut write, &attributes, 4096),
+        )?;
     }
-    Ok((own(read)?, own(write)?))
+    Ok((
+        own("CreatePipe(read)", read)?,
+        own("CreatePipe(write)", write)?,
+    ))
 }
 
 fn token_boolean(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<bool> {
     let mut value = 0u32;
     let mut bytes = 0;
+    let operation = if class == TokenIsAppContainer {
+        "GetTokenInformation(TokenIsAppContainer)"
+    } else if class == TokenIsLessPrivilegedAppContainer {
+        "GetTokenInformation(TokenIsLessPrivilegedAppContainer)"
+    } else {
+        "GetTokenInformation(boolean)"
+    };
     unsafe {
-        ok(GetTokenInformation(
-            token,
-            class,
-            (&mut value as *mut u32).cast(),
-            4,
-            &mut bytes,
-        ))?;
+        ok(
+            operation,
+            GetTokenInformation(token, class, (&mut value as *mut u32).cast(), 4, &mut bytes),
+        )?;
     }
     if bytes != 4 {
         return Err(invalid("token boolean shape"));
     }
     Ok(value != 0)
+}
+
+fn process_completed(process: HANDLE) -> io::Result<bool> {
+    let result = unsafe { WaitForSingleObject(process, 0) };
+    match result {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(operation_error(
+            "WaitForSingleObject(process)",
+            io::Error::last_os_error(),
+        )),
+        _ => Err(invalid("unexpected process wait result")),
+    }
 }
 
 /// Owned group and pipes; the borrow prevents profile removal during execution.
@@ -483,16 +579,14 @@ impl<'a> OwnedProcess<'a> {
         let (stdout_read, stdout_write) = pipe()?;
         let (stderr_read, stderr_write) = pipe()?;
         unsafe {
-            ok(SetHandleInformation(
-                stdout_read.as_raw_handle(),
-                HANDLE_FLAG_INHERIT,
-                0,
-            ))?;
-            ok(SetHandleInformation(
-                stderr_read.as_raw_handle(),
-                HANDLE_FLAG_INHERIT,
-                0,
-            ))?;
+            ok(
+                "SetHandleInformation",
+                SetHandleInformation(stdout_read.as_raw_handle(), HANDLE_FLAG_INHERIT, 0),
+            )?;
+            ok(
+                "SetHandleInformation",
+                SetHandleInformation(stderr_read.as_raw_handle(), HANDLE_FLAG_INHERIT, 0),
+            )?;
         }
         // EOF is the only supported stdin policy in this first production slice.
         drop(stdin_write);
@@ -522,34 +616,42 @@ impl<'a> OwnedProcess<'a> {
         startup.StartupInfo.hStdOutput = stdout_write.as_raw_handle();
         startup.StartupInfo.hStdError = stderr_write.as_raw_handle();
         startup.lpAttributeList = attributes.pointer();
-        let job = own(unsafe { CreateJobObjectW(null(), null()) })?;
+        let job = own("CreateJobObjectW", unsafe {
+            CreateJobObjectW(null(), null())
+        })?;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         unsafe {
-            ok(SetInformationJobObject(
-                job.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ))?;
+            ok(
+                "SetInformationJobObject",
+                SetInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ),
+            )?;
         }
         let mut info = PROCESS_INFORMATION::default();
         unsafe {
-            ok(CreateProcessW(
-                executable.as_ptr(),
-                line.as_mut_ptr(),
-                null(),
-                null(),
-                1,
-                CREATE_SUSPENDED
-                    | CREATE_NO_WINDOW
-                    | CREATE_UNICODE_ENVIRONMENT
-                    | EXTENDED_STARTUPINFO_PRESENT,
-                environment.as_ptr().cast(),
-                directory.as_ptr(),
-                &startup.StartupInfo,
-                &mut info,
-            ))?;
+            ok(
+                "CreateProcessW",
+                CreateProcessW(
+                    executable.as_ptr(),
+                    line.as_mut_ptr(),
+                    null(),
+                    null(),
+                    1,
+                    CREATE_SUSPENDED
+                        | CREATE_NO_WINDOW
+                        | CREATE_UNICODE_ENVIRONMENT
+                        | EXTENDED_STARTUPINFO_PRESENT,
+                    environment.as_ptr().cast(),
+                    directory.as_ptr(),
+                    &startup.StartupInfo,
+                    &mut info,
+                ),
+            )?;
         }
         // SAFETY: successful CreateProcessW returns two new valid owned handles.
         let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };
@@ -573,56 +675,74 @@ impl<'a> OwnedProcess<'a> {
             },
         };
         unsafe {
-            ok(AssignProcessToJobObject(
-                child.job.as_raw_handle(),
-                child.process.as_raw_handle(),
-            ))?;
+            ok(
+                "AssignProcessToJobObject",
+                AssignProcessToJobObject(child.job.as_raw_handle(), child.process.as_raw_handle()),
+            )?;
         }
         child.assigned = true;
         let mut token = null_mut();
         unsafe {
-            ok(OpenProcessToken(
-                child.process.as_raw_handle(),
-                TOKEN_QUERY,
-                &mut token,
-            ))?;
+            ok(
+                "OpenProcessToken",
+                OpenProcessToken(child.process.as_raw_handle(), TOKEN_QUERY, &mut token),
+            )?;
         }
-        let token = own(token)?;
+        let token = own("OpenProcessToken(handle)", token)?;
         let app_container = token_boolean(token.as_raw_handle(), TokenIsAppContainer)?;
         let less_privileged =
             token_boolean(token.as_raw_handle(), TokenIsLessPrivilegedAppContainer)?;
         let mut needed = 0;
-        unsafe {
+        let sizing = unsafe {
             GetTokenInformation(
                 token.as_raw_handle(),
                 TokenCapabilities,
                 null_mut(),
                 0,
                 &mut needed,
-            );
+            )
+        };
+        let sizing_error = if sizing == 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        if sizing_error.as_ref().and_then(io::Error::raw_os_error)
+            != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        {
+            return Err(operation_error(
+                "GetTokenInformation(TokenCapabilities size)",
+                sizing_error.unwrap_or_else(|| invalid("unexpected successful capability sizing")),
+            ));
         }
         if needed < size_of::<u32>() as u32 || needed > 4096 {
             return Err(invalid("token capability shape"));
         }
         let mut groups = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
         unsafe {
-            ok(GetTokenInformation(
-                token.as_raw_handle(),
-                TokenCapabilities,
-                groups.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            ))?;
+            ok(
+                "GetTokenInformation(TokenCapabilities)",
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenCapabilities,
+                    groups.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                ),
+            )?;
         }
         // The variable-length TOKEN_GROUPS buffer can contain only its header.
         let count = unsafe { *groups.as_ptr().cast::<u32>() };
         let mut in_job = 0;
         unsafe {
-            ok(IsProcessInJob(
-                child.process.as_raw_handle(),
-                child.job.as_raw_handle(),
-                &mut in_job,
-            ))?;
+            ok(
+                "IsProcessInJob",
+                IsProcessInJob(
+                    child.process.as_raw_handle(),
+                    child.job.as_raw_handle(),
+                    &mut in_job,
+                ),
+            )?;
         }
         if !app_container || !less_privileged || count != 0 || in_job == 0 {
             return Err(io::Error::other(
@@ -636,7 +756,7 @@ impl<'a> OwnedProcess<'a> {
             job_assigned_before_resume: true,
         };
         if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-            return Err(io::Error::last_os_error());
+            return Err(operation_error("ResumeThread", io::Error::last_os_error()));
         }
         drop(thread);
         drop(stdin_read);
@@ -655,13 +775,16 @@ impl<'a> OwnedProcess<'a> {
     fn active(&self) -> io::Result<u32> {
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         unsafe {
-            ok(QueryInformationJobObject(
-                self.job.as_raw_handle(),
-                JobObjectBasicAccountingInformation,
-                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                null_mut(),
-            ))?;
+            ok(
+                "QueryInformationJobObject",
+                QueryInformationJobObject(
+                    self.job.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    null_mut(),
+                ),
+            )?;
         }
         Ok(info.ActiveProcesses)
     }
@@ -669,15 +792,20 @@ impl<'a> OwnedProcess<'a> {
     fn stop(&mut self) -> io::Result<()> {
         unsafe {
             if self.assigned {
-                ok(TerminateJobObject(self.job.as_raw_handle(), 1))?;
+                ok(
+                    "TerminateJobObject",
+                    TerminateJobObject(self.job.as_raw_handle(), 1),
+                )?;
             } else {
-                ok(TerminateProcess(self.process.as_raw_handle(), 1))?;
+                ok(
+                    "TerminateProcess",
+                    TerminateProcess(self.process.as_raw_handle(), 1),
+                )?;
             }
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let process_done =
-                unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+            let process_done = process_completed(self.process.as_raw_handle())?;
             if process_done && (!self.assigned || self.active()? == 0) {
                 return Ok(());
             }
@@ -723,8 +851,7 @@ impl<'a> OwnedProcess<'a> {
                     stopped = true;
                 }
             }
-            let done =
-                unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+            let done = process_completed(self.process.as_raw_handle())?;
             if done && !stopped && self.active()? != 0 {
                 self.stop()?;
                 stopped = true;
@@ -742,7 +869,10 @@ impl<'a> OwnedProcess<'a> {
         }
         let mut code = 0;
         unsafe {
-            ok(GetExitCodeProcess(self.process.as_raw_handle(), &mut code))?;
+            ok(
+                "GetExitCodeProcess",
+                GetExitCodeProcess(self.process.as_raw_handle(), &mut code),
+            )?;
         }
         self.finished = true;
         Ok(ProcessOutput {
@@ -784,7 +914,10 @@ fn pump(
         return if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA {
             Ok(true)
         } else {
-            Err(io::Error::from_raw_os_error(error as i32))
+            Err(operation_error(
+                "PeekNamedPipe",
+                io::Error::from_raw_os_error(error as i32),
+            ))
         };
     }
     if available == 0 {

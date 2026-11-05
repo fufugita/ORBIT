@@ -5,6 +5,7 @@ mod windows {
     use orbit_platform::fs::Directory;
     use orbit_platform::process::{Completion, SandboxSession, SpawnSpec};
     use std::ffi::OsStr;
+    use std::net::{SocketAddr, ToSocketAddrs};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -35,6 +36,41 @@ mod windows {
         format!("'{}'", value.replace('\'', "''"))
     }
 
+    fn reachable_nonlocal_endpoint() -> SocketAddr {
+        let candidates = ("api.github.com", 443)
+            .to_socket_addrs()
+            .expect("resolve the public TCP control endpoint");
+        for endpoint in candidates.filter(|a| a.is_ipv4()).take(4) {
+            let std::net::IpAddr::V4(ip) = endpoint.ip() else {
+                unreachable!()
+            };
+            if ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+            {
+                continue;
+            }
+            if let Ok(control) =
+                std::net::TcpStream::connect_timeout(&endpoint, Duration::from_secs(3))
+            {
+                assert_eq!(control.peer_addr().unwrap(), endpoint);
+                assert_ne!(
+                    control.local_addr().unwrap().ip(),
+                    endpoint.ip(),
+                    "same-host endpoint is not an outbound control"
+                );
+                // Only the TCP handshake occurs; no application/secret payload is sent.
+                drop(control);
+                return endpoint;
+            }
+        }
+        panic!("public nonlocal TCP control was unreachable; network proof is inconclusive");
+    }
+
     #[test]
     fn powershell_lpac_reads_owned_resources_and_denies_ambient_authority() {
         let session = SandboxSession::create().expect("create ordinary-user profile");
@@ -57,6 +93,14 @@ mod windows {
         let probe = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         drop(listener.accept().unwrap());
         drop(probe);
+        let nonlocal = reachable_nonlocal_endpoint();
+        if let Some(evidence) = std::env::var_os("ORBIT_NATIVE_EVIDENCE_DIR") {
+            std::fs::write(
+                PathBuf::from(evidence).join("network-parent-control.txt"),
+                format!("api.github.com TCP-only control connected to {nonlocal}\n"),
+            )
+            .unwrap();
+        }
         assert!(
             std::env::var_os("ORBIT_FAKE_SECRET").is_some(),
             "parent canary missing"
@@ -77,18 +121,35 @@ function Expect-Denied([scriptblock]$Action) {{
 }}
 Expect-Denied {{ [IO.File]::ReadAllText({secret}) | Out-Null }}
 Expect-Denied {{ [IO.File]::WriteAllText({outside},'bad') }}
-Expect-Denied {{
-  $client=[Net.Sockets.TcpClient]::new()
+function Expect-SocketPolicyDenied([string]$Address,[int]$Port,[string]$Label) {{
+  $client=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork,
+    [Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp)
+  $denied=$false
   try {{
-    $task=$client.ConnectAsync('127.0.0.1',{port})
-    if (-not $task.Wait(2000)) {{ throw 'network deadline' }}
+    try {{
+      $task=$client.ConnectAsync([Net.IPAddress]::Parse($Address),$Port)
+      if (-not $task.Wait(5000)) {{ throw 'network result inconclusive: timeout' }}
+    }} catch {{
+      $cause=$_.Exception
+      while ($cause.InnerException) {{ $cause=$cause.InnerException }}
+      if (($cause -is [Net.Sockets.SocketException]) -and
+          ($cause.SocketErrorCode -eq [Net.Sockets.SocketError]::AccessDenied)) {{
+        $denied=$true
+      }} else {{ throw }}
+    }}
   }} finally {{ $client.Dispose() }}
+  if (-not $denied) {{ throw ('network authority unexpectedly available: '+$Label) }}
+  [Console]::WriteLine('NETWORK_POLICY_DENIED:'+$Label)
 }}
+Expect-SocketPolicyDenied '127.0.0.1' {port} 'loopback'
+Expect-SocketPolicyDenied {nonlocal_ip} {nonlocal_port} 'nonlocal'
 if ([Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')) {{ throw 'ambient secret leaked' }}
 [Console]::WriteLine('DENIALS_OK')
 "#,
             secret = literal(&secret.to_string_lossy()),
-            outside = literal(&outside_write.to_string_lossy())
+            outside = literal(&outside_write.to_string_lossy()),
+            nonlocal_ip = literal(&nonlocal.ip().to_string()),
+            nonlocal_port = nonlocal.port()
         );
         let output = session
             .spawn(&spec(script, Duration::from_secs(30), 65536))
@@ -112,6 +173,8 @@ if ([Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')) {{ throw 'ambien
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains(&format!("ORBIT_PS:{identity}")));
         assert!(stdout.contains("MODULE:") && stdout.contains("DENIALS_OK"));
+        assert!(stdout.contains("NETWORK_POLICY_DENIED:loopback"));
+        assert!(stdout.contains("NETWORK_POLICY_DENIED:nonlocal"));
         assert!(!stdout.contains("fixture-secret-never-in-child"));
         assert_eq!(
             session.read_file(OsStr::new("result.txt"), 100).unwrap(),
