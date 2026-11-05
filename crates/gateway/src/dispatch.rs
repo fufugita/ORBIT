@@ -117,6 +117,11 @@ pub struct EgressReservation {
     pub intent_digest: String,
 }
 
+enum IntentReservationError {
+    Replay,
+    Ledger(LedgerError),
+}
+
 /// The dispatch engine: wires admission → egress fsync → adapter.
 pub struct DispatchEngine {
     /// The registry of provider adapters (kind → adapter).
@@ -214,13 +219,7 @@ impl DispatchEngine {
         match self.recovery_state(session_id, decision_id) {
             Ok(DispatchState::Reserved) => {}
             Ok(_) => {
-                return Err(DispatchError {
-                    code: "E0701",
-                    phase: "dispatch",
-                    message: format!("decision_id {decision_id} already dispatched (E0701)"),
-                    session_id: session_id.into(),
-                    decision_id: decision_id.into(),
-                });
+                return Err(DispatchError::replay(session_id, decision_id));
             }
             Err(e) => {
                 return Err(DispatchError {
@@ -284,7 +283,10 @@ impl DispatchEngine {
         let reservation =
             match self.fsync_egress_intent(ledger_dir, session_id, decision_id, &tuple, &verdict) {
                 Ok(r) => r,
-                Err(e) => {
+                Err(IntentReservationError::Replay) => {
+                    return Err(DispatchError::replay(session_id, decision_id));
+                }
+                Err(IntentReservationError::Ledger(e)) => {
                     return Ok((
                         DispatchOutcome::EgressNotDurable {
                             reason: e.to_string(),
@@ -371,13 +373,7 @@ impl DispatchEngine {
         match self.recovery_state(session_id, decision_id) {
             Ok(DispatchState::Reserved) => {}
             Ok(_) => {
-                return Err(DispatchError {
-                    code: "E0701",
-                    phase: "dispatch",
-                    message: format!("decision_id {decision_id} already dispatched (E0701)"),
-                    session_id: session_id.into(),
-                    decision_id: decision_id.into(),
-                });
+                return Err(DispatchError::replay(session_id, decision_id));
             }
             Err(e) => {
                 return Err(DispatchError {
@@ -443,7 +439,10 @@ impl DispatchEngine {
         let reservation =
             match self.fsync_egress_intent(ledger_dir, session_id, decision_id, &tuple, &verdict) {
                 Ok(r) => r,
-                Err(e) => {
+                Err(IntentReservationError::Replay) => {
+                    return Err(DispatchError::replay(session_id, decision_id));
+                }
+                Err(IntentReservationError::Ledger(e)) => {
                     return Ok((
                         DetailedDispatchOutcome::unknown(DispatchOutcome::EgressNotDurable {
                             reason: e.to_string(),
@@ -541,7 +540,8 @@ impl DispatchEngine {
     /// Append + fsync the EgressIntent to the ledger. This is the point where
     /// a fault (disk full, fsync failure) must BLOCK dispatch (GW-04).
     /// The write window is one short-lived writer: open under contention
-    /// retry, append + fsync, close. Holding the lock across the provider
+    /// retry, authoritative replay check, append + fsync, close. Holding
+    /// the lock across the provider
     /// round instead serialized concurrent sessions behind a whole-round
     /// flock and failed their boot with E0719.
     fn fsync_egress_intent(
@@ -551,7 +551,7 @@ impl DispatchEngine {
         decision_id: &str,
         tuple: &EgressTuple,
         _verdict: &BrokerVerdict,
-    ) -> Result<EgressReservation, LedgerError> {
+    ) -> Result<EgressReservation, IntentReservationError> {
         let intent = EgressIntent {
             session_id: session_id.into(),
             intent_id: decision_id.into(),
@@ -572,9 +572,26 @@ impl DispatchEngine {
         };
         // EgressIntent requires fsync-before-ACK by the ledger's own policy.
         let mut short_lived =
-            LedgerWriter::open_with_retry(ledger_dir, "orbit-egress".into(), "0.1.0")?;
-        let intent_digest = short_lived.append(LedgerEvent::EgressIntent(intent))?;
-        short_lived.close()?;
+            LedgerWriter::open_with_retry(ledger_dir, "orbit-egress".into(), "0.1.0")
+                .map_err(IntentReservationError::Ledger)?;
+        // Only this locked read can authorize a new intent. Another dispatcher
+        // may have consumed the decision since the earlier advisory check.
+        if !matches!(
+            Self::recovery_state_in(ledger_dir, session_id, decision_id)
+                .map_err(IntentReservationError::Ledger)?,
+            DispatchState::Reserved
+        ) {
+            short_lived
+                .close()
+                .map_err(IntentReservationError::Ledger)?;
+            return Err(IntentReservationError::Replay);
+        }
+        let intent_digest = short_lived
+            .append(LedgerEvent::EgressIntent(intent))
+            .map_err(IntentReservationError::Ledger)?;
+        short_lived
+            .close()
+            .map_err(IntentReservationError::Ledger)?;
         Ok(EgressReservation {
             decision_id: decision_id.into(),
             session_id: session_id.into(),
@@ -592,7 +609,15 @@ impl DispatchEngine {
         session_id: &str,
         decision_id: &str,
     ) -> Result<DispatchState, LedgerError> {
-        let (records, _head) = orbit_ledger::verify_ledger(&self.ledger_dir)?;
+        Self::recovery_state_in(&self.ledger_dir, session_id, decision_id)
+    }
+
+    fn recovery_state_in(
+        ledger_dir: &Path,
+        session_id: &str,
+        decision_id: &str,
+    ) -> Result<DispatchState, LedgerError> {
+        let (records, _head) = orbit_ledger::verify_ledger(ledger_dir)?;
         let mut saw_intent_for_decision = false;
         let mut saw_dispatch_for_decision = false;
         for rec in records {
@@ -699,6 +724,16 @@ impl DispatchError {
             message: format!("gate '{gate}' denied model {model} ({code})"),
             session_id: String::new(),
             decision_id: String::new(),
+        }
+    }
+
+    fn replay(session_id: &str, decision_id: &str) -> Self {
+        Self {
+            code: "E0701",
+            phase: "dispatch",
+            message: format!("decision_id {decision_id} already dispatched (E0701)"),
+            session_id: session_id.into(),
+            decision_id: decision_id.into(),
         }
     }
 }
