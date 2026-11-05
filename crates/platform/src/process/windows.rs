@@ -308,6 +308,21 @@ impl SandboxSession {
         OwnedProcess::spawn(self, spec)
     }
 
+    /// Measure the ordinary AppContainer comparison without executing user code.
+    /// Uses the production launch setup with only the LPAC opt-out omitted.
+    /// No child handle escapes; process and Job termination are observed first.
+    pub fn inspect_ordinary_control(&self, spec: &SpawnSpec) -> io::Result<LpacAccessCheck> {
+        let (mut child, thread) = OwnedProcess::create_suspended(self, spec, false)?;
+        let access = LpacAccessCheck {
+            all_application_packages_grant: child.evidence.all_application_packages_grant,
+            own_package_grant: child.evidence.own_package_grant,
+        };
+        child.stop()?;
+        child.finished = true;
+        drop(thread);
+        Ok(access)
+    }
+
     pub fn close(mut self) -> io::Result<()> {
         self.root.take();
         if self.unsafe_cleanup.load(Ordering::Acquire) {
@@ -695,6 +710,23 @@ pub struct OwnedProcess<'a> {
 
 impl<'a> OwnedProcess<'a> {
     fn spawn(session: &'a SandboxSession, spec: &SpawnSpec) -> io::Result<Self> {
+        let (child, thread) = Self::create_suspended(session, spec, true)?;
+        if !child.evidence.less_privileged {
+            return Err(io::Error::other("child failed LPAC admission"));
+        }
+        if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+            return Err(operation_error("ResumeThread", io::Error::last_os_error()));
+        }
+        Ok(child)
+    }
+
+    // Both variants use this exact launch path. Only production can resume;
+    // the ordinary control is inspected and terminated inside its safe API.
+    fn create_suspended(
+        session: &'a SandboxSession,
+        spec: &SpawnSpec,
+        less_privileged: bool,
+    ) -> io::Result<(Self, OwnedHandle)> {
         if spec.timeout.is_zero()
             || spec.timeout > Duration::from_secs(3600)
             || spec.output_limit == 0
@@ -784,12 +816,14 @@ impl<'a> OwnedProcess<'a> {
             stdout_write.as_raw_handle(),
             stderr_write.as_raw_handle(),
         ];
-        let mut attributes = Attributes::new(3)?;
+        let mut attributes = Attributes::new(if less_privileged { 3 } else { 2 })?;
         attributes.set(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &capabilities)?;
-        attributes.set(
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-            &policy,
-        )?;
+        if less_privileged {
+            attributes.set(
+                PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+                &policy,
+            )?;
+        }
         attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles)?;
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -933,7 +967,7 @@ impl<'a> OwnedProcess<'a> {
                 ),
             )?;
         }
-        if !app_container || !less_privileged || count != 0 || in_job == 0 {
+        if !app_container || count != 0 || in_job == 0 {
             return Err(io::Error::other(format!(
                 "child capability or Job verification failed: app_container={app_container}, access={access:?}, capabilities={count}, in_job={in_job}"
             )));
@@ -946,14 +980,10 @@ impl<'a> OwnedProcess<'a> {
             all_application_packages_grant: access.all_application_packages_grant,
             own_package_grant: access.own_package_grant,
         };
-        if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-            return Err(operation_error("ResumeThread", io::Error::last_os_error()));
-        }
-        drop(thread);
         drop(stdin_read);
         drop(stdout_write);
         drop(stderr_write);
-        Ok(child)
+        Ok((child, thread))
     }
 
     pub fn pid(&self) -> u32 {
