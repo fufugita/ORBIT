@@ -100,7 +100,8 @@ mod windows {
             0
         );
         // No LPAC opt-out attribute is set for this negative control.
-        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        let system_root = std::env::var_os("SystemRoot").unwrap();
+        let system = PathBuf::from(&system_root).join("System32");
         let executable: Vec<u16> = system
             .join("cmd.exe")
             .as_os_str()
@@ -108,7 +109,11 @@ mod windows {
             .chain(Some(0))
             .collect();
         let directory: Vec<u16> = system.as_os_str().encode_wide().chain(Some(0)).collect();
-        let environment = [0u16; 2];
+        // Windows activation-context setup needs SystemRoot even though this
+        // control never resumes. Do not inherit the operator's environment.
+        let mut environment: Vec<u16> = OsStr::new("SystemRoot=").encode_wide().collect();
+        environment.extend(system_root.encode_wide());
+        environment.extend([0, 0]);
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.lpAttributeList = attributes.buffer.as_mut_ptr().cast();
