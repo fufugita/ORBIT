@@ -380,12 +380,16 @@ def validate_output(spec, output):
         # composer/effort suites grew beyond their calibrated baselines
         # (terminal now 628 vs 83) without weakening any original check.
         # Every new check is additional observed evidence; the historical
-        # guarantee is "at least the original checks pass, none failed".
-        if len(results) != 1 or int(results[0][0]) < spec["minimum"] or int(results[0][1] or 0):
-            raise EvidenceError("original terminal/composer/effort Results count changed or failed")
-        names = re.findall(r"^\s*PASS\s+(.+)$", output, re.M)
-        if len(names) < spec["minimum"] or re.search(r"^\s*FAIL\s", output, re.M):
-            raise EvidenceError("original Results summary is not backed by successful checks")
+        # guarantee is "at least the original checks ran and passed".
+        summaries = re.findall(r"^(?:== )?Results:.*$", output, re.M)
+        if (len(results) != 1 or len(summaries) != 1
+                or int(results[0][0]) < spec["minimum"]
+                or int(results[0][1] or 0) or int(results[0][2] or 0)):
+            raise EvidenceError("original terminal/composer/effort Results count changed, failed or skipped")
+        names = re.findall(r"^[ \t]*PASS[ \t]+(.+)$", output, re.M)
+        if (len(names) != int(results[0][0])
+                or re.search(r"^[ \t]*(?:FAIL|NOTRUN)(?:[ \t]|$)", output, re.M)):
+            raise EvidenceError("original Results summary is not backed by exactly its successful checks")
         if spec["name"] == "terminal-original" and ("mock provider: started" not in output or "mock provider: already running" in output):
             raise EvidenceError("original terminal suite reused an unrelated mock provider")
         return {"passed": len(names), "checks": names}
