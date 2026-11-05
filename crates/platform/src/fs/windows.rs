@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
-    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Authorization::*;
@@ -525,22 +526,33 @@ impl Directory {
     fn rename(&self, file: &PrivateFile, name: &OsStr) -> io::Result<()> {
         self.prepare(file, name)?;
         let name: Vec<u16> = name.encode_wide().collect();
-        let bytes = offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
+        let bytes = offset_of!(FILE_RENAME_INFORMATION, FileName) + name.len() * 2;
         let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut status = IO_STATUS_BLOCK::default();
         // SAFETY: storage is aligned and large enough for the variable tail;
-        // Windows borrows the buffer only for this synchronous call.
-        unsafe {
+        // both handles remain held, and every PrivateFile was opened with
+        // FILE_SYNCHRONOUS_IO_NONALERT. Native FileRenameInformation accepts
+        // this length-delimited single component relative to RootDirectory.
+        let result = unsafe {
             (*info).Anonymous.ReplaceIfExists = false;
             (*info).RootDirectory = self.handle();
             (*info).FileNameLength = (name.len() * 2) as u32;
             std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-            ok(SetFileInformationByHandle(
+            NtSetInformationFile(
                 file.file.as_raw_handle(),
-                FileRenameInfo,
+                &mut status,
                 info.cast(),
                 bytes as u32,
+                FileRenameInformation,
+            )
+        };
+        if result < 0 {
+            Err(io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(result) } as i32,
             ))
+        } else {
+            Ok(())
         }
     }
 }
