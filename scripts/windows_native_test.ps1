@@ -15,31 +15,45 @@ if ($Group -eq 'HostCapabilities') {
         source=$env:GITHUB_SHA; observation_complete=$false; support_proven=$false
         daemon_usability='unknown_not_contacted'; nested_virtualization_proven=$false
         actual_standard_user_journey_tested=$false; query_timeout_seconds=5
+        optional_feature_timeout_seconds=20; collection_deadline_seconds=60
     }
     function HostError($record) {
         $cause=$record.Exception
         for($i=0;$i -lt 7 -and $null -ne $cause.InnerException;$i++){$cause=$cause.InnerException}
         $errorData=[ordered]@{type=$cause.GetType().FullName;hresult=$cause.HResult}
-        if($cause -is [Microsoft.Management.Infrastructure.CimException]){$errorData.cim_status=$cause.StatusCode.ToString()}
+        if($cause -is [Microsoft.Management.Infrastructure.CimException]){
+            # StatusCode is UInt32; NativeErrorCode is the documented named enum.
+            $errorData.cim_status_code=[uint32]$cause.StatusCode
+            $errorData.cim_status_type=$cause.StatusCode.GetType().FullName
+            $errorData.cim_native_error_code=[int]$cause.NativeErrorCode
+            $errorData.cim_native_error_name=$cause.NativeErrorCode.ToString()
+            $errorData.cim_native_error_type=$cause.NativeErrorCode.GetType().FullName
+        }
         [pscustomobject]$errorData
     }
-    function ReadHostCim([string]$class,[string[]]$properties,[string]$filter='') {
-        if($watch.Elapsed.TotalSeconds -gt 45){
+    function ReadHostCim([string]$class,[string[]]$properties,[string]$filter='',
+        [ValidateRange(1,20)][int]$timeoutSeconds=5) {
+        $remaining=60-$watch.Elapsed.TotalSeconds
+        if($remaining -lt $timeoutSeconds){
             $script:hostCollectionFailed=$true
-            $queries.Add([pscustomobject]@{class=$class;status='collection_deadline_exceeded'})
+            $queries.Add([pscustomobject]@{class=$class;status='insufficient_remaining_deadline';elapsed_seconds=0;
+                requested_timeout_seconds=$timeoutSeconds;remaining_seconds=[math]::Round([math]::Max(0,$remaining),2)})
             return [pscustomobject]@{status='query_error';rows=@()}
         }
+        $queryWatch=[Diagnostics.Stopwatch]::StartNew()
         try {
-            $arguments=@{ClassName=$class;Namespace='root/cimv2';Property=$properties;OperationTimeoutSec=5;ErrorAction='Stop'}
+            $arguments=@{ClassName=$class;Namespace='root/cimv2';Property=$properties;OperationTimeoutSec=$timeoutSeconds;ErrorAction='Stop'}
             if($filter){$arguments.Filter=$filter}
             $rows=@(Get-CimInstance @arguments)
-            $queries.Add([pscustomobject]@{class=$class;status='observed';row_count=$rows.Count})
+            $queries.Add([pscustomobject]@{class=$class;status='observed';row_count=$rows.Count;
+                timeout_seconds=$timeoutSeconds;elapsed_seconds=[math]::Round($queryWatch.Elapsed.TotalSeconds,3)})
             [pscustomobject]@{status='observed';rows=$rows}
         }catch{
             $details=HostError $_
-            $status=if($details.cim_status -in @('InvalidClass','InvalidNamespace','NotSupported')){'unsupported_provider'}else{'query_error'}
+            $status=if($details.cim_native_error_name -in @('InvalidClass','InvalidNamespace','NotSupported')){'unsupported_provider'}else{'query_error'}
             if($status -eq 'query_error'){$script:hostCollectionFailed=$true}
-            $queries.Add([pscustomobject]@{class=$class;status=$status;error=$details})
+            $queries.Add([pscustomobject]@{class=$class;status=$status;error=$details;
+                timeout_seconds=$timeoutSeconds;elapsed_seconds=[math]::Round($queryWatch.Elapsed.TotalSeconds,3)})
             [pscustomobject]@{status=$status;rows=@()}
         }
     }
@@ -92,7 +106,7 @@ if ($Group -eq 'HostCapabilities') {
         # This documented provider supports both client and server editions.
         # A name outside this image's catalog is distinct from Disabled/Absent.
         $featureNames=@('Microsoft-Hyper-V-All','Microsoft-Hyper-V','Hyper-V','Containers','Containers-DisposableClientVM')
-        $featureQuery=ReadHostCim 'Win32_OptionalFeature' @('Name','InstallState') (($featureNames | ForEach-Object {"Name='$_'"}) -join ' OR ')
+        $featureQuery=ReadHostCim 'Win32_OptionalFeature' @('Name','InstallState') (($featureNames | ForEach-Object {"Name='$_'"}) -join ' OR ') -timeoutSeconds 20
         $report.feature_query_path='root/cimv2:Win32_OptionalFeature (documented client/server provider)'
         $report.features=@(foreach($name in $featureNames){
             $matches=@($featureQuery.rows | Where-Object {$_.Name -ceq $name})
