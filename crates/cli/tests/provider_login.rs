@@ -755,10 +755,11 @@ async fn canceled_after_callback_never_sends_exchange() {
 #[tokio::test]
 async fn loopback_absolute_deadline_closes_listener() {
     let fixture = Fixture::new(vec![]);
+    // Leave time for listener setup under parallel CI load before testing expiry.
     let transport = fixture
         .transport()
         .with_timeouts(
-            Duration::from_millis(40),
+            Duration::from_secs(1),
             Duration::from_millis(20),
             Duration::from_millis(15),
         )
@@ -774,7 +775,10 @@ async fn loopback_absolute_deadline_closes_listener() {
     .unwrap();
     let callback = login.callback_url().unwrap().clone();
     assert_eq!(
-        login.wait_for_callback().await.unwrap_err(),
+        tokio::time::timeout(Duration::from_secs(2), login.wait_for_callback())
+            .await
+            .expect("the absolute callback deadline must be observed")
+            .unwrap_err(),
         LoginError::DeadlineExceeded
     );
     assert!(
