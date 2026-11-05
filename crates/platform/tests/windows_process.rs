@@ -16,12 +16,14 @@ mod windows {
     #[test]
     fn ordinary_appcontainer_does_not_pass_lpac_access_probe() {
         let session = SandboxSession::create().unwrap();
+        let script = session
+            .prepare_script(
+                OsStr::new("control.ps1"),
+                "throw 'control must never execute'",
+            )
+            .unwrap();
         let access = session
-            .inspect_ordinary_control(&spec(
-                "throw 'control must never execute'".into(),
-                Duration::from_secs(5),
-                4096,
-            ))
+            .inspect_ordinary_control(&spec(script.path(), Duration::from_secs(5), 4096))
             .unwrap();
         assert!(
             access.own_package_grant && access.all_application_packages_grant,
@@ -36,6 +38,7 @@ mod windows {
             std::fs::write(PathBuf::from(evidence).join("lpac-ordinary-control.txt"),
                 format!("{access:?}\nprimary_thread_never_resumed=true\nobserved_job_active_processes=0\n")).unwrap();
         }
+        drop(script);
         session.close().unwrap();
     }
 
@@ -78,15 +81,15 @@ mod windows {
         assert!(path.is_absolute() && path.is_file());
         path
     }
-    fn spec(script: String, timeout: Duration, output_limit: usize) -> SpawnSpec {
+    fn spec(script: &std::path::Path, timeout: Duration, output_limit: usize) -> SpawnSpec {
         SpawnSpec {
             executable: executable(),
             arguments: vec![
                 "-NoLogo".into(),
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
-                "-Command".into(),
-                script,
+                "-File".into(),
+                script.to_str().expect("owned Unicode script path").into(),
             ],
             timeout,
             output_limit,
@@ -211,8 +214,31 @@ if ([Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')) {{ throw 'ambien
             nonlocal_ip = literal(&nonlocal.ip().to_string()),
             nonlocal_port = nonlocal.port()
         );
+        let prepared = session
+            .prepare_script(OsStr::new("command.ps1"), &script)
+            .unwrap();
+        assert_eq!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(prepared.path())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32),
+            "held script must reject writes with ERROR_SHARING_VIOLATION"
+        );
+        assert_eq!(
+            std::fs::remove_file(prepared.path())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32),
+            "held script must reject deletion with ERROR_SHARING_VIOLATION"
+        );
+        if let Some(evidence) = std::env::var_os("ORBIT_NATIVE_EVIDENCE_DIR") {
+            std::fs::write(PathBuf::from(evidence).join("held-script.txt"),
+                format!("path={}\nidentity={:?}\nbytes_verified=true\nwrite_delete_sharing_denied=true\n", prepared.path().display(), prepared.identity())).unwrap();
+        }
         let child = session
-            .spawn(&spec(script, Duration::from_secs(30), 65536))
+            .spawn(&spec(prepared.path(), Duration::from_secs(30), 65536))
             .unwrap();
         if let Some(evidence) = std::env::var_os("ORBIT_NATIVE_EVIDENCE_DIR") {
             std::fs::write(
@@ -266,6 +292,7 @@ if ([Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')) {{ throw 'ambien
             )
             .unwrap();
         }
+        drop(prepared);
         session.close().unwrap();
         drop(credential);
         drop(directory);
@@ -276,35 +303,35 @@ if ([Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')) {{ throw 'ambien
     #[test]
     fn silent_powershell_deadline_observes_owned_completion() {
         let session = SandboxSession::create().unwrap();
+        let script = session
+            .prepare_script(OsStr::new("silent.ps1"), "Start-Sleep -Seconds 60")
+            .unwrap();
         let started = Instant::now();
         let output = session
-            .spawn(&spec(
-                "Start-Sleep -Seconds 60".into(),
-                Duration::from_secs(2),
-                65536,
-            ))
+            .spawn(&spec(script.path(), Duration::from_secs(2), 65536))
             .unwrap()
             .wait(&AtomicBool::new(false))
             .unwrap();
         assert_eq!(output.completion, Completion::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(10));
+        drop(script);
         session.close().unwrap();
     }
 
     #[test]
     fn powershell_output_limit_observes_owned_completion() {
         let session = SandboxSession::create().unwrap();
+        let script = session
+            .prepare_script(OsStr::new("output.ps1"), "[Console]::Write('x'*200000)")
+            .unwrap();
         let output = session
-            .spawn(&spec(
-                "[Console]::Write('x'*200000)".into(),
-                Duration::from_secs(30),
-                4096,
-            ))
+            .spawn(&spec(script.path(), Duration::from_secs(30), 4096))
             .unwrap()
             .wait(&AtomicBool::new(false))
             .unwrap();
         assert_eq!(output.completion, Completion::OutputLimit);
         assert!(output.stdout.len() + output.stderr.len() <= 4096);
+        drop(script);
         session.close().unwrap();
     }
 }

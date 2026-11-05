@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -128,6 +128,23 @@ pub struct SandboxSession {
     root: Option<OwnedHandle>,
     unsafe_cleanup: AtomicBool,
     closed: bool,
+}
+
+/// Approved script bytes pinned against write/delete access until this guard drops.
+/// The session borrow also keeps its held profile anchor alive.
+pub struct PreparedScript<'a> {
+    _session: &'a SandboxSession,
+    _file: File,
+    path: PathBuf,
+    identity: (u64, [u8; 16]),
+}
+impl PreparedScript<'_> {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn identity(&self) -> (u64, [u8; 16]) {
+        self.identity
+    }
 }
 
 impl SandboxSession {
@@ -262,7 +279,49 @@ impl SandboxSession {
         Ok(bytes)
     }
 
+    pub fn prepare_script(&self, name: &OsStr, source: &str) -> io::Result<PreparedScript<'_>> {
+        validate_component(name)?;
+        if !name.to_str().is_some_and(|name| name.ends_with(".ps1")) || source.len() > 1024 * 1024 {
+            return Err(invalid("expected bounded .ps1 script"));
+        }
+        let mut writer = File::from(self.open_resource(name, true)?);
+        let expected = script_identity(writer.as_raw_handle())?;
+        writer.write_all(source.as_bytes())?;
+        writer.sync_all()?;
+        drop(writer);
+        // Reopen relative to the same held root with no write/delete sharing.
+        // Check both identity and bytes only after this immutable hold exists;
+        // any replacement or modification in the reopen interval fails closed.
+        let mut file = File::from(self.open_resource_with_sharing(name, false, FILE_SHARE_READ)?);
+        let identity = script_identity(file.as_raw_handle())?;
+        if identity != expected {
+            return Err(invalid("prepared script identity changed"));
+        }
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(source.len() as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes != source.as_bytes() {
+            return Err(invalid("prepared script bytes changed"));
+        }
+        Ok(PreparedScript {
+            _session: self,
+            _file: file,
+            path: self.folder.join(name),
+            identity,
+        })
+    }
+
     fn open_resource(&self, name: &OsStr, create: bool) -> io::Result<OwnedHandle> {
+        self.open_resource_with_sharing(name, create, FILE_SHARE_READ | FILE_SHARE_WRITE)
+    }
+
+    fn open_resource_with_sharing(
+        &self,
+        name: &OsStr,
+        create: bool,
+        sharing: u32,
+    ) -> io::Result<OwnedHandle> {
         validate_component(name)?;
         let root = self
             .root
@@ -297,7 +356,7 @@ impl SandboxSession {
                 &mut status,
                 null(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                sharing,
                 if create { FILE_CREATE } else { FILE_OPEN },
                 FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 null(),
@@ -357,6 +416,25 @@ impl Drop for SandboxSession {
             }
         }
     }
+}
+
+fn script_identity(handle: HANDLE) -> io::Result<(u64, [u8; 16])> {
+    let mut information = FILE_ID_INFO::default();
+    unsafe {
+        ok(
+            "GetFileInformationByHandleEx(script identity)",
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                (&mut information as *mut FILE_ID_INFO).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            ),
+        )?;
+    }
+    Ok((
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
 }
 
 fn check_object(handle: HANDLE, directory: bool) -> io::Result<()> {

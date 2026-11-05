@@ -93,7 +93,9 @@ pub struct ProcessOutput {
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{LpacAccessCheck, OwnedProcess, SandboxSession, inspect_lpac_access};
+pub use windows::{
+    LpacAccessCheck, OwnedProcess, PreparedScript, SandboxSession, inspect_lpac_access,
+};
 
 #[cfg(test)]
 mod tests {
