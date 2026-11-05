@@ -176,7 +176,7 @@ $env:CARGO_TERM_COLOR = 'never'
 $env:NO_COLOR = '1'
 if ($Group -eq 'Foundation') {
     $log = Join-Path $EvidenceDir 'foundation.log'
-    cargo +1.99.0 test --locked -p orbit-platform --lib --test windows_foundation -- --test-threads=1 2>&1 |
+    cargo +1.99.0 test --locked --no-fail-fast -p orbit-platform --lib --test windows_foundation -- --test-threads=1 2>&1 |
         Tee-Object -FilePath $log
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $required = @(
@@ -203,6 +203,7 @@ if ($Group -eq 'Foundation') {
         'fs::windows::tests::flush_failure_preserves_original_and_unpublished_candidate',
         'fs::windows::tests::prepublication_failure_restores_expected_original',
         'fs::windows::tests::postpublication_flush_failure_retains_original_backup',
+        'fs::windows::tests::inspection_rechecks_acl_after_snapshot',
         'windows::locked_update_has_explicit_cursor_append_length_and_truncate',
         'windows::lifecycle_rejects_wrong_identity_shared_and_foreign_guards',
         'windows::checked_backup_restore_and_cleanup_preserve_identity',
@@ -216,8 +217,8 @@ if ($Group -eq 'Foundation') {
         'windows::ntfs_short_alias_cannot_bypass_reserved_lock_policy',
         'windows::simultaneous_publication_preserves_the_only_successful_name'
     )
-    if ($required.Count -ne 35 -or @($required | Select-Object -Unique).Count -ne 35) {
-        throw "Foundation's exact required-name manifest must contain 35 unique cases; found $($required.Count)"
+    if ($required.Count -ne 36 -or @($required | Select-Object -Unique).Count -ne 36) {
+        throw "Foundation's exact required-name manifest must contain 36 unique cases; found $($required.Count)"
     }
     $report = Get-Content $log -Raw
     foreach ($case in $required) {

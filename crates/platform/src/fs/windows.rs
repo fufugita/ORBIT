@@ -48,6 +48,15 @@ pub struct FileSnapshot {
     pub attributes: u32,
 }
 
+/// Owner-only file rights accepted by read-only privacy inspection. Mutation
+/// APIs continue to require the original owner-only full-control descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivateFileAccess {
+    ReadOnly,
+    ReadExecute,
+    FullControl,
+}
+
 struct LocalAllocation(*mut c_void);
 impl Drop for LocalAllocation {
     fn drop(&mut self) {
@@ -56,6 +65,7 @@ impl Drop for LocalAllocation {
     }
 }
 
+#[derive(Clone)]
 struct Security {
     sid: Vec<u32>,
     descriptor: Vec<usize>,
@@ -147,6 +157,14 @@ impl Security {
     }
 
     fn check(&self, handle: HANDLE) -> io::Result<()> {
+        self.check_owner_access(handle, false).map(|_| ())
+    }
+
+    fn check_owner_access(
+        &self,
+        handle: HANDLE,
+        readable_file: bool,
+    ) -> io::Result<PrivateFileAccess> {
         let mut owner = null_mut();
         let mut dacl = null_mut();
         let mut descriptor = null_mut();
@@ -196,14 +214,21 @@ impl Security {
         }
         let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
         let sid = (&allowed.SidStart as *const u32).cast_mut().cast();
-        if allowed.Mask != FILE_ALL_ACCESS
-            || unsafe { GetLengthSid(sid) } as usize
-                > header.AceSize as usize - offset_of!(ACCESS_ALLOWED_ACE, SidStart)
+        if unsafe { GetLengthSid(sid) } as usize
+            > header.AceSize as usize - offset_of!(ACCESS_ALLOWED_ACE, SidStart)
             || unsafe { EqualSid(sid, self.sid.as_ptr().cast_mut().cast()) } == 0
         {
-            return Err(denied("state DACL is not owner-only full control"));
+            return Err(denied("state DACL is not owner-only"));
         }
-        Ok(())
+        if allowed.Mask == FILE_ALL_ACCESS {
+            Ok(PrivateFileAccess::FullControl)
+        } else if readable_file && allowed.Mask == FILE_GENERIC_READ {
+            Ok(PrivateFileAccess::ReadOnly)
+        } else if readable_file && allowed.Mask == FILE_GENERIC_READ | FILE_GENERIC_EXECUTE {
+            Ok(PrivateFileAccess::ReadExecute)
+        } else {
+            Err(denied("unsupported owner-private access mask"))
+        }
     }
 }
 
@@ -785,6 +810,201 @@ impl Directory {
         }
         Ok(checked)
     }
+
+    /// Observe a bounded private tree without creating a transaction lock.
+    /// This is read-only evidence; it is not an atomic namespace snapshot.
+    pub fn inspect_private_tree(
+        &self,
+        limits: InspectionLimits,
+    ) -> io::Result<PrivateTreeInspection> {
+        self.check()?;
+        if limits.max_entries == 0
+            || limits.max_entries > 4096
+            || limits.max_name_bytes == 0
+            || limits.max_name_bytes > 1048576
+            || limits.max_depth == 0
+            || limits.max_depth > 128
+        {
+            return Err(invalid("invalid private inspection limits"));
+        }
+        let mut state = InspectionState {
+            entries: Vec::new(),
+            count: 0,
+            name_bytes: 0,
+        };
+        inspect_directory(self, Path::new(""), 0, limits, &mut state)?;
+        self.check()?;
+        state
+            .entries
+            .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        Ok(PrivateTreeInspection {
+            root_identity: self.identity,
+            entries: state.entries,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InspectionLimits {
+    pub max_entries: usize,
+    /// Total UTF-16 bytes of the returned relative paths, including separators.
+    pub max_name_bytes: usize,
+    /// Maximum number of components below the inspected root.
+    pub max_depth: usize,
+}
+
+#[derive(Debug)]
+pub struct PrivateTreeInspection {
+    pub root_identity: FileIdentity,
+    pub entries: Vec<PrivateTreeEntry>,
+}
+
+#[derive(Debug)]
+pub struct PrivateTreeEntry {
+    /// Display/comparison evidence only; this path carries no access authority.
+    pub relative_path: std::path::PathBuf,
+    pub identity: FileIdentity,
+    pub directory: bool,
+    pub file_access: Option<PrivateFileAccess>,
+    pub snapshot: Option<FileSnapshot>,
+}
+
+struct InspectionState {
+    entries: Vec<PrivateTreeEntry>,
+    count: usize,
+    name_bytes: usize,
+}
+
+fn inspect_directory(
+    directory: &Directory,
+    prefix: &Path,
+    depth: usize,
+    limits: InspectionLimits,
+    state: &mut InspectionState,
+) -> io::Result<()> {
+    directory.check()?;
+    let raw = {
+        let _cursor = directory
+            .enumeration
+            .lock()
+            .map_err(|_| io::Error::other("directory cursor poisoned"))?;
+        directory_entries(
+            directory.handle(),
+            EnumerationLimits {
+                // A zero remainder still permits checking an empty directory.
+                max_entries: limits.max_entries.saturating_sub(state.count).max(1),
+                max_name_bytes: limits
+                    .max_name_bytes
+                    .saturating_sub(state.name_bytes)
+                    .max(2),
+            },
+        )?
+    };
+    let mut paths = Vec::with_capacity(raw.len());
+    // Account for the complete listing before descending, so pending sibling
+    // listings cannot multiply memory beyond the global path/entry budgets.
+    for entry in raw {
+        if depth + 1 > limits.max_depth || state.count == limits.max_entries {
+            return Err(invalid("private inspection entry or depth limit exceeded"));
+        }
+        let path = prefix.join(&entry.name);
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .count()
+            .checked_mul(2)
+            .ok_or_else(|| invalid("inspection path size overflow"))?;
+        state.name_bytes = state
+            .name_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= limits.max_name_bytes)
+            .ok_or_else(|| invalid("private inspection path limit exceeded"))?;
+        state.count += 1;
+        paths.push((entry, path));
+    }
+    for (entry, path) in paths {
+        let access = FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE;
+        #[cfg(test)]
+        let access = if INSPECTION_DACL_AFTER_SNAPSHOT.load(Ordering::SeqCst) {
+            access | WRITE_DAC
+        } else {
+            access
+        };
+        let handle = relative(
+            directory.handle(),
+            &entry.name,
+            entry.directory,
+            FILE_OPEN,
+            access,
+            null(),
+        )?;
+        let expected = FileIdentity {
+            volume: directory.identity.volume,
+            file: entry.identity,
+        };
+        if identity(handle.as_raw_handle())? != expected {
+            return Err(denied("inspected entry identity changed"));
+        }
+        if entry.directory {
+            directory.security.check(handle.as_raw_handle())?;
+            let mut chain = directory.chain.clone();
+            chain.push(Arc::new(handle));
+            let child = Directory {
+                chain,
+                identity: expected,
+                security: directory.security.clone(),
+                enumeration: Mutex::new(()),
+            };
+            state.entries.push(PrivateTreeEntry {
+                relative_path: path.clone(),
+                identity: expected,
+                directory: true,
+                file_access: None,
+                snapshot: None,
+            });
+            inspect_directory(&child, &path, depth + 1, limits, state)?;
+            child.check()?;
+        } else {
+            let access = directory
+                .security
+                .check_owner_access(handle.as_raw_handle(), true)?;
+            let snapshot = file_snapshot(handle.as_raw_handle(), expected)?;
+            #[cfg(test)]
+            if INSPECTION_DACL_AFTER_SNAPSHOT.swap(false, Ordering::SeqCst) {
+                // Test-only adversary: change only the owned fixture leaf through
+                // its already-held WRITE_DAC handle after the observed snapshot.
+                let mut acl = [0u64; 2];
+                unsafe {
+                    ok(InitializeAcl(
+                        acl.as_mut_ptr().cast(),
+                        size_of::<ACL>() as u32,
+                        ACL_REVISION,
+                    ))?;
+                    let code = SetSecurityInfo(
+                        handle.as_raw_handle(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        acl.as_mut_ptr().cast(),
+                        null_mut(),
+                    );
+                    if code != ERROR_SUCCESS {
+                        return Err(io::Error::from_raw_os_error(code as i32));
+                    }
+                }
+                INSPECTION_DACL_MUTATION_APPLIED.store(true, Ordering::SeqCst);
+            }
+            state.entries.push(PrivateTreeEntry {
+                relative_path: path,
+                identity: expected,
+                directory: false,
+                file_access: Some(access),
+                snapshot: Some(snapshot),
+            });
+        }
+    }
+    directory.check()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1331,10 +1551,111 @@ fn point(_name: &'static str) -> io::Result<()> {
 thread_local! { static FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 thread_local! { static GAP_CHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+static INSPECTION_DACL_AFTER_SNAPSHOT: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static INSPECTION_DACL_MUTATION_APPLIED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RestoreDaclOnDrop {
+        handle: OwnedHandle,
+        descriptor: Vec<usize>,
+    }
+    impl RestoreDaclOnDrop {
+        fn restore(&self) -> io::Result<()> {
+            let mut dacl = null_mut();
+            let mut present = 0;
+            let mut defaulted = 0;
+            unsafe {
+                ok(GetSecurityDescriptorDacl(
+                    self.descriptor.as_ptr().cast_mut().cast(),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                ))?;
+                if present == 0 || dacl.is_null() {
+                    return Err(invalid("fixture owner DACL unavailable for restoration"));
+                }
+                let code = SetSecurityInfo(
+                    self.handle.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    dacl,
+                    null_mut(),
+                );
+                if code != ERROR_SUCCESS {
+                    return Err(io::Error::from_raw_os_error(code as i32));
+                }
+            }
+            Ok(())
+        }
+    }
+    impl Drop for RestoreDaclOnDrop {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+
+    struct ResetInspectionHook;
+    impl Drop for ResetInspectionHook {
+        fn drop(&mut self) {
+            INSPECTION_DACL_AFTER_SNAPSHOT.store(false, Ordering::SeqCst);
+            INSPECTION_DACL_MUTATION_APPLIED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn inspection_rechecks_acl_after_snapshot() {
+        let home = Home::new();
+        let mut file = home.dir().create_file(OsStr::new("record")).unwrap();
+        file.write_all(b"fixture only").unwrap();
+        drop(file);
+
+        let path = home.base.join("state").join("record");
+        let path_wide = wide(path.as_os_str());
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                READ_CONTROL | WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let restore = RestoreDaclOnDrop {
+            // SAFETY: CreateFileW succeeded and transfers one owned handle.
+            handle: unsafe { OwnedHandle::from_raw_handle(handle) },
+            descriptor: home.dir().security.descriptor.clone(),
+        };
+
+        INSPECTION_DACL_MUTATION_APPLIED.store(false, Ordering::SeqCst);
+        let _reset_hook = ResetInspectionHook;
+        INSPECTION_DACL_AFTER_SNAPSHOT.store(true, Ordering::SeqCst);
+        let result = home.dir().inspect_private_tree(InspectionLimits {
+            max_entries: 8,
+            max_name_bytes: 1024,
+            max_depth: 4,
+        });
+        // The candidate deliberately has no post-snapshot ACL recheck. The hook
+        // must prove it changed this fixture before the expected assertion runs.
+        assert!(
+            INSPECTION_DACL_MUTATION_APPLIED.load(Ordering::SeqCst),
+            "the native fixture DACL mutation did not occur"
+        );
+        restore.restore().unwrap();
+        assert!(
+            result.is_err(),
+            "inspection accepted an owner DACL changed after its file snapshot"
+        );
+    }
 
     #[test]
     fn removal_faults_report_preserved_or_disposition_acknowledged_state() {

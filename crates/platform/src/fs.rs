@@ -79,7 +79,8 @@ pub fn validate_data_component(name: &OsStr) -> io::Result<()> {
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    Directory, DirectoryEntry, Durability, EnumerationLimits, FileIdentity, FileSnapshot, LockMode,
-    MutationFile, PrivateFile, Publication, PublicationState, PublishError, Removal, RemovalError,
+    Directory, DirectoryEntry, Durability, EnumerationLimits, FileIdentity, FileSnapshot,
+    InspectionLimits, LockMode, MutationFile, PrivateFile, PrivateFileAccess, PrivateTreeEntry,
+    PrivateTreeInspection, Publication, PublicationState, PublishError, Removal, RemovalError,
     RemovalState, StateLock, UpdateFile,
 };
