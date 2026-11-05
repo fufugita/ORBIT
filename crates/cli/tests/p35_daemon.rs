@@ -1031,15 +1031,31 @@ fn symlinked_request_record_refuses_startup_preserving_authority() {
     let runtime = fixture.start();
     runtime.shutdown().unwrap();
     let session = fixture.root.join("sessions/owned.json");
+    let lease = SessionLease::acquire(&fixture.root, "owned", "daemon").unwrap();
+    let mut baseline = lease.load().unwrap();
+    // Startup reconstructs updated_at with second resolution. An old value
+    // makes an unwanted rewrite visible without relying on a clock boundary.
+    baseline.updated_at = "0".into();
+    lease.save(&baseline).unwrap();
+    // Keep the old inode alive so atomic replacement cannot hide behind
+    // immediate inode reuse, even if the replacement bytes are identical.
+    let held_snapshot = fs::File::open(&session).unwrap();
+    let prior_metadata = held_snapshot.metadata().unwrap();
+    let prior_identity = (prior_metadata.dev(), prior_metadata.ino());
     let prior = fs::read(&session).unwrap();
     let claims = fixture.root.join("sessions/.requests/owned.json");
     fs::remove_file(&claims).unwrap();
     let outside = fixture.root.join("unrelated.txt");
     fs::write(&outside, b"unrelated").unwrap();
     symlink(&outside, &claims).unwrap();
-    let lease = SessionLease::acquire(&fixture.root, "owned", "daemon").unwrap();
     assert!(OwnerRuntime::start(fixture.config.clone(), lease).is_err());
     assert_eq!(fs::read(&outside).unwrap(), b"unrelated");
+    let after = fs::symlink_metadata(&session).unwrap();
+    assert_eq!(
+        (after.dev(), after.ino()),
+        prior_identity,
+        "refused startup must not replace the saved-session inode"
+    );
     assert_eq!(fs::read(&session).unwrap(), prior);
     assert_eq!(fixture.calls().len(), 0);
 }

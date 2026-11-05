@@ -959,6 +959,10 @@ impl OwnerRuntime {
         .with_effort(config.turn.effort.clone())
         .with_selection_origin(origin);
         file.bind_workspace(&config.working_dir)?;
+        // Refuse invalid request storage before accounting preparation can
+        // bootstrap or rewrite the authoritative saved session.
+        let request_store = request_storage::RequestStore::new(lease.home(), lease.session_id())?;
+        let saved = request_store.load(lease.session_id())?;
         // Normal startup has already anchored its precise origin. A standalone
         // owner cannot infer a fresh namespace from an empty initial transcript.
         let adapter = prepare_root(&lease, &mut file, RootOrigin::RestoredOrLegacy)?;
@@ -990,11 +994,6 @@ impl OwnerRuntime {
             cost_microcents: accounting.file.cost_microcents,
             accounting: accounting.summary,
         };
-        // Validate the request store before anything persists session state:
-        // a refused startup must leave the saved record byte-identical, and
-        // prepare_root has already rewritten it (a fresh updated_at) by now.
-        let request_store = request_storage::RequestStore::new(lease.home(), lease.session_id())?;
-        let saved = request_store.load(lease.session_id())?;
         let (commands, receiver) = mpsc::sync_channel(1);
         let handle = OwnerHandle {
             hub: Arc::new(Mutex::new(Hub {
