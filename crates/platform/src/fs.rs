@@ -39,12 +39,47 @@ pub fn validate_component(name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+/// Stable transaction locks use a reserved, case-insensitive `.lock` suffix.
+/// Data operations cannot rename, update or remove this namespace.
+pub fn validate_lock_component(name: &OsStr) -> io::Result<()> {
+    validate_component(name)?;
+    if !name
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase()
+        .ends_with(".lock")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lock names must end in .lock",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_data_component(name: &OsStr) -> io::Result<()> {
+    validate_component(name)?;
+    if name
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase()
+        .ends_with(".lock")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reserved transaction-lock name",
+        ));
+    }
+    Ok(())
+}
+
 /// The Windows implementation requires a local fixed NTFS volume. Other
 /// platforms deliberately expose no successful storage fallback here.
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    Directory, Durability, FileIdentity, LockMode, PrivateFile, Publication, PublicationState,
-    PublishError, StateLock,
+    Directory, DirectoryEntry, Durability, EnumerationLimits, FileIdentity, LockMode, MutationFile,
+    PrivateFile, Publication, PublicationState, PublishError, Removal, RemovalError, RemovalState,
+    StateLock, UpdateFile,
 };

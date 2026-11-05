@@ -5,22 +5,23 @@
 //! Files may be renamed only through their own held handles. Owner identity is
 //! the effective TokenUser SID, never a token's default owner group.
 
-use super::validate_component;
+use super::{validate_component, validate_data_component, validate_lock_component};
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::{offset_of, size_of};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, Prefix};
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
-    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
-    FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
+    FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+    FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation, FileRenameInformation, NtCreateFile,
+    NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Authorization::*;
@@ -202,6 +203,7 @@ pub struct Directory {
     chain: Vec<Arc<OwnedHandle>>,
     identity: FileIdentity,
     security: Security,
+    enumeration: Mutex<()>,
 }
 
 impl Directory {
@@ -315,6 +317,7 @@ impl Directory {
             identity: identity(handle)?,
             chain,
             security,
+            enumeration: Mutex::new(()),
         })
     }
 
@@ -333,6 +336,7 @@ impl Directory {
     }
 
     pub fn child(&self, name: &OsStr, create: bool) -> io::Result<Self> {
+        validate_data_component(name)?;
         self.check()?;
         let security = Security::current()?;
         let handle = relative(
@@ -347,6 +351,7 @@ impl Directory {
                 null()
             },
         )?;
+        validate_data_component(&held_leaf(handle.as_raw_handle())?)?;
         security.check(handle.as_raw_handle())?;
         let identity = identity(handle.as_raw_handle())?;
         let mut chain = self.chain.clone();
@@ -355,16 +360,30 @@ impl Directory {
             chain,
             identity,
             security,
+            enumeration: Mutex::new(()),
         })
     }
 
     pub fn open_file(&self, name: &OsStr) -> io::Result<PrivateFile> {
+        validate_data_component(name)?;
         self.file(name, FILE_OPEN, false)
     }
     pub fn create_file(&self, name: &OsStr) -> io::Result<PrivateFile> {
+        validate_data_component(name)?;
         self.file(name, FILE_CREATE, true)
     }
     fn file(&self, name: &OsStr, disposition: u32, rename: bool) -> io::Result<PrivateFile> {
+        let access = if rename {
+            FILE_ALL_ACCESS
+        } else if disposition == FILE_OPEN {
+            FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE
+        } else {
+            FILE_ALL_ACCESS & !DELETE
+        };
+        self.file_access(name, disposition, access)
+    }
+
+    fn file_access(&self, name: &OsStr, disposition: u32, access: u32) -> io::Result<PrivateFile> {
         self.check()?;
         let security = Security::current()?;
         let handle = relative(
@@ -372,17 +391,19 @@ impl Directory {
             name,
             false,
             disposition,
-            if rename {
-                FILE_ALL_ACCESS
-            } else {
-                FILE_ALL_ACCESS & !DELETE
-            },
+            access,
             if disposition != FILE_OPEN {
                 security.descriptor.as_ptr().cast()
             } else {
                 null()
             },
         )?;
+        let actual = held_leaf(handle.as_raw_handle())?;
+        if validate_lock_component(name).is_ok() {
+            validate_lock_component(&actual)?;
+        } else {
+            validate_data_component(&actual)?;
+        }
         security.check(handle.as_raw_handle())?;
         let identity = identity(handle.as_raw_handle())?;
         let file = File::from(handle);
@@ -392,10 +413,13 @@ impl Directory {
             parent: self.identity,
             _anchors: self.chain.clone(),
             security,
+            writable_candidate: AtomicBool::new(disposition == FILE_CREATE),
+            publication: Mutex::new(()),
         })
     }
 
     pub fn try_lock(&self, name: &OsStr, mode: LockMode) -> io::Result<StateLock> {
+        validate_lock_component(name)?;
         let file = self.file(name, FILE_OPEN_IF, false)?;
         let mut overlap = OVERLAPPED::default();
         let flags = LOCKFILE_FAIL_IMMEDIATELY
@@ -419,6 +443,21 @@ impl Directory {
 
     /// Publish a new name without replacing any existing object.
     pub fn publish_new(
+        &self,
+        file: &PrivateFile,
+        name: &OsStr,
+    ) -> Result<Publication, PublishError> {
+        let _publication = file
+            .publication
+            .lock()
+            .map_err(|_| io::Error::other("publication capability poisoned"))?;
+        if !file.writable_candidate.load(Ordering::Relaxed) {
+            return Err(denied("publication requires an unpublished candidate").into());
+        }
+        self.publish_checked(file, name)
+    }
+
+    fn publish_checked(
         &self,
         file: &PrivateFile,
         name: &OsStr,
@@ -456,6 +495,13 @@ impl Directory {
         expected: FileIdentity,
         lock: &StateLock,
     ) -> Result<Publication, PublishError> {
+        let _publication = file
+            .publication
+            .lock()
+            .map_err(|_| io::Error::other("publication capability poisoned"))?;
+        if !file.writable_candidate.load(Ordering::Relaxed) {
+            return Err(denied("replacement requires an unpublished candidate").into());
+        }
         if lock.mode != LockMode::Exclusive || lock.file.parent != self.identity {
             return Err(denied("replacement requires this directory's exclusive lock").into());
         }
@@ -514,7 +560,7 @@ impl Directory {
     }
 
     fn prepare(&self, file: &PrivateFile, name: &OsStr) -> io::Result<()> {
-        validate_component(name)?;
+        validate_data_component(name)?;
         self.check()?;
         file.check()?;
         if file.parent != self.identity {
@@ -552,9 +598,429 @@ impl Directory {
                 unsafe { RtlNtStatusToDosError(result) } as i32,
             ))
         } else {
+            file.writable_candidate.store(false, Ordering::Relaxed);
             Ok(())
         }
     }
+}
+
+impl Directory {
+    fn require_lock(&self, lock: &StateLock, exclusive: bool) -> io::Result<()> {
+        self.check()?;
+        lock.file.check()?;
+        if lock.file.parent != self.identity || (exclusive && lock.mode != LockMode::Exclusive) {
+            return Err(denied(
+                "operation requires the same directory's transaction lock",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Existing state is writable only while this borrowed exclusive guard lives.
+    pub fn open_for_update<'lock>(
+        &self,
+        name: &OsStr,
+        expected: FileIdentity,
+        lock: &'lock StateLock,
+    ) -> io::Result<UpdateFile<'lock>> {
+        validate_data_component(name)?;
+        self.require_lock(lock, true)?;
+        let file = self.file_access(
+            name,
+            FILE_OPEN,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | SYNCHRONIZE,
+        )?;
+        if file.identity != expected {
+            return Err(denied("update identity changed"));
+        }
+        Ok(UpdateFile { file, lock })
+    }
+
+    /// Reopen one expected private object for rename/delete, without a pathname
+    /// escape. Release older reader handles before acquiring this capability.
+    pub fn open_for_rename<'lock>(
+        &self,
+        name: &OsStr,
+        expected: FileIdentity,
+        lock: &'lock StateLock,
+    ) -> io::Result<MutationFile<'lock>> {
+        validate_data_component(name)?;
+        self.require_lock(lock, true)?;
+        let file = self.file(name, FILE_OPEN, true)?;
+        if file.identity != expected {
+            return Err(denied("mutation identity changed"));
+        }
+        Ok(MutationFile { file, lock })
+    }
+
+    /// Restore the selected held backup into an absent name. An occupied target
+    /// is never replaced; retain its identity and the backup after uncertainty.
+    pub fn restore_backup(
+        &self,
+        backup: MutationFile<'_>,
+        name: &OsStr,
+    ) -> Result<Publication, PublishError> {
+        self.require_lock(backup.lock, true)?;
+        self.publish_checked(&backup.file, name)
+    }
+
+    /// Consume a checked DELETE-capable file. A disposition acknowledgement is
+    /// not a claim about power-loss durability or later namespace occupants.
+    pub fn remove_file(&self, file: MutationFile<'_>) -> Result<Removal, RemovalError> {
+        self.require_lock(file.lock, true)?;
+        self.prepare(&file.file, OsStr::new("checked-removal"))?;
+        let result = remove_handle(file.file.file.as_raw_handle(), file.file.identity);
+        drop(file); // A disposition-marked handle is only closed, never reused.
+        result
+    }
+
+    /// Remove only an expected private, empty child with no outstanding anchors.
+    pub fn remove_empty_child(
+        &self,
+        name: &OsStr,
+        expected: FileIdentity,
+        lock: &StateLock,
+    ) -> Result<Removal, RemovalError> {
+        validate_data_component(name)?;
+        self.require_lock(lock, true)?;
+        let handle = relative(
+            self.handle(),
+            name,
+            true,
+            FILE_OPEN,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | DELETE,
+            null(),
+        )?;
+        validate_data_component(&held_leaf(handle.as_raw_handle())?)?;
+        self.security.check(handle.as_raw_handle())?;
+        if identity(handle.as_raw_handle())? != expected {
+            return Err(denied("child identity changed").into());
+        }
+        if !directory_entries(
+            handle.as_raw_handle(),
+            EnumerationLimits {
+                max_entries: 1,
+                max_name_bytes: 65536,
+            },
+        )?
+        .is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                "private child is not empty",
+            )
+            .into());
+        }
+        let result = remove_handle(handle.as_raw_handle(), expected);
+        drop(handle);
+        result
+    }
+
+    /// A bounded snapshot under a shared/exclusive transaction guard. Entries
+    /// are evidence only: mutation must reopen and verify the selected identity.
+    pub fn enumerate(
+        &self,
+        limits: EnumerationLimits,
+        lock: &StateLock,
+    ) -> io::Result<Vec<DirectoryEntry>> {
+        self.require_lock(lock, false)?;
+        let _cursor = self
+            .enumeration
+            .lock()
+            .map_err(|_| io::Error::other("directory cursor poisoned"))?;
+        let raw = directory_entries(self.handle(), limits)?;
+        let mut checked = Vec::with_capacity(raw.len());
+        for entry in raw {
+            let expected = FileIdentity {
+                volume: self.identity.volume,
+                file: entry.identity,
+            };
+            let handle = relative(
+                self.handle(),
+                &entry.name,
+                entry.directory,
+                FILE_OPEN,
+                FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE,
+                null(),
+            )?;
+            self.security.check(handle.as_raw_handle())?;
+            if identity(handle.as_raw_handle())? != expected {
+                return Err(denied("enumerated entry changed"));
+            }
+            checked.push(DirectoryEntry {
+                name: entry.name,
+                identity: expected,
+                directory: entry.directory,
+            });
+        }
+        Ok(checked)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EnumerationLimits {
+    pub max_entries: usize,
+    pub max_name_bytes: usize,
+}
+#[derive(Debug)]
+pub struct DirectoryEntry {
+    pub name: OsString,
+    pub identity: FileIdentity,
+    pub directory: bool,
+}
+struct RawEntry {
+    name: OsString,
+    identity: [u8; 16],
+    directory: bool,
+}
+
+fn directory_entries(handle: HANDLE, limits: EnumerationLimits) -> io::Result<Vec<RawEntry>> {
+    if limits.max_entries == 0
+        || limits.max_entries > 4096
+        || limits.max_name_bytes == 0
+        || limits.max_name_bytes > 1048576
+    {
+        return Err(invalid("invalid directory enumeration limits"));
+    }
+    let mut entries = Vec::new();
+    let mut name_bytes = 0usize;
+    let mut buffer = vec![0u64; 8192];
+    let capacity = buffer.len() * size_of::<u64>();
+    let header = offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
+    let mut class = FileIdExtdDirectoryRestartInfo;
+    loop {
+        buffer.fill(0);
+        let result = unsafe {
+            GetFileInformationByHandleEx(handle, class, buffer.as_mut_ptr().cast(), capacity as u32)
+        };
+        if result == 0 {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_NO_MORE_FILES {
+                return Ok(entries);
+            }
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        class = FileIdExtdDirectoryInfo;
+        let mut offset = 0usize;
+        loop {
+            if offset % std::mem::align_of::<FILE_ID_EXTD_DIR_INFO>() != 0
+                || offset + size_of::<FILE_ID_EXTD_DIR_INFO>() > capacity
+            {
+                return Err(invalid("invalid directory entry layout"));
+            }
+            // Aligned OS-written record, with its variable name bounded below.
+            let entry = unsafe {
+                &*buffer
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<FILE_ID_EXTD_DIR_INFO>()
+            };
+            let length = entry.FileNameLength as usize;
+            let end = offset
+                .checked_add(header)
+                .and_then(|v| v.checked_add(length))
+                .filter(|v| *v <= capacity)
+                .ok_or_else(|| invalid("directory name exceeds its buffer"))?;
+            if length == 0 || length % 2 != 0 {
+                return Err(invalid("invalid directory name length"));
+            }
+            let name = unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), length / 2) };
+            if name != [46] && name != [46, 46] {
+                name_bytes = name_bytes
+                    .checked_add(length)
+                    .ok_or_else(|| invalid("directory size overflow"))?;
+                if entries.len() >= limits.max_entries || name_bytes > limits.max_name_bytes {
+                    return Err(invalid("directory enumeration limit exceeded"));
+                }
+                if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(denied("reparse entry in private directory"));
+                }
+                let name = OsString::from_wide(name);
+                validate_component(&name)?;
+                entries.push(RawEntry {
+                    name,
+                    identity: entry.FileId.Identifier,
+                    directory: entry.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                });
+            }
+            if entry.NextEntryOffset == 0 {
+                break;
+            }
+            let next = offset
+                .checked_add(entry.NextEntryOffset as usize)
+                .ok_or_else(|| invalid("directory offset overflow"))?;
+            if next < end || next >= capacity {
+                return Err(invalid("invalid next directory entry"));
+            }
+            offset = next;
+        }
+    }
+}
+
+// Query the held object's normalized long leaf. Caller spelling alone cannot
+// distinguish data from a reserved lock when NTFS 8.3 aliases are enabled.
+fn held_leaf(handle: HANDLE) -> io::Result<OsString> {
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_NT;
+    let required = unsafe { GetFinalPathNameByHandleW(handle, null_mut(), 0, flags) };
+    if required == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if required > 32768 {
+        return Err(invalid("held state name exceeds limit"));
+    }
+    let mut buffer = vec![0u16; required as usize + 1];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, flags)
+    };
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize >= buffer.len() {
+        return Err(invalid("held state name changed"));
+    }
+    buffer.truncate(length as usize);
+    let start = buffer
+        .iter()
+        .rposition(|c| *c == 92)
+        .map_or(0, |offset| offset + 1);
+    let leaf = OsString::from_wide(&buffer[start..]);
+    validate_component(&leaf)?;
+    Ok(leaf)
+}
+
+pub struct MutationFile<'lock> {
+    file: PrivateFile,
+    lock: &'lock StateLock,
+}
+impl MutationFile<'_> {
+    pub fn identity(&self) -> FileIdentity {
+        self.file.identity
+    }
+    pub fn read_limited(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
+        self.file.read_limited(maximum)
+    }
+}
+
+pub struct UpdateFile<'lock> {
+    file: PrivateFile,
+    lock: &'lock StateLock,
+}
+impl UpdateFile<'_> {
+    fn check(&self) -> io::Result<()> {
+        self.lock.file.check()?;
+        if self.lock.mode != LockMode::Exclusive || self.lock.file.parent != self.file.parent {
+            return Err(denied("invalid update guard"));
+        }
+        self.file.check()
+    }
+    pub fn identity(&self) -> FileIdentity {
+        self.file.identity
+    }
+    pub fn length(&self) -> io::Result<u64> {
+        self.check()?;
+        Ok(self.file.file.metadata()?.len())
+    }
+    pub fn position(&mut self) -> io::Result<u64> {
+        self.check()?;
+        self.file.file.stream_position()
+    }
+    pub fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.check()?;
+        self.file.file.seek(position)
+    }
+    pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.check()?;
+        self.file.file.write_all(bytes)
+    }
+    pub fn append_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.check()?;
+        self.file.file.seek(SeekFrom::End(0))?;
+        self.file.file.write_all(bytes)
+    }
+    /// Set length while preserving the explicit cursor, including past EOF.
+    pub fn truncate(&mut self, length: u64) -> io::Result<()> {
+        self.check()?;
+        let cursor = self.file.file.stream_position()?;
+        self.file.file.set_len(length)?;
+        self.file.file.seek(SeekFrom::Start(cursor))?;
+        Ok(())
+    }
+    pub fn read_limited(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
+        self.check()?;
+        self.file.read_limited(maximum)
+    }
+    pub fn sync_all(&self) -> io::Result<()> {
+        self.check()?;
+        self.file.sync_all()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemovalState {
+    DispositionAcknowledged,
+    NamespaceUnknown,
+}
+#[derive(Debug)]
+pub struct Removal {
+    pub identity: FileIdentity,
+    pub state: RemovalState,
+}
+#[derive(Debug)]
+pub enum RemovalError {
+    Unchanged(io::Error),
+    Uncertain {
+        source: io::Error,
+        identity: FileIdentity,
+        state: RemovalState,
+    },
+}
+impl From<io::Error> for RemovalError {
+    fn from(source: io::Error) -> Self {
+        Self::Unchanged(source)
+    }
+}
+impl std::fmt::Display for RemovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unchanged(e) => write!(f, "removal not started: {e}"),
+            Self::Uncertain { source, .. } => write!(f, "removal requires inspection: {source}"),
+        }
+    }
+}
+impl std::error::Error for RemovalError {}
+fn remove_handle(handle: HANDLE, expected: FileIdentity) -> Result<Removal, RemovalError> {
+    point("before_disposition")?;
+    let information = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+    let mut status = IO_STATUS_BLOCK::default();
+    // The synchronous, checked handle is consumed and only closed afterward.
+    let result = unsafe {
+        NtSetInformationFile(
+            handle,
+            &mut status,
+            (&information as *const FILE_DISPOSITION_INFORMATION).cast(),
+            size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+            FileDispositionInformation,
+        )
+    };
+    if result < 0 {
+        return Err(RemovalError::Uncertain {
+            source: io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) } as i32),
+            identity: expected,
+            state: RemovalState::NamespaceUnknown,
+        });
+    }
+    if let Err(source) = point("after_disposition") {
+        return Err(RemovalError::Uncertain {
+            source,
+            identity: expected,
+            state: RemovalState::DispositionAcknowledged,
+        });
+    }
+    Ok(Removal {
+        identity: expected,
+        state: RemovalState::DispositionAcknowledged,
+    })
 }
 
 pub struct PrivateFile {
@@ -563,6 +1029,8 @@ pub struct PrivateFile {
     parent: FileIdentity,
     _anchors: Vec<Arc<OwnedHandle>>,
     security: Security,
+    writable_candidate: AtomicBool,
+    publication: Mutex<()>,
 }
 impl PrivateFile {
     pub fn identity(&self) -> FileIdentity {
@@ -589,6 +1057,11 @@ impl PrivateFile {
     }
     pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.check()?;
+        if !self.writable_candidate.load(Ordering::Relaxed) {
+            return Err(denied(
+                "existing or published state requires an exclusive update guard",
+            ));
+        }
         self.file.write_all(bytes)
     }
     pub fn sync_all(&self) -> io::Result<()> {
@@ -770,6 +1243,14 @@ fn unsupported(message: &'static str) -> io::Error {
 }
 fn point(_name: &'static str) -> io::Result<()> {
     #[cfg(test)]
+    if _name == "before_rename" {
+        GAP_CHECK.with(|slot| {
+            if let Some(check) = slot.borrow_mut().as_mut() {
+                check();
+            }
+        });
+    }
+    #[cfg(test)]
     if FAILURE.with(|slot| slot.get() == Some(_name)) {
         return Err(io::Error::other("injected publication failure"));
     }
@@ -777,10 +1258,153 @@ fn point(_name: &'static str) -> io::Result<()> {
 }
 #[cfg(test)]
 thread_local! { static FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+thread_local! { static GAP_CHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) }; }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_faults_report_preserved_or_disposition_acknowledged_state() {
+        let home = Home::new();
+        let expected = home.original();
+        let lock = home
+            .dir()
+            .try_lock(OsStr::new("transaction.lock"), LockMode::Exclusive)
+            .unwrap();
+        let file = home
+            .dir()
+            .open_for_rename(OsStr::new("record"), expected, &lock)
+            .unwrap();
+        FAILURE.with(|slot| slot.set(Some("before_disposition")));
+        assert!(matches!(
+            home.dir().remove_file(file),
+            Err(RemovalError::Unchanged(_))
+        ));
+        FAILURE.with(|slot| slot.set(None));
+        assert_eq!(
+            home.dir()
+                .open_file(OsStr::new("record"))
+                .unwrap()
+                .identity(),
+            expected
+        );
+        let file = home
+            .dir()
+            .open_for_rename(OsStr::new("record"), expected, &lock)
+            .unwrap();
+        FAILURE.with(|slot| slot.set(Some("after_disposition")));
+        assert!(
+            matches!(home.dir().remove_file(file), Err(RemovalError::Uncertain { identity, state: RemovalState::DispositionAcknowledged, .. }) if identity == expected)
+        );
+        FAILURE.with(|slot| slot.set(None));
+        assert_eq!(
+            home.dir()
+                .open_file(OsStr::new("record"))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    fn snapshot_child(path: &Path, expected: &str) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fs::windows::tests::read_snapshot_child",
+                "--nocapture",
+            ])
+            .env("ORBIT_FS_SNAPSHOT_ROOT", path)
+            .env("ORBIT_FS_SNAPSHOT_EXPECT", expected)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("owned snapshot child exceeded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stdout)
+                .lines()
+                .any(|line| line.trim() == "test fs::windows::tests::read_snapshot_child ... ok")
+        );
+    }
+
+    // Only the mandatory parent counts as native coverage, not this child entry.
+    #[test]
+    fn read_snapshot_child() {
+        let Some(path) = std::env::var_os("ORBIT_FS_SNAPSHOT_ROOT") else {
+            return;
+        };
+        let directory = Directory::open(Path::new(&path)).unwrap();
+        let expected = std::env::var("ORBIT_FS_SNAPSHOT_EXPECT").unwrap();
+        let guard = directory.try_lock(OsStr::new("transaction.lock"), LockMode::Shared);
+        if expected == "blocked" {
+            assert_eq!(
+                guard.err().unwrap().raw_os_error(),
+                Some(ERROR_LOCK_VIOLATION as i32)
+            );
+        } else {
+            let _guard = guard.unwrap();
+            assert_eq!(
+                directory
+                    .open_file(OsStr::new("record"))
+                    .unwrap()
+                    .read_limited(1024)
+                    .unwrap(),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_reader_is_excluded_from_actual_two_rename_gap() {
+        let home = Home::new();
+        let expected = home.original();
+        let candidate = home.candidate();
+        let lock = home
+            .dir()
+            .try_lock(OsStr::new("transaction.lock"), LockMode::Exclusive)
+            .unwrap();
+        let path = home.base.join("state");
+        let gap_path = path.clone();
+        GAP_CHECK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let directory = Directory::open(&gap_path).unwrap();
+                assert_eq!(
+                    directory
+                        .open_file(OsStr::new("record"))
+                        .err()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::NotFound
+                );
+                snapshot_child(&gap_path, "blocked");
+            }))
+        });
+        home.dir()
+            .replace(&candidate, OsStr::new("record"), expected, &lock)
+            .unwrap();
+        GAP_CHECK.with(|slot| *slot.borrow_mut() = None);
+        drop(candidate);
+        drop(lock);
+        snapshot_child(&path, "replacement");
+    }
 
     struct RestoreIdentity;
     impl Drop for RestoreIdentity {

@@ -85,6 +85,12 @@ jobs:
           Get-ComputerInfo -Property WindowsProductName, WindowsVersion, OsBuildNumber |
             Format-List | Out-File platform-results/windows.txt
           whoami /all | Out-File platform-results/identity.txt
+          # This isolated runner needs real short aliases for the reservation test.
+          $fixtureDrive = [IO.Path]::GetPathRoot([IO.Path]::GetTempPath()).TrimEnd('\')
+          fsutil 8dot3name set $fixtureDrive 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          fsutil 8dot3name query $fixtureDrive | Out-File platform-results/ntfs-short-names.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +1.99.0 test --locked -p orbit-platform -- --test-threads=1 --nocapture 2>&1 |
             Tee-Object -FilePath platform-results/windows-foundation.log
           $code = $LASTEXITCODE
@@ -92,6 +98,7 @@ jobs:
           $report = Get-Content platform-results/windows-foundation.log -Raw
           $required = @(
             'ambiguous_components_are_rejected',
+            'lock_namespace_is_reserved_consistently',
             'windows::unicode_private_create_reopen_and_read_bounds',
             'windows::absolute_drive_and_verbatim_aliases_keep_identity',
             'windows::held_root_and_ancestor_cannot_be_swapped',
@@ -107,7 +114,19 @@ jobs:
             'fs::windows::tests::private_storage_works_without_admin_group_or_privileges',
             'fs::windows::tests::flush_failure_preserves_original_and_unpublished_candidate',
             'fs::windows::tests::prepublication_failure_restores_expected_original',
-            'fs::windows::tests::postpublication_flush_failure_retains_original_backup'
+            'fs::windows::tests::postpublication_flush_failure_retains_original_backup',
+            'windows::locked_update_has_explicit_cursor_append_length_and_truncate',
+            'windows::lifecycle_rejects_wrong_identity_shared_and_foreign_guards',
+            'windows::checked_backup_restore_and_cleanup_preserve_identity',
+            'windows::restore_refuses_occupied_target_and_reparse_sources',
+            'windows::enumeration_is_bounded_and_revalidates_entries',
+            'windows::empty_child_cleanup_refuses_live_anchors_nonempty_and_wrong_identity',
+            'windows::stable_lock_names_cannot_enter_data_mutation_routes',
+            'fs::windows::tests::removal_faults_report_preserved_or_disposition_acknowledged_state',
+            'fs::windows::tests::shared_reader_is_excluded_from_actual_two_rename_gap',
+            'windows::published_candidate_cannot_be_republished_without_a_guard',
+            'windows::ntfs_short_alias_cannot_bypass_reserved_lock_policy',
+            'windows::simultaneous_publication_preserves_the_only_successful_name'
           )
           foreach ($case in $required) {
             $pattern = '(?m)^test ' + [regex]::Escape($case) + ' \.\.\. ok\r?$'
