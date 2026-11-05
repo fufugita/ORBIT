@@ -1671,10 +1671,32 @@ $writeName='ORBIT_FAKE_WRITE_'+$nonce; $configName='ORBIT_PUBLIC_CONFIG_'+$nonce
 $machineKey='SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
 $userKey=$originalSid+'\Environment'
 $rows=[Collections.Generic.List[object]]::new()
-$mustDeny=$true; $complete=$true; $exposed=$false
+$mustDeny=$true; $complete=$true; $exposed=$false; $stage='initialization'
 function Digest([string]$value) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($value))) }
+function ExceptionEvidence([Exception]$exception) {
+  $chain=[Collections.Generic.List[object]]::new()
+  $ambiguous=$false; $depth=0; $leaf=$null
+  while($null -ne $exception -and $depth -lt 8) {
+    $entry=[ordered]@{type=$exception.GetType().FullName;hresult=$exception.HResult}
+    if($exception -is [Net.Sockets.SocketException]) {
+      $entry.native_error=$exception.NativeErrorCode
+      $entry.socket_error=$exception.SocketErrorCode.ToString()
+    }
+    if($exception -is [AggregateException] -and $exception.InnerExceptions.Count -ne 1) {
+      $ambiguous=$true
+    }
+    $chain.Add([pscustomobject]$entry)
+    $leaf=$exception; $exception=$exception.InnerException; $depth++
+  }
+  $truncated=$null -ne $exception
+  $socketDenied=-not $truncated -and -not $ambiguous -and
+    $leaf -is [Net.Sockets.SocketException] -and $leaf.NativeErrorCode -eq 10013 -and
+    $leaf.SocketErrorCode -eq [Net.Sockets.SocketError]::AccessDenied
+  [pscustomobject]@{chain=@($chain.ToArray());truncated=$truncated;ambiguous_aggregate=$ambiguous;socket_access_denied=$socketDenied}
+}
 function Observe([string]$id,[scriptblock]$action,[string]$expected,[bool]$protected) {
-  $row=[ordered]@{id=$id; status='api_error'; protected_credential=$protected}
+  $script:stage='registry_'+$id
+  $row=[ordered]@{id=$id; stage=$script:stage; status='api_error'; protected_credential=$protected}
   try {
     $value=& $action
     if ($null -eq $value) { $row.status='not_found' }
@@ -1685,6 +1707,7 @@ function Observe([string]$id,[scriptblock]$action,[string]$expected,[bool]$prote
       if ($protected) { $script:exposed=$true }
     }
   } catch {
+    $row.exception_evidence=ExceptionEvidence $_.Exception
     $cause=$_.Exception; while ($cause.InnerException) { $cause=$cause.InnerException }
     $row.exception=$cause.GetType().FullName; $row.hresult=$cause.HResult
     if($cause -is [ComponentModel.Win32Exception]){$row.native_error=$cause.NativeErrorCode}
@@ -1695,33 +1718,57 @@ function Observe([string]$id,[scriptblock]$action,[string]$expected,[bool]$prote
   $script:rows.Add([pscustomobject]$row)
 }
 function MustDeny([string]$id,[scriptblock]$action) {
+  $script:stage='must_deny_'+$id
   $denied=$false
+  $exceptionEvidence=$null
   try { & $action | Out-Null } catch {
+    $exceptionEvidence=ExceptionEvidence $_.Exception
     $cause=$_.Exception; while ($cause.InnerException) { $cause=$cause.InnerException }
     $denied=$cause -is [UnauthorizedAccessException] -or $cause -is [Security.SecurityException]
   }
-  $script:rows.Add([pscustomobject]@{id=$id; status=$(if($denied){'denied'}else{'must_deny_failed'})})
+  $script:rows.Add([pscustomobject]@{id=$id; status=$(if($denied){'denied'}else{'must_deny_failed'});exception_evidence=$exceptionEvidence})
   if (-not $denied) { $script:mustDeny=$false }
 }
 function NetworkDenied([string]$address,[int]$port,[string]$id) {
-  $client=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork,[Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp)
-  $denied=$false
+  if($id -notin @('loopback','nonlocal')){throw 'invalid fixed network stage'}
+  $client=$null; $denied=$false; $exceptionEvidence=$null; $disposeEvidence=$null
+  $outcome='incomplete'; $connectInvoked=$false
+  $script:stage='network_'+$id+'_construct'
   try {
-    try { $task=$client.ConnectAsync([Net.IPAddress]::Parse($address),$port); if (-not $task.Wait(5000)) { throw 'inconclusive timeout' } }
-    catch { $cause=$_.Exception; while($cause.InnerException){$cause=$cause.InnerException}
-      $denied=$cause -is [Net.Sockets.SocketException] -and $cause.SocketErrorCode -eq [Net.Sockets.SocketError]::AccessDenied }
-  } finally { $client.Dispose() }
-  $script:rows.Add([pscustomobject]@{id=$id; status=$(if($denied){'denied_wsaeacces'}else{'inconclusive_or_allowed'})})
+    $client=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork,[Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp)
+    $script:stage='network_'+$id+'_connect'
+    $connectInvoked=$true
+    $task=$client.ConnectAsync([Net.IPAddress]::Parse($address),$port)
+    $script:stage='network_'+$id+'_wait'
+    if(-not $task.Wait(5000)){throw [TimeoutException]::new('bounded network probe timed out')}
+    $outcome='connected'
+  } catch {
+    $exceptionEvidence=ExceptionEvidence $_.Exception
+    $denied=$exceptionEvidence.socket_access_denied -eq $true
+    $outcome=if($denied){'policy_denied'}else{'incomplete_exception'}
+  } finally {
+    if($null -ne $client){
+      try{$client.Dispose()}catch{$disposeEvidence=ExceptionEvidence $_.Exception;$script:complete=$false}
+    }
+  }
+  $deniedOperation=if(-not $denied){$null}elseif(-not $connectInvoked){'socket_creation'}elseif($script:stage.EndsWith('_wait')){'async_connect_wait'}else{'connect_invocation'}
+  $script:rows.Add([pscustomobject]@{id=$id;stage=$script:stage;attempt_outcome=$outcome;
+    connect_invoked=$connectInvoked;denied_operation=$deniedOperation;
+    status=$(if($denied){'denied_wsaeacces'}else{'inconclusive_or_allowed'});
+    exception_evidence=$exceptionEvidence;dispose_exception_evidence=$disposeEvidence})
   if(-not $denied){$script:mustDeny=$false}
 }
 try {
+  $stage='owned_read_write'
   if([IO.File]::ReadAllText('seed.txt') -ne 'owned seed'){throw 'owned read mismatch'}
   [IO.File]::WriteAllText('result.txt','owned write')
+  $stage='runtime_identity_module'
   $identity=$PSVersionTable.PSEdition+':'+$PSVersionTable.PSVersion.ToString()
   $runtime=[Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
   $module=Get-Date -Format yyyy
   MustDeny 'private_credential_file' { [IO.File]::ReadAllText(@@SECRET@@) }
   MustDeny 'outside_write' { [IO.File]::WriteAllText(@@FORBIDDEN@@,'bad') }
+  $stage='process_credential'
   $processAbsent=$null -eq [Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')
   $rows.Add([pscustomobject]@{id='process_credential'; status=$(if($processAbsent){'absent'}else{'must_deny_failed'})})
   if(-not $processAbsent){$mustDeny=$false}
@@ -1741,6 +1788,7 @@ try {
     try{$key=$root.OpenSubKey($userKey,$true); if($null -eq $key){throw 'missing write fixture'}; try{$key.SetValue($writeName,('child-change:'+$nonce),[Microsoft.Win32.RegistryValueKind]::String)}finally{$key.Dispose()}}finally{$root.Dispose()}
   }
   try {
+    $stage='win32_declarations'
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -1766,10 +1814,10 @@ public static class OrbitRegistryProbe {
     Observe 'win32_machine' { [OrbitRegistryProbe]::Read(-2147483646,$machineKey,$machineName) } @@MACHINE_HASH@@ $true
     Observe 'win32_mapped_user' { [OrbitRegistryProbe]::Read(-2147483647,'Environment',$userName) } @@USER_HASH@@ $true
     Observe 'win32_original_user' { [OrbitRegistryProbe]::Read(-2147483645,$userKey,$userName) } @@USER_HASH@@ $true
-  }catch{$complete=$false; $rows.Add([pscustomobject]@{id='win32_probe';status='unavailable';exception=$_.Exception.GetType().FullName})}
-}catch{$complete=$false; $rows.Add([pscustomobject]@{id='runtime_or_script';status='failed';exception=$_.Exception.GetType().FullName;hresult=$_.Exception.HResult})}
+  }catch{$complete=$false; $rows.Add([pscustomobject]@{id='win32_probe';stage=$stage;status='unavailable';exception_evidence=(ExceptionEvidence $_.Exception)})}
+}catch{$complete=$false; $rows.Add([pscustomobject]@{id='runtime_or_script';stage=$stage;status='failed';exception_evidence=(ExceptionEvidence $_.Exception)})}
 $boundary=if(-not $mustDeny){'failed_must_deny'}elseif($exposed){'unresolved_exposed_persisted_credential'}elseif($complete){'no_exposure_observed'}else{'not_measured'}
-$payload=[ordered]@{measurement_status=$(if($complete -and $mustDeny){'complete'}else{'incomplete'});credential_boundary_status=$boundary;production_policy_unchanged=$true;production_support_pass=$false;nonce=$nonce;original_user_sid=$originalSid;registry_view=64;identity=$identity;runtime=$runtime;module=$module;observations=@($rows.ToArray())}
+$payload=[ordered]@{measurement_status=$(if($complete -and $mustDeny){'complete'}else{'incomplete'});last_stage=$stage;credential_boundary_status=$boundary;production_policy_unchanged=$true;production_support_pass=$false;nonce=$nonce;original_user_sid=$originalSid;registry_view=64;identity=$identity;runtime=$runtime;module=$module;observations=@($rows.ToArray())}
 [IO.File]::WriteAllText('registry-probe.json',($payload|ConvertTo-Json -Depth 8))
 if($complete -and $mustDeny){[Console]::WriteLine('REGISTRY_PROBE_COMPLETE');exit 0}else{exit 7}
 "#;
