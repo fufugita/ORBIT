@@ -193,6 +193,7 @@ if ($Group -eq 'Foundation') {
         'windows::publication_does_not_clobber_and_replace_retains_original',
         'windows::replacement_requires_expected_identity_and_exclusive_lock',
         'windows::exclusive_lock_excludes_other_processes_and_releases',
+        'windows::missing_existing_lock_does_not_create_state',
         'windows::shared_readers_coexist_but_exclude_writer',
         'fs::windows::tests::private_storage_works_without_admin_group_or_privileges',
         'fs::windows::tests::flush_failure_preserves_original_and_unpublished_candidate',

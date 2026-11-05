@@ -418,6 +418,10 @@ impl Directory {
         })
     }
 
+    pub fn open_lock_existing(&self, name: &OsStr, mode: LockMode) -> io::Result<StateLock> {
+        self.try_lock(name, mode)
+    }
+
     pub fn try_lock(&self, name: &OsStr, mode: LockMode) -> io::Result<StateLock> {
         validate_lock_component(name)?;
         let file = self.file(name, FILE_OPEN_IF, false)?;

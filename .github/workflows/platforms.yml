@@ -12,6 +12,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - scripts/nixos_runtime_test.py
+      - scripts/windows_native_test.ps1
       - scripts/in-jail.sh
       - .github/workflows/platforms.yml
 

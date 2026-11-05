@@ -344,6 +344,36 @@ mod windows {
     }
 
     #[test]
+    fn missing_existing_lock_does_not_create_state() {
+        let home = Home::new();
+        let inventory = || {
+            let mut names: Vec<_> = fs::read_dir(home.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = inventory();
+        let error_kind = match home
+            .dir()
+            .open_lock_existing(OsStr::new("status.lock"), LockMode::Shared)
+        {
+            Ok(lock) => {
+                drop(lock);
+                None
+            }
+            Err(error) => Some(error.kind()),
+        };
+        assert_eq!(
+            inventory(),
+            before,
+            "an existing-only lock request must not create state"
+        );
+        assert_eq!(error_kind, Some(std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
     fn shared_readers_coexist_but_exclude_writer() {
         let home = Home::new();
         let held = home
