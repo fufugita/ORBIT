@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install a checked ORBIT bundle. Invoke with bash, including when using a pipe:
-#   curl -fsSL <installer-url> | bash -s -- --version 0.2.0 --dir "$HOME/.local/bin"
+#   curl -fsSL <installer-url> | bash -s -- --version 0.2.1 --dir "$HOME/.local/bin"
 # Release: Python 3.11+, curl and sha256sum/shasum. Source builds are explicit.
 set -Eeuo pipefail
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'install: Python 3.11 or newer is required' >&2; exit 1; }

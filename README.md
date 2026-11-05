@@ -43,7 +43,7 @@ Install Rust through [rustup](https://rustup.rs/), then use the pinned Rust 1.99
 ```sh
 git clone https://github.com/fufugita/ORBIT.git
 cd ORBIT
-bash install.sh --method source --source . --version 0.2.0 --dir "$HOME/.local/bin"
+bash install.sh --method source --source . --version 0.2.1 --dir "$HOME/.local/bin"
 ```
 
 Add the installation directory to `PATH`. The managed installer switches both

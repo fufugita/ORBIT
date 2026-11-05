@@ -10,7 +10,7 @@ Use Bash to run the installer. Release mode requires Python 3.11 or newer, curl,
 and `sha256sum` or `shasum`; Rust is only required for a source build.
 
 ```sh
-bash install.sh --method release --version 0.2.0 --dir "$HOME/.local/bin"
+bash install.sh --method release --version 0.2.1 --dir "$HOME/.local/bin"
 ```
 
 Choose a version with a published archive and checksum for your platform. An
@@ -32,7 +32,7 @@ pointer, so an upgrade switches `orbit` and `orbit-web` together.
 For a source build, provide the checkout and its version explicitly:
 
 ```sh
-bash install.sh --method source --source . --version 0.2.0 --dir "$HOME/.local/bin"
+bash install.sh --method source --source . --version 0.2.1 --dir "$HOME/.local/bin"
 ```
 
 Source mode requires the pinned Rust 1.99 toolchain and `Cargo.lock`. It builds
@@ -460,7 +460,7 @@ Registry installation requires an actually published version. A local archive
 can be tested without publishing or changing the system prefix:
 
 ```sh
-node packaging/npm/stage.mjs --archive path/to/orbit-0.2.0-x86_64-unknown-linux-gnu.tar.gz --output dist/npm
+node packaging/npm/stage.mjs --archive path/to/orbit-0.2.1-x86_64-unknown-linux-gnu.tar.gz --output dist/npm
 mkdir -p dist/npm-packs
 npm pack ./dist/npm/orbit-linux-x64-gnu --pack-destination dist/npm-packs
 npm pack ./dist/npm/orbit --pack-destination dist/npm-packs

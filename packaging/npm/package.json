@@ -1,6 +1,6 @@
 {
   "name": "@fufugita/orbit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "ORBIT terminal and browser agent harness",
   "license": "Apache-2.0",
   "type": "module",
@@ -14,8 +14,8 @@
   "cpu": ["x64", "arm64"],
   "libc": ["glibc"],
   "optionalDependencies": {
-    "@fufugita/orbit-linux-x64-gnu": "0.2.0",
-    "@fufugita/orbit-linux-arm64-gnu": "0.2.0"
+    "@fufugita/orbit-linux-x64-gnu": "0.2.1",
+    "@fufugita/orbit-linux-arm64-gnu": "0.2.1"
   },
   "repository": {
     "type": "git",

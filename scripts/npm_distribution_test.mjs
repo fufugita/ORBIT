@@ -22,7 +22,7 @@ async function scenario(name, run) {
   scenarios[name] = {passed: true, assertions: checks - before};
   console.log(`PASS ${name}: ${checks - before} assertions`);
 }
-const version = '0.2.0';
+const version = '0.2.1';
 const target = 'x86_64-unknown-linux-gnu';
 const armTarget = 'aarch64-unknown-linux-gnu';
 const wrapperMetadata = JSON.parse(fs.readFileSync(path.join(repository, 'packaging/npm/package.json'), 'utf8'));
@@ -146,7 +146,7 @@ execv(args[0],args);perror("fixture exec");return 113;}
   await scenario('release_archive_validation', () => {
     check(verifyArchive(x64Archive, version).manifest.target === target);
     check(verifyArchive(armArchive, version).manifest.target === armTarget);
-    rejects(() => verifyArchive(x64Archive, '0.2.1'), /manifest version/);
+    rejects(() => verifyArchive(x64Archive, version === '0.0.0' ? '0.0.1' : '0.0.0'), /manifest version/);
     for (const change of [{signature: 'claimed'}, {target: 'unknown-linux-gnu'}, {schema_version: 2}, {extra: true}]) rejects(() => verifyArchive(archive(releaseMembers(binary, target, change)), version), /manifest/);
     rejects(() => verifyArchive(archive(releaseMembers(binary, armTarget)), version), /ELF architecture/);
     const brokenHash = releaseMembers(binary); const doc = JSON.parse(brokenHash[0].bytes); doc.components.orbit.sha256 = '0'.repeat(64); brokenHash[0].bytes = Buffer.from(JSON.stringify(doc));
@@ -259,7 +259,7 @@ execv(args[0],args);perror("fixture exec");return 113;}
     const notExecutable = spawnSync(web, [], {encoding: 'utf8'}); check(notExecutable.status === 1 && notExecutable.stderr.includes('not executable') && notExecutable.stderr.includes('Reinstall'));
     fs.chmodSync(nativeWeb, 0o755);
     fs.renameSync(installedNative, `${installedNative}.removed`);
-    const missing = spawnSync(cli, [], {encoding: 'utf8'}); check(missing.status === 1 && missing.stderr.includes('--include=optional') && missing.stderr.includes('@fufugita/orbit-linux-x64-gnu@0.2.0'));
+    const missing = spawnSync(cli, [], {encoding: 'utf8'}); check(missing.status === 1 && missing.stderr.includes('--include=optional') && missing.stderr.includes(`@fufugita/orbit-linux-x64-gnu@${version}`));
     fs.renameSync(`${installedNative}.removed`, installedNative);
     npm(['uninstall', '--global', '--prefix', prefix, '@fufugita/orbit', '@fufugita/orbit-linux-x64-gnu']);
     check(!fs.existsSync(cli) && !fs.existsSync(web) && !fs.existsSync(installedNative));
