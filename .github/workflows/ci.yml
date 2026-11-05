@@ -27,6 +27,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep the private terminal fixture outside Cargo's pruned cache.
+          prefix-key: v1-rust-cargo-only
+          cache-targets: "false"
+          cache-directories: target/debug
       - name: install bubblewrap
         # The shell sandbox tests are real: they run bwrap and assert
         # confined writes succeed, /etc writes fail, and the network is
