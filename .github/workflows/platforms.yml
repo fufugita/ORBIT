@@ -111,6 +111,11 @@ jobs:
             'windows::publication_does_not_clobber_and_replace_retains_original',
             'windows::replacement_requires_expected_identity_and_exclusive_lock',
             'windows::exclusive_lock_excludes_other_processes_and_releases',
+            'windows::missing_existing_lock_does_not_create_state',
+            'windows::existing_lock_fixed_buffer_snapshot_and_cursor',
+            'windows::file_snapshot_detects_content_change',
+            'windows::existing_lock_rejects_nonempty_and_unsafe_without_repair',
+            'windows::existing_only_locks_observe_cross_process_contention',
             'windows::shared_readers_coexist_but_exclude_writer',
             'fs::windows::tests::private_storage_works_without_admin_group_or_privileges',
             'fs::windows::tests::flush_failure_preserves_original_and_unpublished_candidate',
@@ -129,6 +134,9 @@ jobs:
             'windows::ntfs_short_alias_cannot_bypass_reserved_lock_policy',
             'windows::simultaneous_publication_preserves_the_only_successful_name'
           )
+          if ($required.Count -ne 35 -or @($required | Select-Object -Unique).Count -ne 35) {
+            throw "Foundation's exact required-name manifest must contain 35 unique cases; found $($required.Count)"
+          }
           foreach ($case in $required) {
             $pattern = '(?m)^test ' + [regex]::Escape($case) + ' \.\.\. ok\r?$'
             if ($report -notmatch $pattern) { throw "Required native case did not pass: $case" }
@@ -188,6 +196,31 @@ jobs:
         if: always()
         with:
           name: windows-registry-diagnostic
+          path: platform-results/
+
+  windows-registry-witness:
+    if: github.ref == 'refs/heads/codex/platform-first-run-windows-proof-20261105'
+    runs-on: windows-2025
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
+      NO_COLOR: '1'
+      ORBIT_REGISTRY_WITNESS_FIXTURE: github-hosted-fake-data-only-v1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install the pinned compiler
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run the strict fake-data registry isolation witness
+        shell: pwsh
+        run: ./scripts/windows_native_test.ps1 -Group RegistryWitness
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-registry-witness
           path: platform-results/
 
   windows-host-capabilities:

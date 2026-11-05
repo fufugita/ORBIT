@@ -129,6 +129,8 @@ pub struct SandboxSession {
     folder: PathBuf,
     root: Option<OwnedHandle>,
     unsafe_cleanup: AtomicBool,
+    #[cfg(all(test, feature = "registry-witness"))]
+    registry_witness_child_unobserved: AtomicBool,
     closed: bool,
 }
 
@@ -242,6 +244,8 @@ impl SandboxSession {
                 folder,
                 root: Some(root),
                 unsafe_cleanup: AtomicBool::new(false),
+                #[cfg(all(test, feature = "registry-witness"))]
+                registry_witness_child_unobserved: AtomicBool::new(false),
                 closed: false,
             })
         })();
@@ -398,8 +402,9 @@ impl SandboxSession {
         self.root.take();
         if self.unsafe_cleanup.load(Ordering::Acquire) {
             return Err(io::Error::other(format!(
-                "profile retained after unobserved child cleanup: {}",
-                self.name
+                "profile retained after cleanup preservation decision: name={} path={}",
+                self.name,
+                self.folder.display()
             )));
         }
         hresult("DeleteAppContainerProfile", unsafe {
@@ -409,6 +414,19 @@ impl SandboxSession {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "registry-witness"))]
+impl SandboxSession {
+    fn retain_profile_for_registry_witness(&self) -> String {
+        self.unsafe_cleanup.store(true, Ordering::Release);
+        format!(
+            "profile_name={} profile_path={}",
+            self.name,
+            self.folder.display()
+        )
+    }
+}
+
 impl Drop for SandboxSession {
     fn drop(&mut self) {
         self.root.take();
@@ -534,6 +552,30 @@ impl Attributes {
                     key as usize,
                     (value as *const T).cast(),
                     size_of::<T>(),
+                    null_mut(),
+                    null(),
+                ),
+            )
+        }
+    }
+
+    fn set_handle_list(&mut self, handles: &[HANDLE]) -> io::Result<()> {
+        if (handles.len() != 3 && handles.len() != 5)
+            || handles.iter().any(|handle| handle.is_null())
+        {
+            return Err(invalid(
+                "process handle-list shape is not an approved stdio/witness set",
+            ));
+        }
+        unsafe {
+            ok(
+                "UpdateProcThreadAttribute(HANDLE_LIST)",
+                UpdateProcThreadAttribute(
+                    self.pointer(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    handles.as_ptr().cast(),
+                    std::mem::size_of_val(handles),
                     null_mut(),
                     null(),
                 ),
@@ -883,6 +925,106 @@ impl<'a> OwnedProcess<'a> {
         spec: &SpawnSpec,
         less_privileged: bool,
     ) -> io::Result<(Self, OwnedHandle)> {
+        Self::create_suspended_with_context(session, spec, less_privileged, &[], &[], None)
+    }
+
+    #[cfg(all(test, feature = "registry-witness"))]
+    fn create_registry_witness_child(
+        session: &'a SandboxSession,
+        spec: &SpawnSpec,
+        role: &str,
+        nonce: &str,
+        original_user_sid: &str,
+        package_sid: &str,
+        image_sha256: &str,
+        image_identity: (u64, [u8; 16]),
+        fixture_digest: &str,
+        private_read_handles: [self::registry_witness_tests::OwnedRegKey; 2],
+    ) -> io::Result<(Self, OwnedHandle)> {
+        if !matches!(role, "normal" | "cancel")
+            || nonce.len() != 32
+            || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !original_user_sid.starts_with("S-1-5-")
+            || !original_user_sid
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || private_read_handles.iter().any(|key| key.raw().is_null())
+        {
+            return Err(invalid("invalid fixed registry witness launch context"));
+        }
+        let parent_creation =
+            self::registry_witness_tests::process_creation_text(unsafe { GetCurrentProcess() })?;
+        let environment = [
+            ("ORBIT_REGISTRY_WITNESS_ROLE", role),
+            ("ORBIT_REGISTRY_WITNESS_NONCE", nonce),
+            ("ORBIT_REGISTRY_WITNESS_USER_SID", original_user_sid),
+            ("ORBIT_REGISTRY_WITNESS_PACKAGE_SID", package_sid),
+            ("ORBIT_REGISTRY_WITNESS_IMAGE_SHA256", image_sha256),
+            (
+                "ORBIT_REGISTRY_WITNESS_IMAGE_ID",
+                &self::registry_witness_tests::identity_text(image_identity),
+            ),
+            ("ORBIT_REGISTRY_WITNESS_FIXTURE_DIGEST", fixture_digest),
+            (
+                "ORBIT_REGISTRY_WITNESS_PARENT_PID",
+                &format!("{}", unsafe { GetCurrentProcessId() }),
+            ),
+            (
+                "ORBIT_REGISTRY_WITNESS_PARENT_CREATION",
+                parent_creation.as_str(),
+            ),
+            (
+                "ORBIT_REGISTRY_WITNESS_MACHINE_HANDLE",
+                &format!("{}", private_read_handles[0].raw() as usize),
+            ),
+            (
+                "ORBIT_REGISTRY_WITNESS_USER_HANDLE",
+                &format!("{}", private_read_handles[1].raw() as usize),
+            ),
+        ];
+        let handles = [
+            private_read_handles[0].raw().cast(),
+            private_read_handles[1].raw().cast(),
+        ];
+        let mut private_read_handles = Some(private_read_handles);
+        let mut close_inherited = || {
+            let mut errors = Vec::new();
+            for (index, key) in private_read_handles
+                .take()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if let Err(error) = key.close() {
+                    errors.push(format!(
+                        "private inherited key {index} RegCloseKey failed: {error}"
+                    ));
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other(errors.join("; ")))
+            }
+        };
+        Self::create_suspended_with_context(
+            session,
+            spec,
+            true,
+            &environment,
+            &handles,
+            Some(&mut close_inherited),
+        )
+    }
+
+    fn create_suspended_with_context(
+        session: &'a SandboxSession,
+        spec: &SpawnSpec,
+        less_privileged: bool,
+        extra_environment: &[(&str, &str)],
+        extra_handles: &[HANDLE],
+        mut after_create: Option<&mut dyn FnMut() -> io::Result<()>>,
+    ) -> io::Result<(Self, OwnedHandle)> {
         if spec.timeout.is_zero()
             || spec.timeout > Duration::from_secs(3600)
             || spec.output_limit == 0
@@ -943,6 +1085,15 @@ impl<'a> OwnedProcess<'a> {
         for (key, value) in entries {
             environment.extend(wide(OsStr::new(&format!("{key}={value}")))?);
         }
+        for (key, value) in extra_environment {
+            if !key.starts_with("ORBIT_REGISTRY_WITNESS_")
+                || key.contains('=')
+                || value.contains('\0')
+            {
+                return Err(invalid("unsupported test-only child environment entry"));
+            }
+            environment.extend(wide(OsStr::new(&format!("{key}={value}")))?);
+        }
         environment.push(0);
 
         let (stdin_read, stdin_write) = pipe()?;
@@ -984,11 +1135,12 @@ impl<'a> OwnedProcess<'a> {
             }
         };
         let policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-        let handles = [
+        let mut handles = vec![
             stdin_read.as_raw_handle(),
             stdout_write.as_raw_handle(),
             stderr_write.as_raw_handle(),
         ];
+        handles.extend_from_slice(extra_handles);
         let mut attributes = Attributes::new(if less_privileged { 3 } else { 2 })?;
         attributes.set(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &capabilities)?;
         if less_privileged {
@@ -997,7 +1149,7 @@ impl<'a> OwnedProcess<'a> {
                 &policy,
             )?;
         }
-        attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles)?;
+        attributes.set_handle_list(&handles)?;
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -1022,25 +1174,39 @@ impl<'a> OwnedProcess<'a> {
             )?;
         }
         let mut info = PROCESS_INFORMATION::default();
-        unsafe {
-            ok(
-                "CreateProcessW",
-                CreateProcessW(
-                    executable.as_ptr(),
-                    line.as_mut_ptr(),
-                    null(),
-                    null(),
-                    1,
-                    CREATE_SUSPENDED
-                        | CREATE_NO_WINDOW
-                        | CREATE_UNICODE_ENVIRONMENT
-                        | EXTENDED_STARTUPINFO_PRESENT,
-                    environment.as_ptr().cast(),
-                    directory.as_ptr(),
-                    &startup.StartupInfo,
-                    &mut info,
-                ),
-            )?;
+        let create_status = unsafe {
+            CreateProcessW(
+                executable.as_ptr(),
+                line.as_mut_ptr(),
+                null(),
+                null(),
+                1,
+                CREATE_SUSPENDED
+                    | CREATE_NO_WINDOW
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | EXTENDED_STARTUPINFO_PRESENT,
+                environment.as_ptr().cast(),
+                directory.as_ptr(),
+                &startup.StartupInfo,
+                &mut info,
+            )
+        };
+        let create_error = if create_status == 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        let inheritance_cleanup_error = after_create
+            .as_deref_mut()
+            .and_then(|cleanup| cleanup().err());
+        if let Some(error) = create_error {
+            let primary = operation_error("CreateProcessW", error);
+            return Err(match inheritance_cleanup_error {
+                Some(cleanup) => io::Error::other(format!(
+                    "{primary}; immediate inherited-handle cleanup also failed: {cleanup}"
+                )),
+                None => primary,
+            });
         }
         // SAFETY: successful CreateProcessW returns two new valid owned handles.
         let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };
@@ -1139,6 +1305,19 @@ impl<'a> OwnedProcess<'a> {
             return Err(io::Error::other(format!(
                 "child capability or Job verification failed: app_container={app_container}, access={access:?}, capabilities={count}, in_job={in_job}"
             )));
+        }
+        if let Some(error) = inheritance_cleanup_error {
+            let cleanup = child.stop();
+            if cleanup.is_ok() {
+                child.finished = true;
+            }
+            drop(thread);
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(stop_error) => io::Error::other(format!(
+                    "inherited-handle cleanup failed: {error}; child termination/wait also failed: {stop_error}; Drop will retry and session state records unobserved shutdown"
+                )),
+            });
         }
         child.evidence = ConfinementEvidence {
             app_container,
@@ -1280,6 +1459,10 @@ impl Drop for OwnedProcess<'_> {
     fn drop(&mut self) {
         if !self.finished && self.stop().is_err() {
             self.session.unsafe_cleanup.store(true, Ordering::Release);
+            #[cfg(all(test, feature = "registry-witness"))]
+            self.session
+                .registry_witness_child_unobserved
+                .store(true, Ordering::Release);
         }
     }
 }
@@ -1694,6 +1877,8 @@ function ExceptionEvidence([Exception]$exception) {
     $leaf.SocketErrorCode -eq [Net.Sockets.SocketError]::AccessDenied
   [pscustomobject]@{chain=@($chain.ToArray());truncated=$truncated;ambiguous_aggregate=$ambiguous;socket_access_denied=$socketDenied}
 }
+
+
 function Observe([string]$id,[scriptblock]$action,[string]$expected,[bool]$protected) {
   $script:stage='registry_'+$id
   $row=[ordered]@{id=$id; stage=$script:stage; status='api_error'; protected_credential=$protected}
@@ -1821,4 +2006,1961 @@ $payload=[ordered]@{measurement_status=$(if($complete -and $mustDeny){'complete'
 [IO.File]::WriteAllText('registry-probe.json',($payload|ConvertTo-Json -Depth 8))
 if($complete -and $mustDeny){[Console]::WriteLine('REGISTRY_PROBE_COMPLETE');exit 0}else{exit 7}
 "#;
+}
+
+// The strict registry witness is intentionally separate from the broad
+// registryRead diagnostic above.  Its private resource owners are cfg-gated
+// from all production and ordinary test builds.
+#[cfg(all(test, feature = "registry-witness"))]
+mod registry_witness_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::io::{Read, Seek, SeekFrom};
+    use windows_sys::Wdk::Foundation::NtClose;
+    use windows_sys::Wdk::System::Registry::{
+        KeyValuePartialInformation, NtOpenKey, NtQueryValueKey,
+    };
+    use windows_sys::Wdk::System::SystemServices::KEY_VALUE_PARTIAL_INFORMATION;
+    use windows_sys::Win32::Security::Authorization::{
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_OBJECT_LENGTH, BCRYPT_SHA256_ALGORITHM, BCryptCloseAlgorithmProvider,
+        BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptGetProperty, BCryptHashData,
+        BCryptOpenAlgorithmProvider,
+    };
+    use windows_sys::Win32::System::Registry::*;
+
+    const WITNESS_FRAME_START: &[u8] = b"\x1eORBITW1:";
+    const WITNESS_FRAME_END: u8 = 0x1f;
+
+    fn emit_witness_record(payload: &str) -> io::Result<()> {
+        if payload.len() > 8192
+            || !payload.is_ascii()
+            || payload.contains('\u{1e}')
+            || payload.contains('\u{1f}')
+        {
+            return Err(invalid("registry witness record exceeds framing bounds"));
+        }
+        let mut output = io::stdout().lock();
+        write!(output, "\x1eORBITW1:{}:", payload.len())?;
+        output.write_all(payload.as_bytes())?;
+        output.write_all(&[WITNESS_FRAME_END])?;
+        output.flush()
+    }
+
+    fn escape_diagnostic(bytes: &[u8]) -> String {
+        let bounded = &bytes[..bytes.len().min(1024)];
+        let mut escaped = String::with_capacity(bounded.len());
+        for byte in bounded {
+            if (0x20..=0x7e).contains(byte) && *byte != b'\\' {
+                escaped.push(*byte as char);
+            } else {
+                escaped.push_str(&format!("\\x{byte:02X}"));
+            }
+        }
+        escaped
+    }
+
+    /// Registry keys are not kernel HANDLE owners: RegCloseKey is required.
+    pub(super) struct OwnedRegKey(HKEY);
+
+    impl OwnedRegKey {
+        /// # Safety
+        /// `key` must be a successful, uniquely transferred registry handle.
+        unsafe fn from_raw(key: HKEY) -> io::Result<Self> {
+            if key.is_null() {
+                Err(invalid("null registry key"))
+            } else {
+                Ok(Self(key))
+            }
+        }
+
+        pub(super) fn raw(&self) -> HKEY {
+            self.0
+        }
+
+        pub(super) fn close(self) -> io::Result<()> {
+            let key = self.0;
+            std::mem::forget(self);
+            let status = unsafe { RegCloseKey(key) };
+            if status == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status as i32))
+            }
+        }
+    }
+
+    impl Drop for OwnedRegKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { RegCloseKey(self.0) };
+            }
+        }
+    }
+
+    /// Raw NtOpenKey handles have the native NtClose ownership contract.
+    struct OwnedNtKey(HANDLE);
+
+    impl OwnedNtKey {
+        /// # Safety
+        /// `key` must be a successful, uniquely transferred native key handle.
+        unsafe fn from_raw(key: HANDLE) -> io::Result<Self> {
+            if key.is_null() || key == INVALID_HANDLE_VALUE {
+                Err(invalid("invalid native registry key"))
+            } else {
+                Ok(Self(key))
+            }
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+
+        fn close(self) -> io::Result<()> {
+            let key = self.0;
+            std::mem::forget(self);
+            let status = unsafe { NtClose(key) };
+            if status >= 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status))
+            }
+        }
+    }
+
+    impl Drop for OwnedNtKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe { NtClose(self.0) };
+            }
+        }
+    }
+
+    fn nt_unicode(value: &str) -> io::Result<(Vec<u16>, UNICODE_STRING)> {
+        let mut storage: Vec<u16> = value.encode_utf16().collect();
+        let byte_len = storage
+            .len()
+            .checked_mul(size_of::<u16>())
+            .filter(|length| *length <= u16::MAX as usize - size_of::<u16>())
+            .ok_or_else(|| invalid("native registry name exceeds UNICODE_STRING limits"))?;
+        storage.push(0);
+        let value = UNICODE_STRING {
+            Length: byte_len as u16,
+            MaximumLength: (byte_len + size_of::<u16>()) as u16,
+            Buffer: storage.as_mut_ptr(),
+        };
+        Ok((storage, value))
+    }
+
+    fn nt_open_key(path: &str, access: u32) -> Result<OwnedNtKey, i32> {
+        let (mut path_storage, mut object_name) =
+            nt_unicode(path).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let mut attributes = OBJECT_ATTRIBUTES::default();
+        attributes.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+        attributes.RootDirectory = null_mut();
+        attributes.ObjectName = &mut object_name;
+        attributes.Attributes = OBJ_CASE_INSENSITIVE;
+        attributes.SecurityDescriptor = null_mut();
+        attributes.SecurityQualityOfService = null_mut();
+        let mut handle = null_mut();
+        let status = unsafe { NtOpenKey(&mut handle, access, &attributes) };
+        // Keep the backing UTF-16 storage alive through the system call.
+        std::hint::black_box(&mut path_storage);
+        if status < 0 {
+            return Err(status);
+        }
+        // SAFETY: NtOpenKey succeeded and transferred one newly created handle.
+        unsafe { OwnedNtKey::from_raw(handle).map_err(|_| STATUS_INVALID_HANDLE) }
+    }
+
+    fn nt_query_value(key: &OwnedNtKey, name: &str) -> Result<(u32, Vec<u8>), i32> {
+        let (mut name_storage, value_name) =
+            nt_unicode(name).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let mut buffer = [0u8; 4096];
+        let mut returned = 0u32;
+        let status = unsafe {
+            NtQueryValueKey(
+                key.raw(),
+                &value_name,
+                KeyValuePartialInformation,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut returned,
+            )
+        };
+        std::hint::black_box(&mut name_storage);
+        if status < 0 {
+            return Err(status);
+        }
+        decode_partial_key_value(&buffer, returned as usize)
+    }
+
+    fn decode_partial_key_value(buffer: &[u8], returned: usize) -> Result<(u32, Vec<u8>), i32> {
+        let type_offset = std::mem::offset_of!(KEY_VALUE_PARTIAL_INFORMATION, Type);
+        let length_offset = std::mem::offset_of!(KEY_VALUE_PARTIAL_INFORMATION, DataLength);
+        let data_offset = std::mem::offset_of!(KEY_VALUE_PARTIAL_INFORMATION, Data);
+        let field_end = |offset: usize| {
+            offset
+                .checked_add(size_of::<u32>())
+                .ok_or(STATUS_INFO_LENGTH_MISMATCH)
+        };
+        if returned > buffer.len() || returned < data_offset {
+            return Err(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let type_end = field_end(type_offset)?;
+        let length_end = field_end(length_offset)?;
+        if type_end > returned || length_end > returned {
+            return Err(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        // The buffer has byte alignment only. Decode the actual named fields
+        // without constructing a potentially unaligned typed reference.
+        let value_type = u32::from_le_bytes(
+            buffer[type_offset..type_end]
+                .try_into()
+                .map_err(|_| STATUS_INFO_LENGTH_MISMATCH)?,
+        );
+        let length = u32::from_le_bytes(
+            buffer[length_offset..length_end]
+                .try_into()
+                .map_err(|_| STATUS_INFO_LENGTH_MISMATCH)?,
+        ) as usize;
+        let data_end = data_offset
+            .checked_add(length)
+            .ok_or(STATUS_INFO_LENGTH_MISMATCH)?;
+        if data_end > returned || data_end > buffer.len() {
+            return Err(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        Ok((value_type, buffer[data_offset..data_end].to_vec()))
+    }
+
+    fn verify_partial_key_value_header_oracle() -> io::Result<()> {
+        let type_offset = std::mem::offset_of!(KEY_VALUE_PARTIAL_INFORMATION, Type);
+        let length_offset = std::mem::offset_of!(KEY_VALUE_PARTIAL_INFORMATION, DataLength);
+        let data_offset = std::mem::offset_of!(KEY_VALUE_PARTIAL_INFORMATION, Data);
+        let mut bytes = [0u8; 32];
+        bytes[0..4].copy_from_slice(&0xA1B2_C3D4u32.to_le_bytes()); // ignored TitleIndex
+        bytes[type_offset..type_offset + 4].copy_from_slice(&REG_SZ.to_le_bytes());
+        bytes[length_offset..length_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+        bytes[data_offset..data_offset + 2].copy_from_slice(&[0x5A, 0xC3]);
+        let parsed = decode_partial_key_value(&bytes, data_offset + 2)
+            .map_err(io::Error::from_raw_os_error)?;
+        if parsed != (REG_SZ, vec![0x5A, 0xC3]) {
+            return Err(invalid(
+                "synthetic registry result header offset oracle failed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest(bytes: &[u8]) -> io::Result<String> {
+        let mut algorithm = null_mut();
+        let mut hash = null_mut();
+        let mut object_size = 0u32;
+        let mut returned = 0u32;
+        let mut object = Vec::<u64>::new();
+        let mut output = [0u8; 32];
+        let status = unsafe {
+            BCryptOpenAlgorithmProvider(&mut algorithm, BCRYPT_SHA256_ALGORITHM, null(), 0)
+        };
+        if status < 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        let result = (|| {
+            let status = unsafe {
+                BCryptGetProperty(
+                    algorithm,
+                    BCRYPT_OBJECT_LENGTH,
+                    (&mut object_size as *mut u32).cast(),
+                    size_of::<u32>() as u32,
+                    &mut returned,
+                    0,
+                )
+            };
+            if status < 0
+                || returned != size_of::<u32>() as u32
+                || object_size == 0
+                || object_size > 65536
+            {
+                return Err(io::Error::other("BCrypt object-size query failed"));
+            }
+            object.resize((object_size as usize).div_ceil(size_of::<u64>()), 0);
+            let status = unsafe {
+                BCryptCreateHash(
+                    algorithm,
+                    &mut hash,
+                    object.as_mut_ptr().cast(),
+                    object_size,
+                    null(),
+                    0,
+                    0,
+                )
+            };
+            if status < 0 {
+                return Err(io::Error::from_raw_os_error(status));
+            }
+            let status = unsafe { BCryptHashData(hash, bytes.as_ptr(), bytes.len() as u32, 0) };
+            if status < 0 {
+                return Err(io::Error::from_raw_os_error(status));
+            }
+            let status =
+                unsafe { BCryptFinishHash(hash, output.as_mut_ptr(), output.len() as u32, 0) };
+            if status < 0 {
+                return Err(io::Error::from_raw_os_error(status));
+            }
+            Ok(())
+        })();
+        if !hash.is_null() {
+            unsafe { BCryptDestroyHash(hash) };
+        }
+        unsafe { BCryptCloseAlgorithmProvider(algorithm, 0) };
+        result?;
+        Ok(output.iter().map(|byte| format!("{byte:02X}")).collect())
+    }
+
+    fn registry_string_digest(bytes: &[u8]) -> io::Result<String> {
+        if bytes.len() < 2 || bytes.len() % 2 != 0 {
+            return Err(invalid("registry marker is not bounded UTF-16 REG_SZ data"));
+        }
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let end = units
+            .iter()
+            .position(|unit| *unit == 0)
+            .ok_or_else(|| invalid("registry marker lacks a UTF-16 terminator"))?;
+        if units[end..].iter().any(|unit| *unit != 0) {
+            return Err(invalid("registry marker has nonzero trailing data"));
+        }
+        let value = String::from_utf16(&units[..end])
+            .map_err(|_| invalid("registry marker contains invalid UTF-16"))?;
+        digest(value.as_bytes())
+    }
+
+    fn parent_marker_controls(timing: &str) -> io::Result<()> {
+        let machine_name = std::env::var("ORBIT_REGISTRY_WITNESS_MACHINE_MARKER")
+            .map_err(|_| invalid("machine marker identity missing"))?;
+        let user_name = std::env::var("ORBIT_REGISTRY_WITNESS_USER_MARKER")
+            .map_err(|_| invalid("user marker identity missing"))?;
+        let expected_machine = std::env::var("ORBIT_REGISTRY_WITNESS_MACHINE_HASH")
+            .map_err(|_| invalid("machine marker digest missing"))?;
+        let expected_user = std::env::var("ORBIT_REGISTRY_WITNESS_USER_HASH")
+            .map_err(|_| invalid("user marker digest missing"))?;
+        let user_sid = std::env::var("ORBIT_REGISTRY_WITNESS_USER_SID")
+            .map_err(|_| invalid("original user SID missing"))?;
+        let machine_path = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+        let user_path = format!("{user_sid}\\Environment");
+        let machine_nt =
+            "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+        let user_nt = format!("\\Registry\\User\\{user_sid}\\Environment");
+        for (api, root, path, native, name, expected) in [
+            (
+                "win32",
+                HKEY_LOCAL_MACHINE,
+                machine_path,
+                machine_nt,
+                machine_name.as_str(),
+                expected_machine.as_str(),
+            ),
+            (
+                "win32",
+                HKEY_USERS,
+                user_path.as_str(),
+                user_nt.as_str(),
+                user_name.as_str(),
+                expected_user.as_str(),
+            ),
+        ] {
+            let key = win32_open_key(root, path, KEY_QUERY_VALUE)
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+            let observed = registry_string_digest(
+                &win32_query_value(&key, name)
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+            )?;
+            if !observed.eq_ignore_ascii_case(expected) {
+                return Err(io::Error::other("Win32 fake marker digest changed"));
+            }
+            emit_witness_record(&format!(
+                "registry_witness_probe id=parent_present/{timing}/{api}/{} status=0 observed=true sha256={observed}",
+                if api == "win32" && root == HKEY_LOCAL_MACHINE {
+                    "machine"
+                } else {
+                    "user"
+                }
+            ))?;
+            let native_key =
+                nt_open_key(native, KEY_QUERY_VALUE).map_err(io::Error::from_raw_os_error)?;
+            let (kind, value) =
+                nt_query_value(&native_key, name).map_err(io::Error::from_raw_os_error)?;
+            if kind != REG_SZ || !registry_string_digest(&value)?.eq_ignore_ascii_case(expected) {
+                return Err(io::Error::other("native fake marker control changed"));
+            }
+            let target = if root == HKEY_LOCAL_MACHINE {
+                "machine"
+            } else {
+                "user"
+            };
+            emit_witness_record(&format!(
+                "registry_witness_probe id=parent_present/{timing}/nt/{target} status=0 observed=true sha256={}",
+                registry_string_digest(&value)?
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn win32_open_key(root: HKEY, path: &str, access: REG_SAM_FLAGS) -> Result<OwnedRegKey, u32> {
+        let path = wide(OsStr::new(path)).map_err(|_| ERROR_INVALID_PARAMETER)?;
+        let mut key = null_mut();
+        let status = unsafe { RegOpenKeyExW(root, path.as_ptr(), 0, access, &mut key) };
+        if status != ERROR_SUCCESS {
+            return Err(status);
+        }
+        // SAFETY: RegOpenKeyExW succeeded and returned a uniquely owned key.
+        unsafe { OwnedRegKey::from_raw(key).map_err(|_| ERROR_INVALID_HANDLE) }
+    }
+
+    fn win32_query_value(key: &OwnedRegKey, name: &str) -> Result<Vec<u8>, u32> {
+        win32_query_value_handle(key.raw(), name)
+    }
+
+    fn win32_query_value_handle(key: HKEY, name: &str) -> Result<Vec<u8>, u32> {
+        let name = wide(OsStr::new(name)).map_err(|_| ERROR_INVALID_PARAMETER)?;
+        let mut value_type = 0u32;
+        let mut length = 0u32;
+        let first = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                null_mut(),
+                &mut value_type,
+                null_mut(),
+                &mut length,
+            )
+        };
+        if first != ERROR_SUCCESS {
+            return Err(first);
+        }
+        if length == 0 || length > 4096 {
+            return Err(ERROR_INVALID_DATA);
+        }
+        let mut bytes = vec![0u8; length as usize];
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                null_mut(),
+                &mut value_type,
+                bytes.as_mut_ptr(),
+                &mut length,
+            )
+        };
+        if status != ERROR_SUCCESS || value_type != REG_SZ || length as usize > bytes.len() {
+            return Err(if status == ERROR_SUCCESS {
+                ERROR_INVALID_DATA
+            } else {
+                status
+            });
+        }
+        bytes.truncate(length as usize);
+        Ok(bytes)
+    }
+
+    fn private_view_label(root: HKEY) -> io::Result<bool> {
+        let metadata = wide(OsStr::new("Metadata"))?;
+        let mut key = null_mut();
+        let status = unsafe { RegOpenKeyExW(root, metadata.as_ptr(), 0, KEY_READ, &mut key) };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        // SAFETY: RegOpenKeyExW returned one owned key.
+        let key = unsafe { OwnedRegKey::from_raw(key) }?;
+        let bytes = win32_query_value(&key, "Fixture")
+            .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+        Ok(decode_reg_sz(&bytes)? == "ORBIT-PRIVATE-METADATA-V1")
+    }
+
+    fn decode_reg_sz(bytes: &[u8]) -> io::Result<String> {
+        if bytes.is_empty() || bytes.len() > 4096 || bytes.len() % size_of::<u16>() != 0 {
+            return Err(invalid("REG_SZ data has invalid UTF-16 byte length"));
+        }
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let end = units
+            .iter()
+            .position(|unit| *unit == 0)
+            .ok_or_else(|| invalid("REG_SZ data is not NUL terminated"))?;
+        if units[end..].iter().any(|unit| *unit != 0) {
+            return Err(invalid(
+                "REG_SZ data has nonzero bytes after its terminator",
+            ));
+        }
+        String::from_utf16(&units[..end]).map_err(|_| invalid("REG_SZ data is invalid UTF-16"))
+    }
+
+    fn win32_open_status(root: HKEY, path: &str, access: REG_SAM_FLAGS) -> u32 {
+        match win32_open_key(root, path, access) {
+            Ok(key) => {
+                let _ = key.close();
+                ERROR_SUCCESS
+            }
+            Err(status) => status,
+        }
+    }
+
+    fn nt_open_status(path: &str, access: u32) -> i32 {
+        match nt_open_key(path, access) {
+            Ok(key) => {
+                let _ = key.close();
+                0
+            }
+            Err(status) => status,
+        }
+    }
+
+    fn expect_denial(id: &str, domain: &str, actual: i32, expected: i32) {
+        emit_witness_record(&format!(
+            "registry_witness_probe id={id} domain={domain} status={actual:#x}"
+        ))
+        .expect("bounded denial record");
+        assert_eq!(actual, expected, "required denial probe {id} failed");
+    }
+
+    fn record_read(id: &str, observed: bool) {
+        emit_witness_record(&format!(
+            "registry_witness_probe id={id} observed={observed}"
+        ))
+        .expect("bounded read record");
+        assert!(observed, "required private registry read {id} failed");
+    }
+
+    fn create_acl_key(parent: HKEY, name: &str, sddl: &str) -> io::Result<OwnedRegKey> {
+        let name = wide(OsStr::new(name))?;
+        let sddl = wide(OsStr::new(sddl))?;
+        let mut descriptor = null_mut();
+        unsafe {
+            ok(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW(registry witness)",
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                ),
+            )?;
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let mut key = null_mut();
+        let mut disposition = 0u32;
+        let status = unsafe {
+            RegCreateKeyExW(
+                parent,
+                name.as_ptr(),
+                0,
+                null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_ALL_ACCESS,
+                &attributes,
+                &mut key,
+                &mut disposition,
+            )
+        };
+        unsafe { LocalFree(descriptor.cast()) };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        // SAFETY: RegCreateKeyExW returned one owned key handle.
+        let key = unsafe { OwnedRegKey::from_raw(key) }?;
+        if disposition != REG_CREATED_NEW_KEY {
+            let _ = key.close();
+            return Err(invalid("registry witness fixture key already existed"));
+        }
+        Ok(key)
+    }
+
+    fn set_string(key: HKEY, name: &str, value: &str) -> io::Result<()> {
+        let name = wide(OsStr::new(name))?;
+        let mut value: Vec<u16> = value.encode_utf16().collect();
+        value.push(0);
+        let status = unsafe {
+            RegSetValueExW(
+                key,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                value.as_ptr().cast(),
+                (value.len() * size_of::<u16>()) as u32,
+            )
+        };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    }
+
+    struct PrivateRegistryFixture {
+        name: String,
+        root: Option<OwnedRegKey>,
+        created_keys: Vec<String>,
+        expected_values: Vec<(String, String, String)>,
+    }
+
+    struct HeldHelperImage {
+        directory: PathBuf,
+        path: PathBuf,
+        file: File,
+        identity: (u64, [u8; 16]),
+        sha256: String,
+    }
+
+    pub(super) fn identity_text(identity: (u64, [u8; 16])) -> String {
+        format!(
+            "{:016X}:{}",
+            identity.0,
+            identity
+                .1
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>()
+        )
+    }
+
+    pub(super) fn process_creation_text(process: HANDLE) -> io::Result<String> {
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe {
+            ok(
+                "GetProcessTimes(registry witness identity)",
+                GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user),
+            )?;
+        }
+        let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        Ok(format!("{ticks:016X}"))
+    }
+
+    fn set_owned_resource_dacl(
+        handle: HANDLE,
+        user_sid: &str,
+        package_sid: &str,
+        rights: &str,
+    ) -> io::Result<()> {
+        let descriptor_sddl = wide(OsStr::new(&format!(
+            "O:{user_sid}D:P(A;;FA;;;{user_sid})(A;;{rights};;;{package_sid})"
+        )))?;
+        let mut descriptor = null_mut();
+        unsafe {
+            ok(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW(helper image)",
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    descriptor_sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                ),
+            )?;
+        }
+        let (mut present, mut dacl, mut defaulted) = (0, null_mut(), 0);
+        let read = unsafe {
+            GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+        };
+        if read == 0 || present == 0 || dacl.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+            return Err(operation_error(
+                "GetSecurityDescriptorDacl(helper image)",
+                io::Error::last_os_error(),
+            ));
+        }
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            )
+        };
+        unsafe { LocalFree(descriptor.cast()) };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    }
+
+    fn hold_helper_image(
+        session: &SandboxSession,
+        nonce: &str,
+        user_sid: &str,
+        package_sid: &str,
+    ) -> io::Result<HeldHelperImage> {
+        let directory = session.folder.join(format!("registry-helper-{nonce}"));
+        std::fs::create_dir(&directory)?;
+        let path = directory.join("orbit-registry-helper.exe");
+        let mut image_file_created = false;
+        let result = (|| {
+            let directory_wide = wide(directory.as_os_str())?;
+            let directory_handle = own("CreateFileW(owned helper directory)", unsafe {
+                CreateFileW(
+                    directory_wide.as_ptr(),
+                    FILE_READ_ATTRIBUTES | WRITE_DAC | FILE_TRAVERSE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    null_mut(),
+                )
+            })?;
+            check_object(directory_handle.as_raw_handle(), true)?;
+            set_owned_resource_dacl(
+                directory_handle.as_raw_handle(),
+                user_sid,
+                package_sid,
+                "FX",
+            )?;
+            drop(directory_handle);
+
+            let source = std::env::current_exe()?;
+            let source_meta = std::fs::metadata(&source)?;
+            if !source_meta.is_file()
+                || source_meta.len() == 0
+                || source_meta.len() > 128 * 1024 * 1024
+            {
+                return Err(invalid(
+                    "test helper image size is outside the reviewed bound",
+                ));
+            }
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => return Err(invalid("owned helper image path unexpectedly exists")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let mut source_file = File::open(&source)?;
+            let mut target_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            image_file_created = true;
+            io::copy(&mut source_file, &mut target_file)?;
+            target_file.flush()?;
+            drop(target_file);
+            let path_wide = wide(path.as_os_str())?;
+            let file = own("CreateFileW(owned helper image security handle)", unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    FILE_GENERIC_READ | WRITE_DAC | READ_CONTROL,
+                    FILE_SHARE_READ,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    null_mut(),
+                )
+            })?;
+            check_object(file.as_raw_handle(), false)?;
+            set_owned_resource_dacl(file.as_raw_handle(), user_sid, package_sid, "FRFX")?;
+            let identity = script_identity(file.as_raw_handle())?;
+            let file = File::from(file);
+            let mut reader = file.try_clone()?;
+            let mut image_bytes = Vec::with_capacity(source_meta.len() as usize);
+            reader.read_to_end(&mut image_bytes)?;
+            if image_bytes.len() as u64 != source_meta.len() {
+                return Err(invalid("held helper image length changed during copy"));
+            }
+            let sha256 = digest(&image_bytes)?;
+            let identity_after = script_identity(file.as_raw_handle())?;
+            if identity != identity_after {
+                return Err(invalid("held helper image identity changed"));
+            }
+            reader.seek(SeekFrom::Start(0))?;
+            Ok(HeldHelperImage {
+                directory: directory.clone(),
+                path: path.clone(),
+                file,
+                identity,
+                sha256,
+            })
+        })();
+        match result {
+            Ok(image) => Ok(image),
+            Err(primary) => {
+                let cleanup = cleanup_partial_helper_image(&directory, &path, image_file_created);
+                match cleanup {
+                    Ok(()) => {
+                        let detail = format!(
+                            "helper image setup failed: {primary}; partial image cleanup=absence proven"
+                        );
+                        let record = emit_witness_record(
+                            "registry_witness_setup_cleanup object=partial_helper_image outcome=absence_proven",
+                        );
+                        Err(io::Error::other(match record {
+                            Ok(()) => detail,
+                            Err(record_error) => {
+                                format!("{detail}; status record emission failed: {record_error}")
+                            }
+                        }))
+                    }
+                    Err(cleanup) => {
+                        let retained_profile = session.retain_profile_for_registry_witness();
+                        let detail = format!(
+                            "helper image setup failed: {primary}; exact-owned cleanup failed; image={} directory={} residue=unverified: {cleanup}",
+                            path.display(),
+                            directory.display()
+                        );
+                        let record = emit_witness_record(&format!(
+                            "registry_witness_setup_cleanup object=partial_helper_image outcome=FAILED retained={retained_profile} detail={}",
+                            escape_diagnostic(detail.as_bytes())
+                        ));
+                        Err(io::Error::other(match record {
+                            Ok(()) => format!("{detail}; {retained_profile}"),
+                            Err(record_error) => format!(
+                                "{detail}; {retained_profile}; status record emission failed: {record_error}"
+                            ),
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
+    fn cleanup_partial_helper_image(
+        directory: &Path,
+        path: &Path,
+        image_file_created: bool,
+    ) -> io::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !image_file_created || !metadata.file_type().is_file() {
+                    return Err(io::Error::other("unexpected helper image object preserved"));
+                }
+                std::fs::remove_file(path)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() {
+                    return Err(io::Error::other(
+                        "unexpected helper image directory object preserved",
+                    ));
+                }
+                std::fs::remove_dir(directory)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        confirm_absent(path)?;
+        confirm_absent(directory)
+    }
+
+    fn confirm_absent(path: &Path) -> io::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Err(io::Error::other(format!(
+                "owned image object remains: {}",
+                path.display()
+            ))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    impl HeldHelperImage {
+        fn cleanup(self) -> io::Result<()> {
+            let path = self.path.clone();
+            let directory = self.directory.clone();
+            let result = (|| {
+                let identity = script_identity(self.file.as_raw_handle())?;
+                let mut verify = self.file.try_clone()?;
+                verify.seek(SeekFrom::Start(0))?;
+                let mut bytes = Vec::new();
+                verify.read_to_end(&mut bytes)?;
+                if identity != self.identity || digest(&bytes)? != self.sha256 {
+                    return Err(io::Error::other("held helper image changed before cleanup"));
+                }
+                drop(verify);
+                drop(self.file);
+                std::fs::remove_file(&path)?;
+                std::fs::remove_dir(&directory)?;
+                confirm_absent(&path)?;
+                confirm_absent(&directory)
+            })();
+            result.map_err(|error| io::Error::other(format!(
+                "owned helper image cleanup failed; image={} directory={} residue=unverified: {error}",
+                path.display(), directory.display()
+            )))
+        }
+    }
+
+    impl PrivateRegistryFixture {
+        fn create(nonce: &str, user_sid: &str, package_sid: &str) -> io::Result<Self> {
+            let software = win32_open_key(HKEY_CURRENT_USER, "Software", KEY_ALL_ACCESS)
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+            let name = format!("ORBIT_WITNESS_{nonce}");
+            let policy = format!(
+                "O:{user_sid}D:P(D;;0x000D0026;;;{package_sid})(A;;RC;;;OW)(A;;KA;;;{user_sid})(A;;KR;;;{package_sid})"
+            );
+            let root = create_acl_key(software.raw(), &name, &policy)?;
+            let mut created_keys = vec![String::new()];
+            let mut expected_values = Vec::new();
+            let marker = "ORBIT-PRIVATE-METADATA-V1".to_owned();
+            let build: io::Result<()> = (|| {
+                for view_name in ["MachineView", "UserView"] {
+                    let view = create_acl_key(root.raw(), view_name, &policy)?;
+                    created_keys.push(view_name.to_owned());
+                    let metadata_path = format!("{view_name}\\Metadata");
+                    let metadata = create_acl_key(view.raw(), "Metadata", &policy)?;
+                    created_keys.push(metadata_path.clone());
+                    expected_values.push((metadata_path, "Fixture".to_owned(), marker.clone()));
+                    set_string(metadata.raw(), "Fixture", &marker)?;
+                    metadata.close()?;
+                    expected_values.push((
+                        view_name.to_owned(),
+                        "Mutation".to_owned(),
+                        "unchanged-v1".to_owned(),
+                    ));
+                    set_string(view.raw(), "Mutation", "unchanged-v1")?;
+                    let leaf_path = format!("{view_name}\\DeleteLeaf");
+                    let leaf = create_acl_key(view.raw(), "DeleteLeaf", &policy)?;
+                    created_keys.push(leaf_path.clone());
+                    expected_values.push((
+                        leaf_path,
+                        "Fixture".to_owned(),
+                        "delete-target-v1".to_owned(),
+                    ));
+                    set_string(leaf.raw(), "Fixture", "delete-target-v1")?;
+                    leaf.close()?;
+                    view.close()?;
+                }
+                Ok(())
+            })();
+            let mut fixture = Self {
+                name,
+                root: Some(root),
+                created_keys,
+                expected_values,
+            };
+            if let Err(primary) = build {
+                return match fixture.cleanup_owned() {
+                    Ok(()) => {
+                        let detail = format!(
+                            "fixture setup failed: {primary}; exact-owned cleanup=absence proven; nonce_root=Software\\{}",
+                            fixture.name
+                        );
+                        let record = emit_witness_record(&format!(
+                            "registry_witness_setup_cleanup object=private_fixture nonce_root=Software\\{} outcome=absence_proven",
+                            fixture.name
+                        ));
+                        Err(io::Error::other(match record {
+                            Ok(()) => detail,
+                            Err(record_error) => {
+                                format!("{detail}; status record emission failed: {record_error}")
+                            }
+                        }))
+                    }
+                    Err(cleanup) => {
+                        let detail = format!(
+                            "fixture setup failed: {primary}; exact-owned cleanup/residue: {cleanup}"
+                        );
+                        let record = emit_witness_record(&format!(
+                            "registry_witness_setup_cleanup object=private_fixture outcome=FAILED detail={}",
+                            escape_diagnostic(detail.as_bytes())
+                        ));
+                        Err(io::Error::other(match record {
+                            Ok(()) => detail,
+                            Err(record_error) => {
+                                format!("{detail}; status record emission failed: {record_error}")
+                            }
+                        }))
+                    }
+                };
+            }
+            if let Err(close_error) = software.close() {
+                return match fixture.cleanup_owned() {
+                    Ok(()) => {
+                        let detail = format!(
+                            "fixture parent close failed: {close_error}; exact-owned cleanup=absence proven; nonce_root=Software\\{}",
+                            fixture.name
+                        );
+                        let record = emit_witness_record(&format!(
+                            "registry_witness_setup_cleanup object=private_fixture nonce_root=Software\\{} outcome=absence_proven parent_handle_close=FAILED",
+                            fixture.name
+                        ));
+                        Err(io::Error::other(match record {
+                            Ok(()) => detail,
+                            Err(record_error) => {
+                                format!("{detail}; status record emission failed: {record_error}")
+                            }
+                        }))
+                    }
+                    Err(cleanup) => {
+                        let detail = format!(
+                            "fixture parent close failed: {close_error}; exact-owned cleanup failed: {cleanup}"
+                        );
+                        let record = emit_witness_record(&format!(
+                            "registry_witness_setup_cleanup object=private_fixture outcome=FAILED detail={}",
+                            escape_diagnostic(detail.as_bytes())
+                        ));
+                        Err(io::Error::other(match record {
+                            Ok(()) => detail,
+                            Err(record_error) => {
+                                format!("{detail}; status record emission failed: {record_error}")
+                            }
+                        }))
+                    }
+                };
+            }
+            Ok(fixture)
+        }
+
+        fn root_handle(&self, view: &str, access: REG_SAM_FLAGS) -> io::Result<OwnedRegKey> {
+            let path = format!("{view}");
+            win32_open_key(
+                self.root.as_ref().expect("fixture root open").raw(),
+                &path,
+                access,
+            )
+            .map_err(|status| io::Error::from_raw_os_error(status as i32))
+        }
+
+        fn verify_unchanged(&self) -> io::Result<()> {
+            for view in ["MachineView", "UserView"] {
+                let key = self.root_handle(view, KEY_READ)?;
+                if !private_view_label(key.raw())?
+                    || decode_reg_sz(
+                        &win32_query_value(&key, "Mutation")
+                            .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                    )? != "unchanged-v1"
+                {
+                    return Err(io::Error::other("private fixture data changed"));
+                }
+                let leaf = win32_open_key(key.raw(), "DeleteLeaf", KEY_READ)
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+                if decode_reg_sz(
+                    &win32_query_value(&leaf, "Fixture")
+                        .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                )? != "delete-target-v1"
+                {
+                    return Err(io::Error::other("private delete target changed"));
+                }
+            }
+            Ok(())
+        }
+
+        fn cleanup(mut self) -> io::Result<()> {
+            let unchanged = self.verify_unchanged();
+            let cleanup = self.cleanup_owned();
+            match (unchanged, cleanup) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(primary), Ok(())) => Err(io::Error::other(format!(
+                    "fixture changed before cleanup but exact-owned expected state was removed: {primary}"
+                ))),
+                (Ok(()), Err(cleanup)) => Err(cleanup),
+                (Err(primary), Err(cleanup)) => Err(io::Error::other(format!(
+                    "fixture preimage verification failed: {primary}; exact-owned cleanup/residue: {cleanup}"
+                ))),
+            }
+        }
+
+        fn cleanup_owned(&mut self) -> io::Result<()> {
+            let outcome = self.cleanup_owned_steps();
+            outcome.map_err(|error| {
+                let keys = self.created_keys.join(",");
+                let values = self.expected_values.iter().map(|(key, name, _)| format!("{key}\\{name}")).collect::<Vec<_>>().join(",");
+                io::Error::other(format!("{error}; nonce_root=Software\\{}; tracked_key_candidates=[{keys}]; tracked_value_candidates=[{values}]; residue_state=unverified", self.name))
+            })
+        }
+
+        fn cleanup_owned_steps(&mut self) -> io::Result<()> {
+            let software = win32_open_key(HKEY_CURRENT_USER, "Software", KEY_ALL_ACCESS)
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+            let root_handle = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("private fixture cleanup owner missing"))?
+                .raw();
+            for (key_path, value_name, expected) in &self.expected_values {
+                let key = if key_path.is_empty() {
+                    None
+                } else {
+                    Some(
+                        win32_open_key(root_handle, key_path, KEY_QUERY_VALUE | KEY_SET_VALUE)
+                            .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                    )
+                };
+                let handle = key.as_ref().map_or(root_handle, OwnedRegKey::raw);
+                let existing = win32_query_value_handle(handle, value_name);
+                match existing {
+                    Ok(bytes) if decode_reg_sz(&bytes)? == *expected => {
+                        let name = wide(OsStr::new(value_name))?;
+                        let status = unsafe { RegDeleteValueW(handle, name.as_ptr()) };
+                        if status != ERROR_SUCCESS {
+                            return Err(io::Error::from_raw_os_error(status as i32));
+                        }
+                    }
+                    Err(ERROR_FILE_NOT_FOUND) => {}
+                    Ok(_) => {
+                        return Err(io::Error::other(format!(
+                            "unexpected fixture value preserved at {key_path}\\{value_name}"
+                        )));
+                    }
+                    Err(status) => return Err(io::Error::from_raw_os_error(status as i32)),
+                }
+            }
+            for key_path in self.created_keys.iter().rev() {
+                let owned_key = if key_path.is_empty() {
+                    None
+                } else {
+                    Some(
+                        win32_open_key(root_handle, key_path, KEY_READ)
+                            .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                    )
+                };
+                let handle = owned_key.as_ref().map_or(root_handle, OwnedRegKey::raw);
+                require_empty_registry_key(handle, key_path)?;
+                if !key_path.is_empty() {
+                    owned_key.expect("non-root fixture key").close()?;
+                    let path = wide(OsStr::new(key_path))?;
+                    let status = unsafe { RegDeleteKeyW(root_handle, path.as_ptr()) };
+                    if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+                        return Err(io::Error::from_raw_os_error(status as i32));
+                    }
+                    if win32_open_status(root_handle, key_path, KEY_READ) != ERROR_FILE_NOT_FOUND {
+                        return Err(io::Error::other(format!(
+                            "owned fixture key absence not proven: {key_path}"
+                        )));
+                    }
+                }
+            }
+            self.root.take().expect("fixture root owner").close()?;
+            let name = wide(OsStr::new(&self.name))?;
+            let status = unsafe { RegDeleteKeyW(software.raw(), name.as_ptr()) };
+            if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            software.close()?;
+            if win32_open_status(
+                HKEY_CURRENT_USER,
+                &format!("Software\\{}", self.name),
+                KEY_READ,
+            ) != ERROR_FILE_NOT_FOUND
+            {
+                return Err(io::Error::other(
+                    "private fixture cleanup absence not proven",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn require_empty_registry_key(key: HKEY, path: &str) -> io::Result<()> {
+        let (mut subkeys, mut values) = (0u32, 0u32);
+        let status = unsafe {
+            RegQueryInfoKeyW(
+                key,
+                null_mut(),
+                null_mut(),
+                null(),
+                &mut subkeys,
+                null_mut(),
+                null_mut(),
+                &mut values,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::other(format!(
+                "RegQueryInfoKeyW({path}) failed: {status}"
+            )));
+        }
+        if subkeys != 0 || values != 0 {
+            return Err(io::Error::other(format!(
+                "unexpected private key content preserved at {path}: subkeys={subkeys}, values={values}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Closed ID oracle used by the native parent before it accepts evidence.
+    /// Constructing this set is not itself a witness result.
+    fn required_probe_ids() -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        for timing in ["before", "after"] {
+            for api in ["win32", "nt"] {
+                for target in ["machine", "user"] {
+                    ids.insert(format!("parent_present/{timing}/{api}/{target}"));
+                }
+            }
+        }
+        for phase in ["baseline", "reset"] {
+            for api in ["win32", "nt"] {
+                for target in ["machine", "user"] {
+                    ids.insert(format!("{phase}/host_denied/{api}/{target}"));
+                }
+            }
+        }
+        for phase in ["inherited", "mapped", "remapped"] {
+            for view in ["machine_view", "user_view"] {
+                ids.insert(format!("{phase}/public_read/{view}"));
+            }
+        }
+        for view in ["machine_view", "user_view"] {
+            ids.insert(format!("mapped/private_absent/{view}"));
+        }
+        for target in ["machine", "user"] {
+            ids.insert(format!("mapped/host_denied/nt/{target}"));
+        }
+        ids.insert("mapped/host_denied/win32/user".to_owned());
+        for operation in [
+            "set_value",
+            "delete_value",
+            "create_subkey",
+            "delete_leaf",
+            "set_dacl",
+            "set_owner",
+            "reopen_write",
+            "reopen_delete",
+            "reopen_write_dac",
+            "reopen_write_owner",
+            "duplicate_mutation",
+        ] {
+            for view in ["machine_view", "user_view"] {
+                ids.insert(format!("mutation/{operation}/{view}"));
+            }
+        }
+        for view in ["machine_view", "user_view"] {
+            ids.insert(format!("duplicate_read/{view}"));
+        }
+        for right in [
+            "dup_handle",
+            "vm_write",
+            "vm_operation",
+            "create_thread",
+            "write_dac",
+            "write_owner",
+            "vm_read",
+        ] {
+            ids.insert(format!("parent_authority/{right}"));
+        }
+        ids.insert("parent_token/process_query_limited".to_owned());
+        for right in [
+            "token_duplicate",
+            "write_dac",
+            "write_owner",
+            "token_impersonate",
+            "token_assign_primary",
+        ] {
+            ids.insert(format!("parent_token/{right}"));
+        }
+        for view in ["machine_view", "user_view"] {
+            ids.insert(format!("parent_recovery/{view}"));
+        }
+        for lifetime in [
+            "normal_job_zero",
+            "cancel_ready_mapped",
+            "cancel_job_zero",
+            "cleanup_absent",
+        ] {
+            ids.insert(format!("lifetime/{lifetime}"));
+        }
+        ids
+    }
+
+    // Keep the binding imports and ownership types tied to this test-only
+    // module; the actual fixed helper and native probes are added below.
+    #[allow(dead_code)]
+    fn binding_smoke_types() {
+        let _ = NtOpenKey;
+        let _ = NtQueryValueKey;
+        let _: Option<KEY_VALUE_PARTIAL_INFORMATION> = None;
+        let _ = std::mem::size_of::<OBJECT_ATTRIBUTES>();
+    }
+
+    fn reset_predefined_roots() -> io::Result<()> {
+        let machine = unsafe { RegOverridePredefKey(HKEY_LOCAL_MACHINE, null_mut()) };
+        let user = unsafe { RegOverridePredefKey(HKEY_CURRENT_USER, null_mut()) };
+        if machine != ERROR_SUCCESS || user != ERROR_SUCCESS {
+            return Err(io::Error::other(format!(
+                "registry map reset failed: machine={machine}, user={user}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn child_admission(package_sid: &str) -> io::Result<()> {
+        let mut token = null_mut();
+        unsafe {
+            ok(
+                "OpenProcessToken(registry witness helper)",
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut token,
+                ),
+            )?;
+        }
+        let token = own("OpenProcessToken(registry witness helper)", token)?;
+        if !token_boolean(token.as_raw_handle(), TokenIsAppContainer)? {
+            return Err(invalid("registry witness child is not an AppContainer"));
+        }
+        let access =
+            inspect_lpac_access(unsafe { BorrowedHandle::borrow_raw(token.as_raw_handle()) })?;
+        if !access.is_less_privileged() {
+            return Err(invalid("registry witness child is not LPAC"));
+        }
+        let groups = token_buffer(
+            token.as_raw_handle(),
+            TokenCapabilities,
+            "GetTokenInformation(registry witness child capabilities)",
+        )?;
+        let count = unsafe { *groups.as_ptr().cast::<u32>() };
+        if count != 1
+            || groups.len() * size_of::<usize>()
+                < std::mem::offset_of!(TOKEN_GROUPS, Groups) + size_of::<SID_AND_ATTRIBUTES>()
+        {
+            return Err(invalid(
+                "registry witness child capability count differs from singleton",
+            ));
+        }
+        let capability = unsafe { (*groups.as_ptr().cast::<TOKEN_GROUPS>()).Groups[0] };
+        let capability_name = sid_text(capability.Sid)?;
+        verify_runtime_capability_set(&[(&capability_name, capability.Attributes)])?;
+        let container = token_buffer(
+            token.as_raw_handle(),
+            TokenAppContainerSid,
+            "GetTokenInformation(registry witness package SID)",
+        )?;
+        let actual_package = sid_text(unsafe {
+            (*container.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()).TokenAppContainer
+        })?;
+        if actual_package != package_sid {
+            return Err(invalid("registry witness child package SID mismatch"));
+        }
+        let mut in_job = 0;
+        unsafe {
+            ok(
+                "IsProcessInJob(registry witness child)",
+                IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job),
+            )?;
+        }
+        if in_job == 0 {
+            return Err(invalid("registry witness child is not in a Job"));
+        }
+        let mut thread_token = null_mut();
+        let thread_has_token =
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut thread_token) };
+        if thread_has_token != 0 {
+            let _ = unsafe { CloseHandle(thread_token) };
+            return Err(invalid(
+                "registry witness child has an unexpected thread token",
+            ));
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_NO_TOKEN {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        emit_witness_record("registry_witness_child_admission appcontainer=true lpac=true capability_count=1 network_capabilities=0 job=true thread_token=false")
+            .expect("bounded child admission record");
+        Ok(())
+    }
+
+    fn current_image_observation() -> io::Result<(String, String)> {
+        let path = std::env::current_exe()?;
+        let path_wide = wide(path.as_os_str())?;
+        let handle = own("CreateFileW(current helper image)", unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                FILE_GENERIC_READ,
+                FILE_SHARE_READ,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        })?;
+        check_object(handle.as_raw_handle(), false)?;
+        let identity = script_identity(handle.as_raw_handle())?;
+        let mut file = File::from(handle);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok((identity_text(identity), digest(&bytes)?))
+    }
+
+    fn parent_primary_user_sid() -> io::Result<String> {
+        let mut token = null_mut();
+        unsafe {
+            ok(
+                "OpenProcessToken(parent primary identity)",
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token),
+            )?;
+        }
+        let token = own("OpenProcessToken(parent primary identity)", token)?;
+        let user = token_buffer(
+            token.as_raw_handle(),
+            TokenUser,
+            "GetTokenInformation(parent TokenUser)",
+        )?;
+        let sid = sid_text(unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid })?;
+        let mut thread_token = null_mut();
+        let opened =
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut thread_token) };
+        if opened != 0 {
+            let _ = unsafe { CloseHandle(thread_token) };
+            return Err(invalid(
+                "parent has a thread token; primary identity is ambiguous",
+            ));
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_NO_TOKEN {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        Ok(sid)
+    }
+
+    fn duplicate_inheritable_read_key(key: HKEY) -> io::Result<OwnedRegKey> {
+        let mut duplicate = null_mut();
+        unsafe {
+            ok(
+                "DuplicateHandle(private KEY_READ inheritance)",
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    key.cast(),
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    KEY_READ,
+                    1,
+                    0,
+                ),
+            )?;
+        }
+        // Establish the registry-specific owner immediately after duplication;
+        // every later fallible step must close this handle with RegCloseKey.
+        let duplicate = unsafe { OwnedRegKey::from_raw(duplicate.cast()) }?;
+        unsafe {
+            ok(
+                "SetHandleInformation(private registry inheritance)",
+                SetHandleInformation(
+                    duplicate.raw().cast(),
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                ),
+            )?;
+        }
+        Ok(duplicate)
+    }
+
+    fn forward_child_records(bytes: &[u8]) -> io::Result<()> {
+        let mut cursor = 0usize;
+        while let Some(relative) = bytes[cursor..]
+            .windows(WITNESS_FRAME_START.len())
+            .position(|part| part == WITNESS_FRAME_START)
+        {
+            let start = cursor + relative + WITNESS_FRAME_START.len();
+            let colon = bytes[start..]
+                .iter()
+                .position(|byte| *byte == b':')
+                .map(|offset| start + offset)
+                .ok_or_else(|| invalid("truncated helper record length"))?;
+            let length_text = std::str::from_utf8(&bytes[start..colon])
+                .map_err(|_| invalid("invalid helper record length"))?;
+            if length_text.is_empty()
+                || length_text.len() > 4
+                || !length_text.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(invalid("invalid helper record length"));
+            }
+            let length: usize = length_text
+                .parse()
+                .map_err(|_| invalid("invalid helper record length"))?;
+            if length > 8192 {
+                return Err(invalid("oversized helper record"));
+            }
+            let payload_start = colon + 1;
+            let payload_end = payload_start
+                .checked_add(length)
+                .ok_or_else(|| invalid("helper record length overflow"))?;
+            if payload_end >= bytes.len() || bytes[payload_end] != WITNESS_FRAME_END {
+                return Err(invalid("truncated or malformed helper record"));
+            }
+            let payload = std::str::from_utf8(&bytes[payload_start..payload_end])
+                .map_err(|_| invalid("helper record is not UTF-8"))?;
+            emit_witness_record(payload)?;
+            cursor = payload_end + 1;
+        }
+        Ok(())
+    }
+
+    fn parent_recovery(fixture: &PrivateRegistryFixture) -> io::Result<()> {
+        for view in ["MachineView", "UserView"] {
+            let key = fixture.root_handle(view, KEY_ALL_ACCESS)?;
+            let id = if view == "MachineView" {
+                "machine_view"
+            } else {
+                "user_view"
+            };
+            emit_witness_record(&format!(
+                "registry_witness_probe id=parent_recovery/{id} observed=true granted_access={KEY_ALL_ACCESS:#x}"
+            ))?;
+            key.close()?;
+        }
+        Ok(())
+    }
+
+    fn stop_child_after_failure(child: &mut OwnedProcess<'_>, primary: io::Error) -> io::Error {
+        match child.stop() {
+            Ok(()) => {
+                child.finished = true;
+                primary
+            }
+            Err(cleanup) => io::Error::other(format!(
+                "{primary}; child termination/wait failed: {cleanup}; OwnedProcess Drop will retry, and the session records any unobserved shutdown"
+            )),
+        }
+    }
+
+    fn registry_witness_stage_a_run() -> io::Result<()> {
+        verify_partial_key_value_header_oracle()?;
+        let nonce = std::env::var("ORBIT_REGISTRY_WITNESS_NONCE")
+            .map_err(|_| invalid("disposable CI fixture nonce missing"))?;
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(invalid("invalid disposable CI fixture nonce"));
+        }
+        let expected_user_sid = std::env::var("ORBIT_REGISTRY_WITNESS_USER_SID")
+            .map_err(|_| invalid("disposable CI original user SID missing"))?;
+        let user_sid = parent_primary_user_sid()?;
+        if user_sid != expected_user_sid {
+            return Err(invalid(
+                "parent primary process TokenUser differs from fixture identity",
+            ));
+        }
+        let mut session = None;
+        let mut fixture = None;
+        let mut image = None;
+        let run_result = (|| {
+            parent_marker_controls("before")?;
+            session = Some(SandboxSession::create()?);
+            let session_ref = session.as_ref().expect("session initialized");
+            let package_sid = sid_text(session_ref.sid.as_ptr().cast_mut().cast())?;
+            fixture = Some(PrivateRegistryFixture::create(
+                &nonce,
+                &user_sid,
+                &package_sid,
+            )?);
+            let marker_digest = digest(b"ORBIT-PRIVATE-METADATA-V1")?;
+            image = Some(hold_helper_image(
+                session_ref,
+                &nonce,
+                &user_sid,
+                &package_sid,
+            )?);
+            let fixture_ref = fixture.as_ref().expect("fixture initialized");
+            let image_ref = image.as_ref().expect("held image initialized");
+            let machine_root = fixture_ref.root_handle("MachineView", KEY_READ)?;
+            let user_root = fixture_ref.root_handle("UserView", KEY_READ)?;
+            let inherited_machine = duplicate_inheritable_read_key(machine_root.raw())?;
+            let inherited_user = duplicate_inheritable_read_key(user_root.raw())?;
+            machine_root.close()?;
+            user_root.close()?;
+            let image_id = image_ref.identity;
+            let executable = image_ref.path.clone();
+            let spec = SpawnSpec {
+                executable,
+                arguments: vec![
+                    "--exact".to_owned(),
+                    "process::windows::registry_witness_tests::registry_witness_fixed_child_helper"
+                        .to_owned(),
+                    "--nocapture".to_owned(),
+                ],
+                timeout: Duration::from_secs(30),
+                output_limit: 128 * 1024,
+            };
+            let inherited_handles = [inherited_machine, inherited_user];
+            let (mut child, thread) = OwnedProcess::create_registry_witness_child(
+                session_ref,
+                &spec,
+                "normal",
+                &nonce,
+                &user_sid,
+                &package_sid,
+                &image_ref.sha256,
+                image_id,
+                &marker_digest,
+                inherited_handles,
+            )?;
+            if !child.evidence.app_container
+                || !child.evidence.less_privileged
+                || !child.evidence.job_assigned_before_resume
+                || child.evidence.total_capabilities != 1
+                || child.evidence.network_capabilities != 0
+                || child.pid() == 0
+            {
+                let primary = invalid("helper pre-resume LPAC or Job evidence failed");
+                let error = stop_child_after_failure(&mut child, primary);
+                drop(thread);
+                return Err(error);
+            }
+            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+                let error =
+                    operation_error("ResumeThread(registry witness)", io::Error::last_os_error());
+                let error = stop_child_after_failure(&mut child, error);
+                drop(thread);
+                return Err(error);
+            }
+            drop(thread);
+            let output = child.wait(&AtomicBool::new(false))?;
+            emit_witness_record(&format!(
+                "registry_witness_child_result role=normal completion={:?} exit={} image_id={} image_sha256={} fixture_digest={}",
+                output.completion,
+                output.code,
+                identity_text(image_id),
+                image_ref.sha256,
+                marker_digest
+            ))?;
+            emit_witness_record(&format!(
+                "registry_witness_diagnostic stream=stdout truncated={} text={}",
+                output.stdout.len() > 1024,
+                escape_diagnostic(&output.stdout)
+            ))?;
+            emit_witness_record(&format!(
+                "registry_witness_diagnostic stream=stderr truncated={} text={}",
+                output.stderr.len() > 1024,
+                escape_diagnostic(&output.stderr)
+            ))?;
+            forward_child_records(&output.stdout)?;
+            forward_child_records(&output.stderr)?;
+            if output.code != 0 || output.completion != Completion::Exited {
+                return Err(io::Error::other(format!(
+                    "normal helper failed: exit={} completion={:?}",
+                    output.code, output.completion
+                )));
+            }
+            emit_witness_record(
+                "registry_witness_probe id=lifetime/normal_job_zero observed=true active_processes=0",
+            )?;
+            parent_recovery(fixture_ref)?;
+            fixture_ref.verify_unchanged()?;
+            Ok(())
+        })();
+
+        let primary_error = run_result.as_ref().err().map(ToString::to_string);
+        let mut cleanup_errors = Vec::new();
+        let mut fixture_finalized = false;
+        let mut image_finalized = false;
+        let mut profile_finalized = false;
+        let child_shutdown_unobserved = session.as_ref().is_some_and(|session| {
+            session
+                .registry_witness_child_unobserved
+                .load(Ordering::Acquire)
+        });
+        if child_shutdown_unobserved {
+            let fixture_residue = fixture.as_ref().map_or_else(
+                || "not-owned".to_owned(),
+                |fixture| format!("Software\\{}", fixture.name),
+            );
+            let image_residue = image.as_ref().map_or_else(
+                || "not-owned".to_owned(),
+                |image| image.path.display().to_string(),
+            );
+            cleanup_errors.push(format!("child/Job shutdown unobserved; retained registry={fixture_residue}; image={image_residue}; profile={}", session.as_ref().map_or_else(|| "unknown".to_owned(), |session| session.folder.display().to_string())));
+            drop(fixture.take());
+            drop(image.take());
+        } else {
+            if let Some(fixture) = fixture.take() {
+                match fixture.cleanup() {
+                    Ok(()) => fixture_finalized = true,
+                    Err(error) => {
+                        cleanup_errors.push(format!("private fixture cleanup/residue: {error}"))
+                    }
+                }
+            }
+            if let Some(image) = image.take() {
+                match image.cleanup() {
+                    Ok(()) => image_finalized = true,
+                    Err(error) => {
+                        if let Some(session) = session.as_ref() {
+                            let retained = session.retain_profile_for_registry_witness();
+                            cleanup_errors
+                                .push(format!("helper image cleanup/residue: {error}; {retained}"));
+                        } else {
+                            cleanup_errors.push(format!(
+                                "helper image cleanup/residue: {error}; profile owner unavailable"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(session) = session.take() {
+            match session.close() {
+                Ok(()) => profile_finalized = true,
+                Err(error) => cleanup_errors.push(format!("profile cleanup/residue: {error}")),
+            }
+        }
+        let host_marker_result = parent_marker_controls("after");
+        if let Err(error) = &host_marker_result {
+            cleanup_errors.push(format!("host marker post-control failed: {error}"));
+        }
+        if let Some(primary) = primary_error {
+            emit_witness_record(&format!(
+                "registry_witness_status witness_status=INCOMPLETE run_status=FAILED primary={}",
+                escape_diagnostic(primary.as_bytes())
+            ))?;
+        } else {
+            emit_witness_record(
+                "registry_witness_status witness_status=INCOMPLETE run_status=completed_partial",
+            )?;
+        }
+        if !cleanup_errors.is_empty() {
+            for error in &cleanup_errors {
+                emit_witness_record(&format!(
+                    "registry_witness_finalization status=FAILED detail={}",
+                    escape_diagnostic(error.as_bytes())
+                ))?;
+            }
+        } else {
+            emit_witness_record(&format!(
+                "registry_witness_finalization cleanup_errors=0 fixture_owner_finalized={fixture_finalized} image_owner_finalized={image_finalized} profile_owner_finalized={profile_finalized} host_marker_postcontrol=observed"
+            ))?;
+        }
+        if let Some(primary) = run_result.err() {
+            return Err(io::Error::other(format!(
+                "registry witness original failure: {primary}; finalization: {}",
+                if cleanup_errors.is_empty() {
+                    "no finalization errors".to_owned()
+                } else {
+                    cleanup_errors.join("; ")
+                }
+            )));
+        }
+        if !cleanup_errors.is_empty() {
+            return Err(io::Error::other(cleanup_errors.join("; ")));
+        }
+        emit_witness_record(
+            "registry_witness_probe id=lifetime/cleanup_absent observed=true private_fixture=true held_image=true profile_closed=true host_marker_prepost_equal=true",
+        )?;
+        emit_witness_record(
+            "registry_witness_incomplete unimplemented_controls=parent_authority,token_acquisition,mutation,duplicate_access,cancellation witness_status=INCOMPLETE",
+        )?;
+        Err(invalid(
+            "registry witness remains incomplete: parent-authority, token, mutation, duplicate-access and cancellation probes are unimplemented",
+        ))
+    }
+
+    #[test]
+    fn registry_witness_stage_a() -> io::Result<()> {
+        registry_witness_stage_a_run()
+    }
+
+    #[test]
+    fn registry_witness_fixed_child_helper() {
+        let role = std::env::var("ORBIT_REGISTRY_WITNESS_ROLE")
+            .expect("fixed helper test selector must receive a bounded launch role");
+        let nonce =
+            std::env::var("ORBIT_REGISTRY_WITNESS_NONCE").expect("fixed witness nonce missing");
+        let package_sid =
+            std::env::var("ORBIT_REGISTRY_WITNESS_PACKAGE_SID").expect("fixed package SID missing");
+        let user_sid =
+            std::env::var("ORBIT_REGISTRY_WITNESS_USER_SID").expect("original user SID missing");
+        assert!(matches!(role.as_str(), "normal" | "cancel"));
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(
+            user_sid.starts_with("S-1-5-")
+                && user_sid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        );
+        child_admission(&package_sid).expect("actual helper token and Job admission failed");
+        let (image_id, image_hash) =
+            current_image_observation().expect("held helper image observation failed");
+        assert_eq!(
+            image_id,
+            std::env::var("ORBIT_REGISTRY_WITNESS_IMAGE_ID").expect("held image ID missing")
+        );
+        assert_eq!(
+            image_hash,
+            std::env::var("ORBIT_REGISTRY_WITNESS_IMAGE_SHA256")
+                .expect("held image digest missing")
+        );
+        let parent_pid = std::env::var("ORBIT_REGISTRY_WITNESS_PARENT_PID")
+            .expect("parent process ID binding missing");
+        assert!(parent_pid.parse::<u32>().is_ok_and(|pid| pid != 0));
+        let parent_creation = std::env::var("ORBIT_REGISTRY_WITNESS_PARENT_CREATION")
+            .expect("parent creation-time binding missing");
+        assert_eq!(parent_creation.len(), 16);
+        assert!(parent_creation.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let fixture_digest = std::env::var("ORBIT_REGISTRY_WITNESS_FIXTURE_DIGEST")
+            .expect("private fixture digest binding missing");
+        assert_eq!(
+            fixture_digest,
+            digest(b"ORBIT-PRIVATE-METADATA-V1").expect("fixture digest")
+        );
+        let machine = std::env::var("ORBIT_REGISTRY_WITNESS_MACHINE_HANDLE")
+            .expect("machine read handle missing")
+            .parse::<usize>()
+            .expect("invalid machine handle encoding") as HKEY;
+        let user = std::env::var("ORBIT_REGISTRY_WITNESS_USER_HANDLE")
+            .expect("user read handle missing")
+            .parse::<usize>()
+            .expect("invalid user handle encoding") as HKEY;
+        assert!(!machine.is_null() && !user.is_null() && machine != user);
+        // SAFETY: these two inherited private-key handles were transferred
+        // exclusively to this child and are closed with RegCloseKey.
+        let machine = unsafe { OwnedRegKey::from_raw(machine) }.expect("invalid machine key");
+        // SAFETY: same transfer contract as the machine handle above.
+        let user = unsafe { OwnedRegKey::from_raw(user) }.expect("invalid user key");
+        let machine_path = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+        let user_path = format!("{user_sid}\\Environment");
+        let machine_nt =
+            "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+        let user_nt = format!("\\Registry\\User\\{user_sid}\\Environment");
+        expect_denial(
+            "baseline/host_denied/win32/machine",
+            "lstatus",
+            win32_open_status(HKEY_LOCAL_MACHINE, machine_path, KEY_QUERY_VALUE) as i32,
+            ERROR_ACCESS_DENIED as i32,
+        );
+        expect_denial(
+            "baseline/host_denied/win32/user",
+            "lstatus",
+            win32_open_status(HKEY_USERS, &user_path, KEY_QUERY_VALUE) as i32,
+            ERROR_ACCESS_DENIED as i32,
+        );
+        expect_denial(
+            "baseline/host_denied/nt/machine",
+            "ntstatus",
+            nt_open_status(machine_nt, KEY_QUERY_VALUE),
+            STATUS_ACCESS_DENIED,
+        );
+        expect_denial(
+            "baseline/host_denied/nt/user",
+            "ntstatus",
+            nt_open_status(&user_nt, KEY_QUERY_VALUE),
+            STATUS_ACCESS_DENIED,
+        );
+        let inherited_machine = private_view_label(machine.raw()).expect("machine label read");
+        let inherited_user = private_view_label(user.raw()).expect("user label read");
+        record_read("inherited/public_read/machine_view", inherited_machine);
+        record_read("inherited/public_read/user_view", inherited_user);
+
+        let map_machine = unsafe { RegOverridePredefKey(HKEY_LOCAL_MACHINE, machine.raw()) };
+        let map_user = unsafe { RegOverridePredefKey(HKEY_CURRENT_USER, user.raw()) };
+        if map_machine != ERROR_SUCCESS || map_user != ERROR_SUCCESS {
+            let _ = reset_predefined_roots();
+            panic!("private registry mapping failed: machine={map_machine}, user={map_user}");
+        }
+        let mapped_machine = private_view_label(HKEY_LOCAL_MACHINE).expect("mapped machine read");
+        let mapped_user = private_view_label(HKEY_CURRENT_USER).expect("mapped user read");
+        record_read("mapped/public_read/machine_view", mapped_machine);
+        record_read("mapped/public_read/user_view", mapped_user);
+        expect_denial(
+            "mapped/host_denied/nt/machine",
+            "ntstatus",
+            nt_open_status(machine_nt, KEY_QUERY_VALUE),
+            STATUS_ACCESS_DENIED,
+        );
+        expect_denial(
+            "mapped/host_denied/nt/user",
+            "ntstatus",
+            nt_open_status(&user_nt, KEY_QUERY_VALUE),
+            STATUS_ACCESS_DENIED,
+        );
+        expect_denial(
+            "mapped/host_denied/win32/user",
+            "lstatus",
+            win32_open_status(HKEY_USERS, &user_path, KEY_QUERY_VALUE) as i32,
+            ERROR_ACCESS_DENIED as i32,
+        );
+        let machine_absence = win32_open_status(HKEY_LOCAL_MACHINE, "Environment", KEY_QUERY_VALUE);
+        emit_witness_record(&format!("registry_witness_probe id=mapped/private_absent/machine_view domain=lstatus status={machine_absence}"))
+            .expect("bounded private-absence record");
+        assert_eq!(machine_absence, ERROR_FILE_NOT_FOUND);
+        let user_absence = win32_open_status(HKEY_CURRENT_USER, "Environment", KEY_QUERY_VALUE);
+        emit_witness_record(&format!("registry_witness_probe id=mapped/private_absent/user_view domain=lstatus status={user_absence}"))
+            .expect("bounded private-absence record");
+        assert_eq!(user_absence, ERROR_FILE_NOT_FOUND);
+
+        if role == "cancel" {
+            let child_pid = unsafe { GetCurrentProcessId() };
+            let child_creation = process_creation_text(unsafe { GetCurrentProcess() })
+                .expect("helper process creation-time observation failed");
+            emit_witness_record(&format!(
+                "registry_witness_probe id=lifetime/cancel_ready_mapped nonce={nonce} role=cancel pid={child_pid} creation={child_creation} parent_pid={parent_pid} parent_creation={parent_creation} image_id={image_id} image_sha256={image_hash} fixture_digest={fixture_digest} token_appcontainer=true token_lpac=true capability_count=1 network_capabilities=0 job=true inherited_reads=2 mapped_machine=true mapped_user=true maps_live=2"
+            )).expect("bounded cancellation readiness record");
+            std::io::stdout()
+                .flush()
+                .expect("flush cancellation readiness");
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        reset_predefined_roots().expect("reset private registry maps");
+        expect_denial(
+            "reset/host_denied/win32/machine",
+            "lstatus",
+            win32_open_status(HKEY_LOCAL_MACHINE, machine_path, KEY_QUERY_VALUE) as i32,
+            ERROR_ACCESS_DENIED as i32,
+        );
+        expect_denial(
+            "reset/host_denied/win32/user",
+            "lstatus",
+            win32_open_status(HKEY_USERS, &user_path, KEY_QUERY_VALUE) as i32,
+            ERROR_ACCESS_DENIED as i32,
+        );
+        expect_denial(
+            "reset/host_denied/nt/machine",
+            "ntstatus",
+            nt_open_status(machine_nt, KEY_QUERY_VALUE),
+            STATUS_ACCESS_DENIED,
+        );
+        expect_denial(
+            "reset/host_denied/nt/user",
+            "ntstatus",
+            nt_open_status(&user_nt, KEY_QUERY_VALUE),
+            STATUS_ACCESS_DENIED,
+        );
+        let remap_machine = unsafe { RegOverridePredefKey(HKEY_LOCAL_MACHINE, machine.raw()) };
+        let remap_user = unsafe { RegOverridePredefKey(HKEY_CURRENT_USER, user.raw()) };
+        assert_eq!(remap_machine, ERROR_SUCCESS);
+        assert_eq!(remap_user, ERROR_SUCCESS);
+        record_read(
+            "remapped/public_read/machine_view",
+            private_view_label(HKEY_LOCAL_MACHINE).expect("remapped machine read"),
+        );
+        record_read(
+            "remapped/public_read/user_view",
+            private_view_label(HKEY_CURRENT_USER).expect("remapped user read"),
+        );
+        reset_predefined_roots().expect("final private registry map reset");
+        drop(user);
+        drop(machine);
+        emit_witness_record(&format!(
+            "registry_witness_child_complete nonce={nonce} role=normal pid={} image_id={image_id} image_sha256={image_hash} fixture_digest={fixture_digest}",
+            unsafe { GetCurrentProcessId() }
+        )).expect("bounded child completion record");
+    }
+
+    #[test]
+    fn registry_witness_closed_manifest_has_seventy_unique_ids() {
+        let ids = required_probe_ids();
+        assert_eq!(ids.len(), 70);
+        assert!(ids.contains("parent_present/before/win32/machine"));
+        assert!(ids.contains("parent_present/after/nt/user"));
+        assert!(ids.contains("parent_token/token_assign_primary"));
+        assert!(ids.contains("lifetime/cancel_ready_mapped"));
+    }
 }

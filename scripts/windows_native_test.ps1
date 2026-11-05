@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Foundation', 'Confinement', 'RegistryDiagnostic', 'HostCapabilities')]
+    [ValidateSet('Foundation', 'Confinement', 'RegistryDiagnostic', 'RegistryWitness', 'HostCapabilities')]
     [string] $Group = 'Confinement',
     [string] $EvidenceDir = 'platform-results'
 )
@@ -216,6 +216,9 @@ if ($Group -eq 'Foundation') {
         'windows::ntfs_short_alias_cannot_bypass_reserved_lock_policy',
         'windows::simultaneous_publication_preserves_the_only_successful_name'
     )
+    if ($required.Count -ne 35 -or @($required | Select-Object -Unique).Count -ne 35) {
+        throw "Foundation's exact required-name manifest must contain 35 unique cases; found $($required.Count)"
+    }
     $report = Get-Content $log -Raw
     foreach ($case in $required) {
         if ($report -notmatch ('(?m)^test ' + [regex]::Escape($case) + ' \.\.\. ok\r?$')) {
@@ -225,6 +228,192 @@ if ($Group -eq 'Foundation') {
     if ($report -match '\b[1-9][0-9]* (ignored|filtered out)\b') { throw 'Foundation cases were skipped' }
     @{ required_cases = $required.Count; status = 'passed'; source = $env:GITHUB_SHA } |
         ConvertTo-Json | Out-File (Join-Path $EvidenceDir 'foundation.json')
+    return
+}
+if ($Group -eq 'RegistryWitness') {
+    # This opt-in experiment writes disposable fake values only on the exact
+    # GitHub-hosted proof ref. Local/operator registry state is never a fixture.
+    $requiredFixture = @{
+        GITHUB_ACTIONS = 'true'
+        RUNNER_ENVIRONMENT = 'github-hosted'
+        RUNNER_OS = 'Windows'
+        GITHUB_REF = 'refs/heads/codex/platform-first-run-windows-proof-20261105'
+        ORBIT_REGISTRY_WITNESS_FIXTURE = 'github-hosted-fake-data-only-v1'
+    }
+    foreach ($entry in $requiredFixture.GetEnumerator()) {
+        if ([Environment]::GetEnvironmentVariable($entry.Key) -cne $entry.Value) {
+            throw 'Registry witness requires the declared disposable Windows CI fixture'
+        }
+    }
+    if ($env:GITHUB_RUN_ID -notmatch '^[0-9]+$' -or $env:GITHUB_SHA -notmatch '^[0-9a-f]{40}$') {
+        throw 'Registry witness run identity missing'
+    }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $threadIdentity = [Security.Principal.WindowsIdentity]::GetCurrent($true)
+    try {
+        $administrator = [Security.Principal.WindowsPrincipal]::new($identity).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+        $parentIdentity = [ordered]@{
+            source=$env:GITHUB_SHA;run=$env:GITHUB_RUN_ID;user_sid=$identity.User.Value
+            elevated=$administrator;thread_impersonation_present=($null -ne $threadIdentity)
+            fixture_context='github-hosted-disposable-runner';ordinary_user_support_proven=$false
+            production_policy_unchanged=$true;credential_values_enumerated=$false
+        }
+    } finally {
+        if ($null -ne $threadIdentity) { $threadIdentity.Dispose() }
+        $identity.Dispose()
+    }
+    if (-not $administrator -or $parentIdentity.thread_impersonation_present) {
+        throw 'Registry witness fixture requires its declared primary-token administrator without thread impersonation'
+    }
+    $keys = [Collections.Generic.List[Microsoft.Win32.RegistryKey]]::new()
+    $created = [Collections.Generic.List[object]]::new()
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class OrbitRegistryWitnessFixture {
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode,ExactSpelling=true)]
+ public static extern int RegQueryValueExW(SafeRegistryHandle key,string name,IntPtr reserved,
+     out uint type,IntPtr data,ref uint size);
+}
+'@
+    function AssertMarkerAbsent($key,[string]$name) {
+        [uint32]$kind=0; [uint32]$size=0
+        $status=[OrbitRegistryWitnessFixture]::RegQueryValueExW($key.Handle,$name,[IntPtr]::Zero,
+            [ref]$kind,[IntPtr]::Zero,[ref]$size)
+        if ($status -ne 2) { throw "Marker precondition is not exact-name absence: status $status" }
+    }
+    $nonce = $null
+    $failure = $null
+    $cleanupComplete = $false
+    try {
+        $machineRoot = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryView]::Registry64)
+        $userRoot = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::Users,[Microsoft.Win32.RegistryView]::Registry64)
+        $keys.Add($machineRoot); $keys.Add($userRoot)
+        $machine = $machineRoot.OpenSubKey('SYSTEM\CurrentControlSet\Control\Session Manager\Environment',$true)
+        $user = $userRoot.OpenSubKey(($parentIdentity.user_sid+'\Environment'),$true)
+        if ($null -eq $machine -or $null -eq $user) { throw 'Required existing registry marker targets unavailable' }
+        $keys.Add($machine); $keys.Add($user)
+        for ($attempt=0; $attempt -lt 32; $attempt++) {
+            $candidate = [guid]::NewGuid().ToString('N')
+            $machineName = 'ORBIT_WITNESS_MACHINE_'+$candidate
+            $userName = 'ORBIT_WITNESS_USER_'+$candidate
+            try { AssertMarkerAbsent $machine $machineName; AssertMarkerAbsent $user $userName; $nonce=$candidate; break }
+            catch { if ($_.Exception.Message -notlike 'Marker precondition is not exact-name absence:*') { throw } }
+        }
+        if (-not $nonce) { throw 'Could not allocate collision-free marker names' }
+        $machineName = 'ORBIT_WITNESS_MACHINE_'+$nonce
+        $userName = 'ORBIT_WITNESS_USER_'+$nonce
+        $machineValue = [guid]::NewGuid().ToString('N')
+        $userValue = [guid]::NewGuid().ToString('N')
+        foreach ($row in @(
+            @{key=$machine;name=$machineName;value=$machineValue;target='machine'},
+            @{key=$user;name=$userName;value=$userValue;target='user'}
+        )) {
+            # Recheck immediately before a create-only write; never replace a collision.
+            AssertMarkerAbsent $row.key $row.name
+            $created.Add($row)
+            $row.key.SetValue($row.name,$row.value,[Microsoft.Win32.RegistryValueKind]::String)
+            if ($row.key.GetValueKind($row.name) -ne [Microsoft.Win32.RegistryValueKind]::String -or
+                $row.key.GetValue($row.name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $row.value) {
+                throw 'Known-present fake marker control failed'
+            }
+        }
+        $parentIdentity.nonce=$nonce
+        $parentIdentity.marker_names=@($machineName,$userName)
+        $parentIdentity.marker_sha256=@(
+            [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($machineValue))),
+            [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($userValue)))
+        )
+        $parentIdentity | ConvertTo-Json -Depth 5 | Out-File (Join-Path $EvidenceDir 'registry-witness-parent.json')
+        $env:ORBIT_REGISTRY_WITNESS_NONCE=$nonce
+        $env:ORBIT_REGISTRY_WITNESS_USER_SID=$parentIdentity.user_sid
+        $env:ORBIT_REGISTRY_WITNESS_MACHINE_MARKER=$machineName
+        $env:ORBIT_REGISTRY_WITNESS_USER_MARKER=$userName
+        $env:ORBIT_REGISTRY_WITNESS_MACHINE_HASH=$parentIdentity.marker_sha256[0]
+        $env:ORBIT_REGISTRY_WITNESS_USER_HASH=$parentIdentity.marker_sha256[1]
+        $case='process::windows::registry_witness_tests::registry_witness_stage_a'
+        $log=Join-Path $EvidenceDir 'registry-witness.log'
+        cargo +1.99.0 test --locked -p orbit-platform --features registry-witness --lib $case -- --exact --test-threads=1 --nocapture 2>&1 |
+            Tee-Object -FilePath $log
+        $code=$LASTEXITCODE
+        $report=Get-Content $log -Raw
+        $frames=[Collections.Generic.List[string]]::new()
+        $cursor=0
+        $frameStart=[string][char]0x1e+'ORBITW1:'
+        while (($start=$report.IndexOf($frameStart,$cursor,[StringComparison]::Ordinal)) -ge 0) {
+            $lengthStart=$start+$frameStart.Length
+            $colon=$report.IndexOf(':',$lengthStart)
+            if ($colon -lt 0 -or $colon-$lengthStart -lt 1 -or $colon-$lengthStart -gt 4) { throw 'Malformed registry witness frame length' }
+            $lengthText=$report.Substring($lengthStart,$colon-$lengthStart)
+            if ($lengthText -notmatch '^\d{1,4}$') { throw 'Non-numeric registry witness frame length' }
+            $length=[int]$lengthText
+            if ($length -gt 8192) { throw 'Oversized registry witness frame' }
+            $payloadStart=$colon+1
+            $payloadEnd=$payloadStart+$length
+            if ($payloadEnd -ge $report.Length -or [int][char]$report[$payloadEnd] -ne 0x1f) { throw 'Truncated registry witness frame' }
+            $payload=$report.Substring($payloadStart,$length)
+            if ($payload -match '[^\x20-\x7e]') { throw 'Registry witness frame payload is not printable ASCII' }
+            $frames.Add($payload)
+            $cursor=$payloadEnd+1
+        }
+        $frames | Out-File (Join-Path $EvidenceDir 'registry-witness-records.txt') -Encoding ascii
+        $expected=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($timing in @('before','after')) { foreach ($api in @('win32','nt')) { foreach ($target in @('machine','user')) { [void]$expected.Add("parent_present/$timing/$api/$target") } } }
+        foreach ($phase in @('baseline','reset')) { foreach ($api in @('win32','nt')) { foreach ($target in @('machine','user')) { [void]$expected.Add("$phase/host_denied/$api/$target") } } }
+        foreach ($phase in @('inherited','mapped','remapped')) { foreach ($view in @('machine_view','user_view')) { [void]$expected.Add("$phase/public_read/$view") } }
+        foreach ($view in @('machine_view','user_view')) { [void]$expected.Add("mapped/private_absent/$view") }
+        foreach ($target in @('machine','user')) { [void]$expected.Add("mapped/host_denied/nt/$target") }
+        [void]$expected.Add('mapped/host_denied/win32/user')
+        foreach ($operation in @('set_value','delete_value','create_subkey','delete_leaf','set_dacl','set_owner','reopen_write','reopen_delete','reopen_write_dac','reopen_write_owner','duplicate_mutation')) { foreach ($view in @('machine_view','user_view')) { [void]$expected.Add("mutation/$operation/$view") } }
+        foreach ($view in @('machine_view','user_view')) { [void]$expected.Add("duplicate_read/$view") }
+        foreach ($right in @('dup_handle','vm_write','vm_operation','create_thread','write_dac','write_owner','vm_read')) { [void]$expected.Add("parent_authority/$right") }
+        [void]$expected.Add('parent_token/process_query_limited')
+        foreach ($right in @('token_duplicate','write_dac','write_owner','token_impersonate','token_assign_primary')) { [void]$expected.Add("parent_token/$right") }
+        foreach ($view in @('machine_view','user_view')) { [void]$expected.Add("parent_recovery/$view") }
+        foreach ($life in @('normal_job_zero','cancel_ready_mapped','cancel_job_zero','cleanup_absent')) { [void]$expected.Add("lifetime/$life") }
+        if ($expected.Count -ne 70) { throw "Internal closed probe manifest has $($expected.Count) IDs" }
+        $actual=[Collections.Generic.List[string]]::new()
+        foreach ($frame in $frames) { if ($frame -match '^registry_witness_probe id=([^ ]+) ') { $actual.Add($Matches[1]) } }
+        if (@($actual | Select-Object -Unique).Count -ne $actual.Count) { throw 'Duplicate framed registry witness probe ID' }
+        foreach ($id in $actual) { if (-not $expected.Contains($id)) { throw "Unexpected registry witness probe ID: $id" } }
+        $status=@($frames | Where-Object { $_ -match '^registry_witness_status witness_status=INCOMPLETE ' })
+        if ($status.Count -eq 0 -or $code -eq 0) {
+            throw "Partial registry witness did not fail closed with explicit INCOMPLETE evidence (exit $code)"
+        }
+        $missing=@($expected | Where-Object { -not $actual.Contains($_) })
+        $parentIdentity.witness_status='INCOMPLETE_FAILED_partial_checkpoint'
+        $parentIdentity.missing_probe_count=$missing.Count
+        $parentIdentity.ordinary_user_support_proven=$false
+        $parentIdentity | ConvertTo-Json -Depth 5 | Out-File (Join-Path $EvidenceDir 'registry-witness-parent.json')
+        throw "Registry witness intentionally remains INCOMPLETE: exit=$code observed=$($actual.Count)/70 missing=$($missing.Count)"
+    } catch { $failure=$_ }
+    finally {
+        $cleanupComplete=$true
+        foreach ($row in $created) {
+            try {
+                $kind=$row.key.GetValueKind($row.name)
+                $value=$row.key.GetValue($row.name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ($kind -eq [Microsoft.Win32.RegistryValueKind]::String -and $value -ceq $row.value) {
+                    $row.key.DeleteValue($row.name,$true)
+                    [uint32]$kind=0; [uint32]$size=0
+                    $status=[OrbitRegistryWitnessFixture]::RegQueryValueExW($row.key.Handle,$row.name,
+                        [IntPtr]::Zero,[ref]$kind,[IntPtr]::Zero,[ref]$size)
+                    if ($status -ne 2) { $cleanupComplete=$false }
+                } else { $cleanupComplete=$false }
+            } catch { $cleanupComplete=$false }
+        }
+        for ($index=$keys.Count-1; $index -ge 0; $index--) { $keys[$index].Dispose() }
+        if ($null -ne $nonce) {
+            $parentIdentity.cleanup_complete=$cleanupComplete
+            $parentIdentity | ConvertTo-Json -Depth 5 | Out-File (Join-Path $EvidenceDir 'registry-witness-parent.json')
+        }
+    }
+    if (-not $cleanupComplete) { throw 'Registry witness marker cleanup did not prove exact-name absence' }
+    if ($null -ne $failure) { throw $failure }
     return
 }
 $hostExecutable = (Get-Process -Id $PID).Path
