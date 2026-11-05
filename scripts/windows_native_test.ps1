@@ -1,11 +1,162 @@
 param(
-    [ValidateSet('Foundation', 'Confinement', 'RegistryDiagnostic')]
+    [ValidateSet('Foundation', 'Confinement', 'RegistryDiagnostic', 'HostCapabilities')]
     [string] $Group = 'Confinement',
     [string] $EvidenceDir = 'platform-results'
 )
 $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { throw 'Native Windows is required' }
 New-Item -ItemType Directory -Force $EvidenceDir | Out-Null
+if ($Group -eq 'HostCapabilities') {
+    # Observational only. Return before all test setup and fake registry fixtures.
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $script:hostCollectionFailed = $false
+    $queries = [Collections.Generic.List[object]]::new()
+    $report = [ordered]@{
+        source=$env:GITHUB_SHA; observation_complete=$false; support_proven=$false
+        daemon_usability='unknown_not_contacted'; nested_virtualization_proven=$false
+        actual_standard_user_journey_tested=$false; query_timeout_seconds=5
+    }
+    function HostError($record) {
+        $cause=$record.Exception
+        for($i=0;$i -lt 7 -and $null -ne $cause.InnerException;$i++){$cause=$cause.InnerException}
+        $errorData=[ordered]@{type=$cause.GetType().FullName;hresult=$cause.HResult}
+        if($cause -is [Microsoft.Management.Infrastructure.CimException]){$errorData.cim_status=$cause.StatusCode.ToString()}
+        [pscustomobject]$errorData
+    }
+    function ReadHostCim([string]$class,[string[]]$properties,[string]$filter='') {
+        if($watch.Elapsed.TotalSeconds -gt 45){
+            $script:hostCollectionFailed=$true
+            $queries.Add([pscustomobject]@{class=$class;status='collection_deadline_exceeded'})
+            return [pscustomobject]@{status='query_error';rows=@()}
+        }
+        try {
+            $arguments=@{ClassName=$class;Namespace='root/cimv2';Property=$properties;OperationTimeoutSec=5;ErrorAction='Stop'}
+            if($filter){$arguments.Filter=$filter}
+            $rows=@(Get-CimInstance @arguments)
+            $queries.Add([pscustomobject]@{class=$class;status='observed';row_count=$rows.Count})
+            [pscustomobject]@{status='observed';rows=$rows}
+        }catch{
+            $details=HostError $_
+            $status=if($details.cim_status -in @('InvalidClass','InvalidNamespace','NotSupported')){'unsupported_provider'}else{'query_error'}
+            if($status -eq 'query_error'){$script:hostCollectionFailed=$true}
+            $queries.Add([pscustomobject]@{class=$class;status=$status;error=$details})
+            [pscustomobject]@{status=$status;rows=@()}
+        }
+    }
+    function HostBoolean($instance,[string]$property) {
+        $value=if($null -eq $instance){$null}else{$instance.CimInstanceProperties[$property]}
+        if($null -eq $value -or $null -eq $value.Value){return [pscustomobject]@{status='unknown';value=$null}}
+        [pscustomobject]@{status='observed';value=[bool]$value.Value}
+    }
+    try {
+        $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+        $impersonated=[Security.Principal.WindowsIdentity]::GetCurrent($true)
+        try {
+            $report.privilege=[ordered]@{
+                effective_administrator=([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+                thread_impersonation_present=$null -ne $impersonated
+                membership_context=$(if($null -eq $impersonated){'current_process_token'}else{'effective_thread_token_process_authority_unknown'})
+                standard_user_support_proven=$false
+            }
+        }finally{if($null -ne $impersonated){$impersonated.Dispose()};$identity.Dispose()}
+        $osQuery=ReadHostCim 'Win32_OperatingSystem' @('Caption','Version','BuildNumber','OSArchitecture','OperatingSystemSKU','ProductType')
+        if($osQuery.status -eq 'observed' -and $osQuery.rows.Count -eq 1){
+            $os=$osQuery.rows[0]
+            if(-not $os.Caption -or -not $os.Version -or -not $os.BuildNumber -or -not $os.OSArchitecture){throw 'Required OS identity properties unavailable'}
+            $report.os=[ordered]@{status='observed';edition=$os.Caption;version=$os.Version;build=$os.BuildNumber
+                architecture=$os.OSArchitecture;edition_sku=$os.OperatingSystemSKU
+                family=$(if($os.ProductType -eq 1){'client'}elseif($os.ProductType -in @(2,3)){'server'}else{'unknown'})}
+        }else{$report.os=@{status='unavailable_or_unexpected_result';query_status=$osQuery.status};$script:hostCollectionFailed=$true}
+        $systemQuery=ReadHostCim 'Win32_ComputerSystem' @('HypervisorPresent')
+        $system=if($systemQuery.rows.Count -eq 1){$systemQuery.rows[0]}else{$null}
+        $report.hypervisor_present=HostBoolean $system 'HypervisorPresent'
+        if($systemQuery.status -eq 'observed' -and $systemQuery.rows.Count -ne 1){$script:hostCollectionFailed=$true}
+        $cpuQuery=ReadHostCim 'Win32_Processor' @('VMMonitorModeExtensions','SecondLevelAddressTranslationExtensions','VirtualizationFirmwareEnabled')
+        $report.cpu_virtualization=@(foreach($cpu in $cpuQuery.rows){
+            [ordered]@{vm_monitor_mode_extensions=(HostBoolean $cpu 'VMMonitorModeExtensions')
+                slat=(HostBoolean $cpu 'SecondLevelAddressTranslationExtensions')
+                firmware_virtualization=(HostBoolean $cpu 'VirtualizationFirmwareEnabled')}
+        })
+        $report.cpu_query_status=$cpuQuery.status
+        if($cpuQuery.status -eq 'observed' -and $cpuQuery.rows.Count -eq 0){$script:hostCollectionFailed=$true;$report.cpu_query_status='unexpected_empty_result'}
+        $report.nested_exposure_indicator='unknown'
+        if($report.hypervisor_present.value -eq $true -and $report.cpu_virtualization.Count -gt 0){
+            $flags=@($report.cpu_virtualization | ForEach-Object { $_.vm_monitor_mode_extensions.value; $_.slat.value; $_.firmware_virtualization.value })
+            $unknown=@($report.cpu_virtualization | Where-Object {
+                $_.vm_monitor_mode_extensions.status -ne 'observed' -or $_.slat.status -ne 'observed' -or $_.firmware_virtualization.status -ne 'observed'
+            })
+            if($unknown.Count -eq 0){
+                $report.nested_exposure_indicator=if(@($flags | Where-Object {$_ -ne $true}).Count -eq 0){'reported_cpu_flags_exposed_under_hypervisor'}else{'not_indicated_by_reported_flags'}
+            }
+        }
+        # This documented provider supports both client and server editions.
+        # A name outside this image's catalog is distinct from Disabled/Absent.
+        $featureNames=@('Microsoft-Hyper-V-All','Microsoft-Hyper-V','Hyper-V','Containers','Containers-DisposableClientVM')
+        $featureQuery=ReadHostCim 'Win32_OptionalFeature' @('Name','InstallState') (($featureNames | ForEach-Object {"Name='$_'"}) -join ' OR ')
+        $report.feature_query_path='root/cimv2:Win32_OptionalFeature (documented client/server provider)'
+        $report.features=@(foreach($name in $featureNames){
+            $matches=@($featureQuery.rows | Where-Object {$_.Name -ceq $name})
+            if($featureQuery.status -ne 'observed'){@{name=$name;status=$featureQuery.status;state='unknown'}}
+            elseif($matches.Count -eq 0){@{name=$name;status='not_catalogued_on_this_image';state='unknown'}}
+            elseif($matches.Count -eq 1){
+                $state=switch([int]$matches[0].InstallState){1{'enabled'}2{'disabled'}3{'absent'}4{'unknown'}default{'unknown'}}
+                @{name=$name;status='observed';state=$state;raw_install_state=$matches[0].InstallState}
+            }else{$script:hostCollectionFailed=$true;@{name=$name;status='unexpected_duplicate_result';state='unknown'}}
+        })
+        $serviceNames=@('vmcompute','hns','docker')
+        $serviceQuery=ReadHostCim 'Win32_Service' @('Name','State','StartMode') (($serviceNames | ForEach-Object {"Name='$_'"}) -join ' OR ')
+        $report.services=@(foreach($name in $serviceNames){
+            $matches=@($serviceQuery.rows | Where-Object {$_.Name -ieq $name})
+            if($serviceQuery.status -ne 'observed'){@{name=$name;status=$serviceQuery.status}}
+            elseif($matches.Count -eq 0){@{name=$name;status='not_installed'}}
+            elseif($matches.Count -eq 1){@{name=$name;status='observed';state=$matches[0].State;start_mode=$matches[0].StartMode}}
+            else{$script:hostCollectionFailed=$true;@{name=$name;status='unexpected_duplicate_result'}}
+        })
+        $systemRoot=[Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+        $programFiles=[Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+        $roots=@($systemRoot,$programFiles) | Where-Object {$_ -and [IO.Path]::IsPathFullyQualified($_) -and -not $_.StartsWith('\\')}
+        if($roots.Count -ne 2){throw 'Expected local system/program installation roots unavailable'}
+        $files=@(
+            @{name='docker.exe';paths=@((Join-Path $programFiles 'Docker\docker.exe'),(Join-Path $programFiles 'Docker\Docker\resources\bin\docker.exe'),(Join-Path $systemRoot 'docker.exe'))},
+            @{name='WindowsSandbox.exe';paths=@((Join-Path $systemRoot 'WindowsSandbox.exe'))},
+            @{name='wsb.exe';paths=@((Join-Path $systemRoot 'wsb.exe'))}
+        )
+        $report.executable_search_scope='fixed local System/ProgramFiles installation locations; no PATH/user-directory scan'
+        $report.executables=@(foreach($file in $files){
+            $found=$false
+            foreach($candidate in $file.paths){
+                try{
+                    $path=[IO.Path]::GetFullPath($candidate)
+                    for($depth=0;$depth -lt 8;$depth++){
+                        $permitted=@($roots | Where-Object {$path.StartsWith(($_.TrimEnd('\')+'\'),[StringComparison]::OrdinalIgnoreCase)}).Count -gt 0
+                        if(-not $permitted){throw 'Executable link leaves scoped local installation roots'}
+                        try{$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop}
+                        catch{
+                            if($_.FullyQualifiedErrorId -eq 'PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand'){break}
+                            throw
+                        }
+                        if($item -isnot [IO.FileInfo]){throw 'Expected installed executable is not a file'}
+                        if(-not $item.LinkTarget){
+                            $version=[Diagnostics.FileVersionInfo]::GetVersionInfo($item.FullName)
+                            @{name=$file.name;status='observed';canonical_path=$item.FullName;canonicalization='absolute_normalized_leaf_links_resolved';file_version=$version.FileVersion;product_version=$version.ProductVersion}
+                            $found=$true;break
+                        }
+                        $path=if([IO.Path]::IsPathFullyQualified($item.LinkTarget)){$item.LinkTarget}else{[IO.Path]::GetFullPath((Join-Path $item.DirectoryName $item.LinkTarget))}
+                    }
+                    if($depth -ge 8){throw 'Executable link depth exceeded'}
+                }catch{$found=$true;$script:hostCollectionFailed=$true;@{name=$file.name;status='query_error';error=(HostError $_)}}
+            }
+            if(-not $found){@{name=$file.name;status='not_found_in_scoped_locations';systemwide_absence_proven=$false}}
+        })
+    }catch{$script:hostCollectionFailed=$true;$report.collection_error=HostError $_}
+    $report.queries=@($queries.ToArray())
+    $report.elapsed_seconds=[math]::Round($watch.Elapsed.TotalSeconds,2)
+    if($watch.Elapsed.TotalSeconds -gt 60){$script:hostCollectionFailed=$true;$report.collection_deadline_exceeded=$true}
+    $report.observation_complete=-not $script:hostCollectionFailed
+    $report | ConvertTo-Json -Depth 10 | Out-File (Join-Path $EvidenceDir 'host-capabilities.json')
+    if($script:hostCollectionFailed){throw 'Host capability collection incomplete; inspect bounded query statuses'}
+    return
+}
 $env:CARGO_BUILD_JOBS = '1'
 $env:CARGO_TERM_COLOR = 'never'
 $env:NO_COLOR = '1'

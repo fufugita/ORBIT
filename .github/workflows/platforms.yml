@@ -188,3 +188,18 @@ jobs:
         with:
           name: windows-registry-diagnostic
           path: platform-results/
+
+  windows-host-capabilities:
+    if: github.ref == 'refs/heads/codex/platform-first-run-windows-proof-20261105'
+    runs-on: windows-2025
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Observe native isolation prerequisites without changing the host
+        shell: pwsh
+        run: ./scripts/windows_native_test.ps1 -Group HostCapabilities
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-host-capabilities
+          path: platform-results/
