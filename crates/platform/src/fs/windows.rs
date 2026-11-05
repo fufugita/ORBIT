@@ -39,6 +39,15 @@ pub struct FileIdentity {
     pub file: [u8; 16],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileSnapshot {
+    pub identity: FileIdentity,
+    pub length: u64,
+    pub last_write_time: i64,
+    pub change_time: i64,
+    pub attributes: u32,
+}
+
 struct LocalAllocation(*mut c_void);
 impl Drop for LocalAllocation {
     fn drop(&mut self) {
@@ -419,12 +428,27 @@ impl Directory {
     }
 
     pub fn open_lock_existing(&self, name: &OsStr, mode: LockMode) -> io::Result<StateLock> {
-        self.try_lock(name, mode)
+        self.lock_file(name, mode, FILE_OPEN)
     }
 
     pub fn try_lock(&self, name: &OsStr, mode: LockMode) -> io::Result<StateLock> {
+        self.lock_file(name, mode, FILE_OPEN_IF)
+    }
+
+    fn lock_file(&self, name: &OsStr, mode: LockMode, disposition: u32) -> io::Result<StateLock> {
         validate_lock_component(name)?;
-        let file = self.file(name, FILE_OPEN_IF, false)?;
+        let file = if disposition == FILE_OPEN {
+            self.file_access(
+                name,
+                FILE_OPEN,
+                FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE,
+            )?
+        } else {
+            self.file(name, disposition, false)?
+        };
+        if file.snapshot()?.length != 0 {
+            return Err(denied("transaction lock must be empty"));
+        }
         let mut overlap = OVERLAPPED::default();
         let flags = LOCKFILE_FAIL_IMMEDIATELY
             | if mode == LockMode::Exclusive {
@@ -442,7 +466,9 @@ impl Directory {
                 &mut overlap,
             ))?
         };
-        Ok(StateLock { file, mode })
+        let lock = StateLock { file, mode };
+        lock.check()?;
+        Ok(lock)
     }
 
     /// Publish a new name without replacing any existing object.
@@ -509,7 +535,7 @@ impl Directory {
         if lock.mode != LockMode::Exclusive || lock.file.parent != self.identity {
             return Err(denied("replacement requires this directory's exclusive lock").into());
         }
-        lock.file.check()?;
+        lock.check()?;
         self.prepare(file, name)?;
         point("before_flush")?;
         file.sync_all()?;
@@ -611,7 +637,7 @@ impl Directory {
 impl Directory {
     fn require_lock(&self, lock: &StateLock, exclusive: bool) -> io::Result<()> {
         self.check()?;
-        lock.file.check()?;
+        lock.check()?;
         if lock.file.parent != self.identity || (exclusive && lock.mode != LockMode::Exclusive) {
             return Err(denied(
                 "operation requires the same directory's transaction lock",
@@ -912,7 +938,7 @@ pub struct UpdateFile<'lock> {
 }
 impl UpdateFile<'_> {
     fn check(&self) -> io::Result<()> {
-        self.lock.file.check()?;
+        self.lock.check()?;
         if self.lock.mode != LockMode::Exclusive || self.lock.file.parent != self.file.parent {
             return Err(denied("invalid update guard"));
         }
@@ -1047,6 +1073,19 @@ impl PrivateFile {
         }
         self.security.check(self.file.as_raw_handle())
     }
+    /// By-handle comparison evidence, not a checksum or a transaction lock.
+    pub fn snapshot(&self) -> io::Result<FileSnapshot> {
+        self.check()?;
+        file_snapshot(self.file.as_raw_handle(), self.identity)
+    }
+    /// Read directly into caller-owned storage, advancing the existing cursor.
+    /// The caller retains its domain lock and owns buffer zeroization on errors.
+    pub fn read_into(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        let count = self.file.read(buffer)?;
+        self.check()?;
+        Ok(count)
+    }
     pub fn read_limited(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
         self.check()?;
         self.file.seek(SeekFrom::Start(0))?;
@@ -1082,6 +1121,18 @@ pub enum LockMode {
 pub struct StateLock {
     file: PrivateFile,
     mode: LockMode,
+}
+impl StateLock {
+    pub fn identity(&self) -> FileIdentity {
+        self.file.identity()
+    }
+    /// Revalidate the held private object without changing its bytes or length.
+    pub fn check(&self) -> io::Result<()> {
+        if self.file.snapshot()?.length != 0 {
+            return Err(denied("transaction lock must be empty"));
+        }
+        Ok(())
+    }
 }
 impl Drop for StateLock {
     fn drop(&mut self) {
@@ -1193,6 +1244,22 @@ fn relative(
     ensure_kind(handle.as_raw_handle(), directory)?;
     Ok(handle)
 }
+fn file_snapshot(handle: HANDLE, expected: FileIdentity) -> io::Result<FileSnapshot> {
+    ensure_kind(handle, false)?;
+    let standard: FILE_STANDARD_INFO = information(handle, FileStandardInfo)?;
+    let basic: FILE_BASIC_INFO = information(handle, FileBasicInfo)?;
+    if standard.EndOfFile < 0 || identity(handle)? != expected {
+        return Err(denied("file snapshot identity or length changed"));
+    }
+    Ok(FileSnapshot {
+        identity: expected,
+        length: standard.EndOfFile as u64,
+        last_write_time: basic.LastWriteTime,
+        change_time: basic.ChangeTime,
+        attributes: basic.FileAttributes,
+    })
+}
+
 fn ensure_kind(handle: HANDLE, directory: bool) -> io::Result<()> {
     let tag: FILE_ATTRIBUTE_TAG_INFO = information(handle, FileAttributeTagInfo)?;
     let standard: FILE_STANDARD_INFO = information(handle, FileStandardInfo)?;

@@ -269,10 +269,17 @@ mod windows {
     }
 
     fn child_lock(path: &Path, mode: &str, expected: bool) {
+        child_lock_kind(path, mode, expected, false);
+    }
+    fn child_lock_kind(path: &Path, mode: &str, expected: bool, existing_only: bool) {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "windows::lock_child", "--nocapture"])
             .env("ORBIT_FS_LOCK_ROOT", path)
             .env("ORBIT_FS_LOCK_MODE", mode)
+            .env(
+                "ORBIT_FS_LOCK_EXISTING_ONLY",
+                if existing_only { "yes" } else { "no" },
+            )
             .env("ORBIT_FS_LOCK_EXPECT", if expected { "yes" } else { "no" })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -316,7 +323,13 @@ mod windows {
         } else {
             LockMode::Exclusive
         };
-        let acquired = directory.try_lock(OsStr::new("stable.lock"), mode).is_ok();
+        let acquired = if std::env::var("ORBIT_FS_LOCK_EXISTING_ONLY").as_deref() == Ok("yes") {
+            directory
+                .open_lock_existing(OsStr::new("stable.lock"), mode)
+                .is_ok()
+        } else {
+            directory.try_lock(OsStr::new("stable.lock"), mode).is_ok()
+        };
         assert_eq!(
             acquired,
             std::env::var("ORBIT_FS_LOCK_EXPECT").unwrap() == "yes"
@@ -371,6 +384,169 @@ mod windows {
             "an existing-only lock request must not create state"
         );
         assert_eq!(error_kind, Some(std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn existing_lock_fixed_buffer_snapshot_and_cursor() {
+        let home = Home::new();
+        let initial = home
+            .dir()
+            .try_lock(OsStr::new("stable.lock"), LockMode::Exclusive)
+            .unwrap();
+        let lock_identity = initial.identity();
+        let mut seed = home.dir().create_file(OsStr::new("record.json")).unwrap();
+        seed.write_all(b"credential-12345").unwrap();
+        seed.sync_all().unwrap();
+        let identity = seed.identity();
+        drop(seed);
+        drop(initial);
+        let held = home
+            .dir()
+            .open_lock_existing(OsStr::new("stable.lock"), LockMode::Shared)
+            .unwrap();
+        assert_eq!(held.identity(), lock_identity);
+        held.check().unwrap();
+        let mut file = home.dir().open_file(OsStr::new("record.json")).unwrap();
+        let before = file.snapshot().unwrap();
+        assert_eq!(before.identity, identity);
+        assert_eq!(before.length, 16);
+        let mut buffer = [0u8; 8];
+        assert_eq!(file.read_into(&mut buffer[..4]).unwrap(), 4);
+        assert_eq!(&buffer[..4], b"cred");
+        assert_eq!(file.read_into(&mut buffer[4..]).unwrap(), 4);
+        assert_eq!(&buffer, b"credenti");
+        // One extra caller-owned byte detects overflow of an eight-byte limit.
+        let mut extra = [0u8; 1];
+        assert_eq!(file.read_into(&mut extra).unwrap(), 1);
+        assert_eq!(extra, [b'a']);
+        assert_eq!(file.snapshot().unwrap(), before);
+        held.check().unwrap();
+        buffer.fill(0);
+        extra.fill(0);
+    }
+
+    #[test]
+    fn file_snapshot_detects_content_change() {
+        let home = Home::new();
+        let mut seed = home.dir().create_file(OsStr::new("record.json")).unwrap();
+        seed.write_all(b"before").unwrap();
+        seed.sync_all().unwrap();
+        let identity = seed.identity();
+        drop(seed);
+        let file = home.dir().open_file(OsStr::new("record.json")).unwrap();
+        let before = file.snapshot().unwrap();
+        let held = home
+            .dir()
+            .try_lock(OsStr::new("stable.lock"), LockMode::Exclusive)
+            .unwrap();
+        let mut update = home
+            .dir()
+            .open_for_update(OsStr::new("record.json"), identity, &held)
+            .unwrap();
+        update.append_all(b" after").unwrap();
+        update.sync_all().unwrap();
+        drop(update);
+        let after = file.snapshot().unwrap();
+        assert_eq!(before.identity, after.identity);
+        assert_eq!(before.length, 6);
+        assert_eq!(after.length, 12);
+        assert_ne!(before, after);
+        assert!(after.last_write_time > 0 && after.change_time > 0);
+    }
+
+    #[test]
+    fn existing_lock_rejects_nonempty_and_unsafe_without_repair() {
+        let home = Home::new();
+        drop(
+            home.dir()
+                .try_lock(OsStr::new("stable.lock"), LockMode::Exclusive)
+                .unwrap(),
+        );
+        fs::write(home.path().join("stable.lock"), b"invalid lock").unwrap();
+        assert!(
+            home.dir()
+                .open_lock_existing(OsStr::new("stable.lock"), LockMode::Shared)
+                .is_err()
+        );
+        assert!(
+            home.dir()
+                .try_lock(OsStr::new("stable.lock"), LockMode::Exclusive)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(home.path().join("stable.lock")).unwrap(),
+            b"invalid lock"
+        );
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+
+        let unsafe_home = Home::new();
+        drop(
+            unsafe_home
+                .dir()
+                .try_lock(OsStr::new("stable.lock"), LockMode::Exclusive)
+                .unwrap(),
+        );
+        let path = unsafe_home.path().join("stable.lock");
+        assert!(
+            Command::new(command("icacls.exe"))
+                .arg(&path)
+                .args(["/grant", "*S-1-1-0:(R)"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let before = Command::new(command("icacls.exe"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(before.status.success());
+        assert!(
+            unsafe_home
+                .dir()
+                .open_lock_existing(OsStr::new("stable.lock"), LockMode::Shared)
+                .is_err()
+        );
+        let after = Command::new(command("icacls.exe"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(after.status.success());
+        assert_eq!(before.stdout, after.stdout);
+        assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn existing_only_locks_observe_cross_process_contention() {
+        let home = Home::new();
+        let initial = home
+            .dir()
+            .try_lock(OsStr::new("stable.lock"), LockMode::Exclusive)
+            .unwrap();
+        let identity = initial.identity();
+        drop(initial);
+        let held = home
+            .dir()
+            .open_lock_existing(OsStr::new("stable.lock"), LockMode::Shared)
+            .unwrap();
+        child_lock_kind(&home.path(), "shared", true, true);
+        child_lock_kind(&home.path(), "exclusive", false, true);
+        assert!(
+            fs::rename(
+                home.path().join("stable.lock"),
+                home.path().join("moved.lock")
+            )
+            .is_err()
+        );
+        held.check().unwrap();
+        drop(held);
+        child_lock_kind(&home.path(), "exclusive", true, true);
+        let reopened = home
+            .dir()
+            .open_lock_existing(OsStr::new("stable.lock"), LockMode::Shared)
+            .unwrap();
+        assert_eq!(reopened.identity(), identity);
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
     }
 
     #[test]
