@@ -47,6 +47,12 @@ jobs:
         # sandbox tests run against a real sandbox instead of skipping. If
         # the key does not exist they still skip, with a printed reason.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: prepare terminal test dependencies
+        run: python3 scripts/prepare_manual_pty_dependencies.py
+      - name: release verification contracts
+        run: |
+          scripts/in-jail.sh env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_prepare_manual_pty_dependencies.py -v
+          scripts/in-jail.sh env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_priorities_3_5_acceptance.py -v
       - name: test
         # The whole workspace in one run. (The interrupt and sandbox tests
         # used to be fenced off because the job kept dying when they ran;
