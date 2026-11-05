@@ -34,6 +34,12 @@ jobs:
           extra_nix_config: |
             max-jobs = 1
             cores = 2
+      - name: Enable isolated user namespaces on the ephemeral runner
+        run: |
+          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          scripts/in-jail.sh true
       - name: Build exact source package
         id: package
         run: scripts/in-jail.sh nix build -L --no-write-lock-file --out-link result-package .#orbit
