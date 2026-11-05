@@ -91,7 +91,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           fsutil 8dot3name query $fixtureDrive | Out-File platform-results/ntfs-short-names.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo +1.99.0 test --locked -p orbit-platform -- --test-threads=1 --nocapture 2>&1 |
+          cargo +1.99.0 test --locked -p orbit-platform --lib --test windows_foundation -- --test-threads=1 --nocapture 2>&1 |
             Tee-Object -FilePath platform-results/windows-foundation.log
           $code = $LASTEXITCODE
           if ($code -ne 0) { exit $code }
@@ -139,4 +139,27 @@ jobs:
         if: always()
         with:
           name: windows-foundation
+          path: platform-results/
+
+  windows-powershell:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install the pinned compiler
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Prove the initial native PowerShell capability tracer
+        shell: pwsh
+        run: ./scripts/windows_native_test.ps1 -Group Confinement
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-powershell-tracer
           path: platform-results/
