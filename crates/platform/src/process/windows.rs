@@ -124,6 +124,8 @@ pub struct SandboxSession {
     name: String,
     sid: Vec<u32>,
     runtime_sid: Vec<u32>,
+    #[cfg(all(test, feature = "registry-diagnostic"))]
+    registry_probe_sid: Option<Vec<u32>>,
     folder: PathBuf,
     root: Option<OwnedHandle>,
     unsafe_cleanup: AtomicBool,
@@ -235,6 +237,8 @@ impl SandboxSession {
                 name: name.clone(),
                 sid,
                 runtime_sid,
+                #[cfg(all(test, feature = "registry-diagnostic"))]
+                registry_probe_sid: None,
                 folder,
                 root: Some(root),
                 unsafe_cleanup: AtomicBool::new(false),
@@ -966,6 +970,19 @@ impl<'a> OwnedProcess<'a> {
             CapabilityCount: 1,
             Reserved: 0,
         };
+        #[cfg(all(test, feature = "registry-diagnostic"))]
+        let mut probe_capabilities = self::registry_probe_tests::requested_capabilities(session);
+        #[cfg(all(test, feature = "registry-diagnostic"))]
+        let capabilities = if probe_capabilities.is_empty() {
+            capabilities
+        } else {
+            SECURITY_CAPABILITIES {
+                AppContainerSid: session.sid.as_ptr().cast_mut().cast(),
+                Capabilities: probe_capabilities.as_mut_ptr(),
+                CapabilityCount: probe_capabilities.len() as u32,
+                Reserved: 0,
+            }
+        };
         let policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
         let handles = [
             stdin_read.as_raw_handle(),
@@ -1080,7 +1097,18 @@ impl<'a> OwnedProcess<'a> {
             "GetTokenInformation(TokenCapabilities)",
         )?;
         let count = unsafe { *groups.as_ptr().cast::<u32>() };
-        if count != 1 || groups.len() * size_of::<usize>() < size_of::<TOKEN_GROUPS>() {
+        let expected_count = 1;
+        #[cfg(all(test, feature = "registry-diagnostic"))]
+        let expected_count = if session.registry_probe_sid.is_some() {
+            2
+        } else {
+            expected_count
+        };
+        if count != expected_count
+            || groups.len() * size_of::<usize>()
+                < std::mem::offset_of!(TOKEN_GROUPS, Groups)
+                    + count as usize * size_of::<SID_AND_ATTRIBUTES>()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("actual token capability count/shape rejected: count={count}"),
@@ -1088,6 +1116,13 @@ impl<'a> OwnedProcess<'a> {
         }
         let actual = unsafe { (*groups.as_ptr().cast::<TOKEN_GROUPS>()).Groups[0] };
         let actual_sid = sid_text(actual.Sid)?;
+        #[cfg(all(test, feature = "registry-diagnostic"))]
+        if let Some(registry) = &session.registry_probe_sid {
+            registry_probe_tests::verify_capabilities(&groups, registry)?;
+        } else {
+            verify_runtime_capability_set(&[(&actual_sid, actual.Attributes)])?;
+        }
+        #[cfg(not(all(test, feature = "registry-diagnostic")))]
         verify_runtime_capability_set(&[(&actual_sid, actual.Attributes)])?;
         let mut in_job = 0;
         unsafe {
@@ -1289,4 +1324,453 @@ fn pump(
     output.extend_from_slice(&bytes[..accepted]);
     *exceeded |= read > budget;
     Ok(read == 0)
+}
+
+#[cfg(all(test, feature = "registry-diagnostic"))]
+mod registry_probe_tests {
+    use super::*;
+    use crate::fs::Directory;
+    use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+
+    fn evidence(name: &str, bytes: &[u8]) -> io::Result<()> {
+        let root = std::env::var_os("ORBIT_NATIVE_EVIDENCE_DIR")
+            .ok_or_else(|| invalid("diagnostic evidence directory missing"))?;
+        std::fs::write(PathBuf::from(root).join(name), bytes)
+    }
+
+    fn fixture() -> io::Result<()> {
+        for (name, value) in [
+            ("GITHUB_ACTIONS", "true"),
+            ("RUNNER_ENVIRONMENT", "github-hosted"),
+            ("RUNNER_OS", "Windows"),
+            (
+                "GITHUB_REF",
+                "refs/heads/codex/platform-first-run-windows-proof-20261105",
+            ),
+            (
+                "ORBIT_REGISTRY_DIAGNOSTIC_FIXTURE",
+                "github-hosted-fake-data-only-v1",
+            ),
+        ] {
+            if std::env::var(name).as_deref() != Ok(value) {
+                return Err(invalid(
+                    "registry diagnostic requires its disposable CI fixture",
+                ));
+            }
+        }
+        let nonce =
+            std::env::var("ORBIT_PROBE_NONCE").map_err(|_| invalid("missing fixture nonce"))?;
+        if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(invalid("invalid fixture nonce"));
+        }
+        Ok(())
+    }
+
+    fn registry_sid() -> io::Result<Vec<u32>> {
+        fixture()?;
+        let name = wide(OsStr::new("registryRead"))?;
+        let mut allocated = DerivedSids {
+            groups: null_mut(),
+            group_count: 0,
+            capabilities: null_mut(),
+            capability_count: 0,
+        };
+        unsafe {
+            ok(
+                "DeriveCapabilitySidsFromName(registryRead diagnostic)",
+                DeriveCapabilitySidsFromName(
+                    name.as_ptr(),
+                    &mut allocated.groups,
+                    &mut allocated.group_count,
+                    &mut allocated.capabilities,
+                    &mut allocated.capability_count,
+                ),
+            )?;
+        }
+        if allocated.capability_count != 1
+            || allocated.capabilities.is_null()
+            || allocated.group_count > 16
+        {
+            return Err(invalid("diagnostic capability derivation shape"));
+        }
+        let sid = unsafe { *allocated.capabilities };
+        let text = sid_text(sid)?;
+        if text == RUNTIME_CAPABILITY_SID
+            || ["S-1-15-3-1", "S-1-15-3-2", "S-1-15-3-3"].contains(&text.as_str())
+        {
+            return Err(invalid(
+                "registry derivation returned a disallowed identity",
+            ));
+        }
+        let mut report = format!("fixed_name=registryRead\napplication_sid={text}\n");
+        for index in 0..allocated.group_count {
+            report.push_str(&format!(
+                "group_sid={}\n",
+                sid_text(unsafe { *allocated.groups.add(index as usize) })?
+            ));
+        }
+        evidence("registry-derivation.txt", report.as_bytes())?;
+        let bytes = unsafe { GetLengthSid(sid) };
+        if bytes == 0 || bytes > 68 {
+            return Err(invalid("diagnostic SID length"));
+        }
+        let mut copy = vec![0u32; (bytes as usize).div_ceil(4)];
+        unsafe {
+            ok(
+                "CopySid(registry diagnostic)",
+                CopySid(bytes, copy.as_mut_ptr().cast(), sid),
+            )?;
+        }
+        Ok(copy)
+    }
+
+    pub(super) fn requested_capabilities(session: &SandboxSession) -> Vec<SID_AND_ATTRIBUTES> {
+        session
+            .registry_probe_sid
+            .as_ref()
+            .map_or_else(Vec::new, |sid| {
+                vec![
+                    SID_AND_ATTRIBUTES {
+                        Sid: session.runtime_sid.as_ptr().cast_mut().cast(),
+                        Attributes: 4,
+                    },
+                    SID_AND_ATTRIBUTES {
+                        Sid: sid.as_ptr().cast_mut().cast(),
+                        Attributes: 4,
+                    },
+                ]
+            })
+    }
+
+    pub(super) fn verify_capabilities(groups: &[usize], registry: &[u32]) -> io::Result<()> {
+        fixture()?;
+        let registry = sid_text(registry.as_ptr().cast_mut().cast())?;
+        let entries = unsafe {
+            std::slice::from_raw_parts(
+                groups
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(std::mem::offset_of!(TOKEN_GROUPS, Groups))
+                    .cast::<SID_AND_ATTRIBUTES>(),
+                2,
+            )
+        };
+        let mut actual: Vec<_> = entries
+            .iter()
+            .map(|entry| Ok((sid_text(entry.Sid)?, entry.Attributes)))
+            .collect::<io::Result<_>>()?;
+        actual.sort();
+        evidence("registry-actual-token.txt", format!(
+            "actual_capabilities={actual:?}\ntotal_capabilities=2\nexplicit_network_capabilities=0\nproduction_policy_unchanged=true\n").as_bytes())?;
+        let mut expected = vec![(RUNTIME_CAPABILITY_SID.to_owned(), 4), (registry, 4)];
+        expected.sort();
+        if actual != expected {
+            return Err(invalid("diagnostic actual token SID/attribute mismatch"));
+        }
+        let borrowed: Vec<_> = actual
+            .iter()
+            .map(|(sid, flags)| (sid.as_str(), *flags))
+            .collect();
+        if verify_runtime_capability_set(&borrowed).is_ok() {
+            return Err(invalid(
+                "production singleton unexpectedly accepted diagnostic capabilities",
+            ));
+        }
+        Ok(())
+    }
+
+    fn literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn endpoint() -> io::Result<SocketAddr> {
+        for address in ("api.github.com", 443)
+            .to_socket_addrs()?
+            .filter(|a| a.is_ipv4())
+            .take(4)
+        {
+            let std::net::IpAddr::V4(ip) = address.ip() else {
+                unreachable!()
+            };
+            if ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+            {
+                continue;
+            }
+            if let Ok(control) = TcpStream::connect_timeout(&address, Duration::from_secs(3)) {
+                if control.peer_addr()? == address && control.local_addr()?.ip() != address.ip() {
+                    return Ok(address);
+                }
+            }
+        }
+        Err(io::Error::other(
+            "nonlocal parent TCP positive control unavailable",
+        ))
+    }
+
+    // A single explicitly selected real measurement; absent fixture is a failure.
+    #[test]
+    fn registry_read_fake_data_measurement() {
+        let result = measure();
+        if let Err(error) = &result {
+            let _ = evidence(
+                "registry-measurement-error.txt",
+                format!("{error:?}\n").as_bytes(),
+            );
+        }
+        result.unwrap();
+    }
+
+    fn measure() -> io::Result<()> {
+        fixture()?;
+        let mut session = SandboxSession::create()?;
+        session.registry_probe_sid = Some(registry_sid()?);
+        session.prepare_file(OsStr::new("seed.txt"), b"owned seed")?;
+        let outside =
+            std::env::temp_dir().join(format!("{}-registry-probe", session.profile_name()));
+        let directory = Directory::create(&outside)?;
+        let mut credential = directory.create_file(OsStr::new("credentials.json"))?;
+        credential.write_all(b"synthetic-private-file-credential")?;
+        credential.sync_all()?;
+        let secret = outside.join("credentials.json");
+        let forbidden = outside.join("forbidden.txt");
+        let remote = endpoint()?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let loopback = listener.local_addr()?;
+        drop(TcpStream::connect_timeout(
+            &loopback,
+            Duration::from_secs(3),
+        )?);
+        drop(listener.accept()?.0);
+        evidence(
+            "registry-network-parent.txt",
+            format!("nonlocal={remote}\nloopback={loopback}\nTCP_handshake_only=true\n").as_bytes(),
+        )?;
+        let nonce = std::env::var("ORBIT_PROBE_NONCE").map_err(|_| invalid("nonce"))?;
+        let user =
+            std::env::var("ORBIT_PROBE_ORIGINAL_SID").map_err(|_| invalid("original SID"))?;
+        if !user.starts_with("S-1-5-")
+            || !user
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'S' || b == b'-')
+        {
+            return Err(invalid("fixture user SID shape"));
+        }
+        let machine_hash =
+            std::env::var("ORBIT_PROBE_MACHINE_HASH").map_err(|_| invalid("machine hash"))?;
+        let user_hash = std::env::var("ORBIT_PROBE_USER_HASH").map_err(|_| invalid("user hash"))?;
+        for hash in [&machine_hash, &user_hash] {
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid("fixture hash shape"));
+            }
+        }
+        let script = REGISTRY_SCRIPT
+            .replace("@@NONCE@@", &literal(&nonce))
+            .replace("@@USER@@", &literal(&user))
+            .replace("@@MACHINE_HASH@@", &literal(&machine_hash))
+            .replace("@@USER_HASH@@", &literal(&user_hash))
+            .replace("@@SECRET@@", &literal(&secret.to_string_lossy()))
+            .replace("@@FORBIDDEN@@", &literal(&forbidden.to_string_lossy()))
+            .replace("@@REMOTE@@", &literal(&remote.ip().to_string()))
+            .replace("@@REMOTE_PORT@@", &remote.port().to_string())
+            .replace("@@LOOPBACK_PORT@@", &loopback.port().to_string());
+        let held = session.prepare_script(OsStr::new("registry-measurement.ps1"), &script)?;
+        let executable = PathBuf::from(
+            std::env::var_os("ORBIT_TEST_POWERSHELL")
+                .ok_or_else(|| invalid("PowerShell identity missing"))?,
+        );
+        let spec = SpawnSpec {
+            executable,
+            arguments: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-File".into(),
+                held.path()
+                    .to_str()
+                    .ok_or_else(|| invalid("script encoding"))?
+                    .into(),
+            ],
+            timeout: Duration::from_secs(60),
+            output_limit: 131072,
+        };
+        let (child, thread) = OwnedProcess::create_suspended(&session, &spec, true)?;
+        if !child.evidence.app_container
+            || !child.evidence.less_privileged
+            || !child.evidence.job_assigned_before_resume
+        {
+            return Err(invalid("diagnostic LPAC/Job admission failed"));
+        }
+        evidence(
+            "registry-admission.txt",
+            format!(
+                "{:?}\nscript_identity={:?}\n",
+                child.evidence,
+                held.identity()
+            )
+            .as_bytes(),
+        )?;
+        if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+            return Err(operation_error(
+                "ResumeThread(registry diagnostic)",
+                io::Error::last_os_error(),
+            ));
+        }
+        drop(thread);
+        let output = child.wait(&AtomicBool::new(false))?;
+        evidence("registry-child-stdout.txt", &output.stdout)?;
+        evidence("registry-child-stderr.txt", &output.stderr)?;
+        evidence(
+            "registry-completion.txt",
+            format!(
+                "code={}\ncompletion={:?}\nobserved_process_and_zero_job_completion=true\n",
+                output.code, output.completion
+            )
+            .as_bytes(),
+        )?;
+        let payload = session.read_file(OsStr::new("registry-probe.json"), 65536);
+        if let Ok(payload) = &payload {
+            evidence("registry-probe-payload.json", payload)?;
+        }
+        let succeeded = output.code == 0
+            && output.completion == Completion::Exited
+            && String::from_utf8_lossy(&output.stdout).contains("REGISTRY_PROBE_COMPLETE")
+            && payload.is_ok()
+            && session
+                .read_file(OsStr::new("result.txt"), 64)
+                .ok()
+                .as_deref()
+                == Some(b"owned write")
+            && !forbidden.exists()
+            && std::fs::read(&secret)? == b"synthetic-private-file-credential";
+        drop(held);
+        session.close()?;
+        drop(credential);
+        drop(directory);
+        std::fs::remove_file(secret)?;
+        std::fs::remove_dir(outside)?;
+        if !succeeded {
+            return Err(io::Error::other(
+                "registry measurement incomplete; inspect retained runtime evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    const REGISTRY_SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$nonce=@@NONCE@@; $originalSid=@@USER@@
+$machineName='ORBIT_FAKE_MACHINE_'+$nonce; $userName='ORBIT_FAKE_USER_'+$nonce
+$writeName='ORBIT_FAKE_WRITE_'+$nonce; $configName='ORBIT_PUBLIC_CONFIG_'+$nonce
+$machineKey='SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+$userKey=$originalSid+'\Environment'
+$rows=[Collections.Generic.List[object]]::new()
+$mustDeny=$true; $complete=$true; $exposed=$false
+function Digest([string]$value) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($value))) }
+function Observe([string]$id,[scriptblock]$action,[string]$expected,[bool]$protected) {
+  $row=[ordered]@{id=$id; status='api_error'; protected_credential=$protected}
+  try {
+    $value=& $action
+    if ($null -eq $value) { $row.status='not_found' }
+    else {
+      $row.status='readable'; $row.sha256=Digest ([string]$value)
+      $row.matches_fixture=$row.sha256 -eq $expected
+      if (-not $row.matches_fixture) { $script:complete=$false }
+      if ($protected) { $script:exposed=$true }
+    }
+  } catch {
+    $cause=$_.Exception; while ($cause.InnerException) { $cause=$cause.InnerException }
+    $row.exception=$cause.GetType().FullName; $row.hresult=$cause.HResult
+    if($cause -is [ComponentModel.Win32Exception]){$row.native_error=$cause.NativeErrorCode}
+    if ($cause -is [UnauthorizedAccessException] -or $cause -is [Security.SecurityException] -or
+        ($cause -is [ComponentModel.Win32Exception] -and $cause.NativeErrorCode -eq 5)) { $row.status='denied' }
+    else { $row.status='api_error'; $script:complete=$false }
+  }
+  $script:rows.Add([pscustomobject]$row)
+}
+function MustDeny([string]$id,[scriptblock]$action) {
+  $denied=$false
+  try { & $action | Out-Null } catch {
+    $cause=$_.Exception; while ($cause.InnerException) { $cause=$cause.InnerException }
+    $denied=$cause -is [UnauthorizedAccessException] -or $cause -is [Security.SecurityException]
+  }
+  $script:rows.Add([pscustomobject]@{id=$id; status=$(if($denied){'denied'}else{'must_deny_failed'})})
+  if (-not $denied) { $script:mustDeny=$false }
+}
+function NetworkDenied([string]$address,[int]$port,[string]$id) {
+  $client=[Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork,[Net.Sockets.SocketType]::Stream,[Net.Sockets.ProtocolType]::Tcp)
+  $denied=$false
+  try {
+    try { $task=$client.ConnectAsync([Net.IPAddress]::Parse($address),$port); if (-not $task.Wait(5000)) { throw 'inconclusive timeout' } }
+    catch { $cause=$_.Exception; while($cause.InnerException){$cause=$cause.InnerException}
+      $denied=$cause -is [Net.Sockets.SocketException] -and $cause.SocketErrorCode -eq [Net.Sockets.SocketError]::AccessDenied }
+  } finally { $client.Dispose() }
+  $script:rows.Add([pscustomobject]@{id=$id; status=$(if($denied){'denied_wsaeacces'}else{'inconclusive_or_allowed'})})
+  if(-not $denied){$script:mustDeny=$false}
+}
+try {
+  if([IO.File]::ReadAllText('seed.txt') -ne 'owned seed'){throw 'owned read mismatch'}
+  [IO.File]::WriteAllText('result.txt','owned write')
+  $identity=$PSVersionTable.PSEdition+':'+$PSVersionTable.PSVersion.ToString()
+  $runtime=[Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+  $module=Get-Date -Format yyyy
+  MustDeny 'private_credential_file' { [IO.File]::ReadAllText(@@SECRET@@) }
+  MustDeny 'outside_write' { [IO.File]::WriteAllText(@@FORBIDDEN@@,'bad') }
+  $processAbsent=$null -eq [Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')
+  $rows.Add([pscustomobject]@{id='process_credential'; status=$(if($processAbsent){'absent'}else{'must_deny_failed'})})
+  if(-not $processAbsent){$mustDeny=$false}
+  NetworkDenied '127.0.0.1' @@LOOPBACK_PORT@@ 'loopback'
+  NetworkDenied @@REMOTE@@ @@REMOTE_PORT@@ 'nonlocal'
+  Observe 'dotnet_machine' { [Environment]::GetEnvironmentVariable($machineName,[EnvironmentVariableTarget]::Machine) } @@MACHINE_HASH@@ $true
+  Observe 'dotnet_mapped_user' { [Environment]::GetEnvironmentVariable($userName,[EnvironmentVariableTarget]::User) } @@USER_HASH@@ $true
+  Observe 'dotnet_original_user' {
+    $root=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users,[Microsoft.Win32.RegistryView]::Registry64)
+    try { $key=$root.OpenSubKey($userKey); if($null -eq $key){return $null}; try{$key.GetValue($userName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)}finally{$key.Dispose()} }finally{$root.Dispose()}
+  } @@USER_HASH@@ $true
+  Observe 'provider_machine' { Get-ItemPropertyValue -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\'+$machineKey) -Name $machineName -ErrorAction Stop } @@MACHINE_HASH@@ $true
+  Observe 'provider_original_user' { Get-ItemPropertyValue -LiteralPath ('Registry::HKEY_USERS\'+$userKey) -Name $userName -ErrorAction Stop } @@USER_HASH@@ $true
+  Observe 'public_configuration' { [Environment]::GetEnvironmentVariable($configName,[EnvironmentVariableTarget]::Machine) } (Digest 'public-fixture-config') $false
+  MustDeny 'original_user_registry_write' {
+    $root=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users,[Microsoft.Win32.RegistryView]::Registry64)
+    try{$key=$root.OpenSubKey($userKey,$true); if($null -eq $key){throw 'missing write fixture'}; try{$key.SetValue($writeName,('child-change:'+$nonce),[Microsoft.Win32.RegistryValueKind]::String)}finally{$key.Dispose()}}finally{$root.Dispose()}
+  }
+  try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class OrbitRegistryProbe {
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode,ExactSpelling=true)] static extern int RegOpenKeyExW(IntPtr key,string path,uint options,uint access,out IntPtr result);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode,ExactSpelling=true)] static extern int RegQueryValueExW(IntPtr key,string name,IntPtr reserved,out uint type,byte[] bytes,ref uint size);
+ [DllImport("advapi32.dll",ExactSpelling=true)] static extern int RegCloseKey(IntPtr key);
+ public static string Read(int root,string path,string name) {
+  IntPtr key; int status=RegOpenKeyExW(new IntPtr(root),path,0,0x20119,out key);
+  if(status==2)return null; if(status!=0)throw new System.ComponentModel.Win32Exception(status);
+  try { uint type,size=0; status=RegQueryValueExW(key,name,IntPtr.Zero,out type,null,ref size);
+   if(status==2)return null; if(status!=0 && status!=234)throw new System.ComponentModel.Win32Exception(status);
+   if(size==0 || size>8192)throw new InvalidOperationException("fixture size");
+   byte[] bytes=new byte[size]; status=RegQueryValueExW(key,name,IntPtr.Zero,out type,bytes,ref size);
+   if(status!=0)throw new System.ComponentModel.Win32Exception(status);
+   if(type!=1 || size%2!=0)throw new InvalidOperationException("fixture type");
+   return Encoding.Unicode.GetString(bytes,0,(int)size).TrimEnd('\0');
+  }finally{RegCloseKey(key);}
+ }
+}
+'@
+    Observe 'win32_machine' { [OrbitRegistryProbe]::Read(-2147483646,$machineKey,$machineName) } @@MACHINE_HASH@@ $true
+    Observe 'win32_mapped_user' { [OrbitRegistryProbe]::Read(-2147483647,'Environment',$userName) } @@USER_HASH@@ $true
+    Observe 'win32_original_user' { [OrbitRegistryProbe]::Read(-2147483645,$userKey,$userName) } @@USER_HASH@@ $true
+  }catch{$complete=$false; $rows.Add([pscustomobject]@{id='win32_probe';status='unavailable';exception=$_.Exception.GetType().FullName})}
+}catch{$complete=$false; $rows.Add([pscustomobject]@{id='runtime_or_script';status='failed';exception=$_.Exception.GetType().FullName;hresult=$_.Exception.HResult})}
+$boundary=if(-not $mustDeny){'failed_must_deny'}elseif($exposed){'unresolved_exposed_persisted_credential'}elseif($complete){'no_exposure_observed'}else{'not_measured'}
+$payload=[ordered]@{measurement_status=$(if($complete -and $mustDeny){'complete'}else{'incomplete'});credential_boundary_status=$boundary;production_policy_unchanged=$true;production_support_pass=$false;nonce=$nonce;original_user_sid=$originalSid;registry_view=64;identity=$identity;runtime=$runtime;module=$module;observations=@($rows.ToArray())}
+[IO.File]::WriteAllText('registry-probe.json',($payload|ConvertTo-Json -Depth 8))
+if($complete -and $mustDeny){[Console]::WriteLine('REGISTRY_PROBE_COMPLETE');exit 0}else{exit 7}
+"#;
 }

@@ -163,3 +163,28 @@ jobs:
         with:
           name: windows-powershell-tracer
           path: platform-results/
+
+  windows-registry-diagnostic:
+    if: github.ref == 'refs/heads/codex/platform-first-run-windows-proof-20261105'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
+      NO_COLOR: '1'
+      ORBIT_REGISTRY_DIAGNOSTIC_FIXTURE: github-hosted-fake-data-only-v1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install the pinned compiler
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Measure the private fake-data registry boundary
+        shell: pwsh
+        run: ./scripts/windows_native_test.ps1 -Group RegistryDiagnostic
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-registry-diagnostic
+          path: platform-results/
