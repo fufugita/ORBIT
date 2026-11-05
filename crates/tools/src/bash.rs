@@ -1294,24 +1294,26 @@ mod cancel_tests {
         let (cx, dir) = cx();
         let flag = Arc::new(AtomicBool::new(false));
         cx.push_cancel_check(check(&flag));
-        // A unique argv[0] identifies only this test's two descendants,
+        // Keep the standard applet name for multicall sleep implementations.
+        // Exact unique duration arguments identify only this test's descendants,
         // including when bubblewrap gives them different inner PIDs.
-        let name = format!("orbit-cancel-sleep-{}", ulid::Ulid::new());
-        let executable = dir.join(&name);
+        let marker = ulid::Ulid::new().0.to_string();
+        let durations = [format!("31.{marker}"), format!("32.{marker}")];
         let sleep = ["/usr/bin/sleep", "/bin/sleep"]
             .into_iter()
             .find(|path| std::path::Path::new(path).is_file())
             .expect("sleep executable");
-        std::os::unix::fs::symlink(sleep, &executable).unwrap();
-        let argv0 = format!("./{name}");
-        let command = format!("{argv0} 31 & {argv0} 32 && echo done");
+        let command = format!(
+            "{sleep} {} & {sleep} {} && echo done",
+            durations[0], durations[1]
+        );
         let worker = std::thread::spawn(move || run_command(&command, 60, &cx));
         // Establish that both processes actually started before cancel.
         // Defer every assertion until the worker has been cancelled/joined.
         let observed = (|| -> std::io::Result<Vec<FixtureSleep>> {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
-                let children = fixture_sleeps(&argv0)?;
+                let children = fixture_sleeps(sleep, &durations)?;
                 if children.len() == 2
                     && children.iter().any(|child| child.seconds == 31)
                     && children.iter().any(|child| child.seconds == 32)
@@ -1358,7 +1360,12 @@ mod cancel_tests {
         });
         let cleanup = std::fs::remove_dir_all(&dir);
         let r = result.expect("command worker panicked");
-        observed.expect("must observe both owned descendants before cancellation");
+        observed.unwrap_or_else(|error| {
+            panic!(
+                "must observe both owned descendants before cancellation: {error}; joined worker result: {}",
+                r.payload
+            )
+        });
         let running = remaining
             .expect("observation was established")
             .expect("read exact fixture identities after cancellation");
@@ -1379,9 +1386,9 @@ mod cancel_tests {
         nested_pid_namespace: bool,
     }
 
-    /// Match the exact unique argv[0] and duration, then retain the
-    /// outer /proc identity rather than a PID printed inside a sandbox.
-    fn fixture_sleeps(argv0: &str) -> std::io::Result<Vec<FixtureSleep>> {
+    /// Match the exact standard argv[0] and unique decimal duration, then
+    /// retain the outer /proc identity rather than a PID printed in a sandbox.
+    fn fixture_sleeps(argv0: &str, durations: &[String; 2]) -> std::io::Result<Vec<FixtureSleep>> {
         use std::os::unix::fs::MetadataExt as _;
         let observer_namespace = std::fs::metadata("/proc/self/ns/pid")?.ino();
         let mut children = Vec::new();
@@ -1411,10 +1418,12 @@ mod cancel_tests {
             if args.len() != 3 || args[0] != argv0.as_bytes() || !args[2].is_empty() {
                 continue;
             }
-            let seconds = match args[1] {
-                b"31" => 31,
-                b"32" => 32,
-                _ => continue,
+            let seconds = if args[1] == durations[0].as_bytes() {
+                31
+            } else if args[1] == durations[1].as_bytes() {
+                32
+            } else {
+                continue;
             };
             let Some((start_ticks, state)) = process_state(pid)? else {
                 continue;
