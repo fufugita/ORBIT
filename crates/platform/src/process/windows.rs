@@ -1,6 +1,9 @@
 //! A capability token and a separately owned Job precede every child instruction.
 
-use super::{Completion, ConfinementEvidence, ProcessOutput, SpawnSpec, quote_argument};
+use super::{
+    Completion, ConfinementEvidence, ProcessOutput, RUNTIME_CAPABILITY_NAME,
+    RUNTIME_CAPABILITY_SID, SpawnSpec, quote_argument, verify_runtime_capability_set,
+};
 use crate::fs::validate_component;
 use std::ffi::{OsStr, c_void};
 use std::fs::File;
@@ -31,6 +34,7 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
@@ -119,6 +123,7 @@ unsafe fn string_from_pointer(pointer: *const u16) -> io::Result<String> {
 pub struct SandboxSession {
     name: String,
     sid: Vec<u32>,
+    runtime_sid: Vec<u32>,
     folder: PathBuf,
     root: Option<OwnedHandle>,
     unsafe_cleanup: AtomicBool,
@@ -148,15 +153,20 @@ impl SandboxSession {
             nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
         );
         let name_wide = wide(OsStr::new(&name))?;
+        let runtime_sid = derive_runtime_sid()?;
+        let runtime_capability = SID_AND_ATTRIBUTES {
+            Sid: runtime_sid.as_ptr().cast_mut().cast(),
+            Attributes: SE_GROUP_ENABLED as u32,
+        };
         let mut allocated_sid = null_mut();
-        // No network, registry, COM or device capability is requested.
+        // Only the fixed nonnetwork runtime capability is requested.
         hresult("CreateAppContainerProfile", unsafe {
             CreateAppContainerProfile(
                 name_wide.as_ptr(),
                 name_wide.as_ptr(),
                 name_wide.as_ptr(),
-                null(),
-                0,
+                &runtime_capability,
+                1,
                 &mut allocated_sid,
             )
         })?;
@@ -207,6 +217,7 @@ impl SandboxSession {
             Ok(Self {
                 name: name.clone(),
                 sid,
+                runtime_sid,
                 folder,
                 root: Some(root),
                 unsafe_cleanup: AtomicBool::new(false),
@@ -311,16 +322,13 @@ impl SandboxSession {
     /// Measure the ordinary AppContainer comparison without executing user code.
     /// Uses the production launch setup with only the LPAC opt-out omitted.
     /// No child handle escapes; process and Job termination are observed first.
-    pub fn inspect_ordinary_control(&self, spec: &SpawnSpec) -> io::Result<LpacAccessCheck> {
+    pub fn inspect_ordinary_control(&self, spec: &SpawnSpec) -> io::Result<ConfinementEvidence> {
         let (mut child, thread) = OwnedProcess::create_suspended(self, spec, false)?;
-        let access = LpacAccessCheck {
-            all_application_packages_grant: child.evidence.all_application_packages_grant,
-            own_package_grant: child.evidence.own_package_grant,
-        };
+        let evidence = child.evidence;
         child.stop()?;
         child.finished = true;
         drop(thread);
-        Ok(access)
+        Ok(evidence)
     }
 
     pub fn close(mut self) -> io::Result<()> {
@@ -517,6 +525,72 @@ impl Drop for LocalAllocation {
             LocalFree(self.0);
         }
     }
+}
+
+struct DerivedSids {
+    groups: *mut PSID,
+    group_count: u32,
+    capabilities: *mut PSID,
+    capability_count: u32,
+}
+impl Drop for DerivedSids {
+    fn drop(&mut self) {
+        // SAFETY: the successful API owns each SID and each pointer array;
+        // initialized null outputs are harmless on an error path.
+        unsafe {
+            for (array, count) in [
+                (self.groups, self.group_count),
+                (self.capabilities, self.capability_count),
+            ] {
+                if !array.is_null() {
+                    for index in 0..count {
+                        LocalFree((*array.add(index as usize)).cast());
+                    }
+                    LocalFree(array.cast());
+                }
+            }
+        }
+    }
+}
+
+fn derive_runtime_sid() -> io::Result<Vec<u32>> {
+    let name = wide(OsStr::new(RUNTIME_CAPABILITY_NAME))?;
+    let mut allocated = DerivedSids {
+        groups: null_mut(),
+        group_count: 0,
+        capabilities: null_mut(),
+        capability_count: 0,
+    };
+    unsafe {
+        ok(
+            "DeriveCapabilitySidsFromName(lpacInstrumentation)",
+            DeriveCapabilitySidsFromName(
+                name.as_ptr(),
+                &mut allocated.groups,
+                &mut allocated.group_count,
+                &mut allocated.capabilities,
+                &mut allocated.capability_count,
+            ),
+        )?;
+    }
+    if allocated.capability_count != 1 || allocated.capabilities.is_null() {
+        return Err(invalid("runtime capability derivation shape"));
+    }
+    let sid = unsafe { *allocated.capabilities };
+    let text = sid_text(sid)?;
+    verify_runtime_capability_set(&[(&text, SE_GROUP_ENABLED as u32)])?;
+    let bytes = unsafe { GetLengthSid(sid) };
+    if bytes == 0 || bytes > 68 {
+        return Err(invalid("runtime capability SID length"));
+    }
+    let mut owned = vec![0u32; (bytes as usize).div_ceil(size_of::<u32>())];
+    unsafe {
+        ok(
+            "CopySid(runtime capability)",
+            CopySid(bytes, owned.as_mut_ptr().cast(), sid),
+        )?;
+    }
+    Ok(owned)
 }
 
 fn token_buffer(
@@ -804,10 +878,14 @@ impl<'a> OwnedProcess<'a> {
         }
         // EOF is the only supported stdin policy in this first production slice.
         drop(stdin_write);
+        let mut runtime_capability = SID_AND_ATTRIBUTES {
+            Sid: session.runtime_sid.as_ptr().cast_mut().cast(),
+            Attributes: SE_GROUP_ENABLED as u32,
+        };
         let capabilities = SECURITY_CAPABILITIES {
             AppContainerSid: session.sid.as_ptr().cast_mut().cast(),
-            Capabilities: null_mut(),
-            CapabilityCount: 0,
+            Capabilities: &mut runtime_capability,
+            CapabilityCount: 1,
             Reserved: 0,
         };
         let policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
@@ -890,6 +968,9 @@ impl<'a> OwnedProcess<'a> {
                 job_assigned_before_resume: false,
                 all_application_packages_grant: false,
                 own_package_grant: false,
+                total_capabilities: 0,
+                runtime_capability_sid: None,
+                runtime_capability_attributes: 0,
             },
         };
         unsafe {
@@ -915,47 +996,21 @@ impl<'a> OwnedProcess<'a> {
         let access =
             inspect_lpac_access(unsafe { BorrowedHandle::borrow_raw(token.as_raw_handle()) })?;
         let less_privileged = access.is_less_privileged();
-        let mut needed = 0;
-        let sizing = unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenCapabilities,
-                null_mut(),
-                0,
-                &mut needed,
-            )
-        };
-        let sizing_error = if sizing == 0 {
-            Some(io::Error::last_os_error())
-        } else {
-            None
-        };
-        if sizing_error.as_ref().and_then(io::Error::raw_os_error)
-            != Some(ERROR_INSUFFICIENT_BUFFER as i32)
-        {
-            return Err(operation_error(
-                "GetTokenInformation(TokenCapabilities size)",
-                sizing_error.unwrap_or_else(|| invalid("unexpected successful capability sizing")),
+        let groups = token_buffer(
+            token.as_raw_handle(),
+            TokenCapabilities,
+            "GetTokenInformation(TokenCapabilities)",
+        )?;
+        let count = unsafe { *groups.as_ptr().cast::<u32>() };
+        if count != 1 || groups.len() * size_of::<usize>() < size_of::<TOKEN_GROUPS>() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("actual token capability count/shape rejected: count={count}"),
             ));
         }
-        if needed < size_of::<u32>() as u32 || needed > 4096 {
-            return Err(invalid("token capability shape"));
-        }
-        let mut groups = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
-        unsafe {
-            ok(
-                "GetTokenInformation(TokenCapabilities)",
-                GetTokenInformation(
-                    token.as_raw_handle(),
-                    TokenCapabilities,
-                    groups.as_mut_ptr().cast(),
-                    needed,
-                    &mut needed,
-                ),
-            )?;
-        }
-        // The variable-length TOKEN_GROUPS buffer can contain only its header.
-        let count = unsafe { *groups.as_ptr().cast::<u32>() };
+        let actual = unsafe { (*groups.as_ptr().cast::<TOKEN_GROUPS>()).Groups[0] };
+        let actual_sid = sid_text(actual.Sid)?;
+        verify_runtime_capability_set(&[(&actual_sid, actual.Attributes)])?;
         let mut in_job = 0;
         unsafe {
             ok(
@@ -967,7 +1022,7 @@ impl<'a> OwnedProcess<'a> {
                 ),
             )?;
         }
-        if !app_container || count != 0 || in_job == 0 {
+        if !app_container || in_job == 0 {
             return Err(io::Error::other(format!(
                 "child capability or Job verification failed: app_container={app_container}, access={access:?}, capabilities={count}, in_job={in_job}"
             )));
@@ -979,6 +1034,9 @@ impl<'a> OwnedProcess<'a> {
             job_assigned_before_resume: true,
             all_application_packages_grant: access.all_application_packages_grant,
             own_package_grant: access.own_package_grant,
+            total_capabilities: count,
+            runtime_capability_sid: Some(RUNTIME_CAPABILITY_SID),
+            runtime_capability_attributes: actual.Attributes,
         };
         drop(stdin_read);
         drop(stdout_write);

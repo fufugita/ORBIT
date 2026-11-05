@@ -3,7 +3,10 @@
 #[cfg(windows)]
 mod windows {
     use orbit_platform::fs::Directory;
-    use orbit_platform::process::{Completion, SandboxSession, SpawnSpec};
+    use orbit_platform::process::{
+        Completion, RUNTIME_CAPABILITY_SID, SandboxSession, SpawnSpec,
+        verify_runtime_capability_set,
+    };
     use std::ffi::OsStr;
     use std::net::{SocketAddr, ToSocketAddrs};
     use std::path::PathBuf;
@@ -24,12 +27,47 @@ mod windows {
             access.own_package_grant && access.all_application_packages_grant,
             "{access:?}"
         );
-        assert!(!access.is_less_privileged());
+        assert!(!access.less_privileged);
+        assert_eq!(access.total_capabilities, 1);
+        assert_eq!(access.network_capabilities, 0);
+        assert_eq!(access.runtime_capability_sid, Some(RUNTIME_CAPABILITY_SID));
+        assert_eq!(access.runtime_capability_attributes, 4);
         if let Some(evidence) = std::env::var_os("ORBIT_NATIVE_EVIDENCE_DIR") {
             std::fs::write(PathBuf::from(evidence).join("lpac-ordinary-control.txt"),
                 format!("{access:?}\nprimary_thread_never_resumed=true\nobserved_job_active_processes=0\n")).unwrap();
         }
         session.close().unwrap();
+    }
+
+    #[test]
+    fn runtime_policy_rejects_missing_capability() {
+        assert!(verify_runtime_capability_set(&[]).is_err());
+        assert!(verify_runtime_capability_set(&[(RUNTIME_CAPABILITY_SID, 4)]).is_ok());
+    }
+
+    #[test]
+    fn runtime_policy_rejects_extra_capability() {
+        assert!(verify_runtime_capability_set(&[("S-1-15-3-999999", 4)]).is_err());
+        assert!(
+            verify_runtime_capability_set(&[(RUNTIME_CAPABILITY_SID, 4), ("S-1-15-3-999999", 4),])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_policy_rejects_internet_capability() {
+        assert!(verify_runtime_capability_set(&[("S-1-15-3-1", 4)]).is_err());
+        assert!(
+            verify_runtime_capability_set(&[(RUNTIME_CAPABILITY_SID, 4), ("S-1-15-3-1", 4),])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_policy_rejects_changed_attributes() {
+        for flags in [0, 2, 5, 0x10, u32::MAX] {
+            assert!(verify_runtime_capability_set(&[(RUNTIME_CAPABILITY_SID, flags)]).is_err());
+        }
     }
 
     fn executable() -> PathBuf {
@@ -198,6 +236,12 @@ if ([Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')) {{ throw 'ambien
                 && output.confinement.job_assigned_before_resume
         );
         assert_eq!(output.confinement.network_capabilities, 0);
+        assert_eq!(output.confinement.total_capabilities, 1);
+        assert_eq!(
+            output.confinement.runtime_capability_sid,
+            Some(RUNTIME_CAPABILITY_SID)
+        );
+        assert_eq!(output.confinement.runtime_capability_attributes, 4);
         assert!(!output.confinement.all_application_packages_grant);
         assert!(output.confinement.own_package_grant);
         let stdout = String::from_utf8(output.stdout).unwrap();

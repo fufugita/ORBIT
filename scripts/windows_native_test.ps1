@@ -65,7 +65,9 @@ $env:ORBIT_NATIVE_EVIDENCE_DIR = (Resolve-Path $EvidenceDir).Path
 @{ executable = $hostExecutable; family = $PSVersionTable.PSEdition
    version = $PSVersionTable.PSVersion.ToString()
    sha256 = (Get-FileHash -Algorithm SHA256 $hostExecutable).Hash
-   source = $env:GITHUB_SHA; scope = 'initial LPAC production tracer' } |
+   source = $env:GITHUB_SHA; scope = 'initial LPAC production tracer'
+   runtime_capability_policy = 'lpacInstrumentation only, SE_GROUP_ENABLED'
+   expected_total_capabilities = 1; expected_network_capabilities = 0 } |
     ConvertTo-Json | Out-File (Join-Path $EvidenceDir 'powershell-identity.json')
 Get-ComputerInfo -Property WindowsProductName, WindowsVersion, OsBuildNumber |
     Format-List | Out-File (Join-Path $EvidenceDir 'windows.txt')
@@ -76,7 +78,7 @@ $etw = [ordered]@{
     provider = 'F90714A8-5509-434A-BF6D-B1624C8A19A2'; registration_mask = '0x00000800'
     query_status = 'not_run'; conversion_status = 'not_run'; derivation_status = 'not_run'
     comparison_status = 'unavailable'; comparison_kind = 'raw_ace_only_not_effective_access'
-    source = $env:GITHUB_SHA; candidate = 'lpacInstrumentation'; candidate_granted = $false
+    source = $env:GITHUB_SHA; candidate = 'lpacInstrumentation'; diagnostic_grants_capability = $false
 }
 try {
     Add-Type -TypeDefinition @'
@@ -203,6 +205,10 @@ $code = $LASTEXITCODE
 if ($code -ne 0) { exit $code }
 $required = @(
     'windows::ordinary_appcontainer_does_not_pass_lpac_access_probe',
+    'windows::runtime_policy_rejects_missing_capability',
+    'windows::runtime_policy_rejects_extra_capability',
+    'windows::runtime_policy_rejects_internet_capability',
+    'windows::runtime_policy_rejects_changed_attributes',
     'windows::powershell_lpac_reads_owned_resources_and_denies_ambient_authority',
     'windows::silent_powershell_deadline_observes_owned_completion',
     'windows::powershell_output_limit_observes_owned_completion'

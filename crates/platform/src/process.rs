@@ -51,6 +51,26 @@ pub struct ConfinementEvidence {
     pub job_assigned_before_resume: bool,
     pub all_application_packages_grant: bool,
     pub own_package_grant: bool,
+    pub total_capabilities: u32,
+    pub runtime_capability_sid: Option<&'static str>,
+    pub runtime_capability_attributes: u32,
+}
+
+/// Fixed runtime capability identity, measured on the PowerShell ETW provider ACL.
+/// This policy grants no internet, registry or COM capability.
+pub const RUNTIME_CAPABILITY_NAME: &str = "lpacInstrumentation";
+pub const RUNTIME_CAPABILITY_SID: &str = "S-1-15-3-1024-3153509613-960666767-3724611135-2725662640-12138253-543910227-1950414635-4190290187";
+
+/// Accept exactly the approved application capability with SE_GROUP_ENABLED.
+/// Missing, additional, substituted and differently attributed SIDs fail closed.
+pub fn verify_runtime_capability_set(capabilities: &[(&str, u32)]) -> io::Result<()> {
+    if capabilities != [(RUNTIME_CAPABILITY_SID, 4)] {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("runtime capability set rejected: {capabilities:?}"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
