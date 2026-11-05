@@ -290,6 +290,8 @@ def main():
     args = parser.parse_args()
     if len(args.version)>64 or not VERSION.fullmatch(args.version): fail("version must be an exact release version, without a leading v")
     if args.method == "release" and args.source: fail("--source requires --method source")
+    if args.method == "release" and Path("/etc/NIXOS").is_file():
+        fail("NixOS needs the native source package: from the checked-out release run `nix profile install .#orbit`; see docs/platform-support.md")
     target = TARGETS.get((platform.system(), platform.machine()))
     if target is None: fail("no validated installer contract for this platform; Linux native targets only")
     parsed = urllib.parse.urlsplit(args.base_url)

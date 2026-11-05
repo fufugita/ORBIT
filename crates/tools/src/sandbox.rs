@@ -35,6 +35,7 @@ pub struct ShellSandbox {
     pub read_dirs: Vec<PathBuf>,
     /// Whether network access is allowed inside the sandbox.
     pub network: bool,
+    runtime: Result<crate::linux_runtime::LinuxRuntimeLayout, String>,
 }
 
 impl ShellSandbox {
@@ -49,6 +50,7 @@ impl ShellSandbox {
             write_dirs,
             read_dirs: vec![],
             network: false,
+            runtime: crate::linux_runtime::LinuxRuntimeLayout::discover(),
         }
     }
 
@@ -63,14 +65,11 @@ impl ShellSandbox {
         if !cfg!(target_os = "linux") {
             return SandboxStatus::Unsupported;
         }
-        if !Path::new("/usr/bin/bwrap").exists() && which_bwrap().is_none() {
-            return SandboxStatus::Unavailable("bubblewrap not installed".into());
-        }
-        // A real canary: run /bin/true under the same flag set the
-        // executor uses. If this fails, the sandbox is Unavailable —
-        // never guess.
-        let mut cmd = bwrap_base();
-        cmd.arg("/bin/true");
+        let runtime = match crate::linux_runtime::LinuxRuntimeLayout::discover() {
+            Ok(runtime) => runtime,
+            Err(error) => return SandboxStatus::Unavailable(error),
+        };
+        let mut cmd = bwrap_probe(&runtime);
         match cmd.output() {
             Ok(o) if o.status.success() => SandboxStatus::Confined,
             Ok(o) => SandboxStatus::Unavailable(format!(
@@ -85,7 +84,12 @@ impl ShellSandbox {
     /// Build the bwrap command wrapping `user_command`. The returned
     /// Command still needs the shell/appended args by the caller.
     pub fn wrap(&self, user_command: &str, working_dir: &Path) -> Command {
-        let mut cmd = bwrap_base();
+        let Ok(runtime) = &self.runtime else {
+            // A discovery failure must fail to spawn; never fall back to an
+            // unconfined shell or search the caller's mutable PATH.
+            return Command::new("/dev/null/orbit-runtime-unavailable");
+        };
+        let mut cmd = bwrap_base(runtime);
         // Filesystem: bind / read-only (writes only via --bind below),
         // proc/sys/dev as usual, and the write dirs read-write.
         for dir in &self.write_dirs {
@@ -121,23 +125,23 @@ impl ShellSandbox {
             }
         }
         // Run bash -c <command> inside, in the working directory.
-        cmd.arg("bash").arg("-c").arg(user_command);
+        cmd.arg(&runtime.bash).arg("-c").arg(user_command);
         cmd.current_dir(working_dir);
         cmd
     }
 }
 
-fn bwrap_base() -> Command {
-    let mut cmd = Command::new(bwrap_bin());
-    // Base: read-only root, /dev, /proc; a private /tmp; no new
-    // privileges (the roadmap's probe-safely rule generalized: NNP is
-    // set per child, never on ORBIT itself).
-    // Only dirs that exist (merged-usr layouts may lack /lib64 or
-    // /sbin; a missing bind target makes bwrap fail to start).
-    for dir in ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
-        if Path::new(dir).exists() {
-            cmd.arg("--ro-bind").arg(dir).arg(dir);
-        }
+fn bwrap_probe(runtime: &crate::linux_runtime::LinuxRuntimeLayout) -> Command {
+    let mut command = bwrap_base(runtime);
+    command.arg("--unshare-net");
+    command.arg(&runtime.bash).args(["-c", "true"]);
+    command
+}
+
+fn bwrap_base(runtime: &crate::linux_runtime::LinuxRuntimeLayout) -> Command {
+    let mut cmd = Command::new(&runtime.bubblewrap);
+    for root in &runtime.read_roots {
+        cmd.arg("--ro-bind").arg(root).arg(root);
     }
     cmd.arg("--proc")
         .arg("/proc")
@@ -154,32 +158,36 @@ fn bwrap_base() -> Command {
         .arg("dumb")
         .arg("--clearenv");
     // PATH so the shell can find binaries.
-    cmd.arg("--setenv")
-        .arg("PATH")
-        .arg("/usr/local/bin:/usr/bin:/bin");
+    cmd.arg("--setenv").arg("PATH").arg(&runtime.path);
     cmd.stdin(Stdio::null());
     cmd
-}
-
-fn bwrap_bin() -> &'static str {
-    if Path::new("/usr/bin/bwrap").exists() {
-        "/usr/bin/bwrap"
-    } else {
-        "bwrap"
-    }
-}
-
-fn which_bwrap() -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|p| p.join("bwrap"))
-            .find(|p| p.exists())
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_runtime_uses_absolute_shell() {
+        let work = std::env::temp_dir();
+        let command =
+            ShellSandbox::standard(std::slice::from_ref(&work), "runtime-path").wrap("true", &work);
+        let arguments: Vec<_> = command.get_args().collect();
+        assert!(
+            Path::new(arguments[arguments.len() - 3]).is_absolute(),
+            "the executable inside the sandbox must be an absolute resolved Bash path"
+        );
+    }
+
+    #[test]
+    fn linux_runtime_probe_uses_the_standard_network_boundary() {
+        let runtime = crate::linux_runtime::LinuxRuntimeLayout::discover().unwrap();
+        let command = bwrap_probe(&runtime);
+        assert_eq!(command.get_program(), runtime.bubblewrap);
+        let arguments: Vec<_> = command.get_args().collect();
+        assert!(arguments.contains(&std::ffi::OsStr::new("--unshare-net")));
+        assert_eq!(arguments[arguments.len() - 3], runtime.bash);
+    }
 
     #[test]
     fn probe_reports_a_real_status() {

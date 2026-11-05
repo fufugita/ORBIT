@@ -1,0 +1,57 @@
+name: native platforms
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'codex/platform-first-run-*']
+    paths:
+      - flake.nix
+      - flake.lock
+      - nix/**
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - scripts/nixos_runtime_test.py
+      - scripts/in-jail.sh
+      - .github/workflows/platforms.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nixos:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          enable_kvm: true
+          extra_nix_config: |
+            max-jobs = 1
+            cores = 2
+      - name: Build exact source package
+        id: package
+        run: scripts/in-jail.sh nix build -L --no-write-lock-file --out-link result-package .#orbit
+      - name: Run normal-user NixOS VM journey
+        run: scripts/in-jail.sh nix build -L --no-write-lock-file --out-link result-vm .#checks.x86_64-linux.nixos-runtime
+      - name: Retain package identity
+        if: always()
+        run: |
+          mkdir -p platform-results
+          nix flake metadata --json --no-write-lock-file > platform-results/flake.json
+          if test '${{ steps.package.outcome }}' = success; then
+            readlink -f result-package > platform-results/package-store-path
+            sha256sum result-package/bin/orbit result-package/bin/orbit-web \
+              result-package/bin/.orbit-wrapped result-package/bin/.orbit-web-wrapped \
+              > platform-results/package.sha256
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: nixos-package-identity
+          path: platform-results/
