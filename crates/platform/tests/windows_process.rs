@@ -3,12 +3,237 @@
 #[cfg(windows)]
 mod windows {
     use orbit_platform::fs::Directory;
-    use orbit_platform::process::{Completion, SandboxSession, SpawnSpec};
+    use orbit_platform::process::{Completion, SandboxSession, SpawnSpec, inspect_lpac_access};
     use std::ffi::OsStr;
+    use std::mem::size_of;
     use std::net::{SocketAddr, ToSocketAddrs};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::PathBuf;
+    use std::ptr::{null, null_mut};
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName;
+    use windows_sys::Win32::Security::*;
+    use windows_sys::Win32::System::JobObjects::*;
+    use windows_sys::Win32::System::Threading::*;
+
+    struct AttributeList {
+        buffer: Vec<usize>,
+    }
+    impl Drop for AttributeList {
+        fn drop(&mut self) {
+            unsafe {
+                DeleteProcThreadAttributeList(self.buffer.as_mut_ptr().cast());
+            }
+        }
+    }
+    struct AllocatedSid(PSID);
+    impl Drop for AllocatedSid {
+        fn drop(&mut self) {
+            unsafe {
+                FreeSid(self.0);
+            }
+        }
+    }
+    struct NeverResumed {
+        process: OwnedHandle,
+        _thread: OwnedHandle,
+        job: OwnedHandle,
+        assigned: bool,
+    }
+    impl Drop for NeverResumed {
+        fn drop(&mut self) {
+            unsafe {
+                if self.assigned {
+                    TerminateJobObject(self.job.as_raw_handle(), 1);
+                } else {
+                    TerminateProcess(self.process.as_raw_handle(), 1);
+                }
+                WaitForSingleObject(self.process.as_raw_handle(), 5000);
+            }
+        }
+    }
+
+    fn ordinary_appcontainer_token(session: &SandboxSession) -> OwnedHandle {
+        let name: Vec<u16> = OsStr::new(session.profile_name())
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut sid = null_mut();
+        assert!(unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) } >= 0);
+        let sid = AllocatedSid(sid);
+        let capabilities = SECURITY_CAPABILITIES {
+            AppContainerSid: sid.0,
+            Capabilities: null_mut(),
+            CapabilityCount: 0,
+            Reserved: 0,
+        };
+        let mut bytes = 0;
+        assert_eq!(
+            unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut bytes) },
+            0
+        );
+        assert_eq!(unsafe { GetLastError() }, ERROR_INSUFFICIENT_BUFFER);
+        assert!(bytes > 0 && bytes <= 65536);
+        let mut buffer = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                InitializeProcThreadAttributeList(buffer.as_mut_ptr().cast(), 1, 0, &mut bytes)
+            },
+            0
+        );
+        let mut attributes = AttributeList { buffer };
+        assert_ne!(
+            unsafe {
+                UpdateProcThreadAttribute(
+                    attributes.buffer.as_mut_ptr().cast(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    (&capabilities as *const SECURITY_CAPABILITIES).cast(),
+                    size_of::<SECURITY_CAPABILITIES>(),
+                    null_mut(),
+                    null(),
+                )
+            },
+            0
+        );
+        // No LPAC opt-out attribute is set for this negative control.
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        let executable: Vec<u16> = system
+            .join("cmd.exe")
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let directory: Vec<u16> = system.as_os_str().encode_wide().chain(Some(0)).collect();
+        let environment = [0u16; 2];
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes.buffer.as_mut_ptr().cast();
+        let mut info = PROCESS_INFORMATION::default();
+        let job = unsafe { CreateJobObjectW(null(), null()) };
+        assert!(!job.is_null());
+        let job = unsafe { OwnedHandle::from_raw_handle(job) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        assert_ne!(
+            unsafe {
+                SetInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            },
+            0
+        );
+        assert_ne!(
+            unsafe {
+                CreateProcessW(
+                    executable.as_ptr(),
+                    null_mut(),
+                    null(),
+                    null(),
+                    0,
+                    CREATE_SUSPENDED
+                        | CREATE_NO_WINDOW
+                        | CREATE_UNICODE_ENVIRONMENT
+                        | EXTENDED_STARTUPINFO_PRESENT,
+                    environment.as_ptr().cast(),
+                    directory.as_ptr(),
+                    &startup.StartupInfo,
+                    &mut info,
+                )
+            },
+            0,
+            "ordinary AppContainer creation: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut control = NeverResumed {
+            process: unsafe { OwnedHandle::from_raw_handle(info.hProcess) },
+            _thread: unsafe { OwnedHandle::from_raw_handle(info.hThread) },
+            job,
+            assigned: false,
+        };
+        assert_ne!(
+            unsafe {
+                AssignProcessToJobObject(
+                    control.job.as_raw_handle(),
+                    control.process.as_raw_handle(),
+                )
+            },
+            0
+        );
+        control.assigned = true;
+        let mut token = null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    control.process.as_raw_handle(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut token,
+                )
+            },
+            0
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        assert_ne!(
+            unsafe { TerminateJobObject(control.job.as_raw_handle(), 1) },
+            0
+        );
+        assert_eq!(
+            unsafe { WaitForSingleObject(control.process.as_raw_handle(), 5000) },
+            WAIT_OBJECT_0
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            assert_ne!(
+                unsafe {
+                    QueryInformationJobObject(
+                        control.job.as_raw_handle(),
+                        JobObjectBasicAccountingInformation,
+                        (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                        size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                        null_mut(),
+                    )
+                },
+                0
+            );
+            if accounting.ActiveProcesses == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "negative-control Job did not empty"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The primary thread has never been resumed; the returned token remains
+        // valid for inspection after observed process/group termination.
+        drop(control);
+        token
+    }
+
+    #[test]
+    fn ordinary_appcontainer_does_not_pass_lpac_access_probe() {
+        let session = SandboxSession::create().unwrap();
+        let token = ordinary_appcontainer_token(&session);
+        let access = inspect_lpac_access(token.as_handle()).unwrap();
+        assert!(
+            access.own_package_grant && access.all_application_packages_grant,
+            "{access:?}"
+        );
+        assert!(!access.is_less_privileged());
+        if let Some(evidence) = std::env::var_os("ORBIT_NATIVE_EVIDENCE_DIR") {
+            std::fs::write(PathBuf::from(evidence).join("lpac-ordinary-control.txt"),
+                format!("{access:?}\nprimary_thread_never_resumed=true\nobserved_job_active_processes=0\n")).unwrap();
+        }
+        drop(token);
+        session.close().unwrap();
+    }
 
     fn executable() -> PathBuf {
         let path = PathBuf::from(
@@ -151,11 +376,17 @@ if ([Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')) {{ throw 'ambien
             nonlocal_ip = literal(&nonlocal.ip().to_string()),
             nonlocal_port = nonlocal.port()
         );
-        let output = session
+        let child = session
             .spawn(&spec(script, Duration::from_secs(30), 65536))
-            .unwrap()
-            .wait(&AtomicBool::new(false))
             .unwrap();
+        if let Some(evidence) = std::env::var_os("ORBIT_NATIVE_EVIDENCE_DIR") {
+            std::fs::write(
+                PathBuf::from(evidence).join("lpac-requested-token.txt"),
+                format!("{:?}\n", child.evidence()),
+            )
+            .unwrap();
+        }
+        let output = child.wait(&AtomicBool::new(false)).unwrap();
         assert_eq!(output.completion, Completion::Exited);
         assert_eq!(
             output.code,
@@ -170,6 +401,8 @@ if ([Environment]::GetEnvironmentVariable('ORBIT_FAKE_SECRET')) {{ throw 'ambien
                 && output.confinement.job_assigned_before_resume
         );
         assert_eq!(output.confinement.network_capabilities, 0);
+        assert!(!output.confinement.all_application_packages_grant);
+        assert!(output.confinement.own_package_grant);
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains(&format!("ORBIT_PS:{identity}")));
         assert!(stdout.contains("MODULE:") && stdout.contains("DENIALS_OK"));

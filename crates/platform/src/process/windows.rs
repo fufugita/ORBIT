@@ -2,12 +2,12 @@
 
 use super::{Completion, ConfinementEvidence, ProcessOutput, SpawnSpec, quote_argument};
 use crate::fs::validate_component;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, c_void};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,9 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
 };
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+};
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
@@ -466,8 +468,6 @@ fn token_boolean(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<bo
     let mut bytes = 0;
     let operation = if class == TokenIsAppContainer {
         "GetTokenInformation(TokenIsAppContainer)"
-    } else if class == TokenIsLessPrivilegedAppContainer {
-        "GetTokenInformation(TokenIsLessPrivilegedAppContainer)"
     } else {
         "GetTokenInformation(boolean)"
     };
@@ -481,6 +481,188 @@ fn token_boolean(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<bo
         return Err(invalid("token boolean shape"));
     }
     Ok(value != 0)
+}
+
+/// Two successful access decisions, not a query of an undocumented token payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LpacAccessCheck {
+    pub all_application_packages_grant: bool,
+    pub own_package_grant: bool,
+}
+impl LpacAccessCheck {
+    pub fn is_less_privileged(self) -> bool {
+        self.own_package_grant && !self.all_application_packages_grant
+    }
+}
+
+struct LocalAllocation(*mut c_void);
+impl Drop for LocalAllocation {
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
+}
+
+fn token_buffer(
+    token: HANDLE,
+    class: TOKEN_INFORMATION_CLASS,
+    operation: &'static str,
+) -> io::Result<Vec<usize>> {
+    let mut bytes = 0;
+    let result = unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut bytes) };
+    let error = if result == 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    if error.as_ref().and_then(io::Error::raw_os_error) != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        return Err(operation_error(
+            operation,
+            error.unwrap_or_else(|| invalid("token sizing succeeded unexpectedly")),
+        ));
+    }
+    let minimum = if class == TokenUser {
+        size_of::<TOKEN_USER>()
+    } else if class == TokenAppContainerSid {
+        size_of::<TOKEN_APPCONTAINER_INFORMATION>()
+    } else {
+        size_of::<u32>()
+    };
+    if bytes < minimum as u32 || bytes > 65536 {
+        return Err(invalid("token identity buffer size"));
+    }
+    let mut data = vec![0usize; (bytes as usize).div_ceil(size_of::<usize>())];
+    unsafe {
+        ok(
+            operation,
+            GetTokenInformation(token, class, data.as_mut_ptr().cast(), bytes, &mut bytes),
+        )?;
+    }
+    Ok(data)
+}
+
+fn sid_text(sid: PSID) -> io::Result<String> {
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+        return Err(invalid("invalid access-probe SID"));
+    }
+    let mut pointer = null_mut();
+    unsafe {
+        ok(
+            "ConvertSidToStringSidW(access probe)",
+            ConvertSidToStringSidW(sid, &mut pointer),
+        )?;
+    }
+    let allocation = LocalAllocation(pointer.cast());
+    let value = unsafe { string_from_pointer(pointer) };
+    drop(allocation);
+    value
+}
+
+fn descriptor_access(token: HANDLE, owner: &str, package: &str) -> io::Result<bool> {
+    // The user pass grants bit1 through Everyone; the package pass must grant it
+    // independently through the selected package SID.
+    let text = wide(OsStr::new(&format!(
+        "O:{owner}G:{owner}D:P(A;;0x1;;;WD)(A;;0x1;;;{package})"
+    )))?;
+    let mut descriptor = null_mut();
+    unsafe {
+        ok(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW(access probe)",
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                1,
+                &mut descriptor,
+                null_mut(),
+            ),
+        )?;
+    }
+    let allocation = LocalAllocation(descriptor);
+    let mapping = GENERIC_MAPPING {
+        GenericRead: 1,
+        GenericWrite: 2,
+        GenericExecute: 4,
+        GenericAll: 7,
+    };
+    let mut privileges = vec![0usize; 64];
+    for attempt in 0..2 {
+        let mut bytes = (privileges.len() * size_of::<usize>()) as u32;
+        let (mut granted, mut allowed) = (0, 0);
+        let result = unsafe {
+            AccessCheck(
+                descriptor,
+                token,
+                1,
+                &mapping,
+                privileges.as_mut_ptr().cast(),
+                &mut bytes,
+                &mut granted,
+                &mut allowed,
+            )
+        };
+        if result != 0 {
+            drop(allocation);
+            if (allowed != 0 && granted & 1 == 1) || (allowed == 0 && granted == 0) {
+                return Ok(allowed != 0);
+            }
+            return Err(invalid("inconsistent successful access-probe decision"));
+        }
+        let error = io::Error::last_os_error();
+        if attempt == 0
+            && error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32)
+            && bytes > privileges.len() as u32 * size_of::<usize>() as u32
+            && bytes <= 65536
+        {
+            privileges.resize((bytes as usize).div_ceil(size_of::<usize>()), 0);
+        } else {
+            return Err(operation_error("AccessCheck(LPAC authority probe)", error));
+        }
+    }
+    Err(invalid("access-probe sizing exhausted"))
+}
+
+/// Check the LPAC authority property with supported token/ACL APIs. This
+/// composition is validated separately against an ordinary AppContainer.
+/// API errors never become evidence of a denied grant.
+pub fn inspect_lpac_access(token: BorrowedHandle<'_>) -> io::Result<LpacAccessCheck> {
+    let token = token.as_raw_handle();
+    if !token_boolean(token, TokenIsAppContainer)? {
+        return Err(invalid("LPAC access probe requires an AppContainer token"));
+    }
+    let user = token_buffer(
+        token,
+        TokenUser,
+        "GetTokenInformation(TokenUser for access probe)",
+    )?;
+    let package = token_buffer(
+        token,
+        TokenAppContainerSid,
+        "GetTokenInformation(TokenAppContainerSid)",
+    )?;
+    let owner = sid_text(unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid })?;
+    let package = sid_text(unsafe {
+        (*package.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()).TokenAppContainer
+    })?;
+    let mut duplicate = null_mut();
+    unsafe {
+        ok(
+            "DuplicateToken(access probe)",
+            DuplicateToken(token, SecurityImpersonation, &mut duplicate),
+        )?;
+    }
+    let duplicate = own("DuplicateToken(access probe handle)", duplicate)?;
+    let own_package_grant = descriptor_access(duplicate.as_raw_handle(), &owner, &package)?;
+    let all_application_packages_grant =
+        descriptor_access(duplicate.as_raw_handle(), &owner, "AC")?;
+    if !own_package_grant {
+        return Err(io::Error::other(format!(
+            "LPAC positive access control failed: own_package={own_package_grant}, all_application_packages={all_application_packages_grant}"
+        )));
+    }
+    Ok(LpacAccessCheck {
+        all_application_packages_grant,
+        own_package_grant,
+    })
 }
 
 fn process_completed(process: HANDLE) -> io::Result<bool> {
@@ -672,6 +854,8 @@ impl<'a> OwnedProcess<'a> {
                 less_privileged: false,
                 network_capabilities: 0,
                 job_assigned_before_resume: false,
+                all_application_packages_grant: false,
+                own_package_grant: false,
             },
         };
         unsafe {
@@ -685,13 +869,18 @@ impl<'a> OwnedProcess<'a> {
         unsafe {
             ok(
                 "OpenProcessToken",
-                OpenProcessToken(child.process.as_raw_handle(), TOKEN_QUERY, &mut token),
+                OpenProcessToken(
+                    child.process.as_raw_handle(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut token,
+                ),
             )?;
         }
         let token = own("OpenProcessToken(handle)", token)?;
         let app_container = token_boolean(token.as_raw_handle(), TokenIsAppContainer)?;
-        let less_privileged =
-            token_boolean(token.as_raw_handle(), TokenIsLessPrivilegedAppContainer)?;
+        let access =
+            inspect_lpac_access(unsafe { BorrowedHandle::borrow_raw(token.as_raw_handle()) })?;
+        let less_privileged = access.is_less_privileged();
         let mut needed = 0;
         let sizing = unsafe {
             GetTokenInformation(
@@ -745,15 +934,17 @@ impl<'a> OwnedProcess<'a> {
             )?;
         }
         if !app_container || !less_privileged || count != 0 || in_job == 0 {
-            return Err(io::Error::other(
-                "child capability or Job verification failed",
-            ));
+            return Err(io::Error::other(format!(
+                "child capability or Job verification failed: app_container={app_container}, access={access:?}, capabilities={count}, in_job={in_job}"
+            )));
         }
         child.evidence = ConfinementEvidence {
             app_container,
             less_privileged,
             network_capabilities: 0,
             job_assigned_before_resume: true,
+            all_application_packages_grant: access.all_application_packages_grant,
+            own_package_grant: access.own_package_grant,
         };
         if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
             return Err(operation_error("ResumeThread", io::Error::last_os_error()));

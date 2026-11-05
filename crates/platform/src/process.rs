@@ -49,6 +49,8 @@ pub struct ConfinementEvidence {
     pub less_privileged: bool,
     pub network_capabilities: u32,
     pub job_assigned_before_resume: bool,
+    pub all_application_packages_grant: bool,
+    pub own_package_grant: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,7 +73,7 @@ pub struct ProcessOutput {
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{OwnedProcess, SandboxSession};
+pub use windows::{LpacAccessCheck, OwnedProcess, SandboxSession, inspect_lpac_access};
 
 #[cfg(test)]
 mod tests {

@@ -76,6 +76,7 @@ cargo +1.99.0 test --locked -p orbit-platform --test windows_process -- --test-t
 $code = $LASTEXITCODE
 if ($code -ne 0) { exit $code }
 $required = @(
+    'windows::ordinary_appcontainer_does_not_pass_lpac_access_probe',
     'windows::powershell_lpac_reads_owned_resources_and_denies_ambient_authority',
     'windows::silent_powershell_deadline_observes_owned_completion',
     'windows::powershell_output_limit_observes_owned_completion'
