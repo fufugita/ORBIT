@@ -11,6 +11,7 @@ resolver = "3"
 # `cargo build -p orbit-desktop` on a machine with GTK.
 exclude = ["fuzz", "crates/desktop/src-tauri"]
 members = [
+  "crates/platform",
   "crates/frontend-protocol",
   "crates/engine",
   "crates/tools",

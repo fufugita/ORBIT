@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   nixos:
+    if: github.ref != 'refs/heads/codex/platform-first-run-windows-proof-20261105'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -60,4 +61,63 @@ jobs:
         if: always()
         with:
           name: nixos-package-identity
+          path: platform-results/
+
+  windows-foundation:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install the pinned compiler
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc +1.99.0 --version
+      - name: Run native private-storage contracts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force platform-results | Out-Null
+          Get-ComputerInfo -Property WindowsProductName, WindowsVersion, OsBuildNumber |
+            Format-List | Out-File platform-results/windows.txt
+          whoami /all | Out-File platform-results/identity.txt
+          cargo +1.99.0 test --locked -p orbit-platform -- --test-threads=1 --nocapture 2>&1 |
+            Tee-Object -FilePath platform-results/windows-foundation.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
+          $report = Get-Content platform-results/windows-foundation.log -Raw
+          $required = @(
+            'ambiguous_components_are_rejected',
+            'windows::unicode_private_create_reopen_and_read_bounds',
+            'windows::absolute_drive_and_verbatim_aliases_keep_identity',
+            'windows::held_root_and_ancestor_cannot_be_swapped',
+            'windows::file_keeps_ancestor_handles_after_directory_drop',
+            'windows::hardlinks_and_junctions_are_rejected',
+            'windows::file_symlink_is_not_followed',
+            'windows::permissive_dacl_is_rejected_by_held_and_reopened_checks',
+            'windows::wrong_owner_is_rejected',
+            'windows::publication_does_not_clobber_and_replace_retains_original',
+            'windows::replacement_requires_expected_identity_and_exclusive_lock',
+            'windows::exclusive_lock_excludes_other_processes_and_releases',
+            'windows::shared_readers_coexist_but_exclude_writer',
+            'fs::windows::tests::private_storage_works_without_admin_group_or_privileges',
+            'fs::windows::tests::flush_failure_preserves_original_and_unpublished_candidate',
+            'fs::windows::tests::prepublication_failure_restores_expected_original',
+            'fs::windows::tests::postpublication_flush_failure_retains_original_backup'
+          )
+          foreach ($case in $required) {
+            $pattern = '(?m)^test ' + [regex]::Escape($case) + ' \.\.\. ok\r?$'
+            if ($report -notmatch $pattern) { throw "Required native case did not pass: $case" }
+          }
+          if ($report -match '\b[1-9][0-9]* ignored\b') { throw 'Native contracts were ignored' }
+          @{ required_cases = $required.Count; status = 'passed'; source = '${{ github.sha }}' } |
+            ConvertTo-Json | Out-File platform-results/windows-foundation.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-foundation
           path: platform-results/

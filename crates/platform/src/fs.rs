@@ -1,0 +1,50 @@
+//! Private state is addressed relative to held directory handles.
+
+use std::ffi::OsStr;
+use std::io;
+
+/// Reject ambiguous names before passing a single component to an OS backend.
+pub fn validate_component(name: &OsStr) -> io::Result<()> {
+    let name = name.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "state names must be Unicode")
+    })?;
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix).is_some_and(|n| {
+                matches!(
+                    n,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        });
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with(['.', ' '])
+        || name.chars().any(|c| {
+            c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+        })
+        || reserved
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ambiguous state component",
+        ));
+    }
+    Ok(())
+}
+
+/// The Windows implementation requires a local fixed NTFS volume. Other
+/// platforms deliberately expose no successful storage fallback here.
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{
+    Directory, Durability, FileIdentity, LockMode, PrivateFile, Publication, PublicationState,
+    PublishError, StateLock,
+};

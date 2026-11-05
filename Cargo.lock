@@ -2777,6 +2777,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbit-platform"
+version = "0.2.1"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "orbit-plugin"
 version = "0.2.1"
 dependencies = [
