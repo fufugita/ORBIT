@@ -1410,7 +1410,8 @@ impl<'a> OwnedProcess<'a> {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let (mut stdout_closed, mut stderr_closed) = (false, false);
         let mut completion = Completion::Exited;
-        let mut stopped = false;
+        let stopped_before_wait = self.finished;
+        let mut stopped = stopped_before_wait;
         loop {
             let mut exceeded = false;
             let budget = self
@@ -1437,6 +1438,8 @@ impl<'a> OwnedProcess<'a> {
                     self.stop()?;
                     stopped = true;
                 }
+            } else if stopped_before_wait && exceeded {
+                completion = Completion::OutputLimit;
             }
             let done = process_completed(self.process.as_raw_handle())?;
             if done && !stopped && self.active()? != 0 {
@@ -4744,6 +4747,8 @@ mod registry_witness_tests {
 
     fn wait_for_cancel_readiness(
         child: &OwnedProcess<'_>,
+        child_pid: u32,
+        child_creation: &str,
         parent_pid: u32,
         parent_creation: &str,
         expected_admission: &str,
@@ -4756,8 +4761,29 @@ mod registry_witness_tests {
                     "cancellation readiness timed out",
                 ));
             }
-            if process_completed(child.process.as_raw_handle())? {
-                return Err(invalid("cancellation helper exited before live readiness"));
+            match process_completed(child.process.as_raw_handle()) {
+                Ok(true) => {
+                    return match child.active() {
+                        Ok(active) => Err(io::Error::other(format!(
+                            "cancellation helper exited before readiness: child_pid={child_pid} child_creation={child_creation} process_wait=WAIT_OBJECT_0 QueryInformationJobObject=success active_processes={active}"
+                        ))),
+                        Err(error) => Err(io::Error::other(format!(
+                            "cancellation helper exited before readiness: child_pid={child_pid} child_creation={child_creation} process_wait=WAIT_OBJECT_0 QueryInformationJobObject failed: {error}"
+                        ))),
+                    };
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let job = child.active();
+                    return Err(match job {
+                        Ok(active) => io::Error::other(format!(
+                            "cancellation readiness wait query failed: child_pid={child_pid} child_creation={child_creation} WaitForSingleObject(process) failed: {error}; QueryInformationJobObject=success active_processes={active}"
+                        )),
+                        Err(job_error) => io::Error::other(format!(
+                            "cancellation readiness wait queries failed: child_pid={child_pid} child_creation={child_creation} WaitForSingleObject(process) failed: {error}; QueryInformationJobObject failed: {job_error}"
+                        )),
+                    });
+                }
             }
             let stdout = peek_pipe_bytes(&child.stdout, child.output_limit)?;
             let stderr = peek_pipe_bytes(
@@ -4777,12 +4803,41 @@ mod registry_witness_tests {
             if !pending && cancel_readiness_complete(&records, expected_admission, expected_ready)?
             {
                 validate_parent_self_binding(parent_pid, parent_creation)?;
-                if process_completed(child.process.as_raw_handle())? || child.active()? != 1 {
-                    return Err(invalid(
-                        "cancellation readiness was not received from one live Job member",
-                    ));
+                let process_state = process_completed(child.process.as_raw_handle());
+                let job_state = child.active();
+                match (process_state, job_state) {
+                    (Ok(false), Ok(1)) => return Ok(()),
+                    (Ok(done), Ok(active)) => {
+                        let wait_result = if done {
+                            "WAIT_OBJECT_0"
+                        } else {
+                            "WAIT_TIMEOUT"
+                        };
+                        return Err(io::Error::other(format!(
+                            "cancellation readiness received but live-member gate failed: child_pid={child_pid} child_creation={child_creation} process_wait={wait_result} QueryInformationJobObject=success active_processes={active}"
+                        )));
+                    }
+                    (Err(wait_error), Ok(active)) => {
+                        return Err(io::Error::other(format!(
+                            "cancellation readiness gate wait query failed: child_pid={child_pid} child_creation={child_creation} WaitForSingleObject(process) failed: {wait_error}; QueryInformationJobObject=success active_processes={active}"
+                        )));
+                    }
+                    (Ok(done), Err(job_error)) => {
+                        let wait_result = if done {
+                            "WAIT_OBJECT_0"
+                        } else {
+                            "WAIT_TIMEOUT"
+                        };
+                        return Err(io::Error::other(format!(
+                            "cancellation readiness gate Job query failed: child_pid={child_pid} child_creation={child_creation} process_wait={wait_result}; QueryInformationJobObject failed: {job_error}"
+                        )));
+                    }
+                    (Err(wait_error), Err(job_error)) => {
+                        return Err(io::Error::other(format!(
+                            "cancellation readiness gate queries failed: child_pid={child_pid} child_creation={child_creation} WaitForSingleObject(process) failed: {wait_error}; QueryInformationJobObject failed: {job_error}"
+                        )));
+                    }
                 }
-                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -4842,6 +4897,84 @@ mod registry_witness_tests {
                 "{primary}; child termination/wait failed: {cleanup}; OwnedProcess Drop will retry, and the session records any unobserved shutdown"
             )),
         }
+    }
+
+    fn emit_cancel_output_diagnostic(
+        stream: &str,
+        child_pid: u32,
+        child_creation: &str,
+        output: &ProcessOutput,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        const CHUNK_SIZE: usize = 1024;
+        if bytes.is_empty() {
+            return emit_witness_record(&format!(
+                "registry_witness_diagnostic stream={stream} child_pid={child_pid} creation={child_creation} exit_code={} completion={:?} total_bytes=0 offset=0 chunk_bytes=0 text=",
+                output.code, output.completion
+            ));
+        }
+        for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
+            let offset = index * CHUNK_SIZE;
+            emit_witness_record(&format!(
+                "registry_witness_diagnostic stream={stream} child_pid={child_pid} creation={child_creation} exit_code={} completion={:?} total_bytes={} offset={offset} chunk_bytes={} text={}",
+                output.code,
+                output.completion,
+                bytes.len(),
+                chunk.len(),
+                escape_diagnostic(chunk)
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn cancel_child_after_failure_with_output(
+        mut child: OwnedProcess<'_>,
+        primary: io::Error,
+        child_pid: u32,
+        child_creation: &str,
+    ) -> io::Error {
+        let stop_result = child.stop();
+        if stop_result.is_ok() {
+            child.finished = true;
+        }
+        let wait_result = child.wait(&AtomicBool::new(false));
+        let mut details = vec![format!(
+            "cancellation primary failure for child_pid={child_pid} child_creation={child_creation}: {primary}"
+        )];
+        if let Err(error) = stop_result {
+            details.push(format!("explicit child stop/wait failed: {error}"));
+        }
+        match wait_result {
+            Ok(output) => {
+                details.push(format!(
+                    "bounded cancellation output drained: exit_code={} completion={:?} stdout_bytes={} stderr_bytes={}",
+                    output.code,
+                    output.completion,
+                    output.stdout.len(),
+                    output.stderr.len()
+                ));
+                if let Err(error) = emit_cancel_output_diagnostic(
+                    "cancel_stdout",
+                    child_pid,
+                    child_creation,
+                    &output,
+                    &output.stdout,
+                ) {
+                    details.push(format!("stdout diagnostic emission failed: {error}"));
+                }
+                if let Err(error) = emit_cancel_output_diagnostic(
+                    "cancel_stderr",
+                    child_pid,
+                    child_creation,
+                    &output,
+                    &output.stderr,
+                ) {
+                    details.push(format!("stderr diagnostic emission failed: {error}"));
+                }
+            }
+            Err(error) => details.push(format!("bounded child wait/output drain failed: {error}")),
+        }
+        io::Error::other(details.join("; "))
     }
 
     fn run_cancel_witness_child(
@@ -4930,21 +5063,38 @@ mod registry_witness_tests {
         );
         if let Err(error) = wait_for_cancel_readiness(
             &child,
+            child_pid,
+            &child_creation,
             parent_pid,
             parent_creation,
             &expected_admission,
             &expected_child_ready,
         ) {
-            return Err(stop_child_after_failure(&mut child, error));
+            return Err(cancel_child_after_failure_with_output(
+                child,
+                error,
+                child_pid,
+                &child_creation,
+            ));
         }
         if let Err(error) = validate_parent_self_binding(parent_pid, parent_creation) {
-            return Err(stop_child_after_failure(&mut child, error));
+            return Err(cancel_child_after_failure_with_output(
+                child,
+                error,
+                child_pid,
+                &child_creation,
+            ));
         }
         let ready_attestation = format!(
             "{expected_child_ready} parent_received_while_alive=true job_active_processes=1"
         );
         if let Err(error) = emit_witness_record(&ready_attestation) {
-            return Err(stop_child_after_failure(&mut child, error));
+            return Err(cancel_child_after_failure_with_output(
+                child,
+                error,
+                child_pid,
+                &child_creation,
+            ));
         }
 
         child.stop()?;
@@ -4954,6 +5104,7 @@ mod registry_witness_tests {
                 "cancellation Job did not reach zero active processes",
             ));
         }
+        child.finished = true;
         let output = child.wait(&AtomicBool::new(false))?;
         if !cancellation_exit_matches_requested(output.code, output.completion) {
             return Err(invalid(
