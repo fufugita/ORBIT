@@ -1138,8 +1138,8 @@ public static class OrbitRegistryWitnessFixture {
             'returned_bytes','pid','actual_pid','actual_creation','membership','active_processes','observed')
         if((WitnessField $liveMember 'child_pid') -cne (WitnessField $cancelReady 'pid') -or
             (WitnessField $liveMember 'child_creation') -cne (WitnessField $cancelReady 'creation') -or
-            (WitnessField $liveMember 'assigned') -cne 'true' -or
-            (WitnessField $liveMember 'listed') -cne 'true' -or
+            (WitnessField $liveMember 'assigned') -cne '1' -or
+            (WitnessField $liveMember 'listed') -cne '1' -or
             (WitnessField $liveMember 'returned_bytes') -notmatch '^[1-9][0-9]*$' -or
             [int](WitnessField $liveMember 'returned_bytes') -lt 8 -or
             (WitnessField $liveMember 'pid') -cne (WitnessField $cancelReady 'pid') -or
