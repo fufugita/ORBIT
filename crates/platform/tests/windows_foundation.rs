@@ -30,13 +30,23 @@ mod windows {
     use orbit_platform::fs::{
         Directory, EnumerationLimits, InspectionLimits, LockMode, PrivateFileAccess, RemovalState,
     };
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, c_void};
     use std::fs;
+    use std::mem::offset_of;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::Security::Authorization::*;
+    use windows_sys::Win32::Security::*;
+    use windows_sys::Win32::Storage::FileSystem::*;
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
     struct Home {
         base: PathBuf,
@@ -145,6 +155,334 @@ mod windows {
             .trim_matches('"');
         assert!(sid.starts_with("S-1-"), "invalid current SID: {sid}");
         sid.to_owned()
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct FixtureAclFacts {
+        owner_matches_current: bool,
+        owner_matches_administrators: bool,
+        dacl_present: bool,
+        dacl_protected: bool,
+        ace_count: u16,
+        first_ace_type: Option<u8>,
+        first_ace_flags: Option<u8>,
+        first_ace_sid_matches_current: Option<bool>,
+        first_ace_mask: Option<u32>,
+        has_current_owner_full_control_ace: bool,
+        has_everyone_full_control_ace: bool,
+    }
+
+    struct FixtureAclSnapshot {
+        facts: FixtureAclFacts,
+        normalized_descriptor: Vec<u8>,
+    }
+
+    struct LocalSecurityAllocation(*mut c_void);
+    impl Drop for LocalSecurityAllocation {
+        fn drop(&mut self) {
+            let _ = unsafe { LocalFree(self.0) };
+        }
+    }
+
+    fn wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
+    }
+
+    fn sid_from_text(value: &str) -> LocalSecurityAllocation {
+        let value = wide(OsStr::new(value));
+        let mut sid = null_mut();
+        assert_ne!(
+            unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut sid) },
+            0,
+            "converting fixture SID failed: {}",
+            unsafe { GetLastError() }
+        );
+        LocalSecurityAllocation(sid.cast())
+    }
+
+    fn fixture_handle(path: &Path, access: u32, directory: bool) -> OwnedHandle {
+        let path = wide(path.as_os_str());
+        let flags = FILE_FLAG_OPEN_REPARSE_POINT
+            | if directory {
+                FILE_FLAG_BACKUP_SEMANTICS
+            } else {
+                0
+            };
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                flags,
+                null_mut(),
+            )
+        };
+        assert_ne!(
+            handle,
+            INVALID_HANDLE_VALUE,
+            "opening an owned fixture for ACL inspection failed: {}",
+            unsafe { GetLastError() }
+        );
+        unsafe { OwnedHandle::from_raw_handle(handle) }
+    }
+
+    fn set_fixture_file_mask(path: &Path, sid: &str, mask: u32) {
+        let sddl = wide(OsStr::new(&format!(
+            "O:{sid}D:P(A;OICI;0x{mask:08X};;;{sid})"
+        )));
+        let mut descriptor = null_mut();
+        let mut descriptor_length = 0;
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    &mut descriptor_length,
+                )
+            },
+            0,
+            "building fixture ACL descriptor failed: {}",
+            unsafe { GetLastError() }
+        );
+        let descriptor = LocalSecurityAllocation(descriptor.cast());
+        let mut present = 0;
+        let mut dacl = null_mut();
+        let mut defaulted = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor.0.cast(),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            },
+            0,
+            "reading fixture ACL descriptor failed: {}",
+            unsafe { GetLastError() }
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+
+        let handle = fixture_handle(path, READ_CONTROL | WRITE_DAC, false);
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            )
+        };
+        assert_eq!(
+            result, ERROR_SUCCESS,
+            "setting fixture ACL failed: {result}"
+        );
+    }
+
+    fn fixture_acl_snapshot(
+        path: &Path,
+        current_sid_text: &str,
+        directory: bool,
+    ) -> FixtureAclSnapshot {
+        let current_sid = sid_from_text(current_sid_text);
+        let administrators_sid = sid_from_text("S-1-5-32-544");
+        let everyone_sid = sid_from_text("S-1-1-0");
+        let handle = fixture_handle(path, READ_CONTROL, directory);
+        let mut owner = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor = null_mut();
+        let result = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(
+            result, ERROR_SUCCESS,
+            "querying fixture ACL failed: {result}"
+        );
+        let descriptor = LocalSecurityAllocation(descriptor.cast());
+
+        let mut control = 0;
+        let mut revision = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorControl(descriptor.0.cast(), &mut control, &mut revision)
+            },
+            0,
+            "reading fixture descriptor control failed: {}",
+            unsafe { GetLastError() }
+        );
+        let mut dacl_present = 0;
+        let mut descriptor_dacl = null_mut();
+        let mut dacl_defaulted = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor.0.cast(),
+                    &mut dacl_present,
+                    &mut descriptor_dacl,
+                    &mut dacl_defaulted,
+                )
+            },
+            0,
+            "reading fixture DACL presence failed: {}",
+            unsafe { GetLastError() }
+        );
+
+        let ace_count = if dacl.is_null() {
+            0
+        } else {
+            unsafe { (*dacl).AceCount }
+        };
+        let mut first_ace_type = None;
+        let mut first_ace_flags = None;
+        let mut first_ace_sid_matches_current = None;
+        let mut first_ace_mask = None;
+        let mut has_current_owner_full_control_ace = false;
+        let mut has_everyone_full_control_ace = false;
+        if !dacl.is_null() {
+            for index in 0..u32::from(ace_count) {
+                let mut ace = null_mut();
+                assert_ne!(
+                    unsafe { GetAce(dacl, index, &mut ace) },
+                    0,
+                    "reading fixture ACE {index} failed: {}",
+                    unsafe { GetLastError() }
+                );
+                let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+                if index == 0 {
+                    first_ace_type = Some(header.AceType);
+                    first_ace_flags = Some(header.AceFlags);
+                }
+                if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                    || (header.AceSize as usize)
+                        < offset_of!(ACCESS_ALLOWED_ACE, SidStart)
+                            + offset_of!(windows_sys::Win32::Security::SID, SubAuthority)
+                {
+                    continue;
+                }
+                let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                let ace_sid = (&allowed.SidStart as *const u32).cast_mut().cast();
+                let sid_length = unsafe { GetLengthSid(ace_sid) } as usize;
+                let maximum_sid_length =
+                    header.AceSize as usize - offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+                if sid_length == 0 || sid_length > maximum_sid_length {
+                    continue;
+                }
+                let sid_matches_current = unsafe { EqualSid(ace_sid, current_sid.0.cast()) } != 0;
+                if index == 0 {
+                    first_ace_sid_matches_current = Some(sid_matches_current);
+                    first_ace_mask = Some(allowed.Mask);
+                }
+                has_current_owner_full_control_ace |=
+                    sid_matches_current && allowed.Mask == FILE_ALL_ACCESS;
+                has_everyone_full_control_ace |= unsafe {
+                    EqualSid(ace_sid, everyone_sid.0.cast()) != 0 && allowed.Mask == FILE_ALL_ACCESS
+                };
+            }
+        }
+
+        let mut normalized_descriptor = Vec::new();
+        normalized_descriptor.push(u8::from(dacl_present != 0));
+        normalized_descriptor.extend_from_slice(&(control & SE_DACL_PROTECTED).to_le_bytes());
+        if owner.is_null() {
+            normalized_descriptor.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            let owner_length = unsafe { GetLengthSid(owner) } as usize;
+            normalized_descriptor.extend_from_slice(&(owner_length as u32).to_le_bytes());
+            if owner_length != 0 {
+                normalized_descriptor.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(owner.cast::<u8>(), owner_length)
+                });
+            }
+        }
+        if dacl.is_null() {
+            normalized_descriptor.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            let acl_length = unsafe { (*dacl).AclSize } as usize;
+            normalized_descriptor.extend_from_slice(&(acl_length as u32).to_le_bytes());
+            normalized_descriptor.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(dacl.cast::<u8>(), acl_length)
+            });
+        }
+
+        FixtureAclSnapshot {
+            facts: FixtureAclFacts {
+                owner_matches_current: !owner.is_null()
+                    && unsafe { EqualSid(owner, current_sid.0.cast()) } != 0,
+                owner_matches_administrators: !owner.is_null()
+                    && unsafe { EqualSid(owner, administrators_sid.0.cast()) } != 0,
+                dacl_present: dacl_present != 0 && !descriptor_dacl.is_null(),
+                dacl_protected: control & SE_DACL_PROTECTED != 0,
+                ace_count,
+                first_ace_type,
+                first_ace_flags,
+                first_ace_sid_matches_current,
+                first_ace_mask,
+                has_current_owner_full_control_ace,
+                has_everyone_full_control_ace,
+            },
+            normalized_descriptor,
+        }
+    }
+
+    fn assert_fixture_acl(
+        path: &Path,
+        sid: &str,
+        directory: bool,
+        expected_mask: u32,
+    ) -> FixtureAclSnapshot {
+        let snapshot = fixture_acl_snapshot(path, sid, directory);
+        let facts = &snapshot.facts;
+        let inherited_flags = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        assert!(
+            facts.owner_matches_current,
+            "fixture owner mismatch: {facts:?}"
+        );
+        assert!(facts.dacl_present, "fixture DACL missing: {facts:?}");
+        assert!(
+            facts.dacl_protected,
+            "fixture DACL is unprotected: {facts:?}"
+        );
+        assert_eq!(facts.ace_count, 1, "fixture ACE count mismatch: {facts:?}");
+        assert_eq!(
+            facts.first_ace_type,
+            Some(ACCESS_ALLOWED_ACE_TYPE),
+            "fixture ACE type mismatch: {facts:?}"
+        );
+        assert_eq!(
+            facts.first_ace_flags,
+            Some(inherited_flags),
+            "fixture ACE flags mismatch: {facts:?}"
+        );
+        assert_eq!(
+            facts.first_ace_sid_matches_current,
+            Some(true),
+            "fixture ACE SID mismatch: {facts:?}"
+        );
+        assert_eq!(
+            facts.first_ace_mask,
+            Some(expected_mask),
+            "fixture ACE mask mismatch: {facts:?}"
+        );
+        assert!(
+            !facts.has_everyone_full_control_ace,
+            "fixture is permissive: {facts:?}"
+        );
+        snapshot
     }
 
     #[test]
@@ -993,6 +1331,8 @@ mod windows {
     #[test]
     fn inspection_observes_existing_shared_lock_and_nested_files() {
         let home = Home::new();
+        let root_path = home.path();
+        let nested_path = root_path.join("nested");
         let nested = home.dir().child(OsStr::new("nested"), true).unwrap();
         let mut full = nested.create_file(OsStr::new("full.json")).unwrap();
         full.write_all(b"full control fixture").unwrap();
@@ -1004,11 +1344,8 @@ mod windows {
         read_only.write_all(b"read-only fixture").unwrap();
         let read_only_identity = read_only.identity();
         drop(read_only);
-        let read_only_rule = format!("*{sid}:(R)");
-        run_icacls(
-            &home.path().join("read-only.dat"),
-            &["/grant:r", &read_only_rule],
-        );
+        let read_only_path = root_path.join("read-only.dat");
+        set_fixture_file_mask(&read_only_path, &sid, FILE_GENERIC_READ);
 
         let mut read_execute = home
             .dir()
@@ -1017,10 +1354,11 @@ mod windows {
         read_execute.write_all(b"read-execute fixture").unwrap();
         let read_execute_identity = read_execute.identity();
         drop(read_execute);
-        let read_execute_rule = format!("*{sid}:(RX)");
-        run_icacls(
-            &home.path().join("read-execute.dat"),
-            &["/grant:r", &read_execute_rule],
+        let read_execute_path = root_path.join("read-execute.dat");
+        set_fixture_file_mask(
+            &read_execute_path,
+            &sid,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         );
 
         let seed = home
@@ -1036,7 +1374,46 @@ mod windows {
         assert_eq!(shared.identity(), lock_identity);
         shared.check().unwrap();
 
-        let before = tree_snapshot(&home.path());
+        let full_path = nested_path.join("full.json");
+        let lock_path = root_path.join("existing.lock");
+        let acl_before = [
+            (
+                root_path.as_path(),
+                true,
+                assert_fixture_acl(&root_path, &sid, true, FILE_ALL_ACCESS),
+            ),
+            (
+                nested_path.as_path(),
+                true,
+                assert_fixture_acl(&nested_path, &sid, true, FILE_ALL_ACCESS),
+            ),
+            (
+                full_path.as_path(),
+                false,
+                assert_fixture_acl(&full_path, &sid, false, FILE_ALL_ACCESS),
+            ),
+            (
+                read_only_path.as_path(),
+                false,
+                assert_fixture_acl(&read_only_path, &sid, false, FILE_GENERIC_READ),
+            ),
+            (
+                read_execute_path.as_path(),
+                false,
+                assert_fixture_acl(
+                    &read_execute_path,
+                    &sid,
+                    false,
+                    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+                ),
+            ),
+            (
+                lock_path.as_path(),
+                false,
+                assert_fixture_acl(&lock_path, &sid, false, FILE_ALL_ACCESS),
+            ),
+        ];
+        let before = tree_snapshot(&root_path);
         let inspected = home
             .dir()
             .inspect_private_tree(InspectionLimits {
@@ -1084,32 +1461,95 @@ mod windows {
         assert_eq!(lock_entry.identity, lock_identity);
         assert_eq!(lock_entry.file_access, Some(PrivateFileAccess::FullControl));
         assert_eq!(lock_entry.snapshot.unwrap().length, 0);
-        assert_eq!(tree_snapshot(&home.path()), before);
+        assert_eq!(tree_snapshot(&root_path), before);
+        for (path, directory, before_acl) in &acl_before {
+            let after_acl = fixture_acl_snapshot(path, &sid, *directory);
+            assert!(
+                before_acl.normalized_descriptor == after_acl.normalized_descriptor,
+                "inspection changed fixture ACL facts: before={:?}, after={:?}",
+                before_acl.facts,
+                after_acl.facts
+            );
+        }
         shared.check().unwrap();
     }
 
     #[test]
     fn inspection_rejects_permissive_and_wrong_owner_entries_without_repair() {
         let home = Home::new();
+        let sid = current_sid();
         let nested = home.dir().child(OsStr::new("nested"), true).unwrap();
         drop(nested.create_file(OsStr::new("private.dat")).unwrap());
         let nested_path = home.path().join("nested");
-        let permissive_acl = run_icacls(&nested_path, &["/grant", "*S-1-1-0:(F)"]);
-        let before = tree_snapshot(&home.path());
+        let private_acl = assert_fixture_acl(&nested_path, &sid, true, FILE_ALL_ACCESS);
+        home.dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+                max_depth: 4,
+            })
+            .expect("valid nested fixture must pass before permissive mutation");
+
+        run_icacls(&nested_path, &["/grant", "*S-1-1-0:(F)"]);
+        let permissive_acl_before = fixture_acl_snapshot(&nested_path, &sid, true);
+        let permissive_facts = &permissive_acl_before.facts;
         assert!(
-            home.dir()
-                .inspect_private_tree(InspectionLimits {
-                    max_entries: 8,
-                    max_name_bytes: 1024,
-                    max_depth: 4,
-                })
-                .is_err()
+            permissive_facts.owner_matches_current,
+            "mutator changed fixture owner: {permissive_facts:?}"
         );
+        assert!(
+            permissive_facts.dacl_present,
+            "mutator removed the DACL: {permissive_facts:?}"
+        );
+        assert!(
+            permissive_facts.dacl_protected,
+            "mutator unprotected the DACL: {permissive_facts:?}"
+        );
+        assert_eq!(
+            permissive_facts.ace_count, 2,
+            "mutator changed more than the intended ACE: {permissive_facts:?}"
+        );
+        assert_eq!(
+            permissive_facts.first_ace_type,
+            Some(ACCESS_ALLOWED_ACE_TYPE)
+        );
+        assert_eq!(
+            permissive_facts.first_ace_flags,
+            Some((OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8)
+        );
+        assert!(
+            permissive_facts.has_current_owner_full_control_ace,
+            "owner ACE changed: {permissive_facts:?}"
+        );
+        assert!(
+            permissive_facts.has_everyone_full_control_ace,
+            "Everyone full-control ACE was not installed: {permissive_facts:?}"
+        );
+        assert!(private_acl.normalized_descriptor != permissive_acl_before.normalized_descriptor);
+
+        let before = tree_snapshot(&home.path());
+        let error = home
+            .dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+                max_depth: 4,
+            })
+            .expect_err("actual Everyone full-control ACE must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(tree_snapshot(&home.path()), before);
-        assert_eq!(run_icacls(&nested_path, &[]), permissive_acl);
+        let permissive_acl_after = fixture_acl_snapshot(&nested_path, &sid, true);
+        assert!(
+            permissive_acl_before.normalized_descriptor
+                == permissive_acl_after.normalized_descriptor,
+            "inspection changed permissive fixture ACL facts: before={:?}, after={:?}",
+            permissive_acl_before.facts,
+            permissive_acl_after.facts
+        );
         drop(home);
 
         let home = Home::new();
+        let sid = current_sid();
         let mut record = home
             .dir()
             .create_file(OsStr::new("wrong-owner.dat"))
@@ -1117,20 +1557,61 @@ mod windows {
         record.write_all(b"owner fixture").unwrap();
         drop(record);
         let record_path = home.path().join("wrong-owner.dat");
+        let private_acl = assert_fixture_acl(&record_path, &sid, false, FILE_ALL_ACCESS);
+        home.dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+                max_depth: 4,
+            })
+            .expect("valid owner fixture must pass before owner mutation");
+
         run_icacls(&record_path, &["/setowner", "*S-1-5-32-544"]);
-        let owner_before = run_icacls(&record_path, &["/getowner"]);
-        let before = tree_snapshot(&home.path());
+        let wrong_owner_acl_before = fixture_acl_snapshot(&record_path, &sid, false);
+        let wrong_owner_facts = &wrong_owner_acl_before.facts;
         assert!(
-            home.dir()
-                .inspect_private_tree(InspectionLimits {
-                    max_entries: 8,
-                    max_name_bytes: 1024,
-                    max_depth: 4,
-                })
-                .is_err()
+            !wrong_owner_facts.owner_matches_current,
+            "owner mutator did not change owner: {wrong_owner_facts:?}"
         );
+        assert!(
+            wrong_owner_facts.owner_matches_administrators,
+            "fixture owner is not the requested built-in Administrators SID: {wrong_owner_facts:?}"
+        );
+        assert!(wrong_owner_facts.dacl_present && wrong_owner_facts.dacl_protected);
+        assert_eq!(wrong_owner_facts.ace_count, 1);
+        assert_eq!(
+            wrong_owner_facts.first_ace_type,
+            Some(ACCESS_ALLOWED_ACE_TYPE)
+        );
+        assert_eq!(
+            wrong_owner_facts.first_ace_flags,
+            Some((OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8)
+        );
+        assert_eq!(wrong_owner_facts.first_ace_sid_matches_current, Some(true));
+        assert_eq!(wrong_owner_facts.first_ace_mask, Some(FILE_ALL_ACCESS));
+        assert!(wrong_owner_facts.has_current_owner_full_control_ace);
+        assert!(!wrong_owner_facts.has_everyone_full_control_ace);
+        assert!(private_acl.normalized_descriptor != wrong_owner_acl_before.normalized_descriptor);
+
+        let before = tree_snapshot(&home.path());
+        let error = home
+            .dir()
+            .inspect_private_tree(InspectionLimits {
+                max_entries: 8,
+                max_name_bytes: 1024,
+                max_depth: 4,
+            })
+            .expect_err("actual wrong owner must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(tree_snapshot(&home.path()), before);
-        assert_eq!(run_icacls(&record_path, &["/getowner"]), owner_before);
+        let wrong_owner_acl_after = fixture_acl_snapshot(&record_path, &sid, false);
+        assert!(
+            wrong_owner_acl_before.normalized_descriptor
+                == wrong_owner_acl_after.normalized_descriptor,
+            "inspection changed wrong-owner fixture ACL facts: before={:?}, after={:?}",
+            wrong_owner_acl_before.facts,
+            wrong_owner_acl_after.facts
+        );
     }
 
     #[test]
