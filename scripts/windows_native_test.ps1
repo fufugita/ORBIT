@@ -645,16 +645,138 @@ public static class OrbitRegistryWitnessFixture {
                     (WitnessField $record 'active_processes') -cne '0'){throw 'Normal helper Job did not reach zero'}
             }
         }
-        $status=@($frames | Where-Object { $_ -match '^registry_witness_status witness_status=INCOMPLETE ' })
-        if ($status.Count -eq 0 -or $code -eq 0) {
+        $normalResults=@($frames | Where-Object { $_.StartsWith('registry_witness_child_result ') })
+        if($normalResults.Count -ne 1){throw 'Expected exactly one completed normal helper identity record'}
+        $normalResult=$normalResults[0]
+        $normalResultFields=@('role','completion','exit','pid','creation','image_id','image_sha256','fixture_id','fixture_digest')
+        WitnessExactFields $normalResult $normalResultFields
+        if((WitnessField $normalResult 'role') -cne 'normal' -or
+            (WitnessField $normalResult 'completion') -cne 'Exited' -or
+            (WitnessField $normalResult 'exit') -cne '0' -or
+            (WitnessField $normalResult 'pid') -notmatch '^[1-9][0-9]*$' -or
+            (WitnessField $normalResult 'creation') -notmatch '^[0-9A-Fa-f]{16}$' -or
+            (WitnessField $normalResult 'image_id') -notmatch '^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$' -or
+            (WitnessField $normalResult 'image_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+            (WitnessField $normalResult 'fixture_id') -notmatch '^[0-9A-Fa-f]{64}$' -or
+            (WitnessField $normalResult 'fixture_digest') -notmatch '^[0-9A-Fa-f]{64}$'){
+            throw 'Normal helper identity binding is incomplete'
+        }
+        $admissionRecords=@($frames | Where-Object { $_.StartsWith('registry_witness_child_admission ') })
+        if($admissionRecords.Count -ne 2){throw 'Expected exactly one admission record per helper role'}
+        $admissionFields=@('nonce','role','pid','creation','appcontainer','lpac','capability_count','network_capabilities','job','thread_token')
+        foreach($admission in $admissionRecords){WitnessExactFields $admission $admissionFields}
+        $normalAdmission=@($admissionRecords | Where-Object {(WitnessField $_ 'role') -ceq 'normal'})
+        $cancelAdmission=@($admissionRecords | Where-Object {(WitnessField $_ 'role') -ceq 'cancel'})
+        if($normalAdmission.Count -ne 1 -or $cancelAdmission.Count -ne 1){throw 'Admission records were not uniquely bound to normal and cancel roles'}
+        $normalAdmissionRecord=$normalAdmission[0]
+        $cancelAdmissionRecord=$cancelAdmission[0]
+        foreach($admission in @($normalAdmissionRecord,$cancelAdmissionRecord)){
+            if((WitnessField $admission 'nonce') -cne $nonce -or
+                (WitnessField $admission 'pid') -notmatch '^[1-9][0-9]*$' -or
+                (WitnessField $admission 'creation') -notmatch '^[0-9A-Fa-f]{16}$' -or
+                (WitnessField $admission 'appcontainer') -cne 'true' -or
+                (WitnessField $admission 'lpac') -cne 'true' -or
+                (WitnessField $admission 'capability_count') -cne '1' -or
+                (WitnessField $admission 'network_capabilities') -cne '0' -or
+                (WitnessField $admission 'job') -cne 'true' -or
+                (WitnessField $admission 'thread_token') -cne 'false'){
+                throw 'Helper admission token, Job, or invocation binding failed'
+            }
+        }
+        if((WitnessField $normalAdmissionRecord 'pid') -cne (WitnessField $normalResult 'pid') -or
+            (WitnessField $normalAdmissionRecord 'creation') -cne (WitnessField $normalResult 'creation')){
+            throw 'Normal admission did not match the parent-observed child identity'
+        }
+        $cancelReady=$probeRecords['lifetime/cancel_ready_mapped']
+        $cancelReadyFields=@('id','nonce','role','pid','creation','parent_pid','parent_creation',
+            'image_id','image_sha256','fixture_id','fixture_digest','machine_descriptor_sha256',
+            'user_descriptor_sha256','inherited_machine_label_sha256','inherited_user_label_sha256',
+            'mapped_machine_label_sha256','mapped_user_label_sha256','appcontainer','lpac',
+            'capability_count','network_capabilities','thread_token','job','inherited_reads',
+            'mapped_machine','mapped_user','maps_live','parent_received_while_alive','job_active_processes')
+        WitnessExactFields $cancelReady $cancelReadyFields
+        if((WitnessField $cancelReady 'id') -cne 'lifetime/cancel_ready_mapped' -or
+            (WitnessField $cancelReady 'nonce') -cne $nonce -or
+            (WitnessField $cancelReady 'role') -cne 'cancel' -or
+            (WitnessField $cancelReady 'pid') -notmatch '^[1-9][0-9]*$' -or
+            (WitnessField $cancelReady 'creation') -notmatch '^[0-9A-Fa-f]{16}$' -or
+            (WitnessField $cancelReady 'parent_pid') -cne $boundPid -or
+            (WitnessField $cancelReady 'parent_creation') -cne $boundCreation -or
+            (WitnessField $cancelReady 'image_id') -cne (WitnessField $normalResult 'image_id') -or
+            (WitnessField $cancelReady 'image_id') -notmatch '^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$' -or
+            (WitnessField $cancelReady 'image_sha256') -cne (WitnessField $normalResult 'image_sha256') -or
+            (WitnessField $cancelReady 'fixture_id') -cne (WitnessField $normalResult 'fixture_id') -or
+            (WitnessField $cancelReady 'fixture_digest') -cne (WitnessField $normalResult 'fixture_digest') -or
+            (WitnessField $cancelReady 'machine_descriptor_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+            (WitnessField $cancelReady 'user_descriptor_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+            (WitnessField $cancelReady 'inherited_machine_label_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+            (WitnessField $cancelReady 'inherited_user_label_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+            (WitnessField $cancelReady 'mapped_machine_label_sha256') -cne (WitnessField $cancelReady 'inherited_machine_label_sha256') -or
+            (WitnessField $cancelReady 'mapped_user_label_sha256') -cne (WitnessField $cancelReady 'inherited_user_label_sha256') -or
+            (WitnessField $cancelReady 'appcontainer') -cne 'true' -or
+            (WitnessField $cancelReady 'lpac') -cne 'true' -or
+            (WitnessField $cancelReady 'capability_count') -cne '1' -or
+            (WitnessField $cancelReady 'network_capabilities') -cne '0' -or
+            (WitnessField $cancelReady 'thread_token') -cne 'false' -or
+            (WitnessField $cancelReady 'job') -cne 'true' -or
+            (WitnessField $cancelReady 'inherited_reads') -cne '2' -or
+            (WitnessField $cancelReady 'mapped_machine') -cne 'true' -or
+            (WitnessField $cancelReady 'mapped_user') -cne 'true' -or
+            (WitnessField $cancelReady 'maps_live') -cne '2' -or
+            (WitnessField $cancelReady 'parent_received_while_alive') -cne 'true' -or
+            (WitnessField $cancelReady 'job_active_processes') -cne '1'){
+            throw 'Cancellation readiness bindings or live observations failed'
+        }
+        if((WitnessField $cancelAdmissionRecord 'pid') -cne (WitnessField $cancelReady 'pid') -or
+            (WitnessField $cancelAdmissionRecord 'creation') -cne (WitnessField $cancelReady 'creation')){
+            throw 'Cancellation admission did not match the live readiness child identity'
+        }
+        $cancelJob=$probeRecords['lifetime/cancel_job_zero']
+        $cancelJobFields=@('id','nonce','role','pid','creation','parent_pid','parent_creation',
+            'image_id','image_sha256','fixture_id','fixture_digest','terminate_job_object',
+            'process_waited','active_processes','exit_code','observed')
+        WitnessExactFields $cancelJob $cancelJobFields
+        if((WitnessField $cancelJob 'id') -cne 'lifetime/cancel_job_zero' -or
+            (WitnessField $cancelJob 'nonce') -cne $nonce -or
+            (WitnessField $cancelJob 'role') -cne 'cancel' -or
+            (WitnessField $cancelJob 'pid') -cne (WitnessField $cancelReady 'pid') -or
+            (WitnessField $cancelJob 'creation') -cne (WitnessField $cancelReady 'creation') -or
+            (WitnessField $cancelJob 'parent_pid') -cne $boundPid -or
+            (WitnessField $cancelJob 'parent_creation') -cne $boundCreation -or
+            (WitnessField $cancelJob 'image_id') -cne (WitnessField $cancelReady 'image_id') -or
+            (WitnessField $cancelJob 'image_id') -notmatch '^[0-9A-Fa-f]{16}:[0-9A-Fa-f]{32}$' -or
+            (WitnessField $cancelJob 'image_sha256') -cne (WitnessField $cancelReady 'image_sha256') -or
+            (WitnessField $cancelJob 'fixture_id') -cne (WitnessField $cancelReady 'fixture_id') -or
+            (WitnessField $cancelJob 'fixture_digest') -cne (WitnessField $cancelReady 'fixture_digest') -or
+            (WitnessField $cancelJob 'terminate_job_object') -cne 'true' -or
+            (WitnessField $cancelJob 'process_waited') -cne 'true' -or
+            (WitnessField $cancelJob 'active_processes') -cne '0' -or
+            (WitnessField $cancelJob 'exit_code') -cne '1' -or
+            (WitnessField $cancelJob 'observed') -cne 'true'){
+            throw 'Cancellation termination, process wait or zero-active Job proof failed'
+        }
+        $statusRecords=@($frames | Where-Object { $_ -match '^registry_witness_status(?: |$)' })
+        if($statusRecords.Count -ne 1){throw "Expected exactly one registry witness status record (found $($statusRecords.Count))"}
+        $statusRecord=$statusRecords[0]
+        if((WitnessField $statusRecord 'witness_status') -cne 'INCOMPLETE'){
+            throw 'Registry witness status was not explicitly INCOMPLETE'
+        }
+        $runStatus=WitnessField $statusRecord 'run_status'
+        if($runStatus -ceq 'completed_partial'){
+            WitnessExactFields $statusRecord @('witness_status','run_status')
+        } elseif($runStatus -ceq 'FAILED'){
+            WitnessExactFields $statusRecord @('witness_status','run_status','primary')
+            throw "Registry witness failed before the intentional partial checkpoint: $(WitnessField $statusRecord 'primary')"
+        } else {throw "Unknown registry witness run status: $runStatus"}
+        if($code -eq 0) {
             throw "Partial registry witness did not fail closed with explicit INCOMPLETE evidence (exit $code)"
         }
         $missing=@($expected | Where-Object { -not $actual.Contains($_) })
-        $openIds=@('lifetime/cancel_ready_mapped','lifetime/cancel_job_zero','lifetime/cleanup_absent')
+        $openIds=@('lifetime/cleanup_absent')
         $missingKey=@($missing|Sort-Object) -join '|'
         $openKey=@($openIds|Sort-Object) -join '|'
         if($missingKey -cne $openKey){
-            throw "Normal 37-control tranche incomplete; only the three cancellation/cleanup IDs may remain open (missing $($missing -join ', '))"
+            throw "Registry control set incomplete; only cleanup_absent may remain open (missing $($missing -join ', '))"
         }
         $parentIdentity.witness_status='INCOMPLETE_FAILED_partial_checkpoint'
         $parentIdentity.missing_probe_count=$missing.Count

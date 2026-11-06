@@ -949,6 +949,7 @@ impl<'a> OwnedProcess<'a> {
         image_sha256: &str,
         image_identity: (u64, [u8; 16]),
         fixture_digest: &str,
+        fixture_identity_sha256: &str,
         private_read_handles: [self::registry_witness_tests::OwnedRegKey; 2],
     ) -> io::Result<(Self, OwnedHandle)> {
         if !matches!(role, "normal" | "cancel")
@@ -958,6 +959,10 @@ impl<'a> OwnedProcess<'a> {
             || !original_user_sid
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || fixture_identity_sha256.len() != 64
+            || !fixture_identity_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
             || private_read_handles.iter().any(|key| key.raw().is_null())
         {
             return Err(invalid("invalid fixed registry witness launch context"));
@@ -975,6 +980,7 @@ impl<'a> OwnedProcess<'a> {
                 &self::registry_witness_tests::identity_text(image_identity),
             ),
             ("ORBIT_REGISTRY_WITNESS_FIXTURE_DIGEST", fixture_digest),
+            ("ORBIT_REGISTRY_WITNESS_FIXTURE_ID", fixture_identity_sha256),
             (
                 "ORBIT_REGISTRY_WITNESS_PARENT_PID",
                 &format!("{}", unsafe { GetCurrentProcessId() }),
@@ -2993,6 +2999,14 @@ mod registry_witness_tests {
         Ok(())
     }
 
+    fn private_view_label_digest(root: HKEY) -> io::Result<String> {
+        let metadata = win32_open_key(root, "Metadata", KEY_READ)
+            .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+        let value = win32_query_value(&metadata, "Fixture")
+            .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+        registry_string_digest(&value)
+    }
+
     fn private_view_label(root: HKEY) -> io::Result<bool> {
         let metadata = wide(OsStr::new("Metadata"))?;
         let mut key = null_mut();
@@ -4340,7 +4354,7 @@ mod registry_witness_tests {
         Ok(())
     }
 
-    fn child_admission(package_sid: &str) -> io::Result<()> {
+    fn child_admission(package_sid: &str, role: &str, nonce: &str) -> io::Result<()> {
         let mut token = null_mut();
         unsafe {
             ok(
@@ -4412,8 +4426,12 @@ mod registry_witness_tests {
         if error != ERROR_NO_TOKEN {
             return Err(io::Error::from_raw_os_error(error as i32));
         }
-        emit_witness_record("registry_witness_child_admission appcontainer=true lpac=true capability_count=1 network_capabilities=0 job=true thread_token=false")
-            .expect("bounded child admission record");
+        let pid = unsafe { GetCurrentProcessId() };
+        let creation = process_creation_text(unsafe { GetCurrentProcess() })?;
+        emit_witness_record(&format!(
+            "registry_witness_child_admission nonce={nonce} role={role} pid={pid} creation={creation} appcontainer=true lpac=true capability_count=1 network_capabilities=0 job=true thread_token=false"
+        ))
+        .expect("bounded child admission record");
         Ok(())
     }
 
@@ -4516,23 +4534,24 @@ mod registry_witness_tests {
         Ok(value)
     }
 
-    fn forward_child_records(
-        bytes: &[u8],
-        nonce: &str,
-        parent_pid: u32,
-        parent_creation: &str,
-    ) -> io::Result<()> {
+    fn framed_witness_payloads_with_pending(bytes: &[u8]) -> io::Result<(Vec<&str>, bool)> {
+        let mut records = Vec::new();
         let mut cursor = 0usize;
-        while let Some(relative) = bytes[cursor..]
-            .windows(WITNESS_FRAME_START.len())
-            .position(|part| part == WITNESS_FRAME_START)
-        {
+        loop {
+            let Some(relative) = bytes[cursor..]
+                .windows(WITNESS_FRAME_START.len())
+                .position(|part| part == WITNESS_FRAME_START)
+            else {
+                let tail = &bytes[cursor..];
+                let pending_marker = (1..WITNESS_FRAME_START.len())
+                    .any(|length| tail.ends_with(&WITNESS_FRAME_START[..length]));
+                return Ok((records, pending_marker));
+            };
             let start = cursor + relative + WITNESS_FRAME_START.len();
-            let colon = bytes[start..]
-                .iter()
-                .position(|byte| *byte == b':')
-                .map(|offset| start + offset)
-                .ok_or_else(|| invalid("truncated helper record length"))?;
+            let Some(colon_offset) = bytes[start..].iter().position(|byte| *byte == b':') else {
+                return Ok((records, true));
+            };
+            let colon = start + colon_offset;
             let length_text = std::str::from_utf8(&bytes[start..colon])
                 .map_err(|_| invalid("invalid helper record length"))?;
             if length_text.is_empty()
@@ -4551,11 +4570,232 @@ mod registry_witness_tests {
             let payload_end = payload_start
                 .checked_add(length)
                 .ok_or_else(|| invalid("helper record length overflow"))?;
-            if payload_end >= bytes.len() || bytes[payload_end] != WITNESS_FRAME_END {
-                return Err(invalid("truncated or malformed helper record"));
+            if payload_end >= bytes.len() {
+                return Ok((records, true));
+            }
+            if bytes[payload_end] != WITNESS_FRAME_END {
+                return Err(invalid("malformed helper record"));
             }
             let payload = std::str::from_utf8(&bytes[payload_start..payload_end])
                 .map_err(|_| invalid("helper record is not UTF-8"))?;
+            cursor = payload_end + 1;
+            records.push(payload);
+        }
+    }
+
+    fn framed_witness_payloads(bytes: &[u8], allow_partial: bool) -> io::Result<Vec<&str>> {
+        let (records, pending) = framed_witness_payloads_with_pending(bytes)?;
+        if pending && !allow_partial {
+            return Err(invalid("truncated reserved helper frame"));
+        }
+        Ok(records)
+    }
+
+    fn peek_pipe_bytes(file: &File, limit: usize) -> io::Result<Vec<u8>> {
+        let mut available = 0u32;
+        if unsafe {
+            PeekNamedPipe(
+                file.as_raw_handle(),
+                null_mut(),
+                0,
+                null_mut(),
+                &mut available,
+                null_mut(),
+            )
+        } == 0
+        {
+            let error = unsafe { GetLastError() };
+            return Err(operation_error(
+                "PeekNamedPipe(registry cancellation readiness)",
+                io::Error::from_raw_os_error(error as i32),
+            ));
+        }
+        if available as usize > limit {
+            return Err(invalid("cancellation readiness output exceeded its bound"));
+        }
+        let mut bytes = vec![0u8; available as usize];
+        if available != 0 {
+            let mut copied = 0u32;
+            if unsafe {
+                PeekNamedPipe(
+                    file.as_raw_handle(),
+                    bytes.as_mut_ptr().cast(),
+                    available,
+                    &mut copied,
+                    null_mut(),
+                    null_mut(),
+                )
+            } == 0
+            {
+                let error = unsafe { GetLastError() };
+                return Err(operation_error(
+                    "PeekNamedPipe(registry cancellation snapshot)",
+                    io::Error::from_raw_os_error(error as i32),
+                ));
+            }
+            if copied > available {
+                return Err(invalid("PeekNamedPipe returned an invalid byte count"));
+            }
+            bytes.truncate(copied as usize);
+        }
+        Ok(bytes)
+    }
+
+    fn cancel_readiness_complete(
+        records: &[&str],
+        expected_admission: &str,
+        expected_ready: &str,
+    ) -> io::Result<bool> {
+        match records {
+            [] => Ok(false),
+            [admission] if *admission == expected_admission => Ok(false),
+            [admission, ready] if *admission == expected_admission && *ready == expected_ready => {
+                Ok(true)
+            }
+            _ => Err(invalid(
+                "unexpected, duplicate, or replayed cancellation frames",
+            )),
+        }
+    }
+
+    fn cancellation_exit_matches_requested(code: u32, completion: Completion) -> bool {
+        code == 1 && completion == Completion::Exited
+    }
+
+    fn verify_cancel_readiness_frame_oracle() -> io::Result<()> {
+        if !cancellation_exit_matches_requested(1, Completion::Exited)
+            || cancellation_exit_matches_requested(101, Completion::Exited)
+            || cancellation_exit_matches_requested(1, Completion::TimedOut)
+        {
+            return Err(invalid(
+                "requested cancellation exit-code oracle accepted an unexpected result",
+            ));
+        }
+        let admission = "registry_witness_child_admission nonce=0123456789abcdef0123456789abcdef role=cancel pid=42 creation=0123456789abcdef appcontainer=true lpac=true capability_count=1 network_capabilities=0 job=true thread_token=false";
+        let ready = "registry_witness_probe id=lifetime/cancel_ready_mapped role=cancel";
+        let mut complete = WITNESS_FRAME_START.to_vec();
+        complete.extend_from_slice(admission.len().to_string().as_bytes());
+        complete.push(b':');
+        complete.extend_from_slice(admission.as_bytes());
+        complete.push(WITNESS_FRAME_END);
+        complete.extend_from_slice(WITNESS_FRAME_START);
+        complete.extend_from_slice(ready.len().to_string().as_bytes());
+        complete.push(b':');
+        complete.extend_from_slice(ready.as_bytes());
+        complete.push(WITNESS_FRAME_END);
+        let parsed = framed_witness_payloads(&complete, false)?;
+        if !cancel_readiness_complete(&parsed, admission, ready)? {
+            return Err(invalid(
+                "complete cancellation frame oracle was not accepted",
+            ));
+        }
+        let mut partial = complete.clone();
+        partial.pop();
+        let partial_records = framed_witness_payloads(&partial, true)?;
+        if partial_records.as_slice() != [admission]
+            || framed_witness_payloads(&partial, false).is_ok()
+        {
+            return Err(invalid(
+                "partial cancellation frame oracle was not rejected",
+            ));
+        }
+        let mut replay = complete.clone();
+        replay.extend_from_slice(WITNESS_FRAME_START);
+        replay.extend_from_slice(ready.len().to_string().as_bytes());
+        replay.push(b':');
+        replay.extend_from_slice(ready.as_bytes());
+        replay.push(WITNESS_FRAME_END);
+        let replayed = framed_witness_payloads(&replay, false)?;
+        if cancel_readiness_complete(&replayed, admission, ready).is_ok() {
+            return Err(invalid(
+                "replayed cancellation readiness oracle was accepted",
+            ));
+        }
+        let mut malformed = complete.clone();
+        let end = malformed.len() - 1;
+        malformed[end] = b'!';
+        if framed_witness_payloads(&malformed, false).is_ok() {
+            return Err(invalid("malformed cancellation frame oracle was accepted"));
+        }
+        for suffix in [
+            WITNESS_FRAME_START[..7].to_vec(),
+            [&WITNESS_FRAME_START[..], b"123"].concat(),
+            [&WITNESS_FRAME_START[..], b"3:ab"].concat(),
+            [&WITNESS_FRAME_START[..], b"3:abc"].concat(),
+        ] {
+            let mut tailed = complete.clone();
+            tailed.extend_from_slice(&suffix);
+            let (records, pending) = framed_witness_payloads_with_pending(&tailed)?;
+            if !pending
+                || (!pending && cancel_readiness_complete(&records, admission, ready)?)
+                || framed_witness_payloads(&tailed, false).is_ok()
+            {
+                return Err(invalid(
+                    "complete readiness followed by a reserved-frame tail was accepted",
+                ));
+            }
+            let (stderr_records, stderr_pending) = framed_witness_payloads_with_pending(&suffix)?;
+            if !stderr_records.is_empty() || !stderr_pending {
+                return Err(invalid("reserved-frame tail on stderr was not detected"));
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_cancel_readiness(
+        child: &OwnedProcess<'_>,
+        parent_pid: u32,
+        parent_creation: &str,
+        expected_admission: &str,
+        expected_ready: &str,
+    ) -> io::Result<()> {
+        loop {
+            if child.started.elapsed() >= child.timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cancellation readiness timed out",
+                ));
+            }
+            if process_completed(child.process.as_raw_handle())? {
+                return Err(invalid("cancellation helper exited before live readiness"));
+            }
+            let stdout = peek_pipe_bytes(&child.stdout, child.output_limit)?;
+            let stderr = peek_pipe_bytes(
+                &child.stderr,
+                child.output_limit.saturating_sub(stdout.len()),
+            )?;
+            if stdout.len() + stderr.len() > child.output_limit {
+                return Err(invalid(
+                    "cancellation helper exceeded its combined output limit",
+                ));
+            }
+            let (stderr_records, stderr_pending) = framed_witness_payloads_with_pending(&stderr)?;
+            if !stderr_records.is_empty() || stderr_pending {
+                return Err(invalid("cancellation helper framed evidence on stderr"));
+            }
+            let (records, pending) = framed_witness_payloads_with_pending(&stdout)?;
+            if !pending && cancel_readiness_complete(&records, expected_admission, expected_ready)?
+            {
+                validate_parent_self_binding(parent_pid, parent_creation)?;
+                if process_completed(child.process.as_raw_handle())? || child.active()? != 1 {
+                    return Err(invalid(
+                        "cancellation readiness was not received from one live Job member",
+                    ));
+                }
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn forward_child_records(
+        bytes: &[u8],
+        nonce: &str,
+        parent_pid: u32,
+        parent_creation: &str,
+        skip_probe_id: Option<&str>,
+    ) -> io::Result<()> {
+        for payload in framed_witness_payloads(bytes, false)? {
             if payload.starts_with("registry_witness_probe id=parent_authority/")
                 || payload.starts_with("registry_witness_probe id=parent_token/")
             {
@@ -4566,8 +4806,12 @@ mod registry_witness_tests {
                     return Err(invalid("helper parent-authority record binding mismatch"));
                 }
             }
+            if skip_probe_id
+                .is_some_and(|id| payload.starts_with(&format!("registry_witness_probe id={id} ")))
+            {
+                continue;
+            }
             emit_witness_record(payload)?;
-            cursor = payload_end + 1;
         }
         Ok(())
     }
@@ -4600,7 +4844,152 @@ mod registry_witness_tests {
         }
     }
 
+    fn run_cancel_witness_child(
+        session: &SandboxSession,
+        fixture: &PrivateRegistryFixture,
+        image: &HeldHelperImage,
+        nonce: &str,
+        user_sid: &str,
+        package_sid: &str,
+        parent_pid: u32,
+        parent_creation: &str,
+        fixture_digest: &str,
+        fixture_identity_sha256: &str,
+    ) -> io::Result<()> {
+        let machine_root = fixture.root_handle("MachineView", KEY_READ)?;
+        let user_root = fixture.root_handle("UserView", KEY_READ)?;
+        let machine_descriptor = digest(&registry_key_security(machine_root.raw())?)?;
+        let user_descriptor = digest(&registry_key_security(user_root.raw())?)?;
+        let machine_label = private_view_label_digest(machine_root.raw())?;
+        let user_label = private_view_label_digest(user_root.raw())?;
+        let inherited_machine = duplicate_inheritable_read_key(machine_root.raw())?;
+        let inherited_user = duplicate_inheritable_read_key(user_root.raw())?;
+        machine_root.close()?;
+        user_root.close()?;
+
+        let image_id = image.identity;
+        let spec = SpawnSpec {
+            executable: image.path.clone(),
+            arguments: vec![
+                "--exact".to_owned(),
+                "process::windows::registry_witness_tests::registry_witness_fixed_child_helper"
+                    .to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            timeout: Duration::from_secs(30),
+            output_limit: 128 * 1024,
+        };
+        let (mut child, thread) = OwnedProcess::create_registry_witness_child(
+            session,
+            &spec,
+            "cancel",
+            nonce,
+            user_sid,
+            package_sid,
+            &image.sha256,
+            image_id,
+            fixture_digest,
+            fixture_identity_sha256,
+            [inherited_machine, inherited_user],
+        )?;
+        if !child.evidence.app_container
+            || !child.evidence.less_privileged
+            || !child.evidence.job_assigned_before_resume
+            || child.evidence.total_capabilities != 1
+            || child.evidence.network_capabilities != 0
+            || child.pid() == 0
+        {
+            let primary = invalid("cancellation helper pre-resume LPAC or Job evidence failed");
+            let error = stop_child_after_failure(&mut child, primary);
+            drop(thread);
+            return Err(error);
+        }
+        if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+            let error = operation_error(
+                "ResumeThread(registry cancellation)",
+                io::Error::last_os_error(),
+            );
+            let error = stop_child_after_failure(&mut child, error);
+            drop(thread);
+            return Err(error);
+        }
+        drop(thread);
+
+        let child_pid = child.pid();
+        let child_creation = match process_creation_text(child.process.as_raw_handle()) {
+            Ok(value) => value,
+            Err(error) => return Err(stop_child_after_failure(&mut child, error)),
+        };
+        let expected_admission = format!(
+            "registry_witness_child_admission nonce={nonce} role=cancel pid={child_pid} creation={child_creation} appcontainer=true lpac=true capability_count=1 network_capabilities=0 job=true thread_token=false"
+        );
+        let expected_child_ready = format!(
+            "registry_witness_probe id=lifetime/cancel_ready_mapped nonce={nonce} role=cancel pid={child_pid} creation={child_creation} parent_pid={parent_pid} parent_creation={parent_creation} image_id={} image_sha256={} fixture_id={fixture_identity_sha256} fixture_digest={fixture_digest} machine_descriptor_sha256={machine_descriptor} user_descriptor_sha256={user_descriptor} inherited_machine_label_sha256={machine_label} inherited_user_label_sha256={user_label} mapped_machine_label_sha256={machine_label} mapped_user_label_sha256={user_label} appcontainer=true lpac=true capability_count=1 network_capabilities=0 thread_token=false job=true inherited_reads=2 mapped_machine=true mapped_user=true maps_live=2",
+            identity_text(image_id),
+            image.sha256
+        );
+        if let Err(error) = wait_for_cancel_readiness(
+            &child,
+            parent_pid,
+            parent_creation,
+            &expected_admission,
+            &expected_child_ready,
+        ) {
+            return Err(stop_child_after_failure(&mut child, error));
+        }
+        if let Err(error) = validate_parent_self_binding(parent_pid, parent_creation) {
+            return Err(stop_child_after_failure(&mut child, error));
+        }
+        let ready_attestation = format!(
+            "{expected_child_ready} parent_received_while_alive=true job_active_processes=1"
+        );
+        if let Err(error) = emit_witness_record(&ready_attestation) {
+            return Err(stop_child_after_failure(&mut child, error));
+        }
+
+        child.stop()?;
+        let active_processes = child.active()?;
+        if active_processes != 0 {
+            return Err(invalid(
+                "cancellation Job did not reach zero active processes",
+            ));
+        }
+        let output = child.wait(&AtomicBool::new(false))?;
+        if !cancellation_exit_matches_requested(output.code, output.completion) {
+            return Err(invalid(
+                "cancellation child did not exit with the requested Job termination code",
+            ));
+        }
+        let stdout_frames = framed_witness_payloads(&output.stdout, false)?;
+        if stdout_frames.len() != 2
+            || stdout_frames[0] != expected_admission
+            || stdout_frames[1] != expected_child_ready
+            || !framed_witness_payloads(&output.stderr, false)?.is_empty()
+        {
+            return Err(invalid(
+                "cancellation child final transcript differed from live readiness",
+            ));
+        }
+        validate_parent_self_binding(parent_pid, parent_creation)?;
+        forward_child_records(
+            &output.stdout,
+            nonce,
+            parent_pid,
+            parent_creation,
+            Some("lifetime/cancel_ready_mapped"),
+        )?;
+        forward_child_records(&output.stderr, nonce, parent_pid, parent_creation, None)?;
+        emit_witness_record(&format!(
+            "registry_witness_probe id=lifetime/cancel_job_zero nonce={nonce} role=cancel pid={child_pid} creation={child_creation} parent_pid={parent_pid} parent_creation={parent_creation} image_id={} image_sha256={} fixture_id={fixture_identity_sha256} fixture_digest={fixture_digest} terminate_job_object=true process_waited=true active_processes={active_processes} exit_code={} observed=true",
+            identity_text(image_id),
+            image.sha256,
+            output.code
+        ))?;
+        Ok(())
+    }
+
     fn registry_witness_stage_a_run() -> io::Result<()> {
+        verify_cancel_readiness_frame_oracle()?;
         verify_partial_key_value_header_oracle()?;
         let nonce = std::env::var("ORBIT_REGISTRY_WITNESS_NONCE")
             .map_err(|_| invalid("disposable CI fixture nonce missing"))?;
@@ -4639,6 +5028,7 @@ mod registry_witness_tests {
             )?);
             let fixture_ref = fixture.as_ref().expect("fixture initialized");
             let image_ref = image.as_ref().expect("held image initialized");
+            let fixture_identity = digest(fixture_ref.name.as_bytes())?;
             let machine_root = fixture_ref.root_handle("MachineView", KEY_READ)?;
             let user_root = fixture_ref.root_handle("UserView", KEY_READ)?;
             let inherited_machine = duplicate_inheritable_read_key(machine_root.raw())?;
@@ -4669,6 +5059,7 @@ mod registry_witness_tests {
                 &image_ref.sha256,
                 image_id,
                 &marker_digest,
+                &fixture_identity,
                 inherited_handles,
             )?;
             if !child.evidence.app_container
@@ -4691,17 +5082,25 @@ mod registry_witness_tests {
                 return Err(error);
             }
             drop(thread);
+            let normal_child_pid = child.pid();
+            let normal_child_creation = match process_creation_text(child.process.as_raw_handle()) {
+                Ok(value) => value,
+                Err(error) => return Err(stop_child_after_failure(&mut child, error)),
+            };
             let output = child.wait(&AtomicBool::new(false))?;
             validate_parent_self_binding(parent_pid, &parent_creation)?;
             emit_witness_record(&format!(
                 "registry_witness_parent_binding nonce={nonce} pid={parent_pid} creation={parent_creation} live=true"
             ))?;
             emit_witness_record(&format!(
-                "registry_witness_child_result role=normal completion={:?} exit={} image_id={} image_sha256={} fixture_digest={}",
+                "registry_witness_child_result role=normal completion={:?} exit={} pid={} creation={} image_id={} image_sha256={} fixture_id={} fixture_digest={}",
                 output.completion,
                 output.code,
+                normal_child_pid,
+                normal_child_creation,
                 identity_text(image_id),
                 image_ref.sha256,
+                fixture_identity,
                 marker_digest
             ))?;
             emit_witness_record(&format!(
@@ -4714,8 +5113,8 @@ mod registry_witness_tests {
                 output.stderr.len() > 1024,
                 escape_diagnostic(&output.stderr)
             ))?;
-            forward_child_records(&output.stdout, &nonce, parent_pid, &parent_creation)?;
-            forward_child_records(&output.stderr, &nonce, parent_pid, &parent_creation)?;
+            forward_child_records(&output.stdout, &nonce, parent_pid, &parent_creation, None)?;
+            forward_child_records(&output.stderr, &nonce, parent_pid, &parent_creation, None)?;
             if output.code != 0 || output.completion != Completion::Exited {
                 return Err(io::Error::other(format!(
                     "normal helper failed: exit={} completion={:?}",
@@ -4727,6 +5126,18 @@ mod registry_witness_tests {
             )?;
             parent_recovery(fixture_ref)?;
             fixture_ref.verify_unchanged()?;
+            run_cancel_witness_child(
+                session_ref,
+                fixture_ref,
+                image_ref,
+                &nonce,
+                &user_sid,
+                &package_sid,
+                parent_pid,
+                &parent_creation,
+                &marker_digest,
+                &fixture_identity,
+            )?;
             Ok(())
         })();
 
@@ -4824,19 +5235,67 @@ mod registry_witness_tests {
             return Err(io::Error::other(cleanup_errors.join("; ")));
         }
         emit_witness_record(
-            "registry_witness_probe id=lifetime/cleanup_absent observed=true private_fixture=true held_image=true profile_closed=true host_marker_prepost_equal=true",
-        )?;
-        emit_witness_record(
-            "registry_witness_incomplete unimplemented_controls=cancellation,cleanup witness_status=INCOMPLETE",
+            "registry_witness_incomplete unimplemented_controls=cleanup witness_status=INCOMPLETE",
         )?;
         Err(invalid(
-            "registry witness remains incomplete: cancellation and cleanup controls are not complete",
+            "registry witness remains incomplete: cleanup control is not complete",
         ))
     }
 
     #[test]
     fn registry_witness_stage_a() -> io::Result<()> {
         registry_witness_stage_a_run()
+    }
+
+    fn cancellation_child_readiness(
+        nonce: &str,
+        parent_pid: u32,
+        parent_creation: &str,
+        image_id: &str,
+        image_hash: &str,
+        fixture_digest: &str,
+        fixture_id: &str,
+        machine: &OwnedRegKey,
+        user: &OwnedRegKey,
+    ) -> io::Result<()> {
+        let machine_descriptor = digest(&registry_key_security(machine.raw())?)?;
+        let user_descriptor = digest(&registry_key_security(user.raw())?)?;
+        let inherited_machine_label = private_view_label_digest(machine.raw())?;
+        let inherited_user_label = private_view_label_digest(user.raw())?;
+        if !private_view_label(machine.raw())? || !private_view_label(user.raw())? {
+            return Err(invalid(
+                "cancellation helper did not read both inherited labels",
+            ));
+        }
+        let map_machine = unsafe { RegOverridePredefKey(HKEY_LOCAL_MACHINE, machine.raw()) };
+        let map_user = unsafe { RegOverridePredefKey(HKEY_CURRENT_USER, user.raw()) };
+        if map_machine != ERROR_SUCCESS || map_user != ERROR_SUCCESS {
+            let _ = reset_predefined_roots();
+            return Err(io::Error::other(format!(
+                "cancellation private mapping failed: machine={map_machine} user={map_user}"
+            )));
+        }
+        let mapped_machine = private_view_label(HKEY_LOCAL_MACHINE)?;
+        let mapped_user = private_view_label(HKEY_CURRENT_USER)?;
+        let mapped_machine_label = private_view_label_digest(HKEY_LOCAL_MACHINE)?;
+        let mapped_user_label = private_view_label_digest(HKEY_CURRENT_USER)?;
+        if !mapped_machine
+            || !mapped_user
+            || mapped_machine_label != inherited_machine_label
+            || mapped_user_label != inherited_user_label
+        {
+            return Err(invalid(
+                "cancellation mapped labels did not match inherited views",
+            ));
+        }
+        let child_pid = unsafe { GetCurrentProcessId() };
+        let child_creation = process_creation_text(unsafe { GetCurrentProcess() })?;
+        emit_witness_record(&format!(
+            "registry_witness_probe id=lifetime/cancel_ready_mapped nonce={nonce} role=cancel pid={child_pid} creation={child_creation} parent_pid={parent_pid} parent_creation={parent_creation} image_id={image_id} image_sha256={image_hash} fixture_id={fixture_id} fixture_digest={fixture_digest} machine_descriptor_sha256={machine_descriptor} user_descriptor_sha256={user_descriptor} inherited_machine_label_sha256={inherited_machine_label} inherited_user_label_sha256={inherited_user_label} mapped_machine_label_sha256={mapped_machine_label} mapped_user_label_sha256={mapped_user_label} appcontainer=true lpac=true capability_count=1 network_capabilities=0 thread_token=false job=true inherited_reads=2 mapped_machine=true mapped_user=true maps_live=2"
+        ))?;
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[test]
@@ -4858,7 +5317,8 @@ mod registry_witness_tests {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         );
-        child_admission(&package_sid).expect("actual helper token and Job admission failed");
+        child_admission(&package_sid, &role, &nonce)
+            .expect("actual helper token and Job admission failed");
         let (image_id, image_hash) =
             current_image_observation().expect("held helper image observation failed");
         assert_eq!(
@@ -4887,6 +5347,10 @@ mod registry_witness_tests {
             fixture_digest,
             digest(b"ORBIT-PRIVATE-METADATA-V1").expect("fixture digest")
         );
+        let fixture_id = std::env::var("ORBIT_REGISTRY_WITNESS_FIXTURE_ID")
+            .expect("private fixture identity binding missing");
+        assert_eq!(fixture_id.len(), 64);
+        assert!(fixture_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
         let machine = std::env::var("ORBIT_REGISTRY_WITNESS_MACHINE_HANDLE")
             .expect("machine read handle missing")
             .parse::<usize>()
@@ -4901,6 +5365,20 @@ mod registry_witness_tests {
         let machine = unsafe { OwnedRegKey::from_raw(machine) }.expect("invalid machine key");
         // SAFETY: same transfer contract as the machine handle above.
         let user = unsafe { OwnedRegKey::from_raw(user) }.expect("invalid user key");
+        if role == "cancel" {
+            return cancellation_child_readiness(
+                &nonce,
+                parent_pid,
+                &parent_creation,
+                &image_id,
+                &image_hash,
+                &fixture_digest,
+                &fixture_id,
+                &machine,
+                &user,
+            )
+            .expect("cancellation child readiness failed");
+        }
         let machine_path = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
         let user_path = format!("{user_sid}\\Environment");
         let machine_nt =
@@ -4979,21 +5457,6 @@ mod registry_witness_tests {
                 .expect("separate parent-process authority probes failed");
             parent_token_probes(parent_pid, &parent_creation, &nonce)
                 .expect("query-limited parent token gate failed");
-        }
-
-        if role == "cancel" {
-            let child_pid = unsafe { GetCurrentProcessId() };
-            let child_creation = process_creation_text(unsafe { GetCurrentProcess() })
-                .expect("helper process creation-time observation failed");
-            emit_witness_record(&format!(
-                "registry_witness_probe id=lifetime/cancel_ready_mapped nonce={nonce} role=cancel pid={child_pid} creation={child_creation} parent_pid={parent_pid} parent_creation={parent_creation} image_id={image_id} image_sha256={image_hash} fixture_digest={fixture_digest} token_appcontainer=true token_lpac=true capability_count=1 network_capabilities=0 job=true inherited_reads=2 mapped_machine=true mapped_user=true maps_live=2"
-            )).expect("bounded cancellation readiness record");
-            std::io::stdout()
-                .flush()
-                .expect("flush cancellation readiness");
-            loop {
-                std::thread::sleep(Duration::from_millis(100));
-            }
         }
 
         reset_predefined_roots().expect("reset private registry maps");
