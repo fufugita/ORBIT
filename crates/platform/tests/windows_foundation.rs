@@ -361,6 +361,14 @@ mod windows {
     }
 
     fn fixture_has_ace(path: &Path, sid_text: &str, mask: u32, flags: u8, ace_type: u8) -> bool {
+        let mapping = GENERIC_MAPPING {
+            GenericRead: FILE_GENERIC_READ,
+            GenericWrite: FILE_GENERIC_WRITE,
+            GenericExecute: FILE_GENERIC_EXECUTE,
+            GenericAll: FILE_ALL_ACCESS,
+        };
+        let mut expected_mask = mask;
+        unsafe { MapGenericMask(&mut expected_mask, &mapping) };
         let handle = fixture_handle(path, READ_CONTROL, true);
         let mut dacl = null_mut();
         let mut descriptor = null_mut();
@@ -392,7 +400,8 @@ mod windows {
             },
             0
         );
-        (0..info.AceCount).any(|index| {
+        let mut observed_masks = Vec::new();
+        let matched = (0..info.AceCount).any(|index| {
             let mut ace = null_mut();
             assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
             let header = unsafe { &*ace.cast::<ACE_HEADER>() };
@@ -405,8 +414,23 @@ mod windows {
                     .add(offset_of!(ACCESS_ALLOWED_ACE, SidStart))
                     .cast()
             };
-            actual_mask == mask && unsafe { EqualSid(sid_ptr, sid.0.cast()) } != 0
-        })
+            if unsafe { EqualSid(sid_ptr, sid.0.cast()) } == 0 {
+                return false;
+            }
+            observed_masks.push(actual_mask);
+            actual_mask == expected_mask
+        });
+        if !matched {
+            let observed = observed_masks
+                .iter()
+                .map(|value| format!("{value:#010x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "fixture ACE mismatch: type={ace_type:#04x}, flags={flags:#04x}, supplied_mask={mask:#010x}, expected_file_mask={expected_mask:#010x}, observed_matching_masks=[{observed}]"
+            );
+        }
+        matched
     }
 
     fn fixture_container_sddl(owner: &str, grants: &str) -> String {
