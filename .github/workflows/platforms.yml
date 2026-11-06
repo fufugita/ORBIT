@@ -124,6 +124,7 @@ jobs:
             'fs::windows::tests::inspection_rechecks_acl_after_snapshot',
             'fs::windows::tests::inspection_revalidates_full_identity_after_replacement',
             'windows::inspection_empty_root_is_no_effect',
+            'windows::source_directory_reads_public_unicode_file_without_private_authority',
             'windows::inspection_observes_existing_shared_lock_and_nested_files',
             'windows::inspection_rejects_permissive_and_wrong_owner_entries_without_repair',
             'windows::inspection_rejects_reparse_and_hardlink_entries',
@@ -142,8 +143,8 @@ jobs:
             'windows::ntfs_short_alias_cannot_bypass_reserved_lock_policy',
             'windows::simultaneous_publication_preserves_the_only_successful_name'
           )
-          if ($required.Count -ne 43 -or @($required | Select-Object -Unique).Count -ne 43) {
-            throw "Foundation's exact required-name manifest must contain 43 unique cases; found $($required.Count)"
+          if ($required.Count -ne 44 -or @($required | Select-Object -Unique).Count -ne 44) {
+            throw "Foundation's exact required-name manifest must contain 44 unique cases; found $($required.Count)"
           }
           foreach ($case in $required) {
             $pattern = '(?m)^test ' + [regex]::Escape($case) + ' \.\.\. ok\r?$'

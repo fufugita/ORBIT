@@ -29,6 +29,7 @@ fn lock_namespace_is_reserved_consistently() {
 mod windows {
     use orbit_platform::fs::{
         Directory, EnumerationLimits, InspectionLimits, LockMode, PrivateFileAccess, RemovalState,
+        SourceDirectory,
     };
     use std::ffi::{OsStr, c_void};
     use std::fs;
@@ -170,6 +171,9 @@ mod windows {
         first_ace_mask: Option<u32>,
         has_current_owner_full_control_ace: bool,
         has_everyone_full_control_ace: bool,
+        has_everyone_read_ace: bool,
+        everyone_mask: Option<u32>,
+        everyone_ace_flags: Option<u8>,
     }
 
     struct FixtureAclSnapshot {
@@ -290,6 +294,63 @@ mod windows {
         );
     }
 
+    fn set_public_source_acl(path: &Path, sid: &str, directory: bool) {
+        let inheritance = if directory { "OICI" } else { "" };
+        let sddl = wide(OsStr::new(&format!(
+            "D:P(A;{inheritance};0x001F01FF;;;{sid})(A;{inheritance};0x00120089;;;S-1-1-0)"
+        )));
+        let mut descriptor = null_mut();
+        let mut descriptor_length = 0;
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    &mut descriptor_length,
+                )
+            },
+            0,
+            "building public-source fixture ACL failed: {}",
+            unsafe { GetLastError() }
+        );
+        let descriptor = LocalSecurityAllocation(descriptor.cast());
+        let mut present = 0;
+        let mut dacl = null_mut();
+        let mut defaulted = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor.0.cast(),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            },
+            0,
+            "reading public-source fixture ACL failed: {}",
+            unsafe { GetLastError() }
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+        let handle = fixture_handle(path, READ_CONTROL | WRITE_DAC, directory);
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            )
+        };
+        assert_eq!(
+            result, ERROR_SUCCESS,
+            "installing public-source fixture ACL failed: {result}"
+        );
+    }
+
     fn fixture_acl_snapshot(
         path: &Path,
         current_sid_text: &str,
@@ -358,6 +419,9 @@ mod windows {
         let mut first_ace_mask = None;
         let mut has_current_owner_full_control_ace = false;
         let mut has_everyone_full_control_ace = false;
+        let mut has_everyone_read_ace = false;
+        let mut everyone_mask = None;
+        let mut everyone_ace_flags = None;
         if !dacl.is_null() {
             for index in 0..u32::from(ace_count) {
                 let mut ace = null_mut();
@@ -395,11 +459,14 @@ mod windows {
                 let effective = header.AceFlags & INHERIT_ONLY_ACE as u8 == 0;
                 has_current_owner_full_control_ace |=
                     effective && sid_matches_current && allowed.Mask == FILE_ALL_ACCESS;
-                has_everyone_full_control_ace |= unsafe {
-                    effective
-                        && EqualSid(ace_sid, everyone_sid.0.cast()) != 0
-                        && allowed.Mask == FILE_ALL_ACCESS
-                };
+                let sid_matches_everyone = unsafe { EqualSid(ace_sid, everyone_sid.0.cast()) != 0 };
+                if sid_matches_everyone {
+                    everyone_mask = Some(allowed.Mask);
+                    everyone_ace_flags = Some(header.AceFlags);
+                    has_everyone_read_ace |= effective && allowed.Mask & 0x0012_0089 == 0x0012_0089;
+                }
+                has_everyone_full_control_ace |=
+                    effective && sid_matches_everyone && allowed.Mask == FILE_ALL_ACCESS;
             }
         }
 
@@ -442,6 +509,9 @@ mod windows {
                 first_ace_mask,
                 has_current_owner_full_control_ace,
                 has_everyone_full_control_ace,
+                has_everyone_read_ace,
+                everyone_mask,
+                everyone_ace_flags,
             },
             normalized_descriptor,
         }
@@ -506,6 +576,94 @@ mod windows {
         assert_eq!(file.identity(), identity);
         assert!(file.read_limited(3).is_err());
         assert_eq!(file.read_limited(1024).unwrap(), b"private state");
+    }
+
+    #[test]
+    fn source_directory_reads_public_unicode_file_without_private_authority() {
+        let home = Home::new();
+        let private_name = OsStr::new("private source.txt");
+        let private_contents = b"held private baseline";
+        fs::write(home.path().join(private_name), private_contents).unwrap();
+
+        let private_source = SourceDirectory::open(&home.path()).unwrap();
+        let mut private_file = private_source.open_file(private_name).unwrap();
+        let private_identity = private_file.identity();
+        let private_before = private_file.snapshot().unwrap();
+        assert_eq!(private_before.identity, private_identity);
+        assert_eq!(
+            private_file.read_limited(128).unwrap(),
+            private_contents,
+            "the real SourceFile tracer must read through its held file on a private fixture"
+        );
+        assert_eq!(private_file.snapshot().unwrap(), private_before);
+
+        let public_root = home.base.join("public source 雪 tree");
+        fs::create_dir(&public_root).unwrap();
+        let public_name = OsStr::new("source entry 雪.txt");
+        let public_path = public_root.join(public_name);
+        let public_contents = b"public plugin source bytes";
+        fs::write(&public_path, public_contents).unwrap();
+
+        let sid = current_sid();
+        set_public_source_acl(&public_root, &sid, true);
+        set_public_source_acl(&public_path, &sid, false);
+
+        let root_facts = fixture_acl_snapshot(&public_root, &sid, true).facts;
+        assert!(
+            root_facts.owner_matches_current,
+            "source root owner: {root_facts:?}"
+        );
+        assert!(root_facts.dacl_present && root_facts.dacl_protected);
+        assert_eq!(root_facts.ace_count, 2, "source root ACEs: {root_facts:?}");
+        assert!(root_facts.has_current_owner_full_control_ace);
+        assert!(root_facts.has_everyone_read_ace);
+        assert_eq!(root_facts.everyone_mask, Some(0x0012_0089));
+        assert_eq!(
+            root_facts.everyone_ace_flags,
+            Some((OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8),
+            "source directory Everyone ACE flags: {root_facts:?}"
+        );
+        assert!(!root_facts.has_everyone_full_control_ace);
+
+        let file_facts = fixture_acl_snapshot(&public_path, &sid, false).facts;
+        assert!(
+            file_facts.owner_matches_current,
+            "source file owner: {file_facts:?}"
+        );
+        assert!(file_facts.dacl_present && file_facts.dacl_protected);
+        assert_eq!(file_facts.ace_count, 2, "source file ACEs: {file_facts:?}");
+        assert!(file_facts.has_current_owner_full_control_ace);
+        assert!(file_facts.has_everyone_read_ace);
+        assert_eq!(file_facts.everyone_mask, Some(0x0012_0089));
+        assert_eq!(
+            file_facts.everyone_ace_flags,
+            Some(0),
+            "source file Everyone ACE flags: {file_facts:?}"
+        );
+        assert!(!file_facts.has_everyone_full_control_ace);
+
+        let private_policy_error = match Directory::open(&public_root) {
+            Ok(_) => panic!("private Directory accepted the public-readable source tree"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            private_policy_error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "private Directory must preserve its owner-private DACL requirement"
+        );
+
+        let public_source = SourceDirectory::open(&public_root)
+            .expect("public source should open through the separate SourceDirectory policy");
+        let mut public_file = public_source.open_file(public_name).unwrap();
+        let identity = public_file.identity();
+        let before = public_file.snapshot().unwrap();
+        assert_eq!(before.identity, identity);
+        assert_eq!(
+            public_file.read_limited(128).unwrap(),
+            public_contents,
+            "held SourceFile bytes must match the public fixture"
+        );
+        assert_eq!(public_file.snapshot().unwrap(), before);
     }
 
     #[test]

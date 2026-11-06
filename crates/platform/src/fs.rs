@@ -82,5 +82,5 @@ pub use windows::{
     Directory, DirectoryEntry, Durability, EnumerationLimits, FileIdentity, FileSnapshot,
     InspectionLimits, LockMode, MutationFile, PrivateFile, PrivateFileAccess, PrivateTreeEntry,
     PrivateTreeInspection, Publication, PublicationState, PublishError, Removal, RemovalError,
-    RemovalState, StateLock, UpdateFile,
+    RemovalState, SourceDirectory, SourceFile, SourceSnapshot, StateLock, UpdateFile,
 };

@@ -1359,6 +1359,60 @@ impl PrivateFile {
     }
 }
 
+/// Snapshot facts retained by a held source file.
+pub type SourceSnapshot = FileSnapshot;
+
+/// A separately named, held source-directory capability.
+///
+/// This first tracer delegates to the strict private-directory opener while the
+/// source-policy boundary is being established. It never converts a held path
+/// back into I/O authority.
+pub struct SourceDirectory {
+    directory: Directory,
+}
+
+impl SourceDirectory {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        Directory::open(path).map(|directory| Self { directory })
+    }
+
+    pub fn identity(&self) -> FileIdentity {
+        self.directory.identity()
+    }
+
+    pub fn open_file(&self, name: &OsStr) -> io::Result<SourceFile> {
+        self.directory
+            .open_file(name)
+            .map(|file| SourceFile { file })
+    }
+}
+
+/// A regular source file held through its directory capability.
+pub struct SourceFile {
+    file: PrivateFile,
+}
+
+impl SourceFile {
+    pub fn identity(&self) -> FileIdentity {
+        self.file.identity()
+    }
+
+    pub fn snapshot(&self) -> io::Result<SourceSnapshot> {
+        self.file.snapshot()
+    }
+
+    /// Read from the held file and reject metadata changes across the read.
+    pub fn read_limited(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
+        let before = self.file.snapshot()?;
+        let bytes = self.file.read_limited(maximum)?;
+        let after = self.file.snapshot()?;
+        if before != after {
+            return Err(invalid("source file changed during checked read"));
+        }
+        Ok(bytes)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LockMode {
     Shared,
