@@ -583,10 +583,12 @@ public static class OrbitRegistryWitnessFixture {
             $id="mutation/duplicate_mutation/$view";$record=$probeRecords[$id]
             $branch=WitnessField $record 'branch';$status=WitnessHex (WitnessField $record 'status')
             if((WitnessField $record 'domain') -cne 'win32'){throw "Mutation duplicate domain invalid: $id"}
+            # KEY_WRITE (0x20006, including KEY_CREATE_SUB_KEY) | DELETE | WRITE_DAC | WRITE_OWNER.
+            $expectedDuplicateDesired=[uint32]0xf0006
             if($branch -ceq 'duplicate_denied'){
                 if($status -ne 5 -or (WitnessHex (WitnessField $record 'expected')) -ne 5 -or
                     (WitnessField $record 'observed') -cne 'true' -or
-                    (WitnessHex (WitnessField $record 'desired')) -ne 0xf000a -or
+                    (WitnessHex (WitnessField $record 'desired')) -ne $expectedDuplicateDesired -or
                     (WitnessField $record 'actual') -cne 'unknown' -or
                     (WitnessField $record 'data_and_descriptor_unchanged') -cne 'true' -or
                     (WitnessField $record 'mutation_subkey_absent') -cne 'true') {throw "Mutation duplicate denial invalid: $id"}
@@ -596,7 +598,7 @@ public static class OrbitRegistryWitnessFixture {
                 $granted=WitnessHex (WitnessField $record 'actual')
                 if($status -ne 0 -or (WitnessHex (WitnessField $record 'expected')) -ne 0 -or
                     (WitnessField $record 'observed') -cne 'true' -or
-                    (WitnessHex (WitnessField $record 'desired')) -ne 0xf000a -or
+                    (WitnessHex (WitnessField $record 'desired')) -ne $expectedDuplicateDesired -or
                     (WitnessHex (WitnessField $record 'query_ntstatus')) -ne 0 -or
                     [int](WitnessField $record 'returned_length') -ne 56 -or
                     ($granted -band ([uint32]::MaxValue -bxor [uint32]0x20019)) -ne 0 -or
