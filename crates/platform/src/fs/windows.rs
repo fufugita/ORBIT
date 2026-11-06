@@ -5749,6 +5749,965 @@ mod tests {
         }
     }
 
+    const PROBE_DC_DELETE_ACCESS: u32 = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    const PROBE_DC_NO_CHILD_DELETE: u32 = FILE_ALL_ACCESS & !FILE_DELETE_CHILD;
+
+    // Evidence only: all native owners remain in ProbeLedger. These bounded
+    // records never authorize recovery after an uncertain outcome.
+    #[derive(Clone, Debug)]
+    struct ProbeDcEntry {
+        parent: FileIdentity,
+        name: OsString,
+        attempted_name: Option<OsString>,
+        identity: Option<FileIdentity>,
+        mask: u32,
+        bytes: Vec<u8>,
+        creation_acl: Option<ProbeAclEvidence>,
+        acl: Option<ProbeAclEvidence>,
+        negative_keeper: Option<ProbeHandle>,
+        removed: bool,
+    }
+    #[derive(Debug)]
+    struct ProbeDcNegative {
+        name: OsString,
+        identity: Option<FileIdentity>,
+        handle: Option<ProbeHandle>,
+        acl: Option<ProbeAclEvidence>,
+        removed: bool,
+    }
+    #[derive(Debug, Default)]
+    struct ProbeDcEvidence {
+        entries: Vec<ProbeDcEntry>,
+        positive_parents: Vec<(FileIdentity, ProbeHandle)>,
+        negative: Option<ProbeDcNegative>,
+        seal_calls: usize,
+        root_rename_calls: usize,
+        file_rename_calls: usize,
+        disposition_calls: usize,
+        native_denials: usize,
+        identity_refusals: usize,
+        parent_refusals: usize,
+    }
+
+    fn probe_dc_security(security: &Security, mask: u32) -> io::Result<Security> {
+        if ![
+            FILE_GENERIC_READ,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            PROBE_DC_NO_CHILD_DELETE,
+        ]
+        .contains(&mask)
+        {
+            return Err(invalid("unsupported delete-child probe policy"));
+        }
+        let mut text = null_mut();
+        unsafe {
+            ok(ConvertSidToStringSidW(
+                security.sid.as_ptr().cast_mut().cast(),
+                &mut text,
+            ))?;
+        }
+        let allocation = LocalAllocation(text.cast());
+        let mut length = 0;
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        let owner = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+            .map_err(|_| invalid("delete-child probe owner encoding"))?;
+        drop(allocation);
+        let sddl = wide(OsStr::new(&format!(
+            "O:{owner}D:P(A;;0x{mask:08x};;;{owner})"
+        )));
+        let mut raw = null_mut();
+        let mut returned = 0;
+        unsafe {
+            ok(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut raw,
+                &mut returned,
+            ))?;
+        }
+        let allocation = LocalAllocation(raw);
+        let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+        if length == 0 || returned as usize != length {
+            return Err(invalid("delete-child descriptor size mismatch"));
+        }
+        let mut descriptor = vec![0usize; length.div_ceil(size_of::<usize>())];
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw.cast::<u8>(), descriptor.as_mut_ptr().cast(), length);
+        }
+        drop(allocation);
+        Ok(Security {
+            sid: security.sid.clone(),
+            descriptor,
+        })
+    }
+
+    fn probe_dc_policy(
+        handle: HANDLE,
+        security: &Security,
+        mask: u32,
+    ) -> io::Result<ProbeAclEvidence> {
+        let acl = probe_acl_evidence(handle, security)?;
+        if !acl.protected
+            || acl.ace_flags != 0
+            || acl.ace_mask != mask
+            || acl.ace_sid != acl.owner_sid
+        {
+            return Err(denied(
+                "delete-child probe policy differs from exact protected owner-only mask",
+            ));
+        }
+        Ok(acl)
+    }
+
+    fn probe_dc_verify(
+        fixture: &mut ProbeFixture,
+        parent: HANDLE,
+        entry: &ProbeDcEntry,
+    ) -> io::Result<()> {
+        if identity(parent)? != entry.parent {
+            return Err(denied("delete-child observation parent changed"));
+        }
+        let expected = entry
+            .identity
+            .ok_or_else(|| invalid("delete-child entry identity unknown"))?;
+        let security = probe_security_copy(fixture.sec());
+        let view = probe_open_bound(
+            &mut fixture.ledger,
+            parent,
+            entry.parent,
+            &entry.name,
+            false,
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            null(),
+            Some(expected),
+            true,
+        )?;
+        let raw = fixture.ledger.raw(view);
+        let granted = probe_granted_access(raw)?;
+        if granted != FILE_GENERIC_READ {
+            return Err(denied("delete-child read-view grant differs"));
+        }
+        let acl = probe_dc_policy(raw, &security, entry.mask)?;
+        if entry.acl.as_ref() != Some(&acl) || probe_read_payload(raw, expected)? != entry.bytes {
+            return Err(denied("delete-child entry policy or bytes changed"));
+        }
+        println!(
+            "probe_dc_read parent={:?} name={:?} id={expected:?} mask=0x{:08x} granted=0x{granted:08x} owner_dacl={acl:?} bytes={:?}",
+            entry.parent, entry.name, entry.mask, entry.bytes
+        );
+        fixture.ledger.close(view)
+    }
+
+    fn probe_dc_seal(
+        fixture: &mut ProbeFixture,
+        evidence: &mut ProbeDcEvidence,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+        mask: u32,
+        bytes: &[u8],
+        negative_keeper: bool,
+    ) -> io::Result<usize> {
+        if evidence.entries.len() >= 8 {
+            return Err(invalid("delete-child entry bound exceeded"));
+        }
+        let security = probe_security_copy(fixture.sec());
+        let policy = probe_dc_security(&security, mask)?;
+        let index = evidence.entries.len();
+        evidence.entries.push(ProbeDcEntry {
+            parent: parent_id,
+            name: name.to_os_string(),
+            attempted_name: None,
+            identity: None,
+            mask,
+            bytes: bytes.to_vec(),
+            creation_acl: None,
+            acl: None,
+            negative_keeper: None,
+            removed: false,
+        });
+        let writer = probe_open(
+            &mut fixture.ledger,
+            parent,
+            parent_id,
+            name,
+            false,
+            FILE_CREATE,
+            FILE_ALL_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            security.descriptor.as_ptr().cast(),
+        )?;
+        let raw = fixture.ledger.raw(writer);
+        let file_id = identity(raw)?;
+        evidence.entries[index].identity = Some(file_id);
+        ensure_kind(raw, false)?;
+        evidence.entries[index].creation_acl = Some(probe_check_full(raw, &security)?);
+        if probe_granted_access(raw)? != FILE_ALL_ACCESS {
+            return Err(denied("delete-child creation writer grant differs"));
+        }
+        if negative_keeper {
+            let keeper = probe_open_bound(
+                &mut fixture.ledger,
+                parent,
+                parent_id,
+                name,
+                false,
+                DELETE | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                Some(file_id),
+                false,
+            )?;
+            evidence.entries[index].negative_keeper = Some(keeper);
+            let granted = probe_granted_access(fixture.ledger.raw(keeper))?;
+            if granted != DELETE | SYNCHRONIZE {
+                return Err(denied("negative cleanup keeper is not minimal"));
+            }
+            println!(
+                "probe_dc_negative_keeper id={file_id:?} desired=0x{:08x} granted=0x{granted:08x} cleanup_only=true",
+                DELETE | SYNCHRONIZE
+            );
+        }
+        let mut written = 0;
+        if unsafe {
+            WriteFile(
+                raw,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &mut written,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if written as usize != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short delete-child fixture write",
+            ));
+        }
+        if unsafe { FlushFileBuffers(raw) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        evidence.seal_calls += 1;
+        probe_set_dacl(raw, &policy)?;
+        let acl = probe_dc_policy(raw, &security, mask)?;
+        evidence.entries[index].acl = Some(acl.clone());
+        println!(
+            "probe_dc_seal id={file_id:?} mask=0x{mask:08x} owner_dacl={acl:?} native_set_dacl=completed role=initial_seal"
+        );
+        fixture.ledger.close(writer)?;
+        if fixture.ledger.live(writer) {
+            return Err(invalid("delete-child writer remained live"));
+        }
+        probe_dc_verify(fixture, parent, &evidence.entries[index])?;
+        Ok(index)
+    }
+
+    fn probe_dc_children_closed(
+        ledger: &ProbeLedger,
+        entries: &[ProbeDcEntry],
+        parent: FileIdentity,
+    ) -> io::Result<()> {
+        for handle in ledger.handles.iter().flatten() {
+            let observed = identity(handle.as_raw_handle())?;
+            if entries.iter().any(|entry| {
+                entry.parent == parent && !entry.removed && entry.identity == Some(observed)
+            }) {
+                return Err(denied(
+                    "a descendant native owner remains before directory publication",
+                ));
+            }
+        }
+        println!("probe_dc_descendants parent={parent:?} all_owned_child_handles_closed=true");
+        Ok(())
+    }
+
+    fn probe_dc_reacquire(
+        fixture: &mut ProbeFixture,
+        evidence: &mut ProbeDcEvidence,
+        parent: HANDLE,
+        entry: &ProbeDcEntry,
+        expected: FileIdentity,
+    ) -> io::Result<ProbeHandle> {
+        fixture.state().require_lock(
+            fixture
+                .lock
+                .as_ref()
+                .ok_or_else(|| invalid("delete-child publication guard missing"))?,
+            true,
+        )?;
+        if identity(parent)? != entry.parent {
+            evidence.parent_refusals += 1;
+            println!(
+                "probe_dc_guard expected_parent={:?} refused=true disposition_executed=false",
+                entry.parent
+            );
+            return Err(denied("delete-child parent full identity differs"));
+        }
+        let parent_granted = probe_granted_access(parent)?;
+        if parent_granted & FILE_DELETE_CHILD == 0 {
+            return Err(denied("positive parent lacks actual DELETE_CHILD grant"));
+        }
+        let handle = probe_open_bound(
+            &mut fixture.ledger,
+            parent,
+            entry.parent,
+            &entry.name,
+            false,
+            PROBE_DC_DELETE_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            None,
+            true,
+        )?;
+        let raw = fixture.ledger.raw(handle);
+        let actual = identity(raw)?;
+        let granted = probe_granted_access(raw)?;
+        println!(
+            "probe_dc_reacquire parent={:?} parent_granted=0x{parent_granted:08x} name={:?} expected={expected:?} actual={actual:?} desired=0x{PROBE_DC_DELETE_ACCESS:08x} share=0x{:08x} granted=0x{granted:08x} disposition_executed=false",
+            entry.parent,
+            entry.name,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        );
+        if granted != PROBE_DC_DELETE_ACCESS {
+            return Err(denied(
+                "fresh delete-child grant differs from exact request",
+            ));
+        }
+        if actual != expected {
+            fixture.ledger.close(handle)?;
+            evidence.identity_refusals += 1;
+            println!(
+                "probe_dc_identity_refusal actual={actual:?} expected={expected:?} disposition_executed=false checked_close=true"
+            );
+            return Err(denied(
+                "fresh delete-child handle is a different full identity",
+            ));
+        }
+        let security = probe_security_copy(fixture.sec());
+        if entry.acl.as_ref() != Some(&probe_dc_policy(raw, &security, entry.mask)?) {
+            return Err(denied("fresh delete-child handle changed policy"));
+        }
+        probe_dc_verify(fixture, parent, entry)?;
+        Ok(handle)
+    }
+
+    fn probe_dc_remove(
+        fixture: &mut ProbeFixture,
+        evidence: &mut ProbeDcEvidence,
+        parent: HANDLE,
+        index: usize,
+    ) -> io::Result<()> {
+        let entry = evidence.entries[index].clone();
+        if entry.removed {
+            return Err(invalid("delete-child entry already removed"));
+        }
+        let expected = entry
+            .identity
+            .ok_or_else(|| invalid("removal identity unknown"))?;
+        let handle = if let Some(keeper) = entry.negative_keeper {
+            probe_dc_verify(fixture, parent, &entry)?;
+            if identity(fixture.ledger.raw(keeper))? != expected
+                || probe_granted_access(fixture.ledger.raw(keeper))? != DELETE | SYNCHRONIZE
+            {
+                return Err(denied("negative cleanup keeper identity or grant changed"));
+            }
+            keeper
+        } else {
+            probe_dc_reacquire(fixture, evidence, parent, &entry, expected)?
+        };
+        evidence.disposition_calls += 1;
+        println!(
+            "probe_dc_disposition parent={:?} name={:?} id={expected:?} disposition_executed=true negative_keeper={}",
+            entry.parent,
+            entry.name,
+            entry.negative_keeper.is_some()
+        );
+        probe_disposition(fixture.ledger.raw(handle))?;
+        fixture.ledger.close(handle)?;
+        probe_check_absent(&mut fixture.ledger, parent, entry.parent, &entry.name)?;
+        evidence.entries[index].removed = true;
+        fixture.removed.push(format!(
+            "delete-child-payload:{:?}:{expected:?}",
+            entry.name
+        ));
+        println!("probe_dc_removed id={expected:?} absence_verified=true policy_rewritten=false");
+        Ok(())
+    }
+
+    fn probe_dc_positive(
+        fixture: &mut ProbeFixture,
+        evidence: &mut ProbeDcEvidence,
+        old: &OsStr,
+        new: &OsStr,
+        mask: u32,
+    ) -> io::Result<usize> {
+        let state = fixture.state().handle();
+        let state_id = fixture.state().identity();
+        let security = probe_security_copy(fixture.sec());
+        let path = fixture
+            .state_path
+            .as_ref()
+            .ok_or_else(|| invalid("positive state path missing"))?
+            .join(old);
+        probe_check_absent(&mut fixture.ledger, state, state_id, new)?;
+        let (rename, root_id) = probe_create_directory(
+            &mut fixture.ledger,
+            state,
+            state_id,
+            old,
+            &path,
+            &security,
+            Some(&mut fixture.stages),
+        )?;
+        let root_acl = probe_check_full(fixture.ledger.raw(rename), &security)?;
+        let parent = probe_open_bound(
+            &mut fixture.ledger,
+            state,
+            state_id,
+            old,
+            true,
+            FILE_ALL_ACCESS & !DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            Some(root_id),
+            true,
+        )?;
+        evidence.positive_parents.push((root_id, parent));
+        let parent_raw = fixture.ledger.raw(parent);
+        let granted = probe_granted_access(parent_raw)?;
+        if granted != FILE_ALL_ACCESS & !DELETE || granted & FILE_DELETE_CHILD == 0 {
+            return Err(denied("positive root DC grant mismatch"));
+        }
+        println!(
+            "probe_dc_positive_parent id={root_id:?} desired=0x{:08x} share=0x{:08x} granted=0x{granted:08x} acl={root_acl:?}",
+            FILE_ALL_ACCESS & !DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        );
+        let index = probe_dc_seal(
+            fixture,
+            evidence,
+            parent_raw,
+            root_id,
+            OsStr::new("payload"),
+            mask,
+            b"closed-descendant-original",
+            false,
+        )?;
+        let sealed = &evidence.entries[index];
+        let stage = fixture
+            .stages
+            .iter_mut()
+            .find(|stage| stage.identity == root_id)
+            .ok_or_else(|| invalid("sealed positive stage missing"))?;
+        stage.payload = Some((
+            sealed.name.clone(),
+            sealed
+                .identity
+                .ok_or_else(|| invalid("sealed positive identity missing"))?,
+        ));
+        stage.payload_acl_before = sealed.creation_acl.clone();
+        stage.payload_acl_after = sealed.acl.clone();
+        probe_dc_children_closed(&fixture.ledger, &evidence.entries, root_id)?;
+        probe_recheck_chain(fixture.state(), &fixture.state_chain)?;
+        fixture
+            .state()
+            .require_lock(fixture.lock.as_ref().unwrap(), true)?;
+        if identity(state)? != state_id || identity(fixture.ledger.raw(rename))? != root_id {
+            return Err(denied("positive publication anchors changed"));
+        }
+        probe_check_absent(&mut fixture.ledger, state, state_id, new)?;
+        evidence.root_rename_calls += 1;
+        println!(
+            "probe_dc_root_rename old={old:?} target={new:?} root={root_id:?} mask=0x{mask:08x} descendants_closed=true"
+        );
+        let native = probe_rename_directory(fixture.ledger.raw(rename), state, new);
+        probe_log_nt("probe_dc_root_rename_result", &native);
+        if native.effective != 0 {
+            return Err(probe_nt_error(
+                "closed-descendant root rename",
+                native.effective,
+            ));
+        }
+        probe_check_absent(&mut fixture.ledger, state, state_id, old)?;
+        let observed = probe_check_named_directory(
+            &mut fixture.ledger,
+            state,
+            state_id,
+            new,
+            root_id,
+            &security,
+        )?;
+        if probe_check_full(fixture.ledger.raw(observed), &security)? != root_acl
+            || identity(parent_raw)? != root_id
+        {
+            return Err(denied("published root identity or policy changed"));
+        }
+        fixture.ledger.close(observed)?;
+        fixture.rename_stage(root_id, new)?;
+        probe_dc_verify(fixture, parent_raw, &evidence.entries[index])?;
+        let entry = evidence.entries[index].clone();
+        let acquired = probe_dc_reacquire(
+            fixture,
+            evidence,
+            parent_raw,
+            &entry,
+            entry.identity.unwrap(),
+        )?;
+        fixture.ledger.close(acquired)?;
+        fixture.ledger.close(rename)?;
+        Ok(index)
+    }
+
+    fn probe_dc_expect_denial(
+        fixture: &mut ProbeFixture,
+        evidence: &mut ProbeDcEvidence,
+        parent: HANDLE,
+        parent_id: FileIdentity,
+        name: &OsStr,
+        directory: bool,
+        desired: u32,
+        label: &str,
+    ) -> io::Result<()> {
+        match probe_open(
+            &mut fixture.ledger,
+            parent,
+            parent_id,
+            name,
+            directory,
+            FILE_OPEN,
+            desired,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+        ) {
+            Ok(handle) => {
+                let granted = probe_granted_access(fixture.ledger.raw(handle))?;
+                fixture.ledger.close(handle)?;
+                println!(
+                    "probe_dc_denial label={label} unexpected_grant=0x{granted:08x} disposition_executed=false"
+                );
+                Err(denied("negative control unexpectedly granted access"))
+            }
+            Err(error) => {
+                let native = error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<ProbeNativeError>());
+                println!(
+                    "probe_dc_denial label={label} desired=0x{desired:08x} native={native:?} disposition_executed=false"
+                );
+                if native.is_some_and(|status| {
+                    status.operation == "NtCreateFile" && status.status == PROBE_ACCESS_DENIED
+                }) {
+                    evidence.native_denials += 1;
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn probe_dc_negative(
+        fixture: &mut ProbeFixture,
+        evidence: &mut ProbeDcEvidence,
+    ) -> io::Result<()> {
+        let state = fixture.state().handle();
+        let state_id = fixture.state().identity();
+        let security = probe_security_copy(fixture.sec());
+        let policy = probe_dc_security(&security, PROBE_DC_NO_CHILD_DELETE)?;
+        let name = OsStr::new("no-delete-child");
+        evidence.negative = Some(ProbeDcNegative {
+            name: name.to_os_string(),
+            identity: None,
+            handle: None,
+            acl: None,
+            removed: false,
+        });
+        println!(
+            "probe_dc_negative_reserved name={:?} policy=0x{PROBE_DC_NO_CHILD_DELETE:08x} non_authorizing=true",
+            evidence.negative.as_ref().unwrap().name
+        );
+        let creator = probe_open(
+            &mut fixture.ledger,
+            state,
+            state_id,
+            name,
+            true,
+            FILE_CREATE,
+            PROBE_DC_NO_CHILD_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            policy.descriptor.as_ptr().cast(),
+        )?;
+        evidence.negative.as_mut().unwrap().handle = Some(creator);
+        let root_id = identity(fixture.ledger.raw(creator))?;
+        evidence.negative.as_mut().unwrap().identity = Some(root_id);
+        ensure_kind(fixture.ledger.raw(creator), true)?;
+        if probe_granted_access(fixture.ledger.raw(creator))? != PROBE_DC_NO_CHILD_DELETE {
+            return Err(denied("negative creator grant differs"));
+        }
+        let acl = probe_dc_policy(
+            fixture.ledger.raw(creator),
+            &security,
+            PROBE_DC_NO_CHILD_DELETE,
+        )?;
+        evidence.negative.as_mut().unwrap().acl = Some(acl.clone());
+        let r = probe_dc_seal(
+            fixture,
+            evidence,
+            fixture.ledger.raw(creator),
+            root_id,
+            OsStr::new("read-only"),
+            FILE_GENERIC_READ,
+            b"negative R",
+            true,
+        )?;
+        let rx = probe_dc_seal(
+            fixture,
+            evidence,
+            fixture.ledger.raw(creator),
+            root_id,
+            OsStr::new("read-execute"),
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            b"negative RX",
+            true,
+        )?;
+        fixture.ledger.close(creator)?;
+        let parent = probe_open_bound(
+            &mut fixture.ledger,
+            state,
+            state_id,
+            name,
+            true,
+            PROBE_DC_NO_CHILD_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            Some(root_id),
+            true,
+        )?;
+        evidence.negative.as_mut().unwrap().handle = Some(parent);
+        let raw = fixture.ledger.raw(parent);
+        let granted = probe_granted_access(raw)?;
+        if granted != PROBE_DC_NO_CHILD_DELETE
+            || granted & FILE_DELETE_CHILD != 0
+            || probe_dc_policy(raw, &security, PROBE_DC_NO_CHILD_DELETE)? != acl
+        {
+            return Err(denied(
+                "negative fresh parent policy or actual grant differs",
+            ));
+        }
+        println!(
+            "probe_dc_negative_parent id={root_id:?} desired=0x{PROBE_DC_NO_CHILD_DELETE:08x} granted=0x{granted:08x} acl={acl:?} no_broader_parent_handle=true"
+        );
+        probe_dc_expect_denial(
+            fixture,
+            evidence,
+            state,
+            state_id,
+            name,
+            true,
+            FILE_DELETE_CHILD | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            "parent-explicit-DELETE_CHILD",
+        )?;
+        for index in [r, rx] {
+            let entry = evidence.entries[index].clone();
+            probe_dc_verify(fixture, raw, &entry)?;
+            probe_dc_expect_denial(
+                fixture,
+                evidence,
+                raw,
+                root_id,
+                &entry.name,
+                false,
+                PROBE_DC_DELETE_ACCESS,
+                "child-fresh-DELETE",
+            )?;
+            probe_dc_verify(fixture, raw, &entry)?;
+        }
+        if probe_dc_policy(raw, &security, PROBE_DC_NO_CHILD_DELETE)? != acl {
+            return Err(denied(
+                "negative parent DACL changed during denial controls",
+            ));
+        }
+        // Only preseal keepers remove negative children; no parent rename or ACL rewrite.
+        for index in [r, rx] {
+            probe_dc_remove(fixture, evidence, raw, index)?;
+        }
+        if !directory_entries(
+            raw,
+            EnumerationLimits {
+                max_entries: 8,
+                max_name_bytes: 8192,
+            },
+        )?
+        .is_empty()
+        {
+            return Err(denied("negative parent remains nonempty"));
+        }
+        ensure_kind(raw, true)?;
+        if identity(raw)? != root_id
+            || probe_dc_policy(raw, &security, PROBE_DC_NO_CHILD_DELETE)? != acl
+        {
+            return Err(denied("negative root changed before disposition"));
+        }
+        evidence.disposition_calls += 1;
+        println!(
+            "probe_dc_negative_root_disposition id={root_id:?} disposition_executed=true policy_rewritten=false"
+        );
+        probe_disposition(raw)?;
+        fixture.ledger.close(parent)?;
+        probe_check_absent(&mut fixture.ledger, state, state_id, name)?;
+        evidence.negative.as_mut().unwrap().removed = true;
+        fixture
+            .removed
+            .push(format!("delete-child-negative-root:{root_id:?}"));
+        Ok(())
+    }
+
+    fn probe_dc_replacement(
+        fixture: &mut ProbeFixture,
+        evidence: &mut ProbeDcEvidence,
+        index: usize,
+    ) -> io::Result<()> {
+        let original = evidence.entries[index].clone();
+        let parent = evidence
+            .positive_parents
+            .iter()
+            .find(|(id, _)| *id == original.parent)
+            .ok_or_else(|| invalid("replacement parent missing"))?
+            .1;
+        let raw = fixture.ledger.raw(parent);
+        let saved = OsStr::new("saved-original");
+        probe_check_absent(&mut fixture.ledger, raw, original.parent, saved)?;
+        let handle = probe_dc_reacquire(
+            fixture,
+            evidence,
+            raw,
+            &original,
+            original.identity.unwrap(),
+        )?;
+        evidence.entries[index].attempted_name = Some(saved.to_os_string());
+        evidence.file_rename_calls += 1;
+        let native = probe_rename_directory(fixture.ledger.raw(handle), raw, saved);
+        probe_log_nt("probe_dc_original_to_saved", &native);
+        if native.effective != 0 {
+            return Err(probe_nt_error(
+                "delete-child original saved rename",
+                native.effective,
+            ));
+        }
+        fixture.ledger.close(handle)?;
+        probe_check_absent(&mut fixture.ledger, raw, original.parent, &original.name)?;
+        let mut saved_entry = original.clone();
+        saved_entry.name = saved.to_os_string();
+        probe_dc_verify(fixture, raw, &saved_entry)?;
+        evidence.entries[index].name = saved.to_os_string();
+        evidence.entries[index].attempted_name = None;
+        fixture
+            .stages
+            .iter_mut()
+            .find(|stage| stage.identity == original.parent)
+            .ok_or_else(|| invalid("saved original stage missing"))?
+            .payload = Some((saved.to_os_string(), original.identity.unwrap()));
+        let replacement = probe_dc_seal(
+            fixture,
+            evidence,
+            raw,
+            original.parent,
+            &original.name,
+            original.mask,
+            b"different canonical replacement",
+            false,
+        )?;
+        let fresh = evidence.entries[replacement].clone();
+        if fresh.identity == original.identity {
+            return Err(denied("replacement did not receive a different full ID"));
+        }
+        let before = evidence.disposition_calls;
+        let refusals = evidence.identity_refusals;
+        match probe_dc_reacquire(fixture, evidence, raw, &fresh, original.identity.unwrap()) {
+            Ok(handle) => {
+                fixture.ledger.close(handle)?;
+                return Err(denied("replacement accepted original expected identity"));
+            }
+            Err(error)
+                if evidence.identity_refusals == refusals + 1
+                    && evidence.disposition_calls == before =>
+            {
+                println!(
+                    "probe_dc_replacement_refused original={:?} replacement={:?} reason={error} disposition_calls_before={before} disposition_calls_after={}",
+                    original.identity, fresh.identity, evidence.disposition_calls
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        probe_dc_verify(fixture, raw, &evidence.entries[index])?;
+        probe_dc_verify(fixture, raw, &fresh)?;
+        Ok(())
+    }
+
+    fn probe_dc_execute(
+        fixture: &mut ProbeFixture,
+        evidence: &mut ProbeDcEvidence,
+    ) -> io::Result<()> {
+        let state_id = fixture.state().identity();
+        probe_recheck_chain(fixture.state(), &fixture.state_chain)?;
+        fixture
+            .state()
+            .require_lock(fixture.lock.as_ref().unwrap(), true)?;
+        if identity(fixture.state().handle())? != state_id {
+            return Err(denied("delete-child actual state ID changed"));
+        }
+        let security = probe_security_copy(fixture.sec());
+        let foreign = fixture.foreign().handle();
+        let foreign_id = identity(foreign)?;
+        let (canary, acl) = probe_create_payload(
+            &mut fixture.ledger,
+            foreign,
+            foreign_id,
+            OsStr::new("canary"),
+            b"untouched foreign canary",
+            &security,
+        )?;
+        fixture.foreign_canary = Some((canary, acl.clone()));
+        if !matches!(fixture.foreign().require_lock(fixture.lock.as_ref().unwrap(), true), Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        {
+            return Err(denied("foreign parent accepted publication-parent guard"));
+        }
+        probe_verify_foreign(fixture, canary, &acl)?;
+        let r = probe_dc_positive(
+            fixture,
+            evidence,
+            OsStr::new("dc-r-old"),
+            OsStr::new("dc-r-published"),
+            FILE_GENERIC_READ,
+        )?;
+        let rx = probe_dc_positive(
+            fixture,
+            evidence,
+            OsStr::new("dc-rx-old"),
+            OsStr::new("dc-rx-published"),
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )?;
+        if evidence.entries[r].parent == evidence.entries[rx].parent {
+            return Err(denied("R and RX did not use separate roots"));
+        }
+        let entry = evidence.entries[r].clone();
+        let before = evidence.disposition_calls;
+        let refusals = evidence.parent_refusals;
+        match probe_dc_reacquire(fixture, evidence, foreign, &entry, entry.identity.unwrap()) {
+            Ok(handle) => {
+                fixture.ledger.close(handle)?;
+                return Err(denied("foreign parent admitted a mismatched child domain"));
+            }
+            Err(error)
+                if evidence.parent_refusals == refusals + 1
+                    && evidence.disposition_calls == before =>
+            {
+                println!("probe_dc_foreign_refusal reason={error} disposition_executed=false");
+            }
+            Err(error) => return Err(error),
+        }
+        probe_verify_foreign(fixture, canary, &acl)?;
+        probe_dc_negative(fixture, evidence)?;
+        probe_dc_replacement(fixture, evidence, r)?;
+        for index in 0..evidence.entries.len() {
+            if evidence.entries[index].removed {
+                continue;
+            }
+            let parent_id = evidence.entries[index].parent;
+            let parent = evidence
+                .positive_parents
+                .iter()
+                .find(|(id, _)| *id == parent_id)
+                .ok_or_else(|| invalid("cleanup DC parent missing"))?
+                .1;
+            probe_dc_remove(fixture, evidence, fixture.ledger.raw(parent), index)?;
+        }
+        for (root_id, parent) in evidence.positive_parents.clone() {
+            if !directory_entries(
+                fixture.ledger.raw(parent),
+                EnumerationLimits {
+                    max_entries: 8,
+                    max_name_bytes: 8192,
+                },
+            )?
+            .is_empty()
+                || evidence
+                    .entries
+                    .iter()
+                    .any(|entry| entry.parent == root_id && !entry.removed)
+            {
+                return Err(denied(
+                    "positive root not proved empty before ordinary fixture cleanup",
+                ));
+            }
+            fixture
+                .stages
+                .iter_mut()
+                .find(|stage| stage.identity == root_id)
+                .ok_or_else(|| invalid("positive stage missing"))?
+                .payload = None;
+        }
+        if evidence.native_denials != 3
+            || evidence.identity_refusals != 1
+            || evidence.parent_refusals != 1
+            || evidence.root_rename_calls != 2
+            || evidence.file_rename_calls != 1
+            || evidence.seal_calls != 5
+            || evidence.disposition_calls != 6
+            || evidence.entries.iter().any(|entry| !entry.removed)
+            || !evidence
+                .negative
+                .as_ref()
+                .is_some_and(|negative| negative.removed)
+        {
+            return Err(invalid(
+                "delete-child probe evidence/counter reconciliation failed",
+            ));
+        }
+        probe_verify_foreign(fixture, canary, &acl)?;
+        println!(
+            "probe_dc_measurements_complete R_RX=true native_denials={} identity_refusals={} parent_refusals={} root_renames={} file_renames={} initial_seals={} experiment_dispositions={} cleanup_acl_rewrites=0 all_payload_absences_verified=true",
+            evidence.native_denials,
+            evidence.identity_refusals,
+            evidence.parent_refusals,
+            evidence.root_rename_calls,
+            evidence.file_rename_calls,
+            evidence.seal_calls,
+            evidence.disposition_calls
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_directory_delete_child_reacquisition_prerequisite() {
+        let mut fixture = ProbeFixture::empty();
+        let mut evidence = ProbeDcEvidence::default();
+        let result = (|| -> io::Result<()> {
+            fixture.initialize()?;
+            probe_dc_execute(&mut fixture, &mut evidence)?;
+            fixture.finish_success()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => println!(
+                "probe_dc_test_result=DeleteChildReacquisitionMeasuredCohort checked_fixture_teardown=complete native_product_support=false"
+            ),
+            Err(primary) => {
+                println!("probe_dc_partial_receipt non_authorizing=true evidence={evidence:?}");
+                let errors = fixture.preserve_failure();
+                panic!(
+                    "delete-child native measurement/setup failed: {primary}; fixture preserved; checked-close errors={errors:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn private_storage_works_without_admin_group_or_privileges() {
         let _identity = restricted_identity();
