@@ -3177,6 +3177,186 @@ mod registry_witness_tests {
         )
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct HelperPeHeader {
+        machine: u16,
+        subsystem: u16,
+    }
+
+    fn read_u16_le(bytes: &[u8], offset: usize) -> io::Result<u16> {
+        let end = offset
+            .checked_add(size_of::<u16>())
+            .ok_or_else(|| invalid("helper PE field offset overflow"))?;
+        let field = bytes
+            .get(offset..end)
+            .ok_or_else(|| invalid("helper PE field is truncated"))?;
+        Ok(u16::from_le_bytes([field[0], field[1]]))
+    }
+
+    fn read_u32_le(bytes: &[u8], offset: usize) -> io::Result<u32> {
+        let end = offset
+            .checked_add(size_of::<u32>())
+            .ok_or_else(|| invalid("helper PE field offset overflow"))?;
+        let field = bytes
+            .get(offset..end)
+            .ok_or_else(|| invalid("helper PE field is truncated"))?;
+        Ok(u32::from_le_bytes([field[0], field[1], field[2], field[3]]))
+    }
+
+    fn parse_helper_pe_header(bytes: &[u8]) -> io::Result<HelperPeHeader> {
+        const DOS_HEADER_BYTES: usize = 64;
+        const PE_SIGNATURE: &[u8; 4] = b"PE\0\0";
+        const COFF_HEADER_BYTES: usize = 20;
+        const PE32_PLUS_MAGIC: u16 = 0x020b;
+        const PE32_PLUS_FIXED_BYTES: usize = 112;
+        const OPTIONAL_SUBSYSTEM_OFFSET: usize = 68;
+
+        if bytes.get(..2) != Some(b"MZ") || bytes.len() < DOS_HEADER_BYTES {
+            return Err(invalid(
+                "helper image has a truncated or missing DOS header",
+            ));
+        }
+        let pe_offset = usize::try_from(read_u32_le(bytes, 0x3c)?)
+            .map_err(|_| invalid("helper PE header offset conversion overflow"))?;
+        if pe_offset < DOS_HEADER_BYTES {
+            return Err(invalid("helper PE header overlaps the DOS header"));
+        }
+        let signature_end = pe_offset
+            .checked_add(PE_SIGNATURE.len())
+            .ok_or_else(|| invalid("helper PE signature offset overflow"))?;
+        if bytes.get(pe_offset..signature_end) != Some(PE_SIGNATURE.as_slice()) {
+            return Err(invalid("helper PE signature is missing or truncated"));
+        }
+        let coff_offset = signature_end;
+        let coff_end = coff_offset
+            .checked_add(COFF_HEADER_BYTES)
+            .ok_or_else(|| invalid("helper COFF header offset overflow"))?;
+        let coff = bytes
+            .get(coff_offset..coff_end)
+            .ok_or_else(|| invalid("helper COFF header is truncated"))?;
+        let machine = u16::from_le_bytes([coff[0], coff[1]]);
+        let optional_bytes = usize::from(u16::from_le_bytes([coff[16], coff[17]]));
+        if optional_bytes < PE32_PLUS_FIXED_BYTES {
+            return Err(invalid(
+                "helper PE optional header is shorter than fixed PE32+ fields",
+            ));
+        }
+        let optional_end = coff_end
+            .checked_add(optional_bytes)
+            .ok_or_else(|| invalid("helper PE optional header extent overflow"))?;
+        let optional = bytes
+            .get(coff_end..optional_end)
+            .ok_or_else(|| invalid("helper PE optional header extent exceeds the image"))?;
+        if read_u16_le(optional, 0)? != PE32_PLUS_MAGIC {
+            return Err(invalid("helper image is not PE32+"));
+        }
+        let subsystem = read_u16_le(optional, OPTIONAL_SUBSYSTEM_OFFSET)?;
+        Ok(HelperPeHeader { machine, subsystem })
+    }
+
+    fn validate_helper_pe_image(bytes: &[u8]) -> io::Result<HelperPeHeader> {
+        let header = parse_helper_pe_header(bytes)?;
+        if header.machine != 0x8664 || header.subsystem != 2 {
+            return Err(invalid("held helper image must be AMD64 PE32+ GUI"));
+        }
+        Ok(header)
+    }
+
+    fn make_helper_pe_fixture() -> Vec<u8> {
+        const PE_OFFSET: usize = 64;
+        const COFF_OFFSET: usize = PE_OFFSET + 4;
+        const OPTIONAL_OFFSET: usize = COFF_OFFSET + 20;
+        let mut bytes = vec![0u8; OPTIONAL_OFFSET + 112];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&(PE_OFFSET as u32).to_le_bytes());
+        bytes[PE_OFFSET..PE_OFFSET + 4].copy_from_slice(b"PE\0\0");
+        bytes[COFF_OFFSET..COFF_OFFSET + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[COFF_OFFSET + 16..COFF_OFFSET + 18].copy_from_slice(&112u16.to_le_bytes());
+        bytes[OPTIONAL_OFFSET..OPTIONAL_OFFSET + 2].copy_from_slice(&0x020bu16.to_le_bytes());
+        // Decoys at CheckSum and DllCharacteristics must not be read as Subsystem.
+        bytes[OPTIONAL_OFFSET + 64..OPTIONAL_OFFSET + 68].copy_from_slice(&3u32.to_le_bytes());
+        bytes[OPTIONAL_OFFSET + 68..OPTIONAL_OFFSET + 70].copy_from_slice(&2u16.to_le_bytes());
+        bytes[OPTIONAL_OFFSET + 70..OPTIONAL_OFFSET + 72].copy_from_slice(&3u16.to_le_bytes());
+        bytes
+    }
+
+    fn verify_helper_pe_parser_oracle() -> io::Result<()> {
+        let valid = make_helper_pe_fixture();
+        if validate_helper_pe_image(&valid)?
+            != (HelperPeHeader {
+                machine: 0x8664,
+                subsystem: 2,
+            })
+        {
+            return Err(invalid("valid helper PE32+ GUI oracle was rejected"));
+        }
+
+        let rejected = |mut bytes: Vec<u8>, offset: usize, value: u32| -> io::Result<()> {
+            let field = bytes
+                .get_mut(offset..offset + 4)
+                .ok_or_else(|| invalid("helper PE oracle field is out of range"))?;
+            field.copy_from_slice(&value.to_le_bytes());
+            if parse_helper_pe_header(&bytes).is_ok() {
+                return Err(invalid("invalid helper PE offset oracle was accepted"));
+            }
+            Ok(())
+        };
+        for length in [0, 2, 63, 64 + 2] {
+            if parse_helper_pe_header(&valid[..length]).is_ok() {
+                return Err(invalid(
+                    "truncated helper DOS or PE signature oracle was accepted",
+                ));
+            }
+        }
+        if parse_helper_pe_header(&valid[..87]).is_ok() {
+            return Err(invalid("truncated helper COFF header oracle was accepted"));
+        }
+
+        let pe_offset = 64usize;
+        let coff_offset = pe_offset + 4;
+        let optional_offset = coff_offset + 20;
+        let mut overlapping = valid.clone();
+        overlapping[0x3c..0x40].copy_from_slice(&62u32.to_le_bytes());
+        if parse_helper_pe_header(&overlapping).is_ok() {
+            return Err(invalid("overlapping helper PE header oracle was accepted"));
+        }
+        rejected(valid.clone(), 0x3c, u32::MAX)?;
+        let mut short_optional = valid.clone();
+        short_optional[coff_offset + 16..coff_offset + 18].copy_from_slice(&111u16.to_le_bytes());
+        if parse_helper_pe_header(&short_optional).is_ok() {
+            return Err(invalid(
+                "short declared helper optional header oracle was accepted",
+            ));
+        }
+        let mut oversized_optional = valid.clone();
+        oversized_optional[coff_offset + 16..coff_offset + 18]
+            .copy_from_slice(&u16::MAX.to_le_bytes());
+        if parse_helper_pe_header(&oversized_optional).is_ok() {
+            return Err(invalid(
+                "out-of-image helper optional header oracle was accepted",
+            ));
+        }
+        let mut wrong_machine = valid.clone();
+        wrong_machine[coff_offset..coff_offset + 2].copy_from_slice(&0x014cu16.to_le_bytes());
+        if validate_helper_pe_image(&wrong_machine).is_ok() {
+            return Err(invalid("wrong-machine helper PE oracle was accepted"));
+        }
+        let mut pe32 = valid.clone();
+        pe32[optional_offset..optional_offset + 2].copy_from_slice(&0x010bu16.to_le_bytes());
+        if parse_helper_pe_header(&pe32).is_ok() {
+            return Err(invalid("PE32 helper image oracle was accepted"));
+        }
+        for subsystem in [0u16, 3, 4, u16::MAX] {
+            let mut wrong_subsystem = valid.clone();
+            wrong_subsystem[optional_offset + 68..optional_offset + 70]
+                .copy_from_slice(&subsystem.to_le_bytes());
+            if validate_helper_pe_image(&wrong_subsystem).is_ok() {
+                return Err(invalid("non-GUI helper subsystem oracle was accepted"));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn process_creation_text(process: HANDLE) -> io::Result<String> {
         let mut creation = FILETIME::default();
         let mut exit = FILETIME::default();
@@ -3891,6 +4071,15 @@ mod registry_witness_tests {
             if identity != identity_after {
                 return Err(invalid("held helper image identity changed"));
             }
+            let pe_header = validate_helper_pe_image(&image_bytes)?;
+            emit_witness_record(&format!(
+                "registry_witness_diagnostic stream=helper_image_pe image_id={} image_sha256={} image_bytes={} machine={:#06x} subsystem={:#06x}",
+                identity_text(identity),
+                sha256,
+                image_bytes.len(),
+                pe_header.machine,
+                pe_header.subsystem
+            ))?;
             reader.seek(SeekFrom::Start(0))?;
             Ok(HeldHelperImage {
                 directory: directory.clone(),
@@ -5005,6 +5194,104 @@ mod registry_witness_tests {
         Ok(())
     }
 
+    fn verify_cancel_job_single_member(
+        child: &OwnedProcess<'_>,
+        child_pid: u32,
+        child_creation: &str,
+        active_processes: u32,
+    ) -> io::Result<()> {
+        if active_processes != 1 {
+            return Err(invalid(
+                "cancel Job active-process sample was not exactly one",
+            ));
+        }
+        let mut list = BoundedJobProcessIdList {
+            number_of_assigned_processes: 0,
+            number_of_process_ids_in_list: 0,
+            process_id_list: [0; MAX_CANCEL_JOB_DIAGNOSTIC_MEMBERS],
+        };
+        let mut returned_bytes = 0u32;
+        let succeeded = unsafe {
+            QueryInformationJobObject(
+                child.job.as_raw_handle(),
+                JobObjectBasicProcessIdList,
+                (&mut list as *mut BoundedJobProcessIdList).cast(),
+                u32::try_from(size_of::<BoundedJobProcessIdList>())
+                    .map_err(|_| invalid("Job process ID proof buffer too large"))?,
+                &mut returned_bytes,
+            )
+        };
+        if succeeded == 0 {
+            return Err(operation_error(
+                "QueryInformationJobObject(cancel live-member proof)",
+                io::Error::last_os_error(),
+            ));
+        }
+        let assigned = list.number_of_assigned_processes;
+        let listed = list.number_of_process_ids_in_list;
+        let count = checked_job_process_id_count(assigned, listed, returned_bytes)?;
+        if assigned != 1 || listed != 1 || count != 1 {
+            return Err(io::Error::other(format!(
+                "cancel Job PID snapshot is not an exact singleton: assigned={assigned} listed={listed} count={count} returned_bytes={returned_bytes}"
+            )));
+        }
+        let listed_pid = u32::try_from(list.process_id_list[0])
+            .map_err(|_| invalid("cancel Job PID does not fit a Windows process ID"))?;
+        if listed_pid == 0 || listed_pid != child_pid {
+            return Err(io::Error::other(format!(
+                "cancel Job PID snapshot does not identify the launched helper: listed_pid={listed_pid} child_pid={child_pid}"
+            )));
+        }
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                listed_pid,
+            )
+        };
+        if process.is_null() {
+            return Err(operation_error(
+                "OpenProcess(cancel live-member proof)",
+                io::Error::last_os_error(),
+            ));
+        }
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        let actual_pid = unsafe { GetProcessId(process.as_raw_handle()) };
+        if actual_pid != child_pid {
+            return Err(io::Error::other(format!(
+                "cancel Job member process handle PID mismatch: actual_pid={actual_pid} child_pid={child_pid}"
+            )));
+        }
+        let actual_creation = process_creation_text(process.as_raw_handle())?;
+        if actual_creation != child_creation {
+            return Err(io::Error::other(format!(
+                "cancel Job member creation time mismatch: actual_creation={actual_creation} child_creation={child_creation}"
+            )));
+        }
+        let mut in_owned_job = 0;
+        if unsafe {
+            IsProcessInJob(
+                process.as_raw_handle(),
+                child.job.as_raw_handle(),
+                &mut in_owned_job,
+            )
+        } == 0
+        {
+            return Err(operation_error(
+                "IsProcessInJob(cancel live-member proof)",
+                io::Error::last_os_error(),
+            ));
+        }
+        if in_owned_job == 0 {
+            return Err(invalid(
+                "cancel Job PID-list member is not in the exact owned Job",
+            ));
+        }
+        emit_witness_record(&format!(
+            "registry_witness_diagnostic stream=cancel_job_live_member child_pid={child_pid} child_creation={child_creation} assigned={assigned} listed={listed} returned_bytes={returned_bytes} pid={listed_pid} actual_pid={actual_pid} actual_creation={actual_creation} membership=owned_job active_processes={active_processes} observed=true"
+        ))
+    }
+
     fn wait_for_cancel_readiness(
         child: &OwnedProcess<'_>,
         child_pid: u32,
@@ -5066,7 +5353,47 @@ mod registry_witness_tests {
                 let process_state = process_completed(child.process.as_raw_handle());
                 let job_state = child.active();
                 match (process_state, job_state) {
-                    (Ok(false), Ok(1)) => return Ok(()),
+                    (Ok(false), Ok(1)) => {
+                        let proof =
+                            verify_cancel_job_single_member(child, child_pid, child_creation, 1);
+                        let final_process = process_completed(child.process.as_raw_handle());
+                        let final_job = child.active();
+                        if proof.is_ok()
+                            && matches!(final_process.as_ref(), Ok(false))
+                            && matches!(final_job.as_ref(), Ok(1))
+                        {
+                            return Ok(());
+                        }
+                        let wait_detail = match final_process.as_ref() {
+                            Ok(false) => "WAIT_TIMEOUT".to_owned(),
+                            Ok(true) => "WAIT_OBJECT_0".to_owned(),
+                            Err(error) => format!("failed:{error}"),
+                        };
+                        let job_detail = match final_job.as_ref() {
+                            Ok(active) => format!("active_processes={active}"),
+                            Err(error) => format!("failed:{error}"),
+                        };
+                        let proof_detail = proof
+                            .as_ref()
+                            .err()
+                            .map_or_else(|| "verified".to_owned(), ToString::to_string);
+                        let primary = io::Error::other(format!(
+                            "cancellation readiness received but exact live-member proof failed: child_pid={child_pid} child_creation={child_creation} first_process_wait=WAIT_TIMEOUT first_active_processes=1 member_proof={proof_detail} final_process_wait={wait_detail} final_job={job_detail}"
+                        ));
+                        return Err(
+                            match emit_cancel_job_member_diagnostics(
+                                child,
+                                child_pid,
+                                child_creation,
+                                1,
+                            ) {
+                                Ok(()) => primary,
+                                Err(diagnostic_error) => io::Error::other(format!(
+                                    "{primary}; cancel Job member diagnostic emission failed: {diagnostic_error}"
+                                )),
+                            },
+                        );
+                    }
                     (Ok(done), Ok(active)) => {
                         let wait_result = if done {
                             "WAIT_OBJECT_0"
@@ -5414,6 +5741,7 @@ mod registry_witness_tests {
 
     fn registry_witness_stage_a_run() -> io::Result<()> {
         verify_cancel_readiness_frame_oracle()?;
+        verify_helper_pe_parser_oracle()?;
         verify_job_process_id_list_oracle()?;
         verify_partial_key_value_header_oracle()?;
         let nonce = std::env::var("ORBIT_REGISTRY_WITNESS_NONCE")
