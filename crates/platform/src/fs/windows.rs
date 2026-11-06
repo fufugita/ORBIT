@@ -1994,6 +1994,19 @@ impl SourceDirectory {
     }
 }
 
+/// An immutable execution-permission observation for a held source file.
+/// Values are produced only by the fallible source observation API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionPermission {
+    executable: bool,
+}
+
+impl ExecutionPermission {
+    pub fn executable(&self) -> bool {
+        self.executable
+    }
+}
+
 /// A regular source file held through its directory capability.
 pub struct SourceFile {
     file: File,
@@ -2004,6 +2017,13 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
+    /// Observe execution permission without executing or mapping the source.
+    pub fn execution_permission(&self) -> io::Result<ExecutionPermission> {
+        Err(unsupported(
+            "source execution permission observation is not implemented",
+        ))
+    }
+
     pub fn identity(&self) -> FileIdentity {
         self.identity
     }

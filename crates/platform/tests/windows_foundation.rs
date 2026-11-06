@@ -3210,4 +3210,1275 @@ mod windows {
                 .unwrap(),
         );
     }
+    mod execution_oracle {
+        use super::*;
+        use orbit_platform::fs::{SourceFile, SourceSnapshot};
+        use std::ffi::OsString;
+        use std::io;
+        use std::mem::size_of;
+        use std::os::windows::io::IntoRawHandle;
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+            TerminateProcess,
+        };
+
+        const META: u32 = READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        const PENDING: i32 = 0x103;
+        const DENIED: i32 = 0xc0000022u32 as i32;
+        const ABSENT: i32 = 0xc0000034u32 as i32;
+        const PAYLOAD: &[u8] = b"permission-native-fixture-v1";
+        const LIMIT: usize = 65536;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(kind: u32) -> HANDLE;
+        }
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn RtlNtStatusToDosError(status: i32) -> u32;
+        }
+
+        fn bad(message: &'static str) -> io::Error {
+            io::Error::new(io::ErrorKind::InvalidData, message)
+        }
+        fn yes(value: i32) -> io::Result<()> {
+            if value == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        fn require(value: bool, message: &'static str) -> io::Result<()> {
+            if value { Ok(()) } else { Err(bad(message)) }
+        }
+        #[derive(Debug)]
+        struct NativeOpenError {
+            phase: &'static str,
+            status: i32,
+            desired: u32,
+        }
+        impl std::fmt::Display for NativeOpenError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "{} NTSTATUS=0x{:08x} desired=0x{:08x}",
+                    self.phase, self.status as u32, self.desired
+                )
+            }
+        }
+        impl std::error::Error for NativeOpenError {}
+        fn native_is(error: &io::Error, status: i32) -> bool {
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<NativeOpenError>())
+                .is_some_and(|e| e.phase == "NtCreateFile" && e.status == status)
+        }
+        fn uncertain_request() -> ! {
+            static MESSAGE: &[u8] = b"EXEC_ORACLE_UNCLASSIFIED: pending create/ownership unknown; no fixture completion or product RED; terminating without unwinding\r\n";
+            unsafe {
+                let stderr = GetStdHandle((-12i32) as u32);
+                if !stderr.is_null() && stderr != INVALID_HANDLE_VALUE {
+                    let mut written = 0;
+                    let _ = WriteFile(
+                        stderr,
+                        MESSAGE.as_ptr(),
+                        MESSAGE.len() as u32,
+                        &mut written,
+                        null_mut(),
+                    );
+                }
+                let _ = TerminateProcess(GetCurrentProcess(), 0xe0150002);
+            }
+            std::process::abort()
+        }
+        #[derive(Default)]
+        struct Handles {
+            slots: Vec<Option<OwnedHandle>>,
+            closed: Vec<String>,
+        }
+        impl Handles {
+            fn own(&mut self, raw: HANDLE) -> usize {
+                let index = self.slots.len();
+                self.slots
+                    .push(Some(unsafe { OwnedHandle::from_raw_handle(raw) }));
+                index
+            }
+            fn raw(&self, index: usize) -> HANDLE {
+                self.slots[index].as_ref().unwrap().as_raw_handle()
+            }
+            fn close(&mut self, index: usize) -> io::Result<()> {
+                let owned = self.slots[index]
+                    .take()
+                    .ok_or_else(|| bad("oracle owner already consumed"))?;
+                let raw = owned.into_raw_handle();
+                if unsafe { CloseHandle(raw) } == 0 {
+                    let error = io::Error::last_os_error();
+                    self.closed.push(format!("{index}:close-error:{error}"));
+                    Err(error)
+                } else {
+                    self.closed.push(format!("{index}:closed"));
+                    Ok(())
+                }
+            }
+            fn close_all(&mut self) -> Vec<String> {
+                let mut errors = Vec::new();
+                for index in 0..self.slots.len() {
+                    if self.slots[index].is_some() {
+                        if let Err(error) = self.close(index) {
+                            errors.push(error.to_string());
+                        }
+                    }
+                }
+                errors
+            }
+        }
+        fn relative(
+            handles: &mut Handles,
+            parent: HANDLE,
+            name: &OsStr,
+            directory: bool,
+            disposition: u32,
+            desired: u32,
+            descriptor: *const SECURITY_DESCRIPTOR,
+        ) -> io::Result<usize> {
+            orbit_platform::fs::validate_component(name)?;
+            let mut name_wide = name.encode_wide().collect::<Vec<_>>();
+            require(
+                name_wide.len() <= u16::MAX as usize / 2,
+                "oracle native name too long",
+            )?;
+            let name = UNICODE_STRING {
+                Length: (name_wide.len() * 2) as u16,
+                MaximumLength: (name_wide.len() * 2) as u16,
+                Buffer: name_wide.as_mut_ptr(),
+            };
+            let attributes = OBJECT_ATTRIBUTES {
+                Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: parent,
+                ObjectName: &name,
+                Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+                SecurityDescriptor: descriptor,
+                SecurityQualityOfService: null(),
+            };
+            let mut raw = null_mut();
+            let mut iosb = IO_STATUS_BLOCK::default();
+            iosb.Anonymous.Status = 0x6f736962;
+            iosb.Information = usize::MAX;
+            let status = unsafe {
+                NtCreateFile(
+                    &mut raw,
+                    desired,
+                    &attributes,
+                    &mut iosb,
+                    null(),
+                    FILE_ATTRIBUTE_NORMAL,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    disposition,
+                    FILE_SYNCHRONOUS_IO_NONALERT
+                        | FILE_OPEN_REPARSE_POINT
+                        | if directory {
+                            FILE_DIRECTORY_FILE
+                        } else {
+                            FILE_NON_DIRECTORY_FILE
+                        },
+                    null(),
+                    0,
+                )
+            };
+            if status == PENDING {
+                uncertain_request();
+            }
+            if status != 0 {
+                if !raw.is_null() {
+                    uncertain_request();
+                }
+                println!(
+                    "exec_oracle_native_open phase=NtCreateFile returned=0x{:08x} desired=0x{desired:08x} share=READ_WRITE",
+                    status as u32
+                );
+                let kind =
+                    io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
+                        .kind();
+                return Err(io::Error::new(
+                    kind,
+                    NativeOpenError {
+                        phase: "NtCreateFile",
+                        status,
+                        desired,
+                    },
+                ));
+            }
+            if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+                uncertain_request();
+            }
+            let owner = handles.own(raw);
+            println!(
+                "exec_oracle_native_open phase=NtCreateFile returned=0x{:08x} desired=0x{desired:08x} share=READ_WRITE iosb_status=0x{:08x} information={}",
+                status as u32,
+                unsafe { iosb.Anonymous.Status } as u32,
+                iosb.Information
+            );
+            Ok(owner)
+        }
+        fn info<T: Default>(handle: HANDLE, class: FILE_INFO_BY_HANDLE_CLASS) -> io::Result<T> {
+            let mut value = T::default();
+            yes(unsafe {
+                GetFileInformationByHandleEx(
+                    handle,
+                    class,
+                    (&mut value as *mut T).cast(),
+                    size_of::<T>() as u32,
+                )
+            })?;
+            Ok(value)
+        }
+        fn identity(handle: HANDLE) -> io::Result<FileIdentity> {
+            let value: FILE_ID_INFO = info(handle, FileIdInfo)?;
+            Ok(FileIdentity {
+                volume: value.VolumeSerialNumber,
+                file: value.FileId.Identifier,
+            })
+        }
+        fn kind(handle: HANDLE, directory: bool) -> io::Result<()> {
+            let tag: FILE_ATTRIBUTE_TAG_INFO = info(handle, FileAttributeTagInfo)?;
+            let standard: FILE_STANDARD_INFO = info(handle, FileStandardInfo)?;
+            require(
+                tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                    && standard.Directory == directory
+                    && !standard.DeletePending
+                    && (directory || standard.NumberOfLinks == 1),
+                "oracle kind/reparse/link/delete-pending mismatch",
+            )
+        }
+        fn snapshot(handle: HANDLE) -> io::Result<SourceSnapshot> {
+            kind(handle, false)?;
+            let standard: FILE_STANDARD_INFO = info(handle, FileStandardInfo)?;
+            let basic: FILE_BASIC_INFO = info(handle, FileBasicInfo)?;
+            require(
+                standard.EndOfFile >= 0
+                    && basic.FileAttributes
+                        & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+                        == 0,
+                "oracle sampled metadata kind or length mismatch",
+            )?;
+            Ok(SourceSnapshot {
+                identity: identity(handle)?,
+                length: standard.EndOfFile as u64,
+                last_write_time: basic.LastWriteTime,
+                change_time: basic.ChangeTime,
+                attributes: basic.FileAttributes,
+                kind: SourceKind::File,
+                link_count: standard.NumberOfLinks as u32,
+            })
+        }
+        fn sid_bytes(sid: PSID, base: *const u8, length: usize) -> io::Result<Vec<u8>> {
+            require(
+                !sid.is_null() && sid as usize % 4 == 0,
+                "oracle SID absent or misaligned",
+            )?;
+            let offset = (sid as usize)
+                .checked_sub(base as usize)
+                .ok_or_else(|| bad("oracle SID outside buffer"))?;
+            require(
+                offset.checked_add(8).is_some_and(|end| end <= length),
+                "oracle SID prefix outside buffer",
+            )?;
+            let count = unsafe { *sid.cast::<u8>().add(1) } as usize;
+            let bytes = 8 + 4 * count;
+            require(
+                count <= 15 && offset.checked_add(bytes).is_some_and(|end| end <= length),
+                "oracle SID tail outside buffer",
+            )?;
+            yes(unsafe { IsValidSid(sid) })?;
+            require(
+                unsafe { GetLengthSid(sid) } as usize == bytes,
+                "oracle SID length disagreement",
+            )?;
+            Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), bytes) }.to_vec())
+        }
+        fn sid_text(bytes: &[u8]) -> io::Result<String> {
+            let mut aligned = vec![0u32; bytes.len().div_ceil(4)];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    aligned.as_mut_ptr().cast(),
+                    bytes.len(),
+                );
+            }
+            let mut text = null_mut();
+            yes(unsafe { ConvertSidToStringSidW(aligned.as_mut_ptr().cast(), &mut text) })?;
+            let allocation = LocalSecurityAllocation(text.cast());
+            let mut length = 0;
+            while unsafe { *text.add(length) } != 0 {
+                length += 1;
+            }
+            let value = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+                .map_err(|_| bad("oracle SID text encoding"))?;
+            drop(allocation);
+            Ok(value)
+        }
+        fn descriptor(key: &TokenKey, mask: u32) -> io::Result<Vec<usize>> {
+            let user = sid_text(&key.user)?;
+            let group = sid_text(&key.group)?;
+            let text = wide(OsStr::new(&format!(
+                "O:{user}G:{group}D:P(A;;0x{mask:08x};;;{user})"
+            )));
+            let mut raw = null_mut();
+            let mut returned = 0;
+            yes(unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    1,
+                    &mut raw,
+                    &mut returned,
+                )
+            })?;
+            let allocation = LocalSecurityAllocation(raw.cast());
+            let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+            require(
+                length > 0 && length <= LIMIT && length == returned as usize,
+                "oracle descriptor length invalid",
+            )?;
+            let mut bytes = vec![0usize; length.div_ceil(size_of::<usize>())];
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.cast::<u8>(), bytes.as_mut_ptr().cast(), length);
+            }
+            drop(allocation);
+            Ok(bytes)
+        }
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct TokenKey {
+            thread_token: bool,
+            token_type: i32,
+            impersonation: Option<i32>,
+            token_id: (u32, i32),
+            authentication_id: (u32, i32),
+            modified_id: (u32, i32),
+            user: Vec<u8>,
+            group: Vec<u8>,
+        }
+        struct TokenBuffer {
+            words: Vec<usize>,
+            length: usize,
+        }
+        fn token_buffer(handle: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<TokenBuffer> {
+            let mut needed = 0;
+            let first = unsafe { GetTokenInformation(handle, class, null_mut(), 0, &mut needed) };
+            let error = if first == 0 {
+                unsafe { GetLastError() }
+            } else {
+                ERROR_SUCCESS
+            };
+            require(
+                first == 0
+                    && error == ERROR_INSUFFICIENT_BUFFER
+                    && needed > 0
+                    && needed as usize <= LIMIT,
+                "oracle token sizing failed",
+            )?;
+            let mut words = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+            let capacity = words.len() * size_of::<usize>();
+            yes(unsafe {
+                GetTokenInformation(
+                    handle,
+                    class,
+                    words.as_mut_ptr().cast(),
+                    capacity as u32,
+                    &mut needed,
+                )
+            })?;
+            require(
+                needed > 0 && needed as usize <= capacity,
+                "oracle token result exceeds buffer",
+            )?;
+            Ok(TokenBuffer {
+                words,
+                length: needed as usize,
+            })
+        }
+        fn token_value<T: Copy>(handle: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<T> {
+            let buffer = token_buffer(handle, class)?;
+            require(buffer.length >= size_of::<T>(), "short token structure")?;
+            Ok(unsafe { buffer.words.as_ptr().cast::<T>().read() })
+        }
+        fn token_key(handle: HANDLE, thread_token: bool) -> io::Result<TokenKey> {
+            let first: TOKEN_STATISTICS = token_value(handle, TokenStatistics)?;
+            let user_buffer = token_buffer(handle, TokenUser)?;
+            require(
+                user_buffer.length >= size_of::<TOKEN_USER>(),
+                "short token user",
+            )?;
+            let user = unsafe { &*user_buffer.words.as_ptr().cast::<TOKEN_USER>() };
+            let user = sid_bytes(
+                user.User.Sid,
+                user_buffer.words.as_ptr().cast(),
+                user_buffer.length,
+            )?;
+            let group_buffer = token_buffer(handle, TokenPrimaryGroup)?;
+            require(
+                group_buffer.length >= size_of::<TOKEN_PRIMARY_GROUP>(),
+                "short token group",
+            )?;
+            let group = unsafe { &*group_buffer.words.as_ptr().cast::<TOKEN_PRIMARY_GROUP>() };
+            let group = sid_bytes(
+                group.PrimaryGroup,
+                group_buffer.words.as_ptr().cast(),
+                group_buffer.length,
+            )?;
+            let final_stats: TOKEN_STATISTICS = token_value(handle, TokenStatistics)?;
+            let luid = |value: LUID| (value.LowPart, value.HighPart);
+            require(
+                luid(first.TokenId) == luid(final_stats.TokenId)
+                    && luid(first.AuthenticationId) == luid(final_stats.AuthenticationId)
+                    && luid(first.ModifiedId) == luid(final_stats.ModifiedId)
+                    && first.TokenType == final_stats.TokenType,
+                "original token changed within capture",
+            )?;
+            let impersonation = if first.TokenType == TokenImpersonation {
+                let level: i32 = token_value(handle, TokenImpersonationLevel)?;
+                require(
+                    level == first.ImpersonationLevel,
+                    "token impersonation level disagreement",
+                )?;
+                Some(level)
+            } else {
+                require(first.TokenType == TokenPrimary, "unknown token type")?;
+                None
+            };
+            Ok(TokenKey {
+                thread_token,
+                token_type: first.TokenType,
+                impersonation,
+                token_id: luid(first.TokenId),
+                authentication_id: luid(first.AuthenticationId),
+                modified_id: luid(first.ModifiedId),
+                user,
+                group,
+            })
+        }
+        fn effective(handles: &mut Handles) -> io::Result<(usize, TokenKey)> {
+            let mut raw = null_mut();
+            let thread = unsafe {
+                OpenThreadToken(
+                    GetCurrentThread(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    1,
+                    &mut raw,
+                )
+            } != 0;
+            if !thread {
+                let error = unsafe { GetLastError() };
+                if error != ERROR_NO_TOKEN {
+                    return Err(io::Error::from_raw_os_error(error as i32));
+                }
+                yes(unsafe {
+                    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw)
+                })?;
+            }
+            let index = handles.own(raw);
+            let key = token_key(handles.raw(index), thread)?;
+            Ok((index, key))
+        }
+        fn stable_context(
+            handles: &mut Handles,
+            original: usize,
+            key: &TokenKey,
+        ) -> io::Result<()> {
+            require(
+                token_key(handles.raw(original), key.thread_token)? == *key,
+                "retained original token changed",
+            )?;
+            let (fresh, current) = effective(handles)?;
+            let stable = current == *key;
+            handles.close(fresh)?;
+            require(stable, "effective original token context changed")
+        }
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct SecurityFacts {
+            owner: Vec<u8>,
+            group: Vec<u8>,
+            dacl: Vec<u8>,
+            control: u16,
+        }
+        struct ReadDescriptor {
+            words: Vec<usize>,
+            facts: SecurityFacts,
+        }
+        fn read_descriptor(
+            handle: HANDLE,
+            key: &TokenKey,
+            mask: u32,
+        ) -> io::Result<ReadDescriptor> {
+            let mut owner = null_mut();
+            let mut group = null_mut();
+            let mut dacl = null_mut();
+            let mut raw = null_mut();
+            let result = unsafe {
+                GetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION
+                        | GROUP_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION,
+                    &mut owner,
+                    &mut group,
+                    &mut dacl,
+                    null_mut(),
+                    &mut raw,
+                )
+            };
+            if result != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(result as i32));
+            }
+            let allocation = LocalSecurityAllocation(raw.cast());
+            yes(unsafe { IsValidSecurityDescriptor(raw) })?;
+            let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+            require(
+                length >= size_of::<SECURITY_DESCRIPTOR_RELATIVE>() && length <= LIMIT,
+                "oracle descriptor bound exceeded",
+            )?;
+            let mut words = vec![0usize; length.div_ceil(size_of::<usize>())];
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.cast::<u8>(), words.as_mut_ptr().cast(), length);
+            }
+            drop(allocation);
+            let ptr = words.as_mut_ptr().cast();
+            yes(unsafe { IsValidSecurityDescriptor(ptr) })?;
+            let mut control = 0;
+            let mut revision = 0;
+            yes(unsafe { GetSecurityDescriptorControl(ptr, &mut control, &mut revision) })?;
+            require(
+                control & (SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE)
+                    == SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE,
+                "oracle descriptor control invalid",
+            )?;
+            let mut defaulted = 0;
+            let mut present = 0;
+            yes(unsafe { GetSecurityDescriptorOwner(ptr, &mut owner, &mut defaulted) })?;
+            yes(unsafe { GetSecurityDescriptorGroup(ptr, &mut group, &mut defaulted) })?;
+            yes(unsafe {
+                GetSecurityDescriptorDacl(ptr, &mut present, &mut dacl, &mut defaulted)
+            })?;
+            let owner = sid_bytes(owner, words.as_ptr().cast(), length)?;
+            let group = sid_bytes(group, words.as_ptr().cast(), length)?;
+            require(
+                owner == key.user && group == key.group && present != 0 && !dacl.is_null(),
+                "oracle owner/group/DACL mismatch",
+            )?;
+            let offset = (dacl as usize)
+                .checked_sub(words.as_ptr() as usize)
+                .ok_or_else(|| bad("DACL outside descriptor"))?;
+            require(
+                offset
+                    .checked_add(size_of::<ACL>())
+                    .is_some_and(|end| end <= length),
+                "short DACL",
+            )?;
+            let acl_length = unsafe { (*dacl).AclSize } as usize;
+            require(
+                acl_length >= size_of::<ACL>()
+                    && offset
+                        .checked_add(acl_length)
+                        .is_some_and(|end| end <= length),
+                "DACL outside buffer",
+            )?;
+            yes(unsafe { IsValidAcl(dacl) })?;
+            require(
+                unsafe { (*dacl).AceCount } == 1,
+                "oracle DACL has extra ACEs",
+            )?;
+            let mut ace = null_mut();
+            yes(unsafe { GetAce(dacl, 0, &mut ace) })?;
+            let ace_offset = (ace as usize)
+                .checked_sub(dacl as usize)
+                .ok_or_else(|| bad("ACE outside DACL"))?;
+            require(
+                ace_offset
+                    .checked_add(size_of::<ACE_HEADER>())
+                    .is_some_and(|end| end <= acl_length),
+                "short ACE",
+            )?;
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            require(
+                header.AceType == ACCESS_ALLOWED_ACE_TYPE
+                    && header.AceFlags == 0
+                    && header.AceSize as usize >= offset_of!(ACCESS_ALLOWED_ACE, SidStart) + 8
+                    && ace_offset
+                        .checked_add(header.AceSize as usize)
+                        .is_some_and(|end| end <= acl_length),
+                "noncanonical fixture ACE",
+            )?;
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = (&allowed.SidStart as *const u32).cast_mut().cast();
+            require(
+                allowed.Mask == mask
+                    && sid_bytes(sid, ace.cast(), header.AceSize as usize)? == key.user,
+                "oracle ACE mask/SID mismatch",
+            )?;
+            let dacl_bytes =
+                unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), acl_length) }.to_vec();
+            Ok(ReadDescriptor {
+                words,
+                facts: SecurityFacts {
+                    owner,
+                    group,
+                    dacl: dacl_bytes,
+                    control,
+                },
+            })
+        }
+        fn access_check(descriptor: &ReadDescriptor, duplicate: HANDLE) -> io::Result<bool> {
+            let mut mapping = GENERIC_MAPPING {
+                GenericRead: FILE_GENERIC_READ,
+                GenericWrite: FILE_GENERIC_WRITE,
+                GenericExecute: FILE_GENERIC_EXECUTE,
+                GenericAll: FILE_ALL_ACCESS,
+            };
+            let mut privileges =
+                vec![0usize; size_of::<PRIVILEGE_SET>().div_ceil(size_of::<usize>())];
+            for attempt in 0..2 {
+                let capacity = privileges.len() * size_of::<usize>();
+                let mut needed = capacity as u32;
+                let mut granted = 0;
+                let mut allowed = 0;
+                let succeeded = unsafe {
+                    AccessCheck(
+                        descriptor.words.as_ptr().cast_mut().cast(),
+                        duplicate,
+                        FILE_EXECUTE,
+                        &mut mapping,
+                        privileges.as_mut_ptr().cast(),
+                        &mut needed,
+                        &mut granted,
+                        &mut allowed,
+                    )
+                };
+                if succeeded == 0 {
+                    let error = unsafe { GetLastError() };
+                    if attempt == 0
+                        && error == ERROR_INSUFFICIENT_BUFFER
+                        && needed as usize > capacity
+                        && needed as usize <= LIMIT
+                    {
+                        privileges = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+                        continue;
+                    }
+                    return Err(io::Error::from_raw_os_error(error as i32));
+                }
+                require(
+                    needed as usize <= capacity,
+                    "AccessCheck privilege length exceeds buffer",
+                )?;
+                let set = privileges.as_ptr().cast::<PRIVILEGE_SET>();
+                let count = unsafe { (*set).PrivilegeCount } as usize;
+                let end = count
+                    .checked_mul(size_of::<LUID_AND_ATTRIBUTES>())
+                    .and_then(|tail| tail.checked_add(offset_of!(PRIVILEGE_SET, Privilege)))
+                    .ok_or_else(|| bad("AccessCheck privilege count overflow"))?;
+                require(
+                    end <= capacity && end <= needed as usize,
+                    "AccessCheck privilege records exceed output",
+                )?;
+                let executable = allowed != 0;
+                require(
+                    granted == if executable { FILE_EXECUTE } else { 0 },
+                    "AccessCheck granted-mask disagreement",
+                )?;
+                println!(
+                    "exec_oracle_access_check function_bool={succeeded} access_status={allowed} desired=0x{FILE_EXECUTE:08x} granted=0x{granted:08x} privilege_count={count} privilege_bytes={needed}"
+                );
+                return Ok(executable);
+            }
+            Err(bad("AccessCheck retry exhausted"))
+        }
+        #[derive(Debug)]
+        struct Entry {
+            name: OsString,
+            mask: u32,
+            id: Option<FileIdentity>,
+            facts: Option<SecurityFacts>,
+            snapshot: Option<SourceSnapshot>,
+            observed: Option<bool>,
+            removed: bool,
+        }
+        struct Fixture {
+            handles: Handles,
+            key: Option<TokenKey>,
+            original: Option<usize>,
+            duplicate: Option<usize>,
+            temp: Option<usize>,
+            temp_id: Option<FileIdentity>,
+            root: Option<usize>,
+            root_id: Option<FileIdentity>,
+            root_name: OsString,
+            path: PathBuf,
+            entries: Vec<Entry>,
+            directory: Option<SourceDirectory>,
+            sources: Vec<SourceFile>,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                static SERIAL: AtomicU64 = AtomicU64::new(0);
+                let name = OsString::from(format!(
+                    "orbit-exec-permission-{}-{}",
+                    std::process::id(),
+                    SERIAL.fetch_add(1, Ordering::Relaxed)
+                ));
+                Self {
+                    handles: Handles::default(),
+                    key: None,
+                    original: None,
+                    duplicate: None,
+                    temp: None,
+                    temp_id: None,
+                    root: None,
+                    root_id: None,
+                    path: std::env::temp_dir().join(&name),
+                    root_name: name,
+                    entries: Vec::new(),
+                    directory: None,
+                    sources: Vec::new(),
+                }
+            }
+            fn create(&mut self) -> io::Result<()> {
+                let (original, key) = effective(&mut self.handles)?;
+                self.original = Some(original);
+                self.key = Some(key.clone());
+                println!("exec_oracle_original_context={key:?}");
+                let level = key.impersonation.unwrap_or(SecurityImpersonation);
+                let mut raw = null_mut();
+                yes(unsafe {
+                    DuplicateTokenEx(
+                        self.handles.raw(original),
+                        TOKEN_QUERY,
+                        null(),
+                        level,
+                        TokenImpersonation,
+                        &mut raw,
+                    )
+                })?;
+                let duplicate = self.handles.own(raw);
+                self.duplicate = Some(duplicate);
+                let duplicate_stats: TOKEN_STATISTICS =
+                    token_value(self.handles.raw(duplicate), TokenStatistics)?;
+                require(
+                    duplicate_stats.TokenType == TokenImpersonation
+                        && duplicate_stats.ImpersonationLevel == level,
+                    "AccessCheck duplicate type/level invalid",
+                )?;
+                println!(
+                    "exec_oracle_accesscheck_duplicate type={} level={} id=({},{}) diagnostic_only=true",
+                    duplicate_stats.TokenType,
+                    duplicate_stats.ImpersonationLevel,
+                    duplicate_stats.TokenId.LowPart,
+                    duplicate_stats.TokenId.HighPart
+                );
+                let temp_path = wide(std::env::temp_dir().as_os_str());
+                let raw = unsafe {
+                    CreateFileW(
+                        temp_path.as_ptr(),
+                        FILE_LIST_DIRECTORY
+                            | FILE_ADD_SUBDIRECTORY
+                            | FILE_DELETE_CHILD
+                            | FILE_TRAVERSE
+                            | META,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        null(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                        null_mut(),
+                    )
+                };
+                if raw == INVALID_HANDLE_VALUE {
+                    return Err(io::Error::last_os_error());
+                }
+                let temp = self.handles.own(raw);
+                self.temp = Some(temp);
+                kind(raw, true)?;
+                self.temp_id = Some(identity(raw)?);
+                let security = descriptor(&key, FILE_ALL_ACCESS)?;
+                let root = relative(
+                    &mut self.handles,
+                    raw,
+                    &self.root_name,
+                    true,
+                    FILE_CREATE,
+                    FILE_ALL_ACCESS & !DELETE,
+                    security.as_ptr().cast(),
+                )?;
+                self.root = Some(root);
+                let root_raw = self.handles.raw(root);
+                kind(root_raw, true)?;
+                self.root_id = Some(identity(root_raw)?);
+                let _ = read_descriptor(root_raw, &key, FILE_ALL_ACCESS)?;
+                for (name, mask) in [
+                    ("permission-r", FILE_GENERIC_READ),
+                    ("permission-rx", FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
+                    ("permission-full", FILE_ALL_ACCESS),
+                ] {
+                    self.entries.push(Entry {
+                        name: OsString::from(name),
+                        mask,
+                        id: None,
+                        facts: None,
+                        snapshot: None,
+                        observed: None,
+                        removed: false,
+                    });
+                    let index = self.entries.len() - 1;
+                    let writer = relative(
+                        &mut self.handles,
+                        root_raw,
+                        OsStr::new(name),
+                        false,
+                        FILE_CREATE,
+                        FILE_ALL_ACCESS,
+                        security.as_ptr().cast(),
+                    )?;
+                    let raw = self.handles.raw(writer);
+                    kind(raw, false)?;
+                    self.entries[index].id = Some(identity(raw)?);
+                    let _ = read_descriptor(raw, &key, FILE_ALL_ACCESS)?;
+                    let mut written = 0;
+                    yes(unsafe {
+                        WriteFile(
+                            raw,
+                            PAYLOAD.as_ptr(),
+                            PAYLOAD.len() as u32,
+                            &mut written,
+                            null_mut(),
+                        )
+                    })?;
+                    require(
+                        written as usize == PAYLOAD.len(),
+                        "short execution fixture write",
+                    )?;
+                    yes(unsafe { FlushFileBuffers(raw) })?;
+                    let final_sd = descriptor(&key, mask)?;
+                    let mut present = 0;
+                    let mut dacl = null_mut();
+                    let mut defaulted = 0;
+                    yes(unsafe {
+                        GetSecurityDescriptorDacl(
+                            final_sd.as_ptr().cast_mut().cast(),
+                            &mut present,
+                            &mut dacl,
+                            &mut defaulted,
+                        )
+                    })?;
+                    require(
+                        present != 0 && !dacl.is_null(),
+                        "execution fixture sealing DACL missing",
+                    )?;
+                    let status = unsafe {
+                        SetSecurityInfo(
+                            raw,
+                            SE_FILE_OBJECT,
+                            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                            null_mut(),
+                            null_mut(),
+                            dacl,
+                            null_mut(),
+                        )
+                    };
+                    if status != ERROR_SUCCESS {
+                        return Err(io::Error::from_raw_os_error(status as i32));
+                    }
+                    let actual = read_descriptor(raw, &key, mask)?;
+                    self.entries[index].facts = Some(actual.facts);
+                    self.handles.close(writer)?;
+                    // Windows can finalize write metadata when the last writer
+                    // closes. Freeze only after that checked close, independently.
+                    let baseline = relative(
+                        &mut self.handles,
+                        root_raw,
+                        OsStr::new(name),
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    let baseline_raw = self.handles.raw(baseline);
+                    let sampled = snapshot(baseline_raw)?;
+                    require(
+                        Some(sampled.identity) == self.entries[index].id
+                            && read_descriptor(baseline_raw, &key, mask)?.facts
+                                == *self.entries[index].facts.as_ref().unwrap(),
+                        "fixture identity or policy changed after writer close",
+                    )?;
+                    self.entries[index].snapshot = Some(sampled);
+                    self.handles.close(baseline)?;
+                }
+                self.directory = Some(SourceDirectory::open(&self.path)?);
+                require(
+                    self.directory.as_ref().unwrap().identity() == self.root_id.unwrap(),
+                    "source root full ID mismatch",
+                )?;
+                Ok(())
+            }
+            fn collect(&mut self) -> io::Result<()> {
+                let key = self.key.as_ref().unwrap().clone();
+                let original = self.original.unwrap();
+                let duplicate = self.duplicate.unwrap();
+                let root = self.handles.raw(self.root.unwrap());
+                for index in 0..3 {
+                    stable_context(&mut self.handles, original, &key)?;
+                    let source = self
+                        .directory
+                        .as_ref()
+                        .unwrap()
+                        .open_file(&self.entries[index].name)?;
+                    self.sources.push(source);
+                    let before = self.sources[index].snapshot()?;
+                    require(
+                        Some(before) == self.entries[index].snapshot,
+                        "source snapshot differs from independently sealed fixture",
+                    )?;
+                    require(
+                        self.sources[index].read_limited(4096)? == PAYLOAD,
+                        "source fixture bytes differ",
+                    )?;
+                    let meta = relative(
+                        &mut self.handles,
+                        root,
+                        &self.entries[index].name,
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    let meta_raw = self.handles.raw(meta);
+                    require(
+                        snapshot(meta_raw)? == before,
+                        "metadata baseline identity/snapshot differs",
+                    )?;
+                    let sd = read_descriptor(meta_raw, &key, self.entries[index].mask)?;
+                    require(
+                        Some(&sd.facts) == self.entries[index].facts.as_ref(),
+                        "descriptor changed before AccessCheck",
+                    )?;
+                    let reader = relative(
+                        &mut self.handles,
+                        root,
+                        &self.entries[index].name,
+                        false,
+                        FILE_OPEN,
+                        FILE_GENERIC_READ,
+                        null(),
+                    )?;
+                    let read_raw = self.handles.raw(reader);
+                    require(
+                        snapshot(read_raw)? == before,
+                        "independent data-view snapshot differs",
+                    )?;
+                    let mut bytes = [0u8; 128];
+                    let mut count = 0;
+                    yes(unsafe {
+                        ReadFile(
+                            read_raw,
+                            bytes.as_mut_ptr(),
+                            bytes.len() as u32,
+                            &mut count,
+                            null_mut(),
+                        )
+                    })?;
+                    require(
+                        &bytes[..count as usize] == PAYLOAD,
+                        "independent native bytes differ",
+                    )?;
+                    self.handles.close(reader)?;
+                    let access = access_check(&sd, self.handles.raw(duplicate))?;
+                    let native = match relative(
+                        &mut self.handles,
+                        root,
+                        &self.entries[index].name,
+                        false,
+                        FILE_OPEN,
+                        META | FILE_EXECUTE,
+                        null(),
+                    ) {
+                        Ok(execute) => {
+                            require(
+                                snapshot(self.handles.raw(execute))? == before,
+                                "native execute-open snapshot differs",
+                            )?;
+                            require(
+                                read_descriptor(
+                                    self.handles.raw(execute),
+                                    &key,
+                                    self.entries[index].mask,
+                                )?
+                                .facts
+                                    == sd.facts,
+                                "execute-open descriptor differs",
+                            )?;
+                            self.handles.close(execute)?;
+                            true
+                        }
+                        Err(error) if native_is(&error, DENIED) => false,
+                        Err(error) => return Err(error),
+                    };
+                    require(
+                        access == native && access == [false, true, true][index],
+                        "AccessCheck/native execute oracle disagreement",
+                    )?;
+                    require(
+                        read_descriptor(meta_raw, &key, self.entries[index].mask)?.facts
+                            == sd.facts
+                            && snapshot(meta_raw)? == before
+                            && self.sources[index].snapshot()? == before,
+                        "fixture descriptor or sampled metadata changed during permission oracles",
+                    )?;
+                    stable_context(&mut self.handles, original, &key)?;
+                    self.handles.close(meta)?;
+                    self.entries[index].observed = Some(access);
+                    println!(
+                        "exec_oracle_case_complete name={:?} mask=0x{:08x} full_id={:?} owner={:?} group={:?} descriptor={:?} snapshot={before:?} AccessCheck={access} native_execute_open={native} expected={} metadata_baseline=success bytes_verified=true original_context_stable=true",
+                        self.entries[index].name,
+                        self.entries[index].mask,
+                        before.identity,
+                        sd.facts.owner,
+                        sd.facts.group,
+                        sd.facts,
+                        [false, true, true][index]
+                    );
+                }
+                // Resample all three after collection, before the first product call.
+                for index in 0..3 {
+                    let meta = relative(
+                        &mut self.handles,
+                        root,
+                        &self.entries[index].name,
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    require(
+                        snapshot(self.handles.raw(meta))? == self.entries[index].snapshot.unwrap()
+                            && read_descriptor(
+                                self.handles.raw(meta),
+                                &key,
+                                self.entries[index].mask,
+                            )?
+                            .facts
+                                == *self.entries[index].facts.as_ref().unwrap()
+                            && self.sources[index].snapshot()?
+                                == self.entries[index].snapshot.unwrap(),
+                        "all-three final oracle stability check failed",
+                    )?;
+                    self.handles.close(meta)?;
+                }
+                stable_context(&mut self.handles, original, &key)?;
+                self.handles.close(duplicate)?;
+                self.handles.close(original)?;
+                require(
+                    self.entries.iter().all(|entry| entry.observed.is_some()),
+                    "native oracle collection incomplete",
+                )?;
+                for (index, slot) in self.handles.slots.iter().enumerate() {
+                    require(
+                        slot.is_none() || Some(index) == self.temp || Some(index) == self.root,
+                        "test-owned native oracle handle remained before completion marker",
+                    )?;
+                }
+                println!(
+                    "exec_permission_oracles_complete count=3 observations=false,true,true original_context={key:?} all_test_owned_query_handles_checked_closed=true first_product_call_not_yet_made=true"
+                );
+                Ok(())
+            }
+            fn product(&self) -> io::Result<()> {
+                for index in 0..3 {
+                    println!(
+                        "exec_permission_product_call index={index} expected={} native_oracles_complete=3",
+                        self.entries[index].observed.unwrap()
+                    );
+                    let observed = self.sources[index].execution_permission()?;
+                    require(
+                        observed.executable() == self.entries[index].observed.unwrap(),
+                        "product execution permission differs from stable native oracles",
+                    )?;
+                }
+                Ok(())
+            }
+            fn cleanup(&mut self) -> io::Result<()> {
+                self.sources.clear();
+                let key = self.key.as_ref().unwrap().clone();
+                let root = self.handles.raw(self.root.unwrap());
+                let root_id = self.root_id.unwrap();
+                let listed = self
+                    .directory
+                    .as_ref()
+                    .unwrap()
+                    .enumerate(EnumerationLimits {
+                        max_entries: 3,
+                        max_name_bytes: 1024,
+                    })?;
+                require(
+                    listed.len() == 3
+                        && self.entries.iter().all(|entry| {
+                            listed.iter().any(|seen| {
+                                seen.name == entry.name && Some(seen.identity) == entry.id
+                            })
+                        }),
+                    "fixture cleanup inventory differs",
+                )?;
+                for index in 0..3 {
+                    let delete = relative(
+                        &mut self.handles,
+                        root,
+                        &self.entries[index].name,
+                        false,
+                        FILE_OPEN,
+                        DELETE | META,
+                        null(),
+                    )?;
+                    let raw = self.handles.raw(delete);
+                    require(
+                        Some(snapshot(raw)?) == self.entries[index].snapshot
+                            && read_descriptor(raw, &key, self.entries[index].mask)?.facts
+                                == *self.entries[index].facts.as_ref().unwrap(),
+                        "fixture changed before checked cleanup",
+                    )?;
+                    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                    yes(unsafe {
+                        SetFileInformationByHandle(
+                            raw,
+                            FileDispositionInfo,
+                            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                            size_of::<FILE_DISPOSITION_INFO>() as u32,
+                        )
+                    })?;
+                    self.handles.close(delete)?;
+                    match relative(
+                        &mut self.handles,
+                        root,
+                        &self.entries[index].name,
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    ) {
+                        Err(error) if native_is(&error, ABSENT) => {}
+                        Ok(found) => {
+                            self.handles.close(found)?;
+                            return Err(bad("fixture payload remains after deletion"));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    self.entries[index].removed = true;
+                }
+                require(
+                    self.directory
+                        .as_ref()
+                        .unwrap()
+                        .enumerate(EnumerationLimits {
+                            max_entries: 3,
+                            max_name_bytes: 1024,
+                        })?
+                        .is_empty(),
+                    "fixture root not empty after cleanup",
+                )?;
+                drop(self.directory.take());
+                self.handles.close(self.root.unwrap())?;
+                let temp = self.handles.raw(self.temp.unwrap());
+                require(
+                    Some(identity(temp)?) == self.temp_id,
+                    "temporary parent identity changed",
+                )?;
+                let delete = relative(
+                    &mut self.handles,
+                    temp,
+                    &self.root_name,
+                    true,
+                    FILE_OPEN,
+                    DELETE | META,
+                    null(),
+                )?;
+                let raw = self.handles.raw(delete);
+                kind(raw, true)?;
+                require(
+                    identity(raw)? == root_id,
+                    "fixture root changed before deletion",
+                )?;
+                let _ = read_descriptor(raw, &key, FILE_ALL_ACCESS)?;
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                yes(unsafe {
+                    SetFileInformationByHandle(
+                        raw,
+                        FileDispositionInfo,
+                        (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                        size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                })?;
+                self.handles.close(delete)?;
+                match relative(
+                    &mut self.handles,
+                    temp,
+                    &self.root_name,
+                    true,
+                    FILE_OPEN,
+                    META,
+                    null(),
+                ) {
+                    Err(error) if native_is(&error, ABSENT) => {}
+                    Ok(found) => {
+                        self.handles.close(found)?;
+                        return Err(bad("fixture root remains after deletion"));
+                    }
+                    Err(error) => return Err(error),
+                }
+                self.handles.close(self.temp.unwrap())?;
+                require(
+                    self.handles.slots.iter().all(Option::is_none),
+                    "native owner remained after fixture teardown",
+                )?;
+                println!(
+                    "exec_permission_fixture_teardown=complete payloads=3 root_absent=true acl_repair=false native_close_facts={:?}",
+                    self.handles.closed
+                );
+                Ok(())
+            }
+            fn preserve(&mut self) -> Vec<String> {
+                self.sources.clear();
+                drop(self.directory.take());
+                let errors = self.handles.close_all();
+                println!(
+                    "exec_permission_fixture_preserved non_authorizing=true path={:?} root={:?} entries={:?} close_facts={:?} close_errors={errors:?}",
+                    self.path, self.root_id, self.entries, self.handles.closed
+                );
+                errors
+            }
+        }
+        pub(super) fn run() -> io::Result<()> {
+            let mut fixture = Fixture::new();
+            if let Err(primary) = fixture.create().and_then(|_| fixture.collect()) {
+                let close = fixture.preserve();
+                return Err(io::Error::new(
+                    primary.kind(),
+                    format!(
+                        "EXEC_ORACLE_SETUP_FAILURE; not a valid behavioral RED: {primary}; close_errors={close:?}"
+                    ),
+                ));
+            }
+            let product = fixture.product();
+            if let Err(cleanup) = fixture.cleanup() {
+                let close = fixture.preserve();
+                return Err(io::Error::other(format!(
+                    "EXEC_ORACLE_TEARDOWN_FAILURE; not a valid behavioral RED: {cleanup}; product={product:?}; close_errors={close:?}"
+                )));
+            }
+            product.map_err(|error| io::Error::new(error.kind(), format!("product execution_permission failed after all three native oracles and checked teardown: {error}")))
+        }
+    }
+
+    #[test]
+    fn source_execution_permission_matches_native_r_rx_and_full_control() -> std::io::Result<()> {
+        execution_oracle::run()
+    }
 }
