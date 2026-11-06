@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 #[cfg(all(test, feature = "registry-witness"))]
 use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
+#[cfg(all(test, feature = "registry-witness"))]
+use windows_sys::Wdk::Storage::FileSystem::FILE_DIRECTORY_FILE;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
     FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
@@ -40,6 +42,8 @@ use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows_sys::Win32::System::Threading::*;
+#[cfg(all(test, feature = "registry-witness"))]
+use windows_sys::Win32::System::WindowsProgramming::FILE_CREATED;
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
 #[derive(Debug)]
@@ -2621,6 +2625,7 @@ mod registry_witness_tests {
         directory: PathBuf,
         path: PathBuf,
         file: File,
+        directory_identity: (u64, [u8; 16]),
         identity: (u64, [u8; 16]),
         sha256: String,
     }
@@ -2680,11 +2685,176 @@ mod registry_witness_tests {
         }
     }
 
+    fn helper_directory_security_descriptor(
+        user_sid: &str,
+        package_sid: &str,
+    ) -> io::Result<LocalSecurityDescriptor> {
+        let descriptor_sddl = wide(OsStr::new(&format!(
+            "O:{user_sid}D:P(A;;FA;;;{user_sid})(A;;FX;;;{package_sid})"
+        )))?;
+        let mut descriptor = null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                descriptor_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        };
+        if converted == 0 {
+            let primary = operation_error(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW(helper directory)",
+                io::Error::last_os_error(),
+            );
+            let mut allocation = LocalSecurityDescriptor(descriptor);
+            return match allocation.free() {
+                Ok(()) => Err(primary),
+                Err(finalization) => Err(with_directory_diagnostics(
+                    Some(primary),
+                    vec![format!("descriptor finalization failed: {finalization}")],
+                )),
+            };
+        }
+        if descriptor.is_null() {
+            return Err(invalid("helper directory descriptor is null"));
+        }
+        Ok(LocalSecurityDescriptor(descriptor))
+    }
+
+    fn descriptor_dacl_bytes(descriptor: PSECURITY_DESCRIPTOR) -> io::Result<Vec<u8>> {
+        let (mut present, mut dacl, mut defaulted) = (0, null_mut(), 0);
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            == 0
+        {
+            return Err(operation_error(
+                "GetSecurityDescriptorDacl(helper directory)",
+                io::Error::last_os_error(),
+            ));
+        }
+        if present == 0 || dacl.is_null() {
+            return Err(invalid("helper directory DACL is absent or null"));
+        }
+        let mut information = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(operation_error(
+                "GetAclInformation(helper directory)",
+                io::Error::last_os_error(),
+            ));
+        }
+        let length = information.AclBytesInUse as usize;
+        if length < size_of::<ACL>() || length > u16::MAX as usize {
+            return Err(invalid("helper directory DACL length is outside bounds"));
+        }
+        // GetAclInformation supplied the bounded byte length for this live ACL.
+        Ok(unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), length) }.to_vec())
+    }
+
+    fn create_owned_helper_directory(
+        session: &SandboxSession,
+        leaf: &str,
+        user_sid: &str,
+        package_sid: &str,
+    ) -> io::Result<(OwnedHandle, Vec<u8>)> {
+        let root = session
+            .root
+            .as_ref()
+            .ok_or_else(|| invalid("profile closed"))?;
+        let mut name: Vec<u16> = leaf.encode_utf16().collect();
+        if name.is_empty() || name.contains(&0) {
+            return Err(invalid("invalid helper directory component"));
+        }
+        let byte_length = name
+            .len()
+            .checked_mul(size_of::<u16>())
+            .filter(|length| *length <= u16::MAX as usize - size_of::<u16>())
+            .ok_or_else(|| invalid("helper directory name exceeds UNICODE_STRING limits"))?;
+        name.push(0);
+        let mut object_name = UNICODE_STRING {
+            Length: byte_length as u16,
+            MaximumLength: (byte_length + size_of::<u16>()) as u16,
+            Buffer: name.as_mut_ptr(),
+        };
+        let mut security = helper_directory_security_descriptor(user_sid, package_sid)?;
+        let result = (|| {
+            let expected_dacl = descriptor_dacl_bytes(security.0)?;
+            let attributes = OBJECT_ATTRIBUTES {
+                Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: root.as_raw_handle(),
+                ObjectName: &mut object_name,
+                Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+                SecurityDescriptor: security.0.cast(),
+                SecurityQualityOfService: null_mut(),
+            };
+            let mut raw_handle = null_mut();
+            let mut status = IO_STATUS_BLOCK::default();
+            let ntstatus = unsafe {
+                NtCreateFile(
+                    &mut raw_handle,
+                    FILE_LIST_DIRECTORY
+                        | FILE_TRAVERSE
+                        | FILE_READ_ATTRIBUTES
+                        | READ_CONTROL
+                        | SYNCHRONIZE,
+                    &attributes,
+                    &mut status,
+                    null(),
+                    FILE_ATTRIBUTE_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_CREATE,
+                    FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                    null(),
+                    0,
+                )
+            };
+            if ntstatus < 0 {
+                return Err(operation_error(
+                    "NtCreateFile(FILE_CREATE helper directory)",
+                    io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(ntstatus) } as i32),
+                ));
+            }
+            // Transfer ownership before validation or any subsequent fallible work.
+            let handle = own("NtCreateFile(helper directory handle)", raw_handle)?;
+            if status.Information != FILE_CREATED as usize {
+                return Err(operation_error(
+                    "NtCreateFile(FILE_CREATE helper directory disposition)",
+                    invalid("successful directory creation did not report FILE_CREATED"),
+                ));
+            }
+            Ok((handle, expected_dacl))
+        })();
+        let finalization = security.free();
+        match (result, finalization) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(finalization)) => Err(with_directory_diagnostics(
+                None,
+                vec![format!(
+                    "helper descriptor finalization failed: {finalization}"
+                )],
+            )),
+            (Err(primary), Err(finalization)) => Err(with_directory_diagnostics(
+                Some(primary),
+                vec![format!(
+                    "helper descriptor finalization failed: {finalization}"
+                )],
+            )),
+        }
+    }
+
     struct DirectoryDescriptorObservation {
         owner_matches_user: Option<bool>,
         dacl_present: Option<bool>,
         dacl_null: Option<bool>,
         dacl_protected: Option<bool>,
+        dacl_matches_expected: Option<bool>,
         errors: Vec<String>,
     }
 
@@ -2778,12 +2948,14 @@ mod registry_witness_tests {
         path: &Path,
         original_identity: (u64, [u8; 16]),
         user_sid: &str,
+        expected_dacl: Option<&[u8]>,
     ) -> DirectoryDescriptorObservation {
         let mut observation = DirectoryDescriptorObservation {
             owner_matches_user: None,
             dacl_present: None,
             dacl_null: None,
             dacl_protected: None,
+            dacl_matches_expected: None,
             errors: Vec::new(),
         };
         let path_wide = match wide(path.as_os_str()) {
@@ -2887,6 +3059,19 @@ mod registry_witness_tests {
             } else {
                 observation.dacl_present = Some(dacl_present != 0);
                 observation.dacl_null = Some(dacl_pointer.is_null());
+                if dacl_present != 0 && !dacl_pointer.is_null() {
+                    match descriptor_dacl_bytes(descriptor.0) {
+                        Ok(actual) => {
+                            observation.dacl_matches_expected =
+                                expected_dacl.map(|expected| actual.as_slice() == expected);
+                        }
+                        Err(error) => observation
+                            .errors
+                            .push(format!("directory DACL verification failed: {error}")),
+                    }
+                } else if expected_dacl.is_some() {
+                    observation.dacl_matches_expected = Some(false);
+                }
             }
 
             let (mut control, mut revision) = (0, 0);
@@ -2974,27 +3159,28 @@ mod registry_witness_tests {
         user_sid: &str,
         package_sid: &str,
     ) -> io::Result<HeldHelperImage> {
-        let directory = session.folder.join(format!("registry-helper-{nonce}"));
-        std::fs::create_dir(&directory)
-            .map_err(|error| operation_error("CreateDirectory(helper image)", error))?;
+        let leaf = format!("registry-helper-{nonce}");
+        let directory = session.folder.join(&leaf);
         let path = directory.join("orbit-registry-helper.exe");
+        let mut directory_created = false;
+        let mut directory_identity = None;
         let mut image_file_created = false;
         let mut diagnostic_errors = Vec::new();
         let result = (|| {
-            let directory_wide = wide(directory.as_os_str())?;
-            let directory_requested_access = FILE_READ_ATTRIBUTES | WRITE_DAC | FILE_TRAVERSE;
-            let directory_handle = own("CreateFileW(owned helper directory)", unsafe {
-                CreateFileW(
-                    directory_wide.as_ptr(),
-                    directory_requested_access,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                    null_mut(),
-                )
-            })?;
+            let (directory_handle, expected_dacl) =
+                create_owned_helper_directory(session, &leaf, user_sid, package_sid)?;
+            directory_created = true;
+            // The current witness has no identity-bound delete operation, so
+            // keep profile teardown disarmed even if this stack is interrupted.
+            session.retain_profile_for_registry_witness();
             check_object(directory_handle.as_raw_handle(), true)?;
+            let original_identity = script_identity(directory_handle.as_raw_handle())?;
+            directory_identity = Some(original_identity);
+            let directory_requested_access = FILE_LIST_DIRECTORY
+                | FILE_TRAVERSE
+                | FILE_READ_ATTRIBUTES
+                | READ_CONTROL
+                | SYNCHRONIZE;
             let (query_status, returned_length, granted_access) =
                 query_directory_handle_access(directory_handle.as_raw_handle());
             let write_dac = granted_access.map(|mask| mask & WRITE_DAC != 0);
@@ -3007,15 +3193,6 @@ mod registry_witness_tests {
                 observed_bool(write_dac)
             );
             record_helper_diagnostic(&access_record, &mut diagnostic_errors);
-
-            let original_identity = match script_identity(directory_handle.as_raw_handle()) {
-                Ok(identity) => Some(identity),
-                Err(error) => {
-                    diagnostic_errors
-                        .push(format!("directory handle identity query failed: {error}"));
-                    None
-                }
-            };
             if granted_access.is_none() {
                 diagnostic_errors.push(format!(
                     "NtQueryObject directory access unknown: status={:#010x} returned_length={} expected_length={}",
@@ -3023,39 +3200,38 @@ mod registry_witness_tests {
                     returned_length,
                     size_of::<[u32; 14]>()
                 ));
+            } else if granted_access
+                .is_some_and(|mask| mask & directory_requested_access != directory_requested_access)
+            {
+                diagnostic_errors.push(format!(
+                    "NtQueryObject directory granted access lacks requested rights: requested={directory_requested_access:#010x} actual={:#010x}",
+                    granted_access.unwrap_or_default()
+                ));
             }
-            if write_dac == Some(true) {
-                match original_identity {
-                    Some(identity) => {
-                        let observation =
-                            observe_directory_descriptor(&directory, identity, user_sid);
-                        let descriptor_record = format!(
-                            "registry_witness_helper_directory_descriptor owner_matches_user={} dacl_present={} dacl_null={} dacl_protected={}",
-                            observed_bool(observation.owner_matches_user),
-                            observed_bool(observation.dacl_present),
-                            observed_bool(observation.dacl_null),
-                            observed_bool(observation.dacl_protected)
-                        );
-                        record_helper_diagnostic(&descriptor_record, &mut diagnostic_errors);
-                        diagnostic_errors.extend(observation.errors);
-                    }
-                    None => diagnostic_errors.push(
-                        "directory descriptor observation skipped: exact original identity unknown"
-                            .to_owned(),
-                    ),
-                }
-            }
-
-            let dacl_result = set_owned_resource_dacl(
-                directory_handle.as_raw_handle(),
+            let observation = observe_directory_descriptor(
+                &directory,
+                original_identity,
                 user_sid,
-                package_sid,
-                "FX",
-                "SetSecurityInfo(helper image directory)",
+                Some(&expected_dacl),
             );
-            if let Err(primary) = dacl_result {
+            let descriptor_record = format!(
+                "registry_witness_helper_directory_descriptor owner_matches_user={} dacl_present={} dacl_null={} dacl_protected={} dacl_matches_expected={}",
+                observed_bool(observation.owner_matches_user),
+                observed_bool(observation.dacl_present),
+                observed_bool(observation.dacl_null),
+                observed_bool(observation.dacl_protected),
+                observed_bool(observation.dacl_matches_expected)
+            );
+            record_helper_diagnostic(&descriptor_record, &mut diagnostic_errors);
+            diagnostic_errors.extend(observation.errors);
+            if observation.owner_matches_user != Some(true)
+                || observation.dacl_present != Some(true)
+                || observation.dacl_null != Some(false)
+                || observation.dacl_protected != Some(true)
+                || observation.dacl_matches_expected != Some(true)
+            {
                 return Err(with_directory_diagnostics(
-                    Some(primary),
+                    Some(invalid("new helper directory security verification failed")),
                     std::mem::take(&mut diagnostic_errors),
                 ));
             }
@@ -3136,6 +3312,7 @@ mod registry_witness_tests {
                 directory: directory.clone(),
                 path: path.clone(),
                 file,
+                directory_identity: original_identity,
                 identity,
                 sha256,
             })
@@ -3143,84 +3320,27 @@ mod registry_witness_tests {
         match result {
             Ok(image) => Ok(image),
             Err(primary) => {
-                let cleanup = cleanup_partial_helper_image(&directory, &path, image_file_created);
-                match cleanup {
-                    Ok(()) => {
-                        let detail = format!(
-                            "helper image setup failed: {primary}; partial image cleanup=absence proven"
-                        );
-                        let record = emit_witness_record(
-                            "registry_witness_setup_cleanup object=partial_helper_image outcome=absence_proven",
-                        );
-                        Err(io::Error::other(match record {
-                            Ok(()) => detail,
-                            Err(record_error) => {
-                                format!("{detail}; status record emission failed: {record_error}")
-                            }
-                        }))
+                let retained_profile = session.retain_profile_for_registry_witness();
+                let detail = format!(
+                    "helper image setup failed: {primary}; partial helper image cleanup intentionally skipped because deletion is not bound to the held directory; image={} image_created={} directory={} directory_created={} directory_identity={} residue=preserved-or-unverified; {retained_profile}",
+                    path.display(),
+                    image_file_created,
+                    directory.display(),
+                    directory_created,
+                    directory_identity
+                        .map_or_else(|| "unknown".to_owned(), |identity| identity_text(identity))
+                );
+                let record = emit_witness_record(&format!(
+                    "registry_witness_setup_cleanup object=partial_helper_image outcome=FAILED retained={retained_profile} detail={}",
+                    escape_diagnostic(detail.as_bytes())
+                ));
+                Err(io::Error::other(match record {
+                    Ok(()) => detail,
+                    Err(record_error) => {
+                        format!("{detail}; status record emission failed: {record_error}")
                     }
-                    Err(cleanup) => {
-                        let retained_profile = session.retain_profile_for_registry_witness();
-                        let detail = format!(
-                            "helper image setup failed: {primary}; exact-owned cleanup failed; image={} directory={} residue=unverified: {cleanup}",
-                            path.display(),
-                            directory.display()
-                        );
-                        let record = emit_witness_record(&format!(
-                            "registry_witness_setup_cleanup object=partial_helper_image outcome=FAILED retained={retained_profile} detail={}",
-                            escape_diagnostic(detail.as_bytes())
-                        ));
-                        Err(io::Error::other(match record {
-                            Ok(()) => format!("{detail}; {retained_profile}"),
-                            Err(record_error) => format!(
-                                "{detail}; {retained_profile}; status record emission failed: {record_error}"
-                            ),
-                        }))
-                    }
-                }
+                }))
             }
-        }
-    }
-
-    fn cleanup_partial_helper_image(
-        directory: &Path,
-        path: &Path,
-        image_file_created: bool,
-    ) -> io::Result<()> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if !image_file_created || !metadata.file_type().is_file() {
-                    return Err(io::Error::other("unexpected helper image object preserved"));
-                }
-                std::fs::remove_file(path)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        match std::fs::symlink_metadata(directory) {
-            Ok(metadata) => {
-                if !metadata.file_type().is_dir() {
-                    return Err(io::Error::other(
-                        "unexpected helper image directory object preserved",
-                    ));
-                }
-                std::fs::remove_dir(directory)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        confirm_absent(path)?;
-        confirm_absent(directory)
-    }
-
-    fn confirm_absent(path: &Path) -> io::Result<()> {
-        match std::fs::symlink_metadata(path) {
-            Ok(_) => Err(io::Error::other(format!(
-                "owned image object remains: {}",
-                path.display()
-            ))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
         }
     }
 
@@ -3228,6 +3348,7 @@ mod registry_witness_tests {
         fn cleanup(self) -> io::Result<()> {
             let path = self.path.clone();
             let directory = self.directory.clone();
+            let expected_directory_identity = self.directory_identity;
             let result = (|| {
                 let identity = script_identity(self.file.as_raw_handle())?;
                 let mut verify = self.file.try_clone()?;
@@ -3235,19 +3356,22 @@ mod registry_witness_tests {
                 let mut bytes = Vec::new();
                 verify.read_to_end(&mut bytes)?;
                 if identity != self.identity || digest(&bytes)? != self.sha256 {
-                    return Err(io::Error::other("held helper image changed before cleanup"));
+                    return Err(io::Error::other(
+                        "held helper image identity or digest changed",
+                    ));
                 }
-                drop(verify);
-                drop(self.file);
-                std::fs::remove_file(&path)?;
-                std::fs::remove_dir(&directory)?;
-                confirm_absent(&path)?;
-                confirm_absent(&directory)
+                Err(io::Error::other(
+                    "deletion is not bound to the held helper directory; cleanup skipped",
+                ))
             })();
-            result.map_err(|error| io::Error::other(format!(
-                "owned helper image cleanup failed; image={} directory={} residue=unverified: {error}",
-                path.display(), directory.display()
-            )))
+            result.map_err(|error| {
+                io::Error::other(format!(
+                    "helper image cleanup failed; image={} directory={} directory_identity={} residue=preserved-or-unverified; profile retention required: {error}",
+                    path.display(),
+                    directory.display(),
+                    identity_text(expected_directory_identity)
+                ))
+            })
         }
     }
 
