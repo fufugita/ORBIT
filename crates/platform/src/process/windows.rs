@@ -4745,6 +4745,266 @@ mod registry_witness_tests {
         Ok(())
     }
 
+    const MAX_CANCEL_JOB_DIAGNOSTIC_MEMBERS: usize = 16;
+
+    #[repr(C)]
+    struct BoundedJobProcessIdList {
+        number_of_assigned_processes: u32,
+        number_of_process_ids_in_list: u32,
+        process_id_list: [usize; MAX_CANCEL_JOB_DIAGNOSTIC_MEMBERS],
+    }
+
+    fn checked_job_process_id_count(
+        assigned: u32,
+        listed: u32,
+        returned_bytes: u32,
+    ) -> io::Result<usize> {
+        let count = usize::try_from(listed)
+            .map_err(|_| invalid("Job process ID count conversion overflow"))?;
+        let header_bytes = std::mem::offset_of!(BoundedJobProcessIdList, process_id_list);
+        let list_bytes = count
+            .checked_mul(size_of::<usize>())
+            .ok_or_else(|| invalid("Job process ID byte count overflow"))?;
+        let required_bytes = header_bytes
+            .checked_add(list_bytes)
+            .ok_or_else(|| invalid("Job process ID buffer length overflow"))?;
+        let returned_bytes = usize::try_from(returned_bytes)
+            .map_err(|_| invalid("Job process ID returned length conversion overflow"))?;
+        if count > MAX_CANCEL_JOB_DIAGNOSTIC_MEMBERS
+            || assigned < listed
+            || returned_bytes < header_bytes
+            || returned_bytes < required_bytes
+            || returned_bytes > size_of::<BoundedJobProcessIdList>()
+        {
+            return Err(invalid("invalid or incomplete Job process ID list shape"));
+        }
+        Ok(count)
+    }
+
+    fn verify_job_process_id_list_oracle() -> io::Result<()> {
+        let header_bytes = std::mem::offset_of!(BoundedJobProcessIdList, process_id_list);
+        let bytes_for = |count: usize| -> io::Result<u32> {
+            let bytes = header_bytes
+                .checked_add(
+                    count
+                        .checked_mul(size_of::<usize>())
+                        .ok_or_else(|| invalid("Job process ID oracle overflow"))?,
+                )
+                .ok_or_else(|| invalid("Job process ID oracle length overflow"))?;
+            u32::try_from(bytes).map_err(|_| invalid("Job process ID oracle size overflow"))
+        };
+        if checked_job_process_id_count(2, 2, bytes_for(2)?)? != 2
+            || checked_job_process_id_count(17, 16, bytes_for(16)?)? != 16
+            || checked_job_process_id_count(2, 2, bytes_for(2)? - 1).is_ok()
+            || checked_job_process_id_count(1, 2, bytes_for(2)?).is_ok()
+            || checked_job_process_id_count(
+                17,
+                (MAX_CANCEL_JOB_DIAGNOSTIC_MEMBERS + 1) as u32,
+                u32::MAX,
+            )
+            .is_ok()
+            || checked_job_process_id_count(0, 0, u32::MAX).is_ok()
+        {
+            return Err(invalid("Job process ID list validation oracle failed"));
+        }
+        Ok(())
+    }
+
+    fn emit_cancel_job_member_diagnostics(
+        child: &OwnedProcess<'_>,
+        child_pid: u32,
+        child_creation: &str,
+        active_processes: u32,
+    ) -> io::Result<()> {
+        let mut list = BoundedJobProcessIdList {
+            number_of_assigned_processes: 0,
+            number_of_process_ids_in_list: 0,
+            process_id_list: [0; MAX_CANCEL_JOB_DIAGNOSTIC_MEMBERS],
+        };
+        let mut returned_bytes = 0u32;
+        let query_succeeded = unsafe {
+            QueryInformationJobObject(
+                child.job.as_raw_handle(),
+                JobObjectBasicProcessIdList,
+                (&mut list as *mut BoundedJobProcessIdList).cast(),
+                u32::try_from(size_of::<BoundedJobProcessIdList>())
+                    .map_err(|_| invalid("Job process ID diagnostic buffer too large"))?,
+                &mut returned_bytes,
+            )
+        };
+        if query_succeeded == 0 {
+            let error = io::Error::last_os_error();
+            let detail = error.to_string();
+            return emit_witness_record(&format!(
+                "registry_witness_diagnostic stream=cancel_job_members child_pid={child_pid} creation={child_creation} active_processes={active_processes} query=failed native_error={} error_bytes={} error_truncated={} error_text={}",
+                error
+                    .raw_os_error()
+                    .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+                detail.len(),
+                detail.len() > 1024,
+                escape_diagnostic(detail.as_bytes())
+            ));
+        }
+
+        let assigned = list.number_of_assigned_processes;
+        let listed = list.number_of_process_ids_in_list;
+        let count = match checked_job_process_id_count(assigned, listed, returned_bytes) {
+            Ok(count) => count,
+            Err(error) => {
+                return emit_witness_record(&format!(
+                    "registry_witness_diagnostic stream=cancel_job_members child_pid={child_pid} creation={child_creation} active_processes={active_processes} query=invalid assigned={assigned} listed={listed} returned_bytes={returned_bytes} capacity_bytes={} error={}",
+                    size_of::<BoundedJobProcessIdList>(),
+                    escape_diagnostic(error.to_string().as_bytes())
+                ));
+            }
+        };
+        emit_witness_record(&format!(
+            "registry_witness_diagnostic stream=cancel_job_members child_pid={child_pid} creation={child_creation} active_processes={active_processes} query=success assigned={assigned} listed={listed} returned_bytes={returned_bytes} capacity_bytes={} snapshot_complete={} active_count_matches={}",
+            size_of::<BoundedJobProcessIdList>(),
+            assigned == listed,
+            assigned == active_processes
+        ))?;
+
+        for (index, raw_pid) in list.process_id_list[..count].iter().copied().enumerate() {
+            let pid = match u32::try_from(raw_pid) {
+                Ok(pid) if pid != 0 => pid,
+                _ => {
+                    emit_witness_record(&format!(
+                        "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={raw_pid} identity=invalid"
+                    ))?;
+                    continue;
+                }
+            };
+            let process = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    pid,
+                )
+            };
+            if process.is_null() {
+                let error = io::Error::last_os_error();
+                emit_witness_record(&format!(
+                    "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} process_open=failed native_error={}",
+                    error
+                        .raw_os_error()
+                        .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+                ))?;
+                continue;
+            }
+            let process = unsafe { OwnedHandle::from_raw_handle(process) };
+            let actual_pid = unsafe { GetProcessId(process.as_raw_handle()) };
+            if actual_pid == 0 {
+                let error = io::Error::last_os_error();
+                emit_witness_record(&format!(
+                    "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} identity=unknown native_error={}",
+                    error
+                        .raw_os_error()
+                        .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+                ))?;
+                continue;
+            }
+            if actual_pid != pid {
+                emit_witness_record(&format!(
+                    "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} identity=pid_mismatch actual_pid={actual_pid}"
+                ))?;
+                continue;
+            }
+            let actual_creation = match process_creation_text(process.as_raw_handle()) {
+                Ok(creation) => creation,
+                Err(error) => {
+                    emit_witness_record(&format!(
+                        "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} actual_pid={actual_pid} creation=unknown process_times=failed error={}",
+                        escape_diagnostic(error.to_string().as_bytes())
+                    ))?;
+                    continue;
+                }
+            };
+            let own_identity_matches = pid != child_pid || actual_creation == child_creation;
+            let child_identity_binding = if pid == child_pid {
+                if own_identity_matches {
+                    "matches"
+                } else {
+                    "mismatch"
+                }
+            } else {
+                "not_applicable"
+            };
+            let mut in_owned_job = 0;
+            let membership_succeeded = unsafe {
+                IsProcessInJob(
+                    process.as_raw_handle(),
+                    child.job.as_raw_handle(),
+                    &mut in_owned_job,
+                )
+            };
+            if membership_succeeded == 0 {
+                let error = io::Error::last_os_error();
+                emit_witness_record(&format!(
+                    "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} actual_pid={actual_pid} actual_creation={actual_creation} child_identity_binding={child_identity_binding} membership=unknown native_error={}",
+                    error
+                        .raw_os_error()
+                        .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+                ))?;
+                continue;
+            }
+            if in_owned_job == 0 || !own_identity_matches {
+                emit_witness_record(&format!(
+                    "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} actual_pid={actual_pid} actual_creation={actual_creation} child_identity_binding={child_identity_binding} membership={} image_query=skipped",
+                    in_owned_job != 0
+                ))?;
+                continue;
+            }
+
+            let mut image_path = vec![0u16; 32_768];
+            let mut image_path_units = u32::try_from(image_path.len())
+                .map_err(|_| invalid("process image path buffer length overflow"))?;
+            if unsafe {
+                QueryFullProcessImageNameW(
+                    process.as_raw_handle(),
+                    PROCESS_NAME_WIN32,
+                    image_path.as_mut_ptr(),
+                    &mut image_path_units,
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                emit_witness_record(&format!(
+                    "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} actual_pid={actual_pid} actual_creation={actual_creation} child_identity_binding={child_identity_binding} membership=true image_query=unknown native_error={}",
+                    error
+                        .raw_os_error()
+                        .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+                ))?;
+                continue;
+            }
+            let path_units = usize::try_from(image_path_units)
+                .map_err(|_| invalid("process image path length conversion overflow"))?;
+            if path_units == 0 || path_units > image_path.len() {
+                emit_witness_record(&format!(
+                    "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} actual_pid={actual_pid} actual_creation={actual_creation} membership=true image_query=invalid returned_units={path_units} capacity_units={}",
+                    image_path.len()
+                ))?;
+                continue;
+            }
+            let shown_units = path_units.min(256);
+            let mut escaped_path = String::new();
+            for unit in &image_path[..shown_units] {
+                match *unit {
+                    0x20..=0x7e if *unit != u16::from(b'"') => {
+                        escaped_path.push(char::from(*unit as u8));
+                    }
+                    value if value == u16::from(b'"') => escaped_path.push_str("\\\""),
+                    value => escaped_path.push_str(&format!("\\u{value:04X}")),
+                }
+            }
+            emit_witness_record(&format!(
+                "registry_witness_diagnostic stream=cancel_job_member child_pid={child_pid} creation={child_creation} index={index} listed_pid={pid} actual_pid={actual_pid} actual_creation={actual_creation} child_identity_binding={child_identity_binding} membership=true image_query=success image_path_units={path_units} image_path_truncated={} image_path=\"{escaped_path}\"",
+                path_units > shown_units
+            ))?;
+        }
+        Ok(())
+    }
+
     fn wait_for_cancel_readiness(
         child: &OwnedProcess<'_>,
         child_pid: u32,
@@ -4813,9 +5073,22 @@ mod registry_witness_tests {
                         } else {
                             "WAIT_TIMEOUT"
                         };
-                        return Err(io::Error::other(format!(
+                        let primary = format!(
                             "cancellation readiness received but live-member gate failed: child_pid={child_pid} child_creation={child_creation} process_wait={wait_result} QueryInformationJobObject=success active_processes={active}"
-                        )));
+                        );
+                        return Err(
+                            match emit_cancel_job_member_diagnostics(
+                                child,
+                                child_pid,
+                                child_creation,
+                                active,
+                            ) {
+                                Ok(()) => io::Error::other(primary),
+                                Err(diagnostic_error) => io::Error::other(format!(
+                                    "{primary}; cancel Job member diagnostic emission failed: {diagnostic_error}"
+                                )),
+                            },
+                        );
                     }
                     (Err(wait_error), Ok(active)) => {
                         return Err(io::Error::other(format!(
@@ -5141,6 +5414,7 @@ mod registry_witness_tests {
 
     fn registry_witness_stage_a_run() -> io::Result<()> {
         verify_cancel_readiness_frame_oracle()?;
+        verify_job_process_id_list_oracle()?;
         verify_partial_key_value_header_oracle()?;
         let nonce = std::env::var("ORBIT_REGISTRY_WITNESS_NONCE")
             .map_err(|_| invalid("disposable CI fixture nonce missing"))?;
