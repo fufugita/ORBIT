@@ -673,6 +673,72 @@ mod windows {
     }
 
     #[test]
+    fn source_directory_rejects_replaced_full_identity() {
+        let home = Home::new();
+        let public_root = home.base.join("public source replacement tree");
+        fs::create_dir(&public_root).unwrap();
+        let name = OsStr::new("source identity entry 雪.txt");
+        let path = public_root.join(name);
+        fs::write(&path, b"original public source").unwrap();
+        let sid = current_sid();
+        set_public_source_acl(&public_root, &sid, true);
+        set_public_source_acl(&path, &sid, false);
+
+        let source = SourceDirectory::open(&public_root).unwrap();
+        let stale_identity = source.open_file(name).unwrap().identity();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"replacement public source").unwrap();
+        set_public_source_acl(&path, &sid, false);
+
+        let replacement = source.open_file(name).unwrap();
+        let replacement_identity = replacement.identity();
+        assert_ne!(
+            replacement_identity, stale_identity,
+            "the fixture replacement must have a distinct full physical identity"
+        );
+        let mut replacement = replacement;
+        assert_eq!(
+            replacement.read_limited(128).unwrap(),
+            b"replacement public source"
+        );
+        drop(replacement);
+
+        let error = match source.open_file_expected(name, stale_identity) {
+            Ok(_) => panic!("SourceDirectory accepted a replaced source identity"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn source_file_rejects_reads_over_the_requested_bound() {
+        let home = Home::new();
+        let public_root = home.base.join("public source bounded tree");
+        fs::create_dir(&public_root).unwrap();
+        let name = OsStr::new("bounded source entry 雪.txt");
+        let path = public_root.join(name);
+        let contents = b"bounded public source bytes";
+        fs::write(&path, contents).unwrap();
+        let sid = current_sid();
+        set_public_source_acl(&public_root, &sid, true);
+        set_public_source_acl(&path, &sid, false);
+
+        let source = SourceDirectory::open(&public_root).unwrap();
+        let mut file = source.open_file(name).unwrap();
+        let before = file.snapshot().unwrap();
+        let maximum = contents.len() - 1;
+        assert!(
+            before.length > maximum as u64,
+            "oversize fixture must exceed the requested read bound"
+        );
+        assert!(
+            file.read_limited(maximum).is_err(),
+            "SourceFile returned bytes beyond the requested bound"
+        );
+        assert_eq!(file.snapshot().unwrap(), before);
+    }
+
+    #[test]
     fn absolute_drive_and_verbatim_aliases_keep_identity() {
         let home = Home::new();
         let alias = PathBuf::from(format!("\\\\?\\{}", home.path().display()));

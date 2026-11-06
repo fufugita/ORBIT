@@ -1,4 +1,4 @@
-//! Handle-relative private storage on local fixed NTFS volumes.
+//! Handle-relative private storage and read-only source access on local fixed NTFS volumes.
 //!
 //! Every component is opened without following reparses. Directory and lock
 //! handles exclude FILE_SHARE_DELETE, keeping their namespace identity held.
@@ -1362,55 +1362,217 @@ impl PrivateFile {
 /// Snapshot facts retained by a held source file.
 pub type SourceSnapshot = FileSnapshot;
 
-/// A separately named, held source-directory capability.
-///
-/// This first tracer delegates to the strict private-directory opener while the
-/// source-policy boundary is being established. It never converts a held path
-/// back into I/O authority.
+/// A held source-directory capability with no private-state authority.
 pub struct SourceDirectory {
-    directory: Directory,
+    chain: Vec<Arc<OwnedHandle>>,
+    identities: Vec<FileIdentity>,
 }
 
 impl SourceDirectory {
     pub fn open(path: &Path) -> io::Result<Self> {
-        Directory::open(path).map(|directory| Self { directory })
+        let mut components = path.components();
+        let drive = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+                _ => {
+                    return Err(unsupported(
+                        "source requires a local drive; UNC/device paths are unsupported",
+                    ));
+                }
+            },
+            _ => return Err(invalid("source root must be an absolute drive path")),
+        };
+        if components.next() != Some(Component::RootDir) {
+            return Err(invalid("drive-relative source root"));
+        }
+        let names: Vec<_> = components
+            .map(|component| match component {
+                Component::Normal(name) => {
+                    validate_source_component(name)?;
+                    Ok(name.to_os_string())
+                }
+                _ => Err(invalid("ambiguous source root path")),
+            })
+            .collect::<io::Result<_>>()?;
+        let root = wide(OsStr::new(&format!("\\\\?\\{}:\\", char::from(drive))));
+        let drive_path = wide(OsStr::new(&format!("{}:\\", char::from(drive))));
+        if unsafe { GetDriveTypeW(drive_path.as_ptr()) } != DRIVE_FIXED {
+            return Err(unsupported("source requires a fixed local drive"));
+        }
+        let raw = unsafe {
+            CreateFileW(
+                root.as_ptr(),
+                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let first = unsafe { OwnedHandle::from_raw_handle(raw) };
+        ensure_kind(first.as_raw_handle(), true)?;
+        let mut filesystem = [0u16; 32];
+        unsafe {
+            ok(GetVolumeInformationByHandleW(
+                first.as_raw_handle(),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            ))?
+        };
+        if String::from_utf16_lossy(
+            &filesystem[..filesystem
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(filesystem.len())],
+        ) != "NTFS"
+        {
+            return Err(unsupported("source requires NTFS semantics"));
+        }
+        let root_identity = identity(first.as_raw_handle())?;
+        let mut chain = vec![Arc::new(first)];
+        let mut identities = vec![root_identity];
+        for name in names {
+            let parent = chain.last().unwrap();
+            let handle = relative_source(
+                parent.as_raw_handle(),
+                &name,
+                true,
+                FILE_OPEN,
+                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?;
+            let child_identity = identity(handle.as_raw_handle())?;
+            if child_identity.volume != root_identity.volume {
+                return Err(denied("source path crossed its fixed volume"));
+            }
+            chain.push(Arc::new(handle));
+            identities.push(child_identity);
+        }
+        let source = Self { chain, identities };
+        source.check()?;
+        Ok(source)
     }
 
     pub fn identity(&self) -> FileIdentity {
-        self.directory.identity()
+        *self.identities.last().unwrap()
     }
 
     pub fn open_file(&self, name: &OsStr) -> io::Result<SourceFile> {
-        self.directory
-            .open_file(name)
-            .map(|file| SourceFile { file })
+        self.check()?;
+        let parent = self.chain.last().unwrap();
+        let handle = relative_source(
+            parent.as_raw_handle(),
+            name,
+            false,
+            FILE_OPEN,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )?;
+        let file_identity = identity(handle.as_raw_handle())?;
+        if file_identity.volume != self.identity().volume {
+            return Err(denied("source file is on a different volume"));
+        }
+        let source_file = SourceFile {
+            file: File::from(handle),
+            identity: file_identity,
+            parent_identity: self.identity(),
+            anchors: self.chain.clone(),
+            anchor_identities: self.identities.clone(),
+        };
+        source_file.check()?;
+        Ok(source_file)
+    }
+
+    /// Open a child only if its full physical identity still matches an observation.
+    pub fn open_file_expected(
+        &self,
+        name: &OsStr,
+        expected: FileIdentity,
+    ) -> io::Result<SourceFile> {
+        let file = self.open_file(name)?;
+        if file.identity != expected {
+            return Err(denied("source file identity changed before open"));
+        }
+        Ok(file)
+    }
+
+    fn check(&self) -> io::Result<()> {
+        check_source_anchors(&self.chain, &self.identities)
     }
 }
 
 /// A regular source file held through its directory capability.
 pub struct SourceFile {
-    file: PrivateFile,
+    file: File,
+    identity: FileIdentity,
+    parent_identity: FileIdentity,
+    anchors: Vec<Arc<OwnedHandle>>,
+    anchor_identities: Vec<FileIdentity>,
 }
 
 impl SourceFile {
     pub fn identity(&self) -> FileIdentity {
-        self.file.identity()
+        self.identity
     }
 
     pub fn snapshot(&self) -> io::Result<SourceSnapshot> {
-        self.file.snapshot()
+        self.check()?;
+        file_snapshot(self.file.as_raw_handle(), self.identity)
     }
 
     /// Read from the held file and reject metadata changes across the read.
     pub fn read_limited(&mut self, maximum: usize) -> io::Result<Vec<u8>> {
-        let before = self.file.snapshot()?;
-        let bytes = self.file.read_limited(maximum)?;
-        let after = self.file.snapshot()?;
+        let before = self.snapshot()?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        (&mut self.file)
+            .take(maximum.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > maximum {
+            return Err(invalid("source file exceeds read limit"));
+        }
+        let after = self.snapshot()?;
         if before != after {
-            return Err(invalid("source file changed during checked read"));
+            return Err(denied("source file changed during checked read"));
         }
         Ok(bytes)
     }
+
+    fn check(&self) -> io::Result<()> {
+        check_source_anchors(&self.anchors, &self.anchor_identities)?;
+        ensure_kind(self.file.as_raw_handle(), false)?;
+        if identity(self.file.as_raw_handle())? != self.identity
+            || self.anchor_identities.last().copied() != Some(self.parent_identity)
+            || self.parent_identity.volume != self.identity.volume
+        {
+            return Err(denied("source file or parent identity changed"));
+        }
+        Ok(())
+    }
+}
+
+fn check_source_anchors(
+    anchors: &[Arc<OwnedHandle>],
+    identities: &[FileIdentity],
+) -> io::Result<()> {
+    if anchors.is_empty() || anchors.len() != identities.len() {
+        return Err(invalid("invalid held source ancestor chain"));
+    }
+    let volume = identities[0].volume;
+    for (anchor, expected) in anchors.iter().zip(identities) {
+        ensure_kind(anchor.as_raw_handle(), true)?;
+        if identity(anchor.as_raw_handle())? != *expected || expected.volume != volume {
+            return Err(denied("source ancestor identity changed"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1493,6 +1655,42 @@ fn relative(
     descriptor: *const SECURITY_DESCRIPTOR,
 ) -> io::Result<OwnedHandle> {
     validate_component(name)?;
+    relative_validated(parent, name, directory, disposition, access, descriptor)
+}
+
+fn relative_source(
+    parent: HANDLE,
+    name: &OsStr,
+    directory: bool,
+    disposition: u32,
+    access: u32,
+) -> io::Result<OwnedHandle> {
+    validate_source_component(name)?;
+    relative_validated(parent, name, directory, disposition, access, null())
+}
+
+fn validate_source_component(name: &OsStr) -> io::Result<()> {
+    let units: Vec<u16> = name.encode_wide().collect();
+    if units.is_empty()
+        || units == [u16::from(b'.')]
+        || units == [u16::from(b'.'), u16::from(b'.')]
+        || units
+            .iter()
+            .any(|unit| *unit == 0 || matches!(*unit, 0x2f | 0x5c | 0x3a))
+    {
+        return Err(invalid("ambiguous source path component"));
+    }
+    Ok(())
+}
+
+fn relative_validated(
+    parent: HANDLE,
+    name: &OsStr,
+    directory: bool,
+    disposition: u32,
+    access: u32,
+    descriptor: *const SECURITY_DESCRIPTOR,
+) -> io::Result<OwnedHandle> {
     let mut name: Vec<u16> = name.encode_wide().collect();
     let bytes = name
         .len()

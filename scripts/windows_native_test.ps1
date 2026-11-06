@@ -207,6 +207,8 @@ if ($Group -eq 'Foundation') {
         'fs::windows::tests::inspection_revalidates_full_identity_after_replacement',
         'windows::inspection_empty_root_is_no_effect',
         'windows::source_directory_reads_public_unicode_file_without_private_authority',
+        'windows::source_directory_rejects_replaced_full_identity',
+        'windows::source_file_rejects_reads_over_the_requested_bound',
         'windows::inspection_observes_existing_shared_lock_and_nested_files',
         'windows::inspection_rejects_permissive_and_wrong_owner_entries_without_repair',
         'windows::inspection_rejects_reparse_and_hardlink_entries',
@@ -225,8 +227,8 @@ if ($Group -eq 'Foundation') {
         'windows::ntfs_short_alias_cannot_bypass_reserved_lock_policy',
         'windows::simultaneous_publication_preserves_the_only_successful_name'
     )
-    if ($required.Count -ne 44 -or @($required | Select-Object -Unique).Count -ne 44) {
-        throw "Foundation's exact required-name manifest must contain 44 unique cases; found $($required.Count)"
+    if ($required.Count -ne 46 -or @($required | Select-Object -Unique).Count -ne 46) {
+        throw "Foundation's exact required-name manifest must contain 46 unique cases; found $($required.Count)"
     }
     $report = Get-Content $log -Raw
     foreach ($case in $required) {
