@@ -2260,6 +2260,291 @@ fn relative_validated(
     ensure_kind(handle.as_raw_handle(), directory)?;
     Ok(handle)
 }
+// This declaration surface deliberately has no successful construction path.
+// The first native tracer fails before stage creation; later implementation
+// must establish the owned facts represented by these private fields.
+#[allow(dead_code)]
+mod staged_package {
+    use super::*;
+
+    struct StageNode {
+        checked_components: Vec<OsString>,
+        identity: Option<FileIdentity>,
+        handle: Option<OwnedHandle>,
+        snapshot: Option<SourceSnapshot>,
+        expected_executable: bool,
+        sealed: bool,
+        removed: bool,
+    }
+
+    struct StageLeases {
+        active: AtomicU64,
+        close_uncertain: AtomicBool,
+    }
+
+    struct StageCore {
+        guard: Arc<StateLock>,
+        parent_identity: FileIdentity,
+        lock_identity: FileIdentity,
+        outer_anchors: Vec<(Arc<OwnedHandle>, FileIdentity)>,
+        security: Security,
+        original_name: OsString,
+        final_name: Option<OsString>,
+        root: Option<OwnedHandle>,
+        root_identity: Option<FileIdentity>,
+        ledger: Vec<StageNode>,
+        remaining_entries: usize,
+        remaining_name_bytes: usize,
+        remaining_depth: usize,
+        leases: StageLeases,
+        close_errors: Vec<io::Error>,
+        phase: PublicationState,
+    }
+
+    pub struct StagedDirectory {
+        core: StageCore,
+        identity: FileIdentity,
+    }
+
+    struct PackageReadDomain {
+        guard: Arc<StateLock>,
+        parent_identity: FileIdentity,
+        lock_identity: FileIdentity,
+        outer_anchors: Vec<(Arc<OwnedHandle>, FileIdentity)>,
+    }
+
+    pub struct PackageDirectory {
+        domain: Arc<PackageReadDomain>,
+        chain: Vec<(OwnedHandle, FileIdentity)>,
+        identity: FileIdentity,
+        remaining_depth: usize,
+        enumeration: Mutex<()>,
+    }
+
+    enum PackageLease<'a> {
+        Stage(&'a StageLeases),
+        Published(&'a PackageDirectory),
+    }
+
+    pub struct PackageFile<'a> {
+        file: File,
+        identity: FileIdentity,
+        expected_executable: bool,
+        anchors: Vec<Arc<OwnedHandle>>,
+        lease: PackageLease<'a>,
+    }
+
+    pub struct PackagePublication {
+        core: StageCore,
+        identity: FileIdentity,
+        durability: Durability,
+    }
+
+    pub struct PackageAcceptance {
+        directory: PackageDirectory,
+        identity: FileIdentity,
+        durability: Durability,
+    }
+
+    pub struct StageRecovery {
+        core: StageCore,
+        publication: Option<(FileIdentity, Durability)>,
+    }
+
+    pub enum StageCreateError {
+        Unchanged(io::Error),
+        Uncertain {
+            source: io::Error,
+            recovery: StageRecovery,
+        },
+    }
+
+    pub enum StagePublishError {
+        Unchanged {
+            source: io::Error,
+            stage: StagedDirectory,
+        },
+        Uncertain {
+            source: io::Error,
+            state: PublicationState,
+            recovery: StageRecovery,
+        },
+    }
+
+    pub struct StageAcceptError {
+        pub source: io::Error,
+        pub recovery: StageRecovery,
+    }
+
+    impl Directory {
+        pub fn stage_directory(
+            &self,
+            _guard: Arc<StateLock>,
+            _name: &OsStr,
+        ) -> Result<StagedDirectory, StageCreateError> {
+            Err(StageCreateError::Unchanged(unsupported(
+                "staged package creation is not implemented",
+            )))
+        }
+    }
+
+    impl StagedDirectory {
+        pub fn identity(&self) -> FileIdentity {
+            self.identity
+        }
+
+        pub fn write_new<'s>(
+            &'s mut self,
+            _name: &OsStr,
+            _bytes: &[u8],
+            _executable: bool,
+        ) -> io::Result<PackageFile<'s>> {
+            Err(unsupported("staged package writing is not implemented"))
+        }
+
+        pub fn verify_package_mode<'s>(
+            &'s self,
+            _name: &OsStr,
+            _executable: bool,
+        ) -> io::Result<PackageFile<'s>> {
+            Err(unsupported(
+                "staged package verification is not implemented",
+            ))
+        }
+
+        pub fn publish_directory(
+            self,
+            _final_name: &OsStr,
+        ) -> Result<PackagePublication, StagePublishError> {
+            Err(StagePublishError::Unchanged {
+                source: unsupported("staged package publication is not implemented"),
+                stage: self,
+            })
+        }
+    }
+
+    impl PackageFile<'_> {
+        pub fn identity(&self) -> FileIdentity {
+            self.identity
+        }
+        pub fn snapshot(&self) -> io::Result<SourceSnapshot> {
+            Err(unsupported(
+                "package snapshot observation is not implemented",
+            ))
+        }
+        pub fn read_limited(&mut self, _maximum: usize) -> io::Result<Vec<u8>> {
+            Err(unsupported("package reading is not implemented"))
+        }
+        pub fn execution_permission(&self) -> io::Result<ExecutionPermission> {
+            Err(unsupported(
+                "package execution observation is not implemented",
+            ))
+        }
+    }
+
+    impl PackagePublication {
+        pub fn identity(&self) -> FileIdentity {
+            self.identity
+        }
+        pub fn durability(&self) -> Durability {
+            self.durability
+        }
+        pub fn accept(self) -> Result<PackageAcceptance, StageAcceptError> {
+            Err(StageAcceptError {
+                source: unsupported("package acceptance is not implemented"),
+                recovery: StageRecovery {
+                    core: self.core,
+                    publication: Some((self.identity, self.durability)),
+                },
+            })
+        }
+    }
+
+    impl PackageDirectory {
+        pub fn identity(&self) -> FileIdentity {
+            self.identity
+        }
+        pub fn verify_package_mode<'p>(
+            &'p self,
+            _name: &OsStr,
+            _expected: FileIdentity,
+            _executable: bool,
+        ) -> io::Result<PackageFile<'p>> {
+            Err(unsupported(
+                "accepted package verification is not implemented",
+            ))
+        }
+    }
+
+    impl PackageAcceptance {
+        pub fn directory(&self) -> &PackageDirectory {
+            &self.directory
+        }
+    }
+
+    impl std::fmt::Debug for StageRecovery {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StageRecovery")
+                .field("root_identity", &self.core.root_identity)
+                .field("phase", &self.core.phase)
+                .finish_non_exhaustive()
+        }
+    }
+    impl std::fmt::Debug for StagedDirectory {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StagedDirectory")
+                .field("identity", &self.identity)
+                .finish_non_exhaustive()
+        }
+    }
+    impl std::fmt::Debug for StageCreateError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Unchanged(source) => f.debug_tuple("Unchanged").field(source).finish(),
+                Self::Uncertain { source, recovery } => f
+                    .debug_struct("Uncertain")
+                    .field("source", source)
+                    .field("recovery", recovery)
+                    .finish(),
+            }
+        }
+    }
+    impl std::fmt::Debug for StagePublishError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Unchanged { source, stage } => f
+                    .debug_struct("Unchanged")
+                    .field("source", source)
+                    .field("stage", stage)
+                    .finish(),
+                Self::Uncertain {
+                    source,
+                    state,
+                    recovery,
+                } => f
+                    .debug_struct("Uncertain")
+                    .field("source", source)
+                    .field("state", state)
+                    .field("recovery", recovery)
+                    .finish(),
+            }
+        }
+    }
+    impl std::fmt::Debug for StageAcceptError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StageAcceptError")
+                .field("source", &self.source)
+                .field("recovery", &self.recovery)
+                .finish()
+        }
+    }
+}
+
+pub use staged_package::{
+    PackageAcceptance, PackageDirectory, PackageFile, PackagePublication, StageAcceptError,
+    StageCreateError, StagePublishError, StageRecovery, StagedDirectory,
+};
+
 #[cfg(test)]
 struct SourceSnapshotTestHook {
     expected: FileIdentity,

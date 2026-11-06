@@ -80,8 +80,10 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{
     Directory, DirectoryEntry, Durability, EnumerationLimits, ExecutionPermission, FileIdentity,
-    FileSnapshot, InspectionLimits, LockMode, MutationFile, OwnedContainer, PrivateFile,
-    PrivateFileAccess, PrivateTreeEntry, PrivateTreeInspection, Publication, PublicationState,
-    PublishError, Removal, RemovalError, RemovalState, SourceDirectory, SourceEntry, SourceFile,
-    SourceKind, SourceSnapshot, StateLock, UpdateFile,
+    FileSnapshot, InspectionLimits, LockMode, MutationFile, OwnedContainer, PackageAcceptance,
+    PackageDirectory, PackageFile, PackagePublication, PrivateFile, PrivateFileAccess,
+    PrivateTreeEntry, PrivateTreeInspection, Publication, PublicationState, PublishError, Removal,
+    RemovalError, RemovalState, SourceDirectory, SourceEntry, SourceFile, SourceKind,
+    SourceSnapshot, StageAcceptError, StageCreateError, StagePublishError, StageRecovery,
+    StagedDirectory, StateLock, UpdateFile,
 };

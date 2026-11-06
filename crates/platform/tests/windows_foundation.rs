@@ -5364,6 +5364,1335 @@ mod windows {
             }
         }
 
+        pub(super) mod first_stage {
+            use super::*;
+            use orbit_platform::fs::{
+                Durability, PackageAcceptance, PackagePublication, StageAcceptError,
+                StageCreateError, StagePublishError, StagedDirectory, StateLock,
+            };
+            use std::sync::Arc;
+            use windows_sys::Wdk::Storage::FileSystem::{
+                FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+            };
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+            const STAGE: &str = "product-stage";
+            const FINAL: &str = "product-final";
+            const OLD: &str = "root-transition-stage";
+            const NEW: &str = "root-transition-final";
+            const CHILD: &str = "payload";
+            const LOCK: &str = "transaction.lock";
+            const CANARY: &str = "stage-foreign-canary";
+            const ROOT_READ: u32 = META | FILE_LIST_DIRECTORY | FILE_TRAVERSE;
+            const RWD: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            const MISSING: &str = "staged package creation is not implemented";
+
+            #[repr(C)]
+            #[derive(Default)]
+            struct ObjectBasic {
+                attributes: u32,
+                granted: u32,
+                handle_count: u32,
+                pointer_count: u32,
+                reserved: [u32; 10],
+            }
+            #[link(name = "ntdll")]
+            unsafe extern "system" {
+                fn NtQueryObject(
+                    handle: HANDLE,
+                    class: i32,
+                    information: *mut c_void,
+                    bytes: u32,
+                    returned: *mut u32,
+                ) -> i32;
+            }
+
+            fn nt(phase: &'static str, status: i32, desired: u32) -> io::Error {
+                io::Error::other(NativeOpenError {
+                    phase,
+                    status,
+                    desired,
+                })
+            }
+
+            fn granted(handle: HANDLE, expected: u32) -> io::Result<()> {
+                let mut information = ObjectBasic::default();
+                let mut returned = 0;
+                let status = unsafe {
+                    NtQueryObject(
+                        handle,
+                        0,
+                        (&mut information as *mut ObjectBasic).cast(),
+                        size_of::<ObjectBasic>() as u32,
+                        &mut returned,
+                    )
+                };
+                if status != 0 {
+                    return Err(nt("NtQueryObject", status, expected));
+                }
+                require(
+                    returned as usize == size_of::<ObjectBasic>()
+                        && information.granted == expected,
+                    "stage native granted access differs",
+                )?;
+                println!(
+                    "stage_native_grant desired=0x{expected:08x} actual=0x{:08x} query_status=0x{:08x}",
+                    information.granted, status as u32
+                );
+                Ok(())
+            }
+
+            // The accepted opener is unchanged. Only this independent native
+            // observer needs explicit bilateral DELETE sharing before handoff.
+            fn shared(
+                handles: &mut Handles,
+                parent: HANDLE,
+                name: &OsStr,
+                directory: bool,
+                desired: u32,
+            ) -> io::Result<usize> {
+                orbit_platform::fs::validate_component(name)?;
+                let mut wide = name.encode_wide().collect::<Vec<_>>();
+                require(
+                    wide.len() <= u16::MAX as usize / 2,
+                    "stage observer name too long",
+                )?;
+                let name = UNICODE_STRING {
+                    Length: (wide.len() * 2) as u16,
+                    MaximumLength: (wide.len() * 2) as u16,
+                    Buffer: wide.as_mut_ptr(),
+                };
+                let attributes = OBJECT_ATTRIBUTES {
+                    Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+                    RootDirectory: parent,
+                    ObjectName: &name,
+                    Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+                    SecurityDescriptor: null(),
+                    SecurityQualityOfService: null(),
+                };
+                let mut raw = null_mut();
+                let mut iosb = IO_STATUS_BLOCK::default();
+                let status = unsafe {
+                    NtCreateFile(
+                        &mut raw,
+                        desired,
+                        &attributes,
+                        &mut iosb,
+                        null(),
+                        FILE_ATTRIBUTE_NORMAL,
+                        RWD,
+                        FILE_OPEN,
+                        FILE_SYNCHRONOUS_IO_NONALERT
+                            | FILE_OPEN_REPARSE_POINT
+                            | if directory {
+                                FILE_DIRECTORY_FILE
+                            } else {
+                                FILE_NON_DIRECTORY_FILE
+                            },
+                        null(),
+                        0,
+                    )
+                };
+                if status == PENDING || (status != 0 && !raw.is_null()) {
+                    uncertain_request();
+                }
+                println!(
+                    "stage_native_observer returned=0x{:08x} desired=0x{desired:08x} share=0x{RWD:08x}",
+                    status as u32
+                );
+                if status != 0 {
+                    return Err(nt("NtCreateFile", status, desired));
+                }
+                if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+                    uncertain_request();
+                }
+                Ok(handles.own(raw))
+            }
+
+            fn absent(
+                handles: &mut Handles,
+                parent: HANDLE,
+                name: &OsStr,
+                directory: bool,
+            ) -> io::Result<()> {
+                match relative(handles, parent, name, directory, FILE_OPEN, META, null()) {
+                    Err(error) if native_is(&error, ABSENT) => Ok(()),
+                    Ok(found) => {
+                        handles.close(found)?;
+                        Err(bad("stage expected absent name exists"))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+
+            fn rename(source: HANDLE, parent: HANDLE, target: &OsStr) -> io::Result<()> {
+                orbit_platform::fs::validate_data_component(target)?;
+                let name = target.encode_wide().collect::<Vec<_>>();
+                let length = offset_of!(FILE_RENAME_INFORMATION, FileName) + name.len() * 2;
+                let mut storage = vec![0usize; length.div_ceil(size_of::<usize>())];
+                let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+                let mut iosb = IO_STATUS_BLOCK::default();
+                const SENTINEL: i32 = 0x6f736962;
+                iosb.Anonymous.Status = SENTINEL;
+                iosb.Information = usize::MAX;
+                let returned = unsafe {
+                    (*information).Anonymous.ReplaceIfExists = false;
+                    (*information).RootDirectory = parent;
+                    (*information).FileNameLength = (name.len() * 2) as u32;
+                    std::ptr::copy_nonoverlapping(
+                        name.as_ptr(),
+                        (*information).FileName.as_mut_ptr(),
+                        name.len(),
+                    );
+                    NtSetInformationFile(
+                        source,
+                        &mut iosb,
+                        information.cast(),
+                        length as u32,
+                        FileRenameInformation,
+                    )
+                };
+                let pending = returned == PENDING;
+                if pending && unsafe { WaitForSingleObject(source, u32::MAX) } != WAIT_OBJECT_0 {
+                    uncertain_request();
+                }
+                // All input/output storage is live through observed completion;
+                // no shared IOSB reference exists while the kernel may write.
+                let status = if pending {
+                    unsafe { std::ptr::addr_of!(iosb.Anonymous.Status).read() }
+                } else {
+                    returned
+                };
+                if pending && (status == PENDING || status == SENTINEL) {
+                    uncertain_request();
+                }
+                println!(
+                    "stage_root_rename returned=0x{:08x} effective=0x{:08x} pending_wait={pending} replace_if_exists=false",
+                    returned as u32, status as u32
+                );
+                if status == 0 {
+                    Ok(())
+                } else {
+                    Err(nt("NtSetInformationFile(rename)", status, DELETE))
+                }
+            }
+
+            fn raw_bytes(handle: HANDLE, expected: &[u8]) -> io::Result<()> {
+                let mut bytes = [0u8; 128];
+                let mut count = 0;
+                yes(unsafe {
+                    ReadFile(
+                        handle,
+                        bytes.as_mut_ptr(),
+                        bytes.len() as u32,
+                        &mut count,
+                        null_mut(),
+                    )
+                })?;
+                require(
+                    (count as usize) <= bytes.len() && &bytes[..count as usize] == expected,
+                    "stage native payload bytes differ",
+                )
+            }
+
+            fn seal_payload(
+                handles: &mut Handles,
+                parent: HANDLE,
+                key: &TokenKey,
+                entry: &mut Entry,
+            ) -> io::Result<()> {
+                let full = descriptor(key, FILE_ALL_ACCESS)?;
+                let writer = relative(
+                    handles,
+                    parent,
+                    &entry.name,
+                    false,
+                    FILE_CREATE,
+                    FILE_ALL_ACCESS,
+                    full.as_ptr().cast(),
+                )?;
+                let raw = handles.raw(writer);
+                entry.id = Some(identity(raw)?);
+                kind(raw, false)?;
+                let _ = read_descriptor(raw, key, FILE_ALL_ACCESS)?;
+                let mut written = 0;
+                yes(unsafe {
+                    WriteFile(
+                        raw,
+                        PAYLOAD.as_ptr(),
+                        PAYLOAD.len() as u32,
+                        &mut written,
+                        null_mut(),
+                    )
+                })?;
+                require(
+                    written as usize == PAYLOAD.len(),
+                    "stage native payload short write",
+                )?;
+                yes(unsafe { FlushFileBuffers(raw) })?;
+                let read = descriptor(key, FILE_GENERIC_READ)?;
+                let mut present = 0;
+                let mut dacl = null_mut();
+                let mut defaulted = 0;
+                yes(unsafe {
+                    GetSecurityDescriptorDacl(
+                        read.as_ptr().cast_mut().cast(),
+                        &mut present,
+                        &mut dacl,
+                        &mut defaulted,
+                    )
+                })?;
+                require(
+                    present != 0 && !dacl.is_null(),
+                    "stage native R policy missing",
+                )?;
+                let status = unsafe {
+                    SetSecurityInfo(
+                        raw,
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        dacl,
+                        null_mut(),
+                    )
+                };
+                if status != ERROR_SUCCESS {
+                    return Err(io::Error::from_raw_os_error(status as i32));
+                }
+                entry.facts = Some(read_descriptor(raw, key, FILE_GENERIC_READ)?.facts);
+                handles.close(writer)?;
+                let meta = relative(handles, parent, &entry.name, false, FILE_OPEN, META, null())?;
+                let sampled = snapshot(handles.raw(meta))?;
+                require(
+                    Some(sampled.identity) == entry.id
+                        && Some(read_descriptor(handles.raw(meta), key, FILE_GENERIC_READ)?.facts)
+                            == entry.facts,
+                    "stage payload changed after writer close",
+                )?;
+                entry.snapshot = Some(sampled);
+                handles.close(meta)?;
+                Ok(())
+            }
+
+            fn payload(
+                handles: &mut Handles,
+                root: HANDLE,
+                key: &TokenKey,
+                entry: &Entry,
+            ) -> io::Result<()> {
+                let read = shared(handles, root, &entry.name, false, FILE_GENERIC_READ)?;
+                let raw = handles.raw(read);
+                granted(raw, FILE_GENERIC_READ)?;
+                require(
+                    Some(snapshot(raw)?) == entry.snapshot
+                        && Some(read_descriptor(raw, key, entry.mask)?.facts) == entry.facts,
+                    "stage payload identity/policy/snapshot differs",
+                )?;
+                raw_bytes(raw, PAYLOAD)?;
+                handles.close(read)
+            }
+
+            fn remove_file(
+                handles: &mut Handles,
+                root: HANDLE,
+                key: &TokenKey,
+                entry: &mut Entry,
+            ) -> io::Result<()> {
+                let delete = relative(
+                    handles,
+                    root,
+                    &entry.name,
+                    false,
+                    FILE_OPEN,
+                    DELETE | META,
+                    null(),
+                )?;
+                let raw = handles.raw(delete);
+                granted(raw, DELETE | META)?;
+                let sampled = snapshot(raw)?;
+                require(
+                    Some(sampled.identity) == entry.id
+                        && entry.snapshot.is_none_or(|before| sampled == before)
+                        && Some(read_descriptor(raw, key, entry.mask)?.facts) == entry.facts,
+                    "stage cleanup identity/policy differs",
+                )?;
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                yes(unsafe {
+                    SetFileInformationByHandle(
+                        raw,
+                        FileDispositionInfo,
+                        (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                        size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                })?;
+                handles.close(delete)?;
+                absent(handles, root, &entry.name, false)?;
+                entry.removed = true;
+                println!(
+                    "stage_native_file_removed name={:?} full_id={:?} disposition_executed=true checked_close=true actual_absence=true",
+                    entry.name, entry.id
+                );
+                Ok(())
+            }
+
+            fn remove_root(
+                handles: &mut Handles,
+                parent: HANDLE,
+                key: &TokenKey,
+                name: &OsStr,
+                expected: FileIdentity,
+            ) -> io::Result<()> {
+                let delete = relative(
+                    handles,
+                    parent,
+                    name,
+                    true,
+                    FILE_OPEN,
+                    DELETE | META,
+                    null(),
+                )?;
+                let raw = handles.raw(delete);
+                granted(raw, DELETE | META)?;
+                kind(raw, true)?;
+                require(
+                    identity(raw)? == expected,
+                    "stage cleanup root identity differs",
+                )?;
+                let _ = read_descriptor(raw, key, FILE_ALL_ACCESS)?;
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                yes(unsafe {
+                    SetFileInformationByHandle(
+                        raw,
+                        FileDispositionInfo,
+                        (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                        size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                })?;
+                handles.close(delete)?;
+                absent(handles, parent, name, true)
+            }
+
+            #[derive(Debug)]
+            struct RootProbe {
+                create_attempted: bool,
+                root_identity: Option<FileIdentity>,
+                rename_attempted: bool,
+                renamed: bool,
+                payload: Entry,
+                completed: bool,
+            }
+            impl RootProbe {
+                fn new() -> Self {
+                    Self {
+                        create_attempted: false,
+                        root_identity: None,
+                        rename_attempted: false,
+                        renamed: false,
+                        payload: Entry {
+                            name: OsString::from(CHILD),
+                            mask: FILE_GENERIC_READ,
+                            id: None,
+                            facts: None,
+                            snapshot: None,
+                            observed: None,
+                            removed: false,
+                        },
+                        completed: false,
+                    }
+                }
+            }
+
+            fn root_transition(f: &mut Fixture, proof: &mut RootProbe) -> io::Result<()> {
+                let key = f.key.as_ref().unwrap().clone();
+                let parent = f.handles.raw(f.root.unwrap());
+                absent(&mut f.handles, parent, OsStr::new(OLD), true)?;
+                absent(&mut f.handles, parent, OsStr::new(NEW), true)?;
+                let security = descriptor(&key, FILE_ALL_ACCESS)?;
+                proof.create_attempted = true;
+                println!("stage_root_create_attempt name={OLD} namespace_on_failure=unknown");
+                let creator = relative(
+                    &mut f.handles,
+                    parent,
+                    OsStr::new(OLD),
+                    true,
+                    FILE_CREATE,
+                    FILE_ALL_ACCESS,
+                    security.as_ptr().cast(),
+                )?;
+                let root = f.handles.raw(creator);
+                let id = identity(root)?;
+                proof.root_identity = Some(id);
+                kind(root, true)?;
+                granted(root, FILE_ALL_ACCESS)?;
+                let _ = read_descriptor(root, &key, FILE_ALL_ACCESS)?;
+                println!(
+                    "stage_root_create_owned full_id={id:?} delete_file_object_owner={creator} duplicates=0"
+                );
+                let entry = &mut proof.payload;
+                seal_payload(&mut f.handles, root, &key, entry)?;
+                payload(&mut f.handles, root, &key, &entry)?;
+                println!(
+                    "stage_root_descendants_closed=true before_rename=true payload_id={:?}",
+                    entry.id
+                );
+                proof.rename_attempted = true;
+                rename(root, parent, OsStr::new(NEW))?;
+                proof.renamed = true;
+                absent(&mut f.handles, parent, OsStr::new(OLD), true)?;
+                let observer = shared(&mut f.handles, parent, OsStr::new(NEW), true, ROOT_READ)?;
+                let raw = f.handles.raw(observer);
+                kind(raw, true)?;
+                require(identity(raw)? == id, "stage renamed root ID differs")?;
+                granted(raw, ROOT_READ)?;
+                let _ = read_descriptor(raw, &key, FILE_ALL_ACCESS)?;
+                payload(&mut f.handles, raw, &key, &entry)?;
+                f.handles.close(observer)?;
+                f.handles.close(creator)?;
+                println!(
+                    "stage_root_delete_file_object_closed=true original_owner={creator} duplicates=0 compatible_observer_checked_closed=true"
+                );
+                let reader = relative(
+                    &mut f.handles,
+                    parent,
+                    OsStr::new(NEW),
+                    true,
+                    FILE_OPEN,
+                    ROOT_READ,
+                    null(),
+                )?;
+                let raw = f.handles.raw(reader);
+                kind(raw, true)?;
+                require(
+                    identity(raw)? == id,
+                    "stage fresh noDELETE-sharing read root ID differs",
+                )?;
+                granted(raw, ROOT_READ)?;
+                let _ = read_descriptor(raw, &key, FILE_ALL_ACCESS)?;
+                payload(&mut f.handles, raw, &key, &entry)?;
+                f.handles.close(reader)?;
+                let cleanup = relative(
+                    &mut f.handles,
+                    parent,
+                    OsStr::new(NEW),
+                    true,
+                    FILE_OPEN,
+                    ROOT_READ | FILE_DELETE_CHILD,
+                    null(),
+                )?;
+                let raw = f.handles.raw(cleanup);
+                require(
+                    identity(raw)? == id,
+                    "stage cleanup reacquired root ID differs",
+                )?;
+                granted(raw, ROOT_READ | FILE_DELETE_CHILD)?;
+                remove_file(&mut f.handles, raw, &key, entry)?;
+                f.handles.close(cleanup)?;
+                remove_root(&mut f.handles, parent, &key, OsStr::new(NEW), id)?;
+                absent(&mut f.handles, parent, OsStr::new(OLD), true)?;
+                println!(
+                    "stage_root_handoff_prerequisite_complete root_id={id:?} payload_id={:?} no_replace=true all_delete_root_objects_closed=true fresh_read_share=READ_WRITE no_DELETE_share=true canonical_R=true bytes_verified=true payload_absent=true old_root_absent=true final_root_absent=true acl_repair=false",
+                    entry.id
+                );
+                proof.completed = true;
+                Ok(())
+            }
+
+            fn security_blob(handle: HANDLE) -> io::Result<Vec<u8>> {
+                let mut owner = null_mut();
+                let mut group = null_mut();
+                let mut dacl = null_mut();
+                let mut raw = null_mut();
+                let status = unsafe {
+                    GetSecurityInfo(
+                        handle,
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION
+                            | GROUP_SECURITY_INFORMATION
+                            | DACL_SECURITY_INFORMATION,
+                        &mut owner,
+                        &mut group,
+                        &mut dacl,
+                        null_mut(),
+                        &mut raw,
+                    )
+                };
+                if status != ERROR_SUCCESS {
+                    return Err(io::Error::from_raw_os_error(status as i32));
+                }
+                let allocation = LocalSecurityAllocation(raw.cast());
+                yes(unsafe { IsValidSecurityDescriptor(raw) })?;
+                let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+                require(
+                    length >= size_of::<SECURITY_DESCRIPTOR_RELATIVE>() && length <= LIMIT,
+                    "stage ancestor security bounds invalid",
+                )?;
+                let _ = sid_bytes(owner, raw.cast(), length)?;
+                let _ = sid_bytes(group, raw.cast(), length)?;
+                let mut control = 0;
+                let mut revision = 0;
+                yes(unsafe { GetSecurityDescriptorControl(raw, &mut control, &mut revision) })?;
+                require(
+                    control & SE_SELF_RELATIVE != 0,
+                    "stage ancestor descriptor not self relative",
+                )?;
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(raw.cast::<u8>(), length) }.to_vec();
+                drop(allocation);
+                Ok(bytes)
+            }
+
+            struct Anchor {
+                owner: usize,
+                id: FileIdentity,
+                security: Vec<u8>,
+            }
+            enum Flight {
+                Stage(StagedDirectory),
+                Publication(PackagePublication),
+                Acceptance(PackageAcceptance),
+            }
+            enum ProductFailure {
+                Create(StageCreateError),
+                Publish(StagePublishError),
+                Accept(StageAcceptError),
+                Io {
+                    phase: &'static str,
+                    source: io::Error,
+                },
+            }
+            impl std::fmt::Debug for ProductFailure {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    match self {
+                        Self::Create(error) => f.debug_tuple("Constructor").field(error).finish(),
+                        Self::Publish(error) => f.debug_tuple("Publication").field(error).finish(),
+                        Self::Accept(error) => f.debug_tuple("Acceptance").field(error).finish(),
+                        Self::Io { phase, source } => f
+                            .debug_struct("LaterIo")
+                            .field("phase", phase)
+                            .field("source", source)
+                            .finish(),
+                    }
+                }
+            }
+            struct Harness {
+                oracle: Fixture,
+                parent: Option<Directory>,
+                guard: Option<Arc<StateLock>>,
+                lock: Option<Entry>,
+                canary: Option<Entry>,
+                anchors: Vec<Anchor>,
+                flight: Option<Flight>,
+                product_root: Option<FileIdentity>,
+                product_file: Option<FileIdentity>,
+                product_snapshot: Option<SourceSnapshot>,
+                root_probe: RootProbe,
+                lock_attempted: bool,
+                product_cleanup: Option<Entry>,
+            }
+            impl Harness {
+                fn new() -> Self {
+                    let mut oracle = Fixture::new();
+                    oracle.root_name =
+                        OsString::from(format!("stage-{}", oracle.root_name.to_string_lossy()));
+                    oracle.path = std::env::temp_dir().join(&oracle.root_name);
+                    Self {
+                        oracle,
+                        parent: None,
+                        guard: None,
+                        lock: None,
+                        canary: None,
+                        anchors: Vec::new(),
+                        flight: None,
+                        product_root: None,
+                        product_file: None,
+                        product_snapshot: None,
+                        root_probe: RootProbe::new(),
+                        lock_attempted: false,
+                        product_cleanup: None,
+                    }
+                }
+                fn prepare(&mut self) -> io::Result<()> {
+                    for name in [STAGE, FINAL, OLD, NEW, CANARY] {
+                        orbit_platform::fs::validate_data_component(OsStr::new(name))?;
+                    }
+                    orbit_platform::fs::validate_lock_component(OsStr::new(LOCK))?;
+                    self.oracle.create()?;
+                    let mut filesystem = [0u16; 32];
+                    let mut serial = 0;
+                    let mut component_maximum = 0;
+                    let mut flags = 0;
+                    yes(unsafe {
+                        GetVolumeInformationByHandleW(
+                            self.oracle.handles.raw(self.oracle.root.unwrap()),
+                            null_mut(),
+                            0,
+                            &mut serial,
+                            &mut component_maximum,
+                            &mut flags,
+                            filesystem.as_mut_ptr(),
+                            filesystem.len() as u32,
+                        )
+                    })?;
+                    let length = filesystem
+                        .iter()
+                        .position(|c| *c == 0)
+                        .ok_or_else(|| bad("stage filesystem name unterminated"))?;
+                    require(
+                        String::from_utf16(&filesystem[..length])
+                            .map_err(|_| bad("stage filesystem name encoding"))?
+                            == "NTFS",
+                        "stage prerequisite requires NTFS",
+                    )?;
+                    let drive = wide(self.oracle.path.ancestors().last().unwrap().as_os_str());
+                    let drive_type = unsafe { GetDriveTypeW(drive.as_ptr()) };
+                    require(
+                        drive_type == windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED,
+                        "stage prerequisite requires fixed drive",
+                    )?;
+                    println!(
+                        "stage_native_filesystem name=NTFS drive_type={drive_type} volume_serial_diagnostic=0x{serial:08x} flags=0x{flags:08x} component_maximum={component_maximum}"
+                    );
+                    self.parent = Some(Directory::open(&self.oracle.path)?);
+                    require(
+                        self.parent.as_ref().unwrap().identity() == self.oracle.root_id.unwrap(),
+                        "stage actual parent ID differs",
+                    )?;
+                    self.lock_attempted = true;
+                    self.guard = Some(Arc::new(
+                        self.parent
+                            .as_ref()
+                            .unwrap()
+                            .try_lock(OsStr::new(LOCK), LockMode::Exclusive)?,
+                    ));
+                    let lock_id = self.guard.as_ref().unwrap().identity();
+                    {
+                        let mut view = self.parent.as_ref().unwrap().open_for_update(
+                            &self.oracle.entries[2].name,
+                            self.oracle.entries[2].id.unwrap(),
+                            self.guard.as_ref().unwrap(),
+                        )?;
+                        require(
+                            view.read_limited(4096)? == PAYLOAD,
+                            "stage matching exclusive guard validation failed",
+                        )?;
+                    }
+                    let root = self.oracle.handles.raw(self.oracle.root.unwrap());
+                    let key = self.oracle.key.as_ref().unwrap().clone();
+                    let lock = relative(
+                        &mut self.oracle.handles,
+                        root,
+                        OsStr::new(LOCK),
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    let raw = self.oracle.handles.raw(lock);
+                    let sampled = snapshot(raw)?;
+                    require(
+                        sampled.identity == lock_id && sampled.length == 0,
+                        "stage actual lock ID/length differs",
+                    )?;
+                    self.lock = Some(Entry {
+                        name: OsString::from(LOCK),
+                        mask: FILE_ALL_ACCESS,
+                        id: Some(lock_id),
+                        facts: Some(read_descriptor(raw, &key, FILE_ALL_ACCESS)?.facts),
+                        snapshot: Some(sampled),
+                        observed: None,
+                        removed: false,
+                    });
+                    self.oracle.handles.close(lock)?;
+                    self.oracle.collect()?;
+                    // The accepted source oracle supplies a genuine false bit;
+                    // it also checks its two positive controls unchanged.
+                    require(
+                        self.oracle.entries[0].observed == Some(false),
+                        "stage source false-bit oracle incomplete",
+                    )?;
+                    let security = descriptor(&key, FILE_ALL_ACCESS)?;
+                    self.canary = Some(Entry {
+                        name: OsString::from(CANARY),
+                        mask: FILE_ALL_ACCESS,
+                        id: None,
+                        facts: None,
+                        snapshot: None,
+                        observed: None,
+                        removed: false,
+                    });
+                    println!("stage_canary_create_attempt namespace_on_failure=unknown");
+                    let writer = relative(
+                        &mut self.oracle.handles,
+                        root,
+                        OsStr::new(CANARY),
+                        false,
+                        FILE_CREATE,
+                        FILE_ALL_ACCESS,
+                        security.as_ptr().cast(),
+                    )?;
+                    let raw = self.oracle.handles.raw(writer);
+                    let id = identity(raw)?;
+                    self.canary.as_mut().unwrap().id = Some(id);
+                    self.canary.as_mut().unwrap().facts =
+                        Some(read_descriptor(raw, &key, FILE_ALL_ACCESS)?.facts);
+                    let mut written = 0;
+                    yes(unsafe {
+                        WriteFile(
+                            raw,
+                            PAYLOAD.as_ptr(),
+                            PAYLOAD.len() as u32,
+                            &mut written,
+                            null_mut(),
+                        )
+                    })?;
+                    require(
+                        written as usize == PAYLOAD.len(),
+                        "stage canary short write",
+                    )?;
+                    yes(unsafe { FlushFileBuffers(raw) })?;
+                    self.oracle.handles.close(writer)?;
+                    let reader = relative(
+                        &mut self.oracle.handles,
+                        root,
+                        OsStr::new(CANARY),
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    self.canary.as_mut().unwrap().snapshot =
+                        Some(snapshot(self.oracle.handles.raw(reader))?);
+                    require(
+                        self.canary.as_ref().unwrap().snapshot.unwrap().identity == id,
+                        "stage canary baseline identity differs",
+                    )?;
+                    self.oracle.handles.close(reader)?;
+                    let paths = self
+                        .oracle
+                        .path
+                        .ancestors()
+                        .map(Path::to_path_buf)
+                        .collect::<Vec<_>>();
+                    for path in paths.into_iter().rev() {
+                        let path_wide = wide(path.as_os_str());
+                        let raw = unsafe {
+                            CreateFileW(
+                                path_wide.as_ptr(),
+                                META | FILE_TRAVERSE,
+                                RWD,
+                                null(),
+                                OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                null_mut(),
+                            )
+                        };
+                        if raw == INVALID_HANDLE_VALUE {
+                            return Err(io::Error::last_os_error());
+                        }
+                        let owner = self.oracle.handles.own(raw);
+                        kind(raw, true)?;
+                        self.anchors.push(Anchor {
+                            owner,
+                            id: identity(raw)?,
+                            security: security_blob(raw)?,
+                        });
+                    }
+                    require(
+                        self.anchors
+                            .last()
+                            .is_some_and(|a| Some(a.id) == self.oracle.root_id),
+                        "stage independent anchor chain root differs",
+                    )?;
+                    self.observe("before_root_transition", false)?;
+                    root_transition(&mut self.oracle, &mut self.root_probe)?;
+                    self.observe("after_root_transition", false)?;
+                    println!(
+                        "stage_prerequisites_complete source_false=true source_id={:?} parent_id={:?} lock_id={lock_id:?} anchor_full_ids={:?} matching_exclusive_guard=true canonical_R=true AccessCheck_deny=true native_execute_deny=true root_DELETE_close_fresh_noDELETE_reader=true oracle_roots_absent=true canary_preserved=true first_constructor_not_yet_called=true",
+                        self.oracle.entries[0].id,
+                        self.oracle.root_id,
+                        self.anchors.iter().map(|a| a.id).collect::<Vec<_>>()
+                    );
+                    Ok(())
+                }
+                fn observe(&mut self, phase: &'static str, published: bool) -> io::Result<()> {
+                    let f = &mut self.oracle;
+                    let parent = self.parent.as_ref().unwrap();
+                    let guard = self.guard.as_ref().unwrap();
+                    parent.check()?;
+                    guard.check()?;
+                    require(
+                        Some(parent.identity()) == f.root_id
+                            && Some(guard.identity()) == self.lock.as_ref().unwrap().id,
+                        "stage retained parent/lock ID differs",
+                    )?;
+                    for anchor in &self.anchors {
+                        let raw = f.handles.raw(anchor.owner);
+                        kind(raw, true)?;
+                        require(
+                            identity(raw)? == anchor.id && security_blob(raw)? == anchor.security,
+                            "stage ancestor identity/security changed",
+                        )?;
+                    }
+                    let root = f.handles.raw(f.root.unwrap());
+                    let key = f.key.as_ref().unwrap();
+                    let _ = read_descriptor(root, key, FILE_ALL_ACCESS)?;
+                    let lock = relative(
+                        &mut f.handles,
+                        root,
+                        OsStr::new(LOCK),
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    require(
+                        Some(snapshot(f.handles.raw(lock))?)
+                            == self.lock.as_ref().unwrap().snapshot
+                            && Some(
+                                read_descriptor(f.handles.raw(lock), key, FILE_ALL_ACCESS)?.facts,
+                            ) == self.lock.as_ref().unwrap().facts,
+                        "stage lock image changed",
+                    )?;
+                    f.handles.close(lock)?;
+                    let canary = self.canary.as_ref().unwrap();
+                    let reader = relative(
+                        &mut f.handles,
+                        root,
+                        &canary.name,
+                        false,
+                        FILE_OPEN,
+                        FILE_GENERIC_READ,
+                        null(),
+                    )?;
+                    require(
+                        Some(snapshot(f.handles.raw(reader))?) == canary.snapshot
+                            && Some(
+                                read_descriptor(f.handles.raw(reader), key, FILE_ALL_ACCESS)?.facts,
+                            ) == canary.facts,
+                        "stage foreign canary changed",
+                    )?;
+                    raw_bytes(f.handles.raw(reader), PAYLOAD)?;
+                    f.handles.close(reader)?;
+                    absent(&mut f.handles, root, OsStr::new(STAGE), true)?;
+                    if !published {
+                        absent(&mut f.handles, root, OsStr::new(FINAL), true)?;
+                    }
+                    let (token, current) = effective(&mut f.handles)?;
+                    require(
+                        current == *key,
+                        "stage current original token context changed",
+                    )?;
+                    f.handles.close(token)?;
+                    println!(
+                        "stage_under_lock_observation phase={phase} parent_unchanged=true lock_unchanged=true canary_unchanged=true stage_absent=true final_expected_published={published} original_context_stable=true"
+                    );
+                    Ok(())
+                }
+                fn postpublish(
+                    &mut self,
+                    expected_root: FileIdentity,
+                    expected_file: FileIdentity,
+                ) -> io::Result<()> {
+                    let f = &mut self.oracle;
+                    let parent = f.handles.raw(f.root.unwrap());
+                    let key = f.key.as_ref().unwrap();
+                    let root = shared(&mut f.handles, parent, OsStr::new(FINAL), true, ROOT_READ)?;
+                    let raw = f.handles.raw(root);
+                    kind(raw, true)?;
+                    require(
+                        identity(raw)? == expected_root,
+                        "stage product published root ID differs",
+                    )?;
+                    let _ = read_descriptor(raw, key, FILE_ALL_ACCESS)?;
+                    let reader = shared(
+                        &mut f.handles,
+                        raw,
+                        OsStr::new(CHILD),
+                        false,
+                        FILE_GENERIC_READ,
+                    )?;
+                    let child_raw = f.handles.raw(reader);
+                    let sampled = snapshot(child_raw)?;
+                    require(
+                        sampled.identity == expected_file,
+                        "stage product published payload ID differs",
+                    )?;
+                    let _ = read_descriptor(child_raw, key, FILE_GENERIC_READ)?;
+                    raw_bytes(child_raw, PAYLOAD)?;
+                    f.handles.close(reader)?;
+                    f.handles.close(root)?;
+                    println!(
+                        "stage_postpublish_native_observer root_id={expected_root:?} payload_id={expected_file:?} canonical_R=true bytes_verified=true compatible_DELETE_share=true all_observer_owners_checked_closed=true"
+                    );
+                    Ok(())
+                }
+                fn happy(&mut self) -> Result<(), ProductFailure> {
+                    let io = |phase, source| ProductFailure::Io { phase, source };
+                    println!("stage_product_constructor_call native_prerequisites_complete=true");
+                    let stage = self
+                        .parent
+                        .as_ref()
+                        .unwrap()
+                        .stage_directory(
+                            Arc::clone(self.guard.as_ref().unwrap()),
+                            OsStr::new(STAGE),
+                        )
+                        .map_err(ProductFailure::Create)?;
+                    self.product_root = Some(stage.identity());
+                    self.flight = Some(Flight::Stage(stage));
+                    {
+                        let Some(Flight::Stage(stage)) = &mut self.flight else {
+                            return Err(io("stage-state", bad("missing owned stage")));
+                        };
+                        let mut file = stage
+                            .write_new(OsStr::new(CHILD), PAYLOAD, false)
+                            .map_err(|e| io("write_new", e))?;
+                        self.product_file = Some(file.identity());
+                        let sampled = file.snapshot().map_err(|e| io("write snapshot", e))?;
+                        self.product_snapshot = Some(sampled);
+                        require(
+                            sampled.identity == file.identity()
+                                && sampled.length == PAYLOAD.len() as u64
+                                && sampled.kind == SourceKind::File
+                                && sampled.link_count == 1
+                                && file.read_limited(4096).map_err(|e| io("write read", e))?
+                                    == PAYLOAD
+                                && !file
+                                    .execution_permission()
+                                    .map_err(|e| io("write permission", e))?
+                                    .executable(),
+                            "stage written package view differs",
+                        )
+                        .map_err(|e| io("write validation", e))?;
+                        require(
+                            file.snapshot()
+                                .map_err(|e| io("write snapshot after read", e))?
+                                == sampled,
+                            "stage written snapshot changed around read",
+                        )
+                        .map_err(|e| io("write snapshot stability", e))?;
+                    }
+                    {
+                        let Some(Flight::Stage(stage)) = &self.flight else {
+                            return Err(io("verify-state", bad("missing owned stage")));
+                        };
+                        let mut file = stage
+                            .verify_package_mode(OsStr::new(CHILD), false)
+                            .map_err(|e| io("stage verify", e))?;
+                        let sampled = file
+                            .snapshot()
+                            .map_err(|e| io("stage verify snapshot", e))?;
+                        require(
+                            Some(file.identity()) == self.product_file
+                                && Some(sampled) == self.product_snapshot
+                                && file
+                                    .read_limited(4096)
+                                    .map_err(|e| io("stage verify read", e))?
+                                    == PAYLOAD
+                                && !file
+                                    .execution_permission()
+                                    .map_err(|e| io("stage verify permission", e))?
+                                    .executable(),
+                            "stage verified package view differs",
+                        )
+                        .map_err(|e| io("stage verify validation", e))?;
+                        require(
+                            file.snapshot()
+                                .map_err(|e| io("stage verify snapshot after read", e))?
+                                == sampled,
+                            "stage verified snapshot changed around read",
+                        )
+                        .map_err(|e| io("stage verify snapshot stability", e))?;
+                    }
+                    let stage = match self.flight.take() {
+                        Some(Flight::Stage(stage)) => stage,
+                        other => {
+                            self.flight = other;
+                            return Err(io("publication-state", bad("missing owned stage")));
+                        }
+                    };
+                    let publication = stage
+                        .publish_directory(OsStr::new(FINAL))
+                        .map_err(ProductFailure::Publish)?;
+                    let id = publication.identity();
+                    let durability = publication.durability();
+                    self.flight = Some(Flight::Publication(publication));
+                    require(
+                        Some(id) == self.product_root
+                            && durability == Durability::FileBuffersFlushed,
+                        "stage publication identity/durability differs",
+                    )
+                    .map_err(|e| io("publication receipt", e))?;
+                    self.postpublish(id, self.product_file.unwrap())
+                        .map_err(|e| io("postpublication observer", e))?;
+                    let publication = match self.flight.take() {
+                        Some(Flight::Publication(p)) => p,
+                        other => {
+                            self.flight = other;
+                            return Err(io("acceptance-state", bad("missing publication")));
+                        }
+                    };
+                    self.flight = Some(Flight::Acceptance(
+                        publication.accept().map_err(ProductFailure::Accept)?,
+                    ));
+                    let Some(Flight::Acceptance(acceptance)) = &self.flight else {
+                        return Err(io("accepted-state", bad("missing acceptance")));
+                    };
+                    let directory = acceptance.directory();
+                    require(
+                        directory.identity() == id,
+                        "stage accepted directory ID differs",
+                    )
+                    .map_err(|e| io("acceptance identity", e))?;
+                    let mut file = directory
+                        .verify_package_mode(OsStr::new(CHILD), self.product_file.unwrap(), false)
+                        .map_err(|e| io("accepted verify", e))?;
+                    let sampled = file.snapshot().map_err(|e| io("accepted snapshot", e))?;
+                    require(
+                        Some(file.identity()) == self.product_file
+                            && Some(sampled) == self.product_snapshot
+                            && file
+                                .read_limited(4096)
+                                .map_err(|e| io("accepted read", e))?
+                                == PAYLOAD
+                            && !file
+                                .execution_permission()
+                                .map_err(|e| io("accepted permission", e))?
+                                .executable(),
+                        "stage accepted package view differs",
+                    )
+                    .map_err(|e| io("accepted validation", e))?;
+                    require(
+                        file.snapshot()
+                            .map_err(|e| io("accepted snapshot after read", e))?
+                            == sampled,
+                        "stage accepted snapshot changed around read",
+                    )
+                    .map_err(|e| io("accepted snapshot stability", e))?;
+                    Ok(())
+                }
+                fn cleanup_completed_product(&mut self) -> io::Result<()> {
+                    require(
+                        matches!(&self.flight, Some(Flight::Acceptance(_))),
+                        "stage completed cleanup requires immutable acceptance",
+                    )?;
+                    // This is only the genuine happy-path teardown. An intact
+                    // stage/publication/recovery is never released this way.
+                    drop(self.flight.take());
+                    println!(
+                        "stage_accepted_read_capability_released direct_CloseHandle_telemetry=false"
+                    );
+                    let f = &mut self.oracle;
+                    let parent = f.handles.raw(f.root.unwrap());
+                    let key = f.key.as_ref().unwrap();
+                    let root = relative(
+                        &mut f.handles,
+                        parent,
+                        OsStr::new(FINAL),
+                        true,
+                        FILE_OPEN,
+                        ROOT_READ | FILE_DELETE_CHILD,
+                        null(),
+                    )?;
+                    let raw = f.handles.raw(root);
+                    require(
+                        Some(identity(raw)?) == self.product_root,
+                        "stage completed cleanup root ID differs",
+                    )?;
+                    let _ = read_descriptor(raw, key, FILE_ALL_ACCESS)?;
+                    self.product_cleanup = Some(Entry {
+                        name: OsString::from(CHILD),
+                        mask: FILE_GENERIC_READ,
+                        id: self.product_file,
+                        facts: None,
+                        snapshot: None,
+                        observed: None,
+                        removed: false,
+                    });
+                    let entry = self.product_cleanup.as_mut().unwrap();
+                    let reader = relative(
+                        &mut f.handles,
+                        raw,
+                        OsStr::new(CHILD),
+                        false,
+                        FILE_OPEN,
+                        FILE_GENERIC_READ,
+                        null(),
+                    )?;
+                    let read = f.handles.raw(reader);
+                    let sampled = snapshot(read)?;
+                    require(
+                        Some(sampled.identity) == entry.id,
+                        "stage completed cleanup payload ID differs",
+                    )?;
+                    entry.snapshot = Some(sampled);
+                    entry.facts = Some(read_descriptor(read, key, FILE_GENERIC_READ)?.facts);
+                    raw_bytes(read, PAYLOAD)?;
+                    f.handles.close(reader)?;
+                    remove_file(&mut f.handles, raw, key, entry)?;
+                    f.handles.close(root)?;
+                    remove_root(
+                        &mut f.handles,
+                        parent,
+                        key,
+                        OsStr::new(FINAL),
+                        self.product_root.unwrap(),
+                    )?;
+                    Ok(())
+                }
+                fn cleanup(&mut self) -> io::Result<()> {
+                    require(
+                        self.flight.is_none(),
+                        "stage cleanup refuses retained product authority",
+                    )?;
+                    let f = &mut self.oracle;
+                    let root = f.handles.raw(f.root.unwrap());
+                    let key = f.key.as_ref().unwrap().clone();
+                    drop(self.parent.take());
+                    let count = Arc::strong_count(self.guard.as_ref().unwrap());
+                    require(count == 1, "stage cleanup refuses retained guard alias")?;
+                    drop(self.guard.take());
+                    println!(
+                        "stage_public_capabilities_released guard_aliases_before_release={count} parent_released=true direct_CloseHandle_telemetry=false native_disposition_and_absence_follow=true"
+                    );
+                    remove_file(&mut f.handles, root, &key, self.canary.as_mut().unwrap())?;
+                    remove_file(&mut f.handles, root, &key, self.lock.as_mut().unwrap())?;
+                    for anchor in self.anchors.drain(..) {
+                        f.handles.close(anchor.owner)?;
+                    }
+                    f.cleanup()?;
+                    println!(
+                        "stage_fixture_teardown_complete parent_absent=true lock_absent=true canary_absent=true source_oracles_absent=true all_direct_native_owners_checked_closed=true public_release_proved_by_native_cleanup=true"
+                    );
+                    Ok(())
+                }
+                fn preserve(&mut self) -> Vec<String> {
+                    let close = self.oracle.preserve();
+                    println!(
+                        "stage_fixture_invalid_preserved namespace_authority_not_inferred=true product_flight_retained={} parent_guard_retained={} lock_create_attempted={} canary={:?} root_probe={:?} completed_product_cleanup={:?} no_constructor_RED_acknowledgment=true",
+                        self.flight.is_some(),
+                        self.guard.is_some(),
+                        self.lock_attempted,
+                        self.canary,
+                        self.root_probe,
+                        self.product_cleanup
+                    );
+                    close
+                }
+            }
+
+            pub(in crate::windows) struct Failure {
+                setup: Option<io::Error>,
+                product: Option<ProductFailure>,
+                cleanup: Option<io::Error>,
+                close_errors: Vec<String>,
+                retained: Option<Box<Harness>>,
+                expected_constructor: bool,
+            }
+            impl std::fmt::Debug for Failure {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.debug_struct(if self.expected_constructor {
+                        "StageConstructorRed"
+                    } else {
+                        "InvalidStageRed"
+                    })
+                    .field("setup", &self.setup)
+                    .field("product", &self.product)
+                    .field("cleanup", &self.cleanup)
+                    .field("preservation_close_errors", &self.close_errors)
+                    .field(
+                        "owns_unresolved_fixture_or_product_authority",
+                        &self.retained.is_some(),
+                    )
+                    .finish()
+                }
+            }
+
+            pub(super) fn run() -> Result<(), Failure> {
+                let mut harness = Harness::new();
+                if let Err(setup) = harness.prepare() {
+                    let close = harness.preserve();
+                    return Err(Failure {
+                        setup: Some(setup),
+                        product: None,
+                        cleanup: (!close.is_empty())
+                            .then(|| io::Error::other(format!("native close errors: {close:?}"))),
+                        close_errors: close,
+                        retained: Some(Box::new(harness)),
+                        expected_constructor: false,
+                    });
+                }
+                let product = harness.happy();
+                if product.is_ok() {
+                    if let Err(cleanup) = harness
+                        .observe("accepted_product", true)
+                        .and_then(|_| harness.cleanup_completed_product())
+                        .and_then(|_| harness.observe("completed_product_removed", false))
+                        .and_then(|_| harness.cleanup())
+                    {
+                        let close = harness.preserve();
+                        return Err(Failure {
+                            setup: None,
+                            product: None,
+                            cleanup: Some(cleanup),
+                            close_errors: close,
+                            retained: Some(Box::new(harness)),
+                            expected_constructor: false,
+                        });
+                    }
+                    return Ok(());
+                }
+                let expected = matches!(&product, Err(ProductFailure::Create(StageCreateError::Unchanged(source))) if source.kind() == io::ErrorKind::Unsupported && source.to_string() == MISSING)
+                    && harness.flight.is_none();
+                if !expected {
+                    // Only the constructor's exact no-mutation failure is this
+                    // selected RED. Unexpected authority remains
+                    // in the returned owning carrier, never stringified away.
+                    let close = harness.preserve();
+                    return Err(Failure {
+                        setup: None,
+                        product: product.err(),
+                        cleanup: Some(io::Error::other(format!(
+                            "not the selected constructor RED; native close errors={close:?}"
+                        ))),
+                        close_errors: close,
+                        retained: Some(Box::new(harness)),
+                        expected_constructor: false,
+                    });
+                }
+                if let Err(cleanup) = harness
+                    .observe("constructor_unchanged_adjudication", false)
+                    .and_then(|_| harness.cleanup())
+                {
+                    let close = harness.preserve();
+                    return Err(Failure {
+                        setup: None,
+                        product: product.err(),
+                        cleanup: Some(cleanup),
+                        close_errors: close,
+                        retained: Some(Box::new(harness)),
+                        expected_constructor: false,
+                    });
+                }
+                println!(
+                    "stage_constructor_RED_exact phase=constructor variant=Unchanged kind=Unsupported literal={MISSING:?} native_prerequisites_complete=true under_lock_no_mutation_proved=true complete_known_fixture_teardown=true"
+                );
+                Err(Failure {
+                    setup: None,
+                    product: product.err(),
+                    cleanup: None,
+                    close_errors: Vec::new(),
+                    retained: None,
+                    expected_constructor: true,
+                })
+            }
+        }
+
+        pub(super) fn run_first_stage() -> Result<(), first_stage::Failure> {
+            first_stage::run()
+        }
+
         pub(super) fn run_extension() -> io::Result<()> {
             extension::run()
         }
@@ -5398,5 +6727,11 @@ mod windows {
     #[test]
     fn source_execution_permission_denial_is_extension_independent() -> std::io::Result<()> {
         execution_oracle::run_extension()
+    }
+
+    #[test]
+    fn staged_package_seals_and_publishes_one_file()
+    -> Result<(), execution_oracle::first_stage::Failure> {
+        execution_oracle::run_first_stage()
     }
 }
