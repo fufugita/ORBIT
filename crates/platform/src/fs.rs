@@ -85,5 +85,5 @@ pub use windows::{
     PrivateTreeEntry, PrivateTreeInspection, Publication, PublicationState, PublishError, Removal,
     RemovalError, RemovalState, SourceDirectory, SourceEntry, SourceFile, SourceKind,
     SourceSnapshot, StageAcceptError, StageCreateError, StagePublishError, StageRecovery,
-    StagedDirectory, StateLock, UpdateFile,
+    StageRemoval, StageRemovalError, StagedDirectory, StateLock, UpdateFile,
 };

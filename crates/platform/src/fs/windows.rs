@@ -3072,6 +3072,47 @@ mod staged_package {
         core: StageCore,
         publication: Option<(FileIdentity, Durability)>,
     }
+    // Declaration-only evidence. Successful construction requires the later
+    // real disposition, checked-close and absence implementation.
+    #[allow(dead_code)]
+    struct RemovedEntryEvidence {
+        identity: FileIdentity,
+        disposition_status: i32,
+        close_confirmed: bool,
+        absence_confirmed: bool,
+    }
+    #[allow(dead_code)]
+    pub struct StageRemoval {
+        domain: Arc<Domain>,
+        root: RemovedEntryEvidence,
+        entries: Vec<RemovedEntryEvidence>,
+    }
+    pub enum StageRemovalError {
+        Unchanged {
+            source: io::Error,
+            stage: StagedDirectory,
+        },
+        Uncertain {
+            source: io::Error,
+            recovery: StageRecovery,
+        },
+    }
+    impl std::fmt::Debug for StageRemovalError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Unchanged { source, stage } => f
+                    .debug_struct("Unchanged")
+                    .field("source", source)
+                    .field("stage", stage)
+                    .finish(),
+                Self::Uncertain { source, recovery } => f
+                    .debug_struct("Uncertain")
+                    .field("source", source)
+                    .field("recovery", recovery)
+                    .finish(),
+            }
+        }
+    }
     pub enum StageCreateError {
         Unchanged(io::Error),
         Uncertain {
@@ -3348,6 +3389,29 @@ mod staged_package {
             validate_source_component(name)?;
             self.core.make_view(name, executable)
         }
+        pub fn discard(self) -> Result<StageRemoval, StageRemovalError> {
+            let validation = (|| {
+                self.core.check_root()?;
+                self.core.domain.closes.zero()?;
+                self.core.inventory(self.core.raw()?)?;
+                self.core.check_root()?;
+                self.core.domain.closes.zero()
+            })();
+            if let Err(source) = validation {
+                return Err(StageRemovalError::Uncertain {
+                    source,
+                    recovery: StageRecovery {
+                        core: self.core,
+                        publication: None,
+                    },
+                });
+            }
+            Err(StageRemovalError::Unchanged {
+                source: unsupported("staged package discard is not implemented"),
+                stage: self,
+            })
+        }
+
         pub fn publish_directory(
             mut self,
             final_name: &OsStr,
@@ -3860,7 +3924,8 @@ mod staged_package {
 
 pub use staged_package::{
     PackageAcceptance, PackageDirectory, PackageFile, PackagePublication, StageAcceptError,
-    StageCreateError, StagePublishError, StageRecovery, StagedDirectory,
+    StageCreateError, StagePublishError, StageRecovery, StageRemoval, StageRemovalError,
+    StagedDirectory,
 };
 
 #[cfg(test)]
