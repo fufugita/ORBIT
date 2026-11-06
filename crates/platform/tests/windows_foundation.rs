@@ -4455,6 +4455,919 @@ mod windows {
                 errors
             }
         }
+        // A separate runner keeps the accepted three-file oracle and its
+        // witnesses unchanged while sharing its checked native primitives.
+        mod extension {
+            use super::*;
+
+            const COUNT: usize = 4;
+            const CANARY: usize = COUNT;
+            const RX: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+            const CANARY_BYTES: &[u8] = b"extension-foreign-canary-v1";
+
+            fn denied_descriptor(key: &TokenKey) -> io::Result<Vec<usize>> {
+                let user = sid_text(&key.user)?;
+                let group = sid_text(&key.group)?;
+                let text = wide(OsStr::new(&format!(
+                    "O:{user}G:{group}D:P(D;;0x{FILE_EXECUTE:08x};;;{user})(A;;0x{RX:08x};;;{user})"
+                )));
+                let mut raw = null_mut();
+                let mut returned = 0;
+                yes(unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        text.as_ptr(),
+                        1,
+                        &mut raw,
+                        &mut returned,
+                    )
+                })?;
+                let allocation = LocalSecurityAllocation(raw.cast());
+                let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+                require(
+                    length > 0 && length <= LIMIT && length == returned as usize,
+                    "extension descriptor length invalid",
+                )?;
+                let mut words = vec![0usize; length.div_ceil(size_of::<usize>())];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.cast::<u8>(),
+                        words.as_mut_ptr().cast(),
+                        length,
+                    );
+                }
+                drop(allocation);
+                Ok(words)
+            }
+
+            fn policy(handle: HANDLE, key: &TokenKey, index: usize) -> io::Result<ReadDescriptor> {
+                if index != 0 {
+                    return read_descriptor(
+                        handle,
+                        key,
+                        if index == CANARY { FILE_ALL_ACCESS } else { RX },
+                    );
+                }
+                let mut owner = null_mut();
+                let mut group = null_mut();
+                let mut dacl = null_mut();
+                let mut raw = null_mut();
+                let status = unsafe {
+                    GetSecurityInfo(
+                        handle,
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION
+                            | GROUP_SECURITY_INFORMATION
+                            | DACL_SECURITY_INFORMATION,
+                        &mut owner,
+                        &mut group,
+                        &mut dacl,
+                        null_mut(),
+                        &mut raw,
+                    )
+                };
+                if status != ERROR_SUCCESS {
+                    return Err(io::Error::from_raw_os_error(status as i32));
+                }
+                let allocation = LocalSecurityAllocation(raw.cast());
+                yes(unsafe { IsValidSecurityDescriptor(raw) })?;
+                let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+                require(
+                    length >= size_of::<SECURITY_DESCRIPTOR_RELATIVE>() && length <= LIMIT,
+                    "extension descriptor bounds invalid",
+                )?;
+                let mut words = vec![0usize; length.div_ceil(size_of::<usize>())];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.cast::<u8>(),
+                        words.as_mut_ptr().cast(),
+                        length,
+                    );
+                }
+                drop(allocation);
+                let ptr = words.as_mut_ptr().cast();
+                yes(unsafe { IsValidSecurityDescriptor(ptr) })?;
+                let mut control = 0;
+                let mut revision = 0;
+                yes(unsafe { GetSecurityDescriptorControl(ptr, &mut control, &mut revision) })?;
+                require(
+                    control & (SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE)
+                        == SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE,
+                    "extension descriptor control invalid",
+                )?;
+                let mut defaulted = 0;
+                let mut present = 0;
+                yes(unsafe { GetSecurityDescriptorOwner(ptr, &mut owner, &mut defaulted) })?;
+                yes(unsafe { GetSecurityDescriptorGroup(ptr, &mut group, &mut defaulted) })?;
+                yes(unsafe {
+                    GetSecurityDescriptorDacl(ptr, &mut present, &mut dacl, &mut defaulted)
+                })?;
+                let owner = sid_bytes(owner, words.as_ptr().cast(), length)?;
+                let group = sid_bytes(group, words.as_ptr().cast(), length)?;
+                require(
+                    owner == key.user
+                        && group == key.group
+                        && present != 0
+                        && !dacl.is_null()
+                        && dacl as usize % 4 == 0,
+                    "extension owner/group/DACL mismatch",
+                )?;
+                let offset = (dacl as usize)
+                    .checked_sub(words.as_ptr() as usize)
+                    .ok_or_else(|| bad("extension DACL outside descriptor"))?;
+                require(
+                    offset
+                        .checked_add(size_of::<ACL>())
+                        .is_some_and(|end| end <= length),
+                    "extension short ACL",
+                )?;
+                let acl_length = unsafe { (*dacl).AclSize } as usize;
+                require(
+                    acl_length >= size_of::<ACL>()
+                        && offset
+                            .checked_add(acl_length)
+                            .is_some_and(|end| end <= length),
+                    "extension ACL outside descriptor",
+                )?;
+                yes(unsafe { IsValidAcl(dacl) })?;
+                require(
+                    unsafe { (*dacl).AceCount } == 2,
+                    "extension deny policy needs exactly two ACEs",
+                )?;
+                for (ace_index, ace_type, mask) in [
+                    (0, ACCESS_DENIED_ACE_TYPE, FILE_EXECUTE),
+                    (1, ACCESS_ALLOWED_ACE_TYPE, RX),
+                ] {
+                    let mut ace = null_mut();
+                    yes(unsafe { GetAce(dacl, ace_index, &mut ace) })?;
+                    let ace_offset = (ace as usize)
+                        .checked_sub(dacl as usize)
+                        .ok_or_else(|| bad("extension ACE outside ACL"))?;
+                    require(
+                        ace as usize % 4 == 0
+                            && ace_offset
+                                .checked_add(size_of::<ACE_HEADER>())
+                                .is_some_and(|end| end <= acl_length),
+                        "extension ACE header bounds/alignment invalid",
+                    )?;
+                    let header = unsafe { ace.cast::<ACE_HEADER>().read() };
+                    let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+                    require(
+                        header.AceType == ace_type
+                            && header.AceFlags == 0
+                            && header.AceSize as usize >= sid_offset + 8
+                            && ace_offset
+                                .checked_add(header.AceSize as usize)
+                                .is_some_and(|end| end <= acl_length),
+                        "extension ACE order/type/flags/bounds invalid",
+                    )?;
+                    let actual_mask = unsafe {
+                        ace.cast::<u8>()
+                            .add(size_of::<ACE_HEADER>())
+                            .cast::<u32>()
+                            .read()
+                    };
+                    let sid = unsafe { ace.cast::<u8>().add(sid_offset).cast() };
+                    require(
+                        actual_mask == mask
+                            && sid_bytes(sid, ace.cast(), header.AceSize as usize)? == key.user,
+                        "extension ACE mask/SID mismatch",
+                    )?;
+                }
+                let dacl =
+                    unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), acl_length) }.to_vec();
+                Ok(ReadDescriptor {
+                    words,
+                    facts: SecurityFacts {
+                        owner,
+                        group,
+                        dacl,
+                        control,
+                    },
+                })
+            }
+
+            fn bytes(
+                handles: &mut Handles,
+                root: HANDLE,
+                entry: &Entry,
+                expected: &[u8],
+            ) -> io::Result<()> {
+                let reader = relative(
+                    handles,
+                    root,
+                    &entry.name,
+                    false,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ,
+                    null(),
+                )?;
+                let raw = handles.raw(reader);
+                require(
+                    Some(snapshot(raw)?) == entry.snapshot,
+                    "extension data snapshot differs",
+                )?;
+                let mut buffer = [0u8; 128];
+                let mut count = 0;
+                yes(unsafe {
+                    ReadFile(
+                        raw,
+                        buffer.as_mut_ptr(),
+                        buffer.len() as u32,
+                        &mut count,
+                        null_mut(),
+                    )
+                })?;
+                require(
+                    (count as usize) <= buffer.len() && &buffer[..count as usize] == expected,
+                    "extension native bytes differ",
+                )?;
+                handles.close(reader)
+            }
+
+            fn create(f: &mut Fixture) -> io::Result<()> {
+                let (original, key) = effective(&mut f.handles)?;
+                f.original = Some(original);
+                f.key = Some(key.clone());
+                println!("exec_extension_original_context={key:?}");
+                let level = key.impersonation.unwrap_or(SecurityImpersonation);
+                let mut raw = null_mut();
+                yes(unsafe {
+                    DuplicateTokenEx(
+                        f.handles.raw(original),
+                        TOKEN_QUERY,
+                        null(),
+                        level,
+                        TokenImpersonation,
+                        &mut raw,
+                    )
+                })?;
+                let duplicate = f.handles.own(raw);
+                f.duplicate = Some(duplicate);
+                let stats: TOKEN_STATISTICS = token_value(raw, TokenStatistics)?;
+                require(
+                    stats.TokenType == TokenImpersonation && stats.ImpersonationLevel == level,
+                    "extension duplicate type/level invalid",
+                )?;
+                println!(
+                    "exec_extension_accesscheck_duplicate type={} level={} id=({},{}) diagnostic_only=true",
+                    stats.TokenType,
+                    stats.ImpersonationLevel,
+                    stats.TokenId.LowPart,
+                    stats.TokenId.HighPart
+                );
+                let path = wide(std::env::temp_dir().as_os_str());
+                let raw = unsafe {
+                    CreateFileW(
+                        path.as_ptr(),
+                        FILE_LIST_DIRECTORY
+                            | FILE_ADD_SUBDIRECTORY
+                            | FILE_DELETE_CHILD
+                            | FILE_TRAVERSE
+                            | META,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        null(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                        null_mut(),
+                    )
+                };
+                if raw == INVALID_HANDLE_VALUE {
+                    return Err(io::Error::last_os_error());
+                }
+                let temp = f.handles.own(raw);
+                f.temp = Some(temp);
+                f.temp_id = Some(identity(raw)?);
+                kind(raw, true)?;
+                let security = descriptor(&key, FILE_ALL_ACCESS)?;
+                let root = relative(
+                    &mut f.handles,
+                    raw,
+                    &f.root_name,
+                    true,
+                    FILE_CREATE,
+                    FILE_ALL_ACCESS & !DELETE,
+                    security.as_ptr().cast(),
+                )?;
+                f.root = Some(root);
+                let root_raw = f.handles.raw(root);
+                f.root_id = Some(identity(root_raw)?);
+                kind(root_raw, true)?;
+                let _ = read_descriptor(root_raw, &key, FILE_ALL_ACCESS)?;
+                for name in [
+                    "explicit-deny.exe",
+                    "permitted.txt",
+                    "extensionless",
+                    "permitted-雪",
+                    "foreign-canary",
+                ] {
+                    f.entries.push(Entry {
+                        name: OsString::from(name),
+                        mask: FILE_ALL_ACCESS,
+                        id: None,
+                        facts: None,
+                        snapshot: None,
+                        observed: None,
+                        removed: false,
+                    });
+                }
+                // Establish the canary first, so later setup failures also have a
+                // separately identified, independently verifiable foreign image.
+                for index in [CANARY, 0, 1, 2, 3] {
+                    let entry = &mut f.entries[index];
+                    let writer = relative(
+                        &mut f.handles,
+                        root_raw,
+                        &entry.name,
+                        false,
+                        FILE_CREATE,
+                        FILE_ALL_ACCESS,
+                        security.as_ptr().cast(),
+                    )?;
+                    let raw = f.handles.raw(writer);
+                    entry.id = Some(identity(raw)?);
+                    kind(raw, false)?;
+                    entry.facts = Some(read_descriptor(raw, &key, FILE_ALL_ACCESS)?.facts);
+                    let payload = if index == CANARY {
+                        CANARY_BYTES
+                    } else {
+                        PAYLOAD
+                    };
+                    let mut written = 0;
+                    yes(unsafe {
+                        WriteFile(
+                            raw,
+                            payload.as_ptr(),
+                            payload.len() as u32,
+                            &mut written,
+                            null_mut(),
+                        )
+                    })?;
+                    require(
+                        written as usize == payload.len(),
+                        "extension fixture short write",
+                    )?;
+                    yes(unsafe { FlushFileBuffers(raw) })?;
+                    if index != CANARY {
+                        let sd = if index == 0 {
+                            denied_descriptor(&key)?
+                        } else {
+                            descriptor(&key, RX)?
+                        };
+                        let mut present = 0;
+                        let mut dacl = null_mut();
+                        let mut defaulted = 0;
+                        yes(unsafe {
+                            GetSecurityDescriptorDacl(
+                                sd.as_ptr().cast_mut().cast(),
+                                &mut present,
+                                &mut dacl,
+                                &mut defaulted,
+                            )
+                        })?;
+                        require(
+                            present != 0 && !dacl.is_null(),
+                            "extension seal DACL missing",
+                        )?;
+                        let status = unsafe {
+                            SetSecurityInfo(
+                                raw,
+                                SE_FILE_OBJECT,
+                                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                null_mut(),
+                                null_mut(),
+                                dacl,
+                                null_mut(),
+                            )
+                        };
+                        if status != ERROR_SUCCESS {
+                            return Err(io::Error::from_raw_os_error(status as i32));
+                        }
+                    }
+                    entry.facts = Some(policy(raw, &key, index)?.facts);
+                    entry.mask = if index == CANARY { FILE_ALL_ACCESS } else { RX };
+                    f.handles.close(writer)?;
+                    let baseline = relative(
+                        &mut f.handles,
+                        root_raw,
+                        &entry.name,
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    let raw = f.handles.raw(baseline);
+                    let sampled = snapshot(raw)?;
+                    require(
+                        Some(sampled.identity) == entry.id
+                            && Some(policy(raw, &key, index)?.facts) == entry.facts,
+                        "extension policy/ID changed after last writer close",
+                    )?;
+                    entry.snapshot = Some(sampled);
+                    f.handles.close(baseline)?;
+                }
+                f.directory = Some(SourceDirectory::open(&f.path)?);
+                require(
+                    f.directory.as_ref().unwrap().identity() == f.root_id.unwrap(),
+                    "extension source root ID mismatch",
+                )?;
+                Ok(())
+            }
+
+            fn canary(f: &mut Fixture, phase: &'static str) -> io::Result<()> {
+                let root = f.handles.raw(f.root.unwrap());
+                let entry = &f.entries[CANARY];
+                let meta = relative(
+                    &mut f.handles,
+                    root,
+                    &entry.name,
+                    false,
+                    FILE_OPEN,
+                    META,
+                    null(),
+                )?;
+                let raw = f.handles.raw(meta);
+                require(
+                    Some(snapshot(raw)?) == entry.snapshot
+                        && Some(policy(raw, f.key.as_ref().unwrap(), CANARY)?.facts) == entry.facts,
+                    "extension foreign canary changed",
+                )?;
+                f.handles.close(meta)?;
+                bytes(&mut f.handles, root, entry, CANARY_BYTES)?;
+                println!(
+                    "exec_extension_canary phase={phase} full_id={:?} snapshot={:?} descriptor_unchanged=true bytes_unchanged=true",
+                    entry.id, entry.snapshot
+                );
+                Ok(())
+            }
+
+            fn collect(f: &mut Fixture) -> io::Result<()> {
+                let key = f.key.as_ref().unwrap().clone();
+                let original = f.original.unwrap();
+                let duplicate = f.duplicate.unwrap();
+                let root = f.handles.raw(f.root.unwrap());
+                for index in 0..COUNT {
+                    stable_context(&mut f.handles, original, &key)?;
+                    let entry = &mut f.entries[index];
+                    let source = f.directory.as_ref().unwrap().open_file(&entry.name)?;
+                    f.sources.push(source);
+                    let before = f.sources[index].snapshot()?;
+                    require(
+                        Some(before) == entry.snapshot
+                            && f.sources[index].read_limited(4096)? == PAYLOAD,
+                        "extension source baseline differs",
+                    )?;
+                    let meta = relative(
+                        &mut f.handles,
+                        root,
+                        &entry.name,
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    let raw = f.handles.raw(meta);
+                    require(
+                        snapshot(raw)? == before,
+                        "extension metadata baseline differs",
+                    )?;
+                    let sd = policy(raw, &key, index)?;
+                    require(
+                        Some(&sd.facts) == entry.facts.as_ref(),
+                        "extension descriptor changed before AccessCheck",
+                    )?;
+                    bytes(&mut f.handles, root, entry, PAYLOAD)?;
+                    let access = access_check(&sd, f.handles.raw(duplicate))?;
+                    let native = match relative(
+                        &mut f.handles,
+                        root,
+                        &entry.name,
+                        false,
+                        FILE_OPEN,
+                        META | FILE_EXECUTE,
+                        null(),
+                    ) {
+                        Ok(execute) => {
+                            let raw = f.handles.raw(execute);
+                            require(
+                                snapshot(raw)? == before
+                                    && policy(raw, &key, index)?.facts == sd.facts,
+                                "extension execute handle identifies changed file/policy",
+                            )?;
+                            f.handles.close(execute)?;
+                            true
+                        }
+                        Err(error)
+                            if error
+                                .get_ref()
+                                .and_then(|e| e.downcast_ref::<NativeOpenError>())
+                                .is_some_and(|e| {
+                                    e.phase == "NtCreateFile"
+                                        && e.status == DENIED
+                                        && e.desired == META | FILE_EXECUTE
+                                }) =>
+                        {
+                            false
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    require(
+                        access == native && access == (index != 0),
+                        "extension AccessCheck/native decision disagreement",
+                    )?;
+                    require(
+                        policy(raw, &key, index)?.facts == sd.facts
+                            && snapshot(raw)? == before
+                            && f.sources[index].snapshot()? == before,
+                        "extension oracle changed during collection",
+                    )?;
+                    stable_context(&mut f.handles, original, &key)?;
+                    f.handles.close(meta)?;
+                    entry.observed = Some(access);
+                    println!(
+                        "exec_extension_case_complete index={index} name={:?} full_id={:?} snapshot={before:?} descriptor={:?} desired_metadata=0x{META:08x} desired_execute=0x{:08x} AccessCheck={access} native_execute_open={native} expected={} metadata_baseline=success bytes_verified=true original_context_stable=true",
+                        entry.name,
+                        before.identity,
+                        sd.facts,
+                        META | FILE_EXECUTE,
+                        index != 0
+                    );
+                }
+                for index in 0..COUNT {
+                    let entry = &f.entries[index];
+                    let meta = relative(
+                        &mut f.handles,
+                        root,
+                        &entry.name,
+                        false,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    )?;
+                    let raw = f.handles.raw(meta);
+                    require(
+                        Some(snapshot(raw)?) == entry.snapshot
+                            && Some(policy(raw, &key, index)?.facts) == entry.facts
+                            && Some(f.sources[index].snapshot()?) == entry.snapshot,
+                        "extension all-four final stability check failed",
+                    )?;
+                    f.handles.close(meta)?;
+                }
+                canary(f, "before_product")?;
+                stable_context(&mut f.handles, original, &key)?;
+                f.handles.close(duplicate)?;
+                f.handles.close(original)?;
+                require(
+                    f.entries[..COUNT]
+                        .iter()
+                        .all(|entry| entry.observed.is_some()),
+                    "extension oracle collection incomplete",
+                )?;
+                for (index, slot) in f.handles.slots.iter().enumerate() {
+                    require(
+                        slot.is_none() || Some(index) == f.temp || Some(index) == f.root,
+                        "extension query owner remained at completion marker",
+                    )?;
+                }
+                println!(
+                    "exec_extension_oracles_complete count=4 observations=false,true,true,true original_context={key:?} all_test_owned_query_handles_checked_closed=true first_product_call_not_yet_made=true"
+                );
+                Ok(())
+            }
+
+            fn current(f: &mut Fixture) -> io::Result<()> {
+                let (fresh, key) = effective(&mut f.handles)?;
+                let same = Some(&key) == f.key.as_ref();
+                f.handles.close(fresh)?;
+                require(same, "extension product context changed")
+            }
+
+            fn product(f: &mut Fixture) -> io::Result<()> {
+                current(f)?;
+                let mut observations = Vec::new();
+                for index in 0..COUNT {
+                    let entry = &f.entries[index];
+                    let source = &mut f.sources[index];
+                    println!(
+                        "exec_extension_product_call index={index} expected={} native_oracles_complete=4",
+                        entry.observed.unwrap()
+                    );
+                    let before = source.snapshot()?;
+                    let first = source.execution_permission()?;
+                    require(
+                        first.executable() == entry.observed.unwrap(),
+                        "extension product outcome differs from native oracles",
+                    )?;
+                    require(
+                        source.read_limited(4096)? == PAYLOAD,
+                        "extension product bytes differ",
+                    )?;
+                    let second = source.execution_permission()?;
+                    require(
+                        first == second
+                            && Some(before) == entry.snapshot
+                            && source.snapshot()? == before,
+                        "extension whole observation or snapshot changed around read",
+                    )?;
+                    println!(
+                        "exec_extension_product_complete index={index} executable={} repeated_whole_equal=true bytes_unchanged=true snapshot_unchanged=true full_id={:?}",
+                        first.executable(),
+                        before.identity
+                    );
+                    observations.push(first);
+                }
+                for left in 1..COUNT {
+                    for right in left + 1..COUNT {
+                        require(
+                            f.entries[left].facts == f.entries[right].facts
+                                && f.entries[left].id != f.entries[right].id,
+                            "extension distinct-ID equality precondition failed",
+                        )?;
+                        require(
+                            observations[left] != observations[right],
+                            "extension opaque observations lost distinct full IDs",
+                        )?;
+                        println!(
+                            "exec_extension_distinct_identity left={left} right={right} policy_equal=true context_equal=true full_ids_differ=true whole_observations_differ=true"
+                        );
+                    }
+                }
+                current(f)
+            }
+
+            fn close_queries(f: &mut Fixture, errors: &mut Vec<String>) {
+                for index in 0..f.handles.slots.len() {
+                    if f.handles.slots[index].is_some()
+                        && Some(index) != f.root
+                        && Some(index) != f.temp
+                    {
+                        if let Err(error) = f.handles.close(index) {
+                            errors.push(format!("close {index}: {error}"));
+                        }
+                    }
+                }
+            }
+
+            fn remove(f: &mut Fixture, index: usize) -> io::Result<()> {
+                let root = f.handles.raw(f.root.unwrap());
+                let entry = &mut f.entries[index];
+                if entry.removed {
+                    return Ok(());
+                }
+                // The normal native sharing contract excludes DELETE. Finish
+                // the data view before acquiring the cleanup DELETE owner.
+                if entry.snapshot.is_some() {
+                    bytes(
+                        &mut f.handles,
+                        root,
+                        entry,
+                        if index == CANARY {
+                            CANARY_BYTES
+                        } else {
+                            PAYLOAD
+                        },
+                    )?;
+                }
+                let delete = match relative(
+                    &mut f.handles,
+                    root,
+                    &entry.name,
+                    false,
+                    FILE_OPEN,
+                    DELETE | META,
+                    null(),
+                ) {
+                    Ok(delete) => delete,
+                    Err(error) if native_is(&error, ABSENT) && entry.id.is_none() => {
+                        entry.removed = true;
+                        println!(
+                            "exec_extension_cleanup index={index} never_identified=true actual_absence=true"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                let raw = f.handles.raw(delete);
+                let sampled = snapshot(raw)?;
+                require(
+                    Some(sampled.identity) == entry.id,
+                    "extension cleanup refuses unknown/replaced ID",
+                )?;
+                if let Some(before) = entry.snapshot {
+                    require(
+                        sampled == before,
+                        "extension cleanup refuses changed snapshot",
+                    )?;
+                }
+                // Final security facts can precede a failed independent
+                // metadata baseline. Validate them even without a snapshot;
+                // an unmeasured policy transition never authorizes deletion.
+                let expected = entry
+                    .facts
+                    .as_ref()
+                    .ok_or_else(|| bad("extension cleanup refuses unmeasured security"))?;
+                let actual = if entry.mask == FILE_ALL_ACCESS {
+                    read_descriptor(raw, f.key.as_ref().unwrap(), FILE_ALL_ACCESS)?
+                } else {
+                    policy(raw, f.key.as_ref().unwrap(), index)?
+                };
+                require(
+                    actual.facts == *expected,
+                    "extension cleanup refuses changed descriptor",
+                )?;
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                yes(unsafe {
+                    SetFileInformationByHandle(
+                        raw,
+                        FileDispositionInfo,
+                        (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                        size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                })?;
+                f.handles.close(delete)?;
+                match relative(
+                    &mut f.handles,
+                    root,
+                    &entry.name,
+                    false,
+                    FILE_OPEN,
+                    META,
+                    null(),
+                ) {
+                    Err(error) if native_is(&error, ABSENT) => {}
+                    Ok(found) => {
+                        f.handles.close(found)?;
+                        return Err(bad("extension payload remains after deletion"));
+                    }
+                    Err(error) => return Err(error),
+                }
+                entry.removed = true;
+                println!(
+                    "exec_extension_cleanup index={index} full_id={:?} disposition_executed=true delete_owner_checked_closed=true actual_absence=true acl_repair=false",
+                    entry.id
+                );
+                Ok(())
+            }
+
+            fn cleanup(f: &mut Fixture) -> io::Result<()> {
+                f.sources.clear();
+                let mut errors = Vec::new();
+                close_queries(f, &mut errors);
+                if f.root.is_some() && f.root_id.is_some() {
+                    if f.entries
+                        .get(CANARY)
+                        .is_some_and(|entry| entry.snapshot.is_some())
+                    {
+                        if let Err(error) = canary(f, "after_product_or_setup_error") {
+                            errors.push(format!("canary: {error}"));
+                        }
+                        close_queries(f, &mut errors);
+                    }
+                    if let Some(directory) = &f.directory {
+                        match directory.enumerate(EnumerationLimits {
+                            max_entries: COUNT + 1,
+                            max_name_bytes: 1024,
+                        }) {
+                            Ok(listed) => {
+                                if listed.len() != f.entries.len()
+                                    || !f.entries.iter().all(|entry| {
+                                        listed.iter().any(|seen| {
+                                            seen.name == entry.name
+                                                && Some(seen.identity) == entry.id
+                                        })
+                                    })
+                                {
+                                    errors.push("extension cleanup inventory differs".into());
+                                }
+                            }
+                            Err(error) => errors.push(format!("inventory: {error}")),
+                        }
+                    }
+                    for index in 0..f.entries.len() {
+                        if let Err(error) = remove(f, index) {
+                            errors.push(format!("entry {index}: {error}"));
+                        }
+                        close_queries(f, &mut errors);
+                    }
+                }
+                drop(f.directory.take());
+                let root_removed = (|| -> io::Result<bool> {
+                    let Some(root) = f.root else {
+                        return Ok(false);
+                    };
+                    require(
+                        f.root_id.is_some() && f.entries.iter().all(|entry| entry.removed),
+                        "extension partial root retained: ownership/removals incomplete",
+                    )?;
+                    f.handles.close(root)?;
+                    let temp = f.handles.raw(f.temp.unwrap());
+                    require(
+                        Some(identity(temp)?) == f.temp_id,
+                        "extension temporary parent changed",
+                    )?;
+                    let delete = relative(
+                        &mut f.handles,
+                        temp,
+                        &f.root_name,
+                        true,
+                        FILE_OPEN,
+                        DELETE | META,
+                        null(),
+                    )?;
+                    let raw = f.handles.raw(delete);
+                    kind(raw, true)?;
+                    require(
+                        Some(identity(raw)?) == f.root_id,
+                        "extension root ID changed before deletion",
+                    )?;
+                    let _ = read_descriptor(raw, f.key.as_ref().unwrap(), FILE_ALL_ACCESS)?;
+                    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                    yes(unsafe {
+                        SetFileInformationByHandle(
+                            raw,
+                            FileDispositionInfo,
+                            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                            size_of::<FILE_DISPOSITION_INFO>() as u32,
+                        )
+                    })?;
+                    f.handles.close(delete)?;
+                    match relative(
+                        &mut f.handles,
+                        temp,
+                        &f.root_name,
+                        true,
+                        FILE_OPEN,
+                        META,
+                        null(),
+                    ) {
+                        Err(error) if native_is(&error, ABSENT) => Ok(true),
+                        Ok(found) => {
+                            f.handles.close(found)?;
+                            Err(bad("extension root remains after deletion"))
+                        }
+                        Err(error) => Err(error),
+                    }
+                })();
+                let absent = match root_removed {
+                    Ok(absent) => absent,
+                    Err(error) => {
+                        errors.push(format!("root: {error}"));
+                        false
+                    }
+                };
+                if f.temp.is_some() && !absent {
+                    errors.push(
+                        "extension root namespace absence unproved; teardown incomplete".into(),
+                    );
+                }
+                errors.extend(f.handles.close_all());
+                println!(
+                    "exec_extension_fixture_teardown root_absent={absent} all_native_owners_consumed={} entries={:?} acl_repair=false native_close_facts={:?} errors={errors:?}",
+                    f.handles.slots.iter().all(Option::is_none),
+                    f.entries,
+                    f.handles.closed
+                );
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "extension checked cleanup failed: {errors:?}"
+                    )))
+                }
+            }
+
+            pub(super) fn run() -> io::Result<()> {
+                let mut fixture = Fixture::new();
+                fixture.root_name =
+                    OsString::from(format!("extension-{}", fixture.root_name.to_string_lossy()));
+                fixture.path = std::env::temp_dir().join(&fixture.root_name);
+                let setup = create(&mut fixture).and_then(|_| collect(&mut fixture));
+                let product = if setup.is_ok() {
+                    Some(product(&mut fixture))
+                } else {
+                    None
+                };
+                let cleanup = cleanup(&mut fixture);
+                if let Err(error) = cleanup {
+                    return Err(io::Error::other(format!(
+                        "EXEC_EXTENSION_TEARDOWN_FAILURE; not valid behavioral RED: {error}; setup={setup:?}; product={product:?}"
+                    )));
+                }
+                if let Err(error) = setup {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "EXEC_EXTENSION_SETUP_FAILURE; not valid behavioral RED: {error}; checked cleanup completed"
+                        ),
+                    ));
+                }
+                product.unwrap().map_err(|error| io::Error::new(error.kind(), format!("extension product failure after all four native oracles and checked teardown: {error}")))
+            }
+        }
+
+        pub(super) fn run_extension() -> io::Result<()> {
+            extension::run()
+        }
+
         pub(super) fn run() -> io::Result<()> {
             let mut fixture = Fixture::new();
             if let Err(primary) = fixture.create().and_then(|_| fixture.collect()) {
@@ -4480,5 +5393,10 @@ mod windows {
     #[test]
     fn source_execution_permission_matches_native_r_rx_and_full_control() -> std::io::Result<()> {
         execution_oracle::run()
+    }
+
+    #[test]
+    fn source_execution_permission_denial_is_extension_independent() -> std::io::Result<()> {
+        execution_oracle::run_extension()
     }
 }

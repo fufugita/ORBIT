@@ -242,10 +242,11 @@ if ($Group -eq 'Foundation') {
         'fs::windows::tests::source_snapshot_rejects_link_added_after_initial_kind_check',
         'fs::windows::tests::staged_directory_child_keeper_rename_prerequisite',
         'fs::windows::tests::staged_directory_delete_child_reacquisition_prerequisite',
-        'windows::source_execution_permission_matches_native_r_rx_and_full_control'
+        'windows::source_execution_permission_matches_native_r_rx_and_full_control',
+        'windows::source_execution_permission_denial_is_extension_independent'
     )
-    if ($required.Count -ne 63 -or @($required | Select-Object -Unique).Count -ne 63) {
-        throw "Foundation's exact required-name manifest must contain 63 unique cases; found $($required.Count)"
+    if ($required.Count -ne 64 -or @($required | Select-Object -Unique).Count -ne 64) {
+        throw "Foundation's exact required-name manifest must contain 64 unique cases; found $($required.Count)"
     }
     $report = Get-Content $log -Raw
     foreach ($case in $required) {
