@@ -5693,11 +5693,225 @@ mod windows {
                 handles.close(read)
             }
 
+            #[derive(Debug)]
+            struct PrivateLockAce {
+                index: u32,
+                ace_type: u8,
+                flags: u8,
+                size: u16,
+                raw_mask: Option<u32>,
+                mapped_mask: Option<u32>,
+                sid: Option<Vec<u8>>,
+                sid_error: Option<String>,
+            }
+
+            fn private_lock_facts(
+                handle: HANDLE,
+                key: &TokenKey,
+                phase: &'static str,
+            ) -> io::Result<SecurityFacts> {
+                let mut owner = null_mut();
+                let mut group = null_mut();
+                let mut dacl = null_mut();
+                let mut raw = null_mut();
+                let status = unsafe {
+                    GetSecurityInfo(
+                        handle,
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION
+                            | GROUP_SECURITY_INFORMATION
+                            | DACL_SECURITY_INFORMATION,
+                        &mut owner,
+                        &mut group,
+                        &mut dacl,
+                        null_mut(),
+                        &mut raw,
+                    )
+                };
+                if status != ERROR_SUCCESS {
+                    return Err(io::Error::from_raw_os_error(status as i32));
+                }
+                let allocation = LocalSecurityAllocation(raw.cast());
+                yes(unsafe { IsValidSecurityDescriptor(raw) })?;
+                let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+                require(
+                    length >= size_of::<SECURITY_DESCRIPTOR_RELATIVE>() && length <= LIMIT,
+                    "private lock descriptor bound exceeded",
+                )?;
+                let mut words = vec![0usize; length.div_ceil(size_of::<usize>())];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.cast::<u8>(),
+                        words.as_mut_ptr().cast(),
+                        length,
+                    );
+                }
+                drop(allocation);
+                let ptr = words.as_mut_ptr().cast();
+                yes(unsafe { IsValidSecurityDescriptor(ptr) })?;
+                let mut control = 0;
+                let mut revision = 0;
+                yes(unsafe { GetSecurityDescriptorControl(ptr, &mut control, &mut revision) })?;
+                let mut defaulted = 0;
+                let mut present = 0;
+                yes(unsafe { GetSecurityDescriptorOwner(ptr, &mut owner, &mut defaulted) })?;
+                yes(unsafe { GetSecurityDescriptorGroup(ptr, &mut group, &mut defaulted) })?;
+                yes(unsafe {
+                    GetSecurityDescriptorDacl(ptr, &mut present, &mut dacl, &mut defaulted)
+                })?;
+                let owner = sid_bytes(owner, words.as_ptr().cast(), length)?;
+                let group = sid_bytes(group, words.as_ptr().cast(), length)?;
+                println!(
+                    "stage_actual_private_lock_descriptor phase={phase} owner={owner:?} group={group:?} control=0x{control:04x} revision={revision} dacl_present={present} dacl_null={}",
+                    dacl.is_null()
+                );
+                require(!dacl.is_null(), "private lock DACL is null")?;
+                let offset = (dacl as usize)
+                    .checked_sub(words.as_ptr() as usize)
+                    .ok_or_else(|| bad("private lock DACL outside descriptor"))?;
+                require(
+                    dacl as usize % 4 == 0
+                        && offset
+                            .checked_add(size_of::<ACL>())
+                            .is_some_and(|end| end <= length),
+                    "private lock ACL header bounds/alignment invalid",
+                )?;
+                let acl_length = unsafe { (*dacl).AclSize } as usize;
+                require(
+                    acl_length >= size_of::<ACL>()
+                        && offset
+                            .checked_add(acl_length)
+                            .is_some_and(|end| end <= length),
+                    "private lock ACL outside descriptor",
+                )?;
+                let raw_dacl =
+                    unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), acl_length) }.to_vec();
+                let count = unsafe { (*dacl).AceCount } as u32;
+                println!(
+                    "stage_actual_private_lock_dacl phase={phase} ace_count={count} raw_dacl={raw_dacl:?}"
+                );
+                yes(unsafe { IsValidAcl(dacl) })?;
+                require(count <= 4096, "private lock ACE evidence bound exceeded")?;
+                let mut aces = Vec::with_capacity(count as usize);
+                for index in 0..count {
+                    let mut ace = null_mut();
+                    yes(unsafe { GetAce(dacl, index, &mut ace) })?;
+                    let ace_offset = (ace as usize)
+                        .checked_sub(dacl as usize)
+                        .ok_or_else(|| bad("private lock ACE outside ACL"))?;
+                    require(
+                        ace as usize % 4 == 0
+                            && ace_offset
+                                .checked_add(size_of::<ACE_HEADER>())
+                                .is_some_and(|end| end <= acl_length),
+                        "private lock ACE header bounds/alignment invalid",
+                    )?;
+                    let header = unsafe { ace.cast::<ACE_HEADER>().read() };
+                    require(
+                        header.AceSize as usize >= size_of::<ACE_HEADER>()
+                            && ace_offset
+                                .checked_add(header.AceSize as usize)
+                                .is_some_and(|end| end <= acl_length),
+                        "private lock ACE outside ACL",
+                    )?;
+                    let raw_mask = if header.AceSize as usize >= 8 {
+                        Some(unsafe { ace.cast::<u8>().add(4).cast::<u32>().read() })
+                    } else {
+                        None
+                    };
+                    let mapped_mask = raw_mask.map(|mut mask| {
+                        let mut mapping = GENERIC_MAPPING {
+                            GenericRead: FILE_GENERIC_READ,
+                            GenericWrite: FILE_GENERIC_WRITE,
+                            GenericExecute: FILE_GENERIC_EXECUTE,
+                            GenericAll: FILE_ALL_ACCESS,
+                        };
+                        unsafe {
+                            MapGenericMask(&mut mask, &mut mapping);
+                        }
+                        mask
+                    });
+                    let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+                    let sid_result = if matches!(
+                        header.AceType,
+                        ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+                    ) && header.AceSize as usize >= sid_offset + 8
+                    {
+                        sid_bytes(
+                            unsafe { ace.cast::<u8>().add(sid_offset).cast() },
+                            ace.cast(),
+                            header.AceSize as usize,
+                        )
+                    } else {
+                        Err(bad("unsupported or short private lock ACE SID layout"))
+                    };
+                    let (sid, sid_error) = match sid_result {
+                        Ok(sid) => (Some(sid), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
+                    let observed = PrivateLockAce {
+                        index,
+                        ace_type: header.AceType,
+                        flags: header.AceFlags,
+                        size: header.AceSize,
+                        raw_mask,
+                        mapped_mask,
+                        sid,
+                        sid_error,
+                    };
+                    println!("stage_actual_private_lock_ace phase={phase} observed={observed:?}");
+                    aces.push(observed);
+                }
+                // All safely decoded actual evidence precedes policy rejection.
+                // GROUP is validated and fingerprinted independently; the
+                // established private policy does not require token-group equality.
+                require(
+                    control & (SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE)
+                        == SE_DACL_PROTECTED | SE_DACL_PRESENT | SE_SELF_RELATIVE
+                        && present != 0
+                        && owner == key.user
+                        && aces.len() == 1,
+                    "private lock owner/control/ACE count differs",
+                )?;
+                let ace = &aces[0];
+                let inheritance = (OBJECT_INHERIT_ACE
+                    | CONTAINER_INHERIT_ACE
+                    | NO_PROPAGATE_INHERIT_ACE
+                    | INHERITED_ACE) as u8;
+                let known_mask =
+                    FILE_ALL_ACCESS | GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL;
+                require(
+                    ace.index == 0
+                        && ace.ace_type == ACCESS_ALLOWED_ACE_TYPE
+                        && ace.flags & INHERIT_ONLY_ACE as u8 == 0
+                        && ace.flags & !inheritance == 0
+                        && ace.size as usize >= offset_of!(ACCESS_ALLOWED_ACE, SidStart) + 8
+                        && ace.raw_mask.is_some_and(|mask| mask & !known_mask == 0)
+                        && ace.mapped_mask == Some(FILE_ALL_ACCESS)
+                        && ace.sid.as_ref() == Some(&key.user)
+                        && ace.sid_error.is_none(),
+                    "private lock effective owner-full-control policy differs",
+                )?;
+                Ok(SecurityFacts {
+                    owner,
+                    group,
+                    dacl: raw_dacl,
+                    control,
+                })
+            }
+
+            #[derive(Clone, Copy)]
+            enum RemovalPolicy {
+                CanonicalFile,
+                ActualPrivateLock,
+            }
+
             fn remove_file(
                 handles: &mut Handles,
                 root: HANDLE,
                 key: &TokenKey,
                 entry: &mut Entry,
+                policy: RemovalPolicy,
             ) -> io::Result<()> {
                 let delete = relative(
                     handles,
@@ -5713,9 +5927,18 @@ mod windows {
                 let sampled = snapshot(raw)?;
                 require(
                     Some(sampled.identity) == entry.id
-                        && entry.snapshot.is_none_or(|before| sampled == before)
-                        && Some(read_descriptor(raw, key, entry.mask)?.facts) == entry.facts,
+                        && entry.snapshot.is_none_or(|before| sampled == before),
                     "stage cleanup identity/policy differs",
+                )?;
+                let actual = match policy {
+                    RemovalPolicy::CanonicalFile => read_descriptor(raw, key, entry.mask)?.facts,
+                    RemovalPolicy::ActualPrivateLock => {
+                        private_lock_facts(raw, key, "checked_cleanup")?
+                    }
+                };
+                require(
+                    Some(actual) == entry.facts,
+                    "stage cleanup descriptor differs",
                 )?;
                 let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
                 yes(unsafe {
@@ -5886,7 +6109,13 @@ mod windows {
                     "stage cleanup reacquired root ID differs",
                 )?;
                 granted(raw, ROOT_READ | FILE_DELETE_CHILD)?;
-                remove_file(&mut f.handles, raw, &key, entry)?;
+                remove_file(
+                    &mut f.handles,
+                    raw,
+                    &key,
+                    entry,
+                    RemovalPolicy::CanonicalFile,
+                )?;
                 f.handles.close(cleanup)?;
                 remove_root(&mut f.handles, parent, &key, OsStr::new(NEW), id)?;
                 absent(&mut f.handles, parent, OsStr::new(OLD), true)?;
@@ -6066,6 +6295,15 @@ mod windows {
                             .try_lock(OsStr::new(LOCK), LockMode::Exclusive)?,
                     ));
                     let lock_id = self.guard.as_ref().unwrap().identity();
+                    self.lock = Some(Entry {
+                        name: OsString::from(LOCK),
+                        mask: FILE_ALL_ACCESS,
+                        id: Some(lock_id),
+                        facts: None,
+                        snapshot: None,
+                        observed: None,
+                        removed: false,
+                    });
                     {
                         let mut view = self.parent.as_ref().unwrap().open_for_update(
                             &self.oracle.entries[2].name,
@@ -6090,19 +6328,13 @@ mod windows {
                     )?;
                     let raw = self.oracle.handles.raw(lock);
                     let sampled = snapshot(raw)?;
+                    self.lock.as_mut().unwrap().snapshot = Some(sampled);
                     require(
                         sampled.identity == lock_id && sampled.length == 0,
                         "stage actual lock ID/length differs",
                     )?;
-                    self.lock = Some(Entry {
-                        name: OsString::from(LOCK),
-                        mask: FILE_ALL_ACCESS,
-                        id: Some(lock_id),
-                        facts: Some(read_descriptor(raw, &key, FILE_ALL_ACCESS)?.facts),
-                        snapshot: Some(sampled),
-                        observed: None,
-                        removed: false,
-                    });
+                    self.lock.as_mut().unwrap().facts =
+                        Some(private_lock_facts(raw, &key, "initial_capture")?);
                     self.oracle.handles.close(lock)?;
                     self.oracle.collect()?;
                     // The accepted source oracle supplies a genuine false bit;
@@ -6249,9 +6481,11 @@ mod windows {
                     require(
                         Some(snapshot(f.handles.raw(lock))?)
                             == self.lock.as_ref().unwrap().snapshot
-                            && Some(
-                                read_descriptor(f.handles.raw(lock), key, FILE_ALL_ACCESS)?.facts,
-                            ) == self.lock.as_ref().unwrap().facts,
+                            && Some(private_lock_facts(
+                                f.handles.raw(lock),
+                                key,
+                                "under_lock_recheck",
+                            )?) == self.lock.as_ref().unwrap().facts,
                         "stage lock image changed",
                     )?;
                     f.handles.close(lock)?;
@@ -6530,7 +6764,13 @@ mod windows {
                     entry.facts = Some(read_descriptor(read, key, FILE_GENERIC_READ)?.facts);
                     raw_bytes(read, PAYLOAD)?;
                     f.handles.close(reader)?;
-                    remove_file(&mut f.handles, raw, key, entry)?;
+                    remove_file(
+                        &mut f.handles,
+                        raw,
+                        key,
+                        entry,
+                        RemovalPolicy::CanonicalFile,
+                    )?;
                     f.handles.close(root)?;
                     remove_root(
                         &mut f.handles,
@@ -6556,8 +6796,20 @@ mod windows {
                     println!(
                         "stage_public_capabilities_released guard_aliases_before_release={count} parent_released=true direct_CloseHandle_telemetry=false native_disposition_and_absence_follow=true"
                     );
-                    remove_file(&mut f.handles, root, &key, self.canary.as_mut().unwrap())?;
-                    remove_file(&mut f.handles, root, &key, self.lock.as_mut().unwrap())?;
+                    remove_file(
+                        &mut f.handles,
+                        root,
+                        &key,
+                        self.canary.as_mut().unwrap(),
+                        RemovalPolicy::CanonicalFile,
+                    )?;
+                    remove_file(
+                        &mut f.handles,
+                        root,
+                        &key,
+                        self.lock.as_mut().unwrap(),
+                        RemovalPolicy::ActualPrivateLock,
+                    )?;
                     for anchor in self.anchors.drain(..) {
                         f.handles.close(anchor.owner)?;
                     }
@@ -6570,10 +6822,11 @@ mod windows {
                 fn preserve(&mut self) -> Vec<String> {
                     let close = self.oracle.preserve();
                     println!(
-                        "stage_fixture_invalid_preserved namespace_authority_not_inferred=true product_flight_retained={} parent_guard_retained={} lock_create_attempted={} canary={:?} root_probe={:?} completed_product_cleanup={:?} no_constructor_RED_acknowledgment=true",
+                        "stage_fixture_invalid_preserved namespace_authority_not_inferred=true product_flight_retained={} parent_guard_retained={} lock_create_attempted={} lock={:?} canary={:?} root_probe={:?} completed_product_cleanup={:?} no_constructor_RED_acknowledgment=true",
                         self.flight.is_some(),
                         self.guard.is_some(),
                         self.lock_attempted,
+                        self.lock,
                         self.canary,
                         self.root_probe,
                         self.product_cleanup
