@@ -983,6 +983,21 @@ fn validate_container_ace_layout(
     Ok(sid_len)
 }
 
+fn checked_container_access_mask(mask: u32) -> io::Result<u32> {
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+    let mut mapped = mask;
+    unsafe { MapGenericMask(&mut mapped, &mapping) };
+    if mapped & !FILE_ALL_ACCESS != 0 {
+        return Err(denied("container ACE contains unsupported access bits"));
+    }
+    Ok(mapped)
+}
+
 fn check_container_access(security: &Security, handle: HANDLE) -> io::Result<()> {
     let mut owner = null_mut();
     let mut dacl = null_mut();
@@ -1057,14 +1072,7 @@ fn check_container_access(security: &Security, handle: HANDLE) -> io::Result<()>
         return Err(denied("container ACL bounds are invalid"));
     }
 
-    let known_file_rights = FILE_ALL_ACCESS;
     let readable_rights = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-    let mapping = GENERIC_MAPPING {
-        GenericRead: FILE_GENERIC_READ,
-        GenericWrite: FILE_GENERIC_WRITE,
-        GenericExecute: FILE_GENERIC_EXECUTE,
-        GenericAll: FILE_ALL_ACCESS,
-    };
 
     for index in 0..size_info.AceCount {
         let mut ace_ptr = null_mut();
@@ -1107,11 +1115,7 @@ fn check_container_access(security: &Security, handle: HANDLE) -> io::Result<()>
             return Err(denied("container ACE SID is malformed"));
         }
 
-        let mut mapped = mask;
-        unsafe { MapGenericMask(&mut mapped, &mapping) };
-        if mapped & !known_file_rights != 0 {
-            return Err(denied("container ACE contains unsupported access bits"));
-        }
+        let mapped = checked_container_access_mask(mask)?;
         if header.AceType == 0 && header.AceFlags & INHERIT_ONLY_ACE as u8 == 0 {
             let trusted = unsafe {
                 EqualSid(sid.cast(), token_sid) != 0
@@ -2432,6 +2436,33 @@ mod tests {
 
     #[test]
     fn container_ace_layout_parser_only_rejects_malformed_unknown_and_callback_forms() {
+        for (raw, expected) in [
+            (GENERIC_READ, FILE_GENERIC_READ),
+            (GENERIC_WRITE, FILE_GENERIC_WRITE),
+            (GENERIC_EXECUTE, FILE_GENERIC_EXECUTE),
+            (GENERIC_ALL, FILE_ALL_ACCESS),
+            (
+                GENERIC_READ | GENERIC_EXECUTE,
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            ),
+        ] {
+            assert_eq!(checked_container_access_mask(raw).unwrap(), expected);
+        }
+        for raw in [
+            0x0200_0000,
+            0x0100_0000,
+            0x0000_0200,
+            GENERIC_READ | 0x0200_0000,
+            GENERIC_WRITE | 0x0100_0000,
+            GENERIC_ALL | 0x0000_0200,
+        ] {
+            let error = checked_container_access_mask(raw).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                error.to_string(),
+                "container ACE contains unsupported access bits"
+            );
+        }
         let valid_sid = [1, 0, 0, 0, 0, 0, 0, 5];
         assert_eq!(
             validate_container_ace_layout(0, 0, 16, &valid_sid).unwrap(),

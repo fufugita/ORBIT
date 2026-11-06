@@ -1601,6 +1601,8 @@ mod windows {
     fn owned_container_rejects_dangerous_generic_concrete_and_unknown_rights() {
         let home = Home::new();
         let sid = current_sid();
+        // Raw unsupported access flags are covered by the platform's parser-only
+        // unit: the native security setter need not retain those requested bits.
         let grants = [
             ("generic-write", 0x4000_0000),
             ("generic-all", 0x1000_0000),
@@ -1612,8 +1614,6 @@ mod windows {
             ("delete", 0x0001_0000),
             ("write-dac", 0x0004_0000),
             ("write-owner", 0x0008_0000),
-            ("maximum-allowed", 0x0200_0000),
-            ("system-security", 0x0100_0000),
         ];
         for (label, mask) in grants {
             let path = home.base.join(format!("unsafe container {label}"));
@@ -1648,12 +1648,11 @@ mod windows {
                 std::io::ErrorKind::PermissionDenied,
                 "{label}"
             );
-            let expected_cause = if matches!(label, "maximum-allowed" | "system-security") {
-                "container ACE contains unsupported access bits"
-            } else {
-                "container grants an untrusted principal mutation rights"
-            };
-            assert_eq!(error.to_string(), expected_cause, "{label}");
+            assert_eq!(
+                error.to_string(),
+                "container grants an untrusted principal mutation rights",
+                "{label}"
+            );
             assert_fixture_acl_unchanged(&path, &sid, true, &before, &format!("{label} refusal"));
         }
     }
