@@ -1,4 +1,4 @@
-//! Private state is addressed relative to held directory handles.
+//! Filesystem capabilities use held directory handles and explicit policies.
 
 use std::ffi::OsStr;
 use std::io;
@@ -80,7 +80,7 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{
     Directory, DirectoryEntry, Durability, EnumerationLimits, FileIdentity, FileSnapshot,
-    InspectionLimits, LockMode, MutationFile, PrivateFile, PrivateFileAccess, PrivateTreeEntry,
-    PrivateTreeInspection, Publication, PublicationState, PublishError, Removal, RemovalError,
-    RemovalState, SourceDirectory, SourceFile, SourceSnapshot, StateLock, UpdateFile,
+    InspectionLimits, LockMode, MutationFile, OwnedContainer, PrivateFile, PrivateFileAccess,
+    PrivateTreeEntry, PrivateTreeInspection, Publication, PublicationState, PublishError, Removal,
+    RemovalError, RemovalState, SourceDirectory, SourceFile, SourceSnapshot, StateLock, UpdateFile,
 };

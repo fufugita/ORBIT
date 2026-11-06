@@ -844,6 +844,29 @@ impl Directory {
     }
 }
 
+/// A separately named capability for an owner-controlled, readable container.
+///
+/// This initial tracer delegates to the stricter private directory policy; the
+/// container-specific owner and access policy is introduced after its native
+/// positive contract is captured.
+pub struct OwnedContainer {
+    directory: Directory,
+}
+
+impl OwnedContainer {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        Directory::open(path).map(|directory| Self { directory })
+    }
+
+    pub fn identity(&self) -> FileIdentity {
+        self.directory.identity()
+    }
+
+    pub fn check(&self) -> io::Result<()> {
+        self.directory.check()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct InspectionLimits {
     pub max_entries: usize,

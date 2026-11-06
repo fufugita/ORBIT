@@ -28,8 +28,8 @@ fn lock_namespace_is_reserved_consistently() {
 #[cfg(windows)]
 mod windows {
     use orbit_platform::fs::{
-        Directory, EnumerationLimits, InspectionLimits, LockMode, PrivateFileAccess, RemovalState,
-        SourceDirectory,
+        Directory, EnumerationLimits, InspectionLimits, LockMode, OwnedContainer,
+        PrivateFileAccess, RemovalState, SourceDirectory,
     };
     use std::ffi::{OsStr, c_void};
     use std::fs;
@@ -736,6 +736,49 @@ mod windows {
             "SourceFile returned bytes beyond the requested bound"
         );
         assert_eq!(file.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn owned_container_accepts_owner_safe_readable_root() {
+        let home = Home::new();
+        let private = OwnedContainer::open(&home.path()).unwrap();
+        private.check().unwrap();
+        assert_eq!(private.identity(), home.dir().identity());
+
+        let public_root = home.base.join("owner safe readable container");
+        fs::create_dir(&public_root).unwrap();
+        let sid = current_sid();
+        set_public_source_acl(&public_root, &sid, true);
+        let facts = fixture_acl_snapshot(&public_root, &sid, true).facts;
+        assert!(facts.owner_matches_current, "container owner: {facts:?}");
+        assert!(
+            !facts.owner_matches_administrators,
+            "container owner must be the current user: {facts:?}"
+        );
+        assert!(facts.dacl_present && facts.dacl_protected);
+        assert_eq!(facts.ace_count, 2, "container ACEs: {facts:?}");
+        assert!(facts.has_current_owner_full_control_ace);
+        assert!(facts.has_everyone_read_ace);
+        assert_eq!(facts.everyone_mask, Some(0x0012_0089));
+        assert_eq!(
+            facts.everyone_ace_flags,
+            Some((OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8),
+            "container Everyone ACE flags: {facts:?}"
+        );
+        assert!(!facts.has_everyone_full_control_ace);
+
+        let private_policy_error = match Directory::open(&public_root) {
+            Ok(_) => panic!("private Directory accepted the readable container fixture"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            private_policy_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let container = OwnedContainer::open(&public_root)
+            .expect("owner-safe readable container should pass its separate policy");
+        container.check().unwrap();
     }
 
     #[test]
