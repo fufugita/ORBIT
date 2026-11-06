@@ -2268,8 +2268,17 @@ fn source_snapshot(
     run_source_snapshot_test_hook(expected)?;
     let standard: FILE_STANDARD_INFO = information(handle, FileStandardInfo)?;
     let basic: FILE_BASIC_INFO = information(handle, FileBasicInfo)?;
-    if standard.EndOfFile < 0 || identity(handle)? != expected || standard.NumberOfLinks < 1 {
+    if standard.EndOfFile < 0
+        || identity(handle)? != expected
+        || standard.Directory != directory
+        || standard.DeletePending
+        || basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
+    {
         return Err(denied("source snapshot identity, kind, or length changed"));
+    }
+    if standard.NumberOfLinks < 1 || (!directory && standard.NumberOfLinks != 1) {
+        return Err(denied("source snapshot link count changed"));
     }
     Ok(SourceSnapshot {
         identity: expected,
