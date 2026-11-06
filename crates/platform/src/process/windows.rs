@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 #[cfg(all(test, feature = "registry-witness"))]
-use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
+use windows_sys::Wdk::Foundation::ObjectBasicInformation;
 #[cfg(all(test, feature = "registry-witness"))]
 use windows_sys::Wdk::Storage::FileSystem::FILE_DIRECTORY_FILE;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -39,6 +39,8 @@ use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::JobObjects::*;
+#[cfg(all(test, feature = "registry-witness"))]
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows_sys::Win32::System::Threading::*;
@@ -2475,6 +2477,522 @@ mod registry_witness_tests {
         Ok(bytes)
     }
 
+    #[derive(PartialEq, Eq)]
+    struct PrivateViewPreimage {
+        mutation: Vec<u8>,
+        metadata_fixture: Vec<u8>,
+        delete_fixture: Vec<u8>,
+        root_security: Vec<u8>,
+        delete_security: Vec<u8>,
+    }
+
+    impl PrivateViewPreimage {
+        fn digest(&self) -> io::Result<String> {
+            let mut bytes = Vec::new();
+            for item in [
+                &self.mutation,
+                &self.metadata_fixture,
+                &self.delete_fixture,
+                &self.root_security,
+                &self.delete_security,
+            ] {
+                let length = u32::try_from(item.len())
+                    .map_err(|_| invalid("registry preimage field exceeds bound"))?;
+                bytes.extend_from_slice(&length.to_le_bytes());
+                bytes.extend_from_slice(item);
+            }
+            digest(&bytes)
+        }
+    }
+
+    fn registry_key_security(key: HKEY) -> io::Result<Vec<u8>> {
+        let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut length = 0u32;
+        let first = unsafe { RegGetKeySecurity(key, information, null_mut(), &mut length) };
+        if first != ERROR_INSUFFICIENT_BUFFER || length == 0 || length > 65536 {
+            return Err(io::Error::other(format!(
+                "RegGetKeySecurity(size) returned {first} with length {length}"
+            )));
+        }
+        let words = (length as usize).div_ceil(size_of::<usize>());
+        let mut storage = vec![0usize; words];
+        let status = unsafe {
+            RegGetKeySecurity(key, information, storage.as_mut_ptr().cast(), &mut length)
+        };
+        if status != ERROR_SUCCESS
+            || length == 0
+            || length > (storage.len() * size_of::<usize>()) as u32
+        {
+            return Err(io::Error::other(format!(
+                "RegGetKeySecurity(data) returned {status} with length {length}"
+            )));
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), length as usize) };
+        Ok(bytes.to_vec())
+    }
+
+    fn private_view_preimage(root: HKEY) -> io::Result<PrivateViewPreimage> {
+        let metadata = win32_open_key(root, "Metadata", KEY_READ)
+            .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+        let delete_leaf = win32_open_key(root, "DeleteLeaf", KEY_READ)
+            .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+        Ok(PrivateViewPreimage {
+            mutation: win32_query_value_handle(root, "Mutation")
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+            metadata_fixture: win32_query_value(&metadata, "Fixture")
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+            delete_fixture: win32_query_value(&delete_leaf, "Fixture")
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+            root_security: registry_key_security(root)?,
+            delete_security: registry_key_security(delete_leaf.raw())?,
+        })
+    }
+
+    fn aligned_security_descriptor(bytes: &[u8]) -> io::Result<Vec<usize>> {
+        if bytes.is_empty() || bytes.len() > 65536 {
+            return Err(invalid("security descriptor is outside its reviewed bound"));
+        }
+        let mut storage = vec![0usize; bytes.len().div_ceil(size_of::<usize>())];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                storage.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        Ok(storage)
+    }
+
+    fn mutation_probe_subkey_absent(root: HKEY) -> bool {
+        win32_open_status(root, "MutationProbe", KEY_READ) == ERROR_FILE_NOT_FOUND
+    }
+
+    fn create_mutation_probe_status(root: HKEY) -> u32 {
+        let name = match wide(OsStr::new("MutationProbe")) {
+            Ok(name) => name,
+            Err(_) => return ERROR_INVALID_PARAMETER,
+        };
+        let mut key = null_mut();
+        let mut disposition = 0u32;
+        let status = unsafe {
+            RegCreateKeyExW(
+                root,
+                name.as_ptr(),
+                0,
+                null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_ALL_ACCESS,
+                null(),
+                &mut key,
+                &mut disposition,
+            )
+        };
+        if status == ERROR_SUCCESS {
+            // Never use a key unexpectedly acquired by the restricted child.
+            match unsafe { OwnedRegKey::from_raw(key) } {
+                Ok(key) => match key.close() {
+                    Ok(()) => status,
+                    Err(error) => {
+                        error.raw_os_error().unwrap_or(ERROR_INVALID_HANDLE as i32) as u32
+                    }
+                },
+                Err(_) => ERROR_INVALID_HANDLE,
+            }
+        } else {
+            status
+        }
+    }
+
+    fn reopen_and_close_status(root: HKEY, access: u32) -> io::Result<u32> {
+        let subkey = wide(OsStr::new(""))?;
+        let mut key = null_mut();
+        let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, access, &mut key) };
+        if status != ERROR_SUCCESS {
+            return Ok(status);
+        }
+        // An unexpectedly acquired key is closed immediately without use.
+        unsafe { OwnedRegKey::from_raw(key) }?.close()?;
+        Ok(ERROR_SUCCESS)
+    }
+
+    fn mutation_status(
+        root: HKEY,
+        operation: &str,
+        preimage: &PrivateViewPreimage,
+    ) -> io::Result<u32> {
+        match operation {
+            "set_value" => {
+                let name = wide(OsStr::new("Mutation"))?;
+                let status = unsafe {
+                    RegSetValueExW(
+                        root,
+                        name.as_ptr(),
+                        0,
+                        REG_SZ,
+                        preimage.mutation.as_ptr(),
+                        u32::try_from(preimage.mutation.len())
+                            .map_err(|_| invalid("private marker exceeds write bound"))?,
+                    )
+                };
+                Ok(status)
+            }
+            "delete_value" => {
+                let name = wide(OsStr::new("Mutation"))?;
+                Ok(unsafe { RegDeleteValueW(root, name.as_ptr()) })
+            }
+            "create_subkey" => Ok(create_mutation_probe_status(root)),
+            "delete_leaf" => {
+                let name = wide(OsStr::new("DeleteLeaf"))?;
+                Ok(unsafe { RegDeleteKeyW(root, name.as_ptr()) })
+            }
+            "set_dacl" | "set_owner" => {
+                let descriptor = aligned_security_descriptor(&preimage.root_security)?;
+                let information = if operation == "set_dacl" {
+                    DACL_SECURITY_INFORMATION
+                } else {
+                    OWNER_SECURITY_INFORMATION
+                };
+                Ok(unsafe {
+                    RegSetKeySecurity(root, information, descriptor.as_ptr().cast_mut().cast())
+                })
+            }
+            "reopen_write" => reopen_and_close_status(root, KEY_WRITE),
+            "reopen_delete" => reopen_and_close_status(root, DELETE),
+            "reopen_write_dac" => reopen_and_close_status(root, WRITE_DAC),
+            "reopen_write_owner" => reopen_and_close_status(root, WRITE_OWNER),
+            _ => Err(invalid("unknown fixed registry mutation operation")),
+        }
+    }
+
+    fn record_mutation_attempt(root: HKEY, operation: &str, view: &str) -> io::Result<()> {
+        if !mutation_probe_subkey_absent(root) {
+            return Err(invalid("fixed private mutation subkey was not absent"));
+        }
+        let before = private_view_preimage(root)?;
+        let before_digest = before.digest()?;
+        let status = mutation_status(root, operation, &before)?;
+        let after = private_view_preimage(root);
+        let unchanged = after.as_ref().is_ok_and(|after| *after == before);
+        let after_digest = after
+            .as_ref()
+            .ok()
+            .and_then(|after| after.digest().ok())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let subkey_absent = mutation_probe_subkey_absent(root);
+        let observed = status == ERROR_ACCESS_DENIED && unchanged && subkey_absent;
+        emit_witness_record(&format!(
+            "registry_witness_probe id=mutation/{operation}/{view} domain=lstatus status={status:#x} expected=0x5 observed={observed} data_and_descriptor_unchanged={unchanged} mutation_subkey_absent={subkey_absent} before={before_digest} after={after_digest}"
+        ))?;
+        if !observed {
+            return Err(io::Error::other(format!(
+                "private mutation control failed: operation={operation} view={view} status={status:#x} unchanged={unchanged} subkey_absent={subkey_absent}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn duplicate_read_control(root: HKEY, view: &str) -> io::Result<()> {
+        let source_query = query_directory_handle_access(root.cast());
+        let Some(source_access) = source_query.granted_access else {
+            return Err(io::Error::other(format!(
+                "source registry handle access unknown: status={} returned={}",
+                query_ntstatus_text(source_query.ntstatus),
+                source_query.returned_length
+            )));
+        };
+        if source_access & !KEY_READ != 0 {
+            return Err(invalid("inherited registry source exceeds KEY_READ"));
+        }
+        let mut raw = null_mut();
+        let copied = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                root.cast(),
+                GetCurrentProcess(),
+                &mut raw,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if copied == 0 {
+            let status = unsafe { GetLastError() };
+            emit_witness_record(&format!(
+                "registry_witness_probe id=duplicate_read/{view} domain=win32 status={status:#x} expected=0 observed=false source_access={source_access:#x} actual=unknown"
+            ))?;
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let duplicate = unsafe { OwnedRegKey::from_raw(raw.cast()) }?;
+        let query = query_directory_handle_access(duplicate.raw().cast());
+        let actual = query.granted_access;
+        let label_read = private_view_label(duplicate.raw())?;
+        let observed = actual == Some(source_access)
+            && actual.is_some_and(|mask| mask & !KEY_READ == 0)
+            && label_read;
+        emit_witness_record(&format!(
+            "registry_witness_probe id=duplicate_read/{view} domain=win32 status=0x0 expected=0x0 observed={observed} source_access={source_access:#x} actual={} query_ntstatus={} returned_length={} label_read={label_read}",
+            actual.map_or_else(|| "unknown".to_owned(), |mask| format!("{mask:#x}")),
+            query_ntstatus_text(query.ntstatus),
+            query.returned_length
+        ))?;
+        duplicate.close()?;
+        if !observed {
+            return Err(invalid("same-access read duplicate verification failed"));
+        }
+        Ok(())
+    }
+
+    fn duplicate_mutation_control(root: HKEY, view: &str) -> io::Result<()> {
+        if !mutation_probe_subkey_absent(root) {
+            return Err(invalid("fixed private mutation subkey was not absent"));
+        }
+        let before = private_view_preimage(root)?;
+        let before_digest = before.digest()?;
+        let desired = KEY_WRITE | KEY_CREATE_SUB_KEY | DELETE | WRITE_DAC | WRITE_OWNER;
+        let mut raw = null_mut();
+        let copied = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                root.cast(),
+                GetCurrentProcess(),
+                &mut raw,
+                desired,
+                0,
+                0,
+            )
+        };
+        if copied == 0 {
+            let status = unsafe { GetLastError() };
+            let after = private_view_preimage(root);
+            let unchanged = after.as_ref().is_ok_and(|after| *after == before);
+            let subkey_absent = mutation_probe_subkey_absent(root);
+            let after_digest = after
+                .as_ref()
+                .ok()
+                .and_then(|after| after.digest().ok())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let observed = status == ERROR_ACCESS_DENIED && unchanged && subkey_absent;
+            emit_witness_record(&format!(
+                "registry_witness_probe id=mutation/duplicate_mutation/{view} domain=win32 status={status:#x} expected=0x5 observed={observed} branch=duplicate_denied desired={desired:#x} actual=unknown data_and_descriptor_unchanged={unchanged} mutation_subkey_absent={subkey_absent} before={before_digest} after={after_digest}"
+            ))?;
+            return if observed {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status as i32))
+            };
+        }
+        let duplicate = unsafe { OwnedRegKey::from_raw(raw.cast()) }?;
+        let query = query_directory_handle_access(duplicate.raw().cast());
+        let actual = query.granted_access;
+        let Some(actual) = actual else {
+            duplicate.close()?;
+            return Err(io::Error::other(format!(
+                "mutation duplicate granted access unknown: query={} length={}",
+                query_ntstatus_text(query.ntstatus),
+                query.returned_length
+            )));
+        };
+        if actual & !KEY_READ != 0 {
+            duplicate.close()?;
+            emit_witness_record(&format!(
+                "registry_witness_probe id=mutation/duplicate_mutation/{view} domain=win32 status=0 expected=0x5 observed=false branch=unexpected_granted_access desired={desired:#x} actual={actual:#x}"
+            ))?;
+            return Err(invalid(
+                "mutation duplicate exceeded KEY_READ; closed unused handle",
+            ));
+        }
+        let mut statuses = Vec::new();
+        for operation in [
+            "set_value",
+            "delete_value",
+            "create_subkey",
+            "delete_leaf",
+            "set_dacl",
+            "set_owner",
+        ] {
+            let status = mutation_status(duplicate.raw(), operation, &before)?;
+            if status != ERROR_ACCESS_DENIED {
+                duplicate.close()?;
+                emit_witness_record(&format!(
+                    "registry_witness_probe id=mutation/duplicate_mutation/{view} domain=win32 status={status:#x} expected=0x5 observed=false branch=mutation_not_denied desired={desired:#x} actual={actual:#x} operation={operation}"
+                ))?;
+                return Err(io::Error::other(format!(
+                    "mutation through read-limited duplicate was not denied: {operation} status={status:#x}"
+                )));
+            }
+            statuses.push(format!("{operation}=0x{status:x}"));
+        }
+        let after = private_view_preimage(root);
+        let unchanged = after.as_ref().is_ok_and(|after| *after == before);
+        let subkey_absent = mutation_probe_subkey_absent(root);
+        let after_digest = after
+            .as_ref()
+            .ok()
+            .and_then(|after| after.digest().ok())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let observed = unchanged && subkey_absent;
+        emit_witness_record(&format!(
+            "registry_witness_probe id=mutation/duplicate_mutation/{view} domain=win32 status=0x0 expected=0x0 observed={observed} branch=limited desired={desired:#x} actual={actual:#x} query_ntstatus={} returned_length={} data_and_descriptor_unchanged={unchanged} mutation_subkey_absent={subkey_absent} before={before_digest} after={after_digest} attempts={}",
+            query_ntstatus_text(query.ntstatus),
+            query.returned_length,
+            statuses.join(",")
+        ))?;
+        duplicate.close()?;
+        if !observed {
+            return Err(invalid("mutation duplicate changed private fixture state"));
+        }
+        Ok(())
+    }
+
+    fn normal_mutation_controls(machine: HKEY, user: HKEY) -> io::Result<()> {
+        for (view, root) in [("machine_view", machine), ("user_view", user)] {
+            for operation in [
+                "set_value",
+                "delete_value",
+                "create_subkey",
+                "delete_leaf",
+                "set_dacl",
+                "set_owner",
+                "reopen_write",
+                "reopen_delete",
+                "reopen_write_dac",
+                "reopen_write_owner",
+            ] {
+                record_mutation_attempt(root, operation, view)?;
+            }
+            duplicate_read_control(root, view)?;
+            duplicate_mutation_control(root, view)?;
+        }
+        Ok(())
+    }
+
+    fn emit_parent_probe(payload: &str) -> io::Result<()> {
+        emit_witness_record(payload)
+    }
+
+    fn parent_authority_probes(
+        parent_pid: u32,
+        parent_creation: &str,
+        nonce: &str,
+    ) -> io::Result<()> {
+        for (name, access) in [
+            ("dup_handle", PROCESS_DUP_HANDLE),
+            ("vm_write", PROCESS_VM_WRITE),
+            ("vm_operation", PROCESS_VM_OPERATION),
+            ("create_thread", PROCESS_CREATE_THREAD),
+            ("write_dac", WRITE_DAC),
+            ("write_owner", WRITE_OWNER),
+            ("vm_read", PROCESS_VM_READ),
+        ] {
+            let handle = unsafe { OpenProcess(access, 0, parent_pid) };
+            if !handle.is_null() {
+                let owned = own("OpenProcess(parent authority unexpected handle)", handle)?;
+                drop(owned);
+                emit_parent_probe(&format!(
+                    "registry_witness_probe id=parent_authority/{name} domain=win32 status=0 expected=0x5 observed=false requested={access:#x} nonce={nonce} parent_pid={parent_pid} parent_creation={parent_creation} unexpected_handle_closed=true"
+                ))?;
+                return Err(invalid(
+                    "unexpected parent process authority handle acquired",
+                ));
+            }
+            let status = unsafe { GetLastError() };
+            let observed = status == ERROR_ACCESS_DENIED;
+            emit_parent_probe(&format!(
+                "registry_witness_probe id=parent_authority/{name} domain=win32 status={status:#x} expected=0x5 observed={observed} requested={access:#x} nonce={nonce} parent_pid={parent_pid} parent_creation={parent_creation}"
+            ))?;
+            if !observed {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+        }
+        Ok(())
+    }
+
+    fn parent_token_probes(parent_pid: u32, parent_creation: &str, nonce: &str) -> io::Result<()> {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_pid) };
+        if process.is_null() {
+            let status = unsafe { GetLastError() };
+            let observed = status == ERROR_ACCESS_DENIED;
+            emit_parent_probe(&format!(
+                "registry_witness_probe id=parent_token/process_query_limited domain=win32 status={status:#x} expected=0x5 observed={observed} branch=blocked_by_process_gate nonce={nonce} parent_pid={parent_pid} parent_creation={parent_creation}"
+            ))?;
+            if !observed {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            for right in [
+                "token_duplicate",
+                "write_dac",
+                "write_owner",
+                "token_impersonate",
+                "token_assign_primary",
+            ] {
+                emit_parent_probe(&format!(
+                    "registry_witness_probe id=parent_token/{right} domain=gate branch=blocked_by_process_gate executed=false gate_id=parent_token/process_query_limited gate_status=0x5 nonce={nonce} parent_pid={parent_pid} parent_creation={parent_creation}"
+                ))?;
+            }
+            return Ok(());
+        }
+        let process = own("OpenProcess(parent query-limited handle)", process)?;
+        let observed_pid = unsafe { GetProcessId(process.as_raw_handle()) };
+        let observed_creation = process_creation_text(process.as_raw_handle())?;
+        let query = query_directory_handle_access(process.as_raw_handle());
+        let actual = query.granted_access;
+        let branch_valid = observed_pid == parent_pid
+            && observed_creation == parent_creation
+            && actual == Some(PROCESS_QUERY_LIMITED_INFORMATION);
+        emit_parent_probe(&format!(
+            "registry_witness_probe id=parent_token/process_query_limited domain=win32 status=0x0 expected=0x0 observed={branch_valid} branch=query_open actual={} query_ntstatus={} returned_length={} nonce={nonce} parent_pid={observed_pid} parent_creation={observed_creation}",
+            actual.map_or_else(|| "unknown".to_owned(), |mask| format!("{mask:#x}")),
+            query_ntstatus_text(query.ntstatus),
+            query.returned_length
+        ))?;
+        if !branch_valid {
+            return Err(invalid(
+                "query-limited parent process handle identity or granted rights mismatch",
+            ));
+        }
+        for (name, access) in [
+            ("token_duplicate", TOKEN_DUPLICATE),
+            ("write_dac", WRITE_DAC),
+            ("write_owner", WRITE_OWNER),
+            ("token_impersonate", TOKEN_IMPERSONATE),
+            ("token_assign_primary", TOKEN_ASSIGN_PRIMARY),
+        ] {
+            let mut token = null_mut();
+            let opened = unsafe { OpenProcessToken(process.as_raw_handle(), access, &mut token) };
+            if opened != 0 {
+                let owned = own("OpenProcessToken(unexpected parent token)", token)?;
+                drop(owned);
+                emit_parent_probe(&format!(
+                    "registry_witness_probe id=parent_token/{name} domain=win32 status=0 expected=0x5 observed=false branch=query_open executed=true requested={access:#x} acquired=true nonce={nonce} parent_pid={parent_pid} parent_creation={parent_creation} unexpected_token_closed=true"
+                ))?;
+                return Err(invalid(
+                    "unexpected parent token authority acquired and closed",
+                ));
+            }
+            let status = unsafe { GetLastError() };
+            let observed = status == ERROR_ACCESS_DENIED;
+            emit_parent_probe(&format!(
+                "registry_witness_probe id=parent_token/{name} domain=win32 status={status:#x} expected=0x5 observed={observed} branch=query_open executed=true requested={access:#x} acquired=false nonce={nonce} parent_pid={parent_pid} parent_creation={parent_creation}"
+            ))?;
+            if !observed {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_parent_self_binding(pid: u32, creation: &str) -> io::Result<()> {
+        if unsafe { GetCurrentProcessId() } != pid
+            || process_creation_text(unsafe { GetCurrentProcess() })? != creation
+        {
+            return Err(invalid(
+                "parent process identity changed while collecting helper",
+            ));
+        }
+        Ok(())
+    }
+
     fn private_view_label(root: HKEY) -> io::Result<bool> {
         let metadata = wide(OsStr::new("Metadata"))?;
         let mut key = null_mut();
@@ -2920,15 +3438,60 @@ mod registry_witness_tests {
         }
     }
 
-    fn query_directory_handle_access(handle: HANDLE) -> (i32, u32, Option<u32>) {
+    struct DirectoryAccessQuery {
+        ntstatus: Option<i32>,
+        returned_length: u32,
+        granted_access: Option<u32>,
+    }
+
+    fn query_ntstatus_text(status: Option<i32>) -> String {
+        status.map_or_else(|| "unsupported".to_owned(), |value| format!("{value:#x}"))
+    }
+
+    fn query_directory_handle_access(handle: HANDLE) -> DirectoryAccessQuery {
         // PUBLIC_OBJECT_BASIC_INFORMATION contains 14 ULONG/ACCESS_MASK fields.
         // A u32 array provides its required alignment without creating a typed
         // reference into raw bytes. The granted-access field is slot 1.
         let mut information = [0u32; 14];
         let expected_length = (information.len() * size_of::<u32>()) as u32;
         let mut returned_length = 0u32;
+        let ntdll_name = match wide(OsStr::new("ntdll.dll")) {
+            Ok(name) => name,
+            Err(_) => {
+                return DirectoryAccessQuery {
+                    ntstatus: None,
+                    returned_length: 0,
+                    granted_access: None,
+                };
+            }
+        };
+        let module = unsafe { GetModuleHandleW(ntdll_name.as_ptr()) };
+        if module.is_null() {
+            return DirectoryAccessQuery {
+                ntstatus: None,
+                returned_length: 0,
+                granted_access: None,
+            };
+        }
+        let Some(export) = (unsafe { GetProcAddress(module, b"NtQueryObject\0".as_ptr()) }) else {
+            return DirectoryAccessQuery {
+                ntstatus: None,
+                returned_length: 0,
+                granted_access: None,
+            };
+        };
+        type NtQueryObjectFn = unsafe extern "system" fn(
+            HANDLE,
+            windows_sys::Wdk::Foundation::OBJECT_INFORMATION_CLASS,
+            *mut c_void,
+            u32,
+            *mut u32,
+        ) -> NTSTATUS;
+        // SAFETY: resolve the documented NtQueryObject export from the already
+        // loaded system ntdll and use its windows-sys 0.61.2 declaration shape.
+        let query: NtQueryObjectFn = unsafe { std::mem::transmute(export) };
         let status = unsafe {
-            NtQueryObject(
+            query(
                 handle,
                 ObjectBasicInformation,
                 information.as_mut_ptr().cast(),
@@ -2941,7 +3504,11 @@ mod registry_witness_tests {
         } else {
             None
         };
-        (status, returned_length, granted_access)
+        DirectoryAccessQuery {
+            ntstatus: Some(status),
+            returned_length,
+            granted_access,
+        }
     }
 
     fn observe_directory_descriptor(
@@ -3181,13 +3748,13 @@ mod registry_witness_tests {
                 | FILE_READ_ATTRIBUTES
                 | READ_CONTROL
                 | SYNCHRONIZE;
-            let (query_status, returned_length, granted_access) =
-                query_directory_handle_access(directory_handle.as_raw_handle());
+            let query = query_directory_handle_access(directory_handle.as_raw_handle());
+            let granted_access = query.granted_access;
             let write_dac = granted_access.map(|mask| mask & WRITE_DAC != 0);
             let access_record = format!(
-                "registry_witness_helper_directory_access requested={directory_requested_access:#010x} query_ntstatus={:#010x} returned_length={} expected_length={} actual={} write_dac={}",
-                query_status as u32,
-                returned_length,
+                "registry_witness_helper_directory_access requested={directory_requested_access:#010x} query_ntstatus={} returned_length={} expected_length={} actual={} write_dac={}",
+                query_ntstatus_text(query.ntstatus),
+                query.returned_length,
                 size_of::<[u32; 14]>(),
                 granted_access.map_or_else(|| "unknown".to_owned(), |mask| format!("{mask:#010x}")),
                 observed_bool(write_dac)
@@ -3195,9 +3762,9 @@ mod registry_witness_tests {
             record_helper_diagnostic(&access_record, &mut diagnostic_errors);
             if granted_access.is_none() {
                 diagnostic_errors.push(format!(
-                    "NtQueryObject directory access unknown: status={:#010x} returned_length={} expected_length={}",
-                    query_status as u32,
-                    returned_length,
+                    "NtQueryObject directory access unknown: status={} returned_length={} expected_length={}",
+                    query_ntstatus_text(query.ntstatus),
+                    query.returned_length,
                     size_of::<[u32; 14]>()
                 ));
             } else if granted_access
@@ -3935,7 +4502,26 @@ mod registry_witness_tests {
         Ok(duplicate)
     }
 
-    fn forward_child_records(bytes: &[u8]) -> io::Result<()> {
+    fn registry_record_field<'a>(payload: &'a str, key: &str) -> io::Result<&'a str> {
+        let prefix = format!("{key}=");
+        let mut values = payload
+            .split_ascii_whitespace()
+            .filter_map(|field| field.strip_prefix(&prefix));
+        let value = values
+            .next()
+            .ok_or_else(|| invalid("required registry witness record field missing"))?;
+        if values.next().is_some() || value.is_empty() {
+            return Err(invalid("duplicate or empty registry witness record field"));
+        }
+        Ok(value)
+    }
+
+    fn forward_child_records(
+        bytes: &[u8],
+        nonce: &str,
+        parent_pid: u32,
+        parent_creation: &str,
+    ) -> io::Result<()> {
         let mut cursor = 0usize;
         while let Some(relative) = bytes[cursor..]
             .windows(WITNESS_FRAME_START.len())
@@ -3970,6 +4556,16 @@ mod registry_witness_tests {
             }
             let payload = std::str::from_utf8(&bytes[payload_start..payload_end])
                 .map_err(|_| invalid("helper record is not UTF-8"))?;
+            if payload.starts_with("registry_witness_probe id=parent_authority/")
+                || payload.starts_with("registry_witness_probe id=parent_token/")
+            {
+                if registry_record_field(payload, "nonce")? != nonce
+                    || registry_record_field(payload, "parent_pid")? != parent_pid.to_string()
+                    || registry_record_field(payload, "parent_creation")? != parent_creation
+                {
+                    return Err(invalid("helper parent-authority record binding mismatch"));
+                }
+            }
             emit_witness_record(payload)?;
             cursor = payload_end + 1;
         }
@@ -4019,6 +4615,8 @@ mod registry_witness_tests {
                 "parent primary process TokenUser differs from fixture identity",
             ));
         }
+        let parent_pid = unsafe { GetCurrentProcessId() };
+        let parent_creation = process_creation_text(unsafe { GetCurrentProcess() })?;
         let mut session = None;
         let mut fixture = None;
         let mut image = None;
@@ -4094,6 +4692,10 @@ mod registry_witness_tests {
             }
             drop(thread);
             let output = child.wait(&AtomicBool::new(false))?;
+            validate_parent_self_binding(parent_pid, &parent_creation)?;
+            emit_witness_record(&format!(
+                "registry_witness_parent_binding nonce={nonce} pid={parent_pid} creation={parent_creation} live=true"
+            ))?;
             emit_witness_record(&format!(
                 "registry_witness_child_result role=normal completion={:?} exit={} image_id={} image_sha256={} fixture_digest={}",
                 output.completion,
@@ -4112,8 +4714,8 @@ mod registry_witness_tests {
                 output.stderr.len() > 1024,
                 escape_diagnostic(&output.stderr)
             ))?;
-            forward_child_records(&output.stdout)?;
-            forward_child_records(&output.stderr)?;
+            forward_child_records(&output.stdout, &nonce, parent_pid, &parent_creation)?;
+            forward_child_records(&output.stderr, &nonce, parent_pid, &parent_creation)?;
             if output.code != 0 || output.completion != Completion::Exited {
                 return Err(io::Error::other(format!(
                     "normal helper failed: exit={} completion={:?}",
@@ -4225,10 +4827,10 @@ mod registry_witness_tests {
             "registry_witness_probe id=lifetime/cleanup_absent observed=true private_fixture=true held_image=true profile_closed=true host_marker_prepost_equal=true",
         )?;
         emit_witness_record(
-            "registry_witness_incomplete unimplemented_controls=parent_authority,token_acquisition,mutation,duplicate_access,cancellation witness_status=INCOMPLETE",
+            "registry_witness_incomplete unimplemented_controls=cancellation,cleanup witness_status=INCOMPLETE",
         )?;
         Err(invalid(
-            "registry witness remains incomplete: parent-authority, token, mutation, duplicate-access and cancellation probes are unimplemented",
+            "registry witness remains incomplete: cancellation and cleanup controls are not complete",
         ))
     }
 
@@ -4270,7 +4872,11 @@ mod registry_witness_tests {
         );
         let parent_pid = std::env::var("ORBIT_REGISTRY_WITNESS_PARENT_PID")
             .expect("parent process ID binding missing");
-        assert!(parent_pid.parse::<u32>().is_ok_and(|pid| pid != 0));
+        let parent_pid = parent_pid
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0)
+            .expect("invalid parent process ID binding");
         let parent_creation = std::env::var("ORBIT_REGISTRY_WITNESS_PARENT_CREATION")
             .expect("parent creation-time binding missing");
         assert_eq!(parent_creation.len(), 16);
@@ -4365,6 +4971,15 @@ mod registry_witness_tests {
         emit_witness_record(&format!("registry_witness_probe id=mapped/private_absent/user_view domain=lstatus status={user_absence}"))
             .expect("bounded private-absence record");
         assert_eq!(user_absence, ERROR_FILE_NOT_FOUND);
+
+        if role == "normal" {
+            normal_mutation_controls(machine.raw(), user.raw())
+                .expect("private registry mutation or duplication control failed");
+            parent_authority_probes(parent_pid, &parent_creation, &nonce)
+                .expect("separate parent-process authority probes failed");
+            parent_token_probes(parent_pid, &parent_creation, &nonce)
+                .expect("query-limited parent token gate failed");
+        }
 
         if role == "cancel" {
             let child_pid = unsafe { GetCurrentProcessId() };

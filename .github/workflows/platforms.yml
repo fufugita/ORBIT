@@ -215,6 +215,7 @@ jobs:
       CARGO_TERM_COLOR: never
       NO_COLOR: '1'
       ORBIT_REGISTRY_WITNESS_FIXTURE: github-hosted-fake-data-only-v1
+      ORBIT_REGISTRY_WITNESS_NORMAL_CONTROLS: '37-v1'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install the pinned compiler
@@ -222,7 +223,7 @@ jobs:
         run: |
           rustup toolchain install 1.99.0 --profile minimal --no-self-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run the strict fake-data registry isolation witness
+      - name: Run 37 normal-path registry controls (cancellation and cleanup remain incomplete)
         shell: pwsh
         run: ./scripts/windows_native_test.ps1 -Group RegistryWitness
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

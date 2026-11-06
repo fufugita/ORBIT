@@ -247,6 +247,7 @@ if ($Group -eq 'RegistryWitness') {
         RUNNER_OS = 'Windows'
         GITHUB_REF = 'refs/heads/codex/platform-first-run-windows-proof-20261105'
         ORBIT_REGISTRY_WITNESS_FIXTURE = 'github-hosted-fake-data-only-v1'
+        ORBIT_REGISTRY_WITNESS_NORMAL_CONTROLS = '37-v1'
     }
     foreach ($entry in $requiredFixture.GetEnumerator()) {
         if ([Environment]::GetEnvironmentVariable($entry.Key) -cne $entry.Value) {
@@ -365,6 +366,9 @@ public static class OrbitRegistryWitnessFixture {
             if ($payloadEnd -ge $report.Length -or [int][char]$report[$payloadEnd] -ne 0x1f) { throw 'Truncated registry witness frame' }
             $payload=$report.Substring($payloadStart,$length)
             if ($payload -match '[^\x20-\x7e]') { throw 'Registry witness frame payload is not printable ASCII' }
+            if ($payload -notmatch '^(registry_witness_probe|registry_witness_parent_binding|registry_witness_helper_directory_access|registry_witness_helper_directory_descriptor|registry_witness_child_result|registry_witness_diagnostic|registry_witness_child_admission|registry_witness_child_complete|registry_witness_status|registry_witness_finalization|registry_witness_incomplete|registry_witness_setup_cleanup)(?: |$)') {
+                throw 'Unknown framed registry witness record type'
+            }
             $frames.Add($payload)
             $cursor=$payloadEnd+1
         }
@@ -385,14 +389,271 @@ public static class OrbitRegistryWitnessFixture {
         foreach ($life in @('normal_job_zero','cancel_ready_mapped','cancel_job_zero','cleanup_absent')) { [void]$expected.Add("lifetime/$life") }
         if ($expected.Count -ne 70) { throw "Internal closed probe manifest has $($expected.Count) IDs" }
         $actual=[Collections.Generic.List[string]]::new()
-        foreach ($frame in $frames) { if ($frame -match '^registry_witness_probe id=([^ ]+) ') { $actual.Add($Matches[1]) } }
+        foreach ($frame in $frames) {
+            if($frame.StartsWith('registry_witness_probe ') -and $frame -notmatch '^registry_witness_probe id=([^ ]+) .+$'){
+                throw 'Malformed framed registry witness probe'
+            }
+            if ($frame -match '^registry_witness_probe id=([^ ]+) ') { $actual.Add($Matches[1]) }
+        }
         if (@($actual | Select-Object -Unique).Count -ne $actual.Count) { throw 'Duplicate framed registry witness probe ID' }
         foreach ($id in $actual) { if (-not $expected.Contains($id)) { throw "Unexpected registry witness probe ID: $id" } }
+        function WitnessField([string]$record,[string]$name) {
+            $pattern='(?:^|\s)'+[regex]::Escape($name)+'=([^\s]+)'
+            $found=[regex]::Matches($record,$pattern)
+            if($found.Count -ne 1){throw "Missing or duplicate witness field: $name"}
+            $found[0].Groups[1].Value
+        }
+        function WitnessExactFields([string]$record,[string[]]$required,[string[]]$allowed=$required) {
+            $fields=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            $tokens=$record -split ' '
+            foreach($token in $tokens | Select-Object -Skip 1){
+                $separator=$token.IndexOf('=')
+                if($separator -le 0){throw 'Malformed witness key/value field'}
+                $name=$token.Substring(0,$separator)
+                $value=$token.Substring($separator+1)
+                if($name -notmatch '^[a-z_][a-z0-9_]*$' -or [string]::IsNullOrEmpty($value)){
+                    throw "Malformed witness field: $name"
+                }
+                if(-not $fields.TryAdd($name,$value)){throw "Duplicate witness field: $name"}
+            }
+            foreach($name in $required){if(-not $fields.ContainsKey($name)){throw "Missing witness field: $name"}}
+            foreach($name in $fields.Keys){if($name -notin $allowed){throw "Unknown witness field: $name"}}
+            if($fields.Count -ne $required.Count){throw 'Unexpected witness field count'}
+        }
+        function WitnessHex([string]$value) {
+            if($value -notmatch '^0x[0-9a-fA-F]{1,8}$'){throw "Invalid hexadecimal witness status: $value"}
+            [Convert]::ToUInt32($value.Substring(2),16)
+        }
+        $probeRecords=@{}
+        foreach($frame in $frames){
+            if($frame.StartsWith('registry_witness_probe ')){
+                if($frame -notmatch '^registry_witness_probe id=([^ ]+) .+$'){throw 'Malformed probe record'}
+                $probeRecords[$Matches[1]]=$frame
+            }
+        }
+        $bindingFrames=@($frames|Where-Object{$_.StartsWith('registry_witness_parent_binding ')})
+        if($bindingFrames.Count -ne 1){throw 'Expected one parent invocation identity binding'}
+        $binding=$bindingFrames[0]
+        if((WitnessField $binding 'nonce') -cne $nonce -or
+            (WitnessField $binding 'live') -cne 'true' -or
+            (WitnessField $binding 'pid') -notmatch '^[1-9][0-9]*$' -or
+            (WitnessField $binding 'creation') -notmatch '^[0-9A-Fa-f]{16}$'){
+            throw 'Parent invocation identity binding is invalid'
+        }
+        $boundPid=WitnessField $binding 'pid'
+        $boundCreation=WitnessField $binding 'creation'
+        $normalExpected=[Collections.Generic.List[string]]::new()
+        foreach($operation in @('set_value','delete_value','create_subkey','delete_leaf','set_dacl','set_owner','reopen_write','reopen_delete','reopen_write_dac','reopen_write_owner','duplicate_mutation')){
+            foreach($view in @('machine_view','user_view')){$normalExpected.Add("mutation/$operation/$view")}
+        }
+        foreach($view in @('machine_view','user_view')){$normalExpected.Add("duplicate_read/$view")}
+        foreach($right in @('dup_handle','vm_write','vm_operation','create_thread','write_dac','write_owner','vm_read')){$normalExpected.Add("parent_authority/$right")}
+        $normalExpected.Add('parent_token/process_query_limited')
+        foreach($right in @('token_duplicate','write_dac','write_owner','token_impersonate','token_assign_primary')){$normalExpected.Add("parent_token/$right")}
+        if($normalExpected.Count -ne 37){throw 'Internal normal-controls manifest is not 37 IDs'}
+        foreach($id in $normalExpected){if(-not $probeRecords.ContainsKey($id)){throw "Normal control missing: $id"}}
+        foreach($id in $probeRecords.Keys){
+            if($id.StartsWith('parent_authority/') -or $id.StartsWith('parent_token/')){
+                $record=$probeRecords[$id]
+                if((WitnessField $record 'nonce') -cne $nonce -or
+                    (WitnessField $record 'parent_pid') -cne $boundPid -or
+                    (WitnessField $record 'parent_creation') -cne $boundCreation){
+                    throw "Parent-bound control identity mismatch: $id"
+                }
+            }
+            $record=$probeRecords[$id]
+            # Probe-specific schemas below check every normal-tranche branch.
+            # Preserve first-equals parsing because attempts embeds key=value pairs.
+        }
+        $mutationFields=@('id','domain','status','expected','observed','data_and_descriptor_unchanged','mutation_subkey_absent','before','after')
+        foreach($operation in @('set_value','delete_value','create_subkey','delete_leaf','set_dacl','set_owner','reopen_write','reopen_delete','reopen_write_dac','reopen_write_owner')){
+            foreach($view in @('machine_view','user_view')){WitnessExactFields $probeRecords["mutation/$operation/$view"] $mutationFields}
+        }
+        $duplicateReadFields=@('id','domain','status','expected','observed','source_access','actual','query_ntstatus','returned_length','label_read')
+        foreach($view in @('machine_view','user_view')){WitnessExactFields $probeRecords["duplicate_read/$view"] $duplicateReadFields}
+        $authorityFields=@('id','domain','status','expected','observed','requested','nonce','parent_pid','parent_creation')
+        foreach($right in @('dup_handle','vm_write','vm_operation','create_thread','write_dac','write_owner','vm_read')){
+            WitnessExactFields $probeRecords["parent_authority/$right"] $authorityFields
+        }
+        $queryBlockedFields=@('id','domain','status','expected','observed','branch','nonce','parent_pid','parent_creation')
+        $queryOpenFields=@('id','domain','status','expected','observed','branch','actual','query_ntstatus','returned_length','nonce','parent_pid','parent_creation')
+        $queryRecord=$probeRecords['parent_token/process_query_limited']
+        $queryRecordBranch=WitnessField $queryRecord 'branch'
+        if($queryRecordBranch -ceq 'blocked_by_process_gate'){
+            WitnessExactFields $queryRecord $queryBlockedFields
+        } elseif($queryRecordBranch -ceq 'query_open'){
+            WitnessExactFields $queryRecord $queryOpenFields
+        } else {throw 'Unknown query-limited token-gate schema'}
+        $blockedTokenFields=@('id','domain','branch','executed','gate_id','gate_status','nonce','parent_pid','parent_creation')
+        $executedTokenFields=@('id','domain','status','expected','observed','branch','executed','requested','acquired','nonce','parent_pid','parent_creation')
+        foreach($right in @('token_duplicate','write_dac','write_owner','token_impersonate','token_assign_primary')){
+            $record=$probeRecords["parent_token/$right"]
+            if((WitnessField $record 'branch') -ceq 'blocked_by_process_gate'){
+                WitnessExactFields $record $blockedTokenFields
+            } else {WitnessExactFields $record $executedTokenFields}
+        }
+        $duplicateDeniedFields=@('id','domain','status','expected','observed','branch','desired','actual','data_and_descriptor_unchanged','mutation_subkey_absent','before','after')
+        $duplicateLimitedFields=@('id','domain','status','expected','observed','branch','desired','actual','query_ntstatus','returned_length','data_and_descriptor_unchanged','mutation_subkey_absent','before','after','attempts')
+        foreach($view in @('machine_view','user_view')){
+            $record=$probeRecords["mutation/duplicate_mutation/$view"]
+            switch(WitnessField $record 'branch'){
+                'duplicate_denied' {WitnessExactFields $record $duplicateDeniedFields}
+                'limited' {WitnessExactFields $record $duplicateLimitedFields}
+                'unexpected_granted_access' {WitnessExactFields $record @('id','domain','status','expected','observed','branch','desired','actual')}
+                'mutation_not_denied' {WitnessExactFields $record @('id','domain','status','expected','observed','branch','desired','actual','operation')}
+                default {throw 'Unknown duplicate-mutation schema'}
+            }
+        }
+        foreach($operation in @('set_value','delete_value','create_subkey','delete_leaf','set_dacl','set_owner','reopen_write','reopen_delete','reopen_write_dac','reopen_write_owner')){
+            foreach($view in @('machine_view','user_view')){
+                $id="mutation/$operation/$view";$record=$probeRecords[$id]
+                if((WitnessField $record 'domain') -cne 'lstatus' -or
+                    (WitnessHex (WitnessField $record 'status')) -ne 5 -or
+                    (WitnessHex (WitnessField $record 'expected')) -ne 5 -or
+                    (WitnessField $record 'observed') -cne 'true' -or
+                    (WitnessField $record 'data_and_descriptor_unchanged') -cne 'true' -or
+                    (WitnessField $record 'mutation_subkey_absent') -cne 'true'){
+                    throw "Private mutation control failed schema/status/preimage validation: $id"
+                }
+                $before=WitnessField $record 'before';$after=WitnessField $record 'after'
+                if($before -notmatch '^[0-9A-Fa-f]{64}$' -or $before -cne $after){throw "Private mutation preimage changed: $id"}
+            }
+        }
+        foreach($view in @('machine_view','user_view')){
+            $id="duplicate_read/$view";$record=$probeRecords[$id]
+            if((WitnessField $record 'domain') -cne 'win32' -or
+                (WitnessHex (WitnessField $record 'status')) -ne 0 -or
+                (WitnessHex (WitnessField $record 'expected')) -ne 0 -or
+                (WitnessField $record 'observed') -cne 'true' -or
+                (WitnessField $record 'label_read') -cne 'true' -or
+                (WitnessHex (WitnessField $record 'query_ntstatus')) -ne 0 -or
+                [int](WitnessField $record 'returned_length') -ne 56){throw "Same-access duplicate read failed: $id"}
+            $source=WitnessHex (WitnessField $record 'source_access');$granted=WitnessHex (WitnessField $record 'actual')
+            if($source -ne $granted -or ($granted -band ([uint32]::MaxValue -bxor [uint32]0x20019)) -ne 0){throw "Duplicate read handle exceeded source KEY_READ: $id"}
+        }
+        foreach($operation in @('dup_handle','vm_write','vm_operation','create_thread','write_dac','write_owner','vm_read')){
+            $id="parent_authority/$operation";$record=$probeRecords[$id]
+            $rights=@{dup_handle='0x40';vm_write='0x20';vm_operation='0x8';create_thread='0x2';write_dac='0x40000';write_owner='0x80000';vm_read='0x10'}
+            if((WitnessField $record 'domain') -cne 'win32' -or
+                (WitnessHex (WitnessField $record 'status')) -ne 5 -or
+                (WitnessHex (WitnessField $record 'expected')) -ne 5 -or
+                (WitnessField $record 'observed') -cne 'true' -or
+                (WitnessField $record 'requested') -cne $rights[$operation]){throw "Parent authority gate failed: $id"}
+        }
+        $query=$probeRecords['parent_token/process_query_limited']
+        $queryBranch=WitnessField $query 'branch'
+        if($queryBranch -ceq 'blocked_by_process_gate'){
+            if((WitnessField $query 'domain') -cne 'win32' -or
+                (WitnessHex (WitnessField $query 'status')) -ne 5 -or
+                (WitnessHex (WitnessField $query 'expected')) -ne 5 -or
+                (WitnessField $query 'observed') -cne 'true'){throw 'Query-limited denial branch was not exact'}
+            foreach($right in @('token_duplicate','write_dac','write_owner','token_impersonate','token_assign_primary')){
+                $record=$probeRecords["parent_token/$right"]
+                if((WitnessField $record 'domain') -cne 'gate' -or
+                    (WitnessField $record 'branch') -cne 'blocked_by_process_gate' -or
+                    (WitnessField $record 'executed') -cne 'false' -or
+                    (WitnessField $record 'gate_id') -cne 'parent_token/process_query_limited' -or
+                    (WitnessHex (WitnessField $record 'gate_status')) -ne 5 -or
+                    $record -match '(?:^|\s)status=') {throw "Invalid blocked token-gate record: parent_token/$right"}
+            }
+        } elseif($queryBranch -ceq 'query_open'){
+            if((WitnessField $query 'domain') -cne 'win32' -or
+                (WitnessHex (WitnessField $query 'status')) -ne 0 -or
+                (WitnessHex (WitnessField $query 'expected')) -ne 0 -or
+                (WitnessField $query 'observed') -cne 'true' -or
+                (WitnessHex (WitnessField $query 'actual')) -ne 0x1000 -or
+                (WitnessHex (WitnessField $query 'query_ntstatus')) -ne 0 -or
+                [int](WitnessField $query 'returned_length') -ne 56 -or
+                (WitnessField $query 'parent_pid') -cne $boundPid -or
+                (WitnessField $query 'parent_creation') -cne $boundCreation){throw 'Query-limited success binding was invalid'}
+            $tokenRights=@{token_duplicate='0x2';write_dac='0x40000';write_owner='0x80000';token_impersonate='0x4';token_assign_primary='0x1'}
+            foreach($right in $tokenRights.Keys){
+                $record=$probeRecords["parent_token/$right"]
+                if((WitnessField $record 'domain') -cne 'win32' -or
+                    (WitnessField $record 'branch') -cne 'query_open' -or
+                    (WitnessField $record 'executed') -cne 'true' -or
+                    (WitnessField $record 'observed') -cne 'true' -or
+                    (WitnessHex (WitnessField $record 'status')) -ne 5 -or
+                    (WitnessHex (WitnessField $record 'expected')) -ne 5 -or
+                    (WitnessField $record 'acquired') -cne 'false' -or
+                    (WitnessField $record 'requested') -cne $tokenRights[$right]){throw "Token right gate failed: parent_token/$right"}
+            }
+        } else {throw 'Unknown query-limited token-gate branch'}
+        foreach($view in @('machine_view','user_view')){
+            $id="mutation/duplicate_mutation/$view";$record=$probeRecords[$id]
+            $branch=WitnessField $record 'branch';$status=WitnessHex (WitnessField $record 'status')
+            if((WitnessField $record 'domain') -cne 'win32'){throw "Mutation duplicate domain invalid: $id"}
+            if($branch -ceq 'duplicate_denied'){
+                if($status -ne 5 -or (WitnessHex (WitnessField $record 'expected')) -ne 5 -or
+                    (WitnessField $record 'observed') -cne 'true' -or
+                    (WitnessHex (WitnessField $record 'desired')) -ne 0xf000a -or
+                    (WitnessField $record 'actual') -cne 'unknown' -or
+                    (WitnessField $record 'data_and_descriptor_unchanged') -cne 'true' -or
+                    (WitnessField $record 'mutation_subkey_absent') -cne 'true') {throw "Mutation duplicate denial invalid: $id"}
+                $before=WitnessField $record 'before';$after=WitnessField $record 'after'
+                if($before -notmatch '^[0-9A-Fa-f]{64}$' -or $before -cne $after){throw "Mutation duplicate denial changed preimage: $id"}
+            } elseif($branch -ceq 'limited'){
+                $granted=WitnessHex (WitnessField $record 'actual')
+                if($status -ne 0 -or (WitnessHex (WitnessField $record 'expected')) -ne 0 -or
+                    (WitnessField $record 'observed') -cne 'true' -or
+                    (WitnessHex (WitnessField $record 'desired')) -ne 0xf000a -or
+                    (WitnessHex (WitnessField $record 'query_ntstatus')) -ne 0 -or
+                    [int](WitnessField $record 'returned_length') -ne 56 -or
+                    ($granted -band ([uint32]::MaxValue -bxor [uint32]0x20019)) -ne 0 -or
+                    (WitnessField $record 'data_and_descriptor_unchanged') -cne 'true' -or
+                    (WitnessField $record 'mutation_subkey_absent') -cne 'true'){throw "Mutation duplicate exceeded safe read-only branch: $id"}
+                $attempts=@{}
+                foreach($pair in (WitnessField $record 'attempts').Split(',')){
+                    if($pair -notmatch '^([a-z_]+)=(0x[0-9a-fA-F]+)$'){throw "Malformed duplicate mutation subprobe: $id"}
+                    $operationName=$Matches[1];$operationStatus=$Matches[2]
+                    if($attempts.ContainsKey($operationName)){throw "Malformed duplicate mutation subprobe: $id"}
+                    $attempts[$operationName]=$operationStatus
+                }
+                foreach($operation in @('set_value','delete_value','create_subkey','delete_leaf','set_dacl','set_owner')){
+                    if(-not $attempts.ContainsKey($operation) -or (WitnessHex $attempts[$operation]) -ne 5){throw "Duplicate mutation was not denied: $id/$operation"}
+                }
+                if($attempts.Count -ne 6){throw "Unexpected duplicate mutation subprobe: $id"}
+                $before=WitnessField $record 'before';$after=WitnessField $record 'after'
+                if($before -notmatch '^[0-9A-Fa-f]{64}$' -or $before -cne $after){throw "Duplicate mutation changed preimage: $id"}
+            } else {throw "Unknown mutation-duplicate branch: $id"}
+        }
+        foreach($id in $probeRecords.Keys){
+            $record=$probeRecords[$id]
+            if($id -match '^(baseline|reset)/host_denied/(win32|nt)/(machine|user)$' -or
+                $id -match '^mapped/host_denied/(win32|nt)/(machine|user)$'){
+                $api=$id.Split('/')[2]
+                $expectedStatus=if($api -ceq 'win32'){'0x5'}else{'0xc0000022'}
+                $expectedDomain=if($api -ceq 'win32'){'lstatus'}else{'ntstatus'}
+                if((WitnessField $record 'domain') -cne $expectedDomain -or
+                    (WitnessField $record 'status') -cne $expectedStatus){throw "Host-denial status mismatch: $id"}
+            } elseif($id -match '^mapped/private_absent/(machine_view|user_view)$'){
+                if((WitnessField $record 'domain') -cne 'lstatus' -or
+                    (WitnessField $record 'status') -cne '2'){throw "Private absence status mismatch: $id"}
+            } elseif($id -match '^parent_present/(before|after)/(win32|nt)/(machine|user)$'){
+                if((WitnessField $record 'status') -cne '0' -or
+                    (WitnessField $record 'observed') -cne 'true' -or
+                    (WitnessField $record 'sha256') -notmatch '^[0-9A-Fa-f]{64}$'){throw "Parent marker control failed: $id"}
+            } elseif($id -match '^(inherited|mapped|remapped)/public_read/(machine_view|user_view)$'){
+                if((WitnessField $record 'observed') -cne 'true'){throw "Private view read failed: $id"}
+            } elseif($id -match '^parent_recovery/(machine_view|user_view)$'){
+                if((WitnessField $record 'observed') -cne 'true' -or
+                    (WitnessHex (WitnessField $record 'granted_access')) -ne 0xf003f){throw "Parent fixture recovery failed: $id"}
+            } elseif($id -ceq 'lifetime/normal_job_zero'){
+                if((WitnessField $record 'observed') -cne 'true' -or
+                    (WitnessField $record 'active_processes') -cne '0'){throw 'Normal helper Job did not reach zero'}
+            }
+        }
         $status=@($frames | Where-Object { $_ -match '^registry_witness_status witness_status=INCOMPLETE ' })
         if ($status.Count -eq 0 -or $code -eq 0) {
             throw "Partial registry witness did not fail closed with explicit INCOMPLETE evidence (exit $code)"
         }
         $missing=@($expected | Where-Object { -not $actual.Contains($_) })
+        $openIds=@('lifetime/cancel_ready_mapped','lifetime/cancel_job_zero','lifetime/cleanup_absent')
+        $missingKey=@($missing|Sort-Object) -join '|'
+        $openKey=@($openIds|Sort-Object) -join '|'
+        if($missingKey -cne $openKey){
+            throw "Normal 37-control tranche incomplete; only the three cancellation/cleanup IDs may remain open (missing $($missing -join ', '))"
+        }
         $parentIdentity.witness_status='INCOMPLETE_FAILED_partial_checkpoint'
         $parentIdentity.missing_probe_count=$missing.Count
         $parentIdentity.ordinary_user_support_proven=$false
