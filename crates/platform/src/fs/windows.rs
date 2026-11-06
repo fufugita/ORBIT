@@ -2828,6 +2828,7 @@ mod staged_package {
         remaining_depth: usize,
         create_attempted: bool,
         phase: PublicationState,
+        removal: Option<DiscardProgress>,
     }
     impl StageCore {
         fn raw(&self) -> io::Result<HANDLE> {
@@ -3072,14 +3073,318 @@ mod staged_package {
         core: StageCore,
         publication: Option<(FileIdentity, Durability)>,
     }
-    // Declaration-only evidence. Successful construction requires the later
-    // real disposition, checked-close and absence implementation.
+    // Each receipt fact is constructed only after actual disposition, checked
+    // close and exact native name absence have all been confirmed.
     #[allow(dead_code)]
     struct RemovedEntryEvidence {
         identity: FileIdentity,
         disposition_status: i32,
         close_confirmed: bool,
         absence_confirmed: bool,
+    }
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum DiscardClose {
+        Unobserved,
+        Confirmed,
+        Uncertain,
+    }
+    struct DiscardStep {
+        name: PreparedName,
+        identity: FileIdentity,
+        owner: Option<OwnedHandle>,
+        probe_owner: Option<OwnedHandle>,
+        open_attempted: bool,
+        open_status: Option<i32>,
+        validated: bool,
+        disposition_attempted: bool,
+        disposition_status: Option<i32>,
+        close: DiscardClose,
+        absence_attempted: bool,
+        absence_status: Option<i32>,
+        absence_confirmed: bool,
+    }
+    impl DiscardStep {
+        fn prepare(name: &OsStr, identity: FileIdentity) -> io::Result<Self> {
+            Ok(Self {
+                name: PreparedName::new(name)?,
+                identity,
+                owner: None,
+                probe_owner: None,
+                open_attempted: false,
+                open_status: None,
+                validated: false,
+                disposition_attempted: false,
+                disposition_status: None,
+                close: DiscardClose::Unobserved,
+                absence_attempted: false,
+                absence_status: None,
+                absence_confirmed: false,
+            })
+        }
+        fn confirm_absence(
+            &mut self,
+            parent: HANDLE,
+            directory: bool,
+            closes: &Arc<CloseState>,
+            phase: &'static str,
+        ) -> io::Result<()> {
+            self.absence_attempted = true;
+            match native_open(
+                parent,
+                &self.name,
+                directory,
+                FILE_OPEN,
+                META,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                closes,
+                phase,
+            ) {
+                Ok(owner) => {
+                    // A present name is not deletion authority. Retain the
+                    // unexpected owner before any further fallible operation.
+                    self.probe_owner = Some(owner);
+                    self.absence_status = Some(0);
+                    Err(denied("discarded package name is still present"))
+                }
+                Err(error) => {
+                    self.absence_status = discard_native_status(&error, phase);
+                    if self.absence_status == Some(0xc0000034u32 as i32) {
+                        self.absence_confirmed = true;
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        }
+        fn confirmed_evidence(&self) -> io::Result<RemovedEntryEvidence> {
+            if !self.validated
+                || !self.disposition_attempted
+                || self.disposition_status != Some(0)
+                || self.close != DiscardClose::Confirmed
+                || !self.absence_attempted
+                || self.absence_status != Some(0xc0000034u32 as i32)
+                || !self.absence_confirmed
+                || self.owner.is_some()
+                || self.probe_owner.is_some()
+            {
+                return Err(invalid("package removal evidence is incomplete"));
+            }
+            Ok(RemovedEntryEvidence {
+                identity: self.identity,
+                disposition_status: self.disposition_status.unwrap(),
+                close_confirmed: self.close == DiscardClose::Confirmed,
+                absence_confirmed: self.absence_confirmed,
+            })
+        }
+    }
+    struct DiscardProgress {
+        // Index order is bound to the immutable construction ledger. Allocate
+        // every owner/probe slot and receipt capacity before any disposition.
+        entries: Vec<DiscardStep>,
+        root: DiscardStep,
+        confirmed: Vec<RemovedEntryEvidence>,
+    }
+    impl DiscardProgress {
+        fn prepare(core: &StageCore) -> io::Result<Self> {
+            if core.removal.is_some()
+                || core.final_name.is_some()
+                || core.root.is_none()
+                || core.bridge.is_some()
+                || core.reader.is_some()
+                || core.ledger.len() > MAX_ENTRIES
+            {
+                return Err(denied("package is not an intact unpublished discard stage"));
+            }
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(core.ledger.len())
+                .map_err(|e| io::Error::other(e))?;
+            let mut confirmed = Vec::new();
+            confirmed
+                .try_reserve_exact(core.ledger.len())
+                .map_err(|e| io::Error::other(e))?;
+            for node in &core.ledger {
+                entries.push(DiscardStep::prepare(
+                    &node.name,
+                    node.identity
+                        .ok_or_else(|| invalid("package discard entry identity unavailable"))?,
+                )?);
+            }
+            Ok(Self {
+                entries,
+                root: DiscardStep::prepare(
+                    &core.original_name,
+                    core.root_identity
+                        .ok_or_else(|| invalid("package discard root identity unavailable"))?,
+                )?,
+                confirmed,
+            })
+        }
+    }
+    fn discard_native_status(error: &io::Error, phase: &'static str) -> Option<i32> {
+        error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<NativeError>())
+            .filter(|e| e.phase == phase)
+            .map(|e| e.status)
+    }
+    fn discard_mark(raw: HANDLE) -> i32 {
+        let information = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+        let mut iosb = IO_STATUS_BLOCK::default();
+        // All callers use the actual NONALERT+SYNCHRONIZE file object. Its
+        // documented synchronous completion keeps both request buffers live
+        // through return; only returned STATUS_SUCCESS acknowledges marking.
+        unsafe {
+            NtSetInformationFile(
+                raw,
+                &mut iosb,
+                (&information as *const FILE_DISPOSITION_INFORMATION).cast(),
+                size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                FileDispositionInformation,
+            )
+        }
+    }
+    impl StageCore {
+        fn discard_entries(&mut self) -> io::Result<()> {
+            let root = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("package discard root creator unavailable"))?
+                .as_raw_handle();
+            for (index, node) in self.ledger.iter().enumerate() {
+                self.check_root()?;
+                self.domain.closes.zero()?;
+                let progress = self.removal.as_mut().unwrap();
+                let step = &mut progress.entries[index];
+                step.open_attempted = true;
+                match native_open(
+                    root,
+                    &step.name,
+                    false,
+                    FILE_OPEN,
+                    DELETE | META,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null(),
+                    &self.domain.closes,
+                    "package-discard-child-open",
+                ) {
+                    Ok(owner) => {
+                        step.owner = Some(owner);
+                        step.open_status = Some(0);
+                    }
+                    Err(error) => {
+                        step.open_status =
+                            discard_native_status(&error, "package-discard-child-open");
+                        return Err(error);
+                    }
+                }
+                let raw = step.owner.as_ref().unwrap().as_raw_handle();
+                if Some(source_snapshot(raw, step.identity, false)?) != node.snapshot
+                    || self.domain.facts(raw, mode(node.executable))?
+                        != *node.policy.as_ref().unwrap()
+                {
+                    return Err(denied(
+                        "package discard entry identity, snapshot or policy changed",
+                    ));
+                }
+                self.domain.check()?;
+                self.domain.closes.zero()?;
+                step.validated = true;
+                step.disposition_attempted = true;
+                let returned = discard_mark(raw);
+                step.disposition_status = Some(returned);
+                if returned != 0 {
+                    return Err(native_error("package-discard-child-disposition", returned));
+                }
+                // The marked file object is only closed from here onward.
+                // Its full identity was cached before setting delete-pending.
+                let owner = step.owner.take().unwrap();
+                match close_owned(
+                    owner,
+                    &self.domain.closes,
+                    Some(step.identity),
+                    "package discarded child",
+                ) {
+                    Ok(()) => step.close = DiscardClose::Confirmed,
+                    Err(error) => {
+                        step.close = DiscardClose::Uncertain;
+                        return Err(error);
+                    }
+                }
+                step.confirm_absence(
+                    root,
+                    false,
+                    &self.domain.closes,
+                    "package-discard-child-absence",
+                )?;
+                self.domain.closes.zero()?;
+                progress.confirmed.push(step.confirmed_evidence()?);
+            }
+            Ok(())
+        }
+        fn discard_root(&mut self) -> io::Result<()> {
+            let progress = self.removal.as_ref().unwrap();
+            if progress.entries.len() != self.ledger.len()
+                || progress.confirmed.len() != self.ledger.len()
+            {
+                return Err(invalid("package discard entry progress is incomplete"));
+            }
+            for step in &progress.entries {
+                step.confirmed_evidence()?;
+            }
+            self.check_root()?;
+            self.domain.closes.zero()?;
+            let root = self.root.as_ref().unwrap().as_raw_handle();
+            let listed = source_directory_entries(
+                root,
+                EnumerationLimits {
+                    max_entries: MAX_ENTRIES,
+                    max_name_bytes: MAX_NAMES,
+                },
+            )?;
+            if !listed.is_empty() {
+                return Err(denied("package discard root is not empty"));
+            }
+            self.check_root()?;
+            self.domain.closes.zero()?;
+            let step = &mut self.removal.as_mut().unwrap().root;
+            step.validated = true;
+            step.disposition_attempted = true;
+            // Use the original FA/DELETE creator. A second DELETE open would
+            // conflict with that creator's existing RW/noDELETE sharing.
+            let returned = discard_mark(root);
+            step.disposition_status = Some(returned);
+            if returned != 0 {
+                return Err(native_error("package-discard-root-disposition", returned));
+            }
+            // No root/file queries after marking: close, then observe only
+            // through the independently held parent/lock/ancestor domain.
+            let owner = self.root.take().unwrap();
+            match close_owned(
+                owner,
+                &self.domain.closes,
+                Some(step.identity),
+                "package discarded root",
+            ) {
+                Ok(()) => step.close = DiscardClose::Confirmed,
+                Err(error) => {
+                    step.close = DiscardClose::Uncertain;
+                    return Err(error);
+                }
+            }
+            step.confirm_absence(
+                self.domain.parent(),
+                true,
+                &self.domain.closes,
+                "package-discard-root-absence",
+            )?;
+            self.domain.check()?;
+            self.domain.closes.zero()?;
+            step.confirmed_evidence()?;
+            Ok(())
+        }
     }
     #[allow(dead_code)]
     pub struct StageRemoval {
@@ -3162,6 +3467,7 @@ mod staged_package {
                 remaining_depth: 64,
                 create_attempted: false,
                 phase: PublicationState::NamespaceUnknown,
+                removal: None,
             };
             core.ledger.reserve(1);
             core.create_attempted = true;
@@ -3389,26 +3695,40 @@ mod staged_package {
             validate_source_component(name)?;
             self.core.make_view(name, executable)
         }
-        pub fn discard(self) -> Result<StageRemoval, StageRemovalError> {
-            let validation = (|| {
+        pub fn discard(mut self) -> Result<StageRemoval, StageRemovalError> {
+            let result = (|| {
                 self.core.check_root()?;
                 self.core.domain.closes.zero()?;
                 self.core.inventory(self.core.raw()?)?;
                 self.core.check_root()?;
-                self.core.domain.closes.zero()
+                self.core.domain.closes.zero()?;
+                self.core.removal = Some(DiscardProgress::prepare(&self.core)?);
+                self.core.discard_entries()?;
+                self.core.discard_root()?;
+                self.core
+                    .removal
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .confirmed_evidence()
             })();
-            if let Err(source) = validation {
-                return Err(StageRemovalError::Uncertain {
-                    source,
-                    recovery: StageRecovery {
-                        core: self.core,
-                        publication: None,
-                    },
-                });
-            }
-            Err(StageRemovalError::Unchanged {
-                source: unsupported("staged package discard is not implemented"),
-                stage: self,
+            let root = match result {
+                Ok(root) => root,
+                Err(source) => {
+                    return Err(StageRemovalError::Uncertain {
+                        source,
+                        recovery: StageRecovery {
+                            core: self.core,
+                            publication: None,
+                        },
+                    });
+                }
+            };
+            let progress = self.core.removal.take().unwrap();
+            Ok(StageRemoval {
+                domain: self.core.domain,
+                root,
+                entries: progress.confirmed,
             })
         }
 
