@@ -534,7 +534,7 @@ function Get-LateDetailRequiredFields {
 function Assert-LateErrorGrammar([string]$Value,[hashtable]$Expected) {
     if($Value -notmatch '^v1\|([0-9]|1[0-6])\|(.*)$'){throw 'Late error list is malformed or exceeds 16 events'}
     $count=[int]$Matches[1];$body=$Matches[2]
-    $events=if($count -eq 0){@()}else{@($body -split ';',-1)}
+    $events=@(if($count -eq 0){@()}else{@($body -split ';',-1)})
     if($events.Count -ne $count -or $count -ne 1){throw 'Late control requires one exact target event and zero unexpected events'}
     if($events[0] -cnotmatch '^([a-z_]+),([a-z_]+),([A-Za-z0-9_]{1,16}|0x[0-9A-F]{8}),([0-9A-F]*)$'){
         throw 'Late target event does not match the closed ASCII error grammar'
@@ -546,6 +546,41 @@ function Assert-LateErrorGrammar([string]$Value,[hashtable]$Expected) {
     if([Convert]::ToHexString($bytes) -cne $hex){throw 'Late event message is not canonical lossless UTF-8'}
     if($Matches[1] -cne $Expected.target -or $Matches[2] -cne $Expected.domain -or
         $Matches[3] -cne $Expected.code){throw 'Late event phase/domain/code differs from the fixed case table'}
+}
+
+function Test-LateErrorGrammarParser([hashtable]$CaseTable,[string[]]$CaseOrder) {
+    if($CaseOrder.Count -ne 9 -or @($CaseOrder | Select-Object -Unique).Count -ne 9){
+        throw 'Parser regression requires the fixed nine late cases'
+    }
+    $positive=0;$negative=0
+    foreach($caseName in $CaseOrder){
+        if(-not $CaseTable.ContainsKey($caseName)){throw 'Parser regression case is missing'}
+        $want=$CaseTable[$caseName]
+        $eventPrefix=$want.target+','+$want.domain+','+$want.code+','
+        $entry=$eventPrefix+'74657374'
+        Assert-LateErrorGrammar ('v1|1|'+$entry) $want
+        $positive++
+        $badValues=@(
+            'v1|0|',
+            ('v1|2|'+$entry+';'+$entry),
+            ('v1|1|unexpected_phase,'+$want.domain+','+$want.code+',74657374'),
+            ('v1|1|'+$eventPrefix+'FF'),
+            ('v1|1|'+$eventPrefix+'A'),
+            ('v1|1|'+$eventPrefix+('41'*97)),
+            ('v1|1|'+$eventPrefix+'7a')
+        )
+        foreach($badValue in $badValues){
+            $rejected=$false
+            try { Assert-LateErrorGrammar $badValue $want } catch { $rejected=$true }
+            if(-not $rejected){throw "Parser regression admitted an invalid event for $caseName"}
+            $negative++
+        }
+    }
+    if($positive -ne 9 -or $negative -ne 63){throw 'Parser regression did not execute every assertion'}
+    return [pscustomobject][ordered]@{
+        kind='parser_only';status='passed';positive_cases=$positive;negative_cases=$negative
+        source=$env:GITHUB_SHA;run=$env:GITHUB_RUN_ID
+    }
 }
 
 function Assert-LateUtf8Pair([string]$Frame,[string]$Stem) {
@@ -1783,6 +1818,9 @@ function Assert-LateFinalization([string]$Frame,[string]$CaseName,[hashtable]$Ex
             return ,$probeRecords
         }
         $probeRecords=ValidateWitnessTranscript -InputFrames $frames -RunNonce $nonce -ExitCode $code -Mode complete -ControlName '' -ExpectedIds $expected -ActualIds $actual -ExpectedMachineHash $parentIdentity.marker_sha256[0] -ExpectedUserHash $parentIdentity.marker_sha256[1]
+        $lateParserRegression=Test-LateErrorGrammarParser -CaseTable $cleanupLate -CaseOrder $cleanupLateOrder
+        $lateParserRegression | ConvertTo-Json -Depth 4 |
+            Out-File -LiteralPath (Join-Path $EvidenceDir 'cleanup-late-parser-regression.json') -Encoding utf8
         $lateAdmissionUnit='process::windows::registry_witness_tests::registry_witness_late_error_admission_rejects_coalesced_unexpected_close'
         $lateAdmissionLog=Join-Path $EvidenceDir 'cleanup-late-error-admission.log'
         cargo +1.99.0 test --locked -p orbit-platform --features registry-witness --lib $lateAdmissionUnit -- --exact --test-threads=1 --nocapture 2>&1 |

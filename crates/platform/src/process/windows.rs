@@ -10536,7 +10536,7 @@ mod registry_witness_tests {
         late_set(
             &mut late.fields,
             "held_reader_blocker_open_native_result",
-            "not_called",
+            "not_opened",
         );
         late_set(
             &mut late.fields,
