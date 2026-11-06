@@ -1969,6 +1969,7 @@ impl SourceDirectory {
             file: File::from(handle),
             identity: file_identity,
             parent_identity: self.identity(),
+            leaf_name: name.to_os_string(),
             anchors: self.chain.clone(),
             anchor_identities: self.identities.clone(),
         };
@@ -1996,9 +1997,21 @@ impl SourceDirectory {
 
 /// An immutable execution-permission observation for a held source file.
 /// Values are produced only by the fallible source observation API.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ExecutionPermission {
     executable: bool,
+    identity: FileIdentity,
+    security: execution_observation::SecurityFingerprint,
+    context: execution_observation::ContextKey,
+}
+
+impl std::fmt::Debug for ExecutionPermission {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output
+            .debug_struct("ExecutionPermission")
+            .field("executable", &self.executable)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionPermission {
@@ -2012,6 +2025,7 @@ pub struct SourceFile {
     file: File,
     identity: FileIdentity,
     parent_identity: FileIdentity,
+    leaf_name: OsString,
     anchors: Vec<Arc<OwnedHandle>>,
     anchor_identities: Vec<FileIdentity>,
 }
@@ -2019,9 +2033,7 @@ pub struct SourceFile {
 impl SourceFile {
     /// Observe execution permission without executing or mapping the source.
     pub fn execution_permission(&self) -> io::Result<ExecutionPermission> {
-        Err(unsupported(
-            "source execution permission observation is not implemented",
-        ))
+        execution_observation::observe(self)
     }
 
     pub fn identity(&self) -> FileIdentity {
@@ -2404,6 +2416,752 @@ thread_local! { static FAILURE: std::cell::Cell<Option<&'static str>> = const { 
 thread_local! { static GAP_CHECK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
 static INSPECTION_DACL_AFTER_SNAPSHOT: AtomicBool = AtomicBool::new(false);
+
+mod execution_observation {
+    use super::*;
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::SystemServices::ACCESS_SYSTEM_SECURITY;
+
+    const MAX_BYTES: usize = 65536;
+    const MAX_ACES: usize = 4096;
+    const METADATA_ACCESS: u32 = READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    const STATUS_ACCESS_DENIED: i32 = 0xc0000022u32 as i32;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct ContextKey {
+        thread_token: bool,
+        token_type: i32,
+        impersonation_level: Option<i32>,
+        token_id: (u32, i32),
+        authentication_id: (u32, i32),
+        modified_id: (u32, i32),
+        user: Vec<u8>,
+        primary_group: Vec<u8>,
+    }
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct NormalizedAce {
+        kind: u8,
+        flags: u8,
+        mask: u32,
+        sid: Vec<u8>,
+    }
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Dacl {
+        Absent,
+        Null,
+        Entries(Vec<NormalizedAce>),
+    }
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct SecurityFingerprint {
+        owner: Vec<u8>,
+        group: Vec<u8>,
+        control: u16,
+        dacl: Dacl,
+    }
+    struct Descriptor {
+        words: Vec<usize>,
+        fingerprint: SecurityFingerprint,
+    }
+
+    #[derive(Default)]
+    struct Handles {
+        slots: Vec<Option<OwnedHandle>>,
+    }
+    impl Handles {
+        fn own(&mut self, handle: OwnedHandle) -> usize {
+            let index = self.slots.len();
+            self.slots.push(Some(handle));
+            index
+        }
+        fn raw(&self, index: usize) -> HANDLE {
+            self.slots[index].as_ref().unwrap().as_raw_handle()
+        }
+        fn finish<T>(mut self, result: io::Result<T>) -> io::Result<T> {
+            let mut errors = Vec::new();
+            for slot in self.slots.iter_mut().rev() {
+                if let Some(handle) = slot.take() {
+                    let raw = handle.into_raw_handle();
+                    if unsafe { CloseHandle(raw) } == 0 {
+                        errors.push(io::Error::last_os_error());
+                    }
+                }
+            }
+            if errors.is_empty() {
+                return result;
+            }
+            let primary = result.err();
+            let kind = primary
+                .as_ref()
+                .map_or(io::ErrorKind::Other, io::Error::kind);
+            Err(io::Error::new(
+                kind,
+                ObservationCloseError {
+                    primary,
+                    closes: errors,
+                },
+            ))
+        }
+    }
+    #[derive(Debug)]
+    struct ObservationCloseError {
+        primary: Option<io::Error>,
+        closes: Vec<io::Error>,
+    }
+    impl std::fmt::Display for ObservationCloseError {
+        fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(output, "execution observation close uncertainty")?;
+            if let Some(primary) = &self.primary {
+                write!(output, "; original error: {primary}")?;
+            }
+            for error in &self.closes {
+                write!(output, "; CloseHandle: {error}")?;
+            }
+            Ok(())
+        }
+    }
+    impl std::error::Error for ObservationCloseError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.primary
+                .as_ref()
+                .map(|error| error as _)
+                .or_else(|| self.closes.first().map(|error| error as _))
+        }
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum OpenPhase {
+        Metadata,
+        Execute,
+    }
+    #[derive(Debug)]
+    struct NativeOpenError {
+        phase: OpenPhase,
+        status: i32,
+    }
+    impl std::fmt::Display for NativeOpenError {
+        fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                output,
+                "execution observation {:?} NtCreateFile NTSTATUS=0x{:08x}",
+                self.phase, self.status as u32
+            )
+        }
+    }
+    impl std::error::Error for NativeOpenError {}
+
+    fn open(file: &SourceFile, phase: OpenPhase, handles: &mut Handles) -> io::Result<usize> {
+        validate_source_component(&file.leaf_name)?;
+        let parent = file
+            .anchors
+            .last()
+            .ok_or_else(|| invalid("source observation has no parent anchor"))?;
+        if identity(parent.as_raw_handle())? != file.parent_identity {
+            return Err(denied("source observation parent changed"));
+        }
+        let mut name = file.leaf_name.encode_wide().collect::<Vec<_>>();
+        let bytes = name
+            .len()
+            .checked_mul(2)
+            .filter(|bytes| *bytes <= u16::MAX as usize)
+            .ok_or_else(|| invalid("source observation component too long"))?
+            as u16;
+        let name = UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: name.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: null(),
+            SecurityQualityOfService: null(),
+        };
+        let access = METADATA_ACCESS
+            | if phase == OpenPhase::Execute {
+                FILE_EXECUTE
+            } else {
+                0
+            };
+        let mut raw = null_mut();
+        let mut status = IO_STATUS_BLOCK::default();
+        // IRP_MJ_CREATE (including an existing-file open) is synchronous: the
+        // I/O manager waits for a lower driver's pending create to complete.
+        // No FILE_COMPLETE_IF_OPLOCKED or asynchronous mode is requested.
+        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/breaking-oplocks
+        // Request/name/output storage stays live through the completed syscall.
+        let returned = unsafe {
+            NtCreateFile(
+                &mut raw,
+                access,
+                &attributes,
+                &mut status,
+                null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                null(),
+                0,
+            )
+        };
+        // A nonpending syscall return is authoritative; IOSB need not duplicate
+        // it. Only STATUS_SUCCESS proves a successful handle under this contract.
+        if returned != 0 {
+            let kind =
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(returned) } as i32)
+                    .kind();
+            return Err(io::Error::new(
+                kind,
+                NativeOpenError {
+                    phase,
+                    status: returned,
+                },
+            ));
+        }
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            return Err(invalid("source observation open returned no valid handle"));
+        }
+        let index = handles.own(unsafe { OwnedHandle::from_raw_handle(raw) });
+        ensure_kind(handles.raw(index), false)?;
+        if identity(handles.raw(index))? != file.identity {
+            return Err(denied(
+                "source observation reopened a different full identity",
+            ));
+        }
+        Ok(index)
+    }
+
+    fn sid_bytes(sid: PSID, base: *const u8, length: usize) -> io::Result<Vec<u8>> {
+        if sid.is_null() || sid as usize % 4 != 0 {
+            return Err(invalid("source observation SID absent or misaligned"));
+        }
+        let offset = (sid as usize)
+            .checked_sub(base as usize)
+            .ok_or_else(|| invalid("source observation SID outside buffer"))?;
+        if !offset.checked_add(8).is_some_and(|end| end <= length) {
+            return Err(invalid("source observation SID prefix outside buffer"));
+        }
+        let count = unsafe { *sid.cast::<u8>().add(1) } as usize;
+        let bytes = 8 + 4 * count;
+        if count > 15
+            || !offset.checked_add(bytes).is_some_and(|end| end <= length)
+            || unsafe { IsValidSid(sid) } == 0
+            || unsafe { GetLengthSid(sid) } as usize != bytes
+        {
+            return Err(invalid("source observation SID invalid or out of bounds"));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), bytes) }.to_vec())
+    }
+    struct TokenBuffer {
+        words: Vec<usize>,
+        length: usize,
+    }
+    fn token_buffer(handle: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<TokenBuffer> {
+        let mut needed = 0;
+        let first = unsafe { GetTokenInformation(handle, class, null_mut(), 0, &mut needed) };
+        let error = if first == 0 {
+            unsafe { GetLastError() }
+        } else {
+            ERROR_SUCCESS
+        };
+        if first != 0 || error != ERROR_INSUFFICIENT_BUFFER {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        if needed == 0 || needed as usize > MAX_BYTES {
+            return Err(unsupported(
+                "source token information exceeds supported bound",
+            ));
+        }
+        let mut words = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        let capacity = words.len() * size_of::<usize>();
+        unsafe {
+            ok(GetTokenInformation(
+                handle,
+                class,
+                words.as_mut_ptr().cast(),
+                capacity as u32,
+                &mut needed,
+            ))?;
+        }
+        if needed == 0 || needed as usize > capacity {
+            return Err(invalid("source token information result exceeds buffer"));
+        }
+        Ok(TokenBuffer {
+            words,
+            length: needed as usize,
+        })
+    }
+    fn token_value<T: Copy>(handle: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<T> {
+        let buffer = token_buffer(handle, class)?;
+        if buffer.length < size_of::<T>() {
+            return Err(invalid("source token information structure truncated"));
+        }
+        Ok(unsafe { buffer.words.as_ptr().cast::<T>().read() })
+    }
+    fn luid(value: LUID) -> (u32, i32) {
+        (value.LowPart, value.HighPart)
+    }
+    fn context(handle: HANDLE, thread_token: bool) -> io::Result<ContextKey> {
+        let first: TOKEN_STATISTICS = token_value(handle, TokenStatistics)?;
+        let user_buffer = token_buffer(handle, TokenUser)?;
+        if user_buffer.length < size_of::<TOKEN_USER>() {
+            return Err(invalid("source token user structure truncated"));
+        }
+        let user = unsafe { &*user_buffer.words.as_ptr().cast::<TOKEN_USER>() };
+        let user = sid_bytes(
+            user.User.Sid,
+            user_buffer.words.as_ptr().cast(),
+            user_buffer.length,
+        )?;
+        let group_buffer = token_buffer(handle, TokenPrimaryGroup)?;
+        if group_buffer.length < size_of::<TOKEN_PRIMARY_GROUP>() {
+            return Err(invalid("source token primary group truncated"));
+        }
+        let group = unsafe { &*group_buffer.words.as_ptr().cast::<TOKEN_PRIMARY_GROUP>() };
+        let primary_group = sid_bytes(
+            group.PrimaryGroup,
+            group_buffer.words.as_ptr().cast(),
+            group_buffer.length,
+        )?;
+        let level = if first.TokenType == TokenImpersonation {
+            let value: i32 = token_value(handle, TokenImpersonationLevel)?;
+            if value != first.ImpersonationLevel {
+                return Err(denied("source token impersonation level changed"));
+            }
+            Some(value)
+        } else if first.TokenType == TokenPrimary {
+            None
+        } else {
+            return Err(unsupported("unsupported source token type"));
+        };
+        let last: TOKEN_STATISTICS = token_value(handle, TokenStatistics)?;
+        if luid(first.TokenId) != luid(last.TokenId)
+            || luid(first.AuthenticationId) != luid(last.AuthenticationId)
+            || luid(first.ModifiedId) != luid(last.ModifiedId)
+            || first.TokenType != last.TokenType
+            || (level.is_some() && first.ImpersonationLevel != last.ImpersonationLevel)
+        {
+            return Err(denied("source token changed during observation"));
+        }
+        Ok(ContextKey {
+            thread_token,
+            token_type: first.TokenType,
+            impersonation_level: level,
+            token_id: luid(first.TokenId),
+            authentication_id: luid(first.AuthenticationId),
+            modified_id: luid(first.ModifiedId),
+            user,
+            primary_group,
+        })
+    }
+    fn effective(handles: &mut Handles) -> io::Result<(usize, ContextKey)> {
+        let mut raw = null_mut();
+        let thread = unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                1,
+                &mut raw,
+            )
+        } != 0;
+        if !thread {
+            let error = unsafe { GetLastError() };
+            if error != ERROR_NO_TOKEN {
+                return Err(io::Error::from_raw_os_error(error as i32));
+            }
+            unsafe {
+                ok(OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut raw,
+                ))?;
+            }
+        }
+        let index = handles.own(unsafe { OwnedHandle::from_raw_handle(raw) });
+        let key = context(handles.raw(index), thread)?;
+        Ok((index, key))
+    }
+    fn duplicate(handles: &mut Handles, original: usize, key: &ContextKey) -> io::Result<usize> {
+        let mut raw = null_mut();
+        let level = key.impersonation_level.unwrap_or(SecurityImpersonation);
+        unsafe {
+            ok(DuplicateTokenEx(
+                handles.raw(original),
+                TOKEN_QUERY,
+                null(),
+                level,
+                TokenImpersonation,
+                &mut raw,
+            ))?;
+        }
+        let index = handles.own(unsafe { OwnedHandle::from_raw_handle(raw) });
+        let stats: TOKEN_STATISTICS = token_value(handles.raw(index), TokenStatistics)?;
+        if stats.TokenType != TokenImpersonation || stats.ImpersonationLevel != level {
+            return Err(denied(
+                "source AccessCheck duplicate has wrong type or level",
+            ));
+        }
+        Ok(index)
+    }
+    fn mapping() -> GENERIC_MAPPING {
+        GENERIC_MAPPING {
+            GenericRead: FILE_GENERIC_READ,
+            GenericWrite: FILE_GENERIC_WRITE,
+            GenericExecute: FILE_GENERIC_EXECUTE,
+            GenericAll: FILE_ALL_ACCESS,
+        }
+    }
+    fn normalized_mask(mask: u32) -> io::Result<u32> {
+        let known = FILE_ALL_ACCESS
+            | ACCESS_SYSTEM_SECURITY
+            | GENERIC_READ
+            | GENERIC_WRITE
+            | GENERIC_EXECUTE
+            | GENERIC_ALL;
+        if mask & !known != 0 {
+            return Err(unsupported("unsupported source ACE access bits"));
+        }
+        let mut mapped = mask;
+        unsafe {
+            MapGenericMask(&mut mapped, &mapping());
+        }
+        if mapped & !(FILE_ALL_ACCESS | ACCESS_SYSTEM_SECURITY) != 0 {
+            return Err(unsupported("unsupported mapped source ACE rights"));
+        }
+        Ok(mapped)
+    }
+    fn decode_descriptor(mut words: Vec<usize>, length: usize) -> io::Result<Descriptor> {
+        let raw = words.as_mut_ptr().cast();
+        unsafe {
+            ok(IsValidSecurityDescriptor(raw))?;
+        }
+        let mut control = 0;
+        let mut revision = 0;
+        unsafe {
+            ok(GetSecurityDescriptorControl(
+                raw,
+                &mut control,
+                &mut revision,
+            ))?;
+        }
+        let supported = SE_OWNER_DEFAULTED
+            | SE_GROUP_DEFAULTED
+            | SE_DACL_PRESENT
+            | SE_DACL_DEFAULTED
+            | SE_DACL_AUTO_INHERIT_REQ
+            | SE_DACL_AUTO_INHERITED
+            | SE_DACL_PROTECTED
+            | SE_SELF_RELATIVE;
+        if control & SE_SELF_RELATIVE == 0 || control & !supported != 0 {
+            return Err(unsupported(
+                "unsupported source security descriptor controls",
+            ));
+        }
+        let mut owner = null_mut();
+        let mut group = null_mut();
+        let mut dacl = null_mut();
+        let mut defaulted = 0;
+        let mut present = 0;
+        unsafe {
+            ok(GetSecurityDescriptorOwner(raw, &mut owner, &mut defaulted))?;
+            ok(GetSecurityDescriptorGroup(raw, &mut group, &mut defaulted))?;
+            ok(GetSecurityDescriptorDacl(
+                raw,
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            ))?;
+        }
+        let owner = sid_bytes(owner, words.as_ptr().cast(), length)?;
+        let group = sid_bytes(group, words.as_ptr().cast(), length)?;
+        if (control & SE_DACL_PRESENT != 0) != (present != 0) {
+            return Err(invalid("source DACL presence disagreement"));
+        }
+        let normalized = if present == 0 {
+            if !dacl.is_null() {
+                return Err(invalid("absent source DACL has data"));
+            }
+            Dacl::Absent
+        } else if dacl.is_null() {
+            Dacl::Null
+        } else {
+            if dacl as usize % 4 != 0 {
+                return Err(invalid("source DACL is misaligned"));
+            }
+            let offset = (dacl as usize)
+                .checked_sub(words.as_ptr() as usize)
+                .ok_or_else(|| invalid("source DACL outside descriptor"))?;
+            if !offset
+                .checked_add(size_of::<ACL>())
+                .is_some_and(|end| end <= length)
+            {
+                return Err(invalid("source ACL header exceeds descriptor"));
+            }
+            let acl_length = unsafe { (*dacl).AclSize } as usize;
+            if acl_length < size_of::<ACL>()
+                || !offset
+                    .checked_add(acl_length)
+                    .is_some_and(|end| end <= length)
+            {
+                return Err(invalid("source ACL exceeds descriptor"));
+            }
+            unsafe {
+                ok(IsValidAcl(dacl))?;
+            }
+            let count = unsafe { (*dacl).AceCount } as usize;
+            if count > MAX_ACES {
+                return Err(unsupported("source ACL exceeds ACE bound"));
+            }
+            let mut entries = Vec::with_capacity(count);
+            for index in 0..count {
+                let mut ace = null_mut();
+                unsafe {
+                    ok(GetAce(dacl, index as u32, &mut ace))?;
+                }
+                if ace as usize % 4 != 0 {
+                    return Err(invalid("source ACE is misaligned"));
+                }
+                let offset = (ace as usize)
+                    .checked_sub(dacl as usize)
+                    .ok_or_else(|| invalid("source ACE outside ACL"))?;
+                if !offset
+                    .checked_add(size_of::<ACE_HEADER>())
+                    .is_some_and(|end| end <= acl_length)
+                {
+                    return Err(invalid("source ACE header exceeds ACL"));
+                }
+                let header = unsafe { ace.cast::<ACE_HEADER>().read() };
+                let size = header.AceSize as usize;
+                let flags = (OBJECT_INHERIT_ACE
+                    | CONTAINER_INHERIT_ACE
+                    | NO_PROPAGATE_INHERIT_ACE
+                    | INHERIT_ONLY_ACE
+                    | INHERITED_ACE) as u8;
+                if !matches!(header.AceType, 0 | 1) || header.AceFlags & !flags != 0 {
+                    return Err(unsupported("unsupported source ACE type or flags"));
+                }
+                if size < offset_of!(ACCESS_ALLOWED_ACE, SidStart) + 8
+                    || !offset
+                        .checked_add(size)
+                        .is_some_and(|end| end <= acl_length)
+                {
+                    return Err(invalid("source ACE exceeds ACL"));
+                }
+                // Ordinary allow/deny ACEs share the mask/SID layout. Object,
+                // callback, compound and audit forms are explicitly unsupported.
+                let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+                let sid = unsafe { std::ptr::addr_of_mut!((*allowed).SidStart).cast() };
+                let sid = sid_bytes(sid, ace.cast(), size)?;
+                let mask = normalized_mask(unsafe { std::ptr::addr_of!((*allowed).Mask).read() })?;
+                // Normalize only owned storage, without overlapping Rust references.
+                unsafe {
+                    std::ptr::addr_of_mut!((*allowed).Mask).write(mask);
+                }
+                entries.push(NormalizedAce {
+                    kind: header.AceType,
+                    flags: header.AceFlags,
+                    mask,
+                    sid,
+                });
+            }
+            Dacl::Entries(entries)
+        };
+        Ok(Descriptor {
+            words,
+            fingerprint: SecurityFingerprint {
+                owner,
+                group,
+                control,
+                dacl: normalized,
+            },
+        })
+    }
+    fn security(handle: HANDLE) -> io::Result<Descriptor> {
+        let mut owner = null_mut();
+        let mut group = null_mut();
+        let mut dacl = null_mut();
+        let mut raw = null_mut();
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                null_mut(),
+                &mut raw,
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        // Copy self-relative OS storage into bounded aligned owned memory, then
+        // release the OS allocation on both validation success and failure.
+        let result = (|| {
+            if raw.is_null() {
+                return Err(invalid("source security query returned no descriptor"));
+            }
+            unsafe {
+                ok(IsValidSecurityDescriptor(raw))?;
+            }
+            let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+            if length < size_of::<SECURITY_DESCRIPTOR_RELATIVE>() || length > MAX_BYTES {
+                return Err(unsupported(
+                    "source security descriptor exceeds supported bound",
+                ));
+            }
+            let mut words = vec![0usize; length.div_ceil(size_of::<usize>())];
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.cast::<u8>(), words.as_mut_ptr().cast(), length);
+            }
+            decode_descriptor(words, length)
+        })();
+        let free_error = if !raw.is_null() && !unsafe { LocalFree(raw) }.is_null() {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        match (result, free_error) {
+            (value, None) => value,
+            (Ok(_), Some(error)) => Err(error),
+            (Err(primary), Some(error)) => Err(io::Error::new(
+                primary.kind(),
+                format!("{primary}; security allocation release failed: {error}"),
+            )),
+        }
+    }
+    fn access_check(descriptor: &Descriptor, token: HANDLE) -> io::Result<bool> {
+        let mut map = mapping();
+        let mut privileges = vec![0usize; size_of::<PRIVILEGE_SET>().div_ceil(size_of::<usize>())];
+        for attempt in 0..2 {
+            let capacity = privileges.len() * size_of::<usize>();
+            let mut needed = capacity as u32;
+            let mut granted = 0;
+            let mut allowed = 0;
+            let result = unsafe {
+                AccessCheck(
+                    descriptor.words.as_ptr().cast_mut().cast(),
+                    token,
+                    FILE_EXECUTE,
+                    &mut map,
+                    privileges.as_mut_ptr().cast(),
+                    &mut needed,
+                    &mut granted,
+                    &mut allowed,
+                )
+            };
+            if result == 0 {
+                let error = unsafe { GetLastError() };
+                if attempt == 0
+                    && error == ERROR_INSUFFICIENT_BUFFER
+                    && needed as usize > capacity
+                    && needed as usize <= MAX_BYTES
+                {
+                    privileges = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+                    continue;
+                }
+                return Err(io::Error::from_raw_os_error(error as i32));
+            }
+            if needed as usize > capacity {
+                return Err(invalid(
+                    "source AccessCheck privilege output exceeds buffer",
+                ));
+            }
+            let count =
+                unsafe { (*privileges.as_ptr().cast::<PRIVILEGE_SET>()).PrivilegeCount } as usize;
+            let end = count
+                .checked_mul(size_of::<LUID_AND_ATTRIBUTES>())
+                .and_then(|tail| tail.checked_add(offset_of!(PRIVILEGE_SET, Privilege)))
+                .ok_or_else(|| invalid("source AccessCheck privilege count overflow"))?;
+            if end > needed as usize || end > capacity {
+                return Err(invalid(
+                    "source AccessCheck privilege records exceed output",
+                ));
+            }
+            let executable = allowed != 0;
+            if granted != if executable { FILE_EXECUTE } else { 0 } {
+                return Err(invalid(
+                    "source AccessCheck grant disagrees with AccessStatus",
+                ));
+            }
+            return Ok(executable);
+        }
+        Err(unsupported(
+            "source AccessCheck privilege buffer unavailable",
+        ))
+    }
+
+    pub(super) fn observe(file: &SourceFile) -> io::Result<ExecutionPermission> {
+        let mut handles = Handles::default();
+        let result = (|| {
+            let before = file.snapshot()?;
+            let (original, key) = effective(&mut handles)?;
+            let metadata = open(file, OpenPhase::Metadata, &mut handles)?;
+            if source_snapshot(handles.raw(metadata), file.identity, false)? != before {
+                return Err(denied("source metadata baseline changed"));
+            }
+            let descriptor = security(handles.raw(metadata))?;
+            let duplicate = duplicate(&mut handles, original, &key)?;
+            let checked = access_check(&descriptor, handles.raw(duplicate))?;
+            let native = match open(file, OpenPhase::Execute, &mut handles) {
+                Ok(probe) => {
+                    if source_snapshot(handles.raw(probe), file.identity, false)? != before
+                        || security(handles.raw(probe))?.fingerprint != descriptor.fingerprint
+                    {
+                        return Err(denied(
+                            "source execution probe identity, metadata, or security changed",
+                        ));
+                    }
+                    true
+                }
+                Err(error)
+                    if error
+                        .get_ref()
+                        .and_then(|source| source.downcast_ref::<NativeOpenError>())
+                        .is_some_and(|native| {
+                            native.phase == OpenPhase::Execute
+                                && native.status == STATUS_ACCESS_DENIED
+                        }) =>
+                {
+                    false
+                }
+                Err(error) => return Err(error),
+            };
+            if checked != native {
+                return Err(denied(
+                    "AccessCheck and native source execution probe disagree",
+                ));
+            }
+            if security(handles.raw(metadata))?.fingerprint != descriptor.fingerprint
+                || source_snapshot(handles.raw(metadata), file.identity, false)? != before
+                || file.snapshot()? != before
+            {
+                return Err(denied(
+                    "source identity, snapshot, or security changed during execution observation",
+                ));
+            }
+            if context(handles.raw(original), key.thread_token)? != key {
+                return Err(denied("original source token changed"));
+            }
+            let (_, current) = effective(&mut handles)?;
+            if current != key {
+                return Err(denied("current effective source context changed"));
+            }
+            // All temporary native owners must checked-close before this value
+            // can leave the method. It contains facts, never retained authority.
+            Ok(ExecutionPermission {
+                executable: checked,
+                identity: file.identity,
+                security: descriptor.fingerprint,
+                context: key,
+            })
+        })();
+        handles.finish(result)
+    }
+}
+
 #[cfg(test)]
 static INSPECTION_DACL_MUTATION_APPLIED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
