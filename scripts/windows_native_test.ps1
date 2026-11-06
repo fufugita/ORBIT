@@ -15,7 +15,7 @@ if ($Group -eq 'HostCapabilities') {
         source=$env:GITHUB_SHA; observation_complete=$false; support_proven=$false
         daemon_usability='unknown_not_contacted'; nested_virtualization_proven=$false
         actual_standard_user_journey_tested=$false; query_timeout_seconds=5
-        optional_feature_timeout_seconds=20; collection_deadline_seconds=60
+        optional_feature_timeout_seconds=20; service_query_timeout_seconds=20; collection_deadline_seconds=60
     }
     function HostError($record) {
         $cause=$record.Exception
@@ -118,7 +118,7 @@ if ($Group -eq 'HostCapabilities') {
             }else{$script:hostCollectionFailed=$true;@{name=$name;status='unexpected_duplicate_result';state='unknown'}}
         })
         $serviceNames=@('vmcompute','hns','docker')
-        $serviceQuery=ReadHostCim 'Win32_Service' @('Name','State','StartMode') (($serviceNames | ForEach-Object {"Name='$_'"}) -join ' OR ')
+        $serviceQuery=ReadHostCim 'Win32_Service' @('Name','State','StartMode') (($serviceNames | ForEach-Object {"Name='$_'"}) -join ' OR ') -timeoutSeconds 20
         $report.services=@(foreach($name in $serviceNames){
             $matches=@($serviceQuery.rows | Where-Object {$_.Name -ieq $name})
             if($serviceQuery.status -ne 'observed'){@{name=$name;status=$serviceQuery.status}}
