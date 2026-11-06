@@ -271,6 +271,7 @@ if ($Group -eq 'RegistryWitness') {
             elevated=$administrator;thread_impersonation_present=($null -ne $threadIdentity)
             fixture_context='github-hosted-disposable-runner';ordinary_user_support_proven=$false
             production_policy_unchanged=$true;credential_values_enumerated=$false
+            cleanup_negative_controls='PENDING_NATIVE_ORACLES'
         }
     } finally {
         if ($null -ne $threadIdentity) { $threadIdentity.Dispose() }
@@ -759,34 +760,50 @@ public static class OrbitRegistryWitnessFixture {
             (WitnessField $cancelJob 'observed') -cne 'true'){
             throw 'Cancellation termination, process wait or zero-active Job proof failed'
         }
+        if($code -ne 0){throw "Registry witness test did not exit successfully (exit $code)"}
         $statusRecords=@($frames | Where-Object { $_ -match '^registry_witness_status(?: |$)' })
         if($statusRecords.Count -ne 1){throw "Expected exactly one registry witness status record (found $($statusRecords.Count))"}
         $statusRecord=$statusRecords[0]
-        if((WitnessField $statusRecord 'witness_status') -cne 'INCOMPLETE'){
-            throw 'Registry witness status was not explicitly INCOMPLETE'
+        WitnessExactFields $statusRecord @('witness_status','run_status')
+        if((WitnessField $statusRecord 'witness_status') -cne 'COMPLETE' -or
+            (WitnessField $statusRecord 'run_status') -cne 'completed'){
+            throw 'Registry witness did not report completed cleanup'
         }
-        $runStatus=WitnessField $statusRecord 'run_status'
-        if($runStatus -ceq 'completed_partial'){
-            WitnessExactFields $statusRecord @('witness_status','run_status')
-        } elseif($runStatus -ceq 'FAILED'){
-            WitnessExactFields $statusRecord @('witness_status','run_status','primary')
-            throw "Registry witness failed before the intentional partial checkpoint: $(WitnessField $statusRecord 'primary')"
-        } else {throw "Unknown registry witness run status: $runStatus"}
-        if($code -eq 0) {
-            throw "Partial registry witness did not fail closed with explicit INCOMPLETE evidence (exit $code)"
+        if(@($frames | Where-Object { $_ -match '^registry_witness_incomplete(?: |$)' }).Count -ne 0){
+            throw 'A complete registry witness included an incomplete record'
+        }
+        $cleanup=$probeRecords['lifetime/cleanup_absent']
+        $cleanupFields=@('id','observed','normal_job_zero','cancel_job_zero','registry_absent',
+            'image_absent','directory_absent','profile_absent')
+        WitnessExactFields $cleanup $cleanupFields
+        foreach($field in @('observed','normal_job_zero','cancel_job_zero','registry_absent',
+            'image_absent','directory_absent','profile_absent')){
+            if((WitnessField $cleanup $field) -cne 'true'){throw "Cleanup absence receipt failed: $field"}
+        }
+        $finalizations=@($frames | Where-Object { $_ -match '^registry_witness_finalization(?: |$)' })
+        if($finalizations.Count -ne 1){throw "Expected exactly one successful finalization receipt (found $($finalizations.Count))"}
+        $finalization=$finalizations[0]
+        $finalFields=@('cleanup_errors','registry_absent','image_absent','directory_absent',
+            'profile_absent','normal_job_zero','cancel_job_zero','host_marker_postcontrol')
+        WitnessExactFields $finalization $finalFields
+        if((WitnessField $finalization 'cleanup_errors') -cne '0' -or
+            (WitnessField $finalization 'registry_absent') -cne 'true' -or
+            (WitnessField $finalization 'image_absent') -cne 'true' -or
+            (WitnessField $finalization 'directory_absent') -cne 'true' -or
+            (WitnessField $finalization 'profile_absent') -cne 'true' -or
+            (WitnessField $finalization 'normal_job_zero') -cne 'true' -or
+            (WitnessField $finalization 'cancel_job_zero') -cne 'true' -or
+            (WitnessField $finalization 'host_marker_postcontrol') -cne 'observed'){
+            throw 'Final cleanup receipt did not bind all required absence and Job proofs'
         }
         $missing=@($expected | Where-Object { -not $actual.Contains($_) })
-        $openIds=@('lifetime/cleanup_absent')
-        $missingKey=@($missing|Sort-Object) -join '|'
-        $openKey=@($openIds|Sort-Object) -join '|'
-        if($missingKey -cne $openKey){
-            throw "Registry control set incomplete; only cleanup_absent may remain open (missing $($missing -join ', '))"
+        if($missing.Count -ne 0 -or $actual.Count -ne 70){
+            throw "Registry control set incomplete (observed $($actual.Count)/70; missing $($missing -join ', '))"
         }
-        $parentIdentity.witness_status='INCOMPLETE_FAILED_partial_checkpoint'
-        $parentIdentity.missing_probe_count=$missing.Count
+        $parentIdentity.witness_status='COMPLETE'
+        $parentIdentity.missing_probe_count=0
         $parentIdentity.ordinary_user_support_proven=$false
         $parentIdentity | ConvertTo-Json -Depth 5 | Out-File (Join-Path $EvidenceDir 'registry-witness-parent.json')
-        throw "Registry witness intentionally remains INCOMPLETE: exit=$code observed=$($actual.Count)/70 missing=$($missing.Count)"
     } catch { $failure=$_ }
     finally {
         $cleanupComplete=$true
