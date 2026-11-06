@@ -227,7 +227,7 @@ jobs:
         run: |
           rustup toolchain install 1.99.0 --profile minimal --no-self-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run 69 registry controls (cleanup remains incomplete)
+      - name: Run 70 primary controls; cleanup fault controls pending
         shell: pwsh
         run: ./scripts/windows_native_test.ps1 -Group RegistryWitness
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

@@ -2546,20 +2546,54 @@ mod registry_witness_tests {
     }
 
     fn private_view_preimage(root: HKEY) -> io::Result<PrivateViewPreimage> {
-        let metadata = win32_open_key(root, "Metadata", KEY_READ)
-            .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
-        let delete_leaf = win32_open_key(root, "DeleteLeaf", KEY_READ)
-            .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
-        Ok(PrivateViewPreimage {
-            mutation: win32_query_value_handle(root, "Mutation")
-                .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
-            metadata_fixture: win32_query_value(&metadata, "Fixture")
-                .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
-            delete_fixture: win32_query_value(&delete_leaf, "Fixture")
-                .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
-            root_security: registry_key_security(root)?,
-            delete_security: registry_key_security(delete_leaf.raw())?,
-        })
+        let mut metadata = None;
+        let mut delete_leaf = None;
+        let observed = (|| -> io::Result<PrivateViewPreimage> {
+            metadata = Some(
+                win32_open_key(root, "Metadata", KEY_READ)
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+            );
+            delete_leaf = Some(
+                win32_open_key(root, "DeleteLeaf", KEY_READ)
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+            );
+            let metadata = metadata
+                .as_ref()
+                .ok_or_else(|| invalid("Metadata observer missing"))?;
+            let delete_leaf = delete_leaf
+                .as_ref()
+                .ok_or_else(|| invalid("DeleteLeaf observer missing"))?;
+            Ok(PrivateViewPreimage {
+                mutation: win32_query_value_handle(root, "Mutation")
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                metadata_fixture: win32_query_value(metadata, "Fixture")
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                delete_fixture: win32_query_value(delete_leaf, "Fixture")
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                root_security: registry_key_security(root)?,
+                delete_security: registry_key_security(delete_leaf.raw())?,
+            })
+        })();
+        let mut close_errors = Vec::new();
+        if let Some(delete_leaf) = delete_leaf.take() {
+            if let Err(error) = delete_leaf.close() {
+                close_errors.push(format!("DeleteLeaf observer close: {error}"));
+            }
+        }
+        if let Some(metadata) = metadata.take() {
+            if let Err(error) = metadata.close() {
+                close_errors.push(format!("Metadata observer close: {error}"));
+            }
+        }
+        match (observed, close_errors.is_empty()) {
+            (Ok(preimage), true) => Ok(preimage),
+            (Err(primary), true) => Err(primary),
+            (Ok(_), false) => Err(io::Error::other(close_errors.join("; "))),
+            (Err(primary), false) => Err(io::Error::other(format!(
+                "private view preimage failed: {primary}; {}",
+                close_errors.join("; ")
+            ))),
+        }
     }
 
     fn aligned_security_descriptor(bytes: &[u8]) -> io::Result<Vec<usize>> {
@@ -5521,6 +5555,210 @@ mod registry_witness_tests {
             .map_err(|status| io::Error::from_raw_os_error(status as i32))
         }
 
+        fn verify_known_preimages_unchanged(&self) -> io::Result<()> {
+            let root = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("private fixture root owner missing"))?;
+            for (key_path, value_name, expected) in &self.expected_values {
+                let key = if key_path.is_empty() {
+                    None
+                } else {
+                    Some(
+                        win32_open_key(root.raw(), key_path, KEY_QUERY_VALUE)
+                            .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                    )
+                };
+                let handle = key.as_ref().map_or(root.raw(), OwnedRegKey::raw);
+                let observed = win32_query_value_handle(handle, value_name)
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))
+                    .and_then(|bytes| decode_reg_sz(&bytes));
+                let close = key.map_or(Ok(()), OwnedRegKey::close);
+                match (observed, close) {
+                    (Ok(value), Ok(())) if value == *expected => {}
+                    (Ok(value), Ok(())) => {
+                        return Err(io::Error::other(format!(
+                            "known private value changed at {key_path}\\{value_name}: {value}"
+                        )));
+                    }
+                    (Err(primary), Ok(())) => return Err(primary),
+                    (Ok(_), Err(close)) => {
+                        return Err(io::Error::other(format!(
+                            "known value observer close failed at {key_path}\\{value_name}: {close}"
+                        )));
+                    }
+                    (Err(primary), Err(close)) => {
+                        return Err(io::Error::other(format!(
+                            "known value verification failed: {primary}; observer close failed: {close}"
+                        )));
+                    }
+                }
+            }
+            for view in ["MachineView", "UserView"] {
+                let key = self.root_handle(view, KEY_READ)?;
+                let label = private_view_label(key.raw());
+                let close = key.close();
+                match (label, close) {
+                    (Ok(true), Ok(())) => {}
+                    (Ok(false), Ok(())) => {
+                        return Err(io::Error::other(format!(
+                            "private view label changed at {view}"
+                        )));
+                    }
+                    (Err(primary), Ok(())) => return Err(primary),
+                    (Ok(_), Err(close)) => {
+                        return Err(io::Error::other(format!(
+                            "private view observer close failed at {view}: {close}"
+                        )));
+                    }
+                    (Err(primary), Err(close)) => {
+                        return Err(io::Error::other(format!(
+                            "private view verification failed: {primary}; observer close failed: {close}"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn view_preimages(&self) -> io::Result<(PrivateViewPreimage, PrivateViewPreimage)> {
+            let machine = self.root_handle("MachineView", KEY_READ)?;
+            let machine_preimage = private_view_preimage(machine.raw());
+            let machine_close = machine.close();
+            let machine_preimage = match (machine_preimage, machine_close) {
+                (Ok(preimage), Ok(())) => preimage,
+                (Err(primary), Ok(())) => return Err(primary),
+                (Ok(_), Err(close)) => {
+                    return Err(io::Error::other(format!(
+                        "MachineView observer close failed: {close}"
+                    )));
+                }
+                (Err(primary), Err(close)) => {
+                    return Err(io::Error::other(format!(
+                        "MachineView preimage failed: {primary}; observer close failed: {close}"
+                    )));
+                }
+            };
+            let user = self.root_handle("UserView", KEY_READ)?;
+            let user_preimage = private_view_preimage(user.raw());
+            let user_close = user.close();
+            let user_preimage = match (user_preimage, user_close) {
+                (Ok(preimage), Ok(())) => preimage,
+                (Err(primary), Ok(())) => return Err(primary),
+                (Ok(_), Err(close)) => {
+                    return Err(io::Error::other(format!(
+                        "UserView observer close failed: {close}"
+                    )));
+                }
+                (Err(primary), Err(close)) => {
+                    return Err(io::Error::other(format!(
+                        "UserView preimage failed: {primary}; observer close failed: {close}"
+                    )));
+                }
+            };
+            Ok((machine_preimage, user_preimage))
+        }
+
+        fn verify_root_present(&self) -> io::Result<()> {
+            let software = self
+                .software
+                .as_ref()
+                .ok_or_else(|| invalid("Software registry anchor missing"))?;
+            let held = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("private fixture root owner missing"))?;
+            let observation = win32_open_key(software.raw(), &self.name, KEY_READ)
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+            let comparison = match (
+                registry_key_security(observation.raw()),
+                registry_key_security(held.raw()),
+            ) {
+                (Ok(observed), Ok(expected)) if observed == expected => Ok(()),
+                (Ok(_), Ok(_)) => Err(invalid("private fixture root security descriptor changed")),
+                (Err(primary), Ok(_)) | (Ok(_), Err(primary)) => Err(primary),
+                (Err(primary), Err(other)) => Err(io::Error::other(format!(
+                    "private root security observations failed: {primary}; {other}"
+                ))),
+            };
+            let close = observation.close();
+            match (comparison, close) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(()), Err(close)) => Err(io::Error::other(format!(
+                    "private root observer close failed: {close}"
+                ))),
+                (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                    "private root verification failed: {primary}; observer close failed: {close}"
+                ))),
+            }
+        }
+
+        fn create_unknown_key_canary(
+            &self,
+            user_sid: &str,
+            package_sid: &str,
+        ) -> io::Result<PrivateCanaryFacts> {
+            let root = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("private fixture root owner missing"))?;
+            let policy = format!(
+                "O:{user_sid}D:P(D;;0x000D0026;;;{package_sid})(A;;RC;;;OW)(A;;KA;;;{user_sid})(A;;KR;;;{package_sid})"
+            );
+            let key = create_acl_key(root.raw(), "ForeignCanary", &policy)?;
+            let result = (|| {
+                set_string(key.raw(), "Marker", "ORBIT-FOREIGN-CANARY-V1")?;
+                let value = win32_query_value(&key, "Marker")
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+                let descriptor = registry_key_security(key.raw())?;
+                Ok(PrivateCanaryFacts {
+                    value_sha256: digest(&value)?,
+                    descriptor_sha256: digest(&descriptor)?,
+                })
+            })();
+            let close = key.close();
+            match (result, close) {
+                (Ok(facts), Ok(())) => Ok(facts),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(_), Err(close)) => Err(io::Error::other(format!(
+                    "foreign canary key close failed: {close}"
+                ))),
+                (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                    "foreign canary setup failed: {primary}; key close failed: {close}"
+                ))),
+            }
+        }
+
+        fn unknown_key_canary_facts(&self) -> io::Result<PrivateCanaryFacts> {
+            let root = self
+                .root
+                .as_ref()
+                .ok_or_else(|| invalid("private fixture root owner missing"))?;
+            let key = win32_open_key(root.raw(), "ForeignCanary", KEY_READ)
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+            let result = (|| {
+                let value = win32_query_value(&key, "Marker")
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?;
+                let descriptor = registry_key_security(key.raw())?;
+                Ok(PrivateCanaryFacts {
+                    value_sha256: digest(&value)?,
+                    descriptor_sha256: digest(&descriptor)?,
+                })
+            })();
+            let close = key.close();
+            match (result, close) {
+                (Ok(facts), Ok(())) => Ok(facts),
+                (Err(primary), Ok(())) => Err(primary),
+                (Ok(_), Err(close)) => Err(io::Error::other(format!(
+                    "foreign canary observer close failed: {close}"
+                ))),
+                (Err(primary), Err(close)) => Err(io::Error::other(format!(
+                    "foreign canary verification failed: {primary}; observer close failed: {close}"
+                ))),
+            }
+        }
+
         fn verify_unchanged(&self) -> io::Result<()> {
             let root = self
                 .root
@@ -7146,7 +7384,102 @@ mod registry_witness_tests {
         Ok(())
     }
 
-    fn registry_witness_stage_a_run() -> io::Result<()> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CleanupControl {
+        WrongImageHash,
+        UnknownRegistryKey,
+    }
+
+    impl CleanupControl {
+        fn name(self) -> &'static str {
+            match self {
+                Self::WrongImageHash => "wrong_image_hash",
+                Self::UnknownRegistryKey => "unknown_registry_key",
+            }
+        }
+
+        fn target_error(self) -> &'static str {
+            match self {
+                Self::WrongImageHash => "helper image bounded length or SHA-256 differs",
+                Self::UnknownRegistryKey => "private fixture inventory changed",
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ParentMarkerCanaryFacts {
+        machine_value_sha256: String,
+        user_value_sha256: String,
+        machine_descriptor_sha256: String,
+        user_descriptor_sha256: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PrivateCanaryFacts {
+        value_sha256: String,
+        descriptor_sha256: String,
+    }
+
+    fn parent_marker_canary_facts() -> io::Result<ParentMarkerCanaryFacts> {
+        let machine_name = std::env::var("ORBIT_REGISTRY_WITNESS_MACHINE_MARKER")
+            .map_err(|_| invalid("machine marker identity missing"))?;
+        let user_name = std::env::var("ORBIT_REGISTRY_WITNESS_USER_MARKER")
+            .map_err(|_| invalid("user marker identity missing"))?;
+        let user_sid = std::env::var("ORBIT_REGISTRY_WITNESS_USER_SID")
+            .map_err(|_| invalid("original user SID missing"))?;
+        let mut machine = None;
+        let mut user = None;
+        let facts = (|| -> io::Result<ParentMarkerCanaryFacts> {
+            machine = Some(
+                win32_open_key(
+                    HKEY_LOCAL_MACHINE,
+                    "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+                    KEY_READ,
+                )
+                .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+            );
+            user = Some(
+                win32_open_key(HKEY_USERS, &format!("{user_sid}\\Environment"), KEY_READ)
+                    .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+            );
+            let machine = machine.as_ref().expect("machine marker observer retained");
+            let user = user.as_ref().expect("user marker observer retained");
+            Ok(ParentMarkerCanaryFacts {
+                machine_value_sha256: registry_string_digest(
+                    &win32_query_value(machine, &machine_name)
+                        .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                )?,
+                user_value_sha256: registry_string_digest(
+                    &win32_query_value(user, &user_name)
+                        .map_err(|status| io::Error::from_raw_os_error(status as i32))?,
+                )?,
+                machine_descriptor_sha256: digest(&registry_key_security(machine.raw())?)?,
+                user_descriptor_sha256: digest(&registry_key_security(user.raw())?)?,
+            })
+        })();
+        let mut close_errors = Vec::new();
+        if let Some(machine) = machine.take() {
+            if let Err(error) = machine.close() {
+                close_errors.push(format!("machine marker observer close: {error}"));
+            }
+        }
+        if let Some(user) = user.take() {
+            if let Err(error) = user.close() {
+                close_errors.push(format!("user marker observer close: {error}"));
+            }
+        }
+        match (facts, close_errors.is_empty()) {
+            (Ok(facts), true) => Ok(facts),
+            (Err(primary), true) => Err(primary),
+            (Ok(_), false) => Err(io::Error::other(close_errors.join("; "))),
+            (Err(primary), false) => Err(io::Error::other(format!(
+                "parent canary observation failed: {primary}; {}",
+                close_errors.join("; ")
+            ))),
+        }
+    }
+
+    fn registry_witness_stage_a_run(control: Option<CleanupControl>) -> io::Result<()> {
         verify_cancel_readiness_frame_oracle()?;
         verify_helper_pe_parser_oracle()?;
         verify_job_process_id_list_oracle()?;
@@ -7171,6 +7504,20 @@ mod registry_witness_tests {
         let mut fixture = None;
         let mut image = None;
         let mut job_gate = CleanupJobGate::default();
+        let control_canary_before = if control.is_some() {
+            Some(parent_marker_canary_facts()?)
+        } else {
+            None
+        };
+        let mut control_target_error: Option<String> = None;
+        let mut control_private_canary: Option<PrivateCanaryFacts> = None;
+        let mut control_check_errors = Vec::new();
+        let mut control_preflight_verified = false;
+        let mut control_known_preimages_verified = false;
+        let mut control_private_canary_unchanged = false;
+        let mut control_view_preimages_unchanged = false;
+        let mut control_view_preimages_before: Option<(PrivateViewPreimage, PrivateViewPreimage)> =
+            None;
         let run_result = (|| {
             parent_marker_controls("before")?;
             session = Some(SandboxSession::create()?);
@@ -7368,20 +7715,133 @@ mod registry_witness_tests {
             receipt.normal_job_zero = job_gate.normal.is_some();
             receipt.cancel_job_zero = job_gate.cancel.is_some();
             let preflight = (|| {
-                fixture
-                    .as_ref()
-                    .ok_or_else(|| invalid("private fixture owner missing"))?
-                    .verify_unchanged()?;
-                match (profile_anchor.as_ref(), image.as_mut()) {
-                    (Some(anchor), Some(image)) => anchor.verify_predelete(image, &job_gate),
-                    _ => Err(invalid(
-                        "prelaunch profile anchor or held helper image missing",
-                    )),
+                if control.is_some() && primary_error.is_some() {
+                    return Err(invalid(
+                        "cleanup control injection skipped because the real stage failed",
+                    ));
                 }
+                let fixture = fixture
+                    .as_ref()
+                    .ok_or_else(|| invalid("private fixture owner missing"))?;
+                control_view_preimages_before = if control.is_some() {
+                    Some(fixture.view_preimages()?)
+                } else {
+                    None
+                };
+                if control == Some(CleanupControl::UnknownRegistryKey) {
+                    let session_ref = session
+                        .as_ref()
+                        .ok_or_else(|| invalid("profile owner missing for control"))?;
+                    control_private_canary = Some(fixture.create_unknown_key_canary(
+                        &user_sid,
+                        &sid_text(session_ref.sid.as_ptr().cast_mut().cast())?,
+                    )?);
+                }
+                let original_image_hash = image.as_ref().map(|held| held.sha256.clone());
+                if control == Some(CleanupControl::WrongImageHash) {
+                    if let Some(held) = image.as_mut() {
+                        held.sha256 = if held.sha256 == "0".repeat(64) {
+                            "f".repeat(64)
+                        } else {
+                            "0".repeat(64)
+                        };
+                    }
+                }
+                let inventory = fixture.verify_unchanged();
+                let predelete =
+                    inventory.and_then(|()| match (profile_anchor.as_ref(), image.as_mut()) {
+                        (Some(anchor), Some(image)) => anchor.verify_predelete(image, &job_gate),
+                        _ => Err(invalid(
+                            "prelaunch profile anchor or held helper image missing",
+                        )),
+                    });
+                if let (Some(original), Some(held)) = (original_image_hash, image.as_mut()) {
+                    held.sha256 = original;
+                }
+                predelete
             })();
             match preflight {
+                Err(error)
+                    if control.is_some()
+                        && error
+                            .to_string()
+                            .contains(control.expect("control present").target_error()) =>
+                {
+                    control_target_error = Some(error.to_string());
+                    if let (Some(fixture), Some(anchor), Some(image)) = (
+                        fixture.as_ref(),
+                        profile_anchor.as_ref(),
+                        image.as_mut(),
+                    ) {
+                        match fixture.verify_known_preimages_unchanged() {
+                            Ok(()) => control_known_preimages_verified = true,
+                            Err(error) => control_check_errors.push(format!(
+                                "known private view/value recheck: {error}"
+                            )),
+                        }
+                        let root_result = fixture.verify_root_present();
+                        let profile_image_result = anchor.verify_predelete(image, &job_gate);
+                        control_preflight_verified =
+                            root_result.is_ok() && profile_image_result.is_ok();
+                        if let Err(error) = root_result {
+                            control_check_errors.push(format!(
+                                "nonce-root retained-object recheck: {error}"
+                            ));
+                        }
+                        if let Err(error) = profile_image_result {
+                            control_check_errors.push(format!(
+                                "profile/image retained-preflight recheck: {error}"
+                            ));
+                        }
+                        match (
+                            control_view_preimages_before.as_ref(),
+                            fixture.view_preimages(),
+                        ) {
+                            (Some(before), Ok(after)) if &after == before => {
+                                control_view_preimages_unchanged = true;
+                            }
+                            (Some(_), Ok(_)) => control_check_errors.push(
+                                "MachineView/UserView value or security preimage changed".to_owned(),
+                            ),
+                            (None, Ok(_)) => control_check_errors.push(
+                                "MachineView/UserView pre-control snapshot missing".to_owned(),
+                            ),
+                            (_, Err(error)) => control_check_errors.push(format!(
+                                "MachineView/UserView post-rejection snapshot: {error}"
+                            )),
+                        }
+                        if control == Some(CleanupControl::UnknownRegistryKey) {
+                            match (
+                                control_private_canary.as_ref(),
+                                fixture.unknown_key_canary_facts(),
+                            ) {
+                                (Some(before), Ok(after)) if &after == before => {
+                                    control_private_canary_unchanged = true;
+                                }
+                                (Some(_), Ok(_)) => control_check_errors.push(
+                                    "foreign private key value or descriptor changed".to_owned(),
+                                ),
+                                (None, Ok(_)) => control_check_errors.push(
+                                    "foreign private key baseline missing".to_owned(),
+                                ),
+                                (_, Err(error)) => control_check_errors.push(format!(
+                                    "foreign private key post-rejection observation: {error}"
+                                )),
+                            }
+                        }
+                    } else {
+                        control_check_errors.push(
+                            "retained fixture/profile/image owner missing after target rejection"
+                                .to_owned(),
+                        );
+                    }
+                }
                 Err(error) => cleanup_errors.push(format!(
                     "cleanup preflight failed; all residue retained: {error}"
+                )),
+                Ok(()) if control.is_some() => cleanup_errors.push(format!(
+                    "cleanup control {} failed to reach its intended preflight rejection; residue retained",
+                    control.expect("control present").name()
                 )),
                 Ok(()) => {
                     if let Some(fixture) = fixture.as_mut() {
@@ -7504,6 +7964,156 @@ mod registry_witness_tests {
         }
         if let Err(error) = job_gate.require_zero("final cleanup receipt gate") {
             cleanup_errors.push(format!("final exact Job-zero check failed: {error}"));
+        }
+        if let Some(control) = control {
+            let parent_after = parent_marker_canary_facts();
+            let parent_canary_unchanged = match (&control_canary_before, &parent_after) {
+                (Some(before), Ok(after)) if before == after => true,
+                (Some(_), Ok(_)) => {
+                    control_check_errors
+                        .push("parent marker canary value or descriptor changed".to_owned());
+                    false
+                }
+                (Some(_), Err(error)) => {
+                    control_check_errors
+                        .push(format!("parent marker canary post-observation: {error}"));
+                    false
+                }
+                (None, _) => {
+                    control_check_errors.push("parent marker canary baseline missing".to_owned());
+                    false
+                }
+            };
+            let control_job_fences_present = job_gate
+                .normal
+                .as_ref()
+                .is_some_and(|fence| fence.process_waited)
+                && job_gate
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|fence| fence.process_waited);
+            cleanup_errors.extend(job_gate.close_fences());
+            let fixture_id = match fixture.as_ref() {
+                Some(fixture) => match digest(fixture.name.as_bytes()) {
+                    Ok(identity) => Some(identity),
+                    Err(error) => {
+                        control_check_errors
+                            .push(format!("private fixture identity digest: {error}"));
+                        None
+                    }
+                },
+                None => {
+                    control_check_errors
+                        .push("private fixture owner missing for receipt".to_owned());
+                    None
+                }
+            };
+            if image.is_none() {
+                control_check_errors.push("held image owner missing for receipt".to_owned());
+            }
+            let expected_control = primary_error.is_none()
+                && control_target_error.is_some()
+                && control_preflight_verified
+                && control_known_preimages_verified
+                && control_view_preimages_unchanged
+                && (control != CleanupControl::UnknownRegistryKey
+                    || control_private_canary_unchanged)
+                && control_job_fences_present
+                && host_marker_result.is_ok()
+                && parent_canary_unchanged
+                && fixture_id.is_some()
+                && image.is_some()
+                && fixture
+                    .as_ref()
+                    .is_some_and(|fixture| fixture.completed_steps.is_empty())
+                && receipt.profile_sdk_result.is_none()
+                && control_check_errors.is_empty()
+                && cleanup_errors.is_empty();
+            if expected_control {
+                let image = image.as_ref().expect("validated held image retained");
+                let private_value = control_private_canary.as_ref().map_or_else(
+                    || "not_applicable".to_owned(),
+                    |facts| facts.value_sha256.clone(),
+                );
+                let private_descriptor = control_private_canary.as_ref().map_or_else(
+                    || "not_applicable".to_owned(),
+                    |facts| facts.descriptor_sha256.clone(),
+                );
+                let parent = parent_after.expect("validated parent canary observation");
+                let control_record = format!(
+                    "registry_witness_control case={} nonce={} parent_pid={} parent_creation={} reached=true rejection={} jobs_zero=true known_views_unchanged=true view_preimages_unchanged=true private_canary_value_sha256={} private_canary_descriptor_sha256={} private_canary_unchanged={} parent_machine_value_sha256={} parent_user_value_sha256={} parent_machine_descriptor_sha256={} parent_user_descriptor_sha256={} parent_canary_unchanged=true registry_root_retained=true image_profile_retained=true image_id={} image_sha256={} fixture_id={} disposition_attempted=false sdk_called=false",
+                    control.name(),
+                    nonce,
+                    parent_pid,
+                    parent_creation,
+                    match control {
+                        CleanupControl::WrongImageHash => "helper_image_hash_differs",
+                        CleanupControl::UnknownRegistryKey => "private_fixture_inventory_changed",
+                    },
+                    private_value,
+                    private_descriptor,
+                    control_private_canary_unchanged,
+                    parent.machine_value_sha256,
+                    parent.user_value_sha256,
+                    parent.machine_descriptor_sha256,
+                    parent.user_descriptor_sha256,
+                    identity_text(image.identity),
+                    image.sha256,
+                    fixture_id.expect("validated fixture digest")
+                );
+                let finalization = format!(
+                    "registry_witness_finalization status=retained control={} profile_absent=false sdk_called=false registry_fixture_retained=true image_retained=true helper_directory_retained=true normal_job_zero=true cancel_job_zero=true cleanup_errors=0",
+                    control.name()
+                );
+                let mut emission_errors = Vec::new();
+                if let Err(error) = emit_witness_record(&control_record) {
+                    emission_errors.push(format!("cleanup control receipt emission: {error}"));
+                }
+                if let Err(error) = emit_witness_record(&finalization) {
+                    emission_errors.push(format!("cleanup control finalization emission: {error}"));
+                }
+                if let Err(error) = emit_witness_record(
+                    "registry_witness_status witness_status=INCOMPLETE run_status=control_retained",
+                ) {
+                    emission_errors.push(format!("cleanup control status emission: {error}"));
+                }
+                if emission_errors.is_empty() {
+                    return Ok(());
+                }
+                return Err(io::Error::other(format!(
+                    "cleanup control {} evidence emission failed: {}",
+                    control.name(),
+                    emission_errors.join("; ")
+                )));
+            }
+            let mut failure_details = Vec::new();
+            if let Some(primary) = primary_error.as_deref() {
+                failure_details.push(format!("real stage prerequisite: {primary}"));
+            }
+            if let Some(target) = control_target_error.as_deref() {
+                failure_details.push(format!("intended preflight rejection observed: {target}"));
+            }
+            failure_details.extend(control_check_errors.iter().cloned());
+            failure_details.extend(cleanup_errors.iter().cloned());
+            if failure_details.is_empty() {
+                failure_details.push(format!(
+                    "cleanup control {} did not prove target rejection and retained residue",
+                    control.name()
+                ));
+            }
+            let failure = format!(
+                "registry_witness_status witness_status=INCOMPLETE run_status=control_failed primary={}",
+                escape_diagnostic(failure_details.join("; ").as_bytes())
+            );
+            let emission_result = emit_witness_record(&failure);
+            if let Err(error) = emission_result {
+                failure_details.push(format!("cleanup control failure emission: {error}"));
+            }
+            return Err(io::Error::other(format!(
+                "cleanup control {} failed: {}",
+                control.name(),
+                failure_details.join("; ")
+            )));
         }
         match (
             receipt.profile_packages.as_ref(),
@@ -7713,7 +8323,17 @@ mod registry_witness_tests {
 
     #[test]
     fn registry_witness_stage_a() -> io::Result<()> {
-        registry_witness_stage_a_run()
+        registry_witness_stage_a_run(None)
+    }
+
+    #[test]
+    fn registry_witness_cleanup_control_wrong_image_hash() -> io::Result<()> {
+        registry_witness_stage_a_run(Some(CleanupControl::WrongImageHash))
+    }
+
+    #[test]
+    fn registry_witness_cleanup_control_unknown_registry_key() -> io::Result<()> {
+        registry_witness_stage_a_run(Some(CleanupControl::UnknownRegistryKey))
     }
 
     fn cancellation_child_readiness(

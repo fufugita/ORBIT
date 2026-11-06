@@ -371,7 +371,7 @@ public static class OrbitRegistryWitnessFixture {
             if ($payloadEnd -ge $report.Length -or [int][char]$report[$payloadEnd] -ne 0x1f) { throw 'Truncated registry witness frame' }
             $payload=$report.Substring($payloadStart,$length)
             if ($payload -match '[^\x20-\x7e]') { throw 'Registry witness frame payload is not printable ASCII' }
-            if ($payload -notmatch '^(registry_witness_probe|registry_witness_parent_binding|registry_witness_helper_directory_access|registry_witness_helper_directory_descriptor|registry_witness_child_result|registry_witness_diagnostic|registry_witness_child_admission|registry_witness_child_complete|registry_witness_status|registry_witness_finalization|registry_witness_incomplete|registry_witness_setup_cleanup)(?: |$)') {
+            if ($payload -notmatch '^(registry_witness_probe|registry_witness_parent_binding|registry_witness_helper_directory_access|registry_witness_helper_directory_descriptor|registry_witness_child_result|registry_witness_diagnostic|registry_witness_child_admission|registry_witness_child_complete|registry_witness_status|registry_witness_finalization|registry_witness_incomplete|registry_witness_setup_cleanup|registry_witness_control)(?: |$)') {
                 throw 'Unknown framed registry witness record type'
             }
             $frames.Add($payload)
@@ -429,8 +429,363 @@ public static class OrbitRegistryWitnessFixture {
             if($value -notmatch '^0x[0-9a-fA-F]{1,8}$'){throw "Invalid hexadecimal witness status: $value"}
             [Convert]::ToUInt32($value.Substring(2),16)
         }
-        $probeRecords=@{}
-        foreach($frame in $frames){
+        $cleanupCaseManifest=@(
+            'wrong_image_id','wrong_directory_id','wrong_profile_id','wrong_image_hash',
+            'changed_image_dacl','unknown_registry_key','unknown_registry_value',
+            'unknown_helper_entry','unknown_profile_entry','profile_enumeration_limit',
+            'held_reader_sharing','image_leaf_swap','directory_swap','image_hardlink',
+            'missing_job_fence','live_nonzero_job','job_query_error','reader_close_error',
+            'profile_anchor_close_error','observation_parent_close_error','job_fence_close_error',
+            'image_disposition_noeffect','directory_disposition_noeffect','sdk_error',
+            'sdk_s_ok_noeffect'
+        )
+        if($cleanupCaseManifest.Count -ne 25 -or
+            @($cleanupCaseManifest | Select-Object -Unique).Count -ne 25){
+            throw 'Internal closed cleanup-control manifest must contain 25 unique cases'
+        }
+        $cleanupImplemented=@('wrong_image_hash','unknown_registry_key')
+        $cleanupPending=@($cleanupCaseManifest | Where-Object {$_ -notin $cleanupImplemented})
+        if($cleanupPending.Count -ne 23){throw 'Expected exactly 23 not-yet-implemented cleanup controls'}
+        function InvokeCleanupControl([string]$controlName) {
+            $caseName=if($controlName -ceq 'wrong_image_hash'){
+                'process::windows::registry_witness_tests::registry_witness_cleanup_control_wrong_image_hash'
+            }elseif($controlName -ceq 'unknown_registry_key'){
+                'process::windows::registry_witness_tests::registry_witness_cleanup_control_unknown_registry_key'
+            }else{$null}
+            $controlDir=Join-Path $EvidenceDir 'registry-cleanup-controls'
+            $controlLog=Join-Path $controlDir ($controlName+'.log')
+            $controlRecordsPath=Join-Path $controlDir ($controlName+'.records.txt')
+            $controlMetadataPath=Join-Path $controlDir ($controlName+'.json')
+            $caseContext=[ordered]@{
+                case=$controlName;source=$env:GITHUB_SHA;run=$env:GITHUB_RUN_ID
+                selected_unit=$caseName;nonce=$null;user_sid=$parentIdentity.user_sid
+                marker_names=@();marker_hashes=@();attempted=$true
+                selected_test_executed=$false;selected_test_passed=$false
+                transcript_verified=$false;native_control_verified=$false
+                target_reached=$false;primary_probes=0;status='initializing'
+                log_path=(Split-Path -Leaf $controlLog)
+                records_path=(Split-Path -Leaf $controlRecordsPath)
+                metadata_path=(Split-Path -Leaf $controlMetadataPath)
+                environment_restore_errors=@()
+            }
+            $savedEnvironment=[ordered]@{}
+            $processEnvironment=[Environment]::GetEnvironmentVariables(
+                [EnvironmentVariableTarget]::Process)
+            foreach($environmentName in @(
+                'ORBIT_REGISTRY_WITNESS_NONCE','ORBIT_REGISTRY_WITNESS_MACHINE_MARKER',
+                'ORBIT_REGISTRY_WITNESS_USER_MARKER','ORBIT_REGISTRY_WITNESS_MACHINE_HASH',
+                'ORBIT_REGISTRY_WITNESS_USER_HASH'
+            )){
+                $savedEnvironment[$environmentName]=[ordered]@{
+                    present=$processEnvironment.Contains($environmentName)
+                    value=[Environment]::GetEnvironmentVariable(
+                        $environmentName,[EnvironmentVariableTarget]::Process)
+                }
+            }
+            $caseResult=$null
+            $caseFailure=$null
+            try {
+                if($controlName -notin $cleanupImplemented -or $null -eq $caseName){
+                    throw "Cleanup control is not implemented: $controlName"
+                }
+                New-Item -ItemType Directory -Force $controlDir | Out-Null
+                $controlNonce=[guid]::NewGuid().ToString('N')
+                $controlMachineName='ORBIT_WITNESS_MACHINE_'+$controlNonce
+                $controlUserName='ORBIT_WITNESS_USER_'+$controlNonce
+                $controlMachineValue=[guid]::NewGuid().ToString('N')
+                $controlUserValue=[guid]::NewGuid().ToString('N')
+                $controlMachineHash=[Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData(
+                        [Text.Encoding]::UTF8.GetBytes($controlMachineValue)))
+                $controlUserHash=[Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData(
+                        [Text.Encoding]::UTF8.GetBytes($controlUserValue)))
+                $caseContext.nonce=$controlNonce
+                $caseContext.marker_names=@($controlMachineName,$controlUserName)
+                $caseContext.marker_hashes=@($controlMachineHash,$controlUserHash)
+                $caseContext.status='fixture_setup'
+                AssertMarkerAbsent $machine $controlMachineName
+                AssertMarkerAbsent $user $controlUserName
+                foreach($row in @(
+                    @{key=$machine;name=$controlMachineName;value=$controlMachineValue;target='machine'},
+                    @{key=$user;name=$controlUserName;value=$controlUserValue;target='user'}
+                )){
+                    AssertMarkerAbsent $row.key $row.name
+                    [void]$created.Add($row)
+                    $row.key.SetValue($row.name,$row.value,[Microsoft.Win32.RegistryValueKind]::String)
+                    if($row.key.GetValueKind($row.name) -ne [Microsoft.Win32.RegistryValueKind]::String -or
+                        $row.key.GetValue($row.name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -cne $row.value){
+                        throw "Fresh $controlName fake marker did not verify"
+                    }
+                }
+                [Environment]::SetEnvironmentVariable('ORBIT_REGISTRY_WITNESS_NONCE',$controlNonce,
+                    [EnvironmentVariableTarget]::Process)
+                [Environment]::SetEnvironmentVariable('ORBIT_REGISTRY_WITNESS_MACHINE_MARKER',$controlMachineName,
+                    [EnvironmentVariableTarget]::Process)
+                [Environment]::SetEnvironmentVariable('ORBIT_REGISTRY_WITNESS_USER_MARKER',$controlUserName,
+                    [EnvironmentVariableTarget]::Process)
+                [Environment]::SetEnvironmentVariable('ORBIT_REGISTRY_WITNESS_MACHINE_HASH',$controlMachineHash,
+                    [EnvironmentVariableTarget]::Process)
+                [Environment]::SetEnvironmentVariable('ORBIT_REGISTRY_WITNESS_USER_HASH',$controlUserHash,
+                    [EnvironmentVariableTarget]::Process)
+                $caseContext.status='native_test_started'
+            cargo +1.99.0 test --locked -p orbit-platform --features registry-witness --lib $caseName -- --exact --test-threads=1 --nocapture 2>&1 |
+                Tee-Object -FilePath $controlLog | Out-Host
+            $controlCode=$LASTEXITCODE
+            $controlReport=Get-Content $controlLog -Raw
+            $controlFrames=[Collections.Generic.List[string]]::new()
+            $frameRanges=[Collections.Generic.List[object]]::new()
+            $controlCursor=0
+            while(($frameOffset=$controlReport.IndexOf($frameStart,$controlCursor,[StringComparison]::Ordinal)) -ge 0){
+                $lengthStart=$frameOffset+$frameStart.Length
+                $colon=$controlReport.IndexOf(':',$lengthStart)
+                if($colon -lt 0 -or $colon-$lengthStart -lt 1 -or $colon-$lengthStart -gt 4){throw "$controlName malformed frame length"}
+                $lengthText=$controlReport.Substring($lengthStart,$colon-$lengthStart)
+                if($lengthText -notmatch '^\d{1,4}$'){throw "$controlName non-numeric frame length"}
+                $length=[int]$lengthText
+                if($length -gt 8192){throw "$controlName oversized frame"}
+                $payloadStart=$colon+1;$payloadEnd=$payloadStart+$length
+                if($payloadEnd -ge $controlReport.Length -or [int][char]$controlReport[$payloadEnd] -ne 0x1f){
+                    throw "$controlName truncated frame"
+                }
+                $payload=$controlReport.Substring($payloadStart,$length)
+                if($payload -match '[^\x20-\x7e]' -or
+                    $payload -notmatch '^(registry_witness_probe|registry_witness_parent_binding|registry_witness_helper_directory_access|registry_witness_helper_directory_descriptor|registry_witness_child_result|registry_witness_diagnostic|registry_witness_child_admission|registry_witness_child_complete|registry_witness_status|registry_witness_finalization|registry_witness_incomplete|registry_witness_setup_cleanup|registry_witness_control)(?: |$)'){
+                    throw "$controlName unknown or malformed framed record"
+                }
+                $controlFrames.Add($payload)
+                $frameRanges.Add([pscustomobject]@{start=$frameOffset;length=$payloadEnd+1-$frameOffset})
+                $controlCursor=$payloadEnd+1
+            }
+            $harnessView=$controlReport
+            foreach($range in $frameRanges | Sort-Object start -Descending){
+                $harnessView=$harnessView.Remove($range.start,$range.length)
+            }
+            $controlFrames | Out-File $controlRecordsPath -Encoding ascii
+            $exactCaseLine='(?m)^test '+[regex]::Escape($caseName)+' (?:\.\.\. ok|\.\.\. FAILED)\r?$'
+            $caseLines=[regex]::Matches($harnessView,$exactCaseLine)
+            $successLine='(?m)^test '+[regex]::Escape($caseName)+' \.\.\. ok\r?$'
+            $failedLine='(?m)^test '+[regex]::Escape($caseName)+' \.\.\. FAILED\r?$'
+            $successSummary='(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s\r?$'
+            $failedSummary='(?m)^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s\r?$'
+            $runningOne=[regex]::Matches($harnessView,'(?m)^running 1 test\r?$').Count -eq 1
+            $summarySuccess=[regex]::Matches($harnessView,$successSummary).Count -eq 1
+            $summaryFailure=[regex]::Matches($harnessView,$failedSummary).Count -eq 1
+            $caseExecuted=$runningOne -and $caseLines.Count -eq 1 -and ($summarySuccess -or $summaryFailure)
+            $casePassed=$caseExecuted -and
+                [regex]::IsMatch($harnessView,$successLine) -and $summarySuccess
+            $caseContext.selected_test_executed=$caseExecuted
+            $caseContext.selected_test_passed=$casePassed
+            $caseContext.harness_running_one_test=$runningOne
+            $caseContext.harness_summary_success=$summarySuccess
+            $caseContext.harness_summary_failure=$summaryFailure
+            $caseContext.status=if($casePassed){'selected_test_passed'}elseif($caseExecuted){'selected_test_failed'}else{'selected_test_not_proven'}
+            if(-not $caseExecuted){throw "$controlName did not prove execution of exactly one selected Rust unit"}
+            if($controlCode -ne 0 -or -not $casePassed){
+                throw "$controlName selected Rust unit did not pass (exit $controlCode)"
+            }
+            $controlActual=[Collections.Generic.List[string]]::new()
+            $controlProbes=@{}
+            foreach($frame in $controlFrames){
+                if($frame.StartsWith('registry_witness_probe ')){
+                    if($frame -notmatch '^registry_witness_probe id=([^ ]+) .+$'){throw "$controlName malformed probe"}
+                    $id=$Matches[1]
+                    if($controlProbes.ContainsKey($id)){throw "$controlName duplicate probe: $id"}
+                    if(-not $expected.Contains($id)){throw "$controlName unexpected probe: $id"}
+                    $controlActual.Add($id);$controlProbes[$id]=$frame
+                }
+            }
+            $controlMissing=@($expected | Where-Object {-not $controlProbes.ContainsKey($_)})
+            if($controlActual.Count -ne 69 -or $controlMissing.Count -ne 1 -or
+                $controlMissing[0] -cne 'lifetime/cleanup_absent'){
+                throw "$controlName must preserve the exact 69 non-cleanup probes; got $($controlActual.Count), missing $($controlMissing -join ',')"
+            }
+            if(-not $controlProbes.ContainsKey('lifetime/normal_job_zero') -or
+                (WitnessField $controlProbes['lifetime/normal_job_zero'] 'observed') -cne 'true' -or
+                (WitnessField $controlProbes['lifetime/normal_job_zero'] 'active_processes') -cne '0' -or
+                -not $controlProbes.ContainsKey('lifetime/cancel_ready_mapped') -or
+                -not $controlProbes.ContainsKey('lifetime/cancel_job_zero') -or
+                (WitnessField $controlProbes['lifetime/cancel_job_zero'] 'active_processes') -cne '0'){
+                throw "$controlName did not prove both real helper roles reached Job zero"
+            }
+            $controlProbes=ValidateWitnessTranscript -InputFrames $controlFrames -RunNonce $controlNonce -ExitCode $controlCode -Mode retained -ControlName $controlName -ExpectedIds $expected -ActualIds $controlActual -ExpectedMachineHash $controlMachineHash -ExpectedUserHash $controlUserHash
+            $controlBindings=@($controlFrames | Where-Object {$_ -match '^registry_witness_parent_binding '})
+            $normalResults=@($controlFrames | Where-Object {$_ -match '^registry_witness_child_result role=normal '})
+            if($controlBindings.Count -ne 1 -or $normalResults.Count -ne 1){
+                throw "$controlName strict transcript omitted parent or normal-helper identity binding"
+            }
+            $binding=$controlBindings[0]
+            $normalResult=$normalResults[0]
+            $ready=$controlProbes['lifetime/cancel_ready_mapped']
+            $cancelJob=$controlProbes['lifetime/cancel_job_zero']
+            $controlRecords=@($controlFrames | Where-Object {$_ -match '^registry_witness_control(?: |$)'})
+            if($controlRecords.Count -ne 1){throw "$controlName did not emit exactly one targeted control receipt"}
+            $controlRecord=$controlRecords[0]
+            $controlFields=@('case','nonce','parent_pid','parent_creation','reached','rejection','jobs_zero','known_views_unchanged',
+                'view_preimages_unchanged','private_canary_value_sha256','private_canary_descriptor_sha256',
+                'private_canary_unchanged','parent_machine_value_sha256','parent_user_value_sha256',
+                'parent_machine_descriptor_sha256','parent_user_descriptor_sha256','parent_canary_unchanged',
+                'registry_root_retained','image_profile_retained','image_id','image_sha256','fixture_id',
+                'disposition_attempted','sdk_called')
+            WitnessExactFields $controlRecord $controlFields
+            $expectedRejection=if($controlName -ceq 'wrong_image_hash'){
+                'helper_image_hash_differs'
+            }else{'private_fixture_inventory_changed'}
+            $caseContext.target_reached=(WitnessField $controlRecord 'reached') -ceq 'true'
+            $caseContext.primary_probes=69
+            if((WitnessField $controlRecord 'case') -cne $controlName -or
+                (WitnessField $controlRecord 'nonce') -cne $controlNonce -or
+                (WitnessField $controlRecord 'parent_pid') -cne (WitnessField $binding 'pid') -or
+                (WitnessField $controlRecord 'parent_creation') -cne (WitnessField $binding 'creation') -or
+                (WitnessField $controlRecord 'reached') -cne 'true' -or
+                (WitnessField $controlRecord 'rejection') -cne $expectedRejection -or
+                (WitnessField $controlRecord 'jobs_zero') -cne 'true' -or
+                (WitnessField $controlRecord 'known_views_unchanged') -cne 'true' -or
+                (WitnessField $controlRecord 'view_preimages_unchanged') -cne 'true' -or
+                (WitnessField $controlRecord 'parent_canary_unchanged') -cne 'true' -or
+                (WitnessField $controlRecord 'parent_machine_value_sha256') -cne $controlMachineHash -or
+                (WitnessField $controlRecord 'parent_user_value_sha256') -cne $controlUserHash -or
+                (WitnessField $controlRecord 'parent_machine_descriptor_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+                (WitnessField $controlRecord 'parent_user_descriptor_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+                (WitnessField $controlRecord 'registry_root_retained') -cne 'true' -or
+                (WitnessField $controlRecord 'image_profile_retained') -cne 'true' -or
+                (WitnessField $controlRecord 'image_id') -cne (WitnessField $normalResult 'image_id') -or
+                (WitnessField $controlRecord 'image_sha256') -cne (WitnessField $normalResult 'image_sha256') -or
+                (WitnessField $controlRecord 'fixture_id') -cne (WitnessField $normalResult 'fixture_id') -or
+                (WitnessField $controlRecord 'disposition_attempted') -cne 'false' -or
+                (WitnessField $controlRecord 'sdk_called') -cne 'false'){
+                throw "$controlName target seam or retained-object receipt failed"
+            }
+            if($controlName -ceq 'unknown_registry_key'){
+                if((WitnessField $controlRecord 'private_canary_value_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+                    (WitnessField $controlRecord 'private_canary_descriptor_sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+                    (WitnessField $controlRecord 'private_canary_unchanged') -cne 'true'){
+                    throw 'Unknown-key control did not preserve its actual foreign-key value and descriptor'
+                }
+            } elseif((WitnessField $controlRecord 'private_canary_value_sha256') -cne 'not_applicable' -or
+                (WitnessField $controlRecord 'private_canary_descriptor_sha256') -cne 'not_applicable' -or
+                (WitnessField $controlRecord 'private_canary_unchanged') -cne 'false'){
+                throw 'Wrong-image-hash control contained an unexpected private-key canary'
+            }
+            $controlStatus=@($controlFrames | Where-Object {$_ -match '^registry_witness_status(?: |$)'})
+            if($controlStatus.Count -ne 1){throw "$controlName status record is not unique"}
+            WitnessExactFields $controlStatus[0] @('witness_status','run_status')
+            if((WitnessField $controlStatus[0] 'witness_status') -cne 'INCOMPLETE' -or
+                (WitnessField $controlStatus[0] 'run_status') -cne 'control_retained'){
+                throw "$controlName did not report expected retained incomplete cleanup"
+            }
+            if(@($controlFrames | Where-Object {$_ -match '^registry_witness_probe id=lifetime/cleanup_absent '}).Count -ne 0){
+                throw "$controlName incorrectly reported cleanup absence"
+            }
+            $controlFinal=@($controlFrames | Where-Object {$_ -match '^registry_witness_finalization(?: |$)'})
+            if($controlFinal.Count -ne 1){throw "$controlName retained-residue finalization is not unique"}
+            WitnessExactFields $controlFinal[0] @('status','control','profile_absent','sdk_called',
+                'registry_fixture_retained','image_retained','helper_directory_retained',
+                'normal_job_zero','cancel_job_zero','cleanup_errors')
+            if((WitnessField $controlFinal[0] 'status') -cne 'retained' -or
+                (WitnessField $controlFinal[0] 'control') -cne $controlName -or
+                (WitnessField $controlFinal[0] 'profile_absent') -cne 'false' -or
+                (WitnessField $controlFinal[0] 'sdk_called') -cne 'false' -or
+                (WitnessField $controlFinal[0] 'registry_fixture_retained') -cne 'true' -or
+                (WitnessField $controlFinal[0] 'image_retained') -cne 'true' -or
+                (WitnessField $controlFinal[0] 'helper_directory_retained') -cne 'true' -or
+                (WitnessField $controlFinal[0] 'normal_job_zero') -cne 'true' -or
+                (WitnessField $controlFinal[0] 'cancel_job_zero') -cne 'true' -or
+                (WitnessField $controlFinal[0] 'cleanup_errors') -cne '0'){
+                throw "$controlName finalization did not prove deliberate retention"
+            }
+            $caseContext.transcript_verified=$true
+            $caseContext.native_control_verified=$true
+            $caseContext.target_reached=$true
+            $caseContext.primary_probes=69
+            $caseContext.status='passed_expected_refusal'
+            $caseResult=[pscustomobject][ordered]@{
+                case=$controlName;source=$env:GITHUB_SHA;run=$env:GITHUB_RUN_ID
+                selected_unit=$caseName;nonce=$controlNonce;user_sid=$parentIdentity.user_sid
+                marker_names=@($controlMachineName,$controlUserName)
+                marker_hashes=@($controlMachineHash,$controlUserHash)
+                attempted=$true;selected_test_executed=$caseContext.selected_test_executed
+                selected_test_passed=$caseContext.selected_test_passed
+                transcript_verified=$caseContext.transcript_verified
+                native_control_verified=$caseContext.native_control_verified
+                status='passed_expected_refusal';primary_probes=69
+                target_reached=$true;log_path=(Split-Path -Leaf $controlLog)
+                records_path=(Split-Path -Leaf $controlRecordsPath)
+                metadata_path=(Split-Path -Leaf $controlMetadataPath)
+            }
+        } catch {
+            $caseFailure=$_.Exception.Message
+            $caseContext.failure=$caseFailure
+            if($caseContext.status -eq 'initializing'){$caseContext.status='fixture_setup_failed'}
+            elseif($caseContext.status -eq 'native_test_started'){$caseContext.status='native_or_transcript_failed'}
+            elseif($caseContext.status -eq 'selected_test_passed'){$caseContext.status='transcript_validation_failed'}
+        } finally {
+            $restoreErrors=[Collections.Generic.List[string]]::new()
+            foreach($environmentName in $savedEnvironment.Keys){
+                try {
+                    $saved=$savedEnvironment[$environmentName]
+                    $restoreValue=if($saved.present){[string]$saved.value}else{$null}
+                    [Environment]::SetEnvironmentVariable($environmentName,$restoreValue,
+                        [EnvironmentVariableTarget]::Process)
+                } catch {
+                    $restoreErrors.Add("$environmentName restore: $($_.Exception.Message)")
+                }
+            }
+            $caseContext.environment_restore_errors=@($restoreErrors)
+            if($restoreErrors.Count -gt 0){
+                $restoreFailure=$restoreErrors -join '; '
+                if($caseFailure){$caseFailure+="; environment restore: $restoreFailure"}
+                else{$caseFailure="environment restore: $restoreFailure"}
+                $caseContext.failure=$caseFailure
+                $caseContext.status='environment_restore_failed'
+                $caseContext.transcript_verified=$false
+                $caseContext.native_control_verified=$false
+                $caseResult=$null
+            }
+            try {
+                $caseContext | ConvertTo-Json -Depth 8 |
+                    Out-File $controlMetadataPath -Encoding utf8
+            } catch {
+                $metadataFailure="case metadata persistence: $($_.Exception.Message)"
+                if($caseFailure){$caseFailure+="; $metadataFailure"}else{$caseFailure=$metadataFailure}
+                $caseResult=$null
+            }
+        }
+        if($caseFailure){throw "$controlName failed: $caseFailure"}
+        if($null -eq $caseResult){throw "$controlName produced no typed case result"}
+        $caseProperties=@($caseResult.PSObject.Properties.Name)
+        $requiredCaseProperties=@(
+            'case','source','run','selected_unit','nonce','user_sid','marker_names',
+            'marker_hashes','attempted','selected_test_executed','selected_test_passed',
+            'transcript_verified','native_control_verified','status','primary_probes',
+            'target_reached','log_path','records_path','metadata_path'
+        )
+        if($caseResult -isnot [System.Management.Automation.PSCustomObject] -or
+            $caseProperties.Count -ne $requiredCaseProperties.Count -or
+            @($requiredCaseProperties | Where-Object {$_ -notin $caseProperties}).Count -ne 0){
+            throw "$controlName case result shape was not the exact typed summary"
+        }
+        return $caseResult
+        }
+        function ValidateWitnessTranscript {
+            param(
+                [Collections.Generic.List[string]]$InputFrames,
+                [string]$RunNonce,
+                [int]$ExitCode,
+                [ValidateSet('complete','retained')][string]$Mode,
+                [string]$ControlName,
+                [Collections.Generic.HashSet[string]]$ExpectedIds,
+                [Collections.Generic.List[string]]$ActualIds,
+                [string]$ExpectedMachineHash,
+                [string]$ExpectedUserHash
+            )
+            $frames=$InputFrames
+            $nonce=$RunNonce
+            $code=$ExitCode
+            $expected=$ExpectedIds
+            $actual=$ActualIds
+            $probeRecords=@{}
+            foreach($frame in $frames){
             if($frame.StartsWith('registry_witness_probe ')){
                 if($frame -notmatch '^registry_witness_probe id=([^ ]+) .+$'){throw 'Malformed probe record'}
                 $probeRecords[$Matches[1]]=$frame
@@ -637,9 +992,13 @@ public static class OrbitRegistryWitnessFixture {
                 if((WitnessField $record 'domain') -cne 'lstatus' -or
                     (WitnessField $record 'status') -cne '2'){throw "Private absence status mismatch: $id"}
             } elseif($id -match '^parent_present/(before|after)/(win32|nt)/(machine|user)$'){
+                $expectedMarkerHash=if($Matches[3] -ceq 'machine'){$ExpectedMachineHash}else{$ExpectedUserHash}
                 if((WitnessField $record 'status') -cne '0' -or
                     (WitnessField $record 'observed') -cne 'true' -or
-                    (WitnessField $record 'sha256') -notmatch '^[0-9A-Fa-f]{64}$'){throw "Parent marker control failed: $id"}
+                    (WitnessField $record 'sha256') -notmatch '^[0-9A-Fa-f]{64}$' -or
+                    (WitnessField $record 'sha256') -ine $expectedMarkerHash){
+                    throw "Parent marker control failed its fresh expected value hash: $id"
+                }
             } elseif($id -match '^(inherited|mapped|remapped)/public_read/(machine_view|user_view)$'){
                 if((WitnessField $record 'observed') -cne 'true'){throw "Private view read failed: $id"}
             } elseif($id -match '^parent_recovery/(machine_view|user_view)$'){
@@ -760,50 +1119,190 @@ public static class OrbitRegistryWitnessFixture {
             (WitnessField $cancelJob 'observed') -cne 'true'){
             throw 'Cancellation termination, process wait or zero-active Job proof failed'
         }
+        $peDiagnostics=@($frames | Where-Object {$_ -match '^registry_witness_diagnostic stream=helper_image_pe(?: |$)'})
+        if($peDiagnostics.Count -ne 1){throw 'Expected exactly one held-image PE diagnostic'}
+        $peDiagnostic=$peDiagnostics[0]
+        WitnessExactFields $peDiagnostic @('stream','image_id','image_sha256','image_bytes','machine','subsystem')
+        if((WitnessField $peDiagnostic 'image_id') -cne (WitnessField $normalResult 'image_id') -or
+            (WitnessField $peDiagnostic 'image_sha256') -cne (WitnessField $normalResult 'image_sha256') -or
+            (WitnessField $peDiagnostic 'image_bytes') -notmatch '^[1-9][0-9]*$' -or
+            [int64](WitnessField $peDiagnostic 'image_bytes') -gt 16777216 -or
+            (WitnessField $peDiagnostic 'machine') -cne '0x8664' -or
+            (WitnessField $peDiagnostic 'subsystem') -cne '0x0002'){
+            throw 'Held-image PE diagnostic did not bind the bounded AMD64 GUI image'
+        }
+        $liveMemberDiagnostics=@($frames | Where-Object {$_ -match '^registry_witness_diagnostic stream=cancel_job_live_member(?: |$)'})
+        if($liveMemberDiagnostics.Count -ne 1){throw 'Expected exactly one live cancellation Job-member diagnostic'}
+        $liveMember=$liveMemberDiagnostics[0]
+        WitnessExactFields $liveMember @('stream','child_pid','child_creation','assigned','listed',
+            'returned_bytes','pid','actual_pid','actual_creation','membership','active_processes','observed')
+        if((WitnessField $liveMember 'child_pid') -cne (WitnessField $cancelReady 'pid') -or
+            (WitnessField $liveMember 'child_creation') -cne (WitnessField $cancelReady 'creation') -or
+            (WitnessField $liveMember 'assigned') -cne 'true' -or
+            (WitnessField $liveMember 'listed') -cne 'true' -or
+            (WitnessField $liveMember 'returned_bytes') -notmatch '^[1-9][0-9]*$' -or
+            [int](WitnessField $liveMember 'returned_bytes') -lt 8 -or
+            (WitnessField $liveMember 'pid') -cne (WitnessField $cancelReady 'pid') -or
+            (WitnessField $liveMember 'actual_pid') -cne (WitnessField $cancelReady 'pid') -or
+            (WitnessField $liveMember 'actual_creation') -cne (WitnessField $cancelReady 'creation') -or
+            (WitnessField $liveMember 'membership') -cne 'owned_job' -or
+            (WitnessField $liveMember 'active_processes') -cne '1' -or
+            (WitnessField $liveMember 'observed') -cne 'true'){
+            throw 'Live cancellation Job membership did not prove its exact singleton process'
+        }
         if($code -ne 0){throw "Registry witness test did not exit successfully (exit $code)"}
         $statusRecords=@($frames | Where-Object { $_ -match '^registry_witness_status(?: |$)' })
         if($statusRecords.Count -ne 1){throw "Expected exactly one registry witness status record (found $($statusRecords.Count))"}
         $statusRecord=$statusRecords[0]
         WitnessExactFields $statusRecord @('witness_status','run_status')
-        if((WitnessField $statusRecord 'witness_status') -cne 'COMPLETE' -or
-            (WitnessField $statusRecord 'run_status') -cne 'completed'){
-            throw 'Registry witness did not report completed cleanup'
-        }
         if(@($frames | Where-Object { $_ -match '^registry_witness_incomplete(?: |$)' }).Count -ne 0){
-            throw 'A complete registry witness included an incomplete record'
-        }
-        $cleanup=$probeRecords['lifetime/cleanup_absent']
-        $cleanupFields=@('id','observed','normal_job_zero','cancel_job_zero','registry_absent',
-            'image_absent','directory_absent','profile_absent')
-        WitnessExactFields $cleanup $cleanupFields
-        foreach($field in @('observed','normal_job_zero','cancel_job_zero','registry_absent',
-            'image_absent','directory_absent','profile_absent')){
-            if((WitnessField $cleanup $field) -cne 'true'){throw "Cleanup absence receipt failed: $field"}
+            throw 'A witness transcript included a separate incomplete record'
         }
         $finalizations=@($frames | Where-Object { $_ -match '^registry_witness_finalization(?: |$)' })
-        if($finalizations.Count -ne 1){throw "Expected exactly one successful finalization receipt (found $($finalizations.Count))"}
+        if($finalizations.Count -ne 1){throw "Expected exactly one finalization receipt (found $($finalizations.Count))"}
         $finalization=$finalizations[0]
-        $finalFields=@('cleanup_errors','registry_absent','image_absent','directory_absent',
-            'profile_absent','normal_job_zero','cancel_job_zero','host_marker_postcontrol')
-        WitnessExactFields $finalization $finalFields
-        if((WitnessField $finalization 'cleanup_errors') -cne '0' -or
-            (WitnessField $finalization 'registry_absent') -cne 'true' -or
-            (WitnessField $finalization 'image_absent') -cne 'true' -or
-            (WitnessField $finalization 'directory_absent') -cne 'true' -or
-            (WitnessField $finalization 'profile_absent') -cne 'true' -or
-            (WitnessField $finalization 'normal_job_zero') -cne 'true' -or
-            (WitnessField $finalization 'cancel_job_zero') -cne 'true' -or
-            (WitnessField $finalization 'host_marker_postcontrol') -cne 'observed'){
-            throw 'Final cleanup receipt did not bind all required absence and Job proofs'
+        if($Mode -ceq 'complete'){
+            if((WitnessField $statusRecord 'witness_status') -cne 'COMPLETE' -or
+                (WitnessField $statusRecord 'run_status') -cne 'completed'){
+                throw 'Primary registry witness did not report completed cleanup'
+            }
+            $cleanup=$probeRecords['lifetime/cleanup_absent']
+            $cleanupFields=@('id','observed','normal_job_zero','cancel_job_zero','registry_absent',
+                'image_absent','directory_absent','profile_absent')
+            WitnessExactFields $cleanup $cleanupFields
+            foreach($field in @('observed','normal_job_zero','cancel_job_zero','registry_absent',
+                'image_absent','directory_absent','profile_absent')){
+                if((WitnessField $cleanup $field) -cne 'true'){throw "Cleanup absence receipt failed: $field"}
+            }
+            $finalFields=@('cleanup_errors','registry_absent','image_absent','directory_absent',
+                'profile_absent','normal_job_zero','cancel_job_zero','host_marker_postcontrol')
+            WitnessExactFields $finalization $finalFields
+            if((WitnessField $finalization 'cleanup_errors') -cne '0' -or
+                (WitnessField $finalization 'registry_absent') -cne 'true' -or
+                (WitnessField $finalization 'image_absent') -cne 'true' -or
+                (WitnessField $finalization 'directory_absent') -cne 'true' -or
+                (WitnessField $finalization 'profile_absent') -cne 'true' -or
+                (WitnessField $finalization 'normal_job_zero') -cne 'true' -or
+                (WitnessField $finalization 'cancel_job_zero') -cne 'true' -or
+                (WitnessField $finalization 'host_marker_postcontrol') -cne 'observed'){
+                throw 'Final cleanup receipt did not bind all required absence and Job proofs'
+            }
+            $missing=@($expected | Where-Object { -not $actual.Contains($_) })
+            if($missing.Count -ne 0 -or $actual.Count -ne 70){
+                throw "Registry control set incomplete (observed $($actual.Count)/70; missing $($missing -join ', '))"
+            }
+        } else {
+            if((WitnessField $statusRecord 'witness_status') -cne 'INCOMPLETE' -or
+                (WitnessField $statusRecord 'run_status') -cne 'control_retained'){
+                throw 'Retained control did not report exact INCOMPLETE/control_retained status'
+            }
+            if($probeRecords.ContainsKey('lifetime/cleanup_absent')){
+                throw 'Retained control reported cleanup absence'
+            }
+            $retainedFields=@('status','control','profile_absent','sdk_called',
+                'registry_fixture_retained','image_retained','helper_directory_retained',
+                'normal_job_zero','cancel_job_zero','cleanup_errors')
+            WitnessExactFields $finalization $retainedFields
+            if((WitnessField $finalization 'status') -cne 'retained' -or
+                (WitnessField $finalization 'control') -cne $ControlName -or
+                (WitnessField $finalization 'profile_absent') -cne 'false' -or
+                (WitnessField $finalization 'sdk_called') -cne 'false' -or
+                (WitnessField $finalization 'registry_fixture_retained') -cne 'true' -or
+                (WitnessField $finalization 'image_retained') -cne 'true' -or
+                (WitnessField $finalization 'helper_directory_retained') -cne 'true' -or
+                (WitnessField $finalization 'normal_job_zero') -cne 'true' -or
+                (WitnessField $finalization 'cancel_job_zero') -cne 'true' -or
+                (WitnessField $finalization 'cleanup_errors') -cne '0'){
+                throw 'Retained control finalization did not bind unchanged retained state'
+            }
+            $missing=@($expected | Where-Object { -not $actual.Contains($_) })
+            if($actual.Count -ne 69 -or $missing.Count -ne 1 -or
+                $missing[0] -cne 'lifetime/cleanup_absent'){
+                throw "Retained transcript is not exactly the existing 69-control subset; missing $($missing -join ', ')"
+            }
         }
-        $missing=@($expected | Where-Object { -not $actual.Contains($_) })
-        if($missing.Count -ne 0 -or $actual.Count -ne 70){
-            throw "Registry control set incomplete (observed $($actual.Count)/70; missing $($missing -join ', '))"
+            if($Mode -ceq 'complete'){
+                $parentIdentity.primary_witness_status='COMPLETE'
+                $parentIdentity.missing_probe_count=0
+                $parentIdentity.ordinary_user_support_proven=$false
+            }
+            return ,$probeRecords
         }
-        $parentIdentity.witness_status='COMPLETE'
-        $parentIdentity.missing_probe_count=0
-        $parentIdentity.ordinary_user_support_proven=$false
-        $parentIdentity | ConvertTo-Json -Depth 5 | Out-File (Join-Path $EvidenceDir 'registry-witness-parent.json')
+        $probeRecords=ValidateWitnessTranscript -InputFrames $frames -RunNonce $nonce -ExitCode $code -Mode complete -ControlName '' -ExpectedIds $expected -ActualIds $actual -ExpectedMachineHash $parentIdentity.marker_sha256[0] -ExpectedUserHash $parentIdentity.marker_sha256[1]
+        $controlRuns=[Collections.Generic.List[object]]::new()
+        # Run implemented cases first even though the fixed 25-name manifest begins
+        # with controls that are still pending. Every invocation gets fresh nonce
+        # marker names and a separate exact Rust unit selection.
+        $controlFailures=[Collections.Generic.List[object]]::new()
+        foreach($controlName in @('wrong_image_hash','unknown_registry_key')){
+            try {
+                $caseSummary=InvokeCleanupControl $controlName
+                if($caseSummary -isnot [System.Management.Automation.PSCustomObject] -or
+                    $caseSummary.case -cne $controlName -or
+                    $caseSummary.attempted -ne $true){
+                    throw "$controlName did not return one validated case summary"
+                }
+                [void]$controlRuns.Add($caseSummary)
+            } catch {
+                $controlError=$_.Exception.Message
+                $caseMetadataPath=Join-Path $EvidenceDir ('registry-cleanup-controls/'+$controlName+'.json')
+                $caseFailureRecord=$null
+                if(Test-Path -LiteralPath $caseMetadataPath -PathType Leaf){
+                    try {$caseFailureRecord=Get-Content $caseMetadataPath -Raw | ConvertFrom-Json -AsHashtable}
+                    catch {$controlError+="; case metadata parse: $($_.Exception.Message)"}
+                }
+                if($null -eq $caseFailureRecord){
+                    $caseUnit=if($controlName -ceq 'wrong_image_hash'){
+                        'process::windows::registry_witness_tests::registry_witness_cleanup_control_wrong_image_hash'
+                    }else{
+                        'process::windows::registry_witness_tests::registry_witness_cleanup_control_unknown_registry_key'
+                    }
+                    $caseFailureRecord=[ordered]@{
+                        case=$controlName;source=$env:GITHUB_SHA;run=$env:GITHUB_RUN_ID
+                        selected_unit=$caseUnit;nonce=$null;user_sid=$parentIdentity.user_sid
+                        marker_names=@();marker_hashes=@();attempted=$true
+                        selected_test_executed=$false;selected_test_passed=$false
+                        transcript_verified=$false;native_control_verified=$false
+                        status='metadata_missing';failure=$controlError
+                        log_path=('registry-cleanup-controls/'+$controlName+'.log')
+                        records_path=('registry-cleanup-controls/'+$controlName+'.records.txt')
+                        metadata_path=('registry-cleanup-controls/'+$controlName+'.json')
+                    }
+                }else{
+                    $caseFailureRecord.failure=$controlError
+                }
+                [void]$controlFailures.Add($caseFailureRecord)
+            }
+        }
+        $allControlCases=@($controlRuns.ToArray())+@($controlFailures.ToArray())
+        $controlAttempted=@($allControlCases | Where-Object {$_.attempted -eq $true}).Count
+        $controlExecuted=@($allControlCases | Where-Object {$_.selected_test_executed -eq $true}).Count
+        $controlTestPassed=@($allControlCases | Where-Object {
+            $_.selected_test_executed -eq $true -and $_.selected_test_passed -eq $true
+        }).Count
+        $controlPassed=@($allControlCases | Where-Object {
+            $_.transcript_verified -eq $true -and $_.native_control_verified -eq $true
+        }).Count
+        $cleanupControlSummary=[ordered]@{
+            status='PENDING_NATIVE_ORACLES';required=25;attempted=$controlAttempted
+            selected_test_executed=$controlExecuted;selected_test_passed=$controlTestPassed
+            native_controls_verified=$controlPassed;missing=$cleanupPending
+            failed=@($controlFailures.ToArray());manifest=$cleanupCaseManifest
+            cases=$allControlCases
+        }
+        $cleanupControlSummary | ConvertTo-Json -Depth 6 |
+            Out-File (Join-Path $EvidenceDir 'registry-cleanup-controls.json')
+        $parentIdentity.witness_status='INCOMPLETE'
+        $parentIdentity.cleanup_negative_controls='PENDING_NATIVE_ORACLES'
+        $parentIdentity.cleanup_controls_attempted=$cleanupControlSummary.attempted
+        $parentIdentity.cleanup_controls_executed=$cleanupControlSummary.selected_test_executed
+        $parentIdentity.cleanup_controls_selected_tests_passed=$cleanupControlSummary.selected_test_passed
+        $parentIdentity.cleanup_controls_verified=$cleanupControlSummary.native_controls_verified
+        $parentIdentity.cleanup_controls_required=25
+        $parentIdentity.cleanup_controls_missing=$cleanupPending
+        $parentIdentity | ConvertTo-Json -Depth 8 |
+            Out-File (Join-Path $EvidenceDir 'registry-witness-parent.json')
+        throw "Cleanup negative-control suite remains fail-closed: $($cleanupControlSummary.native_controls_verified)/25 verified; failed $(@($controlFailures | ForEach-Object {$_.case}) -join ', '); missing $($cleanupPending -join ', ')"
     } catch { $failure=$_ }
     finally {
         $cleanupComplete=$true
