@@ -583,7 +583,10 @@ mod windows {
         let home = Home::new();
         let private_name = OsStr::new("private source.txt");
         let private_contents = b"held private baseline";
-        fs::write(home.path().join(private_name), private_contents).unwrap();
+        let mut private_writer = home.dir().create_file(private_name).unwrap();
+        private_writer.write_all(private_contents).unwrap();
+        private_writer.sync_all().unwrap();
+        drop(private_writer);
 
         let private_source = SourceDirectory::open(&home.path()).unwrap();
         let mut private_file = private_source.open_file(private_name).unwrap();
