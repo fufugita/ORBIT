@@ -7436,6 +7436,965 @@ mod windows {
                         }
                     }
                 }
+                pub(in crate::windows) mod guard_case {
+                    use super::*;
+                    use windows_sys::Wdk::Storage::FileSystem::{
+                        FILE_MODE_INFORMATION, FileModeInformation, NtQueryInformationFile,
+                    };
+
+                    const SCOPE: &str = "guard-private-scope";
+                    const SCOPE_CANARY: &str = "scope-canary";
+                    const REFUSAL: &str =
+                        "operation requires the same directory's transaction lock";
+
+                    struct CloseUnknown {
+                        raw: usize,
+                        identity: Option<FileIdentity>,
+                        error: u32,
+                        phase: &'static str,
+                    }
+                    impl std::fmt::Debug for CloseUnknown {
+                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.debug_struct("NonAuthorizingCloseUncertainty")
+                                .field("raw", &self.raw)
+                                .field("identity", &self.identity)
+                                .field("error", &self.error)
+                                .field("phase", &self.phase)
+                                .finish()
+                        }
+                    }
+                    fn close_new(
+                        handles: &mut Handles,
+                        unknown: &mut Vec<CloseUnknown>,
+                        owner: usize,
+                        id: Option<FileIdentity>,
+                        phase: &'static str,
+                    ) -> io::Result<()> {
+                        let owned = handles.slots[owner]
+                            .take()
+                            .ok_or_else(|| bad("guard native owner already consumed"))?;
+                        let raw = owned.into_raw_handle();
+                        let result = unsafe { CloseHandle(raw) };
+                        let error = if result == 0 {
+                            unsafe { GetLastError() }
+                        } else {
+                            0
+                        };
+                        if result == 0 {
+                            // This non-authorizing raw slot is never blindly re-closed.
+                            unknown.push(CloseUnknown {
+                                raw: raw as usize,
+                                identity: id,
+                                error,
+                                phase,
+                            });
+                            return Err(io::Error::from_raw_os_error(error as i32));
+                        }
+                        handles
+                            .closed
+                            .push(format!("{owner}:guard-checked-closed:{phase}"));
+                        Ok(())
+                    }
+                    fn pending_lock() -> ! {
+                        static MESSAGE: &[u8] = b"GUARD_CONTROL_UNCLASSIFIED: pending native lock/unlock/query; no case completion; terminating without unwinding\r\n";
+                        unsafe {
+                            let stderr = GetStdHandle((-12i32) as u32);
+                            if !stderr.is_null() && stderr != INVALID_HANDLE_VALUE {
+                                let mut written = 0;
+                                let _ = WriteFile(
+                                    stderr,
+                                    MESSAGE.as_ptr(),
+                                    MESSAGE.len() as u32,
+                                    &mut written,
+                                    null_mut(),
+                                );
+                            }
+                            let _ = TerminateProcess(GetCurrentProcess(), 0xe0150004);
+                        }
+                        std::process::abort()
+                    }
+                    struct LockTrial {
+                        phase: &'static str,
+                        owner: usize,
+                        identity: FileIdentity,
+                        mode: u32,
+                        exclusive: bool,
+                        lock_bool: i32,
+                        lock_error: u32,
+                        unlock: Option<(i32, u32)>,
+                        closed: bool,
+                    }
+                    impl std::fmt::Debug for LockTrial {
+                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.debug_struct("LockTrial")
+                                .field("phase", &self.phase)
+                                .field("owner", &self.owner)
+                                .field("full_id", &self.identity)
+                                .field("actual_mode", &self.mode)
+                                .field("exclusive", &self.exclusive)
+                                .field("lock_bool", &self.lock_bool)
+                                .field("lock_error", &self.lock_error)
+                                .field("unlock", &self.unlock)
+                                .field("checked_closed", &self.closed)
+                                .finish()
+                        }
+                    }
+                    fn lock_trial(
+                        h: &mut Harness,
+                        unknown: &mut Vec<CloseUnknown>,
+                        trials: &mut Vec<LockTrial>,
+                        phase: &'static str,
+                        exclusive: bool,
+                        expected_success: bool,
+                    ) -> io::Result<()> {
+                        let f = &mut h.oracle;
+                        let parent = f.handles.raw(f.root.unwrap());
+                        // Each invocation independently opens a NEW native file object;
+                        // never duplicate or reuse the public guard's file object.
+                        let owner = relative(
+                            &mut f.handles,
+                            parent,
+                            OsStr::new(LOCK),
+                            false,
+                            FILE_OPEN,
+                            FILE_GENERIC_READ,
+                            null(),
+                        )?;
+                        let raw = f.handles.raw(owner);
+                        let id = identity(raw)?;
+                        require(
+                            Some(id) == h.lock.as_ref().unwrap().id,
+                            "guard witness lock ID differs",
+                        )?;
+                        kind(raw, false)?;
+                        granted(raw, FILE_GENERIC_READ)?;
+                        require(
+                            FILE_GENERIC_READ & FILE_READ_DATA != 0,
+                            "guard witness lacks read access",
+                        )?;
+                        require(
+                            Some(snapshot(raw)?) == h.lock.as_ref().unwrap().snapshot
+                                && Some(private_lock_facts(raw, f.key.as_ref().unwrap(), phase)?)
+                                    == h.lock.as_ref().unwrap().facts,
+                            "guard witness lock image differs",
+                        )?;
+                        let mut mode = FILE_MODE_INFORMATION::default();
+                        let mut iosb = IO_STATUS_BLOCK::default();
+                        let status = unsafe {
+                            NtQueryInformationFile(
+                                raw,
+                                &mut iosb,
+                                (&mut mode as *mut FILE_MODE_INFORMATION).cast(),
+                                size_of::<FILE_MODE_INFORMATION>() as u32,
+                                FileModeInformation,
+                            )
+                        };
+                        if status == PENDING {
+                            pending_lock();
+                        }
+                        if status != 0 {
+                            return Err(nt("guard FileModeInformation", status, FILE_GENERIC_READ));
+                        }
+                        require(
+                            iosb.Information == size_of::<FILE_MODE_INFORMATION>()
+                                && mode.Mode & FILE_SYNCHRONOUS_IO_NONALERT != 0
+                                && mode.Mode & 0x10 == 0,
+                            "guard witness I/O mode not synchronous nonalertable",
+                        )?;
+                        let mut overlap = windows_sys::Win32::System::IO::OVERLAPPED::default();
+                        let flags = LOCKFILE_FAIL_IMMEDIATELY
+                            | if exclusive {
+                                LOCKFILE_EXCLUSIVE_LOCK
+                            } else {
+                                0
+                            };
+                        let locked = unsafe { LockFileEx(raw, flags, 0, 1, 0, &mut overlap) };
+                        let lock_error = if locked == 0 {
+                            unsafe { GetLastError() }
+                        } else {
+                            0
+                        };
+                        if locked == 0 && lock_error == ERROR_IO_PENDING {
+                            pending_lock();
+                        }
+                        // No formatting/query occurs before BOOL/GetLastError capture.
+                        trials.push(LockTrial {
+                            phase,
+                            owner,
+                            identity: id,
+                            mode: mode.Mode,
+                            exclusive,
+                            lock_bool: locked,
+                            lock_error,
+                            unlock: None,
+                            closed: false,
+                        });
+                        let trial = trials.last_mut().unwrap();
+                        if locked != 0 {
+                            let unlocked = unsafe { UnlockFileEx(raw, 0, 1, 0, &mut overlap) };
+                            let error = if unlocked == 0 {
+                                unsafe { GetLastError() }
+                            } else {
+                                0
+                            };
+                            if unlocked == 0 && error == ERROR_IO_PENDING {
+                                pending_lock();
+                            }
+                            trial.unlock = Some((unlocked, error));
+                            if unlocked == 0 {
+                                return Err(io::Error::from_raw_os_error(error as i32));
+                            }
+                        }
+                        close_new(&mut f.handles, unknown, owner, Some(id), phase)?;
+                        trial.closed = true;
+                        println!(
+                            "guard_control_native_lock trial={trial:?} independent_open=true duplicated_file_object=false byte_offset=0 byte_length=1 hEvent=null actual_read_grant=true"
+                        );
+                        require(
+                            if expected_success {
+                                locked != 0
+                            } else {
+                                locked == 0 && lock_error == ERROR_LOCK_VIOLATION
+                            },
+                            "guard native lock result does not prove expected mode",
+                        )
+                    }
+                    fn private_directory_facts(
+                        raw: HANDLE,
+                        key: &TokenKey,
+                        phase: &'static str,
+                    ) -> io::Result<SecurityFacts> {
+                        kind(raw, true)?;
+                        println!(
+                            "guard_control_private_policy object_kind=directory phase={phase}"
+                        );
+                        private_lock_facts(raw, key, phase)
+                    }
+                    fn directory_snapshot(raw: HANDLE) -> io::Result<SourceSnapshot> {
+                        kind(raw, true)?;
+                        let standard: FILE_STANDARD_INFO = info(raw, FileStandardInfo)?;
+                        let basic: FILE_BASIC_INFO = info(raw, FileBasicInfo)?;
+                        require(
+                            standard.EndOfFile >= 0
+                                && basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                            "guard scope directory metadata invalid",
+                        )?;
+                        Ok(SourceSnapshot {
+                            identity: identity(raw)?,
+                            length: standard.EndOfFile as u64,
+                            last_write_time: basic.LastWriteTime,
+                            change_time: basic.ChangeTime,
+                            attributes: basic.FileAttributes,
+                            kind: SourceKind::Directory,
+                            link_count: standard.NumberOfLinks as u32,
+                        })
+                    }
+                    fn scope_descriptor(key: &TokenKey) -> io::Result<Vec<usize>> {
+                        let user = sid_text(&key.user)?;
+                        let group = sid_text(&key.group)?;
+                        let text = wide(OsStr::new(&format!(
+                            "O:{user}G:{group}D:P(A;OICI;0x{FILE_ALL_ACCESS:08x};;;{user})"
+                        )));
+                        let mut raw = null_mut();
+                        let mut returned = 0;
+                        yes(unsafe {
+                            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                                text.as_ptr(),
+                                1,
+                                &mut raw,
+                                &mut returned,
+                            )
+                        })?;
+                        let allocation = LocalSecurityAllocation(raw.cast());
+                        let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+                        require(
+                            length > 0 && length <= LIMIT && length == returned as usize,
+                            "guard scope descriptor length invalid",
+                        )?;
+                        let mut words = vec![0usize; length.div_ceil(size_of::<usize>())];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                raw.cast::<u8>(),
+                                words.as_mut_ptr().cast(),
+                                length,
+                            );
+                        }
+                        drop(allocation);
+                        Ok(words)
+                    }
+                    fn scope_empty(raw: HANDLE) -> io::Result<()> {
+                        // Enumerate the owned file object: no conflicting new
+                        // source open while this DELETE owner remains held.
+                        let mut words = vec![0usize; LIMIT / size_of::<usize>()];
+                        let mut class = FileIdBothDirectoryRestartInfo;
+                        for _ in 0..4 {
+                            words.fill(0);
+                            let result = unsafe {
+                                GetFileInformationByHandleEx(
+                                    raw,
+                                    class,
+                                    words.as_mut_ptr().cast(),
+                                    LIMIT as u32,
+                                )
+                            };
+                            let error = if result == 0 {
+                                unsafe { GetLastError() }
+                            } else {
+                                0
+                            };
+                            if result == 0 {
+                                return if error == ERROR_NO_MORE_FILES {
+                                    Ok(())
+                                } else {
+                                    Err(io::Error::from_raw_os_error(error as i32))
+                                };
+                            }
+                            let mut offset = 0usize;
+                            let mut records = 0;
+                            loop {
+                                require(
+                                    offset % std::mem::align_of::<FILE_ID_BOTH_DIR_INFO>() == 0
+                                        && offset
+                                            .checked_add(size_of::<FILE_ID_BOTH_DIR_INFO>())
+                                            .is_some_and(|end| end <= LIMIT),
+                                    "guard scope enumeration header bounds/alignment invalid",
+                                )?;
+                                let entry = unsafe {
+                                    words
+                                        .as_ptr()
+                                        .cast::<u8>()
+                                        .add(offset)
+                                        .cast::<FILE_ID_BOTH_DIR_INFO>()
+                                        .read()
+                                };
+                                let name_offset =
+                                    offset + offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                                let length = entry.FileNameLength as usize;
+                                require(
+                                    length != 0
+                                        && length % 2 == 0
+                                        && name_offset
+                                            .checked_add(length)
+                                            .is_some_and(|end| end <= LIMIT),
+                                    "guard scope enumeration name bounds invalid",
+                                )?;
+                                let name = unsafe {
+                                    std::slice::from_raw_parts(
+                                        words.as_ptr().cast::<u8>().add(name_offset).cast::<u16>(),
+                                        length / 2,
+                                    )
+                                };
+                                require(
+                                    name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16],
+                                    "guard scope cleanup directory not empty",
+                                )?;
+                                records += 1;
+                                require(
+                                    records <= 4,
+                                    "guard scope enumeration record bound exceeded",
+                                )?;
+                                if entry.NextEntryOffset == 0 {
+                                    break;
+                                }
+                                require(
+                                    entry.NextEntryOffset as usize
+                                        >= offset_of!(FILE_ID_BOTH_DIR_INFO, FileName) + length,
+                                    "guard scope enumeration overlapping records",
+                                )?;
+                                offset = offset
+                                    .checked_add(entry.NextEntryOffset as usize)
+                                    .ok_or_else(|| {
+                                        bad("guard scope enumeration offset overflow")
+                                    })?;
+                            }
+                            class = FileIdBothDirectoryInfo;
+                        }
+                        Err(bad("guard scope enumeration batch bound exceeded"))
+                    }
+                    fn scope_absent(
+                        handles: &mut Handles,
+                        parent: HANDLE,
+                        name: &OsStr,
+                        directory: bool,
+                    ) -> io::Result<()> {
+                        match relative(handles, parent, name, directory, FILE_OPEN, META, null()) {
+                            Err(error) if native_is(&error, ABSENT) => Ok(()),
+                            Ok(_) => Err(bad("guard scope name remains present; owner retained")),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    #[derive(Default)]
+                    struct Scope {
+                        attempted: bool,
+                        creator: Option<usize>,
+                        id: Option<FileIdentity>,
+                        facts: Option<SecurityFacts>,
+                        baseline: Option<SourceSnapshot>,
+                        directory: Option<Directory>,
+                        canary: Option<Entry>,
+                        removed: bool,
+                    }
+                    impl Scope {
+                        fn create(
+                            &mut self,
+                            h: &mut Harness,
+                            unknown: &mut Vec<CloseUnknown>,
+                        ) -> io::Result<()> {
+                            let f = &mut h.oracle;
+                            let parent = f.handles.raw(f.root.unwrap());
+                            let key = f.key.as_ref().unwrap().clone();
+                            scope_absent(&mut f.handles, parent, OsStr::new(SCOPE), true)?;
+                            let sd = scope_descriptor(&key)?;
+                            self.attempted = true;
+                            println!(
+                                "guard_control_scope_create_attempt namespace_on_failure=unknown"
+                            );
+                            let creator = relative(
+                                &mut f.handles,
+                                parent,
+                                OsStr::new(SCOPE),
+                                true,
+                                FILE_CREATE,
+                                FILE_ALL_ACCESS,
+                                sd.as_ptr().cast(),
+                            )?;
+                            self.creator = Some(creator);
+                            let raw = f.handles.raw(creator);
+                            self.id = Some(identity(raw)?);
+                            granted(raw, FILE_ALL_ACCESS)?;
+                            self.facts =
+                                Some(private_directory_facts(raw, &key, "guard_scope_initial")?);
+                            self.canary = Some(Entry {
+                                name: OsString::from(SCOPE_CANARY),
+                                mask: FILE_ALL_ACCESS,
+                                id: None,
+                                facts: None,
+                                snapshot: None,
+                                observed: None,
+                                removed: false,
+                            });
+                            let sd = descriptor(&key, FILE_ALL_ACCESS)?;
+                            let writer = relative(
+                                &mut f.handles,
+                                raw,
+                                OsStr::new(SCOPE_CANARY),
+                                false,
+                                FILE_CREATE,
+                                FILE_ALL_ACCESS,
+                                sd.as_ptr().cast(),
+                            )?;
+                            let canary = self.canary.as_mut().unwrap();
+                            let file = f.handles.raw(writer);
+                            canary.id = Some(identity(file)?);
+                            canary.facts =
+                                Some(read_descriptor(file, &key, FILE_ALL_ACCESS)?.facts);
+                            let mut written = 0;
+                            yes(unsafe {
+                                WriteFile(
+                                    file,
+                                    PAYLOAD.as_ptr(),
+                                    PAYLOAD.len() as u32,
+                                    &mut written,
+                                    null_mut(),
+                                )
+                            })?;
+                            require(
+                                written as usize == PAYLOAD.len(),
+                                "guard scope canary short write",
+                            )?;
+                            yes(unsafe { FlushFileBuffers(file) })?;
+                            close_new(
+                                &mut f.handles,
+                                unknown,
+                                writer,
+                                canary.id,
+                                "scope canary creator",
+                            )?;
+                            let reader = relative(
+                                &mut f.handles,
+                                raw,
+                                OsStr::new(SCOPE_CANARY),
+                                false,
+                                FILE_OPEN,
+                                FILE_GENERIC_READ,
+                                null(),
+                            )?;
+                            canary.snapshot = Some(snapshot(f.handles.raw(reader))?);
+                            require(
+                                canary.snapshot.unwrap().identity == canary.id.unwrap(),
+                                "guard scope canary ID changed",
+                            )?;
+                            raw_bytes(f.handles.raw(reader), PAYLOAD)?;
+                            close_new(
+                                &mut f.handles,
+                                unknown,
+                                reader,
+                                canary.id,
+                                "scope canary baseline",
+                            )?;
+                            // Intended namespace setup is complete BEFORE this baseline.
+                            self.baseline = Some(directory_snapshot(raw)?);
+                            close_new(
+                                &mut f.handles,
+                                unknown,
+                                creator,
+                                self.id,
+                                "scope DELETE creator before public child",
+                            )?;
+                            self.creator = None;
+                            self.directory =
+                                Some(h.parent.as_ref().unwrap().child(OsStr::new(SCOPE), false)?);
+                            require(
+                                Some(self.directory.as_ref().unwrap().identity()) == self.id
+                                    && self.id != f.root_id,
+                                "guard public scope identity differs",
+                            )?;
+                            println!(
+                                "guard_control_scope_ready full_id={:?} parent_id={:?} DELETE_creator_closed=true public_child_noDELETE_share=true baseline_after_canary_setup=true",
+                                self.id, f.root_id
+                            );
+                            Ok(())
+                        }
+                        fn observe(
+                            &self,
+                            h: &mut Harness,
+                            unknown: &mut Vec<CloseUnknown>,
+                            phase: &'static str,
+                        ) -> io::Result<()> {
+                            self.directory.as_ref().unwrap().check()?;
+                            let f = &mut h.oracle;
+                            let parent = f.handles.raw(f.root.unwrap());
+                            let key = f.key.as_ref().unwrap();
+                            let owner = relative(
+                                &mut f.handles,
+                                parent,
+                                OsStr::new(SCOPE),
+                                true,
+                                FILE_OPEN,
+                                META,
+                                null(),
+                            )?;
+                            let raw = f.handles.raw(owner);
+                            require(
+                                Some(identity(raw)?) == self.id
+                                    && Some(directory_snapshot(raw)?) == self.baseline
+                                    && Some(private_directory_facts(raw, key, phase)?)
+                                        == self.facts,
+                                "guard scope identity, baseline or policy changed",
+                            )?;
+                            for name in [STAGE, FINAL, LOCK] {
+                                scope_absent(&mut f.handles, raw, OsStr::new(name), name != LOCK)?;
+                            }
+                            let canary = self.canary.as_ref().unwrap();
+                            let reader = relative(
+                                &mut f.handles,
+                                raw,
+                                &canary.name,
+                                false,
+                                FILE_OPEN,
+                                FILE_GENERIC_READ,
+                                null(),
+                            )?;
+                            let file = f.handles.raw(reader);
+                            require(
+                                Some(snapshot(file)?) == canary.snapshot
+                                    && Some(read_descriptor(file, key, FILE_ALL_ACCESS)?.facts)
+                                        == canary.facts,
+                                "guard scope canary image changed",
+                            )?;
+                            raw_bytes(file, PAYLOAD)?;
+                            close_new(
+                                &mut f.handles,
+                                unknown,
+                                reader,
+                                canary.id,
+                                "scope canary observer",
+                            )?;
+                            close_new(
+                                &mut f.handles,
+                                unknown,
+                                owner,
+                                self.id,
+                                "scope directory observer",
+                            )?;
+                            println!(
+                                "guard_control_scope_unchanged phase={phase} full_id={:?} policy=true snapshot=true canary=true stage_final_lock_absent=true",
+                                self.id
+                            );
+                            Ok(())
+                        }
+                        fn cleanup(
+                            &mut self,
+                            h: &mut Harness,
+                            unknown: &mut Vec<CloseUnknown>,
+                        ) -> io::Result<()> {
+                            drop(self.directory.take());
+                            let f = &mut h.oracle;
+                            let parent = f.handles.raw(f.root.unwrap());
+                            let key = f.key.as_ref().unwrap();
+                            let root = relative(
+                                &mut f.handles,
+                                parent,
+                                OsStr::new(SCOPE),
+                                true,
+                                FILE_OPEN,
+                                FILE_ALL_ACCESS,
+                                null(),
+                            )?;
+                            let raw = f.handles.raw(root);
+                            require(
+                                Some(identity(raw)?) == self.id
+                                    && Some(directory_snapshot(raw)?) == self.baseline
+                                    && Some(private_directory_facts(
+                                        raw,
+                                        key,
+                                        "scope_cleanup_preflight",
+                                    )?) == self.facts,
+                                "guard scope cleanup identity/policy/baseline differs",
+                            )?;
+                            let canary = self.canary.as_mut().unwrap();
+                            let file = relative(
+                                &mut f.handles,
+                                raw,
+                                &canary.name,
+                                false,
+                                FILE_OPEN,
+                                DELETE | META,
+                                null(),
+                            )?;
+                            let file_raw = f.handles.raw(file);
+                            let file_id = identity(file_raw)?;
+                            require(
+                                Some(file_id) == canary.id
+                                    && Some(snapshot(file_raw)?) == canary.snapshot
+                                    && Some(read_descriptor(file_raw, key, FILE_ALL_ACCESS)?.facts)
+                                        == canary.facts,
+                                "guard scope cleanup canary identity/policy differs",
+                            )?;
+                            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                            yes(unsafe {
+                                SetFileInformationByHandle(
+                                    file_raw,
+                                    FileDispositionInfo,
+                                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                                )
+                            })?;
+                            close_new(
+                                &mut f.handles,
+                                unknown,
+                                file,
+                                Some(file_id),
+                                "scope canary disposition",
+                            )?;
+                            scope_absent(&mut f.handles, raw, &canary.name, false)?;
+                            canary.removed = true;
+                            scope_empty(raw)?;
+                            // Only root metadata/policy rechecks; its times legitimately changed
+                            // after intended canary removal, so do not reuse the setup snapshot.
+                            kind(raw, true)?;
+                            let root_id = identity(raw)?;
+                            require(
+                                Some(root_id) == self.id
+                                    && Some(private_directory_facts(
+                                        raw,
+                                        key,
+                                        "scope_cleanup_empty",
+                                    )?) == self.facts,
+                                "guard scope cleanup root changed",
+                            )?;
+                            yes(unsafe {
+                                SetFileInformationByHandle(
+                                    raw,
+                                    FileDispositionInfo,
+                                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                                )
+                            })?;
+                            close_new(
+                                &mut f.handles,
+                                unknown,
+                                root,
+                                Some(root_id),
+                                "scope private root disposition",
+                            )?;
+                            scope_absent(&mut f.handles, parent, OsStr::new(SCOPE), true)?;
+                            self.removed = true;
+                            println!(
+                                "guard_control_scope_teardown full_id={root_id:?} canary_absent=true private_root_absent=true actual_checked_close=true acl_repair=false public_release_distinct=true"
+                            );
+                            Ok(())
+                        }
+                    }
+                    enum Error {
+                        Fixture(io::Error),
+                        Constructor(StageCreateError),
+                        UnexpectedStage,
+                        Positive(OperationError),
+                    }
+                    impl From<io::Error> for Error {
+                        fn from(error: io::Error) -> Self {
+                            Self::Fixture(error)
+                        }
+                    }
+                    impl std::fmt::Debug for Error {
+                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            match self {
+                                Self::Fixture(error) => {
+                                    f.debug_tuple("Fixture").field(error).finish()
+                                }
+                                Self::Constructor(error) => {
+                                    f.debug_tuple("Constructor").field(error).finish()
+                                }
+                                Self::UnexpectedStage => f.write_str("UnexpectedStageRetained"),
+                                Self::Positive(error) => {
+                                    f.debug_tuple("Positive").field(error).finish()
+                                }
+                            }
+                        }
+                    }
+                    struct GuardHarness {
+                        a: DiscardHarness,
+                        b: Harness,
+                        scope: Scope,
+                        phase: &'static str,
+                        causes: Vec<(&'static str, io::Error)>,
+                        trials: Vec<LockTrial>,
+                        unknown: Vec<CloseUnknown>,
+                    }
+                    impl GuardHarness {
+                        fn new() -> Self {
+                            Self {
+                                a: DiscardHarness::new(),
+                                b: Harness::new(),
+                                scope: Scope::default(),
+                                phase: "setup",
+                                causes: Vec::with_capacity(3),
+                                trials: Vec::with_capacity(4),
+                                unknown: Vec::with_capacity(32),
+                            }
+                        }
+                        fn observe(&mut self, phase: &'static str) -> io::Result<()> {
+                            self.a.base.observe(phase, false)?;
+                            self.b.observe(phase, false)
+                        }
+                        fn mode(&mut self, mode: LockMode) -> io::Result<()> {
+                            require(
+                                Arc::strong_count(self.a.base.guard.as_ref().unwrap()) == 1,
+                                "guard mode switch refuses retained aliases",
+                            )?;
+                            drop(self.a.base.guard.take());
+                            let guard = self
+                                .a
+                                .base
+                                .parent
+                                .as_ref()
+                                .unwrap()
+                                .open_lock_existing(OsStr::new(LOCK), mode)?;
+                            self.a.base.guard = Some(Arc::new(guard));
+                            require(
+                                Some(self.a.base.guard.as_ref().unwrap().identity())
+                                    == self.a.base.lock.as_ref().unwrap().id,
+                                "guard mode switch changed lock ID",
+                            )?;
+                            self.a.base.guard.as_ref().unwrap().check()?;
+                            println!(
+                                "guard_control_public_mode mode={mode:?} same_lock_id={:?} existing_only=true prior_Arc_count=1",
+                                self.a.base.lock.as_ref().unwrap().id
+                            );
+                            Ok(())
+                        }
+                        fn refusal(
+                            &mut self,
+                            label: &'static str,
+                            result: Result<StagedDirectory, StageCreateError>,
+                        ) -> Result<(), Error> {
+                            match result {
+                                Err(StageCreateError::Unchanged(source))
+                                    if source.kind() == io::ErrorKind::PermissionDenied
+                                        && source.to_string() == REFUSAL =>
+                                {
+                                    self.causes.push((label, source));
+                                    println!(
+                                        "guard_control_constructor_refusal mode={label} variant=Unchanged kind=PermissionDenied literal={REFUSAL:?} source_order_before_native_create=true"
+                                    );
+                                    Ok(())
+                                }
+                                Err(error) => Err(Error::Constructor(error)),
+                                Ok(stage) => {
+                                    self.a.base.flight = Some(Flight::Stage(stage));
+                                    Err(Error::UnexpectedStage)
+                                }
+                            }
+                        }
+                        fn execute(&mut self) -> Result<(), Error> {
+                            self.phase = "two native fixture prerequisites";
+                            self.a.base.prepare()?;
+                            self.b.prepare()?;
+                            require(
+                                self.a.base.parent.as_ref().unwrap().identity()
+                                    != self.b.parent.as_ref().unwrap().identity(),
+                                "guard fixture parents are not distinct",
+                            )?;
+                            self.phase = "same-parent Shared";
+                            self.mode(LockMode::Shared)?;
+                            lock_trial(
+                                &mut self.a.base,
+                                &mut self.unknown,
+                                &mut self.trials,
+                                "A_Shared_native_Shared",
+                                false,
+                                true,
+                            )?;
+                            lock_trial(
+                                &mut self.a.base,
+                                &mut self.unknown,
+                                &mut self.trials,
+                                "A_Shared_native_Exclusive",
+                                true,
+                                false,
+                            )?;
+                            self.observe("guard_shared_before")?;
+                            let result = self.a.base.parent.as_ref().unwrap().stage_directory(
+                                Arc::clone(self.a.base.guard.as_ref().unwrap()),
+                                OsStr::new(STAGE),
+                            );
+                            self.refusal("same_parent_Shared", result)?;
+                            self.observe("guard_shared_after")?;
+                            self.phase = "matching Exclusive reacquisition and foreign guard";
+                            self.mode(LockMode::Exclusive)?;
+                            lock_trial(
+                                &mut self.a.base,
+                                &mut self.unknown,
+                                &mut self.trials,
+                                "A_Exclusive_native_Shared",
+                                false,
+                                false,
+                            )?;
+                            lock_trial(
+                                &mut self.b,
+                                &mut self.unknown,
+                                &mut self.trials,
+                                "B_Exclusive_native_Shared",
+                                false,
+                                false,
+                            )?;
+                            self.observe("guard_foreign_before")?;
+                            let result = self.a.base.parent.as_ref().unwrap().stage_directory(
+                                Arc::clone(self.b.guard.as_ref().unwrap()),
+                                OsStr::new(STAGE),
+                            );
+                            self.refusal("foreign_parent_Exclusive", result)?;
+                            self.observe("guard_foreign_after")?;
+                            self.phase = "ancestor guard as child parent";
+                            self.scope.create(&mut self.a.base, &mut self.unknown)?;
+                            self.scope.observe(
+                                &mut self.a.base,
+                                &mut self.unknown,
+                                "guard_scope_before",
+                            )?;
+                            self.observe("guard_scope_outer_before")?;
+                            let result = self.scope.directory.as_ref().unwrap().stage_directory(
+                                Arc::clone(self.a.base.guard.as_ref().unwrap()),
+                                OsStr::new(STAGE),
+                            );
+                            self.refusal("ancestor_guard_as_child_parent", result)?;
+                            self.scope.observe(
+                                &mut self.a.base,
+                                &mut self.unknown,
+                                "guard_scope_after",
+                            )?;
+                            self.observe("guard_scope_outer_after")?;
+                            self.phase = "scope known-ID teardown";
+                            self.scope.cleanup(&mut self.a.base, &mut self.unknown)?;
+                            self.observe("guard_scope_removed")?;
+                            self.phase = "matching Exclusive positive real removal";
+                            match self.a.stage_and_discard().map_err(Error::Positive)? {
+                                Outcome::Removed => {}
+                                Outcome::Refused => {
+                                    return Err(bad(
+                                        "guard positive refused discard; authority retained",
+                                    )
+                                    .into());
+                                }
+                            }
+                            require(
+                                self.causes.len() == 3
+                                    && self.unknown.is_empty()
+                                    && self.scope.removed,
+                                "guard native refusal/ownership prerequisites incomplete",
+                            )?;
+                            self.b
+                                .observe("guard_positive_other_parent_preserved", false)?;
+                            self.a.removed()?;
+                            self.phase = "other parent full teardown";
+                            self.b.observe("guard_final_other_parent", false)?;
+                            self.b.cleanup()?;
+                            require(
+                                self.trials.len() == 4
+                                    && self.trials.iter().all(|trial| {
+                                        trial.closed
+                                            && (trial.lock_bool == 0
+                                                || trial.unlock.is_some_and(|(ok, error)| {
+                                                    ok != 0 && error == 0
+                                                }))
+                                    })
+                                    && self.unknown.is_empty()
+                                    && self.a.base.oracle.handles.slots.iter().all(Option::is_none)
+                                    && self.b.oracle.handles.slots.iter().all(Option::is_none)
+                                    && self.a.base.flight.is_none()
+                                    && self.a.receipt.is_none()
+                                    && self.a.base.parent.is_none()
+                                    && self.a.base.guard.is_none()
+                                    && self.b.parent.is_none()
+                                    && self.b.guard.is_none()
+                                    && self.scope.directory.is_none()
+                                    && self.scope.creator.is_none()
+                                    && self.scope.removed
+                                    && self
+                                        .scope
+                                        .canary
+                                        .as_ref()
+                                        .is_some_and(|entry| entry.removed),
+                                "guard final teardown or native ownership remains incomplete",
+                            )?;
+                            println!(
+                                "guard_control_complete exact_refusals=3 native_lock_trials={} matching_Exclusive_positive_Removed=true receipt_observed=true both_parents_locks_canaries_scope_absent=true all_native_owners_checked_closed=true remaining_authority=false",
+                                self.trials.len()
+                            );
+                            Ok(())
+                        }
+                    }
+                    pub(in crate::windows) struct Failure {
+                        error: Error,
+                        retained: Box<GuardHarness>,
+                    }
+                    impl std::fmt::Debug for Failure {
+                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.debug_struct("InvalidMatchingGuardControl")
+                                .field("phase", &self.retained.phase)
+                                .field("error", &self.error)
+                                .field("expected_causes", &self.retained.causes)
+                                .field("native_trials", &self.retained.trials)
+                                .field("uncertain_native_closes", &self.retained.unknown)
+                                .field("scope_create_attempted", &self.retained.scope.attempted)
+                                .field("scope_id", &self.retained.scope.id)
+                                .field("scope_removed", &self.retained.scope.removed)
+                                .field("owns_unresolved_fixture_or_product_authority", &true)
+                                .finish()
+                        }
+                    }
+                    pub(in crate::windows) fn run() -> Result<(), Failure> {
+                        let mut harness = GuardHarness::new();
+                        match harness.execute() {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(Failure {
+                                error,
+                                retained: Box::new(harness),
+                            }),
+                        }
+                    }
+                }
             }
 
             pub(in crate::windows) struct Failure {
@@ -7593,6 +8552,12 @@ mod windows {
     fn staged_package_seals_and_publishes_one_file()
     -> Result<(), execution_oracle::first_stage::Failure> {
         execution_oracle::run_first_stage()
+    }
+
+    #[test]
+    fn staged_package_requires_matching_exclusive_parent_guard()
+    -> Result<(), execution_oracle::first_stage::discard_case::guard_case::Failure> {
+        execution_oracle::first_stage::discard_case::guard_case::run()
     }
 
     #[test]
